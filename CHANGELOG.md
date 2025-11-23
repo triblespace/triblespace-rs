@@ -184,6 +184,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entity!`, and query semantics.
 
 ### Changed
+- Corrected the PATCH deep-dive chapter so its descriptions of persistence,
+  node layout, resizing, and hash maintenance match the implementation.
+- Clarified the PATCH deep-dive resizing description to avoid implying growth
+  beyond the 256-entry table.
+- Clarified the PATCH hash-maintenance discussion so hash comparisons
+  short-circuit on matches and walk on mismatches.
 - Expanded the deep-dive blobs chapter with guidance on when to use blob
   storage, how handles relate to schemas, and annotated examples.
 - Corrected the Trible Structure deep dive to describe how `TribleSet::union`
