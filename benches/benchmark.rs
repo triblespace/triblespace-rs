@@ -11,18 +11,18 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::iter::FromIterator;
-use tribles::blob::schemas::succinctarchive::CachedUniverse;
-use tribles::blob::schemas::succinctarchive::CompressedUniverse;
-use tribles::blob::schemas::succinctarchive::SuccinctArchive;
-use tribles::blob::schemas::UnknownBlob;
-use tribles::repo::BlobStorePut;
+use triblespace::core::blob::schemas::succinctarchive::CachedUniverse;
+use triblespace::core::blob::schemas::succinctarchive::CompressedUniverse;
+use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::repo::BlobStorePut;
 
-use tribles::prelude::blobschemas::*;
-use tribles::prelude::*;
+use triblespace::prelude::blobschemas::*;
+use triblespace::prelude::*;
 
-use tribles::patch::Entry;
-use tribles::patch::IdentitySchema;
-use tribles::patch::PATCH;
+use triblespace::core::patch::Entry;
+use triblespace::core::patch::IdentitySchema;
+use triblespace::core::patch::PATCH;
 
 use im::OrdSet;
 
@@ -40,7 +40,7 @@ type UNIVERSE = CachedUniverse<1_048_576, 1_048_576, CompressedUniverse>;
 
 pub mod literature {
     #![allow(unused)]
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" as author: valueschemas::GenId;

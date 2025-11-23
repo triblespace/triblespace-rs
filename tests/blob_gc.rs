@@ -1,12 +1,12 @@
 use anybytes::Bytes;
 use std::collections::HashSet;
 
-use tribles::blob::schemas::UnknownBlob;
-use tribles::blob::{Blob, MemoryBlobStore};
-use tribles::repo::BlobStore;
-use tribles::repo::{reachable, transfer, BlobStoreGet};
-use tribles::value::schemas::hash::Blake3;
-use tribles::value::VALUE_LEN;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::{Blob, MemoryBlobStore};
+use triblespace::core::repo::BlobStore;
+use triblespace::core::repo::{reachable, transfer, BlobStoreGet};
+use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::value::VALUE_LEN;
 
 #[test]
 fn reachable_keep_and_transfer() {

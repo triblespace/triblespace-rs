@@ -1,86 +1,115 @@
 # Identifiers for Distributed Systems
-We found it useful to categorize identifiers along two axes:
+
+Distributed systems are assembled from independently authored pieces of data.
+Keeping those pieces addressable requires names that survive replication,
+concurrent edits, and local conventions. We have found it useful to categorize
+identifier schemes along two axes:
 
 |                | **Abstract**            | **Semantic**        |
 |----------------|-------------------------|---------------------|
-| **Intrinsic**  | Hash, Signature, PubKey | embeddings          |
-| **Extrinsic**  | UUID, UFOID, FUCID      | names, DOI, URL     |
+| **Intrinsic**  | Hash, Signature, PubKey | Embeddings          |
+| **Extrinsic**  | UUID, UFOID, FUCID      | Names, DOI, URL     |
+
+The rows describe how an identifier is minted while the columns describe what
+it tries to communicate. Classifying an identifier along both axes makes its
+trade-offs explicit and helps decide how to combine multiple schemes for a
+given workflow.
 
 ## Abstract vs. Semantic Identifiers
 
-- **Semantic Identifiers (e.g., human-readable names, URLs, embeddings)**
-  These identifiers carry meaning and context about the entity they represent.
-  This can make them them useful for human users,
-  as they can convey information about the entity without requiring additional lookups.
-  For example, a URL can provide information about the location of a resource,
-  or a human readable name can provide information about the entity itself.
-  Embeddings are a special case of semantic identifiers,
-  as they represent the content of an entity in a way that can be compared to other entities.
-  They are also more likely to change over time, as the context of the entity changes.
-  This makes them less useful for identity, as they are not necessarily unique;
-  their strength is to aid interpretation rather than define persistence.
-  To avoid ambiguities and conflicts or the need for a central authority to manage them,
-  semantic identifiers should always be explicitly scoped to a context,
-  such as a namespace or system environment. This ensures that the
-  same name can coexist in different contexts without collision or confusion.
-  This scoping also addresses social challenges inherent in human-readable names:
-  different users may prefer different names for the same entity.
-  By allowing local names to reference persistent identifiers (extrinsic or intrinsic),
-  each user can adopt their preferred naming conventions while maintaining
-  a shared understanding of the underlying identity.
+### Semantic identifiers
 
-- **Abstract Identifiers (e.g., UUIDs, UFOIDs, FUCIDs, hashes, signatures)**  
-  These identifiers provide abstract identity without imposing any semantic meaning or cultural connotations.
-  They can be generated cheaply and without coordination, relying on high entropy to make collisions
-  practically impossible, uniquely, globally, and persistently addressing an entity, regardless of its content or context.
-  Abstract identifiers, when used to reference entities in a system, provide a stable and unique identity that is
-  independent of the content or context of the entity. They are particularly useful in distributed systems, where
-  they can be used to address entities across different nodes without requiring a central authority.
+Semantic identifiers (names, URLs, descriptive labels, embeddings) carry meaning
+about the thing they reference. That context makes them convenient for humans
+and for search workflows where the identifier itself narrows the scope of
+possible matches. Their usefulness comes with caveats:
+
+- Semantics drift. A name that once felt accurate can become misleading as an
+  entity evolves.
+- Semantic identifiers are rarely unique. They work best as entry points into a
+  richer dataset rather than as the source of truth for identity.
+- Without scoping, semantics clash. Two communities can reasonably reuse the
+  same word for different concepts, so the identifier must be tied to a
+  namespace, deployment, or audience.
+
+Distributed systems reconcile those tensions by mapping many local semantic
+names to a persistent abstract identifier. Users remain free to adopt whatever
+terminology makes sense to them while the system maintains a shared canonical
+identity.
+
+Embeddings deserve a special mention. They encode meaning in a machine-friendly
+form that can be compared for similarity instead of exact equality. That makes
+them great for recommendations and clustering but still unsuitable as primary
+identifiers: two distinct entities can legitimately share similar embeddings,
+and embeddings can change whenever the underlying model is retrained.
+
+### Abstract identifiers
+
+Abstract identifiers (UUIDs, UFOIDs, FUCIDs, hashes, signatures) strip all
+meaning away in favor of uniqueness. They can be minted without coordination,
+usually by drawing from a high-entropy space and trusting probability to keep
+collisions effectively impossible. Abstract identifiers shine when you need:
+
+- Stable handles that survive across replicas and through refactors.
+- Globally unique names without a centralized registrar.
+- Cheap, constant-time generation so every component can allocate identifiers on
+  demand.
+
+Because they carry no inherent semantics, abstract identifiers are almost always
+paired with richer metadata. They provide the skeleton that keeps references
+consistent while semantic identifiers supply the narrative that humans consume.
 
 ## Intrinsic vs. Extrinsic Identifiers
 
-- **Intrinsic Identifiers (e.g., hashes, signatures)**  
-  These identifiers provide intrinsic identity by acting as unique fingerprints of the exact content they represent.
-  Unlike abstract identifiers, intrinsic identifiers are directly tied to the data itself, ensuring immutability
-  and self-validation.
+The intrinsic/extrinsic axis captures whether an identifier can be recomputed
+from the entity itself or whether it is assigned externally.
 
-  Intrinsic identifiers are generated by applying cryptographic functions to the content. Their entropy requirements
-  are higher than those of abstract identifiers, as they must not only prevent accidental collisions but also
-  withstand adversarial scenarios, such as deliberate attempts to forge data.
+### Intrinsic identifiers
 
-- **Extrinsic Identifiers (e.g., human-readable names, URLs, DOIs, UUIDs, UFOIDs, FUCIDs)**
-  These identifiers provide identity that is not tied to the content itself,
-  but only by association. They are used to reference entities in a system, but do not
-  provide any guarantees about the content or the entity itself.
-  Allowing for continuity even as that entity may change or evolve.
+Intrinsic identifiers (cryptographic hashes, digital signatures, content-based
+addresses) are derived from the bytes they describe. They function as
+fingerprints: if two values share the same intrinsic identifier then they are
+bit-for-bit identical. This property gives us:
 
-Extrinsic identifiers and intrinsic identifiers represent different kinds of metaphysical identity.  
-For example, in the ship of Theseus thought experiment, both the original ship and the reconstructed ship  
-would share the same extrinsic identity but have different intrinsic identities.
+- Immutability. Changing the content produces a different identifier, which
+  immediately signals tampering or corruption.
+- Self-validation. Replicas can verify received data locally instead of trusting
+  a third party.
+- Stronger adversarial guarantees. Because an attacker must find collisions
+  deliberately, intrinsic identifiers rely on cryptographic strength rather than
+  purely statistical rarity.
+
+### Extrinsic identifiers
+
+Extrinsic identifiers (names, URLs, DOIs, UUIDs, UFOIDs, FUCIDs) are assigned by
+policy instead of by content. They track a conceptual entity as it evolves
+through versions, formats, or migrations. In other words, extrinsic identifiers
+carry the "story" of a thing while intrinsic identifiers nail down individual
+revisions.
+
+Thinking about the classic ship of Theseus thought experiment makes the
+distinction concrete: the restored ship and the reconstructed ship share the
+same extrinsic identity (they are both "Theseus' ship") but have different
+intrinsic identities because their planks differ.
 
 ## Embeddings as Semantic Intrinsic Identifiers
-Note that embeddings are the somewhat curious case of semantic intrinsic identifiers.
-They are intrinsic in that they are tied to the content they represent, but they are also semantic in that they
-carry meaning about the content. Embeddings are used to represent the content of an entity in a way that can be
-compared to other entities, such as for similarity search or classification.
-This makes them especially interesting for search and retrieval systems, where they can be used to find similar
-entities based on a reference entity. But less useful for identity, as they are not necessarily unique.
 
-One thing that makes them especially interesting is that they can be used to compare entities across different
-systems or contexts, even if the entities themselves are not directly comparable. For example, you could compare
-the embeddings of a text document and an image to find similar content, even though the two entities are of
-different types.
+Embeddings blur our neat taxonomy. They are intrinsic because they are computed
+from the underlying data, yet they are overtly semantic because similar content
+produces nearby points in the embedding space. That duality makes them powerful
+for discovery:
 
-Furthermore they aid in the decentralization and commoditization of search and retrieval systems, as they allow
-for the relatively expensive process of generating embeddings to be done decoupled from the indexing and retrieval
-process. This allows for the embedding generation to be done once in a distributed manner, and then the embeddings
-can be used by any system that needs to compare entities. With the embeddings acting as a common language for
-comparing entities, different embeddings can be compared without needing to know about the specifics of each system.
+- Systems can exchange embeddings as a "lingua franca" without exposing raw
+  documents.
+- Expensive feature extraction can happen once and power many downstream
+  indexes, decentralizing search infrastructure.
+- Embeddings let us compare otherwise incomparable artifacts (for example, a
+  caption and an illustration) by projecting them into a shared space.
 
-Contrastingly classic search and retrieval systems require a central authority to index and search the content,
-as the indexing process is tightly coupled with the indexed data. This makes it difficult to compare entities
-across different systems, as each system has its own index and retrieval process.
-It also makes merging indexes virtually impossible, as the indexes are tightly coupled with the structure of the data they index.
+Despite those advantages, embeddings should still point at a durable abstract
+identifier rather than act as the identifier. Collisions are expected, model
+updates can shift the space, and floating-point representations can lose
+determinism across hardware.
 
 ## High-Entropy Identifiers
 
@@ -106,42 +135,47 @@ would halve the effective security of a 256-bit hash, reducing it to \( 2^{128} 
 current or theoretical technology. As a result, 256 bits remains a future-proof choice for intrinsic identifiers.  
 
 Such 256-bit intrinsic identifiers are represented by the types
-[`tribles::value::schemas::hash::Hash`](crate::value::schemas::hash::Hash) and
-[`tribles::value::schemas::hash::Handle`](crate::value::schemas::hash::Handle).  
+[`triblespace::core::value::schemas::hash::Hash`](crate::value::schemas::hash::Hash) and
+[`triblespace::core::value::schemas::hash::Handle`](crate::value::schemas::hash::Handle).  
 
-Additionally, we define three types of high-entropy abstract identifiers to address different requirements:  
-**RNGID, UFOID, and FUCID.** Each balances trade-offs between entropy, locality, compression, and
-predictability, as summarized below.
+Not every workflow needs cryptographic strength. We therefore ship three
+high-entropy abstract identifier families—**RNGID, UFOID, and FUCID**—that keep
+128 bits of global uniqueness while trading off locality, compressibility, and
+predictability to suit different scenarios.
 
 ## Comparison of Identifier Types
 
-|                | [RNGID](rngid::rngid) | [UFOID](ufoid::ufoid) | [FUCID](fucid::fucid) |
-|----------------|-----------------------|-----------------------|------------------------|
-| Entropy        | High                  | High                  | Low                   |
-| Locality       | None                  | High                  | High                  |
-| Compression    | None                  | Low                   | High                  |
-| Predictability | None                  | Low                   | Mid                   |
+|                        | [RNGID](crate::id::rngid::rngid) | [UFOID](crate::id::ufoid::ufoid) | [FUCID](crate::id::fucid::fucid) |
+|------------------------|----------------------------------|----------------------------------|----------------------------------|
+| Global entropy         | 128 bits                        | 96 bits random + timestamp       | 128 bits                         |
+| Locality               | None                            | High (time-ordered)              | High (monotonic counter)         |
+| Compression friendliness | None                          | Low                              | High                             |
+| Predictability         | None                            | Low (reveals mint time)          | High (per-source sequence)       |
 
 # Example: Scientific Publishing
 
-Consider the case of published scientific papers. Each artifact, such as a `.html` or `.pdf` file,
-should be identified by its abstract intrinsic identifier, typically a cryptographic hash of its content.
-This ensures that any two entities referencing the same hash are referring to the exact same version
-of the artifact, providing immutability and validation.  
+Consider the case of published scientific papers. Each artifact, such as a `.html`
+or `.pdf` file, should be identified by its abstract intrinsic identifier,
+typically a cryptographic hash of its content. This ensures that any two
+entities referencing the same hash are referring to the exact same version of
+the artifact, providing immutability and validation.
 
-Across different versions of the same paper, an abstract extrinsic identifier can be used to tie these
-artifacts together as part of one logical entity. The identifier provides continuity,
-regardless of changes to the paper’s content over time.  
+Across different versions of the same paper, an abstract extrinsic identifier can
+tie these artifacts together as part of one logical entity. The identifier
+provides continuity regardless of changes to the paper’s content over time.
 
-Semantic (human-readable) identifiers, such as abbreviations in citations or bibliographies, are scoped to
-individual papers and provide context-specific usability for readers. These names do not convey
-identity but serve as a way for humans to reference the persistent abstract identifiers that underlie the system.
+Semantic (human-readable) identifiers, such as abbreviations in citations or
+bibliographies, are scoped to individual papers and provide context-specific
+usability for readers. These names do not convey identity but serve as a way for
+humans to reference the persistent abstract identifiers that underlie the
+system.
 
-Sadly the identifiers used in practice, such as DOIs, fail to align with these principles and strengths.
-They attempt to provide global extrinsic semantic identifiers for scientific papers,
-an ultimately flawed approach. They lack the associated guarantees of intrinsic identifiers
-and bring all the challenges of semantic identifiers. With their scope defined too broadly,
-and their authority centralized, they fail to live up to the potential of distributed systems.
+Sadly the identifiers used in practice, such as DOIs, fail to align with these
+principles and strengths. They attempt to provide global extrinsic semantic
+identifiers for scientific papers, an ultimately flawed approach. They lack the
+associated guarantees of intrinsic identifiers and bring all the challenges of
+semantic identifiers. With their scope defined too broadly and their authority
+centralized, they fail to live up to the potential of distributed systems.
 
 # ID Ownership
 
@@ -163,8 +197,8 @@ Once the IDs are back in scope you can either work with them directly as
 below shows both approaches in action:
 
 ```rust
-use tribles::examples::literature;
-use tribles::prelude::*;
+use triblespace::examples::literature;
+use triblespace::prelude::*;
 
 let mut kb = TribleSet::new();
 {

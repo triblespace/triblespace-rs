@@ -1,7 +1,7 @@
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
 mod ns {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "71C9AB6D8DF645C894D4473ED04E12CC" as attr: valueschemas::GenId;

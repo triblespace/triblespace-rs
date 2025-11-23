@@ -4,13 +4,13 @@ use url::Url;
 fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::error::Error>> {
     use tempfile::tempdir;
 
-    use tribles::blob::schemas::UnknownBlob;
-    use tribles::blob::Blob;
-    use tribles::blob::Bytes;
-    use tribles::prelude::BlobStorePut;
-    use tribles::repo::objectstore::ObjectStoreRemote;
-    use tribles::repo::{BlobStoreForget, BlobStoreMeta};
-    use tribles::value::schemas::hash::Blake3;
+    use triblespace::core::blob::schemas::UnknownBlob;
+    use triblespace::core::blob::Blob;
+    use triblespace::core::blob::Bytes;
+    use triblespace::core::repo::objectstore::ObjectStoreRemote;
+    use triblespace::core::repo::{BlobStoreForget, BlobStoreMeta};
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace::prelude::BlobStorePut;
 
     let dir = tempdir()?;
     let url = Url::parse(&format!("file://{}", dir.path().display()))?;
@@ -22,7 +22,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     let handle = remote.put::<UnknownBlob, _>(blob)?;
 
     // metadata should be present and report the correct length
-    use tribles::prelude::BlobStore;
+    use triblespace::prelude::BlobStore;
 
     let reader = remote.reader()?;
     let meta = reader.metadata(handle.clone())?;

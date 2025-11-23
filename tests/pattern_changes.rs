@@ -1,9 +1,9 @@
 use crate::entity;
 use crate::pattern_changes;
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
 pub mod literature {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" as author: valueschemas::GenId;

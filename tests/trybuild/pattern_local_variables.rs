@@ -1,7 +1,7 @@
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
 mod names {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: valueschemas::ShortString;

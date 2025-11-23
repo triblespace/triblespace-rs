@@ -1,73 +1,45 @@
 [package]
-name = "tribles"
-version = "0.5.2"
+name = "triblespace"
+version = "0.6.0"
 authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
 edition = "2021"
-rust-version = "1.89"
-description = "The tribles knowledge base implementation for rust."
-homepage = "https://tribles.space"
+description = "The Triblespace: A lightweight knowledge base for rust."
+homepage = "https://trible.space"
 license = "MIT OR Apache-2.0"
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[workspace]
+members = [
+    "triblespace-core",
+    "triblespace-core-macros",
+    "triblespace-macros",
+    "triblespace-macros-common",
+]
+resolver = "2"
 
 [dependencies]
-memmap2 = "0.9.5"
-zerocopy = { version = "0.8", features = ["derive"] }
-anybytes = { git = "https://github.com/triblespace/anybytes", features = ["bytes", "zerocopy"] }
-rand = "0.8"
-digest = "0.10.7"
-ux = "0.1.5"
-siphasher = "1.0.1"
-arbitrary = { version = "1", features = ["derive"] }
-object_store = "0.12.2"
-hex = "0.4.3"
-hex-literal = "1.0.0"
-url = "2.5.0"
-ed25519 = "2.2.3"
-ed25519-dalek = {version = "2.1.0", features = ["rand_core"]}
-blake2 = "0.10.6"
-blake3 = { version = "1.5.0", features = ["traits-preview"] }
-futures = "0.3.30"
-# runtime for bridging async object_store
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-crossbeam-channel = "0.5"
-signature = "2.2.0"
-anyhow = "1.0"
-bytes = "1.6.0"
-bytemuck = { version = "1.15.0", features = ["extern_crate_alloc"]}
-proptest = { version = "1.6.0", optional = true }
-hifitime = "4.1.2"
-f256 = "0.7.0"
-jerky = { git = "https://github.com/triblespace/jerky" }
-itertools = "0.14.0"
-sptr = "0.3.2"
-indxvec = "1.9.0"
-ethnum = "1.5.0"
-num-rational = "0.4.2"
-arrayvec = "0.7.6"
-quick_cache = "0.6.9"
-macro_pub = "0.1.0"
-uuid = "1.15.1"
-reft-light = "0.3.1"
-tribles-macros = { path = "tribles-macros" }
-page_size = "0.6.0"
+triblespace-core = {version = "0.6.0", path = "./triblespace-core"}
+triblespace-macros = {version = "0.6.0", path = "./triblespace-macros"}
 
 [dev-dependencies]
-im = "15.1.0"
-peak_alloc = "0.3.0"
+criterion = "0.6.0"
 fake = "4.3.0"
-coz = "0.1"
+im = "15.1.0"
 rayon = "1.7"
 tempfile = "3.15.0"
-criterion = "0.6.0"
 trybuild = "1.0.99"
-
-[build-dependencies]
-rustversion = "1.0"
+proptest = "1.6.0"
+rand = "0.8"
+ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
+anybytes = { version = "0.20.0", features = ["bytes", "zerocopy"] }
+url = "2.5.0"
+serde_json = "1.0"
+f256 = "0.7.0"
+blake3 = "1.5"
 
 [features]
-default = ["proptest"]
-proptest = ["dep:proptest"]
-kani = []
+default = ["triblespace-core/proptest"]
+proptest = ["triblespace-core/proptest"]
+kani = ["triblespace-core/kani"]
 
 [[bench]]
 name = "benchmark"
@@ -79,6 +51,10 @@ harness = false
 
 [[bench]]
 name = "patch"
+harness = false
+
+[[bench]]
+name = "json_import"
 harness = false
 
 [profile.bench]
@@ -93,6 +69,3 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
 [package.metadata.kani.flags]
 default-unwind = "1"
-
-## Removed workspace.metadata to allow this crate to be used as a path dependency
-## inside the surrounding workspace without creating nested workspace roots.

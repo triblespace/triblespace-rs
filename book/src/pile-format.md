@@ -107,6 +107,6 @@ verification happens lazily only when individual blobs are loaded so that
 opening a large pile remains fast.
 
 For more details on interacting with a pile see the [`Pile` struct
-documentation](https://docs.rs/tribles/latest/tribles/repo/pile/struct.Pile.html).
+documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).
 
 [1]: https://db.cs.cmu.edu/mmap-cidr2022/ "The Case Against Memory-Mapped I/O"

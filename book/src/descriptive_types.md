@@ -6,6 +6,15 @@ shape of the data you want to see rather than prescribing a single concrete
 Rust type for every entity. This gives you the flexibility to keep the full
 graph around and to materialize only the view you need, when you need it.
 
+Reading the chapter sequentially should equip you to:
+
+1. talk about entities in terms of the fields they expose rather than the
+   structs you wish they were,
+2. design APIs that carry just enough information (a workspace, a checkout, an
+   id) to ask for more data later, and
+3. know when it is worth materializing a typed projection and when the
+   descriptive view is already the best representation.
+
 ## Key ideas at a glance
 
 - Attributes are typed fields (unlike untyped RDF predicates).
@@ -17,6 +26,8 @@ graph around and to materialize only the view you need, when you need it.
   export canonical KIND_* constants you can pattern-match directly against.
 - Prefer passing the Workspace + the checkout result (TribleSet) and an
   entity id around — only materialize a concrete Rust view when required.
+- Strongly prefer operating on the tuples returned by `find!`; wrapper
+  structs should exist only as grudging adapters for APIs that demand them.
 
 ## Why "descriptive" not "prescriptive"?
 
@@ -57,19 +68,44 @@ blobs.
 #### Manager-owned repository and workspace DI
 
 At runtime, prefer to give a long-lived manager (session, exporter, service)
-ownership of a Repository instance and expose an "open_workspace()" helper
-that returns a Workspace for branch-local reads/writes. Library functions
-should accept a &mut Workspace (or a TribleSet + Workspace) as arguments
-instead of opening piles/repositories themselves. This avoids repeated
-Pile::open + Repository::new churn in hot paths and centralizes lifecycle
-management in one place.
+ownership of a `Repository<Pile<Blake3>>`. Downstream code can depend on that
+manager in one of two shapes:
+
+1. Accept a `&mut Repository<_>` and open/pull the workspace you need inside
+   the function. This works well for tasks that need to coordinate multiple
+   checkouts or want to control the retry loop themselves, and the mutable
+   borrow is typically short-lived: you only need it while creating or
+   pushing workspaces.
+2. Ask the manager to mint a `&mut Workspace<_>` for the duration of a task
+   (e.g. an update, render, or event-handling callback) and pass that mutable
+   reference down. The manager remains responsible for merging or dropping the
+   workspace when the task completes.
+
+Both approaches avoid constructing piles or repositories ad-hoc and keep
+lifecycle management centralized. Importantly, they let multiple tasks hold
+distinct mutable workspaces over the same repository while only requiring a
+single mutable borrow of the repository when you create or push those
+workspaces. Library functions should therefore accept a `&mut Repository<_>`
+*or* a `&mut Workspace<_>` (optionally paired with a `TribleSet` checkout for
+read-only helpers) rather than opening new repositories inside hot paths.
 
 Example (pseudocode):
 
 ```rust
 // manager owns a Repository for the process/session lifetime
-let mut repo = manager.repo.open_workspace()?;
-let mem = memory_for_prompt_ws(&mut repo, ...)?; // workspace-variant helper
+let mut repo = manager.repo_mut();
+let branch_id = manager.default_branch_id;
+
+// option 1: task pulls its own workspace
+let mut ws = repo.pull(branch_id)?;
+let content = ws.checkout(ws.head())?;
+
+// option 2: manager provides a workspace to a task callback
+manager.with_workspace(branch_id, |ws| {
+    let snapshot = ws.checkout(ws.head())?;
+    render(snapshot);
+    Ok(())
+})?;
 ```
 
 This pattern keeps startup/teardown centralized and eliminates the common
@@ -84,16 +120,43 @@ error, just absence.
 
 When your project defines canonical tag ids (GenId constants) prefer to
 match the tag directly in the pattern rather than binding a short-string
-and filtering afterwards.
+and filtering afterwards. Pattern clauses can be composed: you can match on
+tags and required attributes, and even join related entities in a single
+find! invocation.
 
 Example: find plan snapshot ids (match tag directly)
 
 ```rust
 // Match entities that have the canonical plan snapshot tag attached.
-for (e,) in find!((e: Id), tribles::pattern!(&content, [{ ?e @ metadata::tag: (KIND_PLAN_SNAPSHOT) }])) {
+for (e,) in find!((e: Id), triblespace::pattern!(&content, [{ ?e @ metadata::tag: (KIND_PLAN_SNAPSHOT) }])) {
     // `e` is a plan snapshot entity id; follow-up finds can read other fields
 }
 ```
+
+Worked example: composing a structural pattern
+
+```rust
+// Grab all active plans with a title and owner.
+for (plan_id, title, owner) in find!(
+    (plan_id: Id, title: ShortString, owner: Id),
+    tribles::pattern!(&content, [
+        { ?plan_id @ metadata::tag: (KIND_PLAN) },
+        { ?plan_id plan::status: (plan::STATUS_ACTIVE) },
+        { ?plan_id plan::title: ?title },
+        { ?plan_id plan::owner: ?owner },
+    ])
+) {
+    // `title` is already typed as ShortString.
+    // `owner` can drive a follow-up find! to pull account info as needed.
+}
+```
+
+`find!` returns tuples of the values you requested in the head of the query.
+Nothing more, nothing less. The example above reads as "give me the `Id`
+bound to `plan_id`, the short string bound to `title`, and another `Id`
+bound to `owner` for every entity matching these clauses." Because the
+matching is descriptive, adding a new attribute such as `plan::color` does
+not invalidate the call site — you only see the data you asked for.
 
 ### 3. Lazy, ad‑hoc conversions only where needed
 
@@ -103,13 +166,57 @@ fields, you can perform another small find! there. Don't materialize large
 subgraphs unless a single operation needs them.
 
 The recommended function signature is minimal and focused on the
-tribles primitives:
+tribles primitives. Conversions into bespoke structs are almost always a smell;
+they obscure which fields are actually used and quickly devolve into an
+unofficial schema. Treat any adapter as an opt-in shim that exists purely at
+integration boundaries where consumers refuse to speak tribles primitives.
 
 ```rust
 fn handle_plan_update(ws: &mut Workspace<Pile<Blake3>>, plan_id: Id) -> io::Result<()> {
     // ad-hoc find! calls to read the fields we need
+    let checkout = ws.checkout()?;
+
+    if let Some((title,)) =
+        find!((title: ShortString), tribles::pattern!(&checkout, [{ ?plan_id plan::title: ?title }]))
+            .next()
+    {
+        // The returned tuple is already typed. Convert to an owned String only if
+        // external APIs demand ownership.
+        process_title(title.from_value::<&str>());
+    }
+
+    Ok(())
 }
 ```
+
+If you cannot avoid exposing a typed facade (for example because an external
+API insists on receiving a struct), keep the struct tiny, document that it is a
+legacy shim, and derive it straight from a find! tuple:
+
+```rust
+struct PlanSummary<'a> {
+    id: Id,
+    title: &'a str,
+}
+
+fn load_plan_summary<'a>(ws: &'a mut Workspace<Pile<Blake3>>, plan_id: Id) -> io::Result<Option<PlanSummary<'a>>> {
+    let content = ws.checkout()?;
+    Ok(find!(
+        (title: ShortString),
+        tribles::pattern!(&content, [{ ?plan_id plan::title: ?title }])
+    )
+    .next()
+    .map(|(title,)| PlanSummary {
+        id: plan_id,
+        title: title.from_value::<&str>(),
+    }))
+}
+```
+
+The struct above is merely a view with borrowed references; it is not a
+blessed schema. Resist the temptation to evolve it into a "real" model type —
+extend the `find!` pattern first and only mirror those changes here when an
+external interface forces your hand.
 
 ### 4. Read LongString as &str (zero-copy)
 
@@ -117,13 +224,21 @@ Blob schema types in tribles are intentionally zerocopy. Prefer the
 typed View API which returns a borrowed &str without copying when possible.
 
 ```rust
-let view = ws.get::<View<str>, LongString>(handle).map_err(|e| ...)?;
+let view = ws
+    .get::<View<str>, LongString>(handle)
+    .map_err(|e| ...)?; // `handle` is a Value<Handle<Blake3, LongString>>
 let s: &str = view.as_ref(); // zero-copy view tied to the workspace lifetime
 // If you need an owned String: let owned = view.to_string();
 ```
 
 Note: a View borrows data that is managed by the Workspace; avoid returning
 `&str` that outlives the workspace or the View.
+
+When you do need ownership, convert at the edge of the system. Internal
+helpers should continue to pass views or typed handles around so that the
+call site that triggers a blob fetch is easy to spot. Cloning the in-memory
+blob after it has been pulled is cheap; the expensive part is fetching it
+from storage (potentially a remote) in the first place.
 
 ### 5. Structural sharing and normalization patterns
 
@@ -159,7 +274,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
 
 ```rust
 ws.commit(content, Some("plan-update"));
-// `push` will handle merge+retry internally; it returns Ok(None) on success
+// `push` will handle merge+retry internally; it returns Ok(()) on success
 // or an error if the operation ultimately failed.
 repo.push(&mut ws)?;
 ```
