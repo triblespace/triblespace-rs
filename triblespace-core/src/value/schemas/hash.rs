@@ -1,7 +1,10 @@
 use crate::blob::BlobSchema;
 use crate::blob::MemoryBlobStore;
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -124,6 +127,19 @@ where
     }
 }
 
+fn describe_hash<H>() -> (TribleSet, MemoryBlobStore<Blake3>)
+where
+    H: HashProtocol,
+{
+    let mut tribles = TribleSet::new();
+    let blobs = MemoryBlobStore::new();
+
+    let entity = ExclusiveId::force(H::id());
+    tribles += entity! { &entity @ metadata::name: H::NAME };
+
+    (tribles, blobs)
+}
+
 use blake2::Blake2b as Blake2bUnsized;
 pub type Blake2b = Blake2bUnsized<U32>;
 
@@ -141,11 +157,19 @@ impl ConstMetadata for Blake2b {
     fn id() -> Id {
         id_hex!("91F880222412A49F012BE999942E6199")
     }
+
+    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
+        describe_hash::<Self>()
+    }
 }
 
 impl ConstMetadata for Blake3 {
     fn id() -> Id {
         id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3")
+    }
+
+    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
+        describe_hash::<Self>()
     }
 }
 

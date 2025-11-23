@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ValueSchema` inherits its identifier and default description behavior from
   `ConstMetadata`, removing duplicate `id`, `metadata_id`, and `describe`
   methods from the schema trait itself.
+- Hash protocol metadata now emits the protocol name alongside the identifier
+  so descriptions include the declared `NAME` for each digest.
 - Replaced the `SchemaMetadata` helper with direct `ConstMetadata` impls on
   value schemas so static metadata stays in sync with runtime metadata roots.
 - Removed explicit blob schema hooks from value schemas and attribute metadata,
