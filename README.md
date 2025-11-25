@@ -11,8 +11,8 @@
 
 # About
 
-> “Insufficient facts always invite danger.”  
-> — *Mr. Spock*
+> “We need to abolish names and places, and replace them with hashes.”
+> — Joe Armstrong, [The Mess We’re In](https://www.youtube.com/watch?v=lKXe3HUG2l4)
 
 **Trible Space** is a data space and knowledge graph standard. It offers metadata management capabilities similar to file- and version-control systems, combined with the queryability and convenience of an embedded database, tailored towards use with simple blob storage. It is designed to be a holistic yet lightweight data storage solution that can be used in a variety of contexts, from embedded systems to distributed cloud services.
 

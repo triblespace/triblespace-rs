@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Changed
+- Updated the README quote to Joe Armstrong’s talk “The Mess We’re In.”
 - `Metadata` and `ConstMetadata` now use a shared `id` method as the canonical
   schema identifier, eliminating the former `metadata_id` accessors.
 - `ValueSchema` inherits its identifier and default description behavior from
