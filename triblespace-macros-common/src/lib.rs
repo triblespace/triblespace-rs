@@ -391,7 +391,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                     let af_ident = format_ident!("__af{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
                     attr_tokens.extend(quote! {
-                        let #af_ident = #field_expr;
+                        let #af_ident = &#field_expr;
                         let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
                         constraints.push(Box::new(#a_ident.is(#base_path::value::ToValue::to_value(#af_ident.id()))));
                     });
@@ -511,7 +511,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let val_ident = format_ident!("__val{}", i, span = Span::mixed_site());
         let stmt = quote! {
             {
-                let #af_ident = #field_expr;
+                let #af_ident = &#field_expr;
                 let #val_ident = #af_ident.value_from(#value_expr);
                 let __a_id = #af_ident.id();
                 set.insert(&#base_path::trible::Trible::new(id_ref, &__a_id, &#val_ident));

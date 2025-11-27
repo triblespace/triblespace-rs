@@ -15,7 +15,8 @@ Each attribute introduced with `attributes!` defines an **atomic type** — a un
 ```
 
 Formally this is a function `title : Id → ValueTitle`, or, in relational terms, the set `{ (id, value) }`.
-In the codebase the macro emits a `pub const` of type [`Attribute<S>`](../src/attribute.rs), so the generated binding already carries the `ValueSchema` that governs the value column.
+In the codebase the macro emits either a `pub const` (when you supply the 128-bit id) or a `static LazyLock` (when you omit it) of type [`Attribute<S>`](../src/attribute.rs), so the generated binding already carries the `ValueSchema` that governs the value column.
+The derived form hashes the attribute name together with the schema metadata via `Attribute::from_name`, which is convenient for quick experiments; shared protocols should still pin explicit ids so collaborators and other languages read the same column.
 These atomic pieces are the building blocks for everything else.
 
 ## Entities as Intersection Types

@@ -10,7 +10,11 @@ middle position in a trible and carry the `ValueSchema` (or blob-handle schema)
 that interprets and validates the value. Modules mint them with the
 `attributes!` macro, so they behave like detached struct fields: each attribute
 remains independently typed even when many are combined to describe the same
-entity, preserving its individual semantics.
+entity, preserving its individual semantics. Provide an explicit 128-bit id in
+the macro when you need a canonical column shared across crates or languages;
+omit the literal to derive a deterministic id from the attribute name and value
+schema (the macro calls `Attribute::from_name` for you), which is handy for
+short-lived or internal attributes.
 
 ### Blob
 An immutable chunk of binary data addressed by the hash of its contents. Blobs
@@ -91,4 +95,3 @@ A mutable working area for preparing commits. Workspaces track staged trible
 sets and maintain a private blob store so large payloads can be uploaded before
 publishing. Once a commit is finalised it becomes immutable like the rest of
 Trible Space.
-

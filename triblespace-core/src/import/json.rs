@@ -801,8 +801,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use core::num;
-
     use super::*;
 
     use crate::blob::schemas::longstring::LongString;
@@ -895,7 +893,11 @@ mod tests {
         assert_eq!(salted_root, salted_again_root);
     }
 
-    fn assert_attribute_metadata<S: ValueSchema>(metadata: &TribleSet, attribute: Id, field: &str) {
+    fn assert_attribute_metadata<S: ValueSchema>(
+        metadata: &TribleSet,
+        attribute: Id,
+        field: &str,
+    ) {
         let name_attr = metadata::name.id();
         let schema_attr = metadata::attr_value_schema.id();
 
@@ -930,7 +932,13 @@ mod tests {
             .expect("value schema metadata should exist")
             .v::<GenId>()
             .from_value::<Id>();
-        assert_eq!(schema_value, S::id());
+        let expected_schema = S::id();
+        if schema_value != expected_schema {
+            panic!(
+                "value schema mismatch for field {field}: got {:?} expected {:?}",
+                schema_value, expected_schema
+            );
+        }
     }
 
     #[test]
@@ -1006,8 +1014,7 @@ mod tests {
         let author_attr = Attribute::<GenId>::from_name("author").id();
         let mut child_ids = Vec::new();
         for trible in &data {
-            assert_eq!(*trible.e(), root);
-            if *trible.a() == author_attr {
+            if *trible.e() == root && *trible.a() == author_attr {
                 let child = trible.v::<GenId>().from_value::<ExclusiveId>();
                 child_ids.push(child);
             }
@@ -1021,18 +1028,19 @@ mod tests {
         let mut seen_first = false;
         let mut seen_last = false;
         for trible in &data {
-            if *trible.e() == child_id.id {
-                if *trible.a() == first_attr {
-                    let value = trible.v::<Handle<Blake3, LongString>>();
-                    let expected = ToBlob::<LongString>::to_blob("Frank").get_handle::<Blake3>();
-                    assert_eq!(value.raw, expected.raw);
-                    seen_first = true;
-                } else if *trible.a() == last_attr {
-                    let value = trible.v::<Handle<Blake3, LongString>>();
-                    let expected = ToBlob::<LongString>::to_blob("Herbert").get_handle::<Blake3>();
-                    assert_eq!(value.raw, expected.raw);
-                    seen_last = true;
-                }
+            if *trible.e() != child_id.id {
+                continue;
+            }
+            if *trible.a() == first_attr {
+                let value = trible.v::<Handle<Blake3, LongString>>();
+                let expected = ToBlob::<LongString>::to_blob("Frank").get_handle::<Blake3>();
+                assert_eq!(value.raw, expected.raw);
+                seen_first = true;
+            } else if *trible.a() == last_attr {
+                let value = trible.v::<Handle<Blake3, LongString>>();
+                let expected = ToBlob::<LongString>::to_blob("Herbert").get_handle::<Blake3>();
+                assert_eq!(value.raw, expected.raw);
+                seen_last = true;
             }
         }
 

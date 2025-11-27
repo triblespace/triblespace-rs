@@ -43,7 +43,9 @@ mod literature {
         "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
 
         /// A quote from a work.
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<Blake3, LongString>;
+        // For quick prototypes you can omit the id and let the macro derive it
+        // from the name and schema:
+        pub quote: Handle<Blake3, LongString>;
 
         /// The author of a work.
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;

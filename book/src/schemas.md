@@ -87,6 +87,10 @@ Identifiers also make it possible to derive deterministic attribute IDs when you
 ingest external formats. Helpers such as `Attribute::<S>::from_name("field")`
 combine the schema ID with the source field name to create a stable attribute so
 re-importing the same data always targets the same column.
+The `attributes!` macro can use the same derivation when you omit the 128-bit id
+literal, which is useful for quick experiments or internal attributes; for
+schema that will be shared across binaries or languages prefer explicit ids so
+the column remains stable even if the attribute name later changes.
 
 ## Built‑in value schemas
 

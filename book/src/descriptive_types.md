@@ -19,6 +19,10 @@ Reading the chapter sequentially should equip you to:
 
 - Attributes are typed fields (unlike untyped RDF predicates).
 - An entity in tribles is a structural record: a bag of typed fields.
+- `attributes!` accepts explicit ids for shared columns and can derive
+  deterministic ids from a name + schema when you omit the hex literal; use the
+  derived form for quick, local attributes and reserve explicit ids for
+  published protocols.
 - find! patterns are descriptive type checks / projections: they select
   entities that match a requested shape.
 - entity! constructs ad‑hoc entities (like struct literals).

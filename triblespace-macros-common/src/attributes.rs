@@ -9,10 +9,15 @@ use syn::Token;
 use syn::Type;
 use syn::Visibility;
 
+enum AttributeId {
+    Hex(LitStr),
+    Derived,
+}
+
 struct AttributesDef {
     attrs: Vec<Attribute>,
     vis: Option<Visibility>,
-    id: LitStr,
+    id: AttributeId,
     name: Ident,
     ty: Type,
 }
@@ -27,32 +32,43 @@ impl Parse for AttributesInput {
         let mut attributes = Vec::new();
         while !content.is_empty() {
             let attrs = content.call(Attribute::parse_outer)?;
-            if content.peek(Token![pub]) {
-                let v: Visibility = content.parse()?;
-                return Err(syn::Error::new_spanned(
-                    v,
-                    "visibility must appear after `as` and before the attribute name (e.g. `\"...\" as pub name: Type;`)",
-                ));
-            }
-
-            let id: LitStr = content.parse()?;
-            content.parse::<Token![as]>()?;
-            let vis: Option<Visibility> = if content.peek(Token![pub]) {
-                Some(content.parse()?)
+            if content.peek(LitStr) {
+                let id_lit: LitStr = content.parse()?;
+                content.parse::<Token![as]>()?;
+                let vis: Option<Visibility> = if content.peek(Token![pub]) {
+                    Some(content.parse()?)
+                } else {
+                    None
+                };
+                let name: Ident = content.parse()?;
+                content.parse::<Token![:]>()?;
+                let ty: Type = content.parse()?;
+                content.parse::<Token![;]>()?;
+                attributes.push(AttributesDef {
+                    attrs,
+                    vis,
+                    id: AttributeId::Hex(id_lit),
+                    name,
+                    ty,
+                });
             } else {
-                None
-            };
-            let name: Ident = content.parse()?;
-            content.parse::<Token![:]>()?;
-            let ty: Type = content.parse()?;
-            content.parse::<Token![;]>()?;
-            attributes.push(AttributesDef {
-                attrs,
-                vis,
-                id,
-                name,
-                ty,
-            });
+                let vis: Option<Visibility> = if content.peek(Token![pub]) {
+                    Some(content.parse()?)
+                } else {
+                    None
+                };
+                let name: Ident = content.parse()?;
+                content.parse::<Token![:]>()?;
+                let ty: Type = content.parse()?;
+                content.parse::<Token![;]>()?;
+                attributes.push(AttributesDef {
+                    attrs,
+                    vis,
+                    id: AttributeId::Derived,
+                    name,
+                    ty,
+                });
+            }
         }
         Ok(AttributesInput { attributes })
     }
@@ -74,15 +90,33 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             Some(v) => quote! { #v },
             None => quote! { pub },
         };
-        out.extend(quote! {
-            #(#attrs)*
-            #[allow(non_upper_case_globals)]
-            #vis_ts const #name: #base_path::attribute::Attribute<#ty> = #base_path::attribute::Attribute::from_id_with_name(
-                #base_path::id::_hex_literal_hex!(#id),
-                stringify!(#name),
-            );
-        });
+        match id {
+            AttributeId::Hex(lit) => {
+                out.extend(quote! {
+                    #(#attrs)*
+                    #[allow(non_upper_case_globals)]
+                    #vis_ts const #name: #base_path::attribute::Attribute<#ty> = #base_path::attribute::Attribute::from_id_with_name(
+                        #base_path::id::_hex_literal_hex!(#lit),
+                        stringify!(#name),
+                    );
+                });
+            }
+            AttributeId::Derived => {
+                out.extend(quote! {
+                    #(#attrs)*
+                    #[allow(non_upper_case_globals)]
+                    #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
+                        ::std::sync::LazyLock::new(|| #base_path::attribute::Attribute::from_name(stringify!(#name)));
+                });
+            }
+        }
     }
 
     Ok(out)
+}
+
+impl From<LitStr> for AttributeId {
+    fn from(lit: LitStr) -> Self {
+        AttributeId::Hex(lit)
+    }
 }
