@@ -136,7 +136,7 @@ where
             tribles += entity! { &entity @ metadata::name: name };
         }
 
-        tribles += entity! { &entity @ metadata::attr_value_schema: GenId::value_from(S::id()) };
+        tribles += entity! { &entity @ metadata::value_schema: GenId::value_from(S::id()) };
 
         (tribles, blobs)
     }

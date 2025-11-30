@@ -12,6 +12,7 @@ compile_error!("triblespace-rs requires a 64-bit little-endian target");
 
 pub mod attribute;
 pub mod blob;
+pub mod export;
 pub mod id;
 pub mod import;
 pub mod metadata;

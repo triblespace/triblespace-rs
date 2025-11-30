@@ -231,6 +231,12 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         tribles += hash_tribles;
         tribles += blob_tribles;
 
+        let entity = ExclusiveId::force(Self::id());
+        tribles += entity! { &entity @
+            metadata::blob_schema: T::id(),
+            metadata::hash_schema: H::id(),
+        };
+
         let hash_blobs_iter = hash_blobs
             .reader()
             .expect("hash protocol metadata reader should be infallible")

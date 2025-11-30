@@ -9,8 +9,7 @@ attributes! {
 
 #[test]
 fn attributes_macro_accepts_hex_and_derived_ids() {
-    let expected_fixed =
-        Id::from_hex("11111111111111111111111111111111").expect("valid hex id");
+    let expected_fixed = Id::from_hex("11111111111111111111111111111111").expect("valid hex id");
     assert_eq!(fixed.id(), expected_fixed);
 
     let expected_derived = Attribute::<ShortString>::from_name("derived");

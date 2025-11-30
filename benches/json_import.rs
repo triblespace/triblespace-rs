@@ -1,12 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::path::PathBuf;
-use triblespace::core::blob::ToBlob;
-use triblespace::core::id::ExclusiveId;
-use triblespace::core::import::json::{DeterministicJsonImporter, EncodeError, JsonImporter};
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, Boolean, Handle, F256};
-use triblespace::prelude::*;
+use triblespace::core::import::json::fixed_json_importer;
 
 struct Fixture {
     name: &'static str,
@@ -15,8 +10,7 @@ struct Fixture {
 
 struct PreparedFixture {
     fixture: Fixture,
-    nondeterministic_count: usize,
-    deterministic_count: usize,
+    element_count: usize,
 }
 
 fn load_fixtures() -> Vec<Fixture> {
@@ -45,58 +39,18 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .map(|fixture| {
             let payload = fixture.payload.as_str();
 
-            let mut nondeterministic = make_importer();
-            nondeterministic
+            let mut importer = fixed_json_importer();
+            importer
                 .import_str(payload)
-                .expect("import JSON to determine nondeterministic element count");
-            let nondeterministic_count = nondeterministic.data().len();
-
-            let mut deterministic = make_deterministic_importer();
-            deterministic
-                .import_str(payload)
-                .expect("import JSON to determine deterministic element count");
-            let deterministic_count = deterministic.data().len();
+                .expect("import JSON to determine element count");
+            let element_count = importer.data().len();
 
             PreparedFixture {
                 fixture,
-                nondeterministic_count,
-                deterministic_count,
+                element_count,
             }
         })
         .collect()
-}
-
-fn make_importer() -> JsonImporter<
-    'static,
-    Handle<Blake3, LongString>,
-    F256,
-    Boolean,
-    impl FnMut(&str) -> Result<Value<Handle<Blake3, LongString>>, EncodeError>,
-    impl FnMut(&serde_json::Number) -> Result<Value<F256>, EncodeError>,
-    impl FnMut(bool) -> Result<Value<Boolean>, EncodeError>,
-    fn() -> ExclusiveId,
-> {
-    JsonImporter::new(
-        |text: &str| Ok(ToBlob::<LongString>::to_blob(text.to_owned()).get_handle::<Blake3>()),
-        |number: &serde_json::Number| number.try_to_value().map_err(EncodeError::from_error),
-        |flag: bool| Ok(flag.to_value()),
-    )
-}
-
-fn make_deterministic_importer() -> DeterministicJsonImporter<
-    'static,
-    Handle<Blake3, LongString>,
-    F256,
-    Boolean,
-    impl FnMut(&str) -> Result<Value<Handle<Blake3, LongString>>, EncodeError>,
-    impl FnMut(&serde_json::Number) -> Result<Value<F256>, EncodeError>,
-    impl FnMut(bool) -> Result<Value<Boolean>, EncodeError>,
-> {
-    DeterministicJsonImporter::new(
-        |text: &str| Ok(ToBlob::<LongString>::to_blob(text.to_owned()).get_handle::<Blake3>()),
-        |number: &serde_json::Number| number.try_to_value().map_err(EncodeError::from_error),
-        |flag: bool| Ok(flag.to_value()),
-    )
 }
 
 fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
@@ -105,28 +59,14 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
     for prepared in fixtures {
         let fixture = &prepared.fixture;
 
-        group.throughput(Throughput::Elements(prepared.nondeterministic_count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("nondeterministic", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.as_str();
-                b.iter(|| {
-                    let mut importer = make_importer();
-                    importer.import_str(payload).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-
-        group.throughput(Throughput::Elements(prepared.deterministic_count as u64));
+        group.throughput(Throughput::Elements(prepared.element_count as u64));
         group.bench_with_input(
             BenchmarkId::new("deterministic", fixture.name),
             fixture,
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = make_deterministic_importer();
+                    let mut importer = fixed_json_importer();
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
@@ -146,26 +86,12 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
 
         group.throughput(Throughput::Bytes(bytes));
         group.bench_with_input(
-            BenchmarkId::new("nondeterministic", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.as_str();
-                b.iter(|| {
-                    let mut importer = make_importer();
-                    importer.import_str(payload).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-
-        group.throughput(Throughput::Bytes(bytes));
-        group.bench_with_input(
             BenchmarkId::new("deterministic", fixture.name),
             fixture,
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = make_deterministic_importer();
+                    let mut importer = fixed_json_importer();
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

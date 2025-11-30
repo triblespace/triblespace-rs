@@ -5,38 +5,35 @@ use std::marker::PhantomData;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::attribute::Attribute;
-use crate::id::ufoid;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
+use crate::metadata;
 use crate::metadata::Metadata;
+use crate::prelude::blobschemas::LongString;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
+use crate::value::schemas::boolean::Boolean;
+use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::HashProtocol;
+use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
 use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::{ToValue, TryToValue, Value, ValueSchema};
+use crate::blob::ToBlob;
 
 fn emit_attribute_metadata<S: ValueSchema>(attribute: &Attribute<S>, cache: &mut TribleSet) {
     let (metadata, _) = attribute.describe();
     cache.union(metadata);
 }
 
-/// Error raised while converting JSON documents into tribles.
 #[derive(Debug)]
 pub enum JsonImportError {
-    /// Top-level document was a JSON primitive instead of an object.
     PrimitiveRoot,
-    /// Failed to parse JSON text before conversion.
     Parse(serde_json::Error),
-    /// Failed to encode a string field into the configured schema.
     EncodeString { field: String, source: EncodeError },
-    /// Failed to encode a numeric field into the configured schema.
     EncodeNumber { field: String, source: EncodeError },
-    /// Failed to encode a boolean field into the configured schema.
     EncodeBool { field: String, source: EncodeError },
 }
 
@@ -70,12 +67,10 @@ impl std::error::Error for JsonImportError {
     }
 }
 
-/// Error returned by user supplied encoders when converting JSON primitives.
 #[derive(Debug)]
 pub struct EncodeError(Box<dyn std::error::Error + Send + Sync + 'static>);
 
 impl EncodeError {
-    /// Creates a simple error message for encoder failures.
     pub fn message(message: impl Into<String>) -> Self {
         #[derive(Debug)]
         struct Message(String);
@@ -95,7 +90,6 @@ impl EncodeError {
         self.0.as_ref()
     }
 
-    /// Wraps an existing error inside an [`EncodeError`].
     pub fn from_error(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self(Box::new(err))
     }
@@ -113,475 +107,41 @@ impl std::error::Error for EncodeError {
     }
 }
 
-/// Imports JSON objects into [`TribleSet`]s using configurable schema mappings.
-///
-/// The importer creates a fresh [`ExclusiveId`] for each JSON object and derives
-/// attribute identifiers by hashing the field name together with the chosen
-/// [`ValueSchema`]. Arrays are treated as multi-valued fields: every element is
-/// converted independently while retaining the same attribute id.
-///
-/// String, number, and boolean primitives are converted through user supplied
-/// encoder closures. Those closures can perform additional validation, look up
-/// existing blobs, or allocate new ones in a repository before returning the
-/// [`Value`] to store. Because the encoders receive the raw JSON values they
-/// can stage blobs in whatever [`BlobStore`](crate::repo::BlobStore) backend the
-/// caller chooses before handing back the corresponding handles. Nested objects
-/// recurse automatically and are linked to their parent entity via a `GenId`
-/// attribute derived from the field name. Callers can also supply their own id
-/// generator through [`JsonImporter::with_id_generator`] when they need
-/// deterministic or structured identifiers.
-///
-/// Each time the importer derives a new attribute id it caches the raw
-/// identifier. After conversion completes it emits metadata describing the
-/// field name and value schema so downstream queries can recover the attribute
-/// definition.
-pub struct JsonImporter<
-    'enc,
-    StringSchema,
-    NumberSchema,
-    BoolSchema,
-    StringEncoder,
-    NumberEncoder,
-    BoolEncoder,
-    IdGenerator,
-> where
-    StringSchema: ValueSchema,
-    NumberSchema: ValueSchema,
-    BoolSchema: ValueSchema,
-    StringEncoder: FnMut(&str) -> Result<Value<StringSchema>, EncodeError> + 'enc,
-    NumberEncoder: FnMut(&serde_json::Number) -> Result<Value<NumberSchema>, EncodeError> + 'enc,
-    BoolEncoder: FnMut(bool) -> Result<Value<BoolSchema>, EncodeError> + 'enc,
-    IdGenerator: FnMut() -> ExclusiveId,
-{
-    string_encoder: StringEncoder,
-    number_encoder: NumberEncoder,
-    bool_encoder: BoolEncoder,
-    id_generator: IdGenerator,
-    data: TribleSet,
-    string_attributes: HashMap<String, Attribute<StringSchema>>,
-    number_attributes: HashMap<String, Attribute<NumberSchema>>,
-    bool_attributes: HashMap<String, Attribute<BoolSchema>>,
-    genid_attributes: HashMap<String, Attribute<GenId>>,
-    _schemas: PhantomData<(StringSchema, NumberSchema, BoolSchema)>,
-    _lifetime: PhantomData<&'enc ()>,
-}
-
-impl<
-        'enc,
-        StringSchema,
-        NumberSchema,
-        BoolSchema,
-        StringEncoder,
-        NumberEncoder,
-        BoolEncoder,
-        IdGenerator,
-    >
-    JsonImporter<
-        'enc,
-        StringSchema,
-        NumberSchema,
-        BoolSchema,
-        StringEncoder,
-        NumberEncoder,
-        BoolEncoder,
-        IdGenerator,
-    >
+pub struct JsonImporter<Hasher = Blake3>
 where
-    StringSchema: ValueSchema,
-    NumberSchema: ValueSchema,
-    BoolSchema: ValueSchema,
-    StringEncoder: FnMut(&str) -> Result<Value<StringSchema>, EncodeError> + 'enc,
-    NumberEncoder: FnMut(&serde_json::Number) -> Result<Value<NumberSchema>, EncodeError> + 'enc,
-    BoolEncoder: FnMut(bool) -> Result<Value<BoolSchema>, EncodeError> + 'enc,
-    IdGenerator: FnMut() -> ExclusiveId,
-{
-    /// Creates a new importer using the supplied primitive encoders and id generator.
-    pub fn with_id_generator(
-        string_encoder: StringEncoder,
-        number_encoder: NumberEncoder,
-        bool_encoder: BoolEncoder,
-        id_generator: IdGenerator,
-    ) -> Self {
-        Self {
-            string_encoder,
-            number_encoder,
-            bool_encoder,
-            id_generator,
-            data: TribleSet::new(),
-            string_attributes: HashMap::new(),
-            number_attributes: HashMap::new(),
-            bool_attributes: HashMap::new(),
-            genid_attributes: HashMap::new(),
-            _schemas: PhantomData,
-            _lifetime: PhantomData,
-        }
-    }
-
-    fn next_id(&mut self) -> ExclusiveId {
-        (self.id_generator)()
-    }
-
-    fn string_attribute(&mut self, field: &str) -> Attribute<StringSchema> {
-        if let Some(attribute) = self.string_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<StringSchema>::from_name(field);
-            self.string_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn number_attribute(&mut self, field: &str) -> Attribute<NumberSchema> {
-        if let Some(attribute) = self.number_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<NumberSchema>::from_name(field);
-            self.number_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn bool_attribute(&mut self, field: &str) -> Attribute<BoolSchema> {
-        if let Some(attribute) = self.bool_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<BoolSchema>::from_name(field);
-            self.bool_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn genid_attribute(&mut self, field: &str) -> Attribute<GenId> {
-        if let Some(attribute) = self.genid_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<GenId>::from_name(field);
-            self.genid_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    /// Parses JSON text and imports it into a [`TribleSet`].
-    pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
-        let value = serde_json::from_str::<JsonValue>(input).map_err(JsonImportError::Parse)?;
-        self.import_value(&value)
-    }
-
-    /// Imports a previously parsed JSON [`Value`].
-    ///
-    /// Root documents can either be objects, which yield a single entity, or
-    /// arrays of objects, which return one entity per element. Primitive roots
-    /// are rejected. Returns the identifiers of every imported root entity in
-    /// the order they were encountered.
-    pub fn import_value(&mut self, value: &JsonValue) -> Result<Vec<Id>, JsonImportError> {
-        let mut staged = TribleSet::new();
-        let mut roots = Vec::new();
-
-        match value {
-            JsonValue::Object(object) => {
-                let root = self.next_id();
-                let root = self.stage_object(root, object, &mut staged)?;
-                roots.push(root.forget());
-            }
-            JsonValue::Array(elements) => {
-                for element in elements {
-                    let JsonValue::Object(object) = element else {
-                        return Err(JsonImportError::PrimitiveRoot);
-                    };
-                    let root = self.next_id();
-                    let root = self.stage_object(root, object, &mut staged)?;
-                    roots.push(root.forget());
-                }
-            }
-            _ => return Err(JsonImportError::PrimitiveRoot),
-        }
-
-        self.data.union(staged);
-        Ok(roots)
-    }
-
-    /// Returns the accumulated data tribles imported so far.
-    pub fn data(&self) -> &TribleSet {
-        &self.data
-    }
-
-    /// Returns metadata describing every derived attribute.
-    pub fn metadata(&self) -> TribleSet {
-        self.cached_metadata()
-    }
-
-    /// Clears the accumulated data tribles while retaining cached attributes.
-    pub fn clear_data(&mut self) {
-        self.data = TribleSet::new();
-    }
-
-    /// Clears the accumulated data tribles and resets all cached attributes.
-    pub fn clear(&mut self) {
-        self.clear_data();
-        self.string_attributes.clear();
-        self.number_attributes.clear();
-        self.bool_attributes.clear();
-        self.genid_attributes.clear();
-    }
-
-    fn cached_metadata(&self) -> TribleSet {
-        let mut metadata = TribleSet::new();
-
-        for attribute in self.string_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
-        }
-
-        for attribute in self.number_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
-        }
-
-        for attribute in self.bool_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
-        }
-
-        for attribute in self.genid_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
-        }
-
-        metadata
-    }
-
-    fn stage_object(
-        &mut self,
-        entity: ExclusiveId,
-        object: &Map<String, JsonValue>,
-        staged: &mut TribleSet,
-    ) -> Result<ExclusiveId, JsonImportError> {
-        for (field, value) in object {
-            self.stage_field(&entity, field, value, staged)?;
-        }
-
-        Ok(entity)
-    }
-
-    fn stage_field(
-        &mut self,
-        entity: &ExclusiveId,
-        field: &str,
-        value: &JsonValue,
-        staged: &mut TribleSet,
-    ) -> Result<(), JsonImportError> {
-        match value {
-            JsonValue::Null => Ok(()),
-            JsonValue::Bool(flag) => {
-                let attr = self.bool_attribute(field);
-                let attr_id = attr.id();
-                let encoded =
-                    (self.bool_encoder)(*flag).map_err(|err| JsonImportError::EncodeBool {
-                        field: field.to_owned(),
-                        source: err,
-                    })?;
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
-                Ok(())
-            }
-            JsonValue::Number(number) => {
-                let attr = self.number_attribute(field);
-                let attr_id = attr.id();
-                let encoded =
-                    (self.number_encoder)(number).map_err(|err| JsonImportError::EncodeNumber {
-                        field: field.to_owned(),
-                        source: err,
-                    })?;
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
-                Ok(())
-            }
-            JsonValue::String(text) => {
-                let attr = self.string_attribute(field);
-                let attr_id = attr.id();
-                let encoded =
-                    (self.string_encoder)(text).map_err(|err| JsonImportError::EncodeString {
-                        field: field.to_owned(),
-                        source: err,
-                    })?;
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
-                Ok(())
-            }
-            JsonValue::Array(elements) => {
-                for element in elements {
-                    self.stage_field(entity, field, element, staged)?;
-                }
-                Ok(())
-            }
-            JsonValue::Object(object) => {
-                let child_id = self.next_id();
-                let value = GenId::value_from(&child_id);
-                let _ = self.stage_object(child_id, object, staged)?;
-                let attr = self.genid_attribute(field);
-                let attr_id = attr.id();
-                staged.insert(&Trible::new(entity, &attr_id, &value));
-                Ok(())
-            }
-        }
-    }
-}
-
-impl<'enc, StringSchema, NumberSchema, BoolSchema, StringEncoder, NumberEncoder, BoolEncoder>
-    JsonImporter<
-        'enc,
-        StringSchema,
-        NumberSchema,
-        BoolSchema,
-        StringEncoder,
-        NumberEncoder,
-        BoolEncoder,
-        fn() -> ExclusiveId,
-    >
-where
-    StringSchema: ValueSchema,
-    NumberSchema: ValueSchema,
-    BoolSchema: ValueSchema,
-    StringEncoder: FnMut(&str) -> Result<Value<StringSchema>, EncodeError> + 'enc,
-    NumberEncoder: FnMut(&serde_json::Number) -> Result<Value<NumberSchema>, EncodeError> + 'enc,
-    BoolEncoder: FnMut(bool) -> Result<Value<BoolSchema>, EncodeError> + 'enc,
-{
-    /// Creates a new importer using the supplied primitive encoders.
-    pub fn new(
-        string_encoder: StringEncoder,
-        number_encoder: NumberEncoder,
-        bool_encoder: BoolEncoder,
-    ) -> Self {
-        Self {
-            string_encoder,
-            number_encoder,
-            bool_encoder,
-            id_generator: ufoid,
-            data: TribleSet::new(),
-            string_attributes: HashMap::new(),
-            number_attributes: HashMap::new(),
-            bool_attributes: HashMap::new(),
-            genid_attributes: HashMap::new(),
-            _schemas: PhantomData,
-            _lifetime: PhantomData,
-        }
-    }
-}
-
-/// Deterministic variant of [`JsonImporter`] that derives entity identifiers
-/// from the attribute/value pairs of each object.
-///
-/// Collected pairs are hashed using the configurable [`HashProtocol`] and the
-/// first 16 bytes of the digest become the entity id. Arrays behave as
-/// multi-valued fields and nested objects recurse while contributing their
-/// deterministically generated ids to the parent hash via `GenId` values.
-/// Attribute identifiers are cached like the non-deterministic importer and the
-/// cached entries are converted into metadata describing the field name and
-/// schema after each run.
-pub struct DeterministicJsonImporter<
-    'enc,
-    StringSchema,
-    NumberSchema,
-    BoolSchema,
-    StringEncoder,
-    NumberEncoder,
-    BoolEncoder,
-    Hasher = crate::value::schemas::hash::Blake3,
-> where
-    StringSchema: ValueSchema,
-    NumberSchema: ValueSchema,
-    BoolSchema: ValueSchema,
-    StringEncoder: FnMut(&str) -> Result<Value<StringSchema>, EncodeError> + 'enc,
-    NumberEncoder: FnMut(&serde_json::Number) -> Result<Value<NumberSchema>, EncodeError> + 'enc,
-    BoolEncoder: FnMut(bool) -> Result<Value<BoolSchema>, EncodeError> + 'enc,
     Hasher: HashProtocol,
 {
-    string_encoder: StringEncoder,
-    number_encoder: NumberEncoder,
-    bool_encoder: BoolEncoder,
-    data: TribleSet,
-    string_attributes: HashMap<String, Attribute<StringSchema>>,
-    number_attributes: HashMap<String, Attribute<NumberSchema>>,
-    bool_attributes: HashMap<String, Attribute<BoolSchema>>,
+    string_attributes: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
+    number_attributes: HashMap<String, Attribute<F256>>,
+    bool_attributes: HashMap<String, Attribute<Boolean>>,
     genid_attributes: HashMap<String, Attribute<GenId>>,
+    data: TribleSet,
     id_salt: Option<[u8; 32]>,
-    _schemas: PhantomData<(StringSchema, NumberSchema, BoolSchema)>,
     _hasher: PhantomData<Hasher>,
-    _lifetime: PhantomData<&'enc ()>,
 }
 
-impl<
-        'enc,
-        StringSchema,
-        NumberSchema,
-        BoolSchema,
-        StringEncoder,
-        NumberEncoder,
-        BoolEncoder,
-        Hasher,
-    >
-    DeterministicJsonImporter<
-        'enc,
-        StringSchema,
-        NumberSchema,
-        BoolSchema,
-        StringEncoder,
-        NumberEncoder,
-        BoolEncoder,
-        Hasher,
-    >
-where
-    StringSchema: ValueSchema,
-    NumberSchema: ValueSchema,
-    BoolSchema: ValueSchema,
-    StringEncoder: FnMut(&str) -> Result<Value<StringSchema>, EncodeError> + 'enc,
-    NumberEncoder: FnMut(&serde_json::Number) -> Result<Value<NumberSchema>, EncodeError> + 'enc,
-    BoolEncoder: FnMut(bool) -> Result<Value<BoolSchema>, EncodeError> + 'enc,
-    Hasher: HashProtocol,
-{
-    /// Creates a new deterministic importer using the supplied primitive encoders.
-    pub fn new(
-        string_encoder: StringEncoder,
-        number_encoder: NumberEncoder,
-        bool_encoder: BoolEncoder,
-    ) -> Self {
-        Self::new_with_salt(string_encoder, number_encoder, bool_encoder, None)
+impl<Hasher: HashProtocol> JsonImporter<Hasher> {
+    pub fn new() -> Self {
+        Self::new_with_salt(None)
     }
 
-    /// Creates a new deterministic importer using the supplied primitive
-    /// encoders and an explicit optional 32-byte salt mixed into every derived
-    /// entity ID.
-    pub fn new_with_salt(
-        string_encoder: StringEncoder,
-        number_encoder: NumberEncoder,
-        bool_encoder: BoolEncoder,
-        salt: Option<[u8; 32]>,
-    ) -> Self {
+    pub fn new_with_salt(salt: Option<[u8; 32]>) -> Self {
         Self {
-            string_encoder,
-            number_encoder,
-            bool_encoder,
-            data: TribleSet::new(),
             string_attributes: HashMap::new(),
             number_attributes: HashMap::new(),
             bool_attributes: HashMap::new(),
             genid_attributes: HashMap::new(),
+            data: TribleSet::new(),
             id_salt: salt,
-            _schemas: PhantomData,
             _hasher: PhantomData,
-            _lifetime: PhantomData,
         }
     }
 
-    /// Parses JSON text and imports it deterministically into a [`TribleSet`].
     pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
         let value = serde_json::from_str::<JsonValue>(input).map_err(JsonImportError::Parse)?;
         self.import_value(&value)
     }
 
-    /// Imports a previously parsed JSON [`Value`].
-    ///
-    /// Root documents can either be objects, which yield a single entity, or
-    /// arrays of objects, which return one entity per element. Primitive roots
-    /// are rejected. Returns the identifiers of every imported root entity in
-    /// the order they were encountered.
     pub fn import_value(&mut self, value: &JsonValue) -> Result<Vec<Id>, JsonImportError> {
         let mut staged = TribleSet::new();
         let mut roots = Vec::new();
@@ -607,22 +167,18 @@ where
         Ok(roots)
     }
 
-    /// Returns the accumulated data tribles imported so far.
     pub fn data(&self) -> &TribleSet {
         &self.data
     }
 
-    /// Returns metadata describing every derived attribute.
     pub fn metadata(&self) -> TribleSet {
         self.cached_metadata()
     }
 
-    /// Clears the accumulated data tribles while retaining cached attributes.
     pub fn clear_data(&mut self) {
         self.data = TribleSet::new();
     }
 
-    /// Clears the accumulated data tribles and resets all cached attributes.
     pub fn clear(&mut self) {
         self.clear_data();
         self.string_attributes.clear();
@@ -631,33 +187,33 @@ where
         self.genid_attributes.clear();
     }
 
-    fn string_attribute(&mut self, field: &str) -> Attribute<StringSchema> {
+    fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
         if let Some(attribute) = self.string_attributes.get(field) {
             attribute.clone()
         } else {
-            let attribute = Attribute::<StringSchema>::from_name(field);
+            let attribute = Attribute::<Handle<Blake3, LongString>>::from_name(field);
             self.string_attributes
                 .insert(field.to_owned(), attribute.clone());
             attribute
         }
     }
 
-    fn number_attribute(&mut self, field: &str) -> Attribute<NumberSchema> {
+    fn number_attribute(&mut self, field: &str) -> Attribute<F256> {
         if let Some(attribute) = self.number_attributes.get(field) {
             attribute.clone()
         } else {
-            let attribute = Attribute::<NumberSchema>::from_name(field);
+            let attribute = Attribute::<F256>::from_name(field);
             self.number_attributes
                 .insert(field.to_owned(), attribute.clone());
             attribute
         }
     }
 
-    fn bool_attribute(&mut self, field: &str) -> Attribute<BoolSchema> {
+    fn bool_attribute(&mut self, field: &str) -> Attribute<Boolean> {
         if let Some(attribute) = self.bool_attributes.get(field) {
             attribute.clone()
         } else {
-            let attribute = Attribute::<BoolSchema>::from_name(field);
+            let attribute = Attribute::<Boolean>::from_name(field);
             self.bool_attributes
                 .insert(field.to_owned(), attribute.clone());
             attribute
@@ -677,21 +233,50 @@ where
 
     fn cached_metadata(&self) -> TribleSet {
         let mut metadata = TribleSet::new();
+        let cardinality_hints = metadata::cardinality_hints_for(&self.data);
 
         for attribute in self.string_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
+            let attr_id = attribute.id();
+            let attr_raw: RawId = attr_id.into();
+            metadata::emit_cardinality_metadata(
+                attr_id,
+                cardinality_hints.get(&attr_raw),
+                &mut metadata,
+            );
         }
 
         for attribute in self.number_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
+            let attr_id = attribute.id();
+            let attr_raw: RawId = attr_id.into();
+            metadata::emit_cardinality_metadata(
+                attr_id,
+                cardinality_hints.get(&attr_raw),
+                &mut metadata,
+            );
         }
 
         for attribute in self.bool_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
+            let attr_id = attribute.id();
+            let attr_raw: RawId = attr_id.into();
+            metadata::emit_cardinality_metadata(
+                attr_id,
+                cardinality_hints.get(&attr_raw),
+                &mut metadata,
+            );
         }
 
         for attribute in self.genid_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
+            let attr_id = attribute.id();
+            let attr_raw: RawId = attr_id.into();
+            metadata::emit_cardinality_metadata(
+                attr_id,
+                cardinality_hints.get(&attr_raw),
+                &mut metadata,
+            );
         }
 
         metadata
@@ -732,7 +317,7 @@ where
             JsonValue::Bool(flag) => {
                 let attr = self.bool_attribute(field);
                 let encoded =
-                    (self.bool_encoder)(*flag).map_err(|err| JsonImportError::EncodeBool {
+                    encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
                         field: field.to_owned(),
                         source: err,
                     })?;
@@ -742,7 +327,7 @@ where
             JsonValue::Number(number) => {
                 let attr = self.number_attribute(field);
                 let encoded =
-                    (self.number_encoder)(number).map_err(|err| JsonImportError::EncodeNumber {
+                    encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
                         source: err,
                     })?;
@@ -752,7 +337,7 @@ where
             JsonValue::String(text) => {
                 let attr = self.string_attribute(field);
                 let encoded =
-                    (self.string_encoder)(text).map_err(|err| JsonImportError::EncodeString {
+                    encode_string_to_longstring(text).map_err(|err| JsonImportError::EncodeString {
                         field: field.to_owned(),
                         source: err,
                     })?;
@@ -799,107 +384,51 @@ where
     }
 }
 
+pub type FixedJsonImporter = JsonImporter<Blake3>;
+
+pub fn fixed_json_importer() -> FixedJsonImporter {
+    JsonImporter::new()
+}
+
+pub fn fixed_json_importer_with_salt(salt: Option<[u8; 32]>) -> FixedJsonImporter {
+    JsonImporter::new_with_salt(salt)
+}
+
+fn encode_string_to_longstring(
+    text: &str,
+) -> Result<Value<Handle<Blake3, LongString>>, EncodeError> {
+    Ok(ToBlob::<LongString>::to_blob(text.to_owned()).get_handle::<Blake3>())
+}
+
+fn encode_number_to_f256(number: &serde_json::Number) -> Result<Value<F256>, EncodeError> {
+    number.try_to_value().map_err(EncodeError::from_error)
+}
+
+fn encode_bool_to_boolean(flag: bool) -> Result<Value<Boolean>, EncodeError> {
+    Ok(flag.to_value())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::blob::schemas::longstring::LongString;
-    use crate::blob::MemoryBlobStore;
-    use crate::blob::ToBlob;
-    use crate::id::fucid;
-    use crate::id::Id;
     use crate::metadata;
-    use crate::repo::BlobStore;
-    use crate::value::schemas::boolean::Boolean;
-    use crate::value::schemas::f256::F256;
-    use crate::value::schemas::hash::{Blake3, Handle};
     use crate::value::schemas::shortstring::ShortString;
-    use crate::value::ToValue;
-    use crate::value::TryToValue;
     use crate::value::ValueSchema;
-    use anybytes::View;
     use f256::f256;
 
-    fn make_importer() -> JsonImporter<
-        'static,
-        Handle<Blake3, LongString>,
-        F256,
-        Boolean,
-        impl FnMut(&str) -> Result<Value<Handle<Blake3, LongString>>, EncodeError>,
-        impl FnMut(&serde_json::Number) -> Result<Value<F256>, EncodeError>,
-        impl FnMut(bool) -> Result<Value<Boolean>, EncodeError>,
-        fn() -> ExclusiveId,
-    > {
-        JsonImporter::new(
-            |text: &str| Ok(ToBlob::<LongString>::to_blob(text.to_string()).get_handle::<Blake3>()),
-            |number: &serde_json::Number| number.try_to_value().map_err(EncodeError::from_error),
-            |flag: bool| Ok(flag.to_value()),
-        )
+    fn make_importer() -> JsonImporter {
+        JsonImporter::new()
     }
 
-    fn make_deterministic_importer() -> DeterministicJsonImporter<
-        'static,
-        Handle<Blake3, LongString>,
-        F256,
-        Boolean,
-        impl FnMut(&str) -> Result<Value<Handle<Blake3, LongString>>, EncodeError>,
-        impl FnMut(&serde_json::Number) -> Result<Value<F256>, EncodeError>,
-        impl FnMut(bool) -> Result<Value<Boolean>, EncodeError>,
-    > {
-        make_deterministic_importer_with_salt(None)
+    fn make_importer_with_salt(salt: Option<[u8; 32]>) -> JsonImporter {
+        JsonImporter::new_with_salt(salt)
     }
 
-    fn make_deterministic_importer_with_salt(
-        salt: Option<[u8; 32]>,
-    ) -> DeterministicJsonImporter<
-        'static,
-        Handle<Blake3, LongString>,
-        F256,
-        Boolean,
-        impl FnMut(&str) -> Result<Value<Handle<Blake3, LongString>>, EncodeError>,
-        impl FnMut(&serde_json::Number) -> Result<Value<F256>, EncodeError>,
-        impl FnMut(bool) -> Result<Value<Boolean>, EncodeError>,
-    > {
-        DeterministicJsonImporter::new_with_salt(
-            |text: &str| Ok(ToBlob::<LongString>::to_blob(text.to_string()).get_handle::<Blake3>()),
-            |number: &serde_json::Number| number.try_to_value().map_err(EncodeError::from_error),
-            |flag: bool| Ok(flag.to_value()),
-            salt,
-        )
-    }
-
-    #[test]
-    fn salted_importer_changes_entity_ids() {
-        let payload = serde_json::json!({ "title": "Dune" });
-
-        let mut unsalted = make_deterministic_importer();
-        let unsalted_roots = unsalted.import_value(&payload).unwrap();
-        assert_eq!(unsalted_roots.len(), 1);
-        let unsalted_root = unsalted_roots[0];
-
-        let salt = [0x55; 32];
-        let mut salted = make_deterministic_importer_with_salt(Some(salt));
-        let salted_roots = salted.import_value(&payload).unwrap();
-        assert_eq!(salted_roots.len(), 1);
-        let salted_root = salted_roots[0];
-
-        assert_ne!(unsalted_root, salted_root);
-
-        let mut salted_again = make_deterministic_importer_with_salt(Some(salt));
-        let salted_again_roots = salted_again.import_value(&payload).unwrap();
-        assert_eq!(salted_again_roots.len(), 1);
-        let salted_again_root = salted_again_roots[0];
-
-        assert_eq!(salted_root, salted_again_root);
-    }
-
-    fn assert_attribute_metadata<S: ValueSchema>(
-        metadata: &TribleSet,
-        attribute: Id,
-        field: &str,
-    ) {
+    fn assert_attribute_metadata<S: ValueSchema>(metadata: &TribleSet, attribute: Id, field: &str) {
         let name_attr = metadata::name.id();
-        let schema_attr = metadata::attr_value_schema.id();
+        let schema_attr = metadata::value_schema.id();
 
         let entries: Vec<Trible> = metadata
             .iter()
@@ -915,7 +444,7 @@ mod tests {
         );
         assert!(
             entries.iter().any(|t| *t.a() == schema_attr),
-            "missing metadata::attr_value_schema for {field}"
+            "missing metadata::value_schema for {field}"
         );
 
         let name_value = entries
@@ -939,6 +468,31 @@ mod tests {
                 schema_value, expected_schema
             );
         }
+    }
+
+    #[test]
+    fn salted_importer_changes_entity_ids() {
+        let payload = serde_json::json!({ "title": "Dune" });
+
+        let mut unsalted = make_importer();
+        let unsalted_roots = unsalted.import_value(&payload).unwrap();
+        assert_eq!(unsalted_roots.len(), 1);
+        let unsalted_root = unsalted_roots[0];
+
+        let salt = [0x55; 32];
+        let mut salted = make_importer_with_salt(Some(salt));
+        let salted_roots = salted.import_value(&payload).unwrap();
+        assert_eq!(salted_roots.len(), 1);
+        let salted_root = salted_roots[0];
+
+        assert_ne!(unsalted_root, salted_root);
+
+        let mut salted_again = make_importer_with_salt(Some(salt));
+        let salted_again_roots = salted_again.import_value(&payload).unwrap();
+        assert_eq!(salted_again_roots.len(), 1);
+        let salted_again_root = salted_again_roots[0];
+
+        assert_eq!(salted_root, salted_again_root);
     }
 
     #[test]
@@ -1088,176 +642,8 @@ mod tests {
     }
 
     #[test]
-    fn reports_encoder_errors_with_field() {
-        let mut importer = JsonImporter::new(
-            |text: &str| {
-                if text.is_empty() {
-                    return Err(EncodeError::message("empty strings are not allowed"));
-                }
-                Ok(ToBlob::<LongString>::to_blob(text.to_string()).get_handle::<Blake3>())
-            },
-            |number: &serde_json::Number| {
-                let value = number.as_f64().ok_or_else(|| EncodeError::message("bad"))?;
-                let converted: Value<F256> = f256::from(value).to_value();
-                Ok(converted)
-            },
-            |flag: bool| Ok(Boolean::value_from(flag)),
-        );
-
-        let payload = serde_json::json!({ "name": "", "ok": true });
-        let err = importer.import_value(&payload).unwrap_err();
-        match err {
-            JsonImportError::EncodeString { field, source } => {
-                assert_eq!(field, "name");
-                assert!(source.to_string().contains("empty"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_primitive_roots() {
-        let mut importer = make_importer();
-        let payload = serde_json::json!("nope");
-        let err = importer.import_value(&payload).unwrap_err();
-        match err {
-            JsonImportError::PrimitiveRoot => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn string_encoder_can_write_to_blobstore() {
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
-
-        let mut importer = JsonImporter::new(
-            |text: &str| {
-                let blob = ToBlob::<LongString>::to_blob(text.to_string());
-                Ok(store.insert(blob))
-            },
-            |_number: &serde_json::Number| -> Result<Value<F256>, EncodeError> {
-                unreachable!("number encoder should not be called in this test");
-            },
-            |_flag: bool| -> Result<Value<Boolean>, EncodeError> {
-                unreachable!("bool encoder should not be called in this test");
-            },
-        );
-
-        let payload = serde_json::json!({ "description": "the spice must flow" });
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-
-        let data: Vec<_> = importer.data().iter().collect();
-        let metadata = importer.metadata();
-        assert_eq!(data.len(), 1);
-
-        let description_attr =
-            Attribute::<Handle<Blake3, LongString>>::from_name("description").id();
-        let trible = data.first().unwrap();
-        assert_eq!(trible.a(), &description_attr);
-        let stored_value = trible.v::<Handle<Blake3, LongString>>().clone();
-
-        let entries: Vec<_> = store.reader().unwrap().into_iter().collect();
-        assert_eq!(entries.len(), 1);
-
-        let (handle, blob) = &entries[0];
-        let handle: Value<Handle<Blake3, LongString>> = handle.clone().transmute();
-        assert_eq!(handle.raw, stored_value.raw);
-
-        let text: View<str> = blob
-            .clone()
-            .transmute::<LongString>()
-            .try_from_blob()
-            .unwrap();
-        assert_eq!(text.as_ref(), "the spice must flow");
-
-        assert_attribute_metadata::<Handle<Blake3, LongString>>(
-            &metadata,
-            description_attr,
-            "description",
-        );
-    }
-
-    #[test]
-    fn honors_custom_id_generator() {
-        let mut ids = vec![fucid(), fucid()];
-        let expected: Vec<_> = ids.iter().map(|id| id.id).collect();
-        ids.reverse();
-
-        let mut importer = JsonImporter::with_id_generator(
-            |text: &str| Ok(ToBlob::<LongString>::to_blob(text.to_string()).get_handle::<Blake3>()),
-            |number: &serde_json::Number| {
-                let primitive = if let Some(n) = number.as_i64() {
-                    n as f64
-                } else if let Some(n) = number.as_u64() {
-                    n as f64
-                } else {
-                    number
-                        .as_f64()
-                        .ok_or_else(|| EncodeError::message("non-finite JSON number"))?
-                };
-                let converted: Value<F256> = f256::from(primitive).to_value();
-                Ok(converted)
-            },
-            |flag: bool| Ok(Boolean::value_from(flag)),
-            move || ids.pop().expect("custom id generator exhausted"),
-        );
-
-        let payload = serde_json::json!({
-            "title": "Dune",
-            "author": {
-                "first": "Frank"
-            }
-        });
-
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        let data: Vec<_> = importer.data().iter().collect();
-
-        let author_attr = Attribute::<GenId>::from_name("author").id();
-        let mut root = None;
-        let mut child = None;
-        for trible in &data {
-            if *trible.a() == author_attr {
-                root = Some(*trible.e());
-                child = Some(trible.v::<GenId>().from_value::<ExclusiveId>());
-            }
-        }
-
-        let root = root.expect("missing root reference");
-        assert_eq!(root, expected[0]);
-
-        let child = child.expect("missing child reference");
-        assert_eq!(child.id, expected[1]);
-    }
-
-    #[test]
-    fn clear_resets_cached_attributes() {
-        let mut importer = make_importer();
-        let payload = serde_json::json!({
-            "title": "Dune",
-            "available": true
-        });
-
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert!(!importer.metadata().is_empty());
-
-        importer.clear();
-
-        assert!(importer.data().is_empty());
-        assert!(importer.metadata().is_empty());
-
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        let metadata = importer.metadata();
-        let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();
-        assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, title_attr, "title");
-    }
-
-    #[test]
     fn deterministic_importer_reimports_stably() {
-        let mut importer = make_deterministic_importer();
+        let mut importer = make_importer();
         let payload = serde_json::json!({
             "title": "Dune",
             "pages": 412,
@@ -1282,7 +668,7 @@ mod tests {
 
     #[test]
     fn deterministic_importer_ignores_field_order() {
-        let mut importer = make_deterministic_importer();
+        let mut importer = make_importer();
         let payload_a = serde_json::json!({
             "title": "Dune",
             "tags": ["classic", "scifi"],
@@ -1315,7 +701,7 @@ mod tests {
 
     #[test]
     fn deterministic_importer_handles_top_level_arrays() {
-        let mut importer = make_deterministic_importer();
+        let mut importer = make_importer();
         let payload = serde_json::json!([
             { "title": "Dune" },
             { "title": "Dune Messiah" }
@@ -1334,16 +720,6 @@ mod tests {
         }
 
         assert_eq!(by_root.len(), 2);
-        let observed: std::collections::BTreeSet<_> = by_root.values().copied().collect();
-        let expected: std::collections::BTreeSet<_> = ["Dune", "Dune Messiah"]
-            .into_iter()
-            .map(|title| {
-                ToBlob::<LongString>::to_blob(title)
-                    .get_handle::<Blake3>()
-                    .raw
-            })
-            .collect();
-        assert_eq!(observed, expected);
         assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, title_attr, "title");
 
         importer.clear_data();
@@ -1359,7 +735,7 @@ mod tests {
 
     #[test]
     fn deterministic_clear_resets_cached_attributes() {
-        let mut importer = make_deterministic_importer();
+        let mut importer = make_importer();
         let payload = serde_json::json!({
             "title": "Dune",
             "available": true
@@ -1383,12 +759,36 @@ mod tests {
 
     #[test]
     fn deterministic_importer_rejects_primitive_roots() {
-        let mut importer = make_deterministic_importer();
+        let mut importer = make_importer();
         let payload = serde_json::json!(42);
         let err = importer.import_value(&payload).unwrap_err();
         match err {
             JsonImportError::PrimitiveRoot => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn string_encoder_can_write_to_blobstore() {
+        let mut importer = JsonImporter::<Blake3>::new();
+
+        let payload = serde_json::json!({ "description": "the spice must flow" });
+        let roots = importer.import_value(&payload).unwrap();
+        assert_eq!(roots.len(), 1);
+
+        let data: Vec<_> = importer.data().iter().collect();
+        let metadata = importer.metadata();
+        assert_eq!(data.len(), 1);
+
+        let description_attr =
+            Attribute::<Handle<Blake3, LongString>>::from_name("description").id();
+        let trible = data.first().unwrap();
+        assert_eq!(trible.a(), &description_attr);
+
+        assert_attribute_metadata::<Handle<Blake3, LongString>>(
+            &metadata,
+            description_attr,
+            "description",
+        );
     }
 }
