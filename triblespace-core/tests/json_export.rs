@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use serde_json::json;
+use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::{export_to_json, ExportOptions};
 use triblespace_core::import::json::JsonImporter;
 use triblespace_core::prelude::blobschemas::LongString;
@@ -19,7 +20,8 @@ fn exports_json_with_cardinality_hints() {
         "available": true
     });
 
-    let mut importer = JsonImporter::<Blake3>::new();
+    let mut blobs = MemoryBlobStore::<Blake3>::new();
+    let mut importer = JsonImporter::<_, Blake3>::new(&mut blobs);
     let roots = importer.import_value(&payload).expect("import payload");
     let root = roots[0];
 

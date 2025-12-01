@@ -1,8 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::path::PathBuf;
+use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json::JsonImporter;
-use triblespace::prelude::valueschemas::Blake3;
 
 struct Fixture {
     name: &'static str,
@@ -40,7 +40,8 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .map(|fixture| {
             let payload = fixture.payload.as_str();
 
-            let mut importer = JsonImporter::<Blake3>::new();
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = JsonImporter::new(&mut blobs);
             importer
                 .import_str(payload)
                 .expect("import JSON to determine element count");
@@ -67,7 +68,8 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = JsonImporter::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = JsonImporter::new(&mut blobs);
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
@@ -92,7 +94,8 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = JsonImporter::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = JsonImporter::new(&mut blobs);
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

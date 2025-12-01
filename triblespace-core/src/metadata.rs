@@ -3,7 +3,7 @@
 //! This namespace is used to bootstrap the meaning of other namespaces.
 //! It defines meta attributes that are used to describe other attributes.
 
-use crate::blob::MemoryBlobStore;
+use crate::repo::BlobStore;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
@@ -21,7 +21,7 @@ pub trait Metadata {
     /// Returns the root identifier for this metadata description.
     fn id(&self) -> Id;
 
-    fn describe(&self) -> (TribleSet, MemoryBlobStore<Blake3>);
+    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet;
 }
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
@@ -29,8 +29,9 @@ pub trait ConstMetadata {
     /// Returns the root identifier for this metadata description.
     fn id() -> Id;
 
-    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
-        (TribleSet::new(), MemoryBlobStore::new())
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+        TribleSet::new()
     }
 }
 
@@ -42,8 +43,8 @@ where
         <S as ConstMetadata>::id()
     }
 
-    fn describe(&self) -> (TribleSet, MemoryBlobStore<Blake3>) {
-        <S as ConstMetadata>::describe()
+    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        <S as ConstMetadata>::describe(blobs)
     }
 }
 
@@ -55,8 +56,9 @@ where
         T::id()
     }
 
-    fn describe(&self) -> (TribleSet, MemoryBlobStore<Blake3>) {
-        (TribleSet::new(), MemoryBlobStore::new())
+    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+        TribleSet::new()
     }
 }
 // namespace constants

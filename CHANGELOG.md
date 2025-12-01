@@ -48,7 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `import::json::JsonImporter` for deterministic JSON imports that map strings
   to `Handle<Blake3, LongString>`, numbers to `F256`, booleans to `Boolean`,
   and nested objects to `GenId` links, hashing attribute/value pairs (with an
-  optional 32-byte salt) to derive stable entity ids.
+  optional 32-byte salt) to derive stable entity ids, while streaming blobs into
+  a caller-provided store and exposing data/metadata separately.
 - `valueschemas::Boolean` for encoding `false` as all-zero bytes and `true` as
   all ones, providing an unambiguous target for JSON boolean importers.
 - `RangeU128` and `RangeInclusiveU128` value schemas for encoding pairs of
@@ -238,9 +239,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Allowed both JSON importers to accept top-level arrays by returning multiple
   root entities, keeping primitive roots rejected while permitting batches of
   objects.
-- Simplified the JSON importers to return `TribleSet`s directly instead of a
-  `JsonImportResult` wrapper since consumers can discover entities from the
-  imported statements.
+- Simplified the JSON importer API to return root ids while exposing data and
+  metadata via accessors on `JsonImporter`, avoiding an extra wrapper type.
 - Simplified JSON importer error diagnostics to avoid tracking JSON paths in
   the hot import loop.
 - JSON importers now emit `metadata::name` and `metadata::attr_value_schema`

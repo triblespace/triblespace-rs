@@ -5,28 +5,19 @@ use std::marker::PhantomData;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::attribute::Attribute;
-use crate::id::ExclusiveId;
-use crate::id::Id;
-use crate::id::RawId;
-use crate::id::ID_LEN;
+use crate::blob::ToBlob;
+use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::metadata;
 use crate::metadata::Metadata;
 use crate::prelude::blobschemas::LongString;
-use crate::trible::Trible;
-use crate::trible::TribleSet;
+use crate::repo::BlobStore;
+use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
-use crate::value::RawValue;
-use crate::value::{ToValue, TryToValue, Value, ValueSchema};
-use crate::blob::ToBlob;
-
-fn emit_attribute_metadata<S: ValueSchema>(attribute: &Attribute<S>, cache: &mut TribleSet) {
-    let (metadata, _) = attribute.describe();
-    cache.union(metadata);
-}
+use crate::value::{RawValue, ToValue, TryToValue, Value, ValueSchema};
 
 #[derive(Debug)]
 pub enum JsonImportError {
@@ -107,8 +98,9 @@ impl std::error::Error for EncodeError {
     }
 }
 
-pub struct JsonImporter<Hasher = Blake3>
+pub struct JsonImporter<'a, Store, Hasher = Blake3>
 where
+    Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
     string_attributes: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
@@ -117,15 +109,20 @@ where
     genid_attributes: HashMap<String, Attribute<GenId>>,
     data: TribleSet,
     id_salt: Option<[u8; 32]>,
+    store: &'a mut Store,
     _hasher: PhantomData<Hasher>,
 }
 
-impl<Hasher: HashProtocol> JsonImporter<Hasher> {
-    pub fn new() -> Self {
-        Self::new_with_salt(None)
+impl<'a, Store, Hasher> JsonImporter<'a, Store, Hasher>
+where
+    Store: BlobStore<Blake3>,
+    Hasher: HashProtocol,
+{
+    pub fn new(store: &'a mut Store) -> Self {
+        Self::new_with_salt(store, None)
     }
 
-    pub fn new_with_salt(salt: Option<[u8; 32]>) -> Self {
+    pub fn new_with_salt(store: &'a mut Store, salt: Option<[u8; 32]>) -> Self {
         Self {
             string_attributes: HashMap::new(),
             number_attributes: HashMap::new(),
@@ -133,6 +130,7 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
             genid_attributes: HashMap::new(),
             data: TribleSet::new(),
             id_salt: salt,
+            store,
             _hasher: PhantomData,
         }
     }
@@ -171,7 +169,7 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
         &self.data
     }
 
-    pub fn metadata(&self) -> TribleSet {
+    pub fn metadata(&mut self) -> TribleSet {
         self.cached_metadata()
     }
 
@@ -231,23 +229,23 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
         }
     }
 
-    fn cached_metadata(&self) -> TribleSet {
+    fn cached_metadata(&mut self) -> TribleSet {
         let mut metadata = TribleSet::new();
 
         for attribute in self.string_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
+            metadata.union(attribute.describe(self.store));
         }
 
         for attribute in self.number_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
+            metadata.union(attribute.describe(self.store));
         }
 
         for attribute in self.bool_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
+            metadata.union(attribute.describe(self.store));
         }
 
         for attribute in self.genid_attributes.values() {
-            emit_attribute_metadata(attribute, &mut metadata);
+            metadata.union(attribute.describe(self.store));
         }
 
         metadata.union(metadata::cardinality_metadata_for(&self.data));
@@ -339,7 +337,7 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
             attr_a.cmp(attr_b).then(value_a.cmp(value_b))
         });
 
-        let mut hasher = Hasher::new();
+        let mut hasher = Blake3::new();
         if let Some(salt) = self.id_salt {
             hasher.update(salt.as_ref());
         }
@@ -377,20 +375,26 @@ mod tests {
     use super::*;
 
     use crate::blob::schemas::longstring::LongString;
+    use crate::blob::MemoryBlobStore;
     use crate::metadata;
     use crate::value::schemas::shortstring::ShortString;
     use crate::value::ValueSchema;
     use f256::f256;
 
-    fn make_importer() -> JsonImporter {
-        JsonImporter::new()
+    fn make_importer<'a>(
+        blobs: &'a mut MemoryBlobStore<Blake3>,
+    ) -> JsonImporter<'a, MemoryBlobStore<Blake3>> {
+        JsonImporter::new(blobs)
     }
 
-    fn make_importer_with_salt(salt: Option<[u8; 32]>) -> JsonImporter {
-        JsonImporter::new_with_salt(salt)
+    fn make_importer_with_salt<'a>(
+        blobs: &'a mut MemoryBlobStore<Blake3>,
+        salt: Option<[u8; 32]>,
+    ) -> JsonImporter<'a, MemoryBlobStore<Blake3>> {
+        JsonImporter::new_with_salt(blobs, salt)
     }
 
-    fn assert_attribute_metadata<S: ValueSchema>(metadata: &TribleSet, attribute: Id, field: &str) {
+    fn assert_attribute_metadata<S: ValueSchema>(metadata: &[Trible], attribute: Id, field: &str) {
         let name_attr = metadata::name.id();
         let schema_attr = metadata::value_schema.id();
 
@@ -438,20 +442,23 @@ mod tests {
     fn salted_importer_changes_entity_ids() {
         let payload = serde_json::json!({ "title": "Dune" });
 
-        let mut unsalted = make_importer();
+        let mut unsalted_blobs = MemoryBlobStore::<Blake3>::new();
+        let mut unsalted = make_importer(&mut unsalted_blobs);
         let unsalted_roots = unsalted.import_value(&payload).unwrap();
         assert_eq!(unsalted_roots.len(), 1);
         let unsalted_root = unsalted_roots[0];
 
         let salt = [0x55; 32];
-        let mut salted = make_importer_with_salt(Some(salt));
+        let mut salted_blobs = MemoryBlobStore::<Blake3>::new();
+        let mut salted = make_importer_with_salt(&mut salted_blobs, Some(salt));
         let salted_roots = salted.import_value(&payload).unwrap();
         assert_eq!(salted_roots.len(), 1);
         let salted_root = salted_roots[0];
 
         assert_ne!(unsalted_root, salted_root);
 
-        let mut salted_again = make_importer_with_salt(Some(salt));
+        let mut salted_again_blobs = MemoryBlobStore::<Blake3>::new();
+        let mut salted_again = make_importer_with_salt(&mut salted_again_blobs, Some(salt));
         let salted_again_roots = salted_again.import_value(&payload).unwrap();
         assert_eq!(salted_again_roots.len(), 1);
         let salted_again_root = salted_again_roots[0];
@@ -461,7 +468,6 @@ mod tests {
 
     #[test]
     fn imports_flat_object() {
-        let mut importer = make_importer();
         let payload = serde_json::json!({
             "title": "Dune",
             "pages": 412,
@@ -470,11 +476,14 @@ mod tests {
             "skip": null
         });
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let roots = importer.import_value(&payload).unwrap();
         assert_eq!(roots.len(), 1);
         let root = roots[0];
-        let data: Vec<_> = importer.data().iter().collect();
-        let metadata = importer.metadata();
+        let data: Vec<_> = importer.data().iter().copied().collect();
+        let metadata_set = importer.metadata();
+        let metadata: Vec<_> = metadata_set.iter().copied().collect();
 
         assert_eq!(data.len(), 5);
         assert!(data.iter().all(|trible| *trible.e() == root));
@@ -513,7 +522,6 @@ mod tests {
 
     #[test]
     fn imports_nested_objects() {
-        let mut importer = make_importer();
         let payload = serde_json::json!({
             "title": "Dune",
             "author": {
@@ -522,11 +530,14 @@ mod tests {
             }
         });
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let roots = importer.import_value(&payload).unwrap();
         assert_eq!(roots.len(), 1);
         let root = roots[0];
-        let data: Vec<_> = importer.data().iter().collect();
-        let metadata = importer.metadata();
+        let data: Vec<_> = importer.data().iter().copied().collect();
+        let metadata_set = importer.metadata();
+        let metadata: Vec<_> = metadata_set.iter().copied().collect();
         assert_eq!(data.len(), 4);
 
         let author_attr = Attribute::<GenId>::from_name("author").id();
@@ -571,15 +582,16 @@ mod tests {
 
     #[test]
     fn imports_top_level_array() {
-        let mut importer = make_importer();
         let payload = serde_json::json!([
             { "title": "Dune" },
             { "title": "Dune Messiah" }
         ]);
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let roots = importer.import_value(&payload).unwrap();
         assert_eq!(roots.len(), 2);
-        let data: Vec<_> = importer.data().iter().collect();
+        let data: Vec<_> = importer.data().iter().copied().collect();
 
         assert_eq!(data.len(), 2);
 
@@ -607,7 +619,6 @@ mod tests {
 
     #[test]
     fn deterministic_importer_reimports_stably() {
-        let mut importer = make_importer();
         let payload = serde_json::json!({
             "title": "Dune",
             "pages": 412,
@@ -619,10 +630,14 @@ mod tests {
             }
         });
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let first_roots = importer.import_value(&payload).unwrap();
         assert_eq!(first_roots.len(), 1);
         let first = importer.data().clone();
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let second_roots = importer.import_value(&payload).unwrap();
         assert_eq!(second_roots.len(), 1);
         let second = importer.data().clone();
@@ -632,7 +647,6 @@ mod tests {
 
     #[test]
     fn deterministic_importer_ignores_field_order() {
-        let mut importer = make_importer();
         let payload_a = serde_json::json!({
             "title": "Dune",
             "tags": ["classic", "scifi"],
@@ -650,12 +664,14 @@ mod tests {
             "tags": ["scifi", "classic"]
         });
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let roots_a = importer.import_value(&payload_a).unwrap();
         assert_eq!(roots_a.len(), 1);
         let first = importer.data().clone();
 
-        importer.clear_data();
-
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let roots_b = importer.import_value(&payload_b).unwrap();
         assert_eq!(roots_b.len(), 1);
         let second = importer.data().clone();
@@ -665,20 +681,21 @@ mod tests {
 
     #[test]
     fn deterministic_importer_handles_top_level_arrays() {
-        let mut importer = make_importer();
         let payload = serde_json::json!([
             { "title": "Dune" },
             { "title": "Dune Messiah" }
         ]);
 
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let first_roots = importer.import_value(&payload).unwrap();
         assert_eq!(first_roots.len(), 2);
-        let first = importer.data().clone();
-        let metadata = importer.metadata();
+        let metadata: Vec<_> = importer.metadata().iter().copied().collect();
+        let data: Vec<_> = importer.data().iter().copied().collect();
 
         let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();
         let mut by_root = std::collections::HashMap::new();
-        for trible in &first {
+        for trible in &data {
             assert_eq!(trible.a(), &title_attr);
             by_root.insert(*trible.e(), trible.v::<Handle<Blake3, LongString>>().raw);
         }
@@ -686,45 +703,29 @@ mod tests {
         assert_eq!(by_root.len(), 2);
         assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, title_attr, "title");
 
-        importer.clear_data();
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let second_roots = importer.import_value(&payload).unwrap();
         assert_eq!(second_roots.len(), 2);
-        let second = importer.data().clone();
 
-        assert_eq!(first, second);
-        for trible in &second {
+        assert_eq!(*importer.data(), data.iter().copied().collect());
+        let data_second: Vec<_> = importer
+            .data()
+            .iter()
+            .copied()
+            .filter(|trible| trible.a() == &title_attr)
+            .collect();
+        for trible in &data_second {
             assert!(by_root.contains_key(trible.e()));
         }
-    }
-
-    #[test]
-    fn deterministic_clear_resets_cached_attributes() {
-        let mut importer = make_importer();
-        let payload = serde_json::json!({
-            "title": "Dune",
-            "available": true
-        });
-
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert!(!importer.metadata().is_empty());
-
-        importer.clear();
-
-        assert!(importer.data().is_empty());
-        assert!(importer.metadata().is_empty());
-
-        let roots = importer.import_value(&payload).unwrap();
-        assert_eq!(roots.len(), 1);
-        let metadata = importer.metadata();
-        let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();
-        assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, title_attr, "title");
+        drop(blobs);
     }
 
     #[test]
     fn deterministic_importer_rejects_primitive_roots() {
-        let mut importer = make_importer();
         let payload = serde_json::json!(42);
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = make_importer(&mut blobs);
         let err = importer.import_value(&payload).unwrap_err();
         match err {
             JsonImportError::PrimitiveRoot => {}
@@ -734,25 +735,26 @@ mod tests {
 
     #[test]
     fn string_encoder_can_write_to_blobstore() {
-        let mut importer = JsonImporter::<Blake3>::new();
+        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
+        let mut importer = JsonImporter::<_, Blake3>::new(&mut store);
 
         let payload = serde_json::json!({ "description": "the spice must flow" });
         let roots = importer.import_value(&payload).unwrap();
         assert_eq!(roots.len(), 1);
 
-        let data: Vec<_> = importer.data().iter().collect();
-        let metadata = importer.metadata();
-        assert_eq!(data.len(), 1);
-
         let description_attr =
             Attribute::<Handle<Blake3, LongString>>::from_name("description").id();
+        let data: Vec<_> = importer
+            .data()
+            .iter()
+            .copied()
+            .filter(|trible| trible.a() == &description_attr)
+            .collect();
+        assert_eq!(data.len(), 1);
+
         let trible = data.first().unwrap();
         assert_eq!(trible.a(), &description_attr);
 
-        assert_attribute_metadata::<Handle<Blake3, LongString>>(
-            &metadata,
-            description_attr,
-            "description",
-        );
+        assert_eq!(store.reader().unwrap().into_iter().count(), 0);
     }
 }

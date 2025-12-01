@@ -1,5 +1,4 @@
 use crate::blob::BlobSchema;
-use crate::blob::MemoryBlobStore;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -127,17 +126,17 @@ where
     }
 }
 
-fn describe_hash<H>() -> (TribleSet, MemoryBlobStore<Blake3>)
+fn describe_hash<H>(blobs: &mut impl BlobStore<Blake3>) -> TribleSet
 where
     H: HashProtocol,
 {
+    let _ = blobs;
     let mut tribles = TribleSet::new();
-    let blobs = MemoryBlobStore::new();
 
     let entity = ExclusiveId::force(H::id());
     tribles += entity! { &entity @ metadata::name: H::NAME };
 
-    (tribles, blobs)
+    tribles
 }
 
 use blake2::Blake2b as Blake2bUnsized;
@@ -158,8 +157,8 @@ impl ConstMetadata for Blake2b {
         id_hex!("91F880222412A49F012BE999942E6199")
     }
 
-    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
-        describe_hash::<Self>()
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        describe_hash::<Self>(blobs)
     }
 }
 
@@ -168,8 +167,8 @@ impl ConstMetadata for Blake3 {
         id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3")
     }
 
-    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
-        describe_hash::<Self>()
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        describe_hash::<Self>(blobs)
     }
 }
 
@@ -225,34 +224,17 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         Id::new(raw).expect("derived handle schema id must be non-nil")
     }
 
-    fn describe() -> (TribleSet, MemoryBlobStore<Blake3>) {
-        let (hash_tribles, mut hash_blobs) = H::describe();
-        let (blob_tribles, mut blob_blobs) = T::describe();
-
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
         let mut tribles = TribleSet::new();
-        tribles += hash_tribles;
-        tribles += blob_tribles;
+        tribles += H::describe(blobs);
+        tribles += T::describe(blobs);
 
         let entity = ExclusiveId::force(Self::id());
         tribles += entity! { &entity @
             metadata::blob_schema: T::id(),
             metadata::hash_schema: H::id(),
         };
-
-        let hash_blobs_iter = hash_blobs
-            .reader()
-            .expect("hash protocol metadata reader should be infallible")
-            .into_iter();
-        let blob_blobs_iter = blob_blobs
-            .reader()
-            .expect("blob schema metadata reader should be infallible")
-            .into_iter();
-
-        let blobs = hash_blobs_iter
-            .chain(blob_blobs_iter)
-            .collect::<MemoryBlobStore<Blake3>>();
-
-        (tribles, blobs)
+        tribles
     }
 }
 

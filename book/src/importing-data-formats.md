@@ -12,8 +12,10 @@ structured documents into raw tribles. Today the namespace ships with a single
 deterministic JSON importer:
 
 - `JsonImporter` hashes attribute/value pairs to derive entity identifiers so
-  identical inputs reproduce the same entities, with an optional salt to avoid
-  collisions.
+  identical inputs reproduce the same entities. Construct it with a blob sink
+  (e.g., a `Workspace`’s store or a `MemoryBlobStore`) and use
+  `JsonImporter::new_with_salt` when you need to avoid collisions by mixing in
+  an explicit 32-byte salt.
 
 The importer uses a fixed mapping for JSON primitives:
 
@@ -40,12 +42,11 @@ encoded and stored under the same attribute identifier, producing one trible per
 element.
 
 After an import completes the importer regenerates metadata from its cached
-attribute map. The [`metadata()`](crate::import::json::JsonImporter::metadata)
-accessor returns tribles that link each derived attribute id to its field name,
-value schema, cardinality hint, and any associated blob schema. Merge those
-descriptors into your repository alongside the imported data when you want
-queries to discover the original JSON field names or project datasets by schema
-without repeating the derivation logic.
+attribute map. Call `data()` to inspect the emitted tribles and `metadata()` to
+retrieve attribute descriptors and cardinality hints. Merge those descriptors
+into your repository alongside the imported data when you want queries to
+discover the original JSON field names or project datasets by schema without
+repeating the derivation logic.
 
 Nested objects recurse automatically. The parent receives a `GenId` attribute
 that points at the child entity, allowing the importer to represent the entire
@@ -55,15 +56,15 @@ related documents in separate batches.
 
 ## Managing Entity Identifiers
 
-`JsonImporter` buffers the encoded attribute/value pairs for each object, sorts
+The importer buffers the encoded attribute/value pairs for each object, sorts
 them, and feeds the resulting byte stream into a hash protocol. The first 16
 bytes of that digest become the entity identifier, ensuring identical JSON
 inputs produce identical IDs even across separate runs. You can supply an
 optional 32-byte salt via `JsonImporter::new_with_salt` to keep deterministic
 imports from colliding with existing data. Once the identifier is established,
-the importer writes the cached pairs into its internal trible set via
-`Trible::new`, so subsequent calls to `data()` expose the deterministic
-statements alongside the metadata generated for every derived attribute.
+the importer writes the cached pairs into its trible set via `Trible::new`, and
+exposes the data, metadata, and root entity identifiers for each imported
+document through its accessors.
 
 This hashing step also changes how repeated structures behave. When a JSON
 document contains identical nested objects—common in fixtures such as

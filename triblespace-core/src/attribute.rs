@@ -8,7 +8,7 @@
 use core::marker::PhantomData;
 use std::borrow::Cow;
 
-use crate::blob::{MemoryBlobStore, ToBlob};
+use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
@@ -126,9 +126,9 @@ where
         self.id()
     }
 
-    fn describe(&self) -> (TribleSet, crate::blob::MemoryBlobStore<Blake3>) {
+    fn describe(&self, blobs: &mut impl crate::repo::BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
         let mut tribles = TribleSet::new();
-        let blobs: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
 
         let entity = ExclusiveId::force(self.id());
 
@@ -138,7 +138,7 @@ where
 
         tribles += entity! { &entity @ metadata::value_schema: GenId::value_from(S::id()) };
 
-        (tribles, blobs)
+        tribles
     }
 }
 
