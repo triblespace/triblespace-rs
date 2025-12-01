@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   examples that call `ConstMetadata::id()`.
 - `Handle` value schemas now forward metadata from their hash protocol and blob
   schema components so composite schema descriptions stay discoverable.
-- Attribute identifiers derived from hashed names now use the lower 16 bytes of
-  the Blake3 digest to stay consistent with the ID-to-value layout.
+- Attribute identifiers derived from hashed names now use the rightmost 16 bytes
+  of the Blake3 digest to stay consistent with the ID-to-value layout.
 - Consolidated JSON import into a single deterministic
   `import::json::JsonImporter` with fixed primitive mappings and optional salt
   support, replacing the prior nondeterministic importer and configurable

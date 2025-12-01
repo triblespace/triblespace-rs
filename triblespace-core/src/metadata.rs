@@ -87,7 +87,7 @@ pub struct CardinalityHints {
     pub multi: bool,
 }
 
-pub fn cardinality_hints_for(data: &TribleSet) -> HashMap<RawId, CardinalityHints> {
+pub fn cardinality_metadata_for(data: &TribleSet) -> TribleSet {
     let mut per_entity_counts: HashMap<(RawId, Id), usize> = HashMap::new();
     for trible in data.iter() {
         let attr: RawId = (*trible.a()).into();
@@ -105,23 +105,18 @@ pub fn cardinality_hints_for(data: &TribleSet) -> HashMap<RawId, CardinalityHint
         }
     }
 
-    hints
-}
-
-pub fn emit_cardinality_metadata(
-    attr_id: Id,
-    hints: Option<&CardinalityHints>,
-    metadata: &mut TribleSet,
-) {
-    let Some(hints) = hints else {
-        return;
-    };
-
-    let entity = ExclusiveId::force(attr_id);
-    if hints.single {
-        *metadata += entity! { &entity @ cardinality: "single" };
+    let mut metadata = TribleSet::new();
+    for (attr, hint) in hints {
+        let attr_id =
+            Id::new(attr).expect("cardinality metadata should never be generated for nil ids");
+        let entity = ExclusiveId::force(attr_id);
+        if hint.single {
+            metadata += entity! { &entity @ cardinality: "single" };
+        }
+        if hint.multi {
+            metadata += entity! { &entity @ cardinality: "multi" };
+        }
     }
-    if hints.multi {
-        *metadata += entity! { &entity @ cardinality: "multi" };
-    }
+
+    metadata
 }

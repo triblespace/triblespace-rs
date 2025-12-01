@@ -1,7 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
 use std::path::PathBuf;
-use triblespace::core::import::json::fixed_json_importer;
+use triblespace::core::import::json::JsonImporter;
+use triblespace::prelude::valueschemas::Blake3;
 
 struct Fixture {
     name: &'static str,
@@ -39,7 +40,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .map(|fixture| {
             let payload = fixture.payload.as_str();
 
-            let mut importer = fixed_json_importer();
+            let mut importer = JsonImporter::<Blake3>::new();
             importer
                 .import_str(payload)
                 .expect("import JSON to determine element count");
@@ -61,12 +62,12 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
 
         group.throughput(Throughput::Elements(prepared.element_count as u64));
         group.bench_with_input(
-            BenchmarkId::new("deterministic", fixture.name),
+            BenchmarkId::new("json_import", fixture.name),
             fixture,
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = fixed_json_importer();
+                    let mut importer = JsonImporter::<Blake3>::new();
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
@@ -86,12 +87,12 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
 
         group.throughput(Throughput::Bytes(bytes));
         group.bench_with_input(
-            BenchmarkId::new("deterministic", fixture.name),
+            BenchmarkId::new("json_import", fixture.name),
             fixture,
             |b, fixture| {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
-                    let mut importer = fixed_json_importer();
+                    let mut importer = JsonImporter::<Blake3>::new();
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

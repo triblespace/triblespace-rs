@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::json;
 use triblespace_core::export::json::{export_to_json, ExportOptions};
-use triblespace_core::import::json::fixed_json_importer;
+use triblespace_core::import::json::JsonImporter;
 use triblespace_core::prelude::blobschemas::LongString;
 use triblespace_core::prelude::valueschemas::{Blake3, Handle};
 use triblespace_core::prelude::ToBlob;
@@ -19,7 +19,7 @@ fn exports_json_with_cardinality_hints() {
         "available": true
     });
 
-    let mut importer = fixed_json_importer();
+    let mut importer = JsonImporter::<Blake3>::new();
     let roots = importer.import_value(&payload).expect("import payload");
     let root = roots[0];
 

@@ -219,7 +219,9 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         hasher.update(T::id().as_ref());
         let digest = hasher.finalize();
         let mut raw = [0u8; 16];
-        raw.copy_from_slice(&digest[..16]);
+        let bytes: &[u8] = digest.as_ref();
+        let lower_half = &bytes[bytes.len() - raw.len()..];
+        raw.copy_from_slice(lower_half);
         Id::new(raw).expect("derived handle schema id must be non-nil")
     }
 

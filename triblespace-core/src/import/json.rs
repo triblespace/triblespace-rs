@@ -233,51 +233,24 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
 
     fn cached_metadata(&self) -> TribleSet {
         let mut metadata = TribleSet::new();
-        let cardinality_hints = metadata::cardinality_hints_for(&self.data);
 
         for attribute in self.string_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
-            let attr_id = attribute.id();
-            let attr_raw: RawId = attr_id.into();
-            metadata::emit_cardinality_metadata(
-                attr_id,
-                cardinality_hints.get(&attr_raw),
-                &mut metadata,
-            );
         }
 
         for attribute in self.number_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
-            let attr_id = attribute.id();
-            let attr_raw: RawId = attr_id.into();
-            metadata::emit_cardinality_metadata(
-                attr_id,
-                cardinality_hints.get(&attr_raw),
-                &mut metadata,
-            );
         }
 
         for attribute in self.bool_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
-            let attr_id = attribute.id();
-            let attr_raw: RawId = attr_id.into();
-            metadata::emit_cardinality_metadata(
-                attr_id,
-                cardinality_hints.get(&attr_raw),
-                &mut metadata,
-            );
         }
 
         for attribute in self.genid_attributes.values() {
             emit_attribute_metadata(attribute, &mut metadata);
-            let attr_id = attribute.id();
-            let attr_raw: RawId = attr_id.into();
-            metadata::emit_cardinality_metadata(
-                attr_id,
-                cardinality_hints.get(&attr_raw),
-                &mut metadata,
-            );
         }
+
+        metadata.union(metadata::cardinality_metadata_for(&self.data));
 
         metadata
     }
@@ -377,21 +350,12 @@ impl<Hasher: HashProtocol> JsonImporter<Hasher> {
 
         let digest: [u8; 32] = hasher.finalize().into();
         let mut raw = [0u8; ID_LEN];
-        raw.copy_from_slice(&digest[..ID_LEN]);
+        let lower_half = &digest[digest.len() - ID_LEN..];
+        raw.copy_from_slice(lower_half);
         let id = Id::new(raw).expect("deterministic importer produced nil id");
 
         ExclusiveId::force(id)
     }
-}
-
-pub type FixedJsonImporter = JsonImporter<Blake3>;
-
-pub fn fixed_json_importer() -> FixedJsonImporter {
-    JsonImporter::new()
-}
-
-pub fn fixed_json_importer_with_salt(salt: Option<[u8; 32]>) -> FixedJsonImporter {
-    JsonImporter::new_with_salt(salt)
 }
 
 fn encode_string_to_longstring(

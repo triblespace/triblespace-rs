@@ -97,7 +97,7 @@ impl<S: ValueSchema> Attribute<S> {
     /// The identifier is computed by hashing the field name handle produced as a
     /// `Handle<Blake3, crate::blob::schemas::longstring::LongString>` together with the
     /// schema's [`ConstMetadata::id`].
-    /// The resulting 32-byte Blake3 digest uses its lower 16 bytes to match the
+    /// The resulting 32-byte Blake3 digest uses its rightmost 16 bytes to match the
     /// `RawId` layout used by [`Attribute::from_id`].
     pub fn from_name(name: &str) -> Self {
         let mut hasher = Hasher::new();
