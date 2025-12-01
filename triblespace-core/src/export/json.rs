@@ -5,7 +5,7 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::blob::schemas::longstring::LongString;
 use crate::id::{Id, RawId};
-use crate::metadata::{self, CardinalityHints, ConstMetadata};
+use crate::metadata::{self, ConstMetadata};
 use crate::prelude::{find, pattern};
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
@@ -86,6 +86,12 @@ enum CardinalityMode {
     AlwaysArray,
     AlwaysScalar,
     Dynamic,
+}
+
+#[derive(Default, Clone, Copy)]
+struct CardinalityHints {
+    single: bool,
+    multi: bool,
 }
 
 pub fn export_to_json<F>(

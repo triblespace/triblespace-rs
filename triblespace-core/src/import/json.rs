@@ -9,6 +9,7 @@ use crate::blob::ToBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::macros::entity;
 use crate::prelude::blobschemas::LongString;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
@@ -109,6 +110,7 @@ where
     genid_attributes: HashMap<String, Attribute<GenId>>,
     data: TribleSet,
     id_salt: Option<[u8; 32]>,
+    cardinality: HashMap<RawId, CardinalityHints>,
     store: &'a mut Store,
     _hasher: PhantomData<Hasher>,
 }
@@ -118,11 +120,7 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    pub fn new(store: &'a mut Store) -> Self {
-        Self::new_with_salt(store, None)
-    }
-
-    pub fn new_with_salt(store: &'a mut Store, salt: Option<[u8; 32]>) -> Self {
+    pub fn new(store: &'a mut Store, salt: Option<[u8; 32]>) -> Self {
         Self {
             string_attributes: HashMap::new(),
             number_attributes: HashMap::new(),
@@ -130,6 +128,7 @@ where
             genid_attributes: HashMap::new(),
             data: TribleSet::new(),
             id_salt: salt,
+            cardinality: HashMap::new(),
             store,
             _hasher: PhantomData,
         }
@@ -170,7 +169,27 @@ where
     }
 
     pub fn metadata(&mut self) -> TribleSet {
-        self.cached_metadata()
+        let mut metadata = TribleSet::new();
+
+        for attribute in self.string_attributes.values() {
+            metadata.union(attribute.describe(self.store));
+        }
+
+        for attribute in self.number_attributes.values() {
+            metadata.union(attribute.describe(self.store));
+        }
+
+        for attribute in self.bool_attributes.values() {
+            metadata.union(attribute.describe(self.store));
+        }
+
+        for attribute in self.genid_attributes.values() {
+            metadata.union(attribute.describe(self.store));
+        }
+
+        metadata.union(cardinality_metadata_from_hints(&self.cardinality));
+
+        metadata
     }
 
     pub fn clear_data(&mut self) {
@@ -183,6 +202,7 @@ where
         self.number_attributes.clear();
         self.bool_attributes.clear();
         self.genid_attributes.clear();
+        self.cardinality.clear();
     }
 
     fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
@@ -229,30 +249,6 @@ where
         }
     }
 
-    fn cached_metadata(&mut self) -> TribleSet {
-        let mut metadata = TribleSet::new();
-
-        for attribute in self.string_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.number_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.bool_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.genid_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        metadata.union(metadata::cardinality_metadata_for(&self.data));
-
-        metadata
-    }
-
     fn stage_object(
         &mut self,
         object: &Map<String, JsonValue>,
@@ -261,7 +257,7 @@ where
         let mut pairs = Vec::new();
 
         for (field, value) in object {
-            self.stage_field(field, value, &mut pairs, staged)?;
+            self.stage_field(field, value, &mut pairs, staged, false)?;
         }
 
         let entity = self.derive_id(&pairs);
@@ -282,11 +278,18 @@ where
         value: &JsonValue,
         pairs: &mut Vec<(RawId, RawValue)>,
         staged: &mut TribleSet,
+        multi: bool,
     ) -> Result<(), JsonImportError> {
         match value {
             JsonValue::Null => Ok(()),
             JsonValue::Bool(flag) => {
                 let attr = self.bool_attribute(field);
+                let entry = self.cardinality.entry(attr.raw()).or_default();
+                if multi {
+                    entry.multi = true;
+                } else {
+                    entry.single = true;
+                }
                 let encoded =
                     encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
                         field: field.to_owned(),
@@ -297,6 +300,12 @@ where
             }
             JsonValue::Number(number) => {
                 let attr = self.number_attribute(field);
+                let entry = self.cardinality.entry(attr.raw()).or_default();
+                if multi {
+                    entry.multi = true;
+                } else {
+                    entry.single = true;
+                }
                 let encoded =
                     encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
@@ -307,6 +316,12 @@ where
             }
             JsonValue::String(text) => {
                 let attr = self.string_attribute(field);
+                let entry = self.cardinality.entry(attr.raw()).or_default();
+                if multi {
+                    entry.multi = true;
+                } else {
+                    entry.single = true;
+                }
                 let encoded =
                     encode_string_to_longstring(text).map_err(|err| JsonImportError::EncodeString {
                         field: field.to_owned(),
@@ -317,13 +332,19 @@ where
             }
             JsonValue::Array(elements) => {
                 for element in elements {
-                    self.stage_field(field, element, pairs, staged)?;
+                    self.stage_field(field, element, pairs, staged, true)?;
                 }
                 Ok(())
             }
             JsonValue::Object(object) => {
                 let child_entity = self.stage_object(object, staged)?;
                 let attr = self.genid_attribute(field);
+                let entry = self.cardinality.entry(attr.raw()).or_default();
+                if multi {
+                    entry.multi = true;
+                } else {
+                    entry.single = true;
+                }
                 let value = GenId::value_from(&child_entity);
                 pairs.push((attr.raw(), value.raw));
                 Ok(())
@@ -370,6 +391,29 @@ fn encode_bool_to_boolean(flag: bool) -> Result<Value<Boolean>, EncodeError> {
     Ok(flag.to_value())
 }
 
+#[derive(Default, Clone, Copy)]
+struct CardinalityHints {
+    single: bool,
+    multi: bool,
+}
+
+fn cardinality_metadata_from_hints(hints: &HashMap<RawId, CardinalityHints>) -> TribleSet {
+    let mut metadata = TribleSet::new();
+    for (attr, hint) in hints {
+        let attr_id =
+            Id::new(*attr).expect("cardinality metadata should never be generated for nil ids");
+        let entity = ExclusiveId::force(attr_id);
+        if hint.single {
+            metadata += entity! { &entity @ metadata::cardinality: "single" };
+        }
+        if hint.multi {
+            metadata += entity! { &entity @ metadata::cardinality: "multi" };
+        }
+    }
+
+    metadata
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,14 +428,7 @@ mod tests {
     fn make_importer<'a>(
         blobs: &'a mut MemoryBlobStore<Blake3>,
     ) -> JsonImporter<'a, MemoryBlobStore<Blake3>> {
-        JsonImporter::new(blobs)
-    }
-
-    fn make_importer_with_salt<'a>(
-        blobs: &'a mut MemoryBlobStore<Blake3>,
-        salt: Option<[u8; 32]>,
-    ) -> JsonImporter<'a, MemoryBlobStore<Blake3>> {
-        JsonImporter::new_with_salt(blobs, salt)
+        JsonImporter::new(blobs, None)
     }
 
     fn assert_attribute_metadata<S: ValueSchema>(metadata: &[Trible], attribute: Id, field: &str) {
@@ -443,14 +480,14 @@ mod tests {
         let payload = serde_json::json!({ "title": "Dune" });
 
         let mut unsalted_blobs = MemoryBlobStore::<Blake3>::new();
-        let mut unsalted = make_importer(&mut unsalted_blobs);
+        let mut unsalted = JsonImporter::<_, Blake3>::new(&mut unsalted_blobs, None);
         let unsalted_roots = unsalted.import_value(&payload).unwrap();
         assert_eq!(unsalted_roots.len(), 1);
         let unsalted_root = unsalted_roots[0];
 
         let salt = [0x55; 32];
         let mut salted_blobs = MemoryBlobStore::<Blake3>::new();
-        let mut salted = make_importer_with_salt(&mut salted_blobs, Some(salt));
+        let mut salted = JsonImporter::<_, Blake3>::new(&mut salted_blobs, Some(salt));
         let salted_roots = salted.import_value(&payload).unwrap();
         assert_eq!(salted_roots.len(), 1);
         let salted_root = salted_roots[0];
@@ -458,7 +495,7 @@ mod tests {
         assert_ne!(unsalted_root, salted_root);
 
         let mut salted_again_blobs = MemoryBlobStore::<Blake3>::new();
-        let mut salted_again = make_importer_with_salt(&mut salted_again_blobs, Some(salt));
+        let mut salted_again = JsonImporter::<_, Blake3>::new(&mut salted_again_blobs, Some(salt));
         let salted_again_roots = salted_again.import_value(&payload).unwrap();
         assert_eq!(salted_again_roots.len(), 1);
         let salted_again_root = salted_again_roots[0];
@@ -736,7 +773,7 @@ mod tests {
     #[test]
     fn string_encoder_can_write_to_blobstore() {
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
-        let mut importer = JsonImporter::<_, Blake3>::new(&mut store);
+        let mut importer = JsonImporter::<_, Blake3>::new(&mut store, None);
 
         let payload = serde_json::json!({ "description": "the spice must flow" });
         let roots = importer.import_value(&payload).unwrap();

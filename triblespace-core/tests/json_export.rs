@@ -21,7 +21,7 @@ fn exports_json_with_cardinality_hints() {
     });
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = JsonImporter::<_, Blake3>::new(&mut blobs);
+    let mut importer = JsonImporter::<_, Blake3>::new(&mut blobs, None);
     let roots = importer.import_value(&payload).expect("import payload");
     let root = roots[0];
 

@@ -13,9 +13,8 @@ deterministic JSON importer:
 
 - `JsonImporter` hashes attribute/value pairs to derive entity identifiers so
   identical inputs reproduce the same entities. Construct it with a blob sink
-  (e.g., a `Workspace`’s store or a `MemoryBlobStore`) and use
-  `JsonImporter::new_with_salt` when you need to avoid collisions by mixing in
-  an explicit 32-byte salt.
+  (e.g., a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte
+  salt when you want to mix in extra entropy to avoid collisions.
 
 The importer uses a fixed mapping for JSON primitives:
 
@@ -60,8 +59,8 @@ The importer buffers the encoded attribute/value pairs for each object, sorts
 them, and feeds the resulting byte stream into a hash protocol. The first 16
 bytes of that digest become the entity identifier, ensuring identical JSON
 inputs produce identical IDs even across separate runs. You can supply an
-optional 32-byte salt via `JsonImporter::new_with_salt` to keep deterministic
-imports from colliding with existing data. Once the identifier is established,
+optional 32-byte salt via the constructor to keep deterministic imports from
+colliding with existing data. Once the identifier is established,
 the importer writes the cached pairs into its trible set via `Trible::new`, and
 exposes the data, metadata, and root entity identifiers for each imported
 document through its accessors.

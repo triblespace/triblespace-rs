@@ -4,16 +4,12 @@
 //! It defines meta attributes that are used to describe other attributes.
 
 use crate::repo::BlobStore;
-use crate::id::ExclusiveId;
 use crate::id::Id;
-use crate::id::RawId;
 use crate::id_hex;
-use crate::macros::entity;
 use crate::prelude::valueschemas;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use core::marker::PhantomData;
-use std::collections::HashMap;
 use triblespace_core_macros::attributes;
 
 /// Describes metadata that can be emitted for documentation or discovery.
@@ -81,44 +77,4 @@ attributes! {
     "F83E75F635BE17647CDCE616380B1CD2" as cardinality: valueschemas::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.
     "91C50E9FBB1F73E892EBD5FFDE46C251" as tag: valueschemas::GenId;
-}
-
-#[derive(Default, Clone, Copy)]
-pub struct CardinalityHints {
-    pub single: bool,
-    pub multi: bool,
-}
-
-pub fn cardinality_metadata_for(data: &TribleSet) -> TribleSet {
-    let mut per_entity_counts: HashMap<(RawId, Id), usize> = HashMap::new();
-    for trible in data.iter() {
-        let attr: RawId = (*trible.a()).into();
-        let entity = *trible.e();
-        *per_entity_counts.entry((attr, entity)).or_default() += 1;
-    }
-
-    let mut hints: HashMap<RawId, CardinalityHints> = HashMap::new();
-    for ((attr, _entity), count) in per_entity_counts {
-        let entry = hints.entry(attr).or_default();
-        if count == 1 {
-            entry.single = true;
-        } else {
-            entry.multi = true;
-        }
-    }
-
-    let mut metadata = TribleSet::new();
-    for (attr, hint) in hints {
-        let attr_id =
-            Id::new(attr).expect("cardinality metadata should never be generated for nil ids");
-        let entity = ExclusiveId::force(attr_id);
-        if hint.single {
-            metadata += entity! { &entity @ cardinality: "single" };
-        }
-        if hint.multi {
-            metadata += entity! { &entity @ cardinality: "multi" };
-        }
-    }
-
-    metadata
 }
