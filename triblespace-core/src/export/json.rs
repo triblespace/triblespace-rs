@@ -3,10 +3,12 @@ use std::fmt;
 
 use serde_json::{Map, Value as JsonValue};
 
+use anybytes::View;
 use crate::blob::schemas::longstring::LongString;
 use crate::id::{Id, RawId};
 use crate::metadata::{self, ConstMetadata};
 use crate::prelude::{find, pattern};
+use crate::repo::BlobStoreGet;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::genid::GenId;
@@ -21,6 +23,9 @@ pub enum ExportError {
         attribute: Id,
         schema: Option<Id>,
     },
+    MissingBlob {
+        hash: String,
+    },
 }
 
 impl fmt::Display for ExportError {
@@ -28,6 +33,9 @@ impl fmt::Display for ExportError {
         match self {
             Self::UnknownSchema { attribute, .. } => {
                 write!(f, "unknown schema for attribute {attribute:x}")
+            }
+            Self::MissingBlob { hash } => {
+                write!(f, "missing blob for handle hash {hash}")
             }
         }
     }
@@ -51,14 +59,11 @@ type CardinalityHints = HashSet<RawId>;
 
 const REFERENCE_KEY: &str = "$ref";
 
-pub fn export_to_json<F>(
+pub fn export_to_json(
     merged: &TribleSet,
     root: Id,
-    mut load_longstring: F,
-) -> Result<JsonValue, ExportError>
-where
-    F: FnMut(Value<Handle<Blake3, LongString>>) -> Option<String>,
-{
+    store: &impl BlobStoreGet<Blake3>,
+) -> Result<JsonValue, ExportError> {
     let cardinality = collect_cardinality_hints(merged);
     let handle_blobs = collect_handle_blob_schemas(merged);
     let meta = collect_attribute_meta(merged);
@@ -71,22 +76,19 @@ where
         &cardinality,
         &handle_blobs,
         &mut visited,
-        &mut load_longstring,
+        store,
     )
 }
 
-fn export_entity<F>(
+fn export_entity(
     merged: &TribleSet,
     entity: Id,
     meta: &HashMap<RawId, MetaInfo>,
     cardinality: &CardinalityHints,
     handle_blobs: &HashMap<Id, Id>,
     visited: &mut HashSet<Id>,
-    load_longstring: &mut F,
-) -> Result<JsonValue, ExportError>
-where
-    F: FnMut(Value<Handle<Blake3, LongString>>) -> Option<String>,
-{
+    store: &impl BlobStoreGet<Blake3>,
+) -> Result<JsonValue, ExportError> {
     if !visited.insert(entity) {
         return Ok(reference_for(entity));
     }
@@ -135,7 +137,7 @@ where
                 cardinality,
                 handle_blobs,
                 visited,
-                load_longstring,
+                store,
                 raw_val,
             )?);
         }
@@ -168,7 +170,7 @@ where
     Ok(JsonValue::Object(map))
 }
 
-fn value_to_json<F>(
+fn value_to_json(
     merged: &TribleSet,
     _attr: Id,
     schema: Id,
@@ -176,12 +178,9 @@ fn value_to_json<F>(
     cardinality: &CardinalityHints,
     handle_blobs: &HashMap<Id, Id>,
     visited: &mut HashSet<Id>,
-    load_longstring: &mut F,
+    store: &impl BlobStoreGet<Blake3>,
     raw: &Value<UnknownValue>,
-) -> Result<JsonValue, ExportError>
-where
-    F: FnMut(Value<Handle<Blake3, LongString>>) -> Option<String>,
-{
+) -> Result<JsonValue, ExportError> {
     if schema == ShortString::id() {
         let v = Value::<ShortString>::new(raw.raw).from_value::<String>();
         return Ok(JsonValue::String(v));
@@ -201,25 +200,31 @@ where
             cardinality,
             handle_blobs,
             visited,
-            load_longstring,
+            store,
         );
     }
 
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = Value::<Handle<Blake3, LongString>>::new(raw.raw);
-        if let Some(text) = load_longstring(handle) {
-            return Ok(JsonValue::String(text));
-        }
         let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
-        return Ok(JsonValue::String(hex::encode(hash.raw)));
+        if let Ok(text) = store.get::<View<str>, LongString>(handle) {
+            return Ok(JsonValue::String(text.to_string()));
+        }
+        return Err(ExportError::MissingBlob {
+            hash: hex::encode(hash.raw),
+        });
     }
 
     if let Some(blob_schema) = handle_blobs.get(&schema) {
         if *blob_schema == LongString::id() {
             let handle = Value::<Handle<Blake3, LongString>>::new(raw.raw);
-            if let Some(text) = load_longstring(handle) {
-                return Ok(JsonValue::String(text));
+            if let Ok(text) = store.get::<View<str>, LongString>(handle) {
+                return Ok(JsonValue::String(text.to_string()));
             }
+            let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
+            return Err(ExportError::MissingBlob {
+                hash: hex::encode(hash.raw),
+            });
         }
     }
 

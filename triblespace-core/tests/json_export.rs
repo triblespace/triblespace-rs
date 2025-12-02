@@ -1,12 +1,9 @@
-use std::collections::HashMap;
-
 use serde_json::json;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;
 use triblespace_core::import::json::JsonImporter;
-use triblespace_core::prelude::blobschemas::LongString;
-use triblespace_core::prelude::valueschemas::{Blake3, Handle};
-use triblespace_core::prelude::ToBlob;
+use triblespace_core::prelude::valueschemas::Blake3;
+use triblespace_core::prelude::BlobStore;
 
 #[test]
 fn exports_json_with_cardinality_hints() {
@@ -28,17 +25,9 @@ fn exports_json_with_cardinality_hints() {
     let mut merged = importer.metadata();
     merged.union(importer.data().clone());
 
-    let mut handles: HashMap<_, _> = HashMap::new();
-    for text in ["Dune", "scifi", "classic", "Frank", "Herbert"] {
-        let handle = ToBlob::<LongString>::to_blob(text.to_string()).get_handle::<Blake3>();
-        handles.insert(handle.raw, text.to_string());
-    }
+    let reader = blobs.reader().expect("reader");
 
-    let mut loader = |handle: triblespace_core::value::Value<Handle<Blake3, LongString>>| {
-        handles.get(&handle.raw).cloned()
-    };
-
-    let exported = export_to_json(&merged, root, &mut loader).expect("export");
+    let exported = export_to_json(&merged, root, &reader).expect("export");
 
     assert_eq!(exported, payload);
 }
