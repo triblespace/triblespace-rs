@@ -27,7 +27,8 @@ under the same attribute identifier. Nested objects recurse automatically,
 linking parent to child entities through `GenId` attributes derived from the
 containing field name. After feeding one or more JSON documents through
 `import_value` or `import_str`, call `data()` to inspect the emitted tribles and
-`metadata()` to retrieve attribute descriptors and cardinality hints. Use
+`metadata()` to retrieve attribute descriptors and multi-value hints (a
+`metadata::tag` edge pointing to `metadata::KIND_MULTI`). Use
 `clear_data()` to drop accumulated statements while keeping attribute caches, or
 `clear()` when you need a completely fresh run.
 
@@ -42,10 +43,11 @@ element.
 
 After an import completes the importer regenerates metadata from its cached
 attribute map. Call `data()` to inspect the emitted tribles and `metadata()` to
-retrieve attribute descriptors and cardinality hints. Merge those descriptors
-into your repository alongside the imported data when you want queries to
-discover the original JSON field names or project datasets by schema without
-repeating the derivation logic.
+retrieve attribute descriptors and multi-value hints (via `metadata::tag`
+pointing to `metadata::KIND_MULTI`). Merge those descriptors into your
+repository alongside the imported data when you want queries to discover the
+original JSON field names or project datasets by schema without repeating the
+derivation logic.
 
 Nested objects recurse automatically. The parent receives a `GenId` attribute
 that points at the child entity, allowing the importer to represent the entire

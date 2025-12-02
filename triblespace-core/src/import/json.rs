@@ -5,12 +5,11 @@ use std::marker::PhantomData;
 use serde_json::{Map, Value as JsonValue};
 
 use crate::attribute::Attribute;
-use crate::blob::ToBlob;
+use crate::blob::schemas::longstring::LongString;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::metadata;
 use crate::metadata::Metadata;
 use crate::macros::entity;
-use crate::prelude::blobschemas::LongString;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -110,7 +109,7 @@ where
     genid_attributes: HashMap<String, Attribute<GenId>>,
     data: TribleSet,
     id_salt: Option<[u8; 32]>,
-    cardinality: HashMap<RawId, CardinalityHints>,
+    multi_metadata: TribleSet,
     store: &'a mut Store,
     _hasher: PhantomData<Hasher>,
 }
@@ -128,7 +127,7 @@ where
             genid_attributes: HashMap::new(),
             data: TribleSet::new(),
             id_salt: salt,
-            cardinality: HashMap::new(),
+            multi_metadata: TribleSet::new(),
             store,
             _hasher: PhantomData,
         }
@@ -187,7 +186,7 @@ where
             metadata.union(attribute.describe(self.store));
         }
 
-        metadata.union(cardinality_metadata_from_hints(&self.cardinality));
+        metadata.union(self.multi_metadata.clone());
 
         metadata
     }
@@ -202,7 +201,7 @@ where
         self.number_attributes.clear();
         self.bool_attributes.clear();
         self.genid_attributes.clear();
-        self.cardinality.clear();
+        self.multi_metadata = TribleSet::new();
     }
 
     fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
@@ -284,11 +283,8 @@ where
             JsonValue::Null => Ok(()),
             JsonValue::Bool(flag) => {
                 let attr = self.bool_attribute(field);
-                let entry = self.cardinality.entry(attr.raw()).or_default();
                 if multi {
-                    entry.multi = true;
-                } else {
-                    entry.single = true;
+                    add_multi_hint(attr.raw(), &mut self.multi_metadata);
                 }
                 let encoded =
                     encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
@@ -300,11 +296,8 @@ where
             }
             JsonValue::Number(number) => {
                 let attr = self.number_attribute(field);
-                let entry = self.cardinality.entry(attr.raw()).or_default();
                 if multi {
-                    entry.multi = true;
-                } else {
-                    entry.single = true;
+                    add_multi_hint(attr.raw(), &mut self.multi_metadata);
                 }
                 let encoded =
                     encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
@@ -316,16 +309,15 @@ where
             }
             JsonValue::String(text) => {
                 let attr = self.string_attribute(field);
-                let entry = self.cardinality.entry(attr.raw()).or_default();
                 if multi {
-                    entry.multi = true;
-                } else {
-                    entry.single = true;
+                    add_multi_hint(attr.raw(), &mut self.multi_metadata);
                 }
-                let encoded =
-                    encode_string_to_longstring(text).map_err(|err| JsonImportError::EncodeString {
+                let encoded = self
+                    .store
+                    .put::<LongString, _>(text.to_owned())
+                    .map_err(|err| JsonImportError::EncodeString {
                         field: field.to_owned(),
-                        source: err,
+                        source: EncodeError::from_error(err),
                     })?;
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
@@ -339,11 +331,8 @@ where
             JsonValue::Object(object) => {
                 let child_entity = self.stage_object(object, staged)?;
                 let attr = self.genid_attribute(field);
-                let entry = self.cardinality.entry(attr.raw()).or_default();
                 if multi {
-                    entry.multi = true;
-                } else {
-                    entry.single = true;
+                    add_multi_hint(attr.raw(), &mut self.multi_metadata);
                 }
                 let value = GenId::value_from(&child_entity);
                 pairs.push((attr.raw(), value.raw));
@@ -377,12 +366,6 @@ where
     }
 }
 
-fn encode_string_to_longstring(
-    text: &str,
-) -> Result<Value<Handle<Blake3, LongString>>, EncodeError> {
-    Ok(ToBlob::<LongString>::to_blob(text.to_owned()).get_handle::<Blake3>())
-}
-
 fn encode_number_to_f256(number: &serde_json::Number) -> Result<Value<F256>, EncodeError> {
     number.try_to_value().map_err(EncodeError::from_error)
 }
@@ -391,27 +374,11 @@ fn encode_bool_to_boolean(flag: bool) -> Result<Value<Boolean>, EncodeError> {
     Ok(flag.to_value())
 }
 
-#[derive(Default, Clone, Copy)]
-struct CardinalityHints {
-    single: bool,
-    multi: bool,
-}
-
-fn cardinality_metadata_from_hints(hints: &HashMap<RawId, CardinalityHints>) -> TribleSet {
-    let mut metadata = TribleSet::new();
-    for (attr, hint) in hints {
-        let attr_id =
-            Id::new(*attr).expect("cardinality metadata should never be generated for nil ids");
-        let entity = ExclusiveId::force(attr_id);
-        if hint.single {
-            metadata += entity! { &entity @ metadata::cardinality: "single" };
-        }
-        if hint.multi {
-            metadata += entity! { &entity @ metadata::cardinality: "multi" };
-        }
-    }
-
-    metadata
+fn add_multi_hint(attr: RawId, metadata: &mut TribleSet) {
+    let attr_id =
+        Id::new(attr).expect("cardinality metadata should never be generated for nil ids");
+    let entity = ExclusiveId::force(attr_id);
+    *metadata += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
 }
 
 #[cfg(test)]
@@ -420,9 +387,11 @@ mod tests {
 
     use crate::blob::schemas::longstring::LongString;
     use crate::blob::MemoryBlobStore;
+    use crate::blob::ToBlob;
     use crate::metadata;
     use crate::value::schemas::shortstring::ShortString;
     use crate::value::ValueSchema;
+    use anybytes::View;
     use f256::f256;
 
     fn make_importer<'a>(
@@ -791,7 +760,20 @@ mod tests {
 
         let trible = data.first().unwrap();
         assert_eq!(trible.a(), &description_attr);
+        let stored_value = trible.v::<Handle<Blake3, LongString>>().clone();
 
-        assert_eq!(store.reader().unwrap().into_iter().count(), 0);
+        let entries: Vec<_> = store.reader().unwrap().into_iter().collect();
+        assert_eq!(entries.len(), 1);
+
+        let (handle, blob) = &entries[0];
+        let handle: Value<Handle<Blake3, LongString>> = handle.clone().transmute();
+        assert_eq!(handle.raw, stored_value.raw);
+
+        let text: View<str> = blob
+            .clone()
+            .transmute::<LongString>()
+            .try_from_blob()
+            .expect("blob should decode to LongString");
+        assert_eq!(text.as_ref(), "the spice must flow");
     }
 }

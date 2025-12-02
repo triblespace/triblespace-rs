@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::json;
 use triblespace_core::blob::MemoryBlobStore;
-use triblespace_core::export::json::{export_to_json, ExportOptions};
+use triblespace_core::export::json::export_to_json;
 use triblespace_core::import::json::JsonImporter;
 use triblespace_core::prelude::blobschemas::LongString;
 use triblespace_core::prelude::valueschemas::{Blake3, Handle};
@@ -38,8 +38,7 @@ fn exports_json_with_cardinality_hints() {
         handles.get(&handle.raw).cloned()
     };
 
-    let exported =
-        export_to_json(&merged, root, &mut loader, ExportOptions::default()).expect("export");
+    let exported = export_to_json(&merged, root, &mut loader).expect("export");
 
     assert_eq!(exported, payload);
 }
