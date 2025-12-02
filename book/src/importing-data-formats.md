@@ -49,6 +49,17 @@ repository alongside the imported data when you want queries to discover the
 original JSON field names or project datasets by schema without repeating the
 derivation logic.
 
+When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
+`MemoryBlobStore`) to `export_to_json` so longstrings can be inlined. If a blob
+is missing or unreadable the exporter returns an error with the handle hash
+instead of silently emitting a placeholder, keeping roundtrips lossless when
+blobs are present. The exporter uses the same fixed mapping in reverse:
+`ShortString` → JSON string, `Handle<Blake3, LongString>` → JSON string (via
+blob lookup), `Boolean` → JSON bool, `F256` → JSON number, `GenId` → inlined
+object (unless already visited). Attributes that use other schemas are ignored
+so JSON roundtrips stay predictable even when the dataset mixes in
+format-specific extensions.
+
 Nested objects recurse automatically. The parent receives a `GenId` attribute
 that points at the child entity, allowing the importer to represent the entire
 object graph as a connected set of tribles. Because those `GenId` attributes are
