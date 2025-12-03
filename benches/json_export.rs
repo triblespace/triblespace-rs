@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,11 +19,12 @@ struct Fixture {
 
 struct PreparedFixture {
     name: &'static str,
+    payload: String,
     merged: TribleSet,
     root: Id,
     reader: Reader,
     _blobs: MemoryBlobStore<Blake3>,
-    trible_count: usize,
+    data_tribles: usize,
     json_bytes: usize,
 }
 
@@ -51,18 +53,18 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .into_iter()
         .filter_map(|fixture| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let (merged, root) = {
+            let (merged, root, data_tribles) = {
                 let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
                     JsonImporter::new(&mut blobs, None);
                 let roots = importer.import_str(&fixture.payload).expect("import JSON");
                 let root = *roots.first().expect("root entity");
 
+                let data = importer.data().clone();
                 let mut merged = importer.metadata();
-                merged.union(importer.data().clone());
-                (merged, root)
+                merged.union(data.clone());
+                (merged, root, data.len())
             };
 
-            let trible_count = merged.len();
             let reader = blobs.reader().expect("reader");
             let json_bytes = export_to_json(&merged, root, &reader)
                 .expect("export JSON")
@@ -71,11 +73,12 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
 
             Some(PreparedFixture {
                 name: fixture.name,
+                payload: fixture.payload,
                 merged,
                 root,
                 reader,
                 _blobs: blobs,
-                trible_count,
+                data_tribles,
                 json_bytes,
             })
         })
@@ -86,7 +89,7 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
     let mut group = c.benchmark_group("json_export/elements");
 
     for prepared in fixtures {
-        group.throughput(Throughput::Elements(prepared.trible_count as u64));
+        group.throughput(Throughput::Elements(prepared.data_tribles as u64));
         group.bench_with_input(
             BenchmarkId::new("json_export", prepared.name),
             prepared,
@@ -134,11 +137,134 @@ fn json_export_benchmark(c: &mut Criterion) {
     bench_bytes(c, &fixtures);
 }
 
+fn bench_serde_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
+    let mut group = c.benchmark_group("serde_roundtrip/elements");
+
+    for prepared in fixtures {
+        group.throughput(Throughput::Elements(prepared.data_tribles as u64));
+        group.bench_with_input(
+            BenchmarkId::new("serde_roundtrip", prepared.name),
+            prepared,
+            |b, prepared| {
+                b.iter(|| {
+                    let value: JsonValue =
+                        serde_json::from_str(&prepared.payload).expect("parse json");
+                    let out = serde_json::to_string(&value).expect("serialize json");
+                    std::hint::black_box(out.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_serde_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
+    let mut group = c.benchmark_group("serde_roundtrip/bytes");
+
+    for prepared in fixtures {
+        group.throughput(Throughput::Bytes(prepared.json_bytes as u64));
+        group.bench_with_input(
+            BenchmarkId::new("serde_roundtrip_to_string", prepared.name),
+            prepared,
+            |b, prepared| {
+                b.iter(|| {
+                    let value: JsonValue =
+                        serde_json::from_str(&prepared.payload).expect("parse json");
+                    let out = serde_json::to_string(&value).expect("serialize json");
+                    std::hint::black_box(out.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn serde_benchmarks(c: &mut Criterion) {
+    let fixtures = prepare_fixtures();
+    bench_serde_elements(c, &fixtures);
+    bench_serde_bytes(c, &fixtures);
+}
+
+fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
+    let mut group = c.benchmark_group("tribles_roundtrip/elements");
+
+    for prepared in fixtures {
+        group.throughput(Throughput::Elements(prepared.data_tribles as u64));
+        group.bench_with_input(
+            BenchmarkId::new("tribles_roundtrip", prepared.name),
+            prepared,
+            |b, prepared| {
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let (merged, root) = {
+                        let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                            JsonImporter::new(&mut blobs, None);
+                        let roots =
+                            importer.import_str(&prepared.payload).expect("import JSON");
+                        let root = *roots.first().expect("root entity");
+                        let mut merged = importer.metadata();
+                        merged.union(importer.data().clone());
+                        (merged, root)
+                    };
+                    let reader = blobs.reader().expect("reader");
+                    let value =
+                        export_to_json(&merged, root, &reader).expect("export JSON");
+                    std::hint::black_box(value);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
+    let mut group = c.benchmark_group("tribles_roundtrip/bytes");
+
+    for prepared in fixtures {
+        group.throughput(Throughput::Bytes(prepared.json_bytes as u64));
+        group.bench_with_input(
+            BenchmarkId::new("tribles_roundtrip_to_string", prepared.name),
+            prepared,
+            |b, prepared| {
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let (merged, root) = {
+                        let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                            JsonImporter::new(&mut blobs, None);
+                        let roots =
+                            importer.import_str(&prepared.payload).expect("import JSON");
+                        let root = *roots.first().expect("root entity");
+                        let mut merged = importer.metadata();
+                        merged.union(importer.data().clone());
+                        (merged, root)
+                    };
+                    let reader = blobs.reader().expect("reader");
+                    let json = export_to_json(&merged, root, &reader)
+                        .expect("export JSON")
+                        .to_string();
+                    std::hint::black_box(json.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn tribles_roundtrip_benchmarks(c: &mut Criterion) {
+    let fixtures = prepare_fixtures();
+    bench_tribles_roundtrip_elements(c, &fixtures);
+    bench_tribles_roundtrip_bytes(c, &fixtures);
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default()
         .sample_size(20)
         .warm_up_time(Duration::from_secs(1));
-    targets = json_export_benchmark
+    targets = json_export_benchmark, serde_benchmarks, tribles_roundtrip_benchmarks
 );
 criterion_main!(benches);
