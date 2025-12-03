@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn assert_attribute_metadata<S: ValueSchema>(metadata: &[Trible], attribute: Id, field: &str) {
-        let name_attr = metadata::name.id();
+        let name_attr = metadata::shortname.id();
         let schema_attr = metadata::value_schema.id();
 
         let entries: Vec<Trible> = metadata
@@ -414,7 +414,7 @@ mod tests {
 
         assert!(
             entries.iter().any(|t| *t.a() == name_attr),
-            "missing metadata::name for {field}"
+            "missing metadata::short_name for {field}"
         );
         assert!(
             entries.iter().any(|t| *t.a() == schema_attr),

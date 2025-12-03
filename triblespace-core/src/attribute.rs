@@ -8,6 +8,7 @@
 use core::marker::PhantomData;
 use std::borrow::Cow;
 
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
 use crate::id::RawId;
@@ -16,6 +17,7 @@ use crate::metadata::{self, Metadata};
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Blake3;
+use crate::value::TryToValue;
 use crate::value::ValueSchema;
 use blake3::Hasher;
 /// A typed reference to an attribute id together with its value schema.
@@ -127,13 +129,19 @@ where
     }
 
     fn describe(&self, blobs: &mut impl crate::repo::BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
         let mut tribles = TribleSet::new();
 
         let entity = ExclusiveId::force(self.id());
 
         if let Some(name) = self.name() {
-            tribles += entity! { &entity @ metadata::name: name };
+            if let Ok(short) = name.try_to_value() {
+                tribles += entity! { &entity @ metadata::shortname: short };
+            }
+
+            let handle = ToBlob::<LongString>::to_blob(name.to_owned());
+            if let Ok(handle) = blobs.put(handle) {
+                tribles += entity! { &entity @ metadata::name: handle };
+            }
         }
 
         tribles += entity! { &entity @ metadata::value_schema: GenId::value_from(S::id()) };

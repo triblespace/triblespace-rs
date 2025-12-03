@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json::JsonImporter;
+use triblespace::core::value::schemas::hash::Blake3;
 
 struct Fixture {
     name: &'static str,
@@ -41,7 +42,8 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
             let payload = fixture.payload.as_str();
 
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer = JsonImporter::new(&mut blobs, None);
+            let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                JsonImporter::new(&mut blobs, None);
             importer
                 .import_str(payload)
                 .expect("import JSON to determine element count");
@@ -69,7 +71,8 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = JsonImporter::new(&mut blobs, None);
+                    let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                        JsonImporter::new(&mut blobs, None);
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
@@ -95,7 +98,8 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                 let payload = fixture.payload.as_str();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = JsonImporter::new(&mut blobs, None);
+                    let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                        JsonImporter::new(&mut blobs, None);
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

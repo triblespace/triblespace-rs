@@ -47,7 +47,10 @@ retrieve attribute descriptors and multi-value hints (via `metadata::tag`
 pointing to `metadata::KIND_MULTI`). Merge those descriptors into your
 repository alongside the imported data when you want queries to discover the
 original JSON field names or project datasets by schema without repeating the
-derivation logic.
+derivation logic. Field names are stored as `metadata::name` handles to
+LongString blobs so arbitrarily long keys survive roundtrips; a
+`metadata::shortname` ShortString is also emitted when the key fits for quick
+human-readable inspection.
 
 When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
 `MemoryBlobStore`) to `export_to_json` so longstrings can be inlined. If a blob

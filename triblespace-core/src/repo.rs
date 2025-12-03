@@ -906,7 +906,7 @@ where
             .map_err(PushError::StorageGet)?;
 
         let Ok((branch_name,)) = find!((name: Value<_>),
-            pattern!(base_branch_meta, [{ metadata::name: ?name }])
+            pattern!(base_branch_meta, [{ metadata::shortname: ?name }])
         )
         .exactly_one() else {
             return Err(PushError::BadBranchMetadata());

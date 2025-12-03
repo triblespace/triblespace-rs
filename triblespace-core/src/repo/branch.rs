@@ -44,7 +44,7 @@ pub fn branch_metadata(
            super::signature_s: signature,
         };
     }
-    metadata += entity! { &metadata_entity @  metadata::name: name  };
+    metadata += entity! { &metadata_entity @  metadata::shortname: name  };
 
     metadata
 }
@@ -69,7 +69,7 @@ pub fn branch_unsigned(
         metadata += entity! { &metadata_entity @  super::head: handle  };
     }
 
-    metadata += entity! { &metadata_entity @  metadata::name: name  };
+    metadata += entity! { &metadata_entity @  metadata::shortname: name  };
 
     metadata
 }

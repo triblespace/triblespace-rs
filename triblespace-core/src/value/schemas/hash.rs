@@ -134,7 +134,7 @@ where
     let mut tribles = TribleSet::new();
 
     let entity = ExclusiveId::force(H::id());
-    tribles += entity! { &entity @ metadata::name: H::NAME };
+        tribles += entity! { &entity @ metadata::shortname: H::NAME };
 
     tribles
 }

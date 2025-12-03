@@ -70,35 +70,48 @@ fn export_entity(
     }
 
     let mut fields: HashMap<Id, (String, Vec<JsonValue>)> = HashMap::new();
+    let mut names: HashMap<Id, String> = HashMap::new();
+
+    for (attr, handle) in find!(
+        (attr: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(merged, [{ ?attr @ metadata::name: ?handle }])
+    ) {
+        if let Ok(text) = store.get::<View<str>, LongString>(handle) {
+            names.insert(attr, text.to_string());
+        }
+    }
+
+    for (attr, name) in find!(
+        (attr: Id, name: Value<crate::value::schemas::shortstring::ShortString>),
+        pattern!(merged, [{ ?attr @ metadata::shortname: ?name }])
+    ) {
+        names.entry(attr).or_insert_with(|| name.from_value::<String>());
+    }
 
     // Boolean
-    for (name, attr, value) in find!(
-        (name: String, attr: Id, value: Value<Boolean>),
+    for (attr, value) in find!(
+        (attr: Id, value: Value<Boolean>),
         temp!((e), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, value),
-            pattern!(merged, [
-                { ?attr @ metadata::name: ?name },
-                { ?attr @ metadata::value_schema: Boolean::id() }
-            ])
+            pattern!(merged, [{ ?attr @ metadata::value_schema: Boolean::id() }])
         ))
     ) {
+        let Some(name) = names.get(&attr).cloned() else { continue };
         let entry = fields.entry(attr).or_insert_with(|| (name, Vec::new()));
         entry.1.push(JsonValue::Bool(value.from_value::<bool>()));
     }
 
     // F256
-    for (name, attr, value) in find!(
-        (name: String, attr: Id, value: Value<F256>),
+    for (attr, value) in find!(
+        (attr: Id, value: Value<F256>),
         temp!((e), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, value),
-            pattern!(merged, [
-                { ?attr @ metadata::name: ?name },
-                { ?attr @ metadata::value_schema: F256::id() }
-            ])
+            pattern!(merged, [{ ?attr @ metadata::value_schema: F256::id() }])
         ))
     ) {
+        let Some(name) = names.get(&attr).cloned() else { continue };
         let entry = fields.entry(attr).or_insert_with(|| (name, Vec::new()));
         let number = serde_json::Number::from_str(&value.from_value::<f256>().to_string())
             .expect("f256 should render as a JSON number");
@@ -106,17 +119,15 @@ fn export_entity(
     }
 
     // GenId (inline entity)
-    for (name, attr, child) in find!(
-        (name: String, attr: Id, child: Value<GenId>),
+    for (attr, child) in find!(
+        (attr: Id, child: Value<GenId>),
         temp!((e), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, child),
-            pattern!(merged, [
-                { ?attr @ metadata::name: ?name },
-                { ?attr @ metadata::value_schema: GenId::id() }
-            ])
+            pattern!(merged, [{ ?attr @ metadata::value_schema: GenId::id() }])
         ))
     ) {
+        let Some(name) = names.get(&attr).cloned() else { continue };
         let child_id = child.from_value::<Id>();
         let value = export_entity(
             merged,
@@ -129,17 +140,15 @@ fn export_entity(
     }
 
     // Handles for longstring
-    for (name, attr, value) in find!(
-        (name: String, attr: Id, value: Value<Handle<Blake3, LongString>>),
+    for (attr, value) in find!(
+        (attr: Id, value: Value<Handle<Blake3, LongString>>),
         temp!((e), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, value),
-            pattern!(merged, [
-                { ?attr @ metadata::name: ?name },
-                { ?attr @ metadata::value_schema: Handle::<Blake3, LongString>::id() }
-            ])
+            pattern!(merged, [{ ?attr @ metadata::value_schema: Handle::<Blake3, LongString>::id() }])
         ))
     ) {
+        let Some(name) = names.get(&attr).cloned() else { continue };
         let hash: Value<Hash<Blake3>> = Handle::to_hash(value);
         let text = store
             .get::<View<str>, LongString>(value)

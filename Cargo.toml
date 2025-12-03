@@ -57,6 +57,10 @@ harness = false
 name = "json_import"
 harness = false
 
+[[bench]]
+name = "json_export"
+harness = false
+
 [profile.bench]
 debug = true
 opt-level = 3
