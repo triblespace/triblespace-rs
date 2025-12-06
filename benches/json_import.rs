@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::fs;
 use std::path::PathBuf;
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::import::json::JsonImporter;
+use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
 
 struct Fixture {
@@ -78,6 +78,19 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                 });
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_ephemeral", fixture.name),
+            fixture,
+            |b, fixture| {
+                let payload = fixture.payload.as_str();
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = EphemeralJsonImporter::new(&mut blobs);
+                    importer.import_str(payload).expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -100,6 +113,19 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
                         JsonImporter::new(&mut blobs, None);
+                    importer.import_str(payload).expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_ephemeral", fixture.name),
+            fixture,
+            |b, fixture| {
+                let payload = fixture.payload.as_str();
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = EphemeralJsonImporter::new(&mut blobs);
                     importer.import_str(payload).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

@@ -118,6 +118,19 @@ where
     _hasher: PhantomData<Hasher>,
 }
 
+/// Lightweight importer that skips metadata emission and deterministic ids.
+pub struct EphemeralJsonImporter<'a, Store>
+where
+    Store: BlobStore<Blake3>,
+{
+    string_attributes: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
+    number_attributes: HashMap<String, Attribute<F256>>,
+    bool_attributes: HashMap<String, Attribute<Boolean>>,
+    genid_attributes: HashMap<String, Attribute<GenId>>,
+    data: TribleSet,
+    store: &'a mut Store,
+}
+
 impl<'a, Store, Hasher> JsonImporter<'a, Store, Hasher>
 where
     Store: BlobStore<Blake3>,
@@ -429,6 +442,174 @@ where
     }
 }
 
+impl<'a, Store> EphemeralJsonImporter<'a, Store>
+where
+    Store: BlobStore<Blake3>,
+{
+    pub fn new(store: &'a mut Store) -> Self {
+        Self {
+            string_attributes: HashMap::new(),
+            number_attributes: HashMap::new(),
+            bool_attributes: HashMap::new(),
+            genid_attributes: HashMap::new(),
+            data: TribleSet::new(),
+            store,
+        }
+    }
+
+    pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
+        let value = serde_json::from_str::<JsonValue>(input).map_err(JsonImportError::Parse)?;
+        self.import_value(&value)
+    }
+
+    pub fn import_value(&mut self, value: &JsonValue) -> Result<Vec<Id>, JsonImportError> {
+        let mut staged = TribleSet::new();
+        let mut roots = Vec::new();
+
+        match value {
+            JsonValue::Object(object) => {
+                let root = self.stage_object(ufoid(), object, &mut staged)?;
+                roots.push(root.forget());
+            }
+            JsonValue::Array(elements) => {
+                for element in elements {
+                    let JsonValue::Object(object) = element else {
+                        return Err(JsonImportError::PrimitiveRoot);
+                    };
+                    let root = self.stage_object(ufoid(), object, &mut staged)?;
+                    roots.push(root.forget());
+                }
+            }
+            _ => return Err(JsonImportError::PrimitiveRoot),
+        }
+
+        self.data.union(staged);
+        Ok(roots)
+    }
+
+    pub fn data(&self) -> &TribleSet {
+        &self.data
+    }
+
+    fn stage_object(
+        &mut self,
+        entity: ExclusiveId,
+        object: &Map<String, JsonValue>,
+        staged: &mut TribleSet,
+    ) -> Result<ExclusiveId, JsonImportError> {
+        for (field, value) in object {
+            self.stage_field(&entity, field, value, staged)?;
+        }
+
+        Ok(entity)
+    }
+
+    fn stage_field(
+        &mut self,
+        entity: &ExclusiveId,
+        field: &str,
+        value: &JsonValue,
+        staged: &mut TribleSet,
+    ) -> Result<(), JsonImportError> {
+        match value {
+            JsonValue::Null => Ok(()),
+            JsonValue::Bool(flag) => {
+                let attr = self.bool_attribute(field);
+                let attr_id = attr.id();
+                let encoded =
+                    encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
+                        field: field.to_owned(),
+                        source: err,
+                    })?;
+                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                Ok(())
+            }
+            JsonValue::Number(number) => {
+                let attr = self.number_attribute(field);
+                let attr_id = attr.id();
+                let encoded =
+                    encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
+                        field: field.to_owned(),
+                        source: err,
+                    })?;
+                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                Ok(())
+            }
+            JsonValue::String(text) => {
+                let attr = self.string_attribute(field);
+                let attr_id = attr.id();
+                let encoded = self
+                    .store
+                    .put::<LongString, _>(text.to_owned())
+                    .map_err(|err| JsonImportError::EncodeString {
+                        field: field.to_owned(),
+                        source: EncodeError::from_error(err),
+                    })?;
+                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                Ok(())
+            }
+            JsonValue::Array(elements) => {
+                for element in elements {
+                    self.stage_field(entity, field, element, staged)?;
+                }
+                Ok(())
+            }
+            JsonValue::Object(object) => {
+                let child_id = self.stage_object(ufoid(), object, staged)?;
+                let attr = self.genid_attribute(field);
+                let attr_id = attr.id();
+                let value = GenId::value_from(&child_id);
+                staged.insert(&Trible::new(entity, &attr_id, &value));
+                Ok(())
+            }
+        }
+    }
+
+    fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
+        if let Some(attribute) = self.string_attributes.get(field) {
+            attribute.clone()
+        } else {
+            let attribute = Attribute::<Handle<Blake3, LongString>>::from_name(field);
+            self.string_attributes
+                .insert(field.to_owned(), attribute.clone());
+            attribute
+        }
+    }
+
+    fn number_attribute(&mut self, field: &str) -> Attribute<F256> {
+        if let Some(attribute) = self.number_attributes.get(field) {
+            attribute.clone()
+        } else {
+            let attribute = Attribute::<F256>::from_name(field);
+            self.number_attributes
+                .insert(field.to_owned(), attribute.clone());
+            attribute
+        }
+    }
+
+    fn bool_attribute(&mut self, field: &str) -> Attribute<Boolean> {
+        if let Some(attribute) = self.bool_attributes.get(field) {
+            attribute.clone()
+        } else {
+            let attribute = Attribute::<Boolean>::from_name(field);
+            self.bool_attributes
+                .insert(field.to_owned(), attribute.clone());
+            attribute
+        }
+    }
+
+    fn genid_attribute(&mut self, field: &str) -> Attribute<GenId> {
+        if let Some(attribute) = self.genid_attributes.get(field) {
+            attribute.clone()
+        } else {
+            let attribute = Attribute::<GenId>::from_name(field);
+            self.genid_attributes
+                .insert(field.to_owned(), attribute.clone());
+            attribute
+        }
+    }
+}
+
 fn encode_number_to_f256(number: &serde_json::Number) -> Result<Value<F256>, EncodeError> {
     number.try_to_value().map_err(EncodeError::from_error)
 }
@@ -585,6 +766,44 @@ mod tests {
         assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, tags_attr, "tags");
         assert_attribute_metadata::<F256>(&metadata, pages_attr, "pages");
         assert_attribute_metadata::<Boolean>(&metadata, available_attr, "available");
+    }
+
+    #[test]
+    fn ephemeral_imports_flat_object() {
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = EphemeralJsonImporter::new(&mut blobs);
+        let payload = serde_json::json!({
+            "title": "Dune",
+            "available": true,
+            "tags": ["scifi", "classic"]
+        });
+
+        let roots = importer.import_value(&payload).unwrap();
+        assert_eq!(roots.len(), 1);
+        let root = roots[0];
+        let data: Vec<_> = importer.data().iter().copied().collect();
+        assert_eq!(data.len(), 4);
+        assert!(data.iter().all(|trible| *trible.e() == root));
+
+        let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();
+        let tags_attr = Attribute::<Handle<Blake3, LongString>>::from_name("tags").id();
+        let available_attr = Attribute::<Boolean>::from_name("available").id();
+
+        let mut tag_values = Vec::new();
+        for trible in &data {
+            let attribute = trible.a();
+            if *attribute == title_attr {
+                let value = trible.v::<Handle<Blake3, LongString>>();
+                let expected = ToBlob::<LongString>::to_blob("Dune").get_handle::<Blake3>();
+                assert_eq!(value.raw, expected.raw);
+            } else if *attribute == tags_attr {
+                tag_values.push(trible.v::<Handle<Blake3, LongString>>().raw);
+            } else if *attribute == available_attr {
+                let value = trible.v::<Boolean>();
+                assert!(value.from_value::<bool>());
+            }
+        }
+        assert_eq!(tag_values.len(), 2);
     }
 
     #[test]
