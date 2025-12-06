@@ -35,6 +35,8 @@ url = "2.5.0"
 serde_json = "1.0"
 f256 = "0.7.0"
 blake3 = "1.5"
+oxigraph = "0.4.11"
+oxrdf = "0.2.4"
 
 [features]
 default = ["triblespace-core/proptest"]
@@ -61,6 +63,13 @@ harness = false
 name = "json_export"
 harness = false
 
+[[bench]]
+name = "json_ld"
+harness = false
+
+[[bench]]
+name = "dataset_vs_tribles"
+harness = false
 [profile.bench]
 debug = true
 opt-level = 3

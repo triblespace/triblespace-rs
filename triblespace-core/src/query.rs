@@ -134,7 +134,13 @@ impl<T: ValueSchema> Variable<T> {
     }
 
     pub fn extract(self, binding: &Binding) -> &Value<T> {
-        Value::as_transmute_raw(binding.get(self.index).unwrap())
+        let raw = binding.get(self.index).unwrap_or_else(|| {
+            panic!(
+                "query variable (idx {}) was never bound; ensure it appears in a constraint or remove it from the projection",
+                self.index
+            )
+        });
+        Value::as_transmute_raw(raw)
     }
 }
 

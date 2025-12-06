@@ -27,9 +27,21 @@ fn exports_json_with_cardinality_hints() {
 
     let reader = blobs.reader().expect("reader");
 
-    let exported = export_to_json(&merged, root, &reader).expect("export");
+    let mut exported = export_to_json(&merged, root, &reader).expect("export");
+    let mut expected = payload.clone();
 
-    assert_eq!(exported, payload);
+    fn sort_array_field(doc: &mut serde_json::Value, field: &str) {
+        if let serde_json::Value::Object(map) = doc {
+            if let Some(serde_json::Value::Array(values)) = map.get_mut(field) {
+                values.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+            }
+        }
+    }
+
+    sort_array_field(&mut exported, "tags");
+    sort_array_field(&mut expected, "tags");
+
+    assert_eq!(exported, expected);
 }
 
 #[test]
