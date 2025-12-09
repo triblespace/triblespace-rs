@@ -16,7 +16,9 @@ use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::{ToValue, TryToValue, ValueSchema};
+use crate::value::{ToValue, Value, ValueSchema};
+use std::str::FromStr;
+use f256::f256;
 
 #[derive(Debug, Clone)]
 enum JsValue {
@@ -111,15 +113,11 @@ where
         &mut self,
         field: &Bytes,
     ) -> Result<Attribute<S>, JsonImportError> {
-        let view = field
-            .clone()
-            .view::<str>()
-            .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
         let handle_val = self
             .store
-            .put::<LongString, _>(view.clone())
+            .put::<LongString, _>(Blob::new(field.clone()))
             .map_err(|err| JsonImportError::EncodeString {
-                field: view.to_string(),
+                field: String::from_utf8_lossy(field.as_ref()).into_owned(),
                 source: EncodeError::from_error(err),
             })?;
         Ok(Attribute::<S>::from_handle(&handle_val))
@@ -131,11 +129,6 @@ where
             metadata: TribleSet::new(),
             store,
         }
-    }
-
-    pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
-        let blob = Blob::<LongString>::new(input.to_owned().into());
-        self.import_blob(blob)
     }
 
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Vec<Id>, JsonImportError> {
@@ -205,45 +198,28 @@ where
                 Ok(())
             }
             JsValue::Number(num) => {
-                let field_name = field
-                    .clone()
-                    .view::<str>()
-                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?
-                    .to_string();
+                let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
                 let attr = self.attr_from_field::<F256>(field)?;
                 self.metadata.union(attr.describe(self.store));
                 let attr_id = attr.id();
-                let num_str = num
-                    .clone()
-                    .view::<str>()
+                let num_str = std::str::from_utf8(num.as_ref())
                     .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
-                let number: serde_json::Number =
-                    serde_json::from_str(num_str.as_ref()).map_err(JsonImportError::Parse)?;
-                let encoded = number
-                    .try_to_value()
-                    .map_err(|err| JsonImportError::EncodeNumber {
-                        field: field_name,
-                        source: EncodeError::from_error(err),
-                    })?;
+                let number = f256::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
+                    field: field_name,
+                    source: EncodeError::from_error(err),
+                })?;
+                let encoded: Value<F256> = number.to_value();
                 staged.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
             JsValue::String(text) => {
-                let field_name = field
-                    .clone()
-                    .view::<str>()
-                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?
-                    .to_string();
+                let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
                 let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
                 self.metadata.union(attr.describe(self.store));
                 let attr_id = attr.id();
-                let view = text
-                    .clone()
-                    .view::<str>()
-                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
                 let encoded = self
                     .store
-                    .put::<LongString, _>(view.clone())
+                    .put::<LongString, _>(Blob::new(text.clone()))
                     .map_err(|err| JsonImportError::EncodeString {
                         field: field_name,
                         source: EncodeError::from_error(err),
@@ -276,13 +252,14 @@ mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
     use crate::value::schemas::hash::Blake3;
+    use crate::blob::ToBlob;
 
     #[test]
     fn parses_simple_object() {
         let input = r#"{ "title": "Dune", "pages": 412 }"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = WinnowJsonImporter::new(&mut blobs);
-        let roots = importer.import_str(input).unwrap();
+        let roots = importer.import_blob(input.to_blob()).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(importer.data().len(), 2);
         assert!(!importer.metadata().is_empty());
