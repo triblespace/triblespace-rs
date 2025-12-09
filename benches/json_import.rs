@@ -1,14 +1,22 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
+use anybytes::Bytes;
+use memmap2::Mmap;
 use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::blob::ToBlob;
+use triblespace::core::blob::Blob;
+use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
 use triblespace::core::import::json_stream::StreamingJsonImporter;
+use triblespace::core::import::json_winnow::WinnowJsonImporter;
 use triblespace::core::value::schemas::hash::Blake3;
 
 struct Fixture {
     name: &'static str,
     payload: String,
+    path: PathBuf,
 }
 
 struct PreparedFixture {
@@ -31,7 +39,7 @@ fn load_fixtures() -> Vec<Fixture> {
                 .collect();
             let payload = fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("failed to load {file} for {name} fixture: {err}"));
-            Fixture { name, payload }
+            Fixture { name, payload, path }
         })
         .collect()
 }
@@ -69,12 +77,12 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
                         JsonImporter::new(&mut blobs, None);
-                    importer.import_str(payload).expect("import JSON");
+                    importer.import_str(payload.as_str()).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
             },
@@ -83,11 +91,11 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import_ephemeral", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer = EphemeralJsonImporter::new(&mut blobs);
-                    importer.import_str(payload).expect("import JSON");
+                    importer.import_str(payload.as_str()).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
             },
@@ -96,12 +104,30 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import_streaming", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer = StreamingJsonImporter::new(&mut blobs);
                     importer
                         .import_slice(payload.as_bytes())
+                        .expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_winnow", fixture.name),
+            fixture,
+            |b, fixture| {
+                let file = File::open(&fixture.path).expect("open fixture");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+                let bytes = Bytes::from_source(mmap);
+                let blob = Blob::<LongString>::new(bytes);
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = WinnowJsonImporter::new(&mut blobs);
+                    importer
+                        .import_blob(blob.clone())
                         .expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
@@ -124,12 +150,12 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
                         JsonImporter::new(&mut blobs, None);
-                    importer.import_str(payload).expect("import JSON");
+                    importer.import_str(payload.as_str()).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
             },
@@ -138,11 +164,11 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import_ephemeral", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer = EphemeralJsonImporter::new(&mut blobs);
-                    importer.import_str(payload).expect("import JSON");
+                    importer.import_str(payload.as_str()).expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
             },
@@ -151,12 +177,30 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             BenchmarkId::new("json_import_streaming", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.as_str();
+                let payload = fixture.payload.clone();
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer = StreamingJsonImporter::new(&mut blobs);
                     importer
                         .import_slice(payload.as_bytes())
+                        .expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_winnow", fixture.name),
+            fixture,
+            |b, fixture| {
+                let file = File::open(&fixture.path).expect("open fixture");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+                let bytes = Bytes::from_source(mmap);
+                let blob = Blob::<LongString>::new(bytes);
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = WinnowJsonImporter::new(&mut blobs);
+                    importer
+                        .import_blob(blob.clone())
                         .expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });

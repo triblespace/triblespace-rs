@@ -30,7 +30,8 @@ trybuild = "1.0.99"
 proptest = "1.6.0"
 rand = "0.8"
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
-anybytes = { version = "0.20.0", features = ["bytes", "zerocopy"] }
+anybytes = { version = "0.20.0", features = ["bytes", "zerocopy", "mmap"] }
+memmap2 = "0.9.5"
 url = "2.5.0"
 serde_json = "1.0"
 f256 = "0.7.0"
