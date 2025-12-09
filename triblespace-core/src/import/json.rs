@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 
@@ -104,16 +103,9 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    field_ids: HashMap<String, Id>,
-    field_handles: HashMap<String, Value<Handle<Blake3, LongString>>>,
-    described_fields: HashMap<Id, ()>,
-    string_attributes: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
-    number_attributes: HashMap<String, Attribute<F256>>,
-    bool_attributes: HashMap<String, Attribute<Boolean>>,
-    genid_attributes: HashMap<String, Attribute<GenId>>,
     data: TribleSet,
+    metadata: TribleSet,
     id_salt: Option<[u8; 32]>,
-    field_metadata: TribleSet,
     store: &'a mut Store,
     _hasher: PhantomData<Hasher>,
 }
@@ -123,10 +115,6 @@ pub struct EphemeralJsonImporter<'a, Store>
 where
     Store: BlobStore<Blake3>,
 {
-    string_attributes: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
-    number_attributes: HashMap<String, Attribute<F256>>,
-    bool_attributes: HashMap<String, Attribute<Boolean>>,
-    genid_attributes: HashMap<String, Attribute<GenId>>,
     data: TribleSet,
     store: &'a mut Store,
 }
@@ -136,68 +124,11 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    fn field_id(&mut self, field: &str) -> Id {
-        if let Some(id) = self.field_ids.get(field) {
-            *id
-        } else {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(field.as_bytes());
-            let digest = hasher.finalize();
-            let mut raw = [0u8; ID_LEN];
-            let lower_half = &digest.as_bytes()[digest.as_bytes().len() - ID_LEN..];
-            raw.copy_from_slice(lower_half);
-            let id = Id::new(raw).expect("field id should not be nil");
-            self.field_ids.insert(field.to_owned(), id);
-            id
-        }
-    }
-
-    fn field_handle(
-        &mut self,
-        field: &str,
-    ) -> Result<Value<Handle<Blake3, LongString>>, JsonImportError> {
-        if let Some(handle) = self.field_handles.get(field) {
-            Ok(*handle)
-        } else {
-            let handle = self
-                .store
-                .put::<LongString, _>(field.to_owned())
-                .map_err(|err| JsonImportError::EncodeString {
-                    field: field.to_owned(),
-                    source: EncodeError::from_error(err),
-                })?;
-            self.field_handles.insert(field.to_owned(), handle);
-            Ok(handle)
-        }
-    }
-
-    fn ensure_field_described(
-        &mut self,
-        field: &str,
-        field_id: Id,
-    ) -> Result<(), JsonImportError> {
-        if self.described_fields.contains_key(&field_id) {
-            return Ok(());
-        }
-        let handle = self.field_handle(field)?;
-        let entity = ExclusiveId::force(field_id);
-        self.field_metadata += entity! { &entity @ metadata::name: handle };
-        self.described_fields.insert(field_id, ());
-        Ok(())
-    }
-
     pub fn new(store: &'a mut Store, salt: Option<[u8; 32]>) -> Self {
         Self {
-            field_ids: HashMap::new(),
-            field_handles: HashMap::new(),
-            described_fields: HashMap::new(),
-            string_attributes: HashMap::new(),
-            number_attributes: HashMap::new(),
-            bool_attributes: HashMap::new(),
-            genid_attributes: HashMap::new(),
             data: TribleSet::new(),
+            metadata: TribleSet::new(),
             id_salt: salt,
-            field_metadata: TribleSet::new(),
             store,
             _hasher: PhantomData,
         }
@@ -237,28 +168,8 @@ where
         &self.data
     }
 
-    pub fn metadata(&mut self) -> TribleSet {
-        let mut metadata = TribleSet::new();
-
-        for attribute in self.string_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.number_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.bool_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        for attribute in self.genid_attributes.values() {
-            metadata.union(attribute.describe(self.store));
-        }
-
-        metadata.union(self.field_metadata.clone());
-
-        metadata
+    pub fn metadata(&self) -> TribleSet {
+        self.metadata.clone()
     }
 
     pub fn clear_data(&mut self) {
@@ -267,58 +178,7 @@ where
 
     pub fn clear(&mut self) {
         self.clear_data();
-        self.string_attributes.clear();
-        self.number_attributes.clear();
-        self.bool_attributes.clear();
-        self.genid_attributes.clear();
-        self.field_metadata = TribleSet::new();
-        self.field_ids.clear();
-        self.field_handles.clear();
-        self.described_fields.clear();
-    }
-
-    fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
-        if let Some(attribute) = self.string_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<Handle<Blake3, LongString>>::from_name(field);
-            self.string_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn number_attribute(&mut self, field: &str) -> Attribute<F256> {
-        if let Some(attribute) = self.number_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<F256>::from_name(field);
-            self.number_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn bool_attribute(&mut self, field: &str) -> Attribute<Boolean> {
-        if let Some(attribute) = self.bool_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<Boolean>::from_name(field);
-            self.bool_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn genid_attribute(&mut self, field: &str) -> Attribute<GenId> {
-        if let Some(attribute) = self.genid_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<GenId>::from_name(field);
-            self.genid_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
+        self.metadata = TribleSet::new();
     }
 
     fn stage_object(
@@ -329,7 +189,7 @@ where
         let mut pairs = Vec::new();
 
         for (field, value) in object {
-            self.stage_field(field, value, &mut pairs, staged, false)?;
+            self.stage_field(field, value, &mut pairs, staged)?;
         }
 
         let entity = self.derive_id(&pairs);
@@ -350,44 +210,43 @@ where
         value: &JsonValue,
         pairs: &mut Vec<(RawId, RawValue)>,
         staged: &mut TribleSet,
-        multi: bool,
     ) -> Result<(), JsonImportError> {
-        let field_id = self.field_id(field);
-        self.ensure_field_described(field, field_id)?;
+        let handle = self
+            .store
+            .put::<LongString, _>(field.to_owned())
+            .map_err(|err| JsonImportError::EncodeString {
+                field: field.to_owned(),
+                source: EncodeError::from_error(err),
+            })?;
+        let field_attr = Attribute::<Handle<Blake3, LongString>>::from_handle(&handle);
+        let field_id = field_attr.id();
+        let entity = ExclusiveId::as_transmute_force(&field_id);
+        self.metadata += entity! { entity @ metadata::name: handle };
 
         match value {
             JsonValue::Null => Ok(()),
             JsonValue::Bool(flag) => {
-                let attr = self.bool_attribute(field);
-                if multi {
-                    add_multi_hint(field_id, &mut self.field_metadata);
-                }
-                let encoded =
-                    encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
-                        field: field.to_owned(),
-                        source: err,
-                    })?;
+                let attr = Attribute::<Boolean>::from_handle(&handle);
+                self.metadata.union(attr.describe(self.store));
+                let encoded = (*flag).to_value();
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
             JsonValue::Number(number) => {
-                let attr = self.number_attribute(field);
-                if multi {
-                    add_multi_hint(field_id, &mut self.field_metadata);
-                }
-                let encoded =
-                    encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
+                let attr = Attribute::<F256>::from_handle(&handle);
+                self.metadata.union(attr.describe(self.store));
+                let encoded = number
+                    .try_to_value()
+                    .map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
-                        source: err,
+                        source: EncodeError::from_error(err),
                     })?;
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
             JsonValue::String(text) => {
-                let attr = self.string_attribute(field);
-                if multi {
-                    add_multi_hint(field_id, &mut self.field_metadata);
-                }
+                let attr = Attribute::<Handle<Blake3, LongString>>::from_handle(&handle);
+                self.metadata.union(attr.describe(self.store));
                 let encoded = self
                     .store
                     .put::<LongString, _>(text.to_owned())
@@ -399,17 +258,17 @@ where
                 Ok(())
             }
             JsonValue::Array(elements) => {
+                let entity = ExclusiveId::as_transmute_force(&field_id);
+                self.metadata += entity! { entity @ metadata::tag: metadata::KIND_MULTI };
                 for element in elements {
-                    self.stage_field(field, element, pairs, staged, true)?;
+                    self.stage_field(field, element, pairs, staged)?;
                 }
                 Ok(())
             }
             JsonValue::Object(object) => {
                 let child_entity = self.stage_object(object, staged)?;
-                let attr = self.genid_attribute(field);
-                if multi {
-                    add_multi_hint(field_id, &mut self.field_metadata);
-                }
+                let attr = Attribute::<GenId>::from_handle(&handle);
+                self.metadata.union(attr.describe(self.store));
                 let value = GenId::value_from(&child_entity);
                 pairs.push((attr.raw(), value.raw));
                 Ok(())
@@ -448,10 +307,6 @@ where
 {
     pub fn new(store: &'a mut Store) -> Self {
         Self {
-            string_attributes: HashMap::new(),
-            number_attributes: HashMap::new(),
-            bool_attributes: HashMap::new(),
-            genid_attributes: HashMap::new(),
             data: TribleSet::new(),
             store,
         }
@@ -514,29 +369,26 @@ where
         match value {
             JsonValue::Null => Ok(()),
             JsonValue::Bool(flag) => {
-                let attr = self.bool_attribute(field);
+                let attr = Attribute::<Boolean>::from_name(field);
                 let attr_id = attr.id();
-                let encoded =
-                    encode_bool_to_boolean(*flag).map_err(|err| JsonImportError::EncodeBool {
-                        field: field.to_owned(),
-                        source: err,
-                    })?;
+                let encoded = (*flag).to_value();
                 staged.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
             JsonValue::Number(number) => {
-                let attr = self.number_attribute(field);
+                let attr = Attribute::<F256>::from_name(field);
                 let attr_id = attr.id();
-                let encoded =
-                    encode_number_to_f256(number).map_err(|err| JsonImportError::EncodeNumber {
+                let encoded = number
+                    .try_to_value()
+                    .map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
-                        source: err,
+                        source: EncodeError::from_error(err),
                     })?;
                 staged.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
             JsonValue::String(text) => {
-                let attr = self.string_attribute(field);
+                let attr = Attribute::<Handle<Blake3, LongString>>::from_name(field);
                 let attr_id = attr.id();
                 let encoded = self
                     .store
@@ -549,14 +401,15 @@ where
                 Ok(())
             }
             JsonValue::Array(elements) => {
+                let entity_ref = ExclusiveId::as_transmute_force(&entity.id);
                 for element in elements {
-                    self.stage_field(entity, field, element, staged)?;
+                    self.stage_field(entity_ref, field, element, staged)?;
                 }
                 Ok(())
             }
             JsonValue::Object(object) => {
                 let child_id = self.stage_object(ufoid(), object, staged)?;
-                let attr = self.genid_attribute(field);
+                let attr = Attribute::<GenId>::from_name(field);
                 let attr_id = attr.id();
                 let value = GenId::value_from(&child_id);
                 staged.insert(&Trible::new(entity, &attr_id, &value));
@@ -564,63 +417,6 @@ where
             }
         }
     }
-
-    fn string_attribute(&mut self, field: &str) -> Attribute<Handle<Blake3, LongString>> {
-        if let Some(attribute) = self.string_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<Handle<Blake3, LongString>>::from_name(field);
-            self.string_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn number_attribute(&mut self, field: &str) -> Attribute<F256> {
-        if let Some(attribute) = self.number_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<F256>::from_name(field);
-            self.number_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn bool_attribute(&mut self, field: &str) -> Attribute<Boolean> {
-        if let Some(attribute) = self.bool_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<Boolean>::from_name(field);
-            self.bool_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-
-    fn genid_attribute(&mut self, field: &str) -> Attribute<GenId> {
-        if let Some(attribute) = self.genid_attributes.get(field) {
-            attribute.clone()
-        } else {
-            let attribute = Attribute::<GenId>::from_name(field);
-            self.genid_attributes
-                .insert(field.to_owned(), attribute.clone());
-            attribute
-        }
-    }
-}
-
-fn encode_number_to_f256(number: &serde_json::Number) -> Result<Value<F256>, EncodeError> {
-    number.try_to_value().map_err(EncodeError::from_error)
-}
-
-fn encode_bool_to_boolean(flag: bool) -> Result<Value<Boolean>, EncodeError> {
-    Ok(flag.to_value())
-}
-
-fn add_multi_hint(field_id: Id, metadata: &mut TribleSet) {
-    let entity = ExclusiveId::force(field_id);
-    *metadata += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
 }
 
 #[cfg(test)]
@@ -631,7 +427,6 @@ mod tests {
     use crate::blob::MemoryBlobStore;
     use crate::blob::ToBlob;
     use crate::metadata;
-    use crate::value::schemas::shortstring::ShortString;
     use crate::value::ValueSchema;
     use anybytes::View;
     use f256::f256;
@@ -643,33 +438,18 @@ mod tests {
     }
 
     fn assert_attribute_metadata<S: ValueSchema>(metadata: &[Trible], attribute: Id, field: &str) {
-        let name_attr = metadata::shortname.id();
         let schema_attr = metadata::value_schema.id();
 
         let entries: Vec<Trible> = metadata
             .iter()
-            .filter(|trible| {
-                *trible.e() == attribute && (*trible.a() == name_attr || *trible.a() == schema_attr)
-            })
+            .filter(|trible| *trible.e() == attribute && *trible.a() == schema_attr)
             .copied()
             .collect();
 
         assert!(
-            entries.iter().any(|t| *t.a() == name_attr),
-            "missing metadata::short_name for {field}"
-        );
-        assert!(
             entries.iter().any(|t| *t.a() == schema_attr),
             "missing metadata::value_schema for {field}"
         );
-
-        let name_value = entries
-            .iter()
-            .find(|t| *t.a() == name_attr)
-            .expect("name metadata should exist")
-            .v::<ShortString>()
-            .from_value::<String>();
-        assert_eq!(name_value, field);
 
         let schema_value = entries
             .iter()

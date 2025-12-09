@@ -6,8 +6,6 @@
 //! fields can be declared as `pub const F: Field<ShortString> = Field::from(hex!("..."));`.
 
 use core::marker::PhantomData;
-use std::borrow::Cow;
-
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
@@ -17,14 +15,13 @@ use crate::metadata::{self, Metadata};
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Blake3;
-use crate::value::TryToValue;
 use crate::value::ValueSchema;
 use blake3::Hasher;
 /// A typed reference to an attribute id together with its value schema.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Attribute<S: ValueSchema> {
     raw: RawId,
-    name: Option<Cow<'static, str>>,
+    handle: Option<crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>>,
     _schema: PhantomData<S>,
 }
 
@@ -32,7 +29,7 @@ impl<S: ValueSchema> Clone for Attribute<S> {
     fn clone(&self) -> Self {
         Self {
             raw: self.raw,
-            name: self.name.clone(),
+            handle: self.handle,
             _schema: PhantomData,
         }
     }
@@ -41,11 +38,8 @@ impl<S: ValueSchema> Clone for Attribute<S> {
 impl<S: ValueSchema> Attribute<S> {
     /// Construct a `Field` from a raw 16-byte id and static attribute name.
     pub const fn from_id_with_name(raw: RawId, name: &'static str) -> Self {
-        Self {
-            raw,
-            name: Some(Cow::Borrowed(name)),
-            _schema: PhantomData,
-        }
+        let _ = name;
+        Self { raw, handle: None, _schema: PhantomData }
     }
 
     /// Construct a `Field` from a raw 16-byte id without attaching a static name.
@@ -53,7 +47,7 @@ impl<S: ValueSchema> Attribute<S> {
     pub const fn from_id(raw: RawId) -> Self {
         Self {
             raw,
-            name: None,
+            handle: None,
             _schema: PhantomData,
         }
     }
@@ -91,7 +85,7 @@ impl<S: ValueSchema> Attribute<S> {
 
     /// Returns the declared name of this attribute, if any.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        None
     }
 
     /// Derive an attribute id from a dynamic name and this schema's metadata.
@@ -112,9 +106,28 @@ impl<S: ValueSchema> Attribute<S> {
         let mut raw = [0u8; crate::id::ID_LEN];
         let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
         raw.copy_from_slice(lower_half);
+        Self::from_handle(&field_handle)
+    }
+
+    /// Construct an attribute from a precomputed LongString handle.
+    ///
+    /// The id derivation matches [`Attribute::from_name`], using the rightmost
+    /// 16 bytes of `Blake3(handle_bytes || schema_id)`. The resulting attribute
+    /// carries no human-readable name; metadata emission will therefore skip
+    /// name/shortname unless a name is later injected.
+    pub fn from_handle(handle: &crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>) -> Self {
+        let mut hasher = Hasher::new();
+        hasher.update(&handle.raw);
+        hasher.update(S::id().as_ref());
+
+        let digest = hasher.finalize();
+        let mut raw = [0u8; crate::id::ID_LEN];
+        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
+        raw.copy_from_slice(lower_half);
+
         Self {
             raw,
-            name: Some(Cow::Owned(name.to_owned())),
+            handle: Some(*handle),
             _schema: PhantomData,
         }
     }
@@ -128,20 +141,13 @@ where
         self.id()
     }
 
-    fn describe(&self, blobs: &mut impl crate::repo::BlobStore<Blake3>) -> TribleSet {
+    fn describe(&self, _blobs: &mut impl crate::repo::BlobStore<Blake3>) -> TribleSet {
         let mut tribles = TribleSet::new();
 
         let entity = ExclusiveId::force(self.id());
 
-        if let Some(name) = self.name() {
-            if let Ok(short) = name.try_to_value() {
-                tribles += entity! { &entity @ metadata::shortname: short };
-            }
-
-            let handle = ToBlob::<LongString>::to_blob(name.to_owned());
-            if let Ok(handle) = blobs.put(handle) {
-                tribles += entity! { &entity @ metadata::name: handle };
-            }
+        if let Some(handle) = self.handle {
+            tribles += entity! { &entity @ metadata::name: handle };
         }
 
         tribles += entity! { &entity @ metadata::value_schema: GenId::value_from(S::id()) };
