@@ -5,12 +5,11 @@ use std::path::PathBuf;
 use anybytes::Bytes;
 use memmap2::Mmap;
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::blob::ToBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
 use triblespace::core::import::json_stream::StreamingJsonImporter;
-use triblespace::core::import::json_winnow::WinnowJsonImporter;
+use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
 
 struct Fixture {
@@ -126,6 +125,44 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let mut importer = WinnowJsonImporter::new(&mut blobs);
+                    importer
+                        .import_blob(blob.clone())
+                        .expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_winnow_det", fixture.name),
+            fixture,
+            |b, fixture| {
+                let file = File::open(&fixture.path).expect("open fixture");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+                let bytes = Bytes::from_source(mmap);
+                let blob = Blob::<LongString>::new(bytes);
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer =
+                        DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+                    importer
+                        .import_blob(blob.clone())
+                        .expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_winnow_det", fixture.name),
+            fixture,
+            |b, fixture| {
+                let file = File::open(&fixture.path).expect("open fixture");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+                let bytes = Bytes::from_source(mmap);
+                let blob = Blob::<LongString>::new(bytes);
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer =
+                        DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
                     importer
                         .import_blob(blob.clone())
                         .expect("import JSON");
