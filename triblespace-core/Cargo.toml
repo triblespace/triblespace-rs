@@ -11,6 +11,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 memmap2 = "0.9.5"
+json-event-parser = "0.2.2"
 zerocopy = { version = "0.8", features = ["derive"] }
 anybytes = { version = "0.20.0", features = ["bytes", "zerocopy"] }
 rand = "0.8"

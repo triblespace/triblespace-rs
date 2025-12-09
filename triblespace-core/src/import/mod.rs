@@ -5,3 +5,4 @@
 //! repository or workspace.
 
 pub mod json;
+pub mod json_stream;

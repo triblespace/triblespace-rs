@@ -11,6 +11,7 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::Id;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
+use triblespace::core::import::json_stream::StreamingJsonImporter;
 use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::{BlobStore, TribleSet};
 
@@ -162,6 +163,17 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         });
     });
 
+    group.bench_function(BenchmarkId::new("parse_streaming", FIXTURE_NAME), |b| {
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = StreamingJsonImporter::new(&mut blobs);
+            let roots = importer
+                .import_slice(import_payload.as_bytes())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
     group.bench_function(BenchmarkId::new("parse_ephemeral", FIXTURE_NAME), |b| {
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
@@ -185,6 +197,21 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             hint::black_box(archive.bytes.len());
         });
     });
+
+    group.bench_function(
+        BenchmarkId::new("parse_streaming_simplearchive", FIXTURE_NAME),
+        |b| {
+            b.iter(|| {
+                let mut blobs = MemoryBlobStore::<Blake3>::new();
+                let mut importer = StreamingJsonImporter::new(&mut blobs);
+                importer
+                    .import_slice(import_payload.as_bytes())
+                    .expect("import JSON-LD as JSON");
+                let archive = SimpleArchive::blob_from(&importer.data().clone());
+                hint::black_box(archive.bytes.len());
+            });
+        },
+    );
 
     group.bench_function(
         BenchmarkId::new("parse_ephemeral_simplearchive", FIXTURE_NAME),

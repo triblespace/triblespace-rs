@@ -26,6 +26,7 @@ pub enum JsonImportError {
     EncodeString { field: String, source: EncodeError },
     EncodeNumber { field: String, source: EncodeError },
     EncodeBool { field: String, source: EncodeError },
+    Syntax(String),
 }
 
 impl fmt::Display for JsonImportError {
@@ -42,6 +43,7 @@ impl fmt::Display for JsonImportError {
             Self::EncodeBool { field, source } => {
                 write!(f, "failed to encode boolean field {field:?}: {source}")
             }
+            Self::Syntax(msg) => write!(f, "failed to parse JSON: {msg}"),
         }
     }
 }
@@ -54,6 +56,7 @@ impl std::error::Error for JsonImportError {
             Self::EncodeString { source, .. }
             | Self::EncodeNumber { source, .. }
             | Self::EncodeBool { source, .. } => Some(source.as_error()),
+            Self::Syntax(_) => None,
         }
     }
 }
