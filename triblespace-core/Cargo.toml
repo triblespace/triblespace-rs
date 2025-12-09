@@ -12,8 +12,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 memmap2 = "0.9.5"
 json-event-parser = "0.2.2"
+winnow = "0.7.13"
 zerocopy = { version = "0.8", features = ["derive"] }
-anybytes = { version = "0.20.0", features = ["bytes", "zerocopy"] }
+anybytes = { version = "0.20.0", features = ["bytes", "zerocopy", "winnow", "mmap"] }
 rand = "0.8"
 digest = "0.10.7"
 ux = "0.1.5"
