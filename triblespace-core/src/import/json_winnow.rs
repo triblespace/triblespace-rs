@@ -1,13 +1,8 @@
-use winnow::combinator::{alt, cut_err, delimited, separated, separated_pair};
-use winnow::prelude::*;
-use winnow::token::take_while;
-
 use crate::attribute::Attribute;
-use anybytes::Bytes;
-use crate::blob::Blob;
 use crate::blob::schemas::longstring::LongString;
-use crate::id::{ExclusiveId, Id};
+use crate::blob::Blob;
 use crate::id::ufoid;
+use crate::id::{ExclusiveId, Id};
 use crate::import::json::{EncodeError, JsonImportError};
 use crate::metadata::Metadata;
 use crate::repo::BlobStore;
@@ -17,85 +12,14 @@ use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::{ToValue, Value, ValueSchema};
-use std::str::FromStr;
+use anybytes::Bytes;
 use f256::f256;
+use std::str::FromStr;
+use winnow::stream::Stream;
 
-#[derive(Debug, Clone)]
-enum JsValue {
-    Null,
-    Bool(bool),
-    Number(Bytes),
-    String(Bytes),
-    Array(Vec<JsValue>),
-    Object(Vec<(Bytes, JsValue)>),
-}
-
-fn ws(input: &mut Bytes) -> ModalResult<()> {
-    take_while(0.., |b: u8| b.is_ascii_whitespace())
-        .void()
-        .parse_next(input)
-}
-
-fn json_string(input: &mut Bytes) -> ModalResult<Bytes> {
-    delimited(
-        b'"',
-        take_while(0.., |b: u8| b != b'"' && b != b'\n' && b != b'\r'),
-        cut_err(b'"'),
-    )
-    .parse_next(input)
-}
-
-fn json_number(input: &mut Bytes) -> ModalResult<Bytes> {
-    take_while(1.., |b: u8| {
-        b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
-    })
-    .parse_next(input)
-}
-
-fn json_value(input: &mut Bytes) -> ModalResult<JsValue> {
-    ws.parse_next(input)?;
-    let val = alt((
-        "null".value(JsValue::Null),
-        "true".value(JsValue::Bool(true)),
-        "false".value(JsValue::Bool(false)),
-        json_string.map(JsValue::String),
-        json_number.map(JsValue::Number),
-        json_array,
-        json_object,
-    ))
-    .parse_next(input)?;
-    ws.parse_next(input)?;
-    Ok(val)
-}
-
-fn json_array(input: &mut Bytes) -> ModalResult<JsValue> {
-    delimited(
-        b'[',
-        separated(0.., json_value, delimited(ws, b',', ws)).map(JsValue::Array),
-        cut_err(b']'),
-    )
-    .parse_next(input)
-}
-
-fn json_object(input: &mut Bytes) -> ModalResult<JsValue> {
-    delimited(
-        b'{',
-        separated(
-            0..,
-            delimited(
-                ws,
-                separated_pair(json_string, cut_err(delimited(ws, ':', ws)), json_value),
-                ws,
-            ),
-            delimited(ws, b',', ws),
-        )
-        .map(JsValue::Object),
-        cut_err(b'}'),
-    )
-    .parse_next(input)
-}
-
-/// Winnow-based JSON importer (non-deterministic ids, emits metadata).
+/// Winnow-based streaming JSON importer (non-deterministic ids, emits metadata).
+/// The parser operates directly on `Bytes` and emits tribles as it walks the JSON
+/// structure—no intermediate AST is built.
 pub struct WinnowJsonImporter<'a, Store>
 where
     Store: BlobStore<Blake3>,
@@ -133,86 +57,147 @@ where
 
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Vec<Id>, JsonImportError> {
         let mut bytes = blob.bytes.clone();
-        let value = json_value(&mut bytes).map_err(|e| JsonImportError::Syntax(e.to_string()))?;
-        self.import_value(&value)
-    }
+        self.skip_ws(&mut bytes);
 
-    fn import_value(&mut self, value: &JsValue) -> Result<Vec<Id>, JsonImportError> {
-        let mut staged = TribleSet::new();
         let mut roots = Vec::new();
-        match value {
-            JsValue::Object(map) => {
-                let root = self.stage_object(ufoid(), map, &mut staged)?;
+        match bytes.peek_token() {
+            Some(b'{') => {
+                let root = ufoid();
+                self.parse_object(&mut bytes, &root)?;
                 roots.push(root.forget());
             }
-            JsValue::Array(items) => {
-                for item in items {
-                    let JsValue::Object(map) = item else {
-                        return Err(JsonImportError::PrimitiveRoot);
-                    };
-                    let root = self.stage_object(ufoid(), map, &mut staged)?;
-                    roots.push(root.forget());
+            Some(b'[') => {
+                self.consume_byte(&mut bytes, b'[')?;
+                self.skip_ws(&mut bytes);
+                if bytes.peek_token() == Some(b']') {
+                    self.consume_byte(&mut bytes, b']')?;
+                } else {
+                    loop {
+                        self.skip_ws(&mut bytes);
+                        if bytes.peek_token() != Some(b'{') {
+                            return Err(JsonImportError::PrimitiveRoot);
+                        }
+                        let root = ufoid();
+                        self.parse_object(&mut bytes, &root)?;
+                        roots.push(root.forget());
+                        self.skip_ws(&mut bytes);
+                        match bytes.peek_token() {
+                            Some(b',') => {
+                                self.consume_byte(&mut bytes, b',')?;
+                                continue;
+                            }
+                            Some(b']') => {
+                                self.consume_byte(&mut bytes, b']')?;
+                                break;
+                            }
+                            _ => return Err(JsonImportError::PrimitiveRoot),
+                        }
+                    }
                 }
             }
             _ => return Err(JsonImportError::PrimitiveRoot),
         }
-        self.data.union(staged);
+
+        self.skip_ws(&mut bytes);
         Ok(roots)
     }
 
-    pub fn data(&self) -> &TribleSet {
-        &self.data
-    }
-
-    pub fn metadata(&self) -> TribleSet {
-        self.metadata.clone()
-    }
-
-    fn stage_object(
+    fn parse_object(
         &mut self,
-        entity: ExclusiveId,
-        fields: &[(Bytes, JsValue)],
-        staged: &mut TribleSet,
-    ) -> Result<ExclusiveId, JsonImportError> {
-        for (field, value) in fields {
-            self.stage_field(&entity, field, value, staged)?;
+        bytes: &mut Bytes,
+        entity: &ExclusiveId,
+    ) -> Result<(), JsonImportError> {
+        self.consume_byte(bytes, b'{')?;
+        self.skip_ws(bytes);
+        if bytes.peek_token() == Some(b'}') {
+            self.consume_byte(bytes, b'}')?;
+            return Ok(());
         }
-        Ok(entity)
+
+        loop {
+            let field = self.parse_string(bytes)?;
+            self.skip_ws(bytes);
+            self.consume_byte(bytes, b':')?;
+            self.skip_ws(bytes);
+            self.parse_value(bytes, &entity, &field)?;
+            self.skip_ws(bytes);
+            match bytes.peek_token() {
+                Some(b',') => {
+                    self.consume_byte(bytes, b',')?;
+                    self.skip_ws(bytes);
+                }
+                Some(b'}') => {
+                    self.consume_byte(bytes, b'}')?;
+                    break;
+                }
+                _ => return Err(JsonImportError::Syntax("unexpected token".into())),
+            }
+        }
+        Ok(())
     }
 
-    fn stage_field(
+    fn parse_array(
         &mut self,
+        bytes: &mut Bytes,
         entity: &ExclusiveId,
         field: &Bytes,
-        value: &JsValue,
-        staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
-        match value {
-            JsValue::Null => Ok(()),
-            JsValue::Bool(flag) => {
+        self.consume_byte(bytes, b'[')?;
+        self.skip_ws(bytes);
+        if bytes.peek_token() == Some(b']') {
+            self.consume_byte(bytes, b']')?;
+            return Ok(());
+        }
+
+        loop {
+            self.parse_value(bytes, entity, field)?;
+            self.skip_ws(bytes);
+            match bytes.peek_token() {
+                Some(b',') => {
+                    self.consume_byte(bytes, b',')?;
+                    self.skip_ws(bytes);
+                }
+                Some(b']') => {
+                    self.consume_byte(bytes, b']')?;
+                    break;
+                }
+                _ => return Err(JsonImportError::Syntax("unexpected token".into())),
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_value(
+        &mut self,
+        bytes: &mut Bytes,
+        entity: &ExclusiveId,
+        field: &Bytes,
+    ) -> Result<(), JsonImportError> {
+        match bytes.peek_token() {
+            Some(b'n') => {
+                self.consume_literal(bytes, b"null")?;
+                Ok(())
+            }
+            Some(b't') => {
+                self.consume_literal(bytes, b"true")?;
                 let attr = self.attr_from_field::<Boolean>(field)?;
                 self.metadata.union(attr.describe(self.store));
                 let attr_id = attr.id();
-                let encoded = (*flag).to_value();
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                let encoded = true.to_value();
+                self.data.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
-            JsValue::Number(num) => {
-                let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
-                let attr = self.attr_from_field::<F256>(field)?;
+            Some(b'f') => {
+                self.consume_literal(bytes, b"false")?;
+                let attr = self.attr_from_field::<Boolean>(field)?;
                 self.metadata.union(attr.describe(self.store));
                 let attr_id = attr.id();
-                let num_str = std::str::from_utf8(num.as_ref())
-                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
-                let number = f256::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
-                    field: field_name,
-                    source: EncodeError::from_error(err),
-                })?;
-                let encoded: Value<F256> = number.to_value();
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                let encoded = false.to_value();
+                self.data.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
-            JsValue::String(text) => {
+            Some(b'"') => {
+                let text = self.parse_string(bytes)?;
                 let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
                 let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
                 self.metadata.union(attr.describe(self.store));
@@ -224,26 +209,96 @@ where
                         field: field_name,
                         source: EncodeError::from_error(err),
                     })?;
-                staged.insert(&Trible::new(entity, &attr_id, &encoded));
+                self.data.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
-            JsValue::Array(elements) => {
-                let entity_ref = ExclusiveId::as_transmute_force(&entity.id);
-                for element in elements {
-                    self.stage_field(entity_ref, field, element, staged)?;
-                }
-                Ok(())
-            }
-            JsValue::Object(object) => {
-                let child_id = self.stage_object(ufoid(), object, staged)?;
+            Some(b'{') => {
+                let child = ufoid();
+                self.parse_object(bytes, &child)?;
                 let attr = self.attr_from_field::<GenId>(field)?;
                 self.metadata.union(attr.describe(self.store));
                 let attr_id = attr.id();
-                let value = GenId::value_from(&child_id);
-                staged.insert(&Trible::new(entity, &attr_id, &value));
+                let value = GenId::value_from(&child);
+                self.data.insert(&Trible::new(entity, &attr_id, &value));
+                Ok(())
+            }
+            Some(b'[') => self.parse_array(bytes, entity, field),
+            _ => {
+                let num = self.parse_number(bytes)?;
+                let num_str = std::str::from_utf8(num.as_ref())
+                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
+                let number = f256::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
+                    field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                    source: EncodeError::from_error(err),
+                })?;
+                let attr = self.attr_from_field::<F256>(field)?;
+                self.metadata.union(attr.describe(self.store));
+                let attr_id = attr.id();
+                let encoded: Value<F256> = number.to_value();
+                self.data.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
         }
+    }
+
+    fn skip_ws(&self, bytes: &mut Bytes) {
+        while matches!(bytes.peek_token(), Some(b) if b.is_ascii_whitespace()) {
+            bytes.pop_front();
+        }
+    }
+
+    fn consume_byte(&self, bytes: &mut Bytes, expected: u8) -> Result<(), JsonImportError> {
+        match bytes.pop_front() {
+            Some(b) if b == expected => Ok(()),
+            _ => Err(JsonImportError::Syntax("unexpected token".into())),
+        }
+    }
+
+    fn consume_literal(&self, bytes: &mut Bytes, literal: &[u8]) -> Result<(), JsonImportError> {
+        for expected in literal {
+            self.consume_byte(bytes, *expected)?;
+        }
+        Ok(())
+    }
+
+    fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
+        self.consume_byte(bytes, b'"')?;
+        let mut out = Vec::new();
+        while let Some(b) = bytes.pop_front() {
+            if b == b'"' {
+                return Ok(Bytes::from(out));
+            }
+            if b == b'\n' || b == b'\r' {
+                return Err(JsonImportError::Syntax("unterminated string".into()));
+            }
+            out.push(b);
+        }
+        Err(JsonImportError::Syntax("unterminated string".into()))
+    }
+
+    fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
+        let mut out = Vec::new();
+        while let Some(b) = bytes.peek_token() {
+            if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
+            {
+                out.push(b);
+                bytes.pop_front();
+            } else {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(JsonImportError::Syntax("expected number".into()));
+        }
+        Ok(Bytes::from(out))
+    }
+
+    pub fn data(&self) -> &TribleSet {
+        &self.data
+    }
+
+    pub fn metadata(&self) -> TribleSet {
+        self.metadata.clone()
     }
 }
 
@@ -251,8 +306,8 @@ where
 mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
-    use crate::value::schemas::hash::Blake3;
     use crate::blob::ToBlob;
+    use crate::value::schemas::hash::Blake3;
 
     #[test]
     fn parses_simple_object() {
