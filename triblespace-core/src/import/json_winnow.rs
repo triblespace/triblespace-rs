@@ -20,6 +20,7 @@ use f256::f256;
 use std::str::FromStr;
 use winnow::stream::Stream;
 use std::char;
+use std::collections::HashMap;
 
 /// Winnow-based streaming JSON importer (non-deterministic ids, emits metadata).
 /// The parser operates directly on `Bytes` and emits tribles as it walks the JSON
@@ -29,8 +30,11 @@ where
     Store: BlobStore<Blake3>,
 {
     data: TribleSet,
-    metadata: TribleSet,
     store: &'a mut Store,
+    bool_attrs: HashMap<String, Attribute<Boolean>>,
+    num_attrs: HashMap<String, Attribute<F256>>,
+    str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<String, Attribute<GenId>>,
 }
 
 impl<'a, Store> WinnowJsonImporter<'a, Store>
@@ -51,11 +55,57 @@ where
         Ok(Attribute::<S>::from_handle(&handle_val))
     }
 
+    fn bool_attr(&mut self, field: &Bytes) -> Result<Attribute<Boolean>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.bool_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<Boolean>(field)?;
+        self.bool_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.num_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<F256>(field)?;
+        self.num_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn str_attr(
+        &mut self,
+        field: &Bytes,
+    ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.str_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
+        self.str_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn genid_attr(&mut self, field: &Bytes) -> Result<Attribute<GenId>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.genid_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<GenId>(field)?;
+        self.genid_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
     pub fn new(store: &'a mut Store) -> Self {
         Self {
             data: TribleSet::new(),
-            metadata: TribleSet::new(),
             store,
+            bool_attrs: HashMap::new(),
+            num_attrs: HashMap::new(),
+            str_attrs: HashMap::new(),
+            genid_attrs: HashMap::new(),
         }
     }
 
@@ -184,8 +234,7 @@ where
             }
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
-                let attr = self.attr_from_field::<Boolean>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.bool_attr(field)?;
                 let attr_id = attr.id();
                 let encoded = true.to_value();
                 self.data.insert(&Trible::new(entity, &attr_id, &encoded));
@@ -193,8 +242,7 @@ where
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
-                let attr = self.attr_from_field::<Boolean>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.bool_attr(field)?;
                 let attr_id = attr.id();
                 let encoded = false.to_value();
                 self.data.insert(&Trible::new(entity, &attr_id, &encoded));
@@ -203,8 +251,7 @@ where
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
                 let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
-                let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.str_attr(field)?;
                 let attr_id = attr.id();
                 let encoded = self
                     .store
@@ -219,8 +266,7 @@ where
             Some(b'{') => {
                 let child = ufoid();
                 self.parse_object(bytes, &child)?;
-                let attr = self.attr_from_field::<GenId>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.genid_attr(field)?;
                 let attr_id = attr.id();
                 let value = GenId::value_from(&child);
                 self.data.insert(&Trible::new(entity, &attr_id, &value));
@@ -235,8 +281,7 @@ where
                     field: String::from_utf8_lossy(field.as_ref()).into_owned(),
                     source: EncodeError::from_error(err),
                 })?;
-                let attr = self.attr_from_field::<F256>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.num_attr(field)?;
                 let attr_id = attr.id();
                 let encoded: Value<F256> = number.to_value();
                 self.data.insert(&Trible::new(entity, &attr_id, &encoded));
@@ -351,9 +396,22 @@ where
         &self.data
     }
 
-pub fn metadata(&self) -> TribleSet {
-    self.metadata.clone()
-}
+    pub fn metadata(&mut self) -> TribleSet {
+        let mut meta = TribleSet::new();
+        for attr in self.bool_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.num_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.str_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.genid_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        meta
+    }
 }
 
 /// Deterministic variant that derives entity ids from attribute/value pairs.
@@ -363,8 +421,11 @@ where
     Hasher: HashProtocol,
 {
     data: TribleSet,
-    metadata: TribleSet,
     store: &'a mut Store,
+    bool_attrs: HashMap<String, Attribute<Boolean>>,
+    num_attrs: HashMap<String, Attribute<F256>>,
+    str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<String, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     _hasher: std::marker::PhantomData<Hasher>,
 }
@@ -388,11 +449,57 @@ where
         Ok(Attribute::<S>::from_handle(&handle_val))
     }
 
+    fn bool_attr(&mut self, field: &Bytes) -> Result<Attribute<Boolean>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.bool_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<Boolean>(field)?;
+        self.bool_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.num_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<F256>(field)?;
+        self.num_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn str_attr(
+        &mut self,
+        field: &Bytes,
+    ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.str_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
+        self.str_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
+    fn genid_attr(&mut self, field: &Bytes) -> Result<Attribute<GenId>, JsonImportError> {
+        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        if let Some(attr) = self.genid_attrs.get(&key) {
+            return Ok(attr.clone());
+        }
+        let attr = self.attr_from_field::<GenId>(field)?;
+        self.genid_attrs.insert(key, attr.clone());
+        Ok(attr)
+    }
+
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
             data: TribleSet::new(),
-            metadata: TribleSet::new(),
             store,
+            bool_attrs: HashMap::new(),
+            num_attrs: HashMap::new(),
+            str_attrs: HashMap::new(),
+            genid_attrs: HashMap::new(),
             id_salt,
             _hasher: std::marker::PhantomData,
         }
@@ -536,23 +643,20 @@ where
             }
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
-                let attr = self.attr_from_field::<Boolean>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.bool_attr(field)?;
                 pairs.push((attr.raw().into(), true.to_value().raw));
                 Ok(())
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
-                let attr = self.attr_from_field::<Boolean>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.bool_attr(field)?;
                 pairs.push((attr.raw().into(), false.to_value().raw));
                 Ok(())
             }
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
                 let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
-                let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.str_attr(field)?;
                 let handle = self
                     .store
                     .put::<LongString, _>(Blob::new(text.clone()))
@@ -566,8 +670,7 @@ where
             Some(b'{') => {
                 let (child, child_staged) = self.parse_object(bytes)?;
                 staged.union(child_staged);
-                let attr = self.attr_from_field::<GenId>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.genid_attr(field)?;
                 let value = GenId::value_from(&child);
                 pairs.push((attr.raw().into(), value.raw));
                 Ok(())
@@ -581,8 +684,7 @@ where
                     field: String::from_utf8_lossy(field.as_ref()).into_owned(),
                     source: EncodeError::from_error(err),
                 })?;
-                let attr = self.attr_from_field::<F256>(field)?;
-                self.metadata.union(attr.describe(self.store));
+                let attr = self.num_attr(field)?;
                 let encoded: Value<F256> = number.to_value();
                 pairs.push((attr.raw().into(), encoded.raw));
                 Ok(())
@@ -715,8 +817,21 @@ where
         &self.data
     }
 
-    pub fn metadata(&self) -> TribleSet {
-        self.metadata.clone()
+    pub fn metadata(&mut self) -> TribleSet {
+        let mut meta = TribleSet::new();
+        for attr in self.bool_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.num_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.str_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        for attr in self.genid_attrs.values() {
+            meta.union(attr.describe(self.store));
+        }
+        meta
     }
 }
 
