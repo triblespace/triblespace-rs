@@ -312,6 +312,25 @@ where
 
     fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
         self.consume_byte(bytes, b'"')?;
+        {
+            use winnow::error::InputError;
+            use winnow::token::take_while;
+            use winnow::Parser;
+
+            let mut tentative = bytes.clone();
+            let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+                b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
+            });
+
+            if let Ok(prefix) = segment.parse_next(&mut tentative) {
+                if tentative.peek_token() == Some(b'"') {
+                    tentative.pop_front();
+                    *bytes = tentative;
+                    return Ok(prefix);
+                }
+            }
+        }
+
         let data: &[u8] = bytes;
         let mut i = 0;
         let mut escaped = false;
