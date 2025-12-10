@@ -364,34 +364,7 @@ where
                         b'n' => out.push(b'\n'),
                         b'r' => out.push(b'\r'),
                         b't' => out.push(b'\t'),
-                        b'u' => {
-                            let mut code: u32 = 0;
-                            for _ in 0..4 {
-                                let h = bytes.pop_front().ok_or_else(|| {
-                                    JsonImportError::Syntax("unterminated unicode escape".into())
-                                })?;
-                                code = (code << 4)
-                                    | match h {
-                                        b'0'..=b'9' => (h - b'0') as u32,
-                                        b'a'..=b'f' => (h - b'a' + 10) as u32,
-                                        b'A'..=b'F' => (h - b'A' + 10) as u32,
-                                        _ => {
-                                            return Err(JsonImportError::Syntax(
-                                                "invalid unicode escape".into(),
-                                            ))
-                                        }
-                                    };
-                            }
-                            if let Some(ch) = char::from_u32(code) {
-                                let mut buf = [0u8; 4];
-                                let encoded = ch.encode_utf8(&mut buf);
-                                out.extend_from_slice(encoded.as_bytes());
-                            } else {
-                                return Err(JsonImportError::Syntax(
-                                    "invalid unicode escape".into(),
-                                ));
-                            }
-                        }
+                        b'u' => out.extend_from_slice(&self.parse_unicode_escape(bytes)?),
                         _ => {
                             return Err(JsonImportError::Syntax("invalid escape sequence".into()))
                         }
@@ -417,6 +390,40 @@ where
         number
             .parse_next(bytes)
             .map_err(|_: InputError<Bytes>| JsonImportError::Syntax("expected number".into()))
+    }
+
+    fn parse_unicode_escape(&self, bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
+        use winnow::error::InputError;
+        use winnow::token::take;
+        use winnow::Parser;
+
+        let mut grab = take::<_, _, InputError<Bytes>>(4usize);
+        let hex = grab
+            .parse_next(bytes)
+            .map_err(|_| JsonImportError::Syntax("unterminated unicode escape".into()))?;
+
+        let mut code: u32 = 0;
+        for h in hex.as_ref() {
+            code = (code << 4)
+                | match h {
+                    b'0'..=b'9' => (h - b'0') as u32,
+                    b'a'..=b'f' => (h - b'a' + 10) as u32,
+                    b'A'..=b'F' => (h - b'A' + 10) as u32,
+                    _ => {
+                        return Err(JsonImportError::Syntax(
+                            "invalid unicode escape".into(),
+                        ))
+                    }
+                };
+        }
+
+        if let Some(ch) = char::from_u32(code) {
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            Ok(encoded.as_bytes().to_vec())
+        } else {
+            Err(JsonImportError::Syntax("invalid unicode escape".into()))
+        }
     }
 
     pub fn data(&self) -> &TribleSet {
@@ -892,25 +899,26 @@ mod tests {
         assert!(!importer.metadata().is_empty());
     }
 
-    fn read_text(
+    fn extract_handle_raw(
         importer: &WinnowJsonImporter<'_, MemoryBlobStore<Blake3>>,
-        blobs: &MemoryBlobStore<Blake3>,
         expected_attr: &str,
-    ) -> String {
+    ) -> RawValue {
         let attr = Attribute::<Handle<Blake3, LongString>>::from_name(expected_attr).id();
         let trible = importer
             .data()
             .iter()
             .find(|t| *t.a() == attr)
             .expect("missing string trible");
-        let handle = trible.v::<Handle<Blake3, LongString>>();
+        trible.v::<Handle<Blake3, LongString>>().raw
+    }
 
+    fn read_text(blobs: &mut MemoryBlobStore<Blake3>, handle_raw: RawValue) -> String {
         let entries: Vec<_> = blobs.reader().unwrap().into_iter().collect();
         let (_, blob) = entries
             .iter()
             .find(|(h, _)| {
                 let h: Value<Handle<Blake3, LongString>> = (*h).transmute();
-                h.raw == handle.raw
+                h.raw == handle_raw
             })
             .expect("handle not found in blob store");
 
@@ -928,7 +936,9 @@ mod tests {
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = WinnowJsonImporter::new(&mut blobs);
         importer.import_blob(input.to_blob()).unwrap();
-        let text = read_text(&importer, &blobs, "text");
+        let handle = extract_handle_raw(&importer, "text");
+        drop(importer);
+        let text = read_text(&mut blobs, handle);
         assert_eq!(text, "hello\nworld");
     }
 
@@ -938,7 +948,9 @@ mod tests {
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = WinnowJsonImporter::new(&mut blobs);
         importer.import_blob(input.to_blob()).unwrap();
-        let text = read_text(&importer, &blobs, "text");
+        let handle = extract_handle_raw(&importer, "text");
+        drop(importer);
+        let text = read_text(&mut blobs, handle);
         assert_eq!(text, "smile: \u{263A}");
     }
 }
