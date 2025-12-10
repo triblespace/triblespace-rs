@@ -80,15 +80,17 @@ fn write_entity(
         return Ok(());
     }
 
-    let multi_fields: HashSet<_> = find!(
+    let mut multi_flags: HashMap<RawValue, bool> = HashMap::new();
+    find!(
         (name_handle: Value<Handle<Blake3, LongString>>),
         temp!((field), pattern!(merged, [
             { ?field @ metadata::name: ?name_handle },
             { ?field @ metadata::tag: metadata::KIND_MULTI }
         ]))
     )
-    .map(|(name_handle,)| name_handle.raw)
-    .collect();
+    .for_each(|(name_handle,)| {
+        multi_flags.insert(name_handle.raw, true);
+    });
 
     let mut field_values: Vec<(
         RawValue,
@@ -135,7 +137,7 @@ fn write_entity(
             continue;
         }
 
-        let card_multi = multi_fields.contains(&name_raw) || values.len() > 1;
+        let card_multi = multi_flags.get(&name_raw).copied().unwrap_or(false) || values.len() > 1;
         let rendered = if card_multi {
             ValueRepr::Array(values)
         } else {
@@ -152,7 +154,7 @@ fn write_entity(
         }
         write_escaped_str(&name, out);
         out.push(':');
-        render_value(&value, out);
+        render_value(&value, ctx, out);
     }
     out.push('}');
     Ok(())
@@ -168,14 +170,14 @@ fn match_schema_str(
     if schema == Boolean::id() {
         let value = value.transmute::<Boolean>();
         return Some(Ok(if value.from_value::<bool>() {
-            ValueRepr::Bare("true".to_string())
+            ValueRepr::Bool(true)
         } else {
-            ValueRepr::Bare("false".to_string())
+            ValueRepr::Bool(false)
         }));
     }
     if schema == F256::id() {
         let value = value.transmute::<F256>();
-        return Some(Ok(ValueRepr::Bare(value.from_value::<f256>().to_string())));
+        return Some(Ok(ValueRepr::Num(value.from_value::<f256>())));
     }
     if schema == GenId::id() {
         let child_id = value.transmute::<GenId>().from_value::<Id>();
@@ -183,33 +185,47 @@ fn match_schema_str(
         if let Err(err) = write_entity(merged, child_id, visited, ctx, &mut buf) {
             return Some(Err(err));
         }
-        return Some(Ok(ValueRepr::Bare(buf)));
+        return Some(Ok(ValueRepr::Inline(buf)));
     }
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
-        return Some(resolve_string(ctx, handle).map(ValueRepr::String));
+        return Some(Ok(ValueRepr::Str(handle)));
     }
 
     None
 }
 
 enum ValueRepr {
-    Bare(String),
-    String(String),
+    Inline(String),
+    Bool(bool),
+    Num(f256),
+    Str(Value<Handle<Blake3, LongString>>),
     Array(Vec<ValueRepr>),
 }
 
-fn render_value(value: &ValueRepr, out: &mut String) {
+fn render_value(
+    value: &ValueRepr,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
+    out: &mut String,
+) {
     match value {
-        ValueRepr::Bare(raw) => out.push_str(raw),
-        ValueRepr::String(text) => write_escaped_str(text, out),
+        ValueRepr::Inline(raw) => out.push_str(raw),
+        ValueRepr::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        ValueRepr::Num(num) => out.push_str(&num.to_string()),
+        ValueRepr::Str(handle) => {
+            let text = resolve_string(ctx, *handle);
+            match text {
+                Ok(text) => write_escaped_str(&text, out),
+                Err(err) => write_escaped_str(&format!("<blob missing: {err}>"), out),
+            }
+        }
         ValueRepr::Array(values) => {
             out.push('[');
             for (idx, val) in values.iter().enumerate() {
                 if idx > 0 {
                     out.push(',');
                 }
-                render_value(val, out);
+                render_value(val, ctx, out);
             }
             out.push(']');
         }
