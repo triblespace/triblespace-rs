@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fmt::Write as FmtWrite;
 use std::str::FromStr;
 
 use serde_json::{Map, Value as JsonValue};
@@ -179,7 +180,9 @@ fn write_entity(
     out: &mut String,
 ) -> Result<(), ExportError> {
     if !visited.insert(entity) {
-        out.push_str(&reference_for(entity).to_string());
+        out.push_str("{\"$ref\":\"");
+        let _ = write!(out, "{entity:x}");
+        out.push_str("\"}");
         return Ok(());
     }
 
@@ -216,7 +219,7 @@ fn write_entity(
 
     field_values.sort_by_key(|(name_raw, ..)| *name_raw);
 
-    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut entries: Vec<(String, ValueRepr)> = Vec::new();
     let mut iter = field_values.into_iter().peekable();
     while let Some((name_raw, name_handle, schema, value)) = iter.next() {
         let mut values = vec![(schema, value)];
@@ -241,32 +244,23 @@ fn write_entity(
         }
 
         let card_multi = multi_fields.contains(&name_raw) || values.len() > 1;
-        let value = if card_multi {
-            let mut buf = String::from("[");
-            for (idx, val) in values.into_iter().enumerate() {
-                if idx > 0 {
-                    buf.push(',');
-                }
-                buf.push_str(&val);
-            }
-            buf.push(']');
-            buf
+        let rendered = if card_multi {
+            ValueRepr::Array(values)
         } else {
             values.into_iter().next().expect("len guard ensured a value")
         };
 
-        entries.push((name, value));
+        entries.push((name, rendered));
     }
 
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
     out.push('{');
     for (idx, (name, value)) in entries.into_iter().enumerate() {
         if idx > 0 {
             out.push(',');
         }
-        out.push_str(&serde_json::to_string(&name).expect("serialize name"));
+        write_escaped_str(&name, out);
         out.push(':');
-        out.push_str(&value);
+        render_value(&value, out);
     }
     out.push('}');
     Ok(())
@@ -278,18 +272,18 @@ fn match_schema_str(
     value: Value<UnknownValue>,
     visited: &mut HashSet<Id>,
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-) -> Option<Result<String, ExportError>> {
+) -> Option<Result<ValueRepr, ExportError>> {
     if schema == Boolean::id() {
         let value = value.transmute::<Boolean>();
         return Some(Ok(if value.from_value::<bool>() {
-            "true".to_string()
+            ValueRepr::Bare("true".to_string())
         } else {
-            "false".to_string()
+            ValueRepr::Bare("false".to_string())
         }));
     }
     if schema == F256::id() {
         let value = value.transmute::<F256>();
-        return Some(Ok(value.from_value::<f256>().to_string()));
+        return Some(Ok(ValueRepr::Bare(value.from_value::<f256>().to_string())));
     }
     if schema == GenId::id() {
         let child_id = value.transmute::<GenId>().from_value::<Id>();
@@ -297,16 +291,57 @@ fn match_schema_str(
         if let Err(err) = write_entity(merged, child_id, visited, ctx, &mut buf) {
             return Some(Err(err));
         }
-        return Some(Ok(buf));
+        return Some(Ok(ValueRepr::Bare(buf)));
     }
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
-        return Some(
-            resolve_string(ctx, handle).map(|s| serde_json::to_string(&s).expect("string escape")),
-        );
+        return Some(resolve_string(ctx, handle).map(ValueRepr::String));
     }
 
     None
+}
+
+enum ValueRepr {
+    Bare(String),
+    String(String),
+    Array(Vec<ValueRepr>),
+}
+
+fn render_value(value: &ValueRepr, out: &mut String) {
+    match value {
+        ValueRepr::Bare(raw) => out.push_str(raw),
+        ValueRepr::String(text) => write_escaped_str(text, out),
+        ValueRepr::Array(values) => {
+            out.push('[');
+            for (idx, val) in values.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                render_value(val, out);
+            }
+            out.push(']');
+        }
+    }
+}
+
+fn write_escaped_str(text: &str, out: &mut String) {
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c < '\u{20}' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 struct ExportCtx<'a, Store: BlobStoreGet<Blake3>> {
