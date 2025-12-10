@@ -1,19 +1,21 @@
+use anybytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::Dataset;
-use triblespace::prelude::BlobSchema;
+use serde_json::Value as JsonValue;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, hint};
-use serde_json::Value as JsonValue;
+use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::id::Id;
+use triblespace::core::blob::Blob;
 use triblespace::core::export::json::export_to_json;
+use triblespace::core::id::Id;
 use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
-use triblespace::core::import::json_stream::StreamingJsonImporter;
+use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::prelude::{BlobStore, TribleSet};
+use triblespace::prelude::{BlobSchema, BlobStore, TribleSet};
 
 const FIXTURE_NAME: &str = "mapping-authorities-gnd-agrovoc_lds.jsonld";
 
@@ -119,6 +121,7 @@ fn bench_oxigraph(c: &mut Criterion, payload: &str) {
 fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     let import_payload = normalize_for_import(payload);
     let bytes = import_payload.len() as u64;
+    let import_blob = Blob::<LongString>::new(Bytes::from(import_payload.clone().into_bytes()));
     let mut group = c.benchmark_group("json_ld/tribles");
     group.throughput(Throughput::Bytes(bytes));
 
@@ -163,23 +166,37 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         });
     });
 
-    group.bench_function(BenchmarkId::new("parse_streaming", FIXTURE_NAME), |b| {
-        b.iter(|| {
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer = StreamingJsonImporter::new(&mut blobs);
-            let roots = importer
-                .import_slice(import_payload.as_bytes())
-                .expect("import JSON-LD as JSON");
-            hint::black_box(roots.len());
-        });
-    });
-
     group.bench_function(BenchmarkId::new("parse_ephemeral", FIXTURE_NAME), |b| {
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let mut importer = EphemeralJsonImporter::new(&mut blobs);
             let roots = importer
                 .import_str(&import_payload)
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow_ephemeral", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            let roots = importer
+                .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             hint::black_box(roots.len());
         });
@@ -199,21 +216,6 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     });
 
     group.bench_function(
-        BenchmarkId::new("parse_streaming_simplearchive", FIXTURE_NAME),
-        |b| {
-            b.iter(|| {
-                let mut blobs = MemoryBlobStore::<Blake3>::new();
-                let mut importer = StreamingJsonImporter::new(&mut blobs);
-                importer
-                    .import_slice(import_payload.as_bytes())
-                    .expect("import JSON-LD as JSON");
-                let archive = SimpleArchive::blob_from(&importer.data().clone());
-                hint::black_box(archive.bytes.len());
-            });
-        },
-    );
-
-    group.bench_function(
         BenchmarkId::new("parse_ephemeral_simplearchive", FIXTURE_NAME),
         |b| {
             b.iter(|| {
@@ -227,6 +229,33 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             });
         },
     );
+
+    group.bench_function(BenchmarkId::new("parse_winnow_ephemeral_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
+            importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            hint::black_box(archive.bytes.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            hint::black_box(archive.bytes.len());
+        });
+    });
 
     group.bench_function(BenchmarkId::new("json_roundtrip", FIXTURE_NAME), |b| {
         b.iter(|| {

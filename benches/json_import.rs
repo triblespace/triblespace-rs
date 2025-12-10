@@ -8,7 +8,6 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
-use triblespace::core::import::json_stream::StreamingJsonImporter;
 use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
 
@@ -100,22 +99,7 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("json_import_streaming", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.clone();
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = StreamingJsonImporter::new(&mut blobs);
-                    importer
-                        .import_slice(payload.as_bytes())
-                        .expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_winnow", fixture.name),
+            BenchmarkId::new("json_import_winnow_ephemeral", fixture.name),
             fixture,
             |b, fixture| {
                 let file = File::open(&fixture.path).expect("open fixture");
@@ -133,7 +117,7 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("json_import_winnow_det", fixture.name),
+            BenchmarkId::new("json_import_winnow", fixture.name),
             fixture,
             |b, fixture| {
                 let file = File::open(&fixture.path).expect("open fixture");
@@ -192,22 +176,26 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("json_import_streaming", fixture.name),
+            BenchmarkId::new("json_import_winnow", fixture.name),
             fixture,
             |b, fixture| {
-                let payload = fixture.payload.clone();
+                let file = File::open(&fixture.path).expect("open fixture");
+                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+                let bytes = Bytes::from_source(mmap);
+                let blob = Blob::<LongString>::new(bytes);
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = StreamingJsonImporter::new(&mut blobs);
+                    let mut importer =
+                        DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
                     importer
-                        .import_slice(payload.as_bytes())
+                        .import_blob(blob.clone())
                         .expect("import JSON");
                     std::hint::black_box(importer.data().len());
                 });
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("json_import_winnow", fixture.name),
+            BenchmarkId::new("json_import_winnow_ephemeral", fixture.name),
             fixture,
             |b, fixture| {
                 let file = File::open(&fixture.path).expect("open fixture");

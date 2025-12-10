@@ -5,5 +5,4 @@
 //! repository or workspace.
 
 pub mod json;
-pub mod json_stream;
 pub mod json_winnow;
