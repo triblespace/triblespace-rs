@@ -393,26 +393,29 @@ where
     }
 
     fn parse_unicode_escape(&self, bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
-        use winnow::combinator::repeat;
         use winnow::error::InputError;
-        use winnow::token::one_of;
+        use winnow::token::take;
         use winnow::Parser;
 
-        let mut hex_digit = one_of::<_, _, InputError<Bytes>>((
-            b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'a', b'b', b'c', b'd',
-            b'e', b'f', b'A', b'B', b'C', b'D', b'E', b'F',
-        ))
-        .map(|h| match h {
-            b'0'..=b'9' => (h - b'0') as u32,
-            b'a'..=b'f' => (h - b'a' + 10) as u32,
-            b'A'..=b'F' => (h - b'A' + 10) as u32,
-            _ => unreachable!("filtered by one_of"),
-        });
-
-        let code = repeat(4, &mut hex_digit)
-            .map(|digits: Vec<u32>| digits.into_iter().fold(0u32, |acc, nibble| (acc << 4) | nibble))
+        let mut grab = take::<_, _, InputError<Bytes>>(4usize);
+        let hex = grab
             .parse_next(bytes)
             .map_err(|_| JsonImportError::Syntax("unterminated unicode escape".into()))?;
+
+        let mut code: u32 = 0;
+        for h in hex.as_ref() {
+            code = (code << 4)
+                | match h {
+                    b'0'..=b'9' => (h - b'0') as u32,
+                    b'a'..=b'f' => (h - b'a' + 10) as u32,
+                    b'A'..=b'F' => (h - b'A' + 10) as u32,
+                    _ => {
+                        return Err(JsonImportError::Syntax(
+                            "invalid unicode escape".into(),
+                        ))
+                    }
+                };
+        }
 
         if let Some(ch) = char::from_u32(code) {
             let mut buf = [0u8; 4];
