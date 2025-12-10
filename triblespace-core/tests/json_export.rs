@@ -1,7 +1,10 @@
 use serde_json::json;
+use anybytes::Bytes;
+use triblespace_core::blob::schemas::longstring::LongString;
+use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
-use triblespace_core::export::json::export_to_json;
-use triblespace_core::import::json::JsonImporter;
+use triblespace_core::export::json::export_to_json_string;
+use triblespace_core::import::json_winnow::DeterministicWinnowJsonImporter;
 use triblespace_core::prelude::valueschemas::Blake3;
 use triblespace_core::prelude::BlobStore;
 
@@ -18,8 +21,10 @@ fn exports_json_with_cardinality_hints() {
     });
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = JsonImporter::<_, Blake3>::new(&mut blobs, None);
-    let roots = importer.import_value(&payload).expect("import payload");
+    let mut importer = DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+    let json = serde_json::to_string(&payload).expect("serialize payload");
+    let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
+    let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 
     let mut merged = importer.metadata();
@@ -27,7 +32,9 @@ fn exports_json_with_cardinality_hints() {
 
     let reader = blobs.reader().expect("reader");
 
-    let mut exported = export_to_json(&merged, root, &reader).expect("export");
+    let exported: serde_json::Value =
+        serde_json::from_str(&export_to_json_string(&merged, root, &reader).expect("export"))
+            .expect("parse exported");
     let mut expected = payload.clone();
 
     fn sort_array_field(doc: &mut serde_json::Value, field: &str) {
@@ -69,8 +76,10 @@ fn exports_openai_like_conversation() {
     });
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = JsonImporter::<_, Blake3>::new(&mut blobs, None);
-    let roots = importer.import_value(&payload).expect("import payload");
+    let mut importer = DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+    let json = serde_json::to_string(&payload).expect("serialize payload");
+    let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
+    let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 
     let mut merged = importer.metadata();
@@ -78,7 +87,9 @@ fn exports_openai_like_conversation() {
 
     let reader = blobs.reader().expect("reader");
 
-    let exported = export_to_json(&merged, root, &reader).expect("export");
+    let exported: serde_json::Value =
+        serde_json::from_str(&export_to_json_string(&merged, root, &reader).expect("export"))
+            .expect("parse exported");
 
     assert_eq!(exported, payload);
 }

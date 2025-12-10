@@ -10,9 +10,8 @@ use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::blob::Blob;
-use triblespace::core::export::json::export_to_json;
+use triblespace::core::export::json::export_to_json_string;
 use triblespace::core::id::Id;
-use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
 use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::{BlobSchema, BlobStore, TribleSet};
@@ -135,10 +134,10 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
 
     let export_fixture = {
         let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-            JsonImporter::new(&mut blobs, None);
+        let mut importer =
+            DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
         let roots = importer
-            .import_str(&import_payload)
+            .import_blob(import_blob.clone())
             .expect("import JSON-LD as JSON");
         let mut merged = importer.metadata();
         merged.union(importer.data().clone());
@@ -155,23 +154,25 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     };
 
     group.bench_function(BenchmarkId::new("parse", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                JsonImporter::new(&mut blobs, None);
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
             let roots = importer
-                .import_str(&import_payload)
+                .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             hint::black_box(roots.len());
         });
     });
 
     group.bench_function(BenchmarkId::new("parse_ephemeral", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer = EphemeralJsonImporter::new(&mut blobs);
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
             let roots = importer
-                .import_str(&import_payload)
+                .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             hint::black_box(roots.len());
         });
@@ -203,12 +204,13 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     });
 
     group.bench_function(BenchmarkId::new("parse_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                JsonImporter::new(&mut blobs, None);
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
             importer
-                .import_str(&import_payload)
+                .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             let archive = SimpleArchive::blob_from(&importer.data().clone());
             hint::black_box(archive.bytes.len());
@@ -218,11 +220,12 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     group.bench_function(
         BenchmarkId::new("parse_ephemeral_simplearchive", FIXTURE_NAME),
         |b| {
+            let blob = import_blob.clone();
             b.iter(|| {
                 let mut blobs = MemoryBlobStore::<Blake3>::new();
-                let mut importer = EphemeralJsonImporter::new(&mut blobs);
+                let mut importer = WinnowJsonImporter::new(&mut blobs);
                 importer
-                    .import_str(&import_payload)
+                    .import_blob(blob.clone())
                     .expect("import JSON-LD as JSON");
                 let archive = SimpleArchive::blob_from(&importer.data().clone());
                 hint::black_box(archive.bytes.len());
@@ -258,26 +261,27 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     });
 
     group.bench_function(BenchmarkId::new("json_roundtrip", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                JsonImporter::new(&mut blobs, None);
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
             let roots = importer
-                .import_str(&import_payload)
+                .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             let mut merged = importer.metadata();
             merged.union(importer.data().clone());
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {
-                export_to_json(&merged, roots[0], &reader).expect("export JSON")
+                export_to_json_string(&merged, roots[0], &reader).expect("export JSON")
             } else {
                 let values: Vec<_> = roots
                     .iter()
-                    .map(|root| export_to_json(&merged, *root, &reader).expect("export JSON"))
+                    .map(|root| export_to_json_string(&merged, *root, &reader).expect("export JSON"))
                     .collect();
-                JsonValue::Array(values)
+                format!("[{}]", values.join(","))
             };
-            let exported_len = exported.to_string().len();
+            let exported_len = exported.len();
             assert!(
                 exported_len > import_payload.len() / 2,
                 "expected sizeable export (>{} bytes), got {exported_len}",
@@ -291,20 +295,20 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         b.iter(|| {
             let reader = export_fixture.reader.clone();
             let exported = if export_fixture.roots.len() == 1 {
-                export_to_json(&export_fixture.merged, export_fixture.roots[0], &reader)
+                export_to_json_string(&export_fixture.merged, export_fixture.roots[0], &reader)
                     .expect("export JSON")
             } else {
                 let values: Vec<_> = export_fixture
                     .roots
                     .iter()
                     .map(|root| {
-                        export_to_json(&export_fixture.merged, *root, &reader)
+                        export_to_json_string(&export_fixture.merged, *root, &reader)
                             .expect("export JSON")
                     })
                     .collect();
-                JsonValue::Array(values)
+                format!("[{}]", values.join(","))
             };
-            let exported_len = exported.to_string().len();
+            let exported_len = exported.len();
             assert!(
                 exported_len > export_fixture.payload_len / 2,
                 "expected sizeable export (>{} bytes), got {exported_len}",

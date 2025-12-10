@@ -1,9 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as FmtWrite;
-use std::str::FromStr;
-
-use serde_json::{Map, Value as JsonValue};
 
 use anybytes::View;
 use crate::blob::schemas::longstring::LongString;
@@ -52,22 +49,6 @@ impl fmt::Display for ExportError {
 
 impl std::error::Error for ExportError {}
 
-const REFERENCE_KEY: &str = "$ref";
-
-pub fn export_to_json(
-    merged: &TribleSet,
-    root: Id,
-    store: &impl BlobStoreGet<Blake3>,
-) -> Result<JsonValue, ExportError> {
-    let mut ctx = ExportCtx {
-        store,
-        name_cache: HashMap::new(),
-        string_cache: HashMap::new(),
-    };
-    let mut visited = HashSet::new();
-    export_entity(merged, root, &mut visited, &mut ctx)
-}
-
 /// Streamed exporter that writes JSON text directly (avoids serde_json Numbers).
 pub fn export_to_json_string(
     merged: &TribleSet,
@@ -83,93 +64,6 @@ pub fn export_to_json_string(
     let mut out = String::new();
     write_entity(merged, root, &mut visited, &mut ctx, &mut out)?;
     Ok(out)
-}
-
-fn export_entity(
-    merged: &TribleSet,
-    entity: Id,
-    visited: &mut HashSet<Id>,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-) -> Result<JsonValue, ExportError> {
-    if !visited.insert(entity) {
-        return Ok(reference_for(entity));
-    }
-
-    let mut object_entries = Map::new();
-    let multi_fields: HashSet<_> = find!(
-        (name_handle: Value<Handle<Blake3, LongString>>),
-        temp!((field), pattern!(merged, [
-            { ?field @ metadata::name: ?name_handle },
-            { ?field @ metadata::tag: metadata::KIND_MULTI }
-        ]))
-    )
-    .map(|(name_handle,)| name_handle.raw)
-    .collect();
-
-    let mut field_values: Vec<(
-        RawValue,
-        Value<Handle<Blake3, LongString>>,
-        Id,
-        Value<UnknownValue>,
-    )> = Vec::new();
-    find!(
-        (name_handle: Value<Handle<Blake3, LongString>>, schema: Id, value: Value<UnknownValue>),
-        temp!((e, attr), and!(
-            e.is(entity.to_value()),
-            merged.pattern(e, attr, value),
-            pattern!(merged, [
-                { ?attr @ metadata::name: ?name_handle },
-                { ?attr @ metadata::value_schema: ?schema }
-            ])
-        ))
-    )
-    .for_each(|(name_handle, schema, value)| {
-        field_values.push((name_handle.raw, name_handle, schema, value));
-    });
-
-    field_values.sort_by_key(|(name_raw, ..)| *name_raw);
-
-    let mut iter = field_values.into_iter().peekable();
-    while let Some((name_raw, name_handle, schema, value)) = iter.next() {
-        let mut values = vec![(schema, value)];
-        while let Some((next_raw, _, _, _)) = iter.peek() {
-            if *next_raw != name_raw {
-                break;
-            }
-            let (_, _, s, v) = iter.next().expect("peeked element exists");
-            values.push((s, v));
-        }
-
-        let name = resolve_name(ctx, name_handle)?;
-
-        let json_values: Result<Vec<_>, ExportError> = values
-            .into_iter()
-            .filter_map(|(schema, value)| match_schema(merged, schema, value, visited, ctx))
-            .collect();
-
-        let values = json_values?;
-        if values.is_empty() {
-            continue;
-        }
-
-        let card_multi = multi_fields.contains(&name_raw) || values.len() > 1;
-        let value = if card_multi {
-            JsonValue::Array(values)
-        } else {
-            values.into_iter().next().expect("len guard ensured a value")
-        };
-
-        object_entries.insert(name, value);
-    }
-
-    Ok(JsonValue::Object(object_entries))
-}
-
-fn reference_for(entity: Id) -> JsonValue {
-    JsonValue::Object(Map::from_iter([(
-        REFERENCE_KEY.to_string(),
-        JsonValue::String(format!("{entity:x}")),
-    )]))
 }
 
 fn write_entity(
@@ -390,33 +284,4 @@ fn resolve_string(
         .to_string();
     ctx.string_cache.insert(handle.raw, text.clone());
     Ok(text)
-}
-
-fn match_schema(
-    merged: &TribleSet,
-    schema: Id,
-    value: Value<UnknownValue>,
-    visited: &mut HashSet<Id>,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-) -> Option<Result<JsonValue, ExportError>> {
-    if schema == Boolean::id() {
-        let value = value.transmute::<Boolean>();
-        return Some(Ok(JsonValue::Bool(value.from_value::<bool>())));
-    }
-    if schema == F256::id() {
-        let value = value.transmute::<F256>();
-        let number = serde_json::Number::from_str(&value.from_value::<f256>().to_string())
-            .expect("f256 should render as a JSON number");
-        return Some(Ok(JsonValue::Number(number)));
-    }
-    if schema == GenId::id() {
-        let child_id = value.transmute::<GenId>().from_value::<Id>();
-        return Some(export_entity(merged, child_id, visited, ctx));
-    }
-    if schema == Handle::<Blake3, LongString>::id() {
-        let handle = value.transmute::<Handle<Blake3, LongString>>();
-        return Some(resolve_string(ctx, handle).map(JsonValue::String));
-    }
-
-    None
 }
