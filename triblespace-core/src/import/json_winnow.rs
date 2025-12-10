@@ -31,10 +31,10 @@ where
 {
     data: TribleSet,
     store: &'a mut Store,
-    bool_attrs: HashMap<String, Attribute<Boolean>>,
-    num_attrs: HashMap<String, Attribute<F256>>,
-    str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
-    genid_attrs: HashMap<String, Attribute<GenId>>,
+    bool_attrs: HashMap<Bytes, Attribute<Boolean>>,
+    num_attrs: HashMap<Bytes, Attribute<F256>>,
+    str_attrs: HashMap<Bytes, Attribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<Bytes, Attribute<GenId>>,
 }
 
 impl<'a, Store> WinnowJsonImporter<'a, Store>
@@ -56,7 +56,7 @@ where
     }
 
     fn bool_attr(&mut self, field: &Bytes) -> Result<Attribute<Boolean>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.bool_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -66,7 +66,7 @@ where
     }
 
     fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -79,7 +79,7 @@ where
         &mut self,
         field: &Bytes,
     ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -89,7 +89,7 @@ where
     }
 
     fn genid_attr(&mut self, field: &Bytes) -> Result<Attribute<GenId>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -312,44 +312,33 @@ where
 
     fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
         self.consume_byte(bytes, b'"')?;
-        let mut out = Vec::new();
+        let data: &[u8] = bytes;
+        let mut i = 0;
         let mut escaped = false;
-        while let Some(b) = bytes.pop_front() {
+        let mut needs_unescape = false;
+
+        while i < data.len() {
+            let b = data[i];
             if escaped {
+                needs_unescape = true;
                 match b {
-                    b'"' => out.push(b'"'),
-                    b'\\' => out.push(b'\\'),
-                    b'/' => out.push(b'/'),
-                    b'b' => out.push(0x08),
-                    b'f' => out.push(0x0c),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        i += 1;
+                    }
                     b'u' => {
-                        let mut code: u32 = 0;
-                        for _ in 0..4 {
-                            let h = bytes.pop_front().ok_or_else(|| {
-                                JsonImportError::Syntax("unterminated unicode escape".into())
-                            })?;
-                            code = (code << 4)
-                                | match h {
-                                    b'0'..=b'9' => (h - b'0') as u32,
-                                    b'a'..=b'f' => (h - b'a' + 10) as u32,
-                                    b'A'..=b'F' => (h - b'A' + 10) as u32,
-                                    _ => {
-                                        return Err(JsonImportError::Syntax(
-                                            "invalid unicode escape".into(),
-                                        ))
-                                    }
-                                };
+                        if i + 4 >= data.len() {
+                            return Err(JsonImportError::Syntax(
+                                "unterminated unicode escape".into(),
+                            ));
                         }
-                        if let Some(ch) = char::from_u32(code) {
-                            let mut buf = [0u8; 4];
-                            let encoded = ch.encode_utf8(&mut buf);
-                            out.extend_from_slice(encoded.as_bytes());
-                        } else {
+                        let digits = &data[i + 1..i + 5];
+                        if !digits
+                            .iter()
+                            .all(|h| matches!(h, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+                        {
                             return Err(JsonImportError::Syntax("invalid unicode escape".into()));
                         }
+                        i += 5;
                     }
                     _ => {
                         return Err(JsonImportError::Syntax(
@@ -360,36 +349,129 @@ where
                 escaped = false;
                 continue;
             }
-            if b == b'\\' {
-                escaped = true;
-                continue;
+
+            match b {
+                b'\\' => {
+                    escaped = true;
+                    i += 1;
+                }
+                b'"' => {
+                    let content = bytes
+                        .take_prefix(i)
+                        .ok_or_else(|| JsonImportError::Syntax("unterminated string".into()))?;
+                    self.consume_byte(bytes, b'"')?;
+                    if needs_unescape {
+                        let mut out = Vec::with_capacity(content.len());
+                        let mut iter = content.iter().copied();
+                        while let Some(ch) = iter.next() {
+                            if ch != b'\\' {
+                                out.push(ch);
+                                continue;
+                            }
+                            let esc = iter
+                                .next()
+                                .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
+                            match esc {
+                                b'"' => out.push(b'"'),
+                                b'\\' => out.push(b'\\'),
+                                b'/' => out.push(b'/'),
+                                b'b' => out.push(0x08),
+                                b'f' => out.push(0x0c),
+                                b'n' => out.push(b'\n'),
+                                b'r' => out.push(b'\r'),
+                                b't' => out.push(b'\t'),
+                                b'u' => {
+                                    let d1 = iter
+                                        .next()
+                                        .ok_or_else(|| {
+                                            JsonImportError::Syntax(
+                                                "unterminated unicode escape".into(),
+                                            )
+                                        })?;
+                                    let d2 = iter
+                                        .next()
+                                        .ok_or_else(|| {
+                                            JsonImportError::Syntax(
+                                                "unterminated unicode escape".into(),
+                                            )
+                                        })?;
+                                    let d3 = iter
+                                        .next()
+                                        .ok_or_else(|| {
+                                            JsonImportError::Syntax(
+                                                "unterminated unicode escape".into(),
+                                            )
+                                        })?;
+                                    let d4 = iter
+                                        .next()
+                                        .ok_or_else(|| {
+                                            JsonImportError::Syntax(
+                                                "unterminated unicode escape".into(),
+                                            )
+                                        })?;
+                                    let mut code: u32 = 0;
+                                    for h in [d1, d2, d3, d4] {
+                                        code = (code << 4)
+                                            | match h {
+                                                b'0'..=b'9' => (h - b'0') as u32,
+                                                b'a'..=b'f' => (h - b'a' + 10) as u32,
+                                                b'A'..=b'F' => (h - b'A' + 10) as u32,
+                                                _ => {
+                                                    return Err(JsonImportError::Syntax(
+                                                        "invalid unicode escape".into(),
+                                                    ))
+                                                }
+                                            };
+                                    }
+                                    if let Some(ch) = char::from_u32(code) {
+                                        let mut buf = [0u8; 4];
+                                        let encoded = ch.encode_utf8(&mut buf);
+                                        out.extend_from_slice(encoded.as_bytes());
+                                    } else {
+                                        return Err(JsonImportError::Syntax(
+                                            "invalid unicode escape".into(),
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    return Err(JsonImportError::Syntax(
+                                        "invalid escape sequence".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        return Ok(Bytes::from(out));
+                    }
+                    return Ok(content);
+                }
+                b'\n' | b'\r' => {
+                    return Err(JsonImportError::Syntax("unterminated string".into()))
+                }
+                _ => i += 1,
             }
-            if b == b'"' {
-                return Ok(Bytes::from(out));
-            }
-            if b == b'\n' || b == b'\r' {
-                return Err(JsonImportError::Syntax("unterminated string".into()));
-            }
-            out.push(b);
         }
+
         Err(JsonImportError::Syntax("unterminated string".into()))
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        let mut out = Vec::new();
-        while let Some(b) = bytes.peek_token() {
-            if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
-            {
-                out.push(b);
-                bytes.pop_front();
+        let data: &[u8] = bytes;
+        let mut len = 0;
+        while len < data.len() {
+            let b = data[len];
+            if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E' {
+                len += 1;
             } else {
                 break;
             }
         }
-        if out.is_empty() {
+        if len == 0 {
             return Err(JsonImportError::Syntax("expected number".into()));
         }
-        Ok(Bytes::from(out))
+        let number = bytes
+            .take_prefix(len)
+            .ok_or_else(|| JsonImportError::Syntax("expected number".into()))?;
+        Ok(number)
     }
 
     pub fn data(&self) -> &TribleSet {
@@ -422,10 +504,10 @@ where
 {
     data: TribleSet,
     store: &'a mut Store,
-    bool_attrs: HashMap<String, Attribute<Boolean>>,
-    num_attrs: HashMap<String, Attribute<F256>>,
-    str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
-    genid_attrs: HashMap<String, Attribute<GenId>>,
+    bool_attrs: HashMap<Bytes, Attribute<Boolean>>,
+    num_attrs: HashMap<Bytes, Attribute<F256>>,
+    str_attrs: HashMap<Bytes, Attribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<Bytes, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     _hasher: std::marker::PhantomData<Hasher>,
 }
@@ -450,7 +532,7 @@ where
     }
 
     fn bool_attr(&mut self, field: &Bytes) -> Result<Attribute<Boolean>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.bool_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -460,7 +542,7 @@ where
     }
 
     fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -473,7 +555,7 @@ where
         &mut self,
         field: &Bytes,
     ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
         }
@@ -483,7 +565,7 @@ where
     }
 
     fn genid_attr(&mut self, field: &Bytes) -> Result<Attribute<GenId>, JsonImportError> {
-        let key = String::from_utf8_lossy(field.as_ref()).into_owned();
+        let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());
         }
