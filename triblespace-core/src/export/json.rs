@@ -111,8 +111,6 @@ fn write_entity(
         field_values.push((name_handle.raw, name_handle, schema, value));
     });
 
-    field_values.sort_by_key(|(name_raw, ..)| *name_raw);
-
     let mut entries: Vec<(String, ValueRepr)> = Vec::new();
     let mut iter = field_values.into_iter().peekable();
     while let Some((name_raw, name_handle, schema, value)) = iter.next() {
