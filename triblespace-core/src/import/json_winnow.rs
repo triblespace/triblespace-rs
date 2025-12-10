@@ -868,6 +868,7 @@ mod tests {
     use crate::blob::MemoryBlobStore;
     use crate::blob::ToBlob;
     use crate::value::schemas::hash::Blake3;
+    use anybytes::View;
 
     #[test]
     fn parses_simple_object() {
@@ -889,5 +890,55 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert_eq!(importer.data().len(), 2);
         assert!(!importer.metadata().is_empty());
+    }
+
+    fn read_text(
+        importer: &WinnowJsonImporter<'_, MemoryBlobStore<Blake3>>,
+        blobs: &MemoryBlobStore<Blake3>,
+        expected_attr: &str,
+    ) -> String {
+        let attr = Attribute::<Handle<Blake3, LongString>>::from_name(expected_attr).id();
+        let trible = importer
+            .data()
+            .iter()
+            .find(|t| *t.a() == attr)
+            .expect("missing string trible");
+        let handle = trible.v::<Handle<Blake3, LongString>>();
+
+        let entries: Vec<_> = blobs.reader().unwrap().into_iter().collect();
+        let (_, blob) = entries
+            .iter()
+            .find(|(h, _)| {
+                let h: Value<Handle<Blake3, LongString>> = (*h).transmute();
+                h.raw == handle.raw
+            })
+            .expect("handle not found in blob store");
+
+        let text: View<str> = blob
+            .clone()
+            .transmute::<LongString>()
+            .try_from_blob()
+            .expect("blob should decode as string");
+        text.as_ref().to_owned()
+    }
+
+    #[test]
+    fn parses_escaped_string() {
+        let input = r#"{ "text": "hello\nworld" }"#;
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = WinnowJsonImporter::new(&mut blobs);
+        importer.import_blob(input.to_blob()).unwrap();
+        let text = read_text(&importer, &blobs, "text");
+        assert_eq!(text, "hello\nworld");
+    }
+
+    #[test]
+    fn parses_unicode_escape() {
+        let input = r#"{ "text": "smile: \u263A" }"#;
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer = WinnowJsonImporter::new(&mut blobs);
+        importer.import_blob(input.to_blob()).unwrap();
+        let text = read_text(&importer, &blobs, "text");
+        assert_eq!(text, "smile: \u{263A}");
     }
 }
