@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::export::json::export_to_json;
+use triblespace::core::export::json::{export_to_json, export_to_json_string};
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonImporter;
 use triblespace::core::value::schemas::hash::Blake3;
@@ -102,6 +102,18 @@ fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                 });
             },
         );
+        group.bench_with_input(
+            BenchmarkId::new("json_export_stream", prepared.name),
+            prepared,
+            |b, prepared| {
+                let reader = prepared.reader.clone();
+                b.iter(|| {
+                    let json = export_to_json_string(&prepared.merged, prepared.root, &reader)
+                        .expect("export");
+                    std::hint::black_box(json.len());
+                });
+            },
+        );
     }
 
     group.finish();
@@ -121,6 +133,18 @@ fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
                     let value =
                         export_to_json(&prepared.merged, prepared.root, &reader).expect("export");
                     let json = value.to_string();
+                    std::hint::black_box(json.len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_export_stream_to_string", prepared.name),
+            prepared,
+            |b, prepared| {
+                let reader = prepared.reader.clone();
+                b.iter(|| {
+                    let json = export_to_json_string(&prepared.merged, prepared.root, &reader)
+                        .expect("export");
                     std::hint::black_box(json.len());
                 });
             },
@@ -245,6 +269,29 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                     let json = export_to_json(&merged, root, &reader)
                         .expect("export JSON")
                         .to_string();
+                    std::hint::black_box(json.len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("tribles_roundtrip_stream_to_string", prepared.name),
+            prepared,
+            |b, prepared| {
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let (merged, root) = {
+                        let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
+                            JsonImporter::new(&mut blobs, None);
+                        let roots =
+                            importer.import_str(&prepared.payload).expect("import JSON");
+                        let root = *roots.first().expect("root entity");
+                        let mut merged = importer.metadata();
+                        merged.union(importer.data().clone());
+                        (merged, root)
+                    };
+                    let reader = blobs.reader().expect("reader");
+                    let json =
+                        export_to_json_string(&merged, root, &reader).expect("export JSON");
                     std::hint::black_box(json.len());
                 });
             },
