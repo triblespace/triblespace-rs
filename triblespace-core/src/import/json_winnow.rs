@@ -331,146 +331,78 @@ where
             }
         }
 
-        let data: &[u8] = bytes;
-        let mut i = 0;
-        let mut escaped = false;
-        let mut needs_unescape = false;
+        let mut out = Vec::new();
+        loop {
+            use winnow::error::InputError;
+            use winnow::token::take_while;
+            use winnow::Parser;
 
-        while i < data.len() {
-            let b = data[i];
-            if escaped {
-                needs_unescape = true;
-                match b {
-                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
-                        i += 1;
-                    }
-                    b'u' => {
-                        if i + 4 >= data.len() {
-                            return Err(JsonImportError::Syntax(
-                                "unterminated unicode escape".into(),
-                            ));
-                        }
-                        let digits = &data[i + 1..i + 5];
-                        if !digits
-                            .iter()
-                            .all(|h| h.is_ascii_hexdigit())
-                        {
-                            return Err(JsonImportError::Syntax("invalid unicode escape".into()));
-                        }
-                        i += 5;
-                    }
-                    _ => {
-                        return Err(JsonImportError::Syntax(
-                            "invalid escape sequence".into(),
-                        ))
-                    }
-                }
-                escaped = false;
-                continue;
-            }
+            let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+                b != b'\\' && b != b'"' && b != b'\n' && b != b'\r'
+            });
+            let chunk = segment
+                .parse_next(bytes)
+                .map_err(|_| JsonImportError::Syntax("unterminated string".into()))?;
+            out.extend_from_slice(chunk.as_ref());
 
-            match b {
-                b'\\' => {
-                    escaped = true;
-                    i += 1;
+            match bytes.peek_token() {
+                Some(b'"') => {
+                    bytes.pop_front();
+                    return Ok(Bytes::from(out));
                 }
-                b'"' => {
-                    let content = bytes
-                        .take_prefix(i)
-                        .ok_or_else(|| JsonImportError::Syntax("unterminated string".into()))?;
-                    self.consume_byte(bytes, b'"')?;
-                    if needs_unescape {
-                        let mut out = Vec::with_capacity(content.len());
-                        let mut iter = content.iter().copied();
-                        while let Some(ch) = iter.next() {
-                            if ch != b'\\' {
-                                out.push(ch);
-                                continue;
+                Some(b'\\') => {
+                    bytes.pop_front();
+                    let esc = bytes
+                        .pop_front()
+                        .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
+                    match esc {
+                        b'"' => out.push(b'"'),
+                        b'\\' => out.push(b'\\'),
+                        b'/' => out.push(b'/'),
+                        b'b' => out.push(0x08),
+                        b'f' => out.push(0x0c),
+                        b'n' => out.push(b'\n'),
+                        b'r' => out.push(b'\r'),
+                        b't' => out.push(b'\t'),
+                        b'u' => {
+                            let mut code: u32 = 0;
+                            for _ in 0..4 {
+                                let h = bytes.pop_front().ok_or_else(|| {
+                                    JsonImportError::Syntax("unterminated unicode escape".into())
+                                })?;
+                                code = (code << 4)
+                                    | match h {
+                                        b'0'..=b'9' => (h - b'0') as u32,
+                                        b'a'..=b'f' => (h - b'a' + 10) as u32,
+                                        b'A'..=b'F' => (h - b'A' + 10) as u32,
+                                        _ => {
+                                            return Err(JsonImportError::Syntax(
+                                                "invalid unicode escape".into(),
+                                            ))
+                                        }
+                                    };
                             }
-                            let esc = iter
-                                .next()
-                                .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
-                            match esc {
-                                b'"' => out.push(b'"'),
-                                b'\\' => out.push(b'\\'),
-                                b'/' => out.push(b'/'),
-                                b'b' => out.push(0x08),
-                                b'f' => out.push(0x0c),
-                                b'n' => out.push(b'\n'),
-                                b'r' => out.push(b'\r'),
-                                b't' => out.push(b'\t'),
-                                b'u' => {
-                                    let d1 = iter
-                                        .next()
-                                        .ok_or_else(|| {
-                                            JsonImportError::Syntax(
-                                                "unterminated unicode escape".into(),
-                                            )
-                                        })?;
-                                    let d2 = iter
-                                        .next()
-                                        .ok_or_else(|| {
-                                            JsonImportError::Syntax(
-                                                "unterminated unicode escape".into(),
-                                            )
-                                        })?;
-                                    let d3 = iter
-                                        .next()
-                                        .ok_or_else(|| {
-                                            JsonImportError::Syntax(
-                                                "unterminated unicode escape".into(),
-                                            )
-                                        })?;
-                                    let d4 = iter
-                                        .next()
-                                        .ok_or_else(|| {
-                                            JsonImportError::Syntax(
-                                                "unterminated unicode escape".into(),
-                                            )
-                                        })?;
-                                    let mut code: u32 = 0;
-                                    for h in [d1, d2, d3, d4] {
-                                        code = (code << 4)
-                                            | match h {
-                                                b'0'..=b'9' => (h - b'0') as u32,
-                                                b'a'..=b'f' => (h - b'a' + 10) as u32,
-                                                b'A'..=b'F' => (h - b'A' + 10) as u32,
-                                                _ => {
-                                                    return Err(JsonImportError::Syntax(
-                                                        "invalid unicode escape".into(),
-                                                    ))
-                                                }
-                                            };
-                                    }
-                                    if let Some(ch) = char::from_u32(code) {
-                                        let mut buf = [0u8; 4];
-                                        let encoded = ch.encode_utf8(&mut buf);
-                                        out.extend_from_slice(encoded.as_bytes());
-                                    } else {
-                                        return Err(JsonImportError::Syntax(
-                                            "invalid unicode escape".into(),
-                                        ));
-                                    }
-                                }
-                                _ => {
-                                    return Err(JsonImportError::Syntax(
-                                        "invalid escape sequence".into(),
-                                    ))
-                                }
+                            if let Some(ch) = char::from_u32(code) {
+                                let mut buf = [0u8; 4];
+                                let encoded = ch.encode_utf8(&mut buf);
+                                out.extend_from_slice(encoded.as_bytes());
+                            } else {
+                                return Err(JsonImportError::Syntax(
+                                    "invalid unicode escape".into(),
+                                ));
                             }
                         }
-                        return Ok(Bytes::from(out));
+                        _ => {
+                            return Err(JsonImportError::Syntax("invalid escape sequence".into()))
+                        }
                     }
-                    return Ok(content);
                 }
-                b'\n' | b'\r' => {
+                Some(b'\n') | Some(b'\r') | None => {
                     return Err(JsonImportError::Syntax("unterminated string".into()))
                 }
-                _ => i += 1,
+                _ => unreachable!("peek_token only yields bytes"),
             }
         }
-
-        Err(JsonImportError::Syntax("unterminated string".into()))
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
