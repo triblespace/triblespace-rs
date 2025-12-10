@@ -33,7 +33,7 @@ fn exports_json_with_cardinality_hints() {
     fn sort_array_field(doc: &mut serde_json::Value, field: &str) {
         if let serde_json::Value::Object(map) = doc {
             if let Some(serde_json::Value::Array(values)) = map.get_mut(field) {
-                values.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+                values.sort_by_key(|a| a.to_string());
             }
         }
     }

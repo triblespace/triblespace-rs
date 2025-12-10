@@ -321,7 +321,7 @@ mod tests {
     fn uuid_nil_round_trip() {
         let uuid = uuid::Uuid::nil();
         let value = uuid.try_to_value().expect("uuid packing should succeed");
-        GenId::validate(value.clone()).expect("schema validation");
+        GenId::validate(value).expect("schema validation");
         let round_trip = uuid::Uuid::try_from_value(&value).expect("uuid unpacking should succeed");
         assert_eq!(uuid, round_trip);
     }

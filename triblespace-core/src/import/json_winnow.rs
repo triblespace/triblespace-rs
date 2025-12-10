@@ -18,9 +18,9 @@ use crate::id::ID_LEN;
 use anybytes::Bytes;
 use f256::f256;
 use std::str::FromStr;
-use winnow::stream::Stream;
 use std::char;
 use std::collections::HashMap;
+use winnow::stream::Stream;
 
 /// Winnow-based streaming JSON importer (non-deterministic ids, emits metadata).
 /// The parser operates directly on `Bytes` and emits tribles as it walks the JSON
@@ -173,7 +173,7 @@ where
             self.skip_ws(bytes);
             self.consume_byte(bytes, b':')?;
             self.skip_ws(bytes);
-            self.parse_value(bytes, &entity, &field)?;
+            self.parse_value(bytes, entity, &field)?;
             self.skip_ws(bytes);
             match bytes.peek_token() {
                 Some(b',') => {
@@ -334,7 +334,7 @@ where
                         let digits = &data[i + 1..i + 5];
                         if !digits
                             .iter()
-                            .all(|h| matches!(h, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+                            .all(|h| h.is_ascii_hexdigit())
                         {
                             return Err(JsonImportError::Syntax("invalid unicode escape".into()));
                         }
@@ -455,23 +455,17 @@ where
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        let data: &[u8] = bytes;
-        let mut len = 0;
-        while len < data.len() {
-            let b = data[len];
-            if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E' {
-                len += 1;
-            } else {
-                break;
-            }
-        }
-        if len == 0 {
-            return Err(JsonImportError::Syntax("expected number".into()));
-        }
-        let number = bytes
-            .take_prefix(len)
-            .ok_or_else(|| JsonImportError::Syntax("expected number".into()))?;
-        Ok(number)
+        use winnow::error::InputError;
+        use winnow::token::take_while;
+        use winnow::Parser;
+
+        let mut number = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
+            b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
+        });
+
+        number
+            .parse_next(bytes)
+            .map_err(|_: InputError<Bytes>| JsonImportError::Syntax("expected number".into()))
     }
 
     pub fn data(&self) -> &TribleSet {
@@ -726,13 +720,13 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw().into(), true.to_value().raw));
+                pairs.push((attr.raw(), true.to_value().raw));
                 Ok(())
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw().into(), false.to_value().raw));
+                pairs.push((attr.raw(), false.to_value().raw));
                 Ok(())
             }
             Some(b'"') => {
@@ -746,7 +740,7 @@ where
                         field: field_name,
                         source: EncodeError::from_error(err),
                     })?;
-                pairs.push((attr.raw().into(), handle.raw));
+                pairs.push((attr.raw(), handle.raw));
                 Ok(())
             }
             Some(b'{') => {
@@ -754,7 +748,7 @@ where
                 staged.union(child_staged);
                 let attr = self.genid_attr(field)?;
                 let value = GenId::value_from(&child);
-                pairs.push((attr.raw().into(), value.raw));
+                pairs.push((attr.raw(), value.raw));
                 Ok(())
             }
             Some(b'[') => self.parse_array(bytes, field, pairs, staged),
@@ -768,7 +762,7 @@ where
                 })?;
                 let attr = self.num_attr(field)?;
                 let encoded: Value<F256> = number.to_value();
-                pairs.push((attr.raw().into(), encoded.raw));
+                pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
         }

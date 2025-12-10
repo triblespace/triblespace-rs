@@ -948,13 +948,13 @@ mod tests {
 
         let trible = data.first().unwrap();
         assert_eq!(trible.a(), &description_attr);
-        let stored_value = trible.v::<Handle<Blake3, LongString>>().clone();
+        let stored_value = *trible.v::<Handle<Blake3, LongString>>();
 
         let entries: Vec<_> = store.reader().unwrap().into_iter().collect();
         let (_handle, blob) = entries
             .iter()
             .find(|(handle, _)| {
-                let handle: Value<Handle<Blake3, LongString>> = handle.clone().transmute();
+                let handle: Value<Handle<Blake3, LongString>> = (*handle).transmute();
                 handle.raw == stored_value.raw
             })
             .expect("imported value should be stored in blob store");
