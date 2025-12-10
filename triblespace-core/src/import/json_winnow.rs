@@ -255,7 +255,7 @@ where
                 let attr_id = attr.id();
                 let encoded = self
                     .store
-                    .put::<LongString, _>(Blob::new(text.clone()))
+                    .put::<LongString, _>(Blob::new(text))
                     .map_err(|err| JsonImportError::EncodeString {
                         field: field_name,
                         source: EncodeError::from_error(err),
@@ -311,71 +311,7 @@ where
     }
 
     fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        self.consume_byte(bytes, b'"')?;
-        {
-            use winnow::error::InputError;
-            use winnow::token::take_while;
-            use winnow::Parser;
-
-            let mut tentative = bytes.clone();
-            let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-                b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
-            });
-
-            if let Ok(prefix) = segment.parse_next(&mut tentative) {
-                if tentative.peek_token() == Some(b'"') {
-                    tentative.pop_front();
-                    *bytes = tentative;
-                    return Ok(prefix);
-                }
-            }
-        }
-
-        let mut out = Vec::new();
-        loop {
-            use winnow::error::InputError;
-            use winnow::token::take_while;
-            use winnow::Parser;
-
-            let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-                b != b'\\' && b != b'"' && b != b'\n' && b != b'\r'
-            });
-            let chunk = segment
-                .parse_next(bytes)
-                .map_err(|_| JsonImportError::Syntax("unterminated string".into()))?;
-            out.extend_from_slice(chunk.as_ref());
-
-            match bytes.peek_token() {
-                Some(b'"') => {
-                    bytes.pop_front();
-                    return Ok(Bytes::from(out));
-                }
-                Some(b'\\') => {
-                    bytes.pop_front();
-                    let esc = bytes
-                        .pop_front()
-                        .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
-                    match esc {
-                        b'"' => out.push(b'"'),
-                        b'\\' => out.push(b'\\'),
-                        b'/' => out.push(b'/'),
-                        b'b' => out.push(0x08),
-                        b'f' => out.push(0x0c),
-                        b'n' => out.push(b'\n'),
-                        b'r' => out.push(b'\r'),
-                        b't' => out.push(b'\t'),
-                        b'u' => out.extend_from_slice(&self.parse_unicode_escape(bytes)?),
-                        _ => {
-                            return Err(JsonImportError::Syntax("invalid escape sequence".into()))
-                        }
-                    }
-                }
-                Some(b'\n') | Some(b'\r') | None => {
-                    return Err(JsonImportError::Syntax("unterminated string".into()))
-                }
-                _ => unreachable!("peek_token only yields bytes"),
-            }
-        }
+        parse_string_common(bytes, &mut parse_unicode_escape)
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
@@ -390,40 +326,6 @@ where
         number
             .parse_next(bytes)
             .map_err(|_: InputError<Bytes>| JsonImportError::Syntax("expected number".into()))
-    }
-
-    fn parse_unicode_escape(&self, bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
-        use winnow::error::InputError;
-        use winnow::token::take;
-        use winnow::Parser;
-
-        let mut grab = take::<_, _, InputError<Bytes>>(4usize);
-        let hex = grab
-            .parse_next(bytes)
-            .map_err(|_| JsonImportError::Syntax("unterminated unicode escape".into()))?;
-
-        let mut code: u32 = 0;
-        for h in hex.as_ref() {
-            code = (code << 4)
-                | match h {
-                    b'0'..=b'9' => (h - b'0') as u32,
-                    b'a'..=b'f' => (h - b'a' + 10) as u32,
-                    b'A'..=b'F' => (h - b'A' + 10) as u32,
-                    _ => {
-                        return Err(JsonImportError::Syntax(
-                            "invalid unicode escape".into(),
-                        ))
-                    }
-                };
-        }
-
-        if let Some(ch) = char::from_u32(code) {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            Ok(encoded.as_bytes().to_vec())
-        } else {
-            Err(JsonImportError::Syntax("invalid unicode escape".into()))
-        }
     }
 
     pub fn data(&self) -> &TribleSet {
@@ -445,6 +347,115 @@ where
             meta.union(attr.describe(self.store));
         }
         meta
+    }
+}
+
+fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
+    use winnow::error::InputError;
+    use winnow::token::take;
+    use winnow::Parser;
+
+    let mut grab = take::<_, _, InputError<Bytes>>(4usize);
+    let hex = grab
+        .parse_next(bytes)
+        .map_err(|_| JsonImportError::Syntax("unterminated unicode escape".into()))?;
+
+    let mut code: u32 = 0;
+    for h in hex.as_ref() {
+        code = (code << 4)
+            | match h {
+                b'0'..=b'9' => (h - b'0') as u32,
+                b'a'..=b'f' => (h - b'a' + 10) as u32,
+                b'A'..=b'F' => (h - b'A' + 10) as u32,
+                _ => {
+                    return Err(JsonImportError::Syntax(
+                        "invalid unicode escape".into(),
+                    ))
+                }
+            };
+    }
+
+    if let Some(ch) = char::from_u32(code) {
+        let mut buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buf);
+        Ok(encoded.as_bytes().to_vec())
+    } else {
+        Err(JsonImportError::Syntax("invalid unicode escape".into()))
+    }
+}
+
+fn parse_string_common(bytes: &mut Bytes, unicode_escape: &mut impl FnMut(&mut Bytes) -> Result<Vec<u8>, JsonImportError>) -> Result<Bytes, JsonImportError> {
+    let consume_byte = |bytes: &mut Bytes, expected: u8| -> Result<(), JsonImportError> {
+        match bytes.pop_front() {
+            Some(b) if b == expected => Ok(()),
+            _ => Err(JsonImportError::Syntax("unexpected token".into())),
+        }
+    };
+
+    consume_byte(bytes, b'"')?;
+    {
+        use winnow::error::InputError;
+        use winnow::token::take_while;
+        use winnow::Parser;
+
+        let mut tentative = bytes.clone();
+        let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+            b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
+        });
+
+        if let Ok(prefix) = segment.parse_next(&mut tentative) {
+            if tentative.peek_token() == Some(b'"') {
+                tentative.pop_front();
+                *bytes = tentative;
+                return Ok(prefix);
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    loop {
+        use winnow::error::InputError;
+        use winnow::token::take_while;
+        use winnow::Parser;
+
+        let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+            b != b'\\' && b != b'"' && b != b'\n' && b != b'\r'
+        });
+        let chunk = segment
+            .parse_next(bytes)
+            .map_err(|_| JsonImportError::Syntax("unterminated string".into()))?;
+        out.extend_from_slice(chunk.as_ref());
+
+        match bytes.peek_token() {
+            Some(b'"') => {
+                bytes.pop_front();
+                return Ok(Bytes::from(out));
+            }
+            Some(b'\\') => {
+                bytes.pop_front();
+                let esc = bytes
+                    .pop_front()
+                    .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
+                match esc {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'u' => out.extend_from_slice(&unicode_escape(bytes)?),
+                    _ => {
+                        return Err(JsonImportError::Syntax("invalid escape sequence".into()))
+                    }
+                }
+            }
+            Some(b'\n') | Some(b'\r') | None => {
+                return Err(JsonImportError::Syntax("unterminated string".into()))
+            }
+            _ => unreachable!("peek_token only yields bytes"),
+        }
     }
 }
 
@@ -693,7 +704,7 @@ where
                 let attr = self.str_attr(field)?;
                 let handle = self
                     .store
-                    .put::<LongString, _>(Blob::new(text.clone()))
+                    .put::<LongString, _>(Blob::new(text))
                     .map_err(|err| JsonImportError::EncodeString {
                         field: field_name,
                         source: EncodeError::from_error(err),
@@ -766,85 +777,21 @@ where
     }
 
     fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        self.consume_byte(bytes, b'"')?;
-        let mut out = Vec::new();
-        let mut escaped = false;
-        while let Some(b) = bytes.pop_front() {
-            if escaped {
-                match b {
-                    b'"' => out.push(b'"'),
-                    b'\\' => out.push(b'\\'),
-                    b'/' => out.push(b'/'),
-                    b'b' => out.push(0x08),
-                    b'f' => out.push(0x0c),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
-                    b'u' => {
-                        let mut code: u32 = 0;
-                        for _ in 0..4 {
-                            let h = bytes.pop_front().ok_or_else(|| {
-                                JsonImportError::Syntax("unterminated unicode escape".into())
-                            })?;
-                            code = (code << 4)
-                                | match h {
-                                    b'0'..=b'9' => (h - b'0') as u32,
-                                    b'a'..=b'f' => (h - b'a' + 10) as u32,
-                                    b'A'..=b'F' => (h - b'A' + 10) as u32,
-                                    _ => {
-                                        return Err(JsonImportError::Syntax(
-                                            "invalid unicode escape".into(),
-                                        ))
-                                    }
-                                };
-                        }
-                        if let Some(ch) = char::from_u32(code) {
-                            let mut buf = [0u8; 4];
-                            let encoded = ch.encode_utf8(&mut buf);
-                            out.extend_from_slice(encoded.as_bytes());
-                        } else {
-                            return Err(JsonImportError::Syntax("invalid unicode escape".into()));
-                        }
-                    }
-                    _ => {
-                        return Err(JsonImportError::Syntax(
-                            "invalid escape sequence".into(),
-                        ))
-                    }
-                }
-                escaped = false;
-                continue;
-            }
-            if b == b'\\' {
-                escaped = true;
-                continue;
-            }
-            if b == b'"' {
-                return Ok(Bytes::from(out));
-            }
-            if b == b'\n' || b == b'\r' {
-                return Err(JsonImportError::Syntax("unterminated string".into()));
-            }
-            out.push(b);
-        }
-        Err(JsonImportError::Syntax("unterminated string".into()))
+        parse_string_common(bytes, &mut parse_unicode_escape)
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        let mut out = Vec::new();
-        while let Some(b) = bytes.peek_token() {
-            if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
-            {
-                out.push(b);
-                bytes.pop_front();
-            } else {
-                break;
-            }
-        }
-        if out.is_empty() {
-            return Err(JsonImportError::Syntax("expected number".into()));
-        }
-        Ok(Bytes::from(out))
+        use winnow::error::InputError;
+        use winnow::token::take_while;
+        use winnow::Parser;
+
+        let mut number = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
+            b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
+        });
+
+        number
+            .parse_next(bytes)
+            .map_err(|_: InputError<Bytes>| JsonImportError::Syntax("expected number".into()))
     }
 
     pub fn data(&self) -> &TribleSet {
