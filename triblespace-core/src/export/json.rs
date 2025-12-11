@@ -113,8 +113,8 @@ fn write_entity(
         field_values.push((name_handle.raw, name_handle, schema, value));
     });
 
-    let mut entries: Vec<(String, ValueRepr)> = Vec::new();
     let mut iter = field_values.into_iter().peekable();
+    let mut field_idx = 0usize;
     while let Some((name_raw, name_handle, schema, value)) = iter.next() {
         let mut values = vec![(schema, value)];
         while let Some((next_raw, _, _, _)) = iter.peek() {
@@ -127,109 +127,66 @@ fn write_entity(
 
         let name = resolve_name(ctx, name_handle)?;
 
-        let json_values: Result<Vec<_>, ExportError> = values
-            .into_iter()
-            .filter_map(|(schema, value)| match_schema_str(merged, schema, value, visited, ctx))
-            .collect();
-
-        let values = json_values?;
-        if values.is_empty() {
-            continue;
-        }
-
-        let card_multi = multi_flags.get(&name_raw).copied().unwrap_or(false) || values.len() > 1;
-        let rendered = if card_multi {
-            ValueRepr::Array(values)
-        } else {
-            values.into_iter().next().expect("len guard ensured a value")
-        };
-
-        entries.push((name, rendered));
-    }
-
-    out.push('{');
-    for (idx, (name, value)) in entries.into_iter().enumerate() {
-        if idx > 0 {
+        if field_idx > 0 {
             out.push(',');
         }
         write_escaped_str(&name, out);
         out.push(':');
-        render_value(&value, ctx, out);
+
+        let card_multi = multi_flags.get(&name_raw).copied().unwrap_or(false) || values.len() > 1;
+        if card_multi {
+            out.push('[');
+            for (i, (schema, value)) in values.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_schema_value(merged, schema, value, visited, ctx, out)?;
+            }
+            out.push(']');
+        } else if let Some((schema, value)) = values.into_iter().next() {
+            render_schema_value(merged, schema, value, visited, ctx, out)?;
+        }
+        field_idx += 1;
     }
     out.push('}');
     Ok(())
 }
 
-fn match_schema_str(
+fn render_schema_value(
     merged: &TribleSet,
     schema: Id,
     value: Value<UnknownValue>,
     visited: &mut HashSet<Id>,
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-) -> Option<Result<ValueRepr, ExportError>> {
+    out: &mut String,
+) -> Result<(), ExportError> {
     if schema == Boolean::id() {
         let value = value.transmute::<Boolean>();
-        return Some(Ok(if value.from_value::<bool>() {
-            ValueRepr::Bool(true)
-        } else {
-            ValueRepr::Bool(false)
-        }));
+        out.push_str(if value.from_value::<bool>() { "true" } else { "false" });
+        return Ok(());
     }
     if schema == F256::id() {
         let value = value.transmute::<F256>();
-        return Some(Ok(ValueRepr::Num(value.from_value::<f256>())));
+        out.push_str(&value.from_value::<f256>().to_string());
+        return Ok(());
     }
     if schema == GenId::id() {
         let child_id = value.transmute::<GenId>().from_value::<Id>();
         let mut buf = String::new();
         if let Err(err) = write_entity(merged, child_id, visited, ctx, &mut buf) {
-            return Some(Err(err));
+            return Err(err);
         }
-        return Some(Ok(ValueRepr::Inline(buf)));
+        out.push_str(&buf);
+        return Ok(());
     }
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
-        return Some(Ok(ValueRepr::Str(handle)));
+        let text = resolve_string(ctx, handle)?;
+        write_escaped_str(&text, out);
+        return Ok(());
     }
 
-    None
-}
-
-enum ValueRepr {
-    Inline(String),
-    Bool(bool),
-    Num(f256),
-    Str(Value<Handle<Blake3, LongString>>),
-    Array(Vec<ValueRepr>),
-}
-
-fn render_value(
-    value: &ValueRepr,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-    out: &mut String,
-) {
-    match value {
-        ValueRepr::Inline(raw) => out.push_str(raw),
-        ValueRepr::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
-        ValueRepr::Num(num) => out.push_str(&num.to_string()),
-        ValueRepr::Str(handle) => {
-            let text = resolve_string(ctx, *handle);
-            match text {
-                Ok(text) => write_escaped_str(&text, out),
-                Err(err) => write_escaped_str(&format!("<blob missing: {err}>"), out),
-            }
-        }
-        ValueRepr::Array(values) => {
-            out.push('[');
-            for (idx, val) in values.iter().enumerate() {
-                if idx > 0 {
-                    out.push(',');
-                }
-                render_value(val, ctx, out);
-            }
-            out.push(']');
-        }
-    }
+    Ok(())
 }
 
 fn write_escaped_str(text: &str, out: &mut String) {
