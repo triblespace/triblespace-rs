@@ -182,7 +182,7 @@ fn render_schema_value(
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
         let text = resolve_string(ctx, handle)?;
-        write_escaped_str(&text, out);
+        write_escaped_str(text.as_ref(), out);
         return Ok(());
     }
 
@@ -191,20 +191,38 @@ fn render_schema_value(
 
 fn write_escaped_str(text: &str, out: &mut String) {
     out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if c < '\u{20}' => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+    let bytes = text.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if b >= 0x20 && b != b'\\' && b != b'"' {
+            // Fast path: copy contiguous ASCII chunk.
+            let start = idx;
+            idx += 1;
+            while idx < bytes.len() {
+                let b2 = bytes[idx];
+                if b2 < 0x20 || b2 == b'\\' || b2 == b'"' {
+                    break;
+                }
+                idx += 1;
             }
-            c => out.push(c),
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..idx]) });
+            continue;
         }
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x0c => out.push_str("\\f"),
+            _ if b < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", b);
+            }
+            _ => out.push(b as char),
+        }
+        idx += 1;
     }
     out.push('"');
 }
@@ -212,7 +230,7 @@ fn write_escaped_str(text: &str, out: &mut String) {
 struct ExportCtx<'a, Store: BlobStoreGet<Blake3>> {
     store: &'a Store,
     name_cache: HashMap<RawValue, String>,
-    string_cache: HashMap<RawValue, String>,
+    string_cache: HashMap<RawValue, View<str>>,
 }
 
 fn resolve_name(
@@ -239,20 +257,19 @@ fn resolve_name(
 fn resolve_string(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
     handle: Value<Handle<Blake3, LongString>>,
-) -> Result<String, ExportError> {
+) -> Result<View<str>, ExportError> {
     if let Some(cached) = ctx.string_cache.get(&handle.raw) {
         return Ok(cached.clone());
     }
 
     let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
-    let text = ctx
+    let text: View<str> = ctx
         .store
         .get::<View<str>, LongString>(handle)
         .map_err(|err| ExportError::BlobStore {
             hash: hex::encode(hash.raw),
             source: err.to_string(),
-        })?
-        .to_string();
+        })?;
     ctx.string_cache.insert(handle.raw, text.clone());
     Ok(text)
 }
