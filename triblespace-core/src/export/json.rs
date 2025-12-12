@@ -14,7 +14,6 @@ use crate::repo::BlobStoreGet;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
-use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, Hash};
 use crate::value::schemas::UnknownValue;
@@ -22,7 +21,7 @@ use crate::value::ToValue;
 use crate::value::Value;
 use crate::value::RawValue;
 use crate::temp;
-use f256::f256;
+use ryu::Buffer;
 
 #[derive(Debug)]
 pub enum ExportError {
@@ -168,18 +167,22 @@ fn render_schema_value(
         out.push_str(if value.from_value::<bool>() { "true" } else { "false" });
         return Ok(());
     }
-    if schema == F256::id() {
-        let value = value.transmute::<F256>();
-        out.push_str(&value.from_value::<f256>().to_string());
-        return Ok(());
-    }
     if schema == F64::id() {
         let value = value.transmute::<F64>();
         let number = value.from_value::<f64>();
-        if number.fract() == 0.0 && number.abs() <= 9_007_199_254_740_992.0 {
-            let _ = write!(out, "{number:.0}");
+        if !number.is_finite() {
+            out.push_str("null");
+            return Ok(());
+        }
+        let mut buf = Buffer::new();
+        let s = buf.format_finite(number);
+        // Preserve integer-looking forms for roundtrip tests.
+        if s.contains('e') || s.contains('E') {
+            out.push_str(s);
+        } else if s.contains('.') {
+            out.push_str(s.trim_end_matches('0').trim_end_matches('.'));
         } else {
-            let _ = write!(out, "{number:.17e}");
+            out.push_str(s);
         }
         return Ok(());
     }
