@@ -2,6 +2,7 @@
 
 pub mod boolean;
 pub mod ed25519;
+pub mod f64;
 pub mod f256;
 pub mod genid;
 pub mod hash;

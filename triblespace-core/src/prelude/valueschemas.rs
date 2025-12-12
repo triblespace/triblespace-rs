@@ -2,6 +2,7 @@ pub use crate::value::schemas::boolean::Boolean;
 pub use crate::value::schemas::ed25519::ED25519PublicKey;
 pub use crate::value::schemas::ed25519::ED25519RComponent;
 pub use crate::value::schemas::ed25519::ED25519SComponent;
+pub use crate::value::schemas::f64::F64;
 pub use crate::value::schemas::f256::F256;
 pub use crate::value::schemas::f256::F256BE;
 pub use crate::value::schemas::f256::F256LE;

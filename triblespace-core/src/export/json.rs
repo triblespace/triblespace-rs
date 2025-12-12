@@ -13,6 +13,7 @@ use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
+use crate::value::schemas::f64::F64;
 use crate::value::schemas::f256::F256;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, Hash};
@@ -79,6 +80,8 @@ fn write_entity(
         out.push_str("\"}");
         return Ok(());
     }
+
+    out.push('{');
 
     let mut multi_flags: HashMap<RawValue, bool> = HashMap::new();
     find!(
@@ -168,6 +171,16 @@ fn render_schema_value(
     if schema == F256::id() {
         let value = value.transmute::<F256>();
         out.push_str(&value.from_value::<f256>().to_string());
+        return Ok(());
+    }
+    if schema == F64::id() {
+        let value = value.transmute::<F64>();
+        let number = value.from_value::<f64>();
+        if number.fract() == 0.0 && number.abs() <= 9_007_199_254_740_992.0 {
+            let _ = write!(out, "{number:.0}");
+        } else {
+            let _ = write!(out, "{number:.17e}");
+        }
         return Ok(());
     }
     if schema == GenId::id() {

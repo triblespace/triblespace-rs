@@ -19,7 +19,7 @@ deterministic JSON importer:
 The importer uses a fixed mapping for JSON primitives:
 
 - strings → `Handle<Blake3, LongString>`
-- numbers → `F256`
+- numbers → `F64`
 - booleans → `Boolean`
 
 Arrays are treated as multi-valued fields; every element becomes its own trible
@@ -58,7 +58,7 @@ is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:
 `ShortString` → JSON string, `Handle<Blake3, LongString>` → JSON string (via
-blob lookup), `Boolean` → JSON bool, `F256` → JSON number, `GenId` → inlined
+blob lookup), `Boolean` → JSON bool, `F64` → JSON number, `GenId` → inlined
 object (unless already visited). Attributes that use other schemas are ignored
 so JSON roundtrips stay predictable even when the dataset mixes in
 format-specific extensions.

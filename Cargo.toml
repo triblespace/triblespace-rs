@@ -71,6 +71,10 @@ harness = false
 [[bench]]
 name = "dataset_vs_tribles"
 harness = false
+
+[[bench]]
+name = "number_format"
+harness = false
 [profile.bench]
 debug = true
 opt-level = 3

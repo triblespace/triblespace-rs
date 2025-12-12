@@ -14,7 +14,7 @@ use crate::macros::entity;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::f256::F256;
+use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
@@ -111,7 +111,7 @@ where
     id_salt: Option<[u8; 32]>,
     store: &'a mut Store,
     bool_attrs: HashMap<String, Attribute<Boolean>>,
-    num_attrs: HashMap<String, Attribute<F256>>,
+    num_attrs: HashMap<String, Attribute<F64>>,
     str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
     genid_attrs: HashMap<String, Attribute<GenId>>,
     multi_attrs: HashSet<Id>,
@@ -126,7 +126,7 @@ where
     data: TribleSet,
     store: &'a mut Store,
     bool_attrs: HashMap<String, Attribute<Boolean>>,
-    num_attrs: HashMap<String, Attribute<F256>>,
+    num_attrs: HashMap<String, Attribute<F64>>,
     str_attrs: HashMap<String, Attribute<Handle<Blake3, LongString>>>,
     genid_attrs: HashMap<String, Attribute<GenId>>,
 }
@@ -234,7 +234,7 @@ where
         Ok(attr)
     }
 
-    fn num_attr(&mut self, field: &str) -> Result<Attribute<F256>, JsonImportError> {
+    fn num_attr(&mut self, field: &str) -> Result<Attribute<F64>, JsonImportError> {
         if let Some(attr) = self.num_attrs.get(field) {
             return Ok(attr.clone());
         }
@@ -245,7 +245,7 @@ where
                 field: field.to_owned(),
                 source: EncodeError::from_error(err),
             })?;
-        let attr = Attribute::<F256>::from_handle(&handle);
+        let attr = Attribute::<F64>::from_handle(&handle);
         self.num_attrs.insert(field.to_owned(), attr.clone());
         Ok(attr)
     }
@@ -325,7 +325,7 @@ where
             }
             JsonValue::Number(number) => {
                 let attr = self.num_attr(field)?;
-                let encoded = number
+                let encoded: Value<F64> = number
                     .try_to_value()
                     .map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
@@ -447,11 +447,11 @@ where
         attr
     }
 
-    fn num_attr(&mut self, field: &str) -> Attribute<F256> {
+    fn num_attr(&mut self, field: &str) -> Attribute<F64> {
         if let Some(attr) = self.num_attrs.get(field) {
             return attr.clone();
         }
-        let attr = Attribute::<F256>::from_name(field);
+        let attr = Attribute::<F64>::from_name(field);
         self.num_attrs.insert(field.to_owned(), attr.clone());
         attr
     }
@@ -506,7 +506,7 @@ where
             JsonValue::Number(number) => {
                 let attr = self.num_attr(field);
                 let attr_id = attr.id();
-                let encoded = number
+                let encoded: Value<F64> = number
                     .try_to_value()
                     .map_err(|err| JsonImportError::EncodeNumber {
                         field: field.to_owned(),
@@ -557,7 +557,6 @@ mod tests {
     use crate::metadata;
     use crate::value::ValueSchema;
     use anybytes::View;
-    use f256::f256;
 
     fn make_importer<'a>(
         blobs: &'a mut MemoryBlobStore<Blake3>,
@@ -646,7 +645,7 @@ mod tests {
 
         let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();
         let tags_attr = Attribute::<Handle<Blake3, LongString>>::from_name("tags").id();
-        let pages_attr = Attribute::<F256>::from_name("pages").id();
+        let pages_attr = Attribute::<F64>::from_name("pages").id();
         let available_attr = Attribute::<Boolean>::from_name("available").id();
 
         let mut tag_values = Vec::new();
@@ -659,10 +658,9 @@ mod tests {
             } else if *attribute == tags_attr {
                 tag_values.push(trible.v::<Handle<Blake3, LongString>>().raw);
             } else if *attribute == pages_attr {
-                let value = trible.v::<F256>();
-                let number: f256 = value.from_value();
-                let expected = f256::from(412.0);
-                assert_eq!(number, expected);
+                let value = trible.v::<F64>();
+                let number: f64 = value.from_value();
+                assert_eq!(number, 412.0);
             } else if *attribute == available_attr {
                 let value = trible.v::<Boolean>();
                 assert!(value.from_value::<bool>());
@@ -672,7 +670,7 @@ mod tests {
 
         assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, title_attr, "title");
         assert_attribute_metadata::<Handle<Blake3, LongString>>(&metadata, tags_attr, "tags");
-        assert_attribute_metadata::<F256>(&metadata, pages_attr, "pages");
+        assert_attribute_metadata::<F64>(&metadata, pages_attr, "pages");
         assert_attribute_metadata::<Boolean>(&metadata, available_attr, "available");
     }
 

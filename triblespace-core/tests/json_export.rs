@@ -32,9 +32,9 @@ fn exports_json_with_cardinality_hints() {
 
     let reader = blobs.reader().expect("reader");
 
-    let exported: serde_json::Value =
-        serde_json::from_str(&export_to_json_string(&merged, root, &reader).expect("export"))
-            .expect("parse exported");
+    let export_raw = export_to_json_string(&merged, root, &reader).expect("export");
+    let mut exported: serde_json::Value =
+        serde_json::from_str(&export_raw).unwrap_or_else(|err| panic!("{err}: {export_raw}"));
     let mut expected = payload.clone();
 
     fn sort_array_field(doc: &mut serde_json::Value, field: &str) {
@@ -87,9 +87,9 @@ fn exports_openai_like_conversation() {
 
     let reader = blobs.reader().expect("reader");
 
-    let exported: serde_json::Value =
-        serde_json::from_str(&export_to_json_string(&merged, root, &reader).expect("export"))
-            .expect("parse exported");
+    let exported_raw = export_to_json_string(&merged, root, &reader).expect("export");
+    let exported: serde_json::Value = serde_json::from_str(&exported_raw)
+        .unwrap_or_else(|err| panic!("{err}: {exported_raw}"));
 
     assert_eq!(exported, payload);
 }

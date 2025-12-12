@@ -4,11 +4,13 @@ use crate::blob::Blob;
 use crate::id::ufoid;
 use crate::id::{ExclusiveId, Id};
 use crate::import::json::{EncodeError, JsonImportError};
+use crate::macros::entity;
 use crate::metadata::Metadata;
+use crate::metadata;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::f256::F256;
+use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
@@ -16,10 +18,9 @@ use crate::value::{RawValue, ToValue, Value, ValueSchema};
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use anybytes::Bytes;
-use f256::f256;
 use std::str::FromStr;
 use std::char;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use winnow::stream::Stream;
 
 /// Winnow-based streaming JSON importer (non-deterministic ids, emits metadata).
@@ -32,9 +33,10 @@ where
     data: TribleSet,
     store: &'a mut Store,
     bool_attrs: HashMap<Bytes, Attribute<Boolean>>,
-    num_attrs: HashMap<Bytes, Attribute<F256>>,
+    num_attrs: HashMap<Bytes, Attribute<F64>>,
     str_attrs: HashMap<Bytes, Attribute<Handle<Blake3, LongString>>>,
     genid_attrs: HashMap<Bytes, Attribute<GenId>>,
+    array_fields: HashSet<Bytes>,
 }
 
 impl<'a, Store> WinnowJsonImporter<'a, Store>
@@ -65,12 +67,12 @@ where
         Ok(attr)
     }
 
-    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
+    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F64>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
         }
-        let attr = self.attr_from_field::<F256>(field)?;
+        let attr = self.attr_from_field::<F64>(field)?;
         self.num_attrs.insert(key, attr.clone());
         Ok(attr)
     }
@@ -106,6 +108,7 @@ where
             num_attrs: HashMap::new(),
             str_attrs: HashMap::new(),
             genid_attrs: HashMap::new(),
+            array_fields: HashSet::new(),
         }
     }
 
@@ -197,6 +200,7 @@ where
         field: &Bytes,
     ) -> Result<(), JsonImportError> {
         self.consume_byte(bytes, b'[')?;
+        self.array_fields.insert(field.clone());
         self.skip_ws(bytes);
         if bytes.peek_token() == Some(b']') {
             self.consume_byte(bytes, b']')?;
@@ -277,13 +281,20 @@ where
                 let num = self.parse_number(bytes)?;
                 let num_str = std::str::from_utf8(num.as_ref())
                     .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
-                let number = f256::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
-                    field: String::from_utf8_lossy(field.as_ref()).into_owned(),
-                    source: EncodeError::from_error(err),
-                })?;
+                let number: f64 =
+                    f64::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
+                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                        source: EncodeError::from_error(err),
+                    })?;
+                if !number.is_finite() {
+                    return Err(JsonImportError::EncodeNumber {
+                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                        source: EncodeError::message("non-finite number"),
+                    });
+                }
                 let attr = self.num_attr(field)?;
                 let attr_id = attr.id();
-                let encoded: Value<F256> = number.to_value();
+                let encoded: Value<F64> = number.to_value();
                 self.data.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }
@@ -334,17 +345,37 @@ where
 
     pub fn metadata(&mut self) -> TribleSet {
         let mut meta = TribleSet::new();
-        for attr in self.bool_attrs.values() {
+        for (key, attr) in self.bool_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.num_attrs.values() {
+        for (key, attr) in self.num_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.str_attrs.values() {
+        for (key, attr) in self.str_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.genid_attrs.values() {
+        for (key, attr) in self.genid_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
         meta
     }
@@ -468,11 +499,12 @@ where
     data: TribleSet,
     store: &'a mut Store,
     bool_attrs: HashMap<Bytes, Attribute<Boolean>>,
-    num_attrs: HashMap<Bytes, Attribute<F256>>,
+    num_attrs: HashMap<Bytes, Attribute<F64>>,
     str_attrs: HashMap<Bytes, Attribute<Handle<Blake3, LongString>>>,
     genid_attrs: HashMap<Bytes, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     _hasher: std::marker::PhantomData<Hasher>,
+    array_fields: HashSet<Bytes>,
 }
 
 impl<'a, Store, Hasher> DeterministicWinnowJsonImporter<'a, Store, Hasher>
@@ -504,12 +536,12 @@ where
         Ok(attr)
     }
 
-    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F256>, JsonImportError> {
+    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F64>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
         }
-        let attr = self.attr_from_field::<F256>(field)?;
+        let attr = self.attr_from_field::<F64>(field)?;
         self.num_attrs.insert(key, attr.clone());
         Ok(attr)
     }
@@ -547,6 +579,7 @@ where
             genid_attrs: HashMap::new(),
             id_salt,
             _hasher: std::marker::PhantomData,
+            array_fields: HashSet::new(),
         }
     }
 
@@ -650,6 +683,7 @@ where
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
         self.consume_byte(bytes, b'[')?;
+        self.array_fields.insert(field.clone());
         self.skip_ws(bytes);
         if bytes.peek_token() == Some(b']') {
             self.consume_byte(bytes, b']')?;
@@ -725,12 +759,19 @@ where
                 let num = self.parse_number(bytes)?;
                 let num_str = std::str::from_utf8(num.as_ref())
                     .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
-                let number = f256::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
-                    field: String::from_utf8_lossy(field.as_ref()).into_owned(),
-                    source: EncodeError::from_error(err),
-                })?;
+                let number: f64 =
+                    f64::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
+                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                        source: EncodeError::from_error(err),
+                    })?;
+                if !number.is_finite() {
+                    return Err(JsonImportError::EncodeNumber {
+                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                        source: EncodeError::message("non-finite number"),
+                    });
+                }
                 let attr = self.num_attr(field)?;
-                let encoded: Value<F256> = number.to_value();
+                let encoded: Value<F64> = number.to_value();
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
@@ -800,17 +841,37 @@ where
 
     pub fn metadata(&mut self) -> TribleSet {
         let mut meta = TribleSet::new();
-        for attr in self.bool_attrs.values() {
+        for (key, attr) in self.bool_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.num_attrs.values() {
+        for (key, attr) in self.num_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.str_attrs.values() {
+        for (key, attr) in self.str_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
-        for attr in self.genid_attrs.values() {
+        for (key, attr) in self.genid_attrs.iter() {
             meta.union(attr.describe(self.store));
+            if self.array_fields.contains(key) {
+                let attr_id = attr.id();
+                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
+            }
         }
         meta
     }

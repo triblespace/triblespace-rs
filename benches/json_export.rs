@@ -253,9 +253,45 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
     group.finish();
 }
 
+fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
+    let mut group = c.benchmark_group("tribles_roundtrip/bytes");
+
+    for prepared in fixtures {
+        group.throughput(Throughput::Bytes(prepared.payload.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("tribles_roundtrip_to_string", prepared.name),
+            prepared,
+            |b, prepared| {
+                let payload = prepared.payload.clone().into_bytes();
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let (merged, root) = {
+                        let mut importer =
+                            DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+                        let roots = importer
+                            .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
+                            .expect("import JSON");
+                        let root = *roots.first().expect("root entity");
+                        let mut merged = importer.metadata();
+                        merged.union(importer.data().clone());
+                        (merged, root)
+                    };
+                    let reader = blobs.reader().expect("reader");
+                    let json = export_to_json_string(&merged, root, &reader)
+                        .expect("export JSON");
+                    std::hint::black_box(json.len());
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn tribles_roundtrip_benchmarks(c: &mut Criterion) {
     let fixtures = prepare_fixtures();
     bench_tribles_roundtrip_elements(c, &fixtures);
+    bench_tribles_roundtrip_bytes(c, &fixtures);
 }
 
 criterion_group!(

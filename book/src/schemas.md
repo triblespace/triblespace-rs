@@ -100,6 +100,7 @@ The crate provides the following value schemas out of the box:
 - `U256BE` / `U256LE` &ndash; 256-bit unsigned integers.
 - `I256BE` / `I256LE` &ndash; 256-bit signed integers.
 - `R256BE` / `R256LE` &ndash; 256-bit rational numbers.
+- `F64` &ndash; IEEE-754 double-precision floating point number (little-endian).
 - `F256BE` / `F256LE` &ndash; 256-bit floating point numbers.
 - `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/value/schemas/hash.rs)).
 - `ED25519RComponent`, `ED25519SComponent` and `ED25519PublicKey` &ndash; signature fields and keys.
