@@ -50,39 +50,13 @@ impl fmt::Display for ExportError {
 impl std::error::Error for ExportError {}
 
 /// Streamed exporter that writes JSON text directly (avoids serde_json Numbers).
-pub fn export_to_json_string(
+pub fn export_to_json(
     merged: &TribleSet,
     root: Id,
     store: &impl BlobStoreGet<Blake3>,
-) -> Result<String, ExportError> {
-    let mut ctx = ExportCtx {
-        store,
-        name_cache: HashMap::new(),
-        string_cache: HashMap::new(),
-    };
-    let mut visited = HashSet::new();
-    let mut out = String::new();
-    write_entity(merged, root, &mut visited, &mut ctx, &mut out)?;
-    Ok(out)
-}
-
-fn write_entity(
-    merged: &TribleSet,
-    entity: Id,
-    visited: &mut HashSet<Id>,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-    out: &mut String,
+    out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
-    if !visited.insert(entity) {
-        out.push_str("{\"$ref\":\"");
-        let _ = write!(out, "{entity:x}");
-        out.push_str("\"}");
-        return Ok(());
-    }
-
-    out.push('{');
-
-    let mut multi_flags: HashMap<RawValue, bool> = HashMap::new();
+    let mut multi_flags = HashSet::new();
     find!(
         (name_handle: Value<Handle<Blake3, LongString>>),
         temp!((field), pattern!(merged, [
@@ -91,8 +65,35 @@ fn write_entity(
         ]))
     )
     .for_each(|(name_handle,)| {
-        multi_flags.insert(name_handle.raw, true);
+        multi_flags.insert(name_handle.raw);
     });
+
+    let mut ctx = ExportCtx {
+        store,
+        name_cache: HashMap::new(),
+        string_cache: HashMap::new(),
+        multi_flags,
+    };
+    let mut visited = HashSet::new();
+    write_entity(merged, root, &mut visited, &mut ctx, out)?;
+    Ok(())
+}
+
+fn write_entity(
+    merged: &TribleSet,
+    entity: Id,
+    visited: &mut HashSet<Id>,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
+    out: &mut impl FmtWrite,
+) -> Result<(), ExportError> {
+    if !visited.insert(entity) {
+        let _ = out.write_str("{\"$ref\":\"");
+        let _ = write!(out, "{entity:x}");
+        let _ = out.write_str("\"}");
+        return Ok(());
+    }
+
+    let _ = out.write_char('{');
 
     let mut field_values: Vec<(
         RawValue,
@@ -130,27 +131,27 @@ fn write_entity(
         let name = resolve_name(ctx, name_handle)?;
 
         if field_idx > 0 {
-            out.push(',');
+            let _ = out.write_char(',');
         }
         write_escaped_str(&name, out);
-        out.push(':');
+        let _ = out.write_char(':');
 
-        let card_multi = multi_flags.get(&name_raw).copied().unwrap_or(false) || values.len() > 1;
+        let card_multi = ctx.multi_flags.contains(&name_raw) || values.len() > 1;
         if card_multi {
-            out.push('[');
+            let _ = out.write_char('[');
             for (i, (schema, value)) in values.into_iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    let _ = out.write_char(',');
                 }
                 render_schema_value(merged, schema, value, visited, ctx, out)?;
             }
-            out.push(']');
+            let _ = out.write_char(']');
         } else if let Some((schema, value)) = values.into_iter().next() {
             render_schema_value(merged, schema, value, visited, ctx, out)?;
         }
         field_idx += 1;
     }
-    out.push('}');
+    let _ = out.write_char('}');
     Ok(())
 }
 
@@ -160,29 +161,29 @@ fn render_schema_value(
     value: Value<UnknownValue>,
     visited: &mut HashSet<Id>,
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-    out: &mut String,
+    out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
     if schema == Boolean::id() {
         let value = value.transmute::<Boolean>();
-        out.push_str(if value.from_value::<bool>() { "true" } else { "false" });
+        let _ = out.write_str(if value.from_value::<bool>() { "true" } else { "false" });
         return Ok(());
     }
     if schema == F64::id() {
         let value = value.transmute::<F64>();
         let number = value.from_value::<f64>();
         if !number.is_finite() {
-            out.push_str("null");
+            let _ = out.write_str("null");
             return Ok(());
         }
         let mut buf = Buffer::new();
         let s = buf.format_finite(number);
         // Preserve integer-looking forms for roundtrip tests.
         if s.contains('e') || s.contains('E') {
-            out.push_str(s);
+            let _ = out.write_str(s);
         } else if s.contains('.') {
-            out.push_str(s.trim_end_matches('0').trim_end_matches('.'));
+            let _ = out.write_str(s.trim_end_matches('0').trim_end_matches('.'));
         } else {
-            out.push_str(s);
+            let _ = out.write_str(s);
         }
         return Ok(());
     }
@@ -192,7 +193,7 @@ fn render_schema_value(
         if let Err(err) = write_entity(merged, child_id, visited, ctx, &mut buf) {
             return Err(err);
         }
-        out.push_str(&buf);
+        let _ = out.write_str(&buf);
         return Ok(());
     }
     if schema == Handle::<Blake3, LongString>::id() {
@@ -205,8 +206,8 @@ fn render_schema_value(
     Ok(())
 }
 
-fn write_escaped_str(text: &str, out: &mut String) {
-    out.push('"');
+fn write_escaped_str(text: &str, out: &mut impl FmtWrite) {
+    let _ = out.write_char('"');
     let bytes = text.as_bytes();
     let mut idx = 0;
     while idx < bytes.len() {
@@ -222,31 +223,32 @@ fn write_escaped_str(text: &str, out: &mut String) {
                 }
                 idx += 1;
             }
-            out.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..idx]) });
+            let _ = out.write_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..idx]) });
             continue;
         }
         match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x08 => out.push_str("\\b"),
-            0x0c => out.push_str("\\f"),
+            b'"' => { let _ = out.write_str("\\\""); }
+            b'\\' => { let _ = out.write_str("\\\\"); }
+            b'\n' => { let _ = out.write_str("\\n"); }
+            b'\r' => { let _ = out.write_str("\\r"); }
+            b'\t' => { let _ = out.write_str("\\t"); }
+            0x08 => { let _ = out.write_str("\\b"); }
+            0x0c => { let _ = out.write_str("\\f"); }
             _ if b < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", b);
             }
-            _ => out.push(b as char),
+            _ => { let _ = out.write_char(b as char); }
         }
         idx += 1;
     }
-    out.push('"');
+    let _ = out.write_char('"');
 }
 
 struct ExportCtx<'a, Store: BlobStoreGet<Blake3>> {
     store: &'a Store,
     name_cache: HashMap<RawValue, String>,
     string_cache: HashMap<RawValue, View<str>>,
+    multi_flags: HashSet<RawValue>,
 }
 
 fn resolve_name(

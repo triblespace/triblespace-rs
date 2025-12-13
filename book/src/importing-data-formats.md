@@ -53,7 +53,7 @@ LongString blobs so arbitrarily long keys survive roundtrips; a
 human-readable inspection.
 
 When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
-`MemoryBlobStore`) to `export_to_json_string` so longstrings can be inlined. If a blob
+`MemoryBlobStore`) to `export_to_json` so longstrings can be inlined. If a blob
 is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:

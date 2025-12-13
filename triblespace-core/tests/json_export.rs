@@ -3,7 +3,7 @@ use anybytes::Bytes;
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
-use triblespace_core::export::json::export_to_json_string;
+use triblespace_core::export::json::export_to_json;
 use triblespace_core::import::json_winnow::DeterministicWinnowJsonImporter;
 use triblespace_core::prelude::valueschemas::Blake3;
 use triblespace_core::prelude::BlobStore;
@@ -32,7 +32,8 @@ fn exports_json_with_cardinality_hints() {
 
     let reader = blobs.reader().expect("reader");
 
-    let export_raw = export_to_json_string(&merged, root, &reader).expect("export");
+    let mut export_raw = String::new();
+    export_to_json(&merged, root, &reader, &mut export_raw).expect("export");
     let mut exported: serde_json::Value =
         serde_json::from_str(&export_raw).unwrap_or_else(|err| panic!("{err}: {export_raw}"));
     let mut expected = payload.clone();
@@ -87,7 +88,8 @@ fn exports_openai_like_conversation() {
 
     let reader = blobs.reader().expect("reader");
 
-    let exported_raw = export_to_json_string(&merged, root, &reader).expect("export");
+    let mut exported_raw = String::new();
+    export_to_json(&merged, root, &reader, &mut exported_raw).expect("export");
     let exported: serde_json::Value = serde_json::from_str(&exported_raw)
         .unwrap_or_else(|err| panic!("{err}: {exported_raw}"));
 

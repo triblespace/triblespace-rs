@@ -3,6 +3,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
 use oxigraph::model::Dataset;
 use serde_json::Value as JsonValue;
+use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, hint};
@@ -10,7 +11,7 @@ use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::blob::Blob;
-use triblespace::core::export::json::export_to_json_string;
+use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
 use triblespace::core::value::schemas::hash::Blake3;
@@ -273,13 +274,22 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             merged.union(importer.data().clone());
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {
-                export_to_json_string(&merged, roots[0], &reader).expect("export JSON")
+                let mut out = String::new();
+                export_to_json(&merged, roots[0], &reader, &mut out).expect("export JSON");
+                out
             } else {
-                let values: Vec<_> = roots
-                    .iter()
-                    .map(|root| export_to_json_string(&merged, *root, &reader).expect("export JSON"))
-                    .collect();
-                format!("[{}]", values.join(","))
+                let mut out = String::new();
+                let mut first = true;
+                let _ = out.write_char('[');
+                for root in roots.iter() {
+                    if !first {
+                        let _ = out.write_char(',');
+                    }
+                    first = false;
+                    export_to_json(&merged, *root, &reader, &mut out).expect("export JSON");
+                }
+                let _ = out.write_char(']');
+                out
             };
             let exported_len = exported.len();
             assert!(
@@ -294,20 +304,28 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     group.bench_function(BenchmarkId::new("export_only_json", FIXTURE_NAME), move |b| {
         b.iter(|| {
             let reader = export_fixture.reader.clone();
-            let exported = if export_fixture.roots.len() == 1 {
-                export_to_json_string(&export_fixture.merged, export_fixture.roots[0], &reader)
-                    .expect("export JSON")
+            let mut exported = String::new();
+            if export_fixture.roots.len() == 1 {
+                export_to_json(
+                    &export_fixture.merged,
+                    export_fixture.roots[0],
+                    &reader,
+                    &mut exported,
+                )
+                .expect("export JSON");
             } else {
-                let values: Vec<_> = export_fixture
-                    .roots
-                    .iter()
-                    .map(|root| {
-                        export_to_json_string(&export_fixture.merged, *root, &reader)
-                            .expect("export JSON")
-                    })
-                    .collect();
-                format!("[{}]", values.join(","))
-            };
+                let mut first = true;
+                let _ = exported.write_char('[');
+                for root in export_fixture.roots.iter() {
+                    if !first {
+                        let _ = exported.write_char(',');
+                    }
+                    first = false;
+                    export_to_json(&export_fixture.merged, *root, &reader, &mut exported)
+                        .expect("export JSON");
+                }
+                let _ = exported.write_char(']');
+            }
             let exported_len = exported.len();
             assert!(
                 exported_len > export_fixture.payload_len / 2,
