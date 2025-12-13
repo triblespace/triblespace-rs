@@ -116,6 +116,8 @@ fn write_entity(
         field_values.push((name_handle.raw, name_handle, schema, value));
     });
 
+    field_values.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
+
     let mut iter = field_values.into_iter().peekable();
     let mut field_idx = 0usize;
     while let Some((name_raw, name_handle, schema, value)) = iter.next() {
@@ -175,26 +177,18 @@ fn render_schema_value(
             let _ = out.write_str("null");
             return Ok(());
         }
-        let mut buf = Buffer::new();
-        let s = buf.format_finite(number);
-        // Preserve integer-looking forms for roundtrip tests.
-        if s.contains('e') || s.contains('E') {
-            let _ = out.write_str(s);
-        } else if s.contains('.') {
-            let _ = out.write_str(s.trim_end_matches('0').trim_end_matches('.'));
+        if number.fract() == 0.0 {
+            let _ = write!(out, "{number:.0}");
         } else {
+            let mut buf = Buffer::new();
+            let s = buf.format_finite(number);
             let _ = out.write_str(s);
         }
         return Ok(());
     }
     if schema == GenId::id() {
         let child_id = value.transmute::<GenId>().from_value::<Id>();
-        let mut buf = String::new();
-        if let Err(err) = write_entity(merged, child_id, visited, ctx, &mut buf) {
-            return Err(err);
-        }
-        let _ = out.write_str(&buf);
-        return Ok(());
+        return write_entity(merged, child_id, visited, ctx, out);
     }
     if schema == Handle::<Blake3, LongString>::id() {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
