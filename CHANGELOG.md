@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Repository::pull_with_key`.
 
 ### Changed
+- Expanded the Pile Format chapter with a restore-first operational workflow,
+  corrected usage example showing a restore-after-open startup without an
+  explicit refresh, and detailed record field breakdowns.
+- Clarified that `Pile::restore` already applies intact records before
+  truncating and that reader/branch helpers refresh automatically, so manual
+  refreshes are only needed when scanning between operations.
 - Normalized the Descriptive Typing chapter to use consistent Markdown headings
   and remove unused front matter.
 - Clarified `PATCH::iter_ordered` and `PATCHOrderedIterator` documentation to
