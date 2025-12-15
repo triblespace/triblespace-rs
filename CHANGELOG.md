@@ -182,6 +182,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entity!`, and query semantics.
 
 ### Changed
+- Expanded the Pile Blob Metadata chapter with an accurate header field
+  breakdown, timestamp conversion example, and details on lazy validation.
+- Corrected the BlobMetadata description to state it surfaces the timestamp and
+  length fields from the header.
 - Expanded the Pile Format chapter with a restore-first operational workflow,
   corrected usage example showing a restore-after-open startup without an
   explicit refresh, and detailed record field breakdowns.
