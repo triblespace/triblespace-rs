@@ -2,8 +2,8 @@ use anybytes::Bytes;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Barrier;
-use tribles::blob::schemas::UnknownBlob;
-use tribles::prelude::*;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::prelude::*;
 
 #[test]
 fn refresh_during_restore_truncation_is_safe() {

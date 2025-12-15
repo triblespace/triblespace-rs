@@ -1,9 +1,9 @@
 use crate::{entity, pattern, pattern_changes};
-use tribles::prelude::*;
+use triblespace::prelude::*;
 use trybuild::TestCases;
 
 pub mod names {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: valueschemas::ShortString;
@@ -12,7 +12,7 @@ pub mod names {
 }
 
 mod social {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "C2C8D4D6E3E5479EA6F4D71D979CD3CE" as friend: valueschemas::GenId;
@@ -21,7 +21,7 @@ mod social {
 }
 
 mod library {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "6E7843FC4D9C428EBF5C9C86CB8C33C4" as title: valueschemas::ShortString;

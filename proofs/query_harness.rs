@@ -1,5 +1,6 @@
 #![cfg(kani)]
 
+use super::util;
 use crate::prelude::*;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::UnknownValue;
@@ -20,21 +21,13 @@ pub mod qns {
 #[kani::unwind(64)]
 fn query_harness() {
     // Build a small knowledge base with one author and one book.
-    let author_raw: [u8; 16] = kani::any();
-    let book_raw: [u8; 16] = kani::any();
-    kani::assume(author_raw != [0u8; 16]);
-    kani::assume(book_raw != [0u8; 16]);
-    kani::assume(book_raw != author_raw);
-    let author = ExclusiveId::force(Id::new(author_raw).unwrap());
-    let book = ExclusiveId::force(Id::new(book_raw).unwrap());
+    let author = util::bounded_exclusive_id();
+    let book = util::bounded_exclusive_id();
+    kani::assume(author != book);
 
-    let firstname_raw: [u8; 32] = kani::any();
-    let lastname_raw: [u8; 32] = kani::any();
-    let title_raw: [u8; 32] = kani::any();
-
-    let firstname = Value::<UnknownValue>::new(firstname_raw);
-    let lastname = Value::<UnknownValue>::new(lastname_raw);
-    let title = Value::<UnknownValue>::new(title_raw);
+    let firstname = util::bounded_unknown_value();
+    let lastname = util::bounded_unknown_value();
+    let title = util::bounded_unknown_value();
 
     let mut set = TribleSet::new();
     set += entity! { &author @

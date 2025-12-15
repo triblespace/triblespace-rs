@@ -3,16 +3,16 @@ use std::collections::HashSet;
 
 use fake::faker::lorem::en::Sentence;
 use fake::faker::lorem::en::Words;
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
 use fake::faker::name::raw::*;
 use fake::locales::*;
 use fake::Fake;
-use tribles::query::ContainsConstraint;
-use tribles::repo::BlobStorePut;
+use triblespace::core::query::ContainsConstraint;
+use triblespace::core::repo::BlobStorePut;
 
 pub mod literature {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" as author: valueschemas::GenId;

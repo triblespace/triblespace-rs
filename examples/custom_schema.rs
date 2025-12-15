@@ -1,23 +1,36 @@
 use anybytes::Bytes;
 use std::convert::Infallible;
-use tribles::blob::Blob;
-use tribles::blob::BlobSchema;
-use tribles::blob::ToBlob;
-use tribles::blob::TryFromBlob;
-use tribles::id::id_hex;
-use tribles::id::Id;
-use tribles::value::FromValue;
-use tribles::value::ToValue;
-use tribles::value::Value;
-use tribles::value::ValueSchema;
-use tribles::value::VALUE_LEN;
+use triblespace::core::blob::Blob;
+use triblespace::core::blob::BlobSchema;
+use triblespace::core::blob::ToBlob;
+use triblespace::core::blob::TryFromBlob;
+use triblespace::core::repo::BlobStore;
+use triblespace::core::id::id_hex;
+use triblespace::core::id::Id;
+use triblespace::core::metadata::ConstMetadata;
+use triblespace::core::value::FromValue;
+use triblespace::core::value::ToValue;
+use triblespace::core::value::Value;
+use triblespace::core::value::ValueSchema;
+use triblespace::core::value::VALUE_LEN;
+use triblespace::core::value::schemas::hash::Blake3;
 
 // ANCHOR: custom_schema
 
 pub struct U64LE;
 
+impl ConstMetadata for U64LE {
+    fn id() -> Id {
+        id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> triblespace::core::trible::TribleSet {
+        let _ = blobs;
+        triblespace::core::trible::TribleSet::new()
+    }
+}
+
 impl ValueSchema for U64LE {
-    const VALUE_SCHEMA_ID: Id = id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A");
     type ValidationError = Infallible;
 }
 
@@ -37,9 +50,13 @@ impl FromValue<'_, U64LE> for u64 {
 
 pub struct BytesBlob;
 
-impl BlobSchema for BytesBlob {
-    const BLOB_SCHEMA_ID: Id = id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0");
+impl ConstMetadata for BytesBlob {
+    fn id() -> Id {
+        id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0")
+    }
 }
+
+impl BlobSchema for BytesBlob {}
 
 impl ToBlob<BytesBlob> for Bytes {
     fn to_blob(self) -> Blob<BytesBlob> {

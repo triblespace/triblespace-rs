@@ -33,9 +33,9 @@ afterwards.
 
 ```rust,no_run
 use anybytes::Bytes;
-use tribles::blob::schemas::UnknownBlob;
-use tribles::blob::Blob;
-use tribles::repo::pile::Pile;
+use triblespace::blob::schemas::UnknownBlob;
+use triblespace::blob::Blob;
+use triblespace::repo::pile::Pile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pile = Pile::open("/tmp/example.pile")?;

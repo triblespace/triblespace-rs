@@ -1,6 +1,6 @@
-use tribles::patch::Entry;
-use tribles::patch::IdentitySchema;
-use tribles::patch::PATCH;
+use triblespace::core::patch::Entry;
+use triblespace::core::patch::IdentitySchema;
+use triblespace::core::patch::PATCH;
 
 #[test]
 fn patches_with_same_keys_but_different_values_compare_equal() {

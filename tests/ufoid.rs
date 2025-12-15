@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 use std::collections::HashSet;
-use tribles::id::ufoid::timestamp_distance;
-use tribles::id::ufoid::{self};
+use triblespace::core::id::ufoid::timestamp_distance;
+use triblespace::core::id::ufoid::{self};
 
 proptest! {
     #[test]
@@ -19,7 +19,7 @@ proptest! {
         for byte in 4..16 { // skip timestamp bytes
             let mut unique = HashSet::new();
             for id in &ids {
-                let raw: &tribles::id::RawId = AsRef::<tribles::id::RawId>::as_ref(id);
+                let raw: &triblespace::core::id::RawId = AsRef::<triblespace::core::id::RawId>::as_ref(id);
                 unique.insert(raw[byte]);
             }
             prop_assert!(unique.len() > count / 10, "byte {} lacks entropy", byte);

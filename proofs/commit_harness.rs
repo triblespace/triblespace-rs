@@ -1,9 +1,9 @@
 #![cfg(kani)]
 
 use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
-use tribles::prelude::*;
-use tribles::repo::{self, commit};
-use tribles::value::schemas::hash::Blake3;
+use triblespace::prelude::*;
+use triblespace::core::repo::{self, commit};
+use triblespace::core::value::schemas::hash::Blake3;
 use kani::BoundedArbitrary;
 use crate::pattern;
 use crate::entity;

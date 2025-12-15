@@ -78,8 +78,8 @@
 - Add `proofs/patch_harness.rs` with ByteTable checks proving `plan_insert`
   respects `MAX_RETRIES`, `table_insert` hands growth entries back to
   `Branch::modify_child`, and `table_grow` preserves every occupant.
-- Extend `proofs/value_harness.rs` with schema-aware helpers ensuring forced
-  values reject truncated buffers.
+- Extend `proofs/value_harness.rs` with schema-aware helpers ensuring
+  `TryFromValue` conversions reject truncated buffers.
 - Expand `proofs/commit_harness.rs` with bounded commit DAG generators that
   assert append-only pile semantics.
 

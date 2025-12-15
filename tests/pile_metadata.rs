@@ -5,13 +5,13 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
 use tempfile::tempdir;
-use tribles::blob::schemas::UnknownBlob;
-use tribles::blob::Blob;
-use tribles::prelude::BlobStore;
-use tribles::prelude::BlobStorePut;
-use tribles::repo::pile::Pile;
-use tribles::repo::BlobStoreMeta;
-use tribles::value::schemas::hash::Blake3;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::Blob;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::BlobStoreMeta;
+use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::prelude::BlobStore;
+use triblespace::prelude::BlobStorePut;
 
 #[test]
 fn metadata_detects_corrupted_blob() {

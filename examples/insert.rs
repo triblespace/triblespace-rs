@@ -1,14 +1,14 @@
 use crate::entity;
 use fake::faker::lorem::en::Sentence;
 use fake::faker::lorem::en::Words;
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
-use tribles::examples::literature;
+use triblespace::core::examples::literature;
 
 use fake::faker::name::raw::*;
 use fake::locales::*;
 use fake::Fake;
-use tribles::repo::BlobStorePut;
+use triblespace::core::repo::BlobStorePut;
 
 fn main() {
     let mut kb = TribleSet::new();
