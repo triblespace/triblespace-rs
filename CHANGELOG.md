@@ -182,6 +182,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entity!`, and query semantics.
 
 ### Changed
+- Expanded the Pile Format chapter with a restore-first operational workflow,
+  corrected usage example showing a restore-after-open startup without an
+  explicit refresh, and detailed record field breakdowns.
+- Clarified that `Pile::restore` already applies intact records before
+  truncating and that reader/branch helpers refresh automatically, so manual
+  refreshes are only needed when scanning between operations.
 - Corrected the PATCH deep-dive chapter so its descriptions of persistence,
   node layout, resizing, and hash maintenance match the implementation.
 - Clarified the PATCH deep-dive resizing description to avoid implying growth
