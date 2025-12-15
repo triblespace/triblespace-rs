@@ -2,12 +2,12 @@ use anybytes::Bytes;
 use proptest::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use tribles::blob::schemas::UnknownBlob;
-use tribles::prelude::blobschemas::SimpleArchive;
-use tribles::prelude::valueschemas::Handle;
-use tribles::prelude::*;
-use tribles::repo::PushResult;
-use tribles::value::schemas::hash::Blake3;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::repo::PushResult;
+use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::prelude::blobschemas::SimpleArchive;
+use triblespace::prelude::valueschemas::Handle;
+use triblespace::prelude::*;
 
 #[derive(Debug, Clone)]
 enum Op {

@@ -1,6 +1,6 @@
-use tribles::patch::Entry;
-use tribles::patch::IdentitySchema;
-use tribles::patch::PATCH;
+use triblespace::core::patch::Entry;
+use triblespace::core::patch::IdentitySchema;
+use triblespace::core::patch::PATCH;
 
 #[test]
 fn intersect_multiple_common_children_commits_branchmut_integration() {

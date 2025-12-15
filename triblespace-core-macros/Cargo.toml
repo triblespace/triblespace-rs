@@ -1,0 +1,15 @@
+[package]
+name = "triblespace-core-macros"
+version = "0.6.0"
+edition = "2021"
+description = "Plain wrappers around the triblespace procedural macros"
+license = "MIT OR Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["extra-traits"] }
+triblespace-macros-common = {version = "0.6.0", path = "../triblespace-macros-common"}

@@ -1,7 +1,7 @@
-use tribles::blob::schemas::succinctarchive::OrderedUniverse;
-use tribles::blob::schemas::succinctarchive::SuccinctArchive;
-use tribles::prelude::*;
-use tribles::value::schemas::UnknownValue;
+use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
+use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
+use triblespace::core::value::schemas::UnknownValue;
+use triblespace::prelude::*;
 
 #[test]
 fn distinct_and_enumerate() {

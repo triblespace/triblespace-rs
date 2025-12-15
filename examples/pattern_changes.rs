@@ -2,12 +2,12 @@ use crate::entity;
 use crate::pattern_changes;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use tribles::prelude::*;
-use tribles::repo::memoryrepo::MemoryRepo;
-use tribles::repo::Repository;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
+use triblespace::core::repo::Repository;
+use triblespace::prelude::*;
 
 pub mod literature {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" as author: valueschemas::GenId;

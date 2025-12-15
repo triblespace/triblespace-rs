@@ -1,18 +1,18 @@
-![Crates.io Version](https://img.shields.io/crates/v/tribles)
-![docs.rs](https://img.shields.io/docsrs/tribles)
+![Crates.io Version](https://img.shields.io/crates/v/triblespace)
+![docs.rs](https://img.shields.io/docsrs/triblespace)
 ![Discord Shield](https://discordapp.com/api/guilds/795317845181464651/widget.png?style=shield)
 
 🚧🚧🚧 Please note that this is work in progress, so while a lot of things have settled by now, we still favour breaking backwards compatiblity for seeminly minor improvements. 🚧🚧🚧
 
 
-<img src="https://github.com/triblespace/tribles-rust/blob/main/sticker.png?raw=true" width="300"
+<img src="https://github.com/triblespace/triblespace-rs/blob/main/sticker.png?raw=true" width="300"
  alt="The mascot of the trible.space a cute fluffy trible with three eyes."/>
 
 
 # About
 
-> “Insufficient facts always invite danger.”  
-> — *Mr. Spock*
+> “We need to abolish names and places, and replace them with hashes.”
+> — Joe Armstrong, [The Mess We’re In](https://www.youtube.com/watch?v=lKXe3HUG2l4)
 
 **Trible Space** is a data space and knowledge graph standard. It offers metadata management capabilities similar to file- and version-control systems, combined with the queryability and convenience of an embedded database, tailored towards use with simple blob storage. It is designed to be a holistic yet lightweight data storage solution that can be used in a variety of contexts, from embedded systems to distributed cloud services.
 
@@ -39,24 +39,24 @@ If you have any questions or want to chat about graph databases hop into our [di
 Add the crate to your project:
 
 ```bash
-cargo add tribles
+cargo add triblespace
 ```
 
-Then spin up a repository-backed workspace, mint the attributes your program
-needs, populate the repository with data, and query it—all in a single
-program.
+Once the crate is installed, you can experiment immediately with the
+quick-start program below. It showcases the attribute macros, workspace
+staging, queries, and pushing commits to a repository.
 
 ```rust
-use tribles::prelude::*;
-use tribles::prelude::blobschemas::LongString;
-use tribles::repo::{memoryrepo::MemoryRepo, Repository};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::prelude::*;
+use triblespace::prelude::blobschemas::LongString;
+use triblespace::core::repo::{memoryrepo::MemoryRepo, Repository};
 
 mod literature {
-    use tribles::prelude::*;
-    use tribles::prelude::blobschemas::LongString;
-    use tribles::prelude::valueschemas::{Blake3, GenId, Handle, R256, ShortString};
+    use triblespace::prelude::*;
+    use triblespace::prelude::blobschemas::LongString;
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, R256, ShortString};
 
     attributes! {
         /// The title of a work.
@@ -78,8 +78,18 @@ mod literature {
 
         /// The number of pages in the work.
         "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
+
+        /// A pen name or alternate spelling for an author.
+        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
+
+        /// A throwaway prototype field; omit the id to derive it from the name and schema.
+        pub prototype_note: Handle<Blake3, LongString>;
     }
 }
+
+// The examples pin explicit ids for shared schemas. For quick prototypes you
+// can omit the hex literal and `attributes!` will derive a deterministic id
+// from the attribute name and schema (via Attribute::from_name).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
@@ -105,16 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         literature::title: "Dune",
         literature::author: &author_id,
         literature::quote: ws.put::<LongString, _>(
-            "Deep in the human unconscious is a pervasive need for a logical \
-             universe that makes sense. But the real universe is always one \
-             step beyond logic."
+            "Deep in the human unconscious is a pervasive need for a logical              universe that makes sense. But the real universe is always one              step beyond logic."
         ),
         literature::quote: ws.put::<LongString, _>(
-            "I must not fear. Fear is the mind-killer. Fear is the little-death \
-             that brings total obliteration. I will face my fear. I will permit \
-             it to pass over me and through me. And when it has gone past I will \
-             turn the inner eye to see its path. Where the fear has gone there \
-             will be nothing. Only I will remain."
+            "I must not fear. Fear is the mind-killer. Fear is the little-death              that brings total obliteration. I will face my fear. I will permit              it to pass over me and through me. And when it has gone past I will              turn the inner eye to see its path. Where the fear has gone there              will be nothing. Only I will remain."
         ),
     };
 
@@ -142,49 +146,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         let quote: View<str> = ws.get(quote)?;
         let quote = quote.as_ref();
-        println!("'{quote}'\n - from {title} by {f} {}.", l.from_value::<&str>());
+        println!("'{quote}'
+ - from {title} by {f} {}.", l.from_value::<&str>());
     }
 
-    // Use `try_push` for a single attempt that returns a conflict workspace on
-    // CAS failure; use `push` to let the repository merge and retry
-    // automatically.
+    // Use `push` when you want automatic retries that merge concurrent history
+    // into the workspace before publishing.
+    repo.push(&mut ws).expect("publish initial library");
+
+    // Stage a non-monotonic update that we plan to reconcile manually.
+    ws.commit(
+        entity! { &author_id @ literature::firstname: "Francis" },
+        Some("use pen name"),
+    );
+
+    // Simulate a collaborator racing us with a different update.
+    let mut collaborator = repo
+        .pull(*branch_id)
+        .expect("pull collaborator workspace");
+    collaborator.commit(
+        entity! { &author_id @ literature::firstname: "Franklin" },
+        Some("record legal first name"),
+    );
+    repo.push(&mut collaborator)
+        .expect("publish collaborator history");
+
+    // `try_push` returns a conflict workspace when the CAS fails, letting us
+    // inspect divergent history and decide how to merge it.
     if let Some(mut conflict_ws) = repo
         .try_push(&mut ws)
-        .expect("push staged commits")
+        .expect("attempt manual conflict resolution")
     {
-        // Resolve conflicts by merging the returned workspace as needed.
+        let conflict_catalog = conflict_ws.checkout(..)?;
+
+        for (first,) in find!(
+            (first: Value<_>),
+            pattern!(&conflict_catalog, [{
+                literature::author: &author_id,
+                literature::firstname: ?first
+            }])
+        ) {
+            println!("Collaborator kept the name '{}'.", first.from_value::<&str>());
+        }
+
         ws.merge(&mut conflict_ws)
             .expect("merge conflicting history");
-        repo.push(&mut ws).expect("finalize push after merge");
+
+        ws.commit(
+            entity! { &author_id @ literature::alias: "Francis" },
+            Some("keep pen-name as an alias"),
+        );
+
+        repo.push(&mut ws)
+            .expect("publish merged aliases");
     }
 
     Ok(())
 }
 ```
 
-`Repository::create_branch` returns an `ExclusiveId` guard for the new branch.
-Dereference it (or call `release`) when passing the branch identifier to
-`Repository::pull` so additional workspaces can target the same branch.
 
-The example inlines the `tribles::examples::literature` namespace with
-`attributes!` so the quick-start walkthrough and crate examples stay aligned
-while still compiling in standalone projects. Update the 32-character hex
-strings when you adapt the code to keep attribute identifiers globally unique.
-
-You can also introduce temporary equality constraints inside a pattern without
-adding them to the surrounding `find!` bindings. Prefix a variable name with
-`_?` to allocate a scoped query variable that lives only for the duration of the
-macro expansion:
-
-```ignore
-pattern!(&set, [{
-    ?author @ literature::firstname: _?name,
-    literature::lastname: _?name,
-}]);
-```
-
-This binds both attributes to the same generated variable, ensuring the first
-and last names match without cluttering the outer query signature.
+The [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
+chapter of the book breaks this example down line by line, covers project
+scaffolding, and introduces more background on how repositories, workspaces,
+and queries interact.
 
 ## Tribles Book
 
@@ -200,20 +225,20 @@ For details on setting up a development environment, see [Developing Locally](bo
 
 # Learn More
 
-The best way to get started is to read the [Tribles Book](https://triblespace.github.io/tribles-rust/). The following links mirror the book's chapter order so you can progress from the basics to more advanced topics:
+The best way to get started is to read the [Tribles Book](https://triblespace.github.io/triblespace-rs/). The following links mirror the book's chapter order so you can progress from the basics to more advanced topics:
 
-1. [Introduction](https://triblespace.github.io/tribles-rust/introduction.html)
-2. [Getting Started](https://triblespace.github.io/tribles-rust/getting-started.html)
-3. [Architecture](https://triblespace.github.io/tribles-rust/architecture.html)
-4. [Query Language](https://triblespace.github.io/tribles-rust/query-language.html)
-5. [Incremental Queries](https://triblespace.github.io/tribles-rust/incremental-queries.html)
-6. [Schemas](https://triblespace.github.io/tribles-rust/schemas.html)
-7. [Repository Workflows](https://triblespace.github.io/tribles-rust/repository-workflows.html)
-8. [Commit Selectors](https://triblespace.github.io/tribles-rust/commit-selectors.html)
-9. [Philosophy](https://triblespace.github.io/tribles-rust/deep-dive/philosophy.html)
-10. [Identifiers](https://triblespace.github.io/tribles-rust/deep-dive/identifiers.html)
-11. [Trible Structure](https://triblespace.github.io/tribles-rust/deep-dive/trible-structure.html)
-12. [Pile Format](https://triblespace.github.io/tribles-rust/pile-format.html)
+1. [Introduction](https://triblespace.github.io/triblespace-rs/introduction.html)
+2. [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
+3. [Architecture](https://triblespace.github.io/triblespace-rs/architecture.html)
+4. [Query Language](https://triblespace.github.io/triblespace-rs/query-language.html)
+5. [Incremental Queries](https://triblespace.github.io/triblespace-rs/incremental-queries.html)
+6. [Schemas](https://triblespace.github.io/triblespace-rs/schemas.html)
+7. [Repository Workflows](https://triblespace.github.io/triblespace-rs/repository-workflows.html)
+8. [Commit Selectors](https://triblespace.github.io/triblespace-rs/commit-selectors.html)
+9. [Philosophy](https://triblespace.github.io/triblespace-rs/deep-dive/philosophy.html)
+10. [Identifiers](https://triblespace.github.io/triblespace-rs/deep-dive/identifiers.html)
+11. [Trible Structure](https://triblespace.github.io/triblespace-rs/deep-dive/trible-structure.html)
+12. [Pile Format](https://triblespace.github.io/triblespace-rs/pile-format.html)
 ## License
 
 Licensed under either of

@@ -1,50 +1,33 @@
 #![doc = include_str!("../README.md")]
-// Prefer explicit `?` variable bindings in patterns instead of relying on
-// parenthesisation. Do not suppress `unused_parens` at the crate level.
-#![cfg_attr(nightly, feature(rustc_attrs, decl_macro, file_lock))]
+extern crate self as triblespace;
 
-extern crate self as tribles;
+pub use triblespace_core::arrayvec;
 
-#[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
-compile_error!("tribles-rust requires a 64-bit little-endian target");
+pub use triblespace_core as core;
 
-pub mod attribute;
-pub mod blob;
-pub mod id;
-pub mod metadata;
-pub mod patch;
-pub mod prelude;
-pub mod query;
-pub mod repo;
-pub mod trible;
-pub mod value;
+pub mod macros {
+    pub use triblespace_core::macros::id_hex;
+    pub use triblespace_macros::{
+        attributes, entity, find, matches, path, pattern, pattern_changes,
+    };
+}
 
-pub mod debug;
-pub mod examples;
-
-// Re-export dependencies used by generated macros so consumers
-// don't need to add them explicitly.
-pub use arrayvec;
-pub use macro_pub;
-pub use tribles_macros as macros;
-// Re-export proc-macros at the crate root so they are available within the
-// crate without requiring explicit `use` statements at every call site.
-pub use tribles_macros::attributes;
-pub use tribles_macros::entity;
-pub use tribles_macros::path;
-pub use tribles_macros::pattern;
-pub use tribles_macros::pattern_changes;
+pub mod prelude {
+    pub use crate::macros::{attributes, entity, find, matches, path, pattern, pattern_changes};
+    pub use triblespace_core::prelude::*;
+}
 
 #[cfg(kani)]
 #[path = "../proofs/mod.rs"]
 mod proofs;
 
-// Let's add the readme example as a test
+// Keep the README example here so the facade crate exercises the public API as
+// consumers see it while `triblespace-core` stays lean for proc-macro usage.
 #[cfg(test)]
 mod readme_example {
+    use crate::core::repo::{memoryrepo::MemoryRepo, Repository};
     use crate::prelude::blobschemas::LongString;
     use crate::prelude::*;
-    use crate::repo::{memoryrepo::MemoryRepo, Repository};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
 
@@ -73,6 +56,9 @@ mod readme_example {
 
             /// The number of pages in the work.
             "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
+
+            /// A pen name or alternate spelling for an author.
+            "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
         }
     }
 
@@ -113,19 +99,22 @@ mod readme_example {
         let catalog = ws.checkout(..)?;
         let title = "Dune";
 
+        // Use `_?ident` when you need a fresh variable scoped to this macro call
+        // without declaring it in the find! projection list.
         for (f, l, quote) in find!(
             (first: String, last: Value<_>, quote),
             pattern!(&catalog, [
-                { _?author @
-                literature::firstname: ?first,
-                literature::lastname: ?last
-            },
-            {
-                literature::title: title,
-                literature::author: _?author,
-                literature::quote: ?quote
-            }
-        ])
+                {
+                    _?author @
+                    literature::firstname: ?first,
+                    literature::lastname: ?last
+                },
+                {
+                    literature::title: title,
+                    literature::author: _?author,
+                    literature::quote: ?quote
+                }
+            ])
         ) {
             let quote: View<str> = ws.get(quote)?;
             let quote = quote.as_ref();
@@ -133,13 +122,58 @@ mod readme_example {
             println!(
                 "'{quote}'\n - from {title} by {f} {}.",
                 l.from_value::<&str>()
-            )
+            );
         }
 
-        if let Some(mut conflict_ws) = repo.try_push(&mut ws).expect("push staged commits") {
+        // Use `push` when you want automatic retries that merge concurrent history
+        // into the workspace before publishing.
+        repo.push(&mut ws).expect("publish initial library");
+
+        // Stage a non-monotonic update that we plan to reconcile manually.
+        ws.commit(
+            entity! { &author_id @ literature::firstname: "Francis" },
+            Some("use pen name"),
+        );
+
+        // Simulate a collaborator racing us with a different update.
+        let mut collaborator = repo.pull(*branch_id).expect("pull collaborator workspace");
+        collaborator.commit(
+            entity! { &author_id @ literature::firstname: "Franklin" },
+            Some("record legal first name"),
+        );
+        repo.push(&mut collaborator)
+            .expect("publish collaborator history");
+
+        // `try_push` returns a conflict workspace when the CAS fails, letting us
+        // inspect divergent history and decide how to merge it.
+        if let Some(mut conflict_ws) = repo
+            .try_push(&mut ws)
+            .expect("attempt manual conflict resolution")
+        {
+            let conflict_catalog = conflict_ws.checkout(..)?;
+
+            for (first,) in find!(
+                (first: Value<_>),
+                pattern!(&conflict_catalog, [{
+                    literature::author: &author_id,
+                    literature::firstname: ?first
+                }])
+            ) {
+                println!(
+                    "Collaborator kept the name '{}'.",
+                    first.from_value::<&str>()
+                );
+            }
+
             ws.merge(&mut conflict_ws)
                 .expect("merge conflicting history");
-            repo.push(&mut ws).expect("finalize push after merge");
+
+            ws.commit(
+                entity! { &author_id @ literature::alias: "Francis" },
+                Some("keep pen-name as an alias"),
+            );
+
+            repo.push(&mut ws).expect("publish merged aliases");
         }
 
         Ok(())

@@ -1,0 +1,355 @@
+use anybytes::Bytes;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use oxigraph::io::{JsonLdProfileSet, RdfFormat, RdfParser, RdfSerializer};
+use oxigraph::model::Dataset;
+use serde_json::Value as JsonValue;
+use std::fmt::Write as FmtWrite;
+use std::path::PathBuf;
+use std::time::Duration;
+use std::{fs, hint};
+use triblespace::core::blob::schemas::longstring::LongString;
+use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::blob::Blob;
+use triblespace::core::export::json::export_to_json;
+use triblespace::core::id::Id;
+use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
+use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::prelude::{BlobSchema, BlobStore, TribleSet};
+
+const FIXTURE_NAME: &str = "mapping-authorities-gnd-agrovoc_lds.jsonld";
+
+fn load_payload() -> String {
+    let path: PathBuf = [
+        env!("CARGO_MANIFEST_DIR"),
+        "benches",
+        "data",
+        "json-ld",
+        FIXTURE_NAME,
+    ]
+    .into_iter()
+    .collect();
+    fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("failed to read {FIXTURE_NAME} at {path:?}: {err}"))
+}
+
+fn normalize_for_import(payload: &str) -> String {
+    let value: JsonValue = serde_json::from_str(payload).expect("parse fixture JSON-LD");
+    match value {
+        JsonValue::Array(items) => {
+            let mut flattened = Vec::new();
+            for item in items {
+                match item {
+                    JsonValue::Array(inner) => flattened.extend(inner),
+                    JsonValue::Object(_) => flattened.push(item),
+                    _ => {}
+                }
+            }
+            serde_json::to_string(&JsonValue::Array(flattened)).expect("serialize")
+        }
+        JsonValue::Object(_) => payload.to_owned(),
+        _ => payload.to_owned(),
+    }
+}
+
+fn bench_oxigraph(c: &mut Criterion, payload: &str) {
+    let bytes = payload.len() as u64;
+    let mut group = c.benchmark_group("json_ld/oxigraph");
+    group.throughput(Throughput::Bytes(bytes));
+
+    group.bench_function(BenchmarkId::new("parse", FIXTURE_NAME), |b| {
+        b.iter(|| {
+            let mut dataset = Dataset::new();
+            let parser = RdfParser::from_format(RdfFormat::JsonLd {
+                profile: JsonLdProfileSet::default(),
+            });
+            for quad in parser.for_reader(payload.as_bytes()) {
+                dataset.insert(&quad.expect("quad"));
+            }
+            hint::black_box(dataset.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_nquads", FIXTURE_NAME), |b| {
+        b.iter(|| {
+            let mut dataset = Dataset::new();
+            let parser = RdfParser::from_format(RdfFormat::JsonLd {
+                profile: JsonLdProfileSet::default(),
+            });
+            for quad in parser.for_reader(payload.as_bytes()) {
+                dataset.insert(&quad.expect("quad"));
+            }
+
+            let mut serializer =
+                RdfSerializer::from_format(RdfFormat::NQuads).for_writer(Vec::new());
+            for quad in dataset.iter() {
+                serializer.serialize_quad(quad).expect("serialize quad");
+            }
+            let out = serializer.finish().expect("finish serialization");
+            hint::black_box(out.len());
+        });
+    });
+
+    group.bench_function(
+        BenchmarkId::new("jsonld_roundtrip", FIXTURE_NAME),
+        |b| {
+            b.iter(|| {
+                let mut dataset = Dataset::new();
+                let parser = RdfParser::from_format(RdfFormat::JsonLd {
+                    profile: JsonLdProfileSet::default(),
+                });
+                for quad in parser.for_reader(payload.as_bytes()) {
+                    dataset.insert(&quad.expect("quad"));
+                }
+
+                let mut serializer = RdfSerializer::from_format(RdfFormat::JsonLd {
+                    profile: JsonLdProfileSet::default(),
+                })
+                .for_writer(Vec::new());
+                for quad in dataset.iter() {
+                    serializer.serialize_quad(quad).expect("serialize quad");
+                }
+                let out = serializer.finish().expect("finish serialization");
+                hint::black_box(out.len());
+            });
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
+    let import_payload = normalize_for_import(payload);
+    let bytes = import_payload.len() as u64;
+    let import_blob = Blob::<LongString>::new(Bytes::from(import_payload.clone().into_bytes()));
+    let mut group = c.benchmark_group("json_ld/tribles");
+    group.throughput(Throughput::Bytes(bytes));
+
+    struct ExportFixture {
+        merged: TribleSet,
+        roots: Vec<Id>,
+        reader: <MemoryBlobStore<Blake3> as BlobStore<Blake3>>::Reader,
+        payload_len: usize,
+        _blobs: MemoryBlobStore<Blake3>,
+    }
+
+    let export_fixture = {
+        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut importer =
+            DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+        let roots = importer
+            .import_blob(import_blob.clone())
+            .expect("import JSON-LD as JSON");
+        let mut merged = importer.metadata();
+        merged.union(importer.data().clone());
+        let reader = blobs.reader().expect("reader");
+        let payload_len = import_payload.len();
+
+        ExportFixture {
+            merged,
+            roots,
+            reader,
+            payload_len,
+            _blobs: blobs,
+        }
+    };
+
+    group.bench_function(BenchmarkId::new("parse", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_ephemeral", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow_ephemeral", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            hint::black_box(roots.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            hint::black_box(archive.bytes.len());
+        });
+    });
+
+    group.bench_function(
+        BenchmarkId::new("parse_ephemeral_simplearchive", FIXTURE_NAME),
+        |b| {
+            let blob = import_blob.clone();
+            b.iter(|| {
+                let mut blobs = MemoryBlobStore::<Blake3>::new();
+                let mut importer = WinnowJsonImporter::new(&mut blobs);
+                importer
+                    .import_blob(blob.clone())
+                    .expect("import JSON-LD as JSON");
+                let archive = SimpleArchive::blob_from(&importer.data().clone());
+                hint::black_box(archive.bytes.len());
+            });
+        },
+    );
+
+    group.bench_function(BenchmarkId::new("parse_winnow_ephemeral_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer = WinnowJsonImporter::new(&mut blobs);
+            importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            hint::black_box(archive.bytes.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("parse_winnow_simplearchive", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            hint::black_box(archive.bytes.len());
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("json_roundtrip", FIXTURE_NAME), |b| {
+        let blob = import_blob.clone();
+        b.iter(|| {
+            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut importer =
+                DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+            let roots = importer
+                .import_blob(blob.clone())
+                .expect("import JSON-LD as JSON");
+            let mut merged = importer.metadata();
+            merged.union(importer.data().clone());
+            let reader = blobs.reader().expect("reader");
+            let exported = if roots.len() == 1 {
+                let mut out = String::new();
+                export_to_json(&merged, roots[0], &reader, &mut out).expect("export JSON");
+                out
+            } else {
+                let mut out = String::new();
+                let mut first = true;
+                let _ = out.write_char('[');
+                for root in roots.iter() {
+                    if !first {
+                        let _ = out.write_char(',');
+                    }
+                    first = false;
+                    export_to_json(&merged, *root, &reader, &mut out).expect("export JSON");
+                }
+                let _ = out.write_char(']');
+                out
+            };
+            let exported_len = exported.len();
+            assert!(
+                exported_len > import_payload.len() / 2,
+                "expected sizeable export (>{} bytes), got {exported_len}",
+                import_payload.len() / 2
+            );
+            hint::black_box(exported_len);
+        });
+    });
+
+    group.bench_function(BenchmarkId::new("export_only_json", FIXTURE_NAME), move |b| {
+        b.iter(|| {
+            let reader = export_fixture.reader.clone();
+            let mut exported = String::new();
+            if export_fixture.roots.len() == 1 {
+                export_to_json(
+                    &export_fixture.merged,
+                    export_fixture.roots[0],
+                    &reader,
+                    &mut exported,
+                )
+                .expect("export JSON");
+            } else {
+                let mut first = true;
+                let _ = exported.write_char('[');
+                for root in export_fixture.roots.iter() {
+                    if !first {
+                        let _ = exported.write_char(',');
+                    }
+                    first = false;
+                    export_to_json(&export_fixture.merged, *root, &reader, &mut exported)
+                        .expect("export JSON");
+                }
+                let _ = exported.write_char(']');
+            }
+            let exported_len = exported.len();
+            assert!(
+                exported_len > export_fixture.payload_len / 2,
+                "expected sizeable export (>{} bytes), got {exported_len}",
+                export_fixture.payload_len / 2
+            );
+            hint::black_box(exported_len + export_fixture.merged.len());
+        });
+    });
+
+    group.finish();
+}
+
+fn json_ld_benchmarks(c: &mut Criterion) {
+    let payload = load_payload();
+    bench_oxigraph(c, &payload);
+    bench_tribles_roundtrip(c, &payload);
+}
+
+criterion_group!(
+    name = benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(Duration::from_secs(1));
+    targets = json_ld_benchmarks
+);
+criterion_main!(benches);

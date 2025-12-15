@@ -1,17 +1,46 @@
 # Blobs
 
-Blobs are immutable sequences of bytes used to represent data that does not fit into the fixed 256‑bit value slot of a trible. Each blob is typed by a `BlobSchema` similar to how values use `ValueSchema`. This allows structured data to be serialized into a blob while still tracking its schema.
+Blobs are immutable sequences of bytes used whenever data no longer fits into
+the fixed 256‑bit value slot of a trible. Instead of treating these payloads as
+untyped binary blobs, Tribles keeps track of their structure via `BlobSchema`.
+Much like `ValueSchema` drives how values are serialized into a trible, a
+`BlobSchema` defines how to encode and decode rich data into a byte sequence.
 
-Values and tribles capture small facts in a fixed width, whereas blobs are used "in the large" for documents, media and other sizable payloads. A blob can therefore represent anything from a single file to a complete archive of tribles.
+## When to reach for blobs
 
-Converting Rust types to blobs is infallible in practice, so only the `ToBlob` and `TryFromBlob` traits are widely used. The `TryToBlob` and `FromBlob` variants have been dropped to keep the API surface small.
+Values and tribles capture compact facts – identifiers, timestamps, counters –
+in a fixed width. Whenever information grows beyond that footprint, blobs carry
+the payload while tribles continue to reference it. Common use cases include
+documents, media assets, serialized entity archives, or even domain specific
+binary formats. Because blobs are content addressed, the same payload stored
+twice automatically deduplicates to the same handle. In the in-memory
+implementation this falls straight out of the code: `MemoryBlobStore::insert`
+keeps a `BTreeMap` keyed by the handle and simply reuses the existing entry
+when the same digest shows up again.
 
-The following example demonstrates creating blobs, archiving a `TribleSet` and signing its contents:
+## Handles, schemas, and stores
+
+Blobs live in a `BlobStore`. The store provides persistent storage and a
+content hash, determined by the selected `HashProtocol`, that acts as a stable
+handle. Handles can be embedded into tribles just like any other value so they
+benefit from the existing querying machinery. A handle couples the blob's hash
+with its `BlobSchema` so consumers always know how to deserialize the
+referenced bytes.
+
+Converting Rust types to blobs is infallible in practice, therefore the `ToBlob`
+and `TryFromBlob` traits are the most common helpers. The `TryToBlob` and
+`FromBlob` variants have been dropped to keep the API surface small without
+losing ergonomics.
+
+## End‑to‑end example
+
+The following example demonstrates creating blobs, archiving a `TribleSet` and
+signing its contents:
 
 ```rust
-use tribles::prelude::*;
-use tribles::examples::literature;
-use tribles::repo;
+use triblespace::prelude::*;
+use triblespace::examples::literature;
+use triblespace::repo;
 use valueschemas::{Handle, Blake3};
 use blobschemas::{SimpleArchive, LongString};
 use rand::rngs::OsRng;
@@ -35,7 +64,8 @@ let set = entity!{
    literature::quote: quote_b
 };
 
-// Serialize the TribleSet and store it as another blob.
+// Serialize the TribleSet and store it as another blob. The resulting
+// handle points to the archived bytes and keeps track of its schema.
 let archived_set_handle: Value<Handle<Blake3, SimpleArchive>> = memory_store.put(&set).unwrap();
 
 let mut csprng = OsRng;
@@ -49,7 +79,8 @@ let signature: Signature = commit_author_key.sign(
         .bytes,
 );
 
-// Store the handle in another TribleSet.
+// Store the handle in another TribleSet so the archived content can be
+// referenced alongside metadata and cryptographic proofs.
 let _meta_set = entity!{
    repo::content: archived_set_handle,
    repo::short_message: "Initial commit",
@@ -60,6 +91,8 @@ let _meta_set = entity!{
 ```
 
 Blobs complement tribles and values by handling large payloads while keeping the
-core data structures compact. A blob's hash, computed via a chosen
-`HashProtocol`, acts as a stable handle that can be embedded into tribles or
-other blobs, enabling content‑addressed references without copying the payload.
+core data structures compact. Embedding handles into entities ties together
+structured metadata and heavyweight data without breaking immutability or
+introducing duplication. This division of labor lets tribles focus on querying
+relationships while BlobStores take care of storage concerns such as hashing,
+deduplication, and retrieval.

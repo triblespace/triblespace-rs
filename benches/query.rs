@@ -1,6 +1,6 @@
 use crate::entity;
 use crate::pattern;
-use tribles::prelude::*;
+use triblespace::prelude::*;
 
 use fake::faker::lorem::en::Sentence;
 use fake::faker::lorem::en::Words;
@@ -9,7 +9,7 @@ use fake::locales::*;
 use fake::Fake;
 
 pub mod literature {
-    use tribles::prelude::*;
+    use triblespace::prelude::*;
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" as author: valueschemas::GenId;
