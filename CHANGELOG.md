@@ -59,6 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Repository::pull_with_key`.
 
 ### Changed
+- Expanded the Pile Blob Metadata chapter with an accurate header field
+  breakdown, timestamp conversion example, and details on lazy validation.
+- Corrected the BlobMetadata description to state it surfaces the timestamp and
+  length fields from the header.
 - Normalized the Descriptive Typing chapter to use consistent Markdown headings
   and remove unused front matter.
 - Clarified `PATCH::iter_ordered` and `PATCHOrderedIterator` documentation to
