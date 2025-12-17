@@ -17,6 +17,25 @@ your Rust types. Likewise, the Rust side can evolve its internal
 representations—add helper methods, change struct layouts, or introduce new
 types—without invalidating existing datasets.
 
+## Identifier shapes and entropy
+
+Schemas and attributes rely on stable identifiers, so it helps to be explicit
+about which style you are using:
+
+|                | **Abstract**                    | **Semantic**                |
+|----------------|---------------------------------|-----------------------------|
+| **Intrinsic**  | Hashes, signatures              | Embeddings                  |
+| **Extrinsic**  | RNGID, UFOID, FUCID, namespaced | Names, URLs, DOIs           |
+
+Abstract identifiers prioritise uniqueness; semantic ones carry meaning for
+humans or search systems. Intrinsic identifiers are derived from content and
+double as integrity checks, while extrinsic identifiers are assigned externally
+and persist across revisions. Entities and attributes use high‑entropy abstract
+extrinsic IDs so writers can mint handles without coordination. When a value
+needs to reference a large payload, use an intrinsic identifier such as a
+schema-qualified 256‑bit hash: it can be embedded into the 32‑byte value slot
+and still resists collisions, even against adversaries.
+
 ### Why 32 bytes?
 
 Storing arbitrary Rust types requires a portable representation. Instead of
@@ -171,3 +190,12 @@ By keeping schema identifiers alongside stored values and blobs you can roll out
 new representations incrementally: ship readers that understand both IDs, update
 your import pipelines, and finally switch writers once everything recognizes the
 replacement schema.
+
+## Deepen this topic
+
+- [Architecture](architecture.md#identifier-taxonomy) covers how identifier
+  choices flow into the data model and repository layers.
+- [Query Engine](query-engine.md#search-loop) shows how schemas and identifiers
+  interact with the constraint-guided search.
+- [Type Algebra](type-algebra.md) explains how schemas map onto the algebraic
+  view of attributes, entities, and datasets.

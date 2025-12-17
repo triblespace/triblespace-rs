@@ -235,3 +235,15 @@ before branching or pulling when you need a different default identity, or use
 `Repository::create_branch_with_key` and `Repository::pull_with_key` to choose a
 specific key per branch or workspace. The [Managing signing identities](repository-workflows.html#managing-signing-identities)
 section covers this workflow in more detail.
+
+## Learn more
+
+- The [Architecture](architecture.md) chapter explains how repositories, blob
+  stores, branches, and workspaces fit together underneath the quick-start
+  helpers shown here.
+- The [Philosophy](deep-dive/philosophy.md) deep dive outlines the clarity,
+  safety, and performance principles that drive the defaults used throughout
+  this walkthrough.
+- The [Identifiers](deep-dive/identifiers.md) appendix covers how minted
+  attribute IDs, ownership checks, and abstract identifiers flow through
+  schemas and repositories.

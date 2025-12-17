@@ -4,13 +4,18 @@ Trible Space is designed to keep data management simple, safe and fast.  The [RE
 
 ## Design Goals
 
-A full discussion of the motivation behind Trible Space can be found in the [Philosophy](deep-dive/philosophy.md) section.  At a high level we want a self‑contained data store that offers:
+The architecture keeps four values in view: clarity before cleverness, a productive synchronous API surface, strong validation at the boundaries, and predictable performance. These grew out of earlier "semantic" technologies that attempted to model knowledge as graphs.  While systems like RDF promised great flexibility, in practice they often became difficult to host, query and synchronise.  Trible Space keeps the idea of describing the world with simple statements but stores them in a form that is easy to exchange and reason about.
 
-- **Simplicity** – minimal moving parts and predictable behaviour.
-- **Developer Experience** – a clear API that avoids complex servers or background processes.
-- **Safety and Performance** – sound data structures backed by efficient content addressed blobs.
+## Identifier taxonomy
 
-These goals grew out of earlier "semantic" technologies that attempted to model knowledge as graphs.  While systems like RDF promised great flexibility, in practice they often became difficult to host, query and synchronise.  Trible Space keeps the idea of describing the world with simple statements but stores them in a form that is easy to exchange and reason about.
+Identifiers fall into two orthogonal axes that surface throughout the storage and repository layers:
+
+|                | **Abstract**                    | **Semantic**                |
+|----------------|---------------------------------|-----------------------------|
+| **Intrinsic**  | Content hashes, signatures      | Embeddings                  |
+| **Extrinsic**  | RNGID, UFOID, FUCID, namespaced | Names, URLs, DOIs, labels   |
+
+Abstract identifiers prioritise uniqueness; semantic ones carry meaning for people or search systems. Intrinsic identifiers are derived from the bytes they describe (for example 256‑bit hashes), while extrinsic identifiers are assigned externally and persist even as content evolves. Trible Space leans on abstract extrinsic identifiers for entities and attributes so writers can mint stable handles without coordination, and pairs those with intrinsic identifiers when a value references immutable content such as a blob. The high‑entropy families (`RNGID`, `UFOID`, `FUCID`) keep collision risk negligible, while 256‑bit hashes remain suitable even under future cryptographic pressure.
 
 ## Architectural Layers
 
@@ -25,9 +30,25 @@ Each layer has a tight, well defined boundary.  Code that manipulates tribles ne
 
 ## Data Model
 
-The fundamental unit of information is a [`Trible`](https://docs.rs/triblespace/latest/triblespace/trible/struct.Trible.html).  Its 64 byte layout is described in [Trible Structure](deep-dive/trible-structure.md).  A `Trible` links a subject entity to an attribute and value.  Multiple tribles are stored in a [`TribleSet`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html), which behaves like a hashmap with three columns — subject, attribute and value.
+The fundamental unit of information is a [`Trible`](https://docs.rs/triblespace/latest/triblespace/trible/struct.Trible.html).
+Its fixed 64‑byte layout fits cleanly in caches:
 
-The 64 byte boundary allows tribles to live comfortably on cache lines and makes deduplication trivial.  Because tribles are immutable, the runtime can copy, hash and serialise them without coordinating with other threads.  Higher level features like schema checking and query planning are therefore free to assume that every fact they observe is stable for the lifetime of a query.
+``` text
+┌────────────────────────────64 byte───────────────────────────┐
+┌──────────────┐┌──────────────┐┌──────────────────────────────┐
+│  entity-id   ││ attribute-id ││        inlined value         │
+└──────────────┘└──────────────┘└──────────────────────────────┘
+└────16 byte───┘└────16 byte───┘└────────────32 byte───────────┘
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶
+```
+
+Entity and attribute identifiers are abstract, extrinsic handles. The value slot
+stores either a compact payload or an intrinsic identifier (typically a
+schema-qualified hash) pointing to a blob when data grows beyond 256 bits. This
+rigid layout keeps serialisation trivial and makes it easy to estimate physical
+size as a function of fact count. Multiple tribles are stored in a
+[`TribleSet`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html),
+which behaves like a hashmap with three columns — subject, attribute and value.
 
 ## Trible Sets
 
@@ -38,11 +59,21 @@ attribute and value.  The trees reuse the same leaf nodes so a trible is stored
 only once, avoiding a naïve six‑fold memory cost while still letting the search
 loop pick the most selective permutation using the constraint heuristics.
 
+Edges point from the entity making a claim to the entity being described, which
+avoids arbitrary direction choices and keeps ownership clear. Set operations
+such as `union`, `intersection`, and `difference` respect the immutable nature
+of facts: new information is added monotonically while subtraction is used for
+snapshot comparisons rather than destructive deletion.
+
+Identifier ownership enforces this directionality in code. `ExclusiveId`s tie an
+ID to a single writer (usually a thread-local `IdOwner`), and the query helper
+`local_ids` only enumerates identifiers owned by the current thread. Borrowing
+an ID temporarily transfers exclusive access for updates while copy-on-write set
+operations keep other readers isolated.
+
 ## Blob Storage
 
-All persistent data lives in a [`BlobStore`](https://docs.rs/triblespace/latest/triblespace/blob/index.html).  Each blob is addressed by the hash of its contents, so identical data occupies space only once and readers can verify integrity by recomputing the hash.  The trait exposes simple `get` and `put` operations, leaving caching and eviction strategies to the backend.  Implementations decide where bytes reside: an in‑memory [`MemoryBlobStore`](https://docs.rs/triblespace/latest/triblespace/blob/struct.MemoryBlobStore.html), an on‑disk [`Pile`](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html) described in [Pile Format](pile-format.md) or a remote object store.  Because handles are just 32‑byte hashes, repositories can copy or cache blobs without coordination.  Trible sets, user blobs and commit records all share this mechanism.
-
-Content addressing also means that blob stores can be layered.  Applications commonly use a fast local cache backed by a slower durable store.  Only the outermost layer needs to implement eviction; inner layers simply re-use the same hash keys, so cache misses fall through cleanly.
+All persistent data lives in a [`BlobStore`](https://docs.rs/triblespace/latest/triblespace/blob/index.html). Each blob is addressed by the hash of its contents, so identical payloads deduplicate automatically and readers can verify integrity by recomputing the hash. A blob handle couples the digest with its `BlobSchema`, keeping decoding deterministic even across language boundaries. The trait exposes simple `get` and `put` operations while backends decide where bytes reside: an in‑memory [`MemoryBlobStore`](https://docs.rs/triblespace/latest/triblespace/blob/struct.MemoryBlobStore.html), an on‑disk [`Pile`](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html) described in [Pile Format](pile-format.md) or a remote object store. Because handles are just 32‑byte hashes, repositories can copy or cache blobs without coordination and layer stores—for example a fast cache backed by a durable remote bucket. The same mechanism stores user payloads, archived `TribleSet`s, and commit records.
 
 ## Branch Store
 
@@ -106,3 +137,13 @@ Because commits are immutable, rollback and branching are cheap.  Diverging hist
 `Repository::pull` reads the branch metadata, loads the referenced commit, and couples that history with a fresh `MemoryBlobStore` staged area plus a reader for the repository's existing blobs.【F:src/repo.rs†L820-L848】  Workspace methods then stage edits locally: `Workspace::put` (the helper that adds blobs) writes application data into the in-memory store while `Workspace::commit` converts the new `TribleSet` into blobs and advances the current head pointer.【F:src/repo.rs†L1514-L1568】  Applications hydrate their views with `Workspace::checkout`, which gathers the selected commits and returns the assembled trible set to the caller.【F:src/repo.rs†L1681-L1697】  When the changes are ready to publish, `Repository::try_push` enumerates the staged blobs, uploads them into the repository blob store, creates updated branch metadata, and performs the compare-and-set branch update before clearing the staging area.【F:src/repo.rs†L881-L1014】  Because every blob is addressed by its hash, repositories can safely share data through any common storage without coordination.
 
 The boundaries between layers encourage modular tooling.  A CLI client can operate entirely within a workspace while a sync service automates pushes and pulls between repositories.  As long as components honour the blob and branch store contracts they can evolve independently without risking the core guarantees of Trible Space.
+
+## Deepen this topic
+
+- The [Introduction](introduction.md#design-principles) distils the design
+  values that shaped these layers.
+- [Schemas](schemas.md#identifier-shapes-and-entropy) expands on the identifier
+  taxonomy and why high-entropy IDs pair well with blob handles.
+- [Query Engine](query-engine.md#search-loop) and
+  [Atreides Join](atreides-join.md) show how the six-way indexes feed the
+  constraint-guided search.

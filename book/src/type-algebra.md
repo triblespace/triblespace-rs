@@ -6,6 +6,14 @@ TribleSpace grew out of a pragmatic goal: keep data declarative, composable, and
 Along the way we discovered that the core operations already form a **type algebra**.
 The macros used to define attributes, entities, and queries map directly onto familiar type-theoretic constructions, yielding an isomorphism between *relations over triples* and *types over records*.
 
+## Before you read
+
+This chapter assumes you are comfortable with the basic query surface described
+in [Query Language](query-language.md) and the identifier conventions outlined
+in [Schemas](schemas.md#identifier-shapes-and-entropy). Those sections explain
+how attribute IDs, value schemas, and trible layouts influence the algebraic
+interpretation below.
+
 ## Attributes Introduce Atomic Types
 
 Each attribute introduced with `attributes!` defines an **atomic type** — a unary relation between an entity identifier and the attribute’s value:
@@ -101,5 +109,14 @@ Seeing the primitives through a type-theoretic lens clarifies several ergonomic 
 
 With a single associative, commutative, idempotent union, we obtain both row extension and dataset union, and a unified logical framework that bridges *data engineering* with *type theory*.
 That economy of primitives allows the system to feel simple on the surface yet provide rich type theory underneath.
+
+## Deepen this topic
+
+- [Architecture](architecture.md#data-model) details the trible layout that the
+  algebra reasons about.
+- [Schemas](schemas.md) explains how identifiers, value schemas, and blobs line
+  up with the algebraic view of attributes and entities.
+- [Query Engine](query-engine.md) shows how the search loop executes the
+  declarative queries produced by the type algebra.
 
 [Trible]: ../src/trible.rs

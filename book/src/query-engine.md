@@ -20,6 +20,13 @@ partial assignments. Composite constraints, such as unions, may also override
 keeps the engine agnostic to where the data comes from—be it in-memory
 indices, remote stores, or bespoke application predicates.
 
+Under the hood `TribleSet` indexes each fact under all six permutations of
+entity, attribute, and value. Each permutation has its own inner nodes but
+shares the same leaf tribles, keeping storage compact while letting the engine
+choose the most selective ordering for the current bindings. That structure is
+why constraint estimates stay cheap even when joins span large or skewed
+datasets.
+
 ## Search Loop
 
 The engine executes a query as a depth-first search over partial bindings. The
@@ -160,6 +167,16 @@ Great care has been taken to ensure that query languages with different styles
 and semantics can coexist and even be mixed with other languages and data models
 within the same query. For practical examples of the current facilities, see the
 [Query Language](query-language.md) chapter.
+
+## Deepen this topic
+
+- [Architecture](architecture.md#data-model) and
+  [Schemas](schemas.md#identifier-shapes-and-entropy) describe the trible layout
+  and identifier choices that keep constraint estimates cheap.
+- [Atreides Join](atreides-join.md) expands on the heuristics this search loop
+  consumes.
+- [Commit Selectors](commit-selectors.md) shows how the same constraint
+  machinery walks repository history.
 
 [^1]: Note that this query-schema isomorphism isn't necessarily true in all
 databases or query languages, e.g., it does not hold for SQL.

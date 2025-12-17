@@ -491,3 +491,12 @@ let influencers = find!((start: Value<_>),
 Combining `path!` with other constraints like this enables expressive graph
 queries while staying in the same declarative framework as the rest of the
 chapter.
+
+## Learn more
+
+- The [Query Engine](query-engine.md) chapter shows how the solver orders
+  constraints, estimates work, and plans the joins described here.
+- [Atreides Join](atreides-join.md) dives into the execution strategy behind the
+  query macros when they evaluate against large trible sets.
+- The [Trible Structure](deep-dive/trible-structure.md) deep dive visualizes the
+  storage layout and indexing model that query constraints read from.

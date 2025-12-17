@@ -96,6 +96,12 @@ this chapter are implemented using the same building blocks that are available
 to library users, making it straightforward to prototype project-specific
 combinators without altering the `Workspace::checkout` API.
 
+Under the covers a `CommitSet` is backed by PATCH, the persistent trie described
+in [Repository Workflows](repository-workflows.md#patch-under-the-hood). That
+structure keeps unions, intersections, and differences cache friendly even as
+history grows, which is why selectors can expose set combinators without
+surprising performance cliffs.
+
 ## Set combinators
 
 `union`, `intersect`, and `difference` wrap two other selectors and forward the
@@ -235,4 +241,13 @@ timestamp interval intersects the inclusive range.
 
 Internally it uses `filter(ancestors(HEAD), ..)` to check each commit's
 timestamp range.
+
+## Deepen this topic
+
+- [Architecture](architecture.md) explains how commit metadata, branch heads,
+  and repository storage fit together beneath these selectors.
+- [Repository Workflows](repository-workflows.md#patch-under-the-hood) shows how
+  the PATCH payloads these selectors traverse are structured.
+- [Garbage Collection](garbage-collection.md) builds on selectors to show how
+  reachable commits and blobs are computed during retention.
 

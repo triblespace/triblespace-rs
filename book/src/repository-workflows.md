@@ -117,6 +117,17 @@ ws.commit(change, Some("initial commit"));
 repo.push(&mut ws)?;
 ```
 
+### PATCH under the hood
+
+Set operations such as merges, diffs, and intersections rely on PATCH (the
+Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance). PATCH
+stores each branch node in a compact cuckoo table, grows only when needed, and
+keeps a 128‑bit fingerprint per subtree. Those hashes allow union and
+intersection to short-circuit identical subtrees while copy-on-write updates
+retain persistence so existing readers see a stable view. Understanding that
+structure helps explain why repository workflows remain fast even as histories
+grow.
+
 ### Managing signing identities
 
 The key passed to `Repository::new` becomes the default signing identity for
@@ -518,3 +529,12 @@ fn merge_import_example(
     Ok(())
 }
 ```
+
+## Deepen this topic
+
+- The [Architecture](architecture.md) chapter unpacks how blob stores, branch
+  stores, and repositories coordinate to make these workflows durable.
+- [PATCH under the hood](#patch-under-the-hood) explains how commit payloads are
+  represented and combined during merges and selectors.
+- [Pile Format](pile-format.md) and [Pile Blob Metadata](pile-blob-metadata.md)
+  detail the on-disk layout used by the repository workflows above.

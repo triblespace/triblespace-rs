@@ -7,6 +7,24 @@ pages you should be able to recognize when Trible Space is the right tool,
 whether you are prototyping something new, extending an existing system, or
 adapting it for your own research purposes.
 
+## Design philosophy
+
+Trible Space favors predictable, easy-to-audit building blocks over clever
+abstractions. Four principles guide every subsystem:
+
+* **Clarity before cleverness.** Prefer mechanically simple components whose
+  behaviour is easy to reason about even when composed with the rest of the
+  stack.
+* **Productive developer experience.** APIs should read like regular Rust and
+  stay synchronous by default so experiments run naturally in tests and REPLs.
+* **Soundness and data integrity.** Validation and safety checks live close to
+  the data they protect so invariants are explicit and auditable.
+* **Performance with headroom.** Tune the hot paths, but keep latency
+  predictable and avoid optimisations that would obscure correctness.
+
+You will see these themes echoed throughout the architecture and query engine
+chapters whenever a design trade-off appears.
+
 ## Why Trible Space exists
 
 Trible Space exists because teams need to steward complex, diverse, and

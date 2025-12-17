@@ -1,3 +1,3 @@
 # Deep Dive
 
-This section contains in-depth discussions about Trible Space internals.
+These topics have been integrated into the main chapters. Follow the links in each stub file to reach the updated content.

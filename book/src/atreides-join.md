@@ -7,6 +7,16 @@ approach draws on the broader theory of worst-case optimal joins and lets us
 navigate the search space directly rather than materialising intermediate
 results.
 
+## Before you read
+
+This chapter builds on the constraint protocol described in
+[Query Engine](query-engine.md) and assumes familiarity with the
+identifier and trible layout conventions explained in
+[Architecture](architecture.md#identifier-taxonomy) and
+[Schemas](schemas.md#identifier-shapes-and-entropy). Those sections show why the
+engine leans on high-entropy identifiers and six-way indexes when navigating the
+search space.
+
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](crate::query::Constraint) trait,
@@ -168,3 +178,11 @@ join plan for each case.
 This combination of simple heuristics, incremental estimates, and a disciplined
 search strategy keeps the implementation straightforward while delivering the
 performance characteristics we need for real-world workloads.
+
+## Deepen this topic
+
+- The [Query Engine](query-engine.md) chapter walks through the search loop that
+  consumes these heuristics.
+- [Architecture](architecture.md#data-model) and
+  [Schemas](schemas.md#identifier-shapes-and-entropy) explain how the trible
+  layout and identifier choices keep estimates cheap and reliable.

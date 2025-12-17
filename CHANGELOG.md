@@ -25,11 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema components so composite schema descriptions stay discoverable.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes
   of the Blake3 digest to stay consistent with the ID-to-value layout.
+- Inlined the former deep-dive chapters into Introduction, Architecture, Schemas,
+  Query Engine, Repository Workflows, and Commit Selectors, leaving redirect
+  stubs in the appendix.
+- Added prerequisite notes and “Deepen this topic” cross-references to the
+  advanced chapters so readers can jump to identifier, trible layout, and PATCH
+  background from the implementation track.
+- Summarised the documentation roadmap status and highlighted the remaining
+  high-priority topics to tackle next.
 - Consolidated JSON import into a single deterministic
   `import::json::JsonImporter` with fixed primitive mappings and optional salt
   support, replacing the prior nondeterministic importer and configurable
   encoder callbacks.
 ### Added
+- Plan for merging deep-dive chapters into the main book narrative, outlining a
+  staged summary restructure and cross-references that surface core concepts
+  alongside their consumer chapters.
 - Guidance on how `ExclusiveId` ownership narrows safe absence checks while
   keeping queries monotonic across collaborators in the incremental queries
   chapter of the book.
@@ -111,6 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded the documentation backlog with notes on remote object-store conflict
   handling, succinct archive indexes, and extending regular path engines.
 ### Changed
+- Restructured the book summary into user-guide and implementation tracks and
+  added learn-more links from the user chapters to the conceptual sections.
 - `Attribute` now retains its declared name, uses the field name for dynamic
   attributes, and relies on the `Metadata` trait to emit attribute metadata in
   both code-generated and runtime scenarios.

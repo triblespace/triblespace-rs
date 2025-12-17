@@ -7,6 +7,53 @@ pick one of these items up, try to produce a runnable example (or at least
 executable pseudocode) so the section teaches a concrete workflow rather than a
 theory sketch.
 
+## Status at a glance
+
+- [x] Reshaped the summary and inlined the deep-dive appendix content into the
+  main chapters.
+- [x] Added cross-references and prerequisites so advanced chapters link back
+  to identifier, trible layout, and PATCH background material.
+- [ ] Fill in the remaining documentation gaps below (high-priority topics are
+  the best next targets).
+
+## Deep-dive integration plan
+
+The deep-dive appendix should be merged into the main narrative so readers meet
+core concepts alongside the chapters that use them. Tackle the reflow in three
+passes:
+
+1. **Reshape the SUMMARY.** Split the table of contents into a user guide track
+   (Getting Started, Query Language, Repository Workflows, Commit Selectors)
+   and an implementation track (Architecture, Query Engine, Type Algebra). Add
+   “learn more” links from the user guide into the corresponding conceptual
+   sections so readers can choose their depth without jumping to an appendix.
+2. **Inline deep dives near their consumers.**
+   * Move `deep-dive/philosophy.md` highlights into the Introduction lead-in
+     and the Architecture opening, trimming the appendix copy to avoid
+     duplication.
+   * Merge `deep-dive/identifiers.md` into Schemas and Architecture so abstract
+     vs. semantic identifiers sit next to entity/attribute definitions and the
+     storage layout.
+   * Fold `deep-dive/trible-structure.md` into Architecture and Query Engine
+     to describe layout, indexing, and edge semantics where execution is
+     explained.
+   * Attach `deep-dive/blobs.md` to the blob storage portions of Architecture
+     and the blob-format chapters so readers see handle/metadata rules alongside
+     repository workflows.
+   * Relocate `deep-dive/patch.md` next to Repository Workflows and
+     Commit Selectors, framing it as the underlying representation those flows
+     manipulate.
+
+The first two passes are now reflected in the main chapters; the deep-dive
+files have been replaced with redirects to their new homes.
+3. **Add cross-references and prerequisites.** Each advanced chapter now ends
+   with a short “Deepen this topic” list that links to the moved sections, plus
+   a “Before you read” note for chapters such as Atreides Join and Type Algebra
+   that call out identifier and trible-layout prerequisites.
+
+The integration work above is complete; the lists below capture the remaining
+documentation areas that still need dedicated chapters or examples.
+
 ## High-priority topics
 
 The following themes unblock common deployment or operational scenarios and
