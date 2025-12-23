@@ -8,12 +8,14 @@ pub use triblespace_core as core;
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{
-        attributes, entity, find, matches, path, pattern, pattern_changes,
+        attributes, entity, find, matches, path, pattern, pattern_changes, value_formatter,
     };
 }
 
 pub mod prelude {
-    pub use crate::macros::{attributes, entity, find, matches, path, pattern, pattern_changes};
+    pub use crate::macros::{
+        attributes, entity, find, matches, path, pattern, pattern_changes, value_formatter,
+    };
     pub use triblespace_core::prelude::*;
 }
 
@@ -25,7 +27,7 @@ mod proofs;
 // consumers see it while `triblespace-core` stays lean for proc-macro usage.
 #[cfg(test)]
 mod readme_example {
-    use crate::core::repo::{memoryrepo::MemoryRepo, Repository};
+    use crate::core::repo::{Repository, memoryrepo::MemoryRepo};
     use crate::prelude::blobschemas::LongString;
     use crate::prelude::*;
     use ed25519_dalek::SigningKey;
@@ -33,7 +35,7 @@ mod readme_example {
 
     mod literature {
         use crate::prelude::blobschemas::LongString;
-        use crate::prelude::valueschemas::{Blake3, GenId, Handle, ShortString, R256};
+        use crate::prelude::valueschemas::{Blake3, GenId, Handle, R256, ShortString};
         use crate::prelude::*;
 
         attributes! {

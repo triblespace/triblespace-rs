@@ -2,7 +2,7 @@ use proc_macro::Span;
 use proc_macro::TokenStream;
 
 use proc_macro2::TokenStream as TokenStream2;
-use quote::{quote, ToTokens};
+use quote::{ToTokens, quote};
 
 use std::path::Path;
 
@@ -10,26 +10,28 @@ use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
 use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
-use triblespace_core::repo::pile::Pile;
+use triblespace_core::id::fucid;
 use triblespace_core::repo::Repository;
 use triblespace_core::repo::Workspace;
+use triblespace_core::repo::pile::Pile;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::Blake3;
 
-use syn::parse::Parse;
-use syn::parse::ParseStream;
 use syn::Attribute;
 use syn::Ident;
 use syn::LitStr;
 use syn::Token;
 use syn::Type;
 use syn::Visibility;
+use syn::parse::Parse;
+use syn::parse::ParseStream;
 
 use triblespace_macros_common::{
     attributes_impl, entity_impl, path_impl, pattern_changes_impl, pattern_impl,
 };
+
+mod value_formatter;
 
 mod instrumentation_attributes {
     pub(crate) mod attribute {
@@ -346,4 +348,15 @@ pub fn matches(input: TokenStream) -> TokenStream {
     emit_metadata("matches", &clone, |_context| {});
     let inner = TokenStream2::from(input);
     TokenStream::from(quote!(::triblespace::core::matches!(#inner)))
+}
+
+#[proc_macro_attribute]
+pub fn value_formatter(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let clone = item.clone();
+    emit_metadata("value_formatter", &clone, |_context| {});
+
+    match value_formatter::expand(attr, item) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
 }
