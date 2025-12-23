@@ -1,6 +1,9 @@
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::Value;
@@ -33,6 +36,20 @@ impl ConstMetadata for U256LE {
     fn id() -> Id {
         id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E")
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_REV_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
+    }
 }
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
@@ -40,6 +57,20 @@ impl ValueSchema for U256LE {
 impl ConstMetadata for U256BE {
     fn id() -> Id {
         id_hex!("DC3CFB719B05F019FB8101A6F471A982")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 impl ValueSchema for U256BE {
@@ -49,6 +80,20 @@ impl ConstMetadata for I256LE {
     fn id() -> Id {
         id_hex!("DB94325A37D96037CBFC6941A4C3B66D")
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_REV_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
+    }
 }
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
@@ -56,6 +101,20 @@ impl ValueSchema for I256LE {
 impl ConstMetadata for I256BE {
     fn id() -> Id {
         id_hex!("CE3A7839231F1EB390E9E8E13DAED782")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 impl ValueSchema for I256BE {

@@ -2,36 +2,31 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fmt::Write as FmtWrite;
 
-use anybytes::View;
+use crate::and;
 use crate::blob::schemas::longstring::LongString;
 use crate::id::Id;
 use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::prelude::{find, pattern};
-use crate::and;
 use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;
+use crate::temp;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, Hash};
 use crate::value::schemas::UnknownValue;
+use crate::value::RawValue;
 use crate::value::ToValue;
 use crate::value::Value;
-use crate::value::RawValue;
-use crate::temp;
+use anybytes::View;
 use ryu::Buffer;
 
 #[derive(Debug)]
 pub enum ExportError {
-    MissingBlob {
-        hash: String,
-    },
-    BlobStore {
-        hash: String,
-        source: String,
-    },
+    MissingBlob { hash: String },
+    BlobStore { hash: String, source: String },
 }
 
 impl fmt::Display for ExportError {
@@ -167,7 +162,11 @@ fn render_schema_value(
 ) -> Result<(), ExportError> {
     if schema == Boolean::id() {
         let value = value.transmute::<Boolean>();
-        let _ = out.write_str(if value.from_value::<bool>() { "true" } else { "false" });
+        let _ = out.write_str(if value.from_value::<bool>() {
+            "true"
+        } else {
+            "false"
+        });
         return Ok(());
     }
     if schema == F64::id() {
@@ -221,17 +220,33 @@ fn write_escaped_str(text: &str, out: &mut impl FmtWrite) {
             continue;
         }
         match b {
-            b'"' => { let _ = out.write_str("\\\""); }
-            b'\\' => { let _ = out.write_str("\\\\"); }
-            b'\n' => { let _ = out.write_str("\\n"); }
-            b'\r' => { let _ = out.write_str("\\r"); }
-            b'\t' => { let _ = out.write_str("\\t"); }
-            0x08 => { let _ = out.write_str("\\b"); }
-            0x0c => { let _ = out.write_str("\\f"); }
+            b'"' => {
+                let _ = out.write_str("\\\"");
+            }
+            b'\\' => {
+                let _ = out.write_str("\\\\");
+            }
+            b'\n' => {
+                let _ = out.write_str("\\n");
+            }
+            b'\r' => {
+                let _ = out.write_str("\\r");
+            }
+            b'\t' => {
+                let _ = out.write_str("\\t");
+            }
+            0x08 => {
+                let _ = out.write_str("\\b");
+            }
+            0x0c => {
+                let _ = out.write_str("\\f");
+            }
             _ if b < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", b);
             }
-            _ => { let _ = out.write_char(b as char); }
+            _ => {
+                let _ = out.write_char(b as char);
+            }
         }
         idx += 1;
     }

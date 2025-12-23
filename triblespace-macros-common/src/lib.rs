@@ -16,8 +16,10 @@ use syn::Path;
 use syn::Token;
 
 mod attributes;
+mod value_formatter;
 
 pub use attributes::attributes_impl;
+pub use value_formatter::value_formatter_impl;
 
 struct PathInput {
     set: Expr,

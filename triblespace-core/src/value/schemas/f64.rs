@@ -1,6 +1,9 @@
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryToValue;
@@ -16,6 +19,20 @@ pub struct F64;
 impl ConstMetadata for F64 {
     fn id() -> Id {
         id_hex!("C80A60F4A6F2FBA5A8DB2531A923EC70")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::F64_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 

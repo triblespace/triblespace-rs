@@ -5,13 +5,14 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use proc_macro::TokenStream;
 use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::ToTokens;
 use quote::format_ident;
 use quote::quote;
+use quote::ToTokens;
 
+use syn::parse::Parse;
+use syn::parse::ParseStream;
 use syn::FnArg;
 use syn::ItemFn;
 use syn::ReturnType;
@@ -19,17 +20,15 @@ use syn::Token;
 use syn::Type;
 use syn::TypeParamBound;
 use syn::Visibility;
-use syn::parse::Parse;
-use syn::parse::ParseStream;
 
 const WASM_OUTPUT_BYTES: usize = 8 * 1024;
 const WASM_STACK_SIZE_BYTES: usize = 128 * 1024;
 const WASM_INITIAL_MEMORY_BYTES: usize = 8 * 64 * 1024;
 const WASM_MAX_MEMORY_BYTES: usize = 8 * 64 * 1024;
 
-pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream2> {
-    let args: ValueFormatterArgs = syn::parse(attr)?;
-    let mut item_fn: ItemFn = syn::parse(item)?;
+pub fn value_formatter_impl(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
+    let args: ValueFormatterArgs = syn::parse2(attr)?;
+    let mut item_fn: ItemFn = syn::parse2(item)?;
     validate_signature(&item_fn)?;
     item_fn.attrs.push(syn::parse_quote!(#[allow(dead_code)]));
 
@@ -376,7 +375,7 @@ fn compile_wasm_formatter(item_fn: &ItemFn) -> syn::Result<PathBuf> {
             .arg("-C")
             .arg(format!("link-arg=stack-size={WASM_STACK_SIZE_BYTES}"))
             .arg("-C")
-            .arg(format!("link-arg=--export-memory"))
+            .arg("link-arg=--export-memory")
             .arg("-C")
             .arg(format!(
                 "link-arg=--initial-memory={WASM_INITIAL_MEMORY_BYTES}"

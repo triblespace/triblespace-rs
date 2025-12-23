@@ -1,5 +1,5 @@
-use serde_json::json;
 use anybytes::Bytes;
+use serde_json::json;
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
@@ -90,8 +90,8 @@ fn exports_openai_like_conversation() {
 
     let mut exported_raw = String::new();
     export_to_json(&merged, root, &reader, &mut exported_raw).expect("export");
-    let exported: serde_json::Value = serde_json::from_str(&exported_raw)
-        .unwrap_or_else(|err| panic!("{err}: {exported_raw}"));
+    let exported: serde_json::Value =
+        serde_json::from_str(&exported_raw).unwrap_or_else(|err| panic!("{err}: {exported_raw}"));
 
     assert_eq!(exported, payload);
 }

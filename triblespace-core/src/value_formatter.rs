@@ -361,4 +361,231 @@ mod tests {
         raw[0] = b'Z';
         assert_eq!(formatter.format_value(&raw).unwrap(), "Z");
     }
+
+    #[cfg(feature = "builtin-wasm-formatters")]
+    #[test]
+    fn builtins_emit_and_run() {
+        use crate::blob::schemas::longstring::LongString;
+        use crate::value::schemas::boolean::Boolean;
+        use crate::value::schemas::ed25519::ED25519PublicKey;
+        use crate::value::schemas::ed25519::ED25519RComponent;
+        use crate::value::schemas::ed25519::ED25519SComponent;
+        use crate::value::schemas::f256::F256BE;
+        use crate::value::schemas::f256::F256LE;
+        use crate::value::schemas::f64::F64;
+        use crate::value::schemas::genid::GenId;
+        use crate::value::schemas::hash::Blake3;
+        use crate::value::schemas::hash::Handle;
+        use crate::value::schemas::hash::Hash;
+        use crate::value::schemas::iu256::I256BE;
+        use crate::value::schemas::iu256::I256LE;
+        use crate::value::schemas::iu256::U256BE;
+        use crate::value::schemas::iu256::U256LE;
+        use crate::value::schemas::linelocation::LineLocation;
+        use crate::value::schemas::r256::R256BE;
+        use crate::value::schemas::r256::R256LE;
+        use crate::value::schemas::range::RangeInclusiveU128;
+        use crate::value::schemas::range::RangeU128;
+        use crate::value::schemas::shortstring::ShortString;
+        use crate::value::schemas::time::NsTAIInterval;
+        use crate::value::schemas::UnknownValue;
+        use crate::value::Value;
+        use crate::value::ValueSchema;
+
+        fn hex_upper(bytes: &[u8]) -> String {
+            const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for &byte in bytes {
+                out.push(TABLE[(byte >> 4) as usize] as char);
+                out.push(TABLE[(byte & 0x0F) as usize] as char);
+            }
+            out
+        }
+
+        fn hex_upper_rev(bytes: &[u8]) -> String {
+            const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for &byte in bytes.iter().rev() {
+                out.push(TABLE[(byte >> 4) as usize] as char);
+                out.push(TABLE[(byte & 0x0F) as usize] as char);
+            }
+            out
+        }
+
+        let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
+        let mut space = TribleSet::new();
+        space += Boolean::describe(&mut store);
+        space += GenId::describe(&mut store);
+        space += ShortString::describe(&mut store);
+        space += F64::describe(&mut store);
+        space += F256LE::describe(&mut store);
+        space += F256BE::describe(&mut store);
+        space += U256LE::describe(&mut store);
+        space += U256BE::describe(&mut store);
+        space += I256LE::describe(&mut store);
+        space += I256BE::describe(&mut store);
+        space += R256LE::describe(&mut store);
+        space += R256BE::describe(&mut store);
+        space += RangeU128::describe(&mut store);
+        space += RangeInclusiveU128::describe(&mut store);
+        space += LineLocation::describe(&mut store);
+        space += NsTAIInterval::describe(&mut store);
+        space += ED25519RComponent::describe(&mut store);
+        space += ED25519SComponent::describe(&mut store);
+        space += ED25519PublicKey::describe(&mut store);
+        space += UnknownValue::describe(&mut store);
+        space += <Hash<Blake3> as ConstMetadata>::describe(&mut store);
+        space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store);
+
+        let reader = store.reader().expect("blob reader");
+        let formatters =
+            load_wasm_value_formatters(&space, &reader, WasmFormatterLimits::default())
+                .expect("load formatters");
+
+        let boolean = formatters.get(&Boolean::id()).expect("boolean formatter");
+        assert_eq!(boolean.format_value(&[0u8; 32]).unwrap(), "false");
+        assert_eq!(boolean.format_value(&[u8::MAX; 32]).unwrap(), "true");
+
+        let id = crate::id::Id::new([1u8; 16]).expect("non-nil id");
+        let genid = formatters.get(&GenId::id()).expect("genid formatter");
+        assert_eq!(
+            genid.format_value(&GenId::value_from(id).raw).unwrap(),
+            "01".repeat(16)
+        );
+
+        let shortstring = formatters
+            .get(&ShortString::id())
+            .expect("shortstring formatter");
+        assert_eq!(
+            shortstring
+                .format_value(&ShortString::value_from("hi").raw)
+                .unwrap(),
+            "hi"
+        );
+
+        let float64 = formatters.get(&F64::id()).expect("f64 formatter");
+        assert_eq!(
+            float64.format_value(&F64::value_from(1.5f64).raw).unwrap(),
+            "1.5"
+        );
+
+        let u256_expected = format!("{:0>64}", "2A");
+        let u256le = formatters.get(&U256LE::id()).expect("u256le formatter");
+        assert_eq!(
+            u256le.format_value(&U256LE::value_from(42u64).raw).unwrap(),
+            u256_expected
+        );
+        let u256be = formatters.get(&U256BE::id()).expect("u256be formatter");
+        assert_eq!(
+            u256be.format_value(&U256BE::value_from(42u64).raw).unwrap(),
+            u256_expected
+        );
+
+        let i256_expected = "FF".repeat(32);
+        let i256le = formatters.get(&I256LE::id()).expect("i256le formatter");
+        assert_eq!(
+            i256le.format_value(&I256LE::value_from(-1i8).raw).unwrap(),
+            i256_expected
+        );
+        let i256be = formatters.get(&I256BE::id()).expect("i256be formatter");
+        assert_eq!(
+            i256be.format_value(&I256BE::value_from(-1i8).raw).unwrap(),
+            i256_expected
+        );
+
+        let r256le = formatters.get(&R256LE::id()).expect("r256le formatter");
+        assert_eq!(
+            r256le
+                .format_value(&R256LE::value_from(-3i128).raw)
+                .unwrap(),
+            "-3"
+        );
+        let r256be = formatters.get(&R256BE::id()).expect("r256be formatter");
+        assert_eq!(
+            r256be
+                .format_value(&R256BE::value_from(-3i128).raw)
+                .unwrap(),
+            "-3"
+        );
+
+        let range_u128 = formatters
+            .get(&RangeU128::id())
+            .expect("range_u128 formatter");
+        assert_eq!(
+            range_u128
+                .format_value(&RangeU128::value_from((5u128, 10u128)).raw)
+                .unwrap(),
+            "5..10"
+        );
+        let range_inclusive_u128 = formatters
+            .get(&RangeInclusiveU128::id())
+            .expect("range_inclusive_u128 formatter");
+        assert_eq!(
+            range_inclusive_u128
+                .format_value(&RangeInclusiveU128::value_from((5u128, 10u128)).raw)
+                .unwrap(),
+            "5..=10"
+        );
+
+        let linelocation = formatters
+            .get(&LineLocation::id())
+            .expect("linelocation formatter");
+        assert_eq!(
+            linelocation
+                .format_value(&LineLocation::value_from((1u64, 2u64, 3u64, 4u64)).raw)
+                .unwrap(),
+            "1:2..3:4"
+        );
+
+        let nstai = formatters
+            .get(&NsTAIInterval::id())
+            .expect("nstai_interval formatter");
+        let mut raw = [0u8; 32];
+        raw[0..16].copy_from_slice(&5i128.to_le_bytes());
+        raw[16..32].copy_from_slice(&10i128.to_le_bytes());
+        assert_eq!(nstai.format_value(&raw).unwrap(), "5..=10");
+
+        let f256le = formatters.get(&F256LE::id()).expect("f256le formatter");
+        let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
+        assert_eq!(f256le.format_value(&raw).unwrap(), hex_upper_rev(&raw));
+
+        let f256be = formatters.get(&F256BE::id()).expect("f256be formatter");
+        let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
+        assert_eq!(f256be.format_value(&raw).unwrap(), hex_upper(&raw));
+
+        let ed25519_r = formatters
+            .get(&ED25519RComponent::id())
+            .expect("ed25519 r formatter");
+        let raw = [0xABu8; 32];
+        assert_eq!(ed25519_r.format_value(&raw).unwrap(), "AB".repeat(32));
+
+        let ed25519_s = formatters
+            .get(&ED25519SComponent::id())
+            .expect("ed25519 s formatter");
+        assert_eq!(ed25519_s.format_value(&raw).unwrap(), "AB".repeat(32));
+
+        let ed25519_pk = formatters
+            .get(&ED25519PublicKey::id())
+            .expect("ed25519 public key formatter");
+        assert_eq!(ed25519_pk.format_value(&raw).unwrap(), "AB".repeat(32));
+
+        let unknown = formatters
+            .get(&UnknownValue::id())
+            .expect("unknown formatter");
+        assert_eq!(unknown.format_value(&raw).unwrap(), "AB".repeat(32));
+
+        let hash_formatter = formatters
+            .get(&Hash::<Blake3>::id())
+            .expect("hash formatter");
+        assert_eq!(hash_formatter.format_value(&raw).unwrap(), "AB".repeat(32));
+
+        let handle_formatter = formatters
+            .get(&Handle::<Blake3, LongString>::id())
+            .expect("handle formatter");
+        let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
+        assert_eq!(
+            handle_formatter.format_value(&raw).unwrap(),
+            "EF".repeat(32)
+        );
+    }
 }

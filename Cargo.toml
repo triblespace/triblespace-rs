@@ -44,6 +44,7 @@ default = ["triblespace-core/proptest", "triblespace-core/wasm-formatters"]
 proptest = ["triblespace-core/proptest"]
 kani = ["triblespace-core/kani"]
 wasm-formatters = ["triblespace-core/wasm-formatters"]
+builtin-wasm-formatters = ["triblespace-core/builtin-wasm-formatters"]
 
 [[bench]]
 name = "benchmark"

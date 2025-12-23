@@ -5,7 +5,6 @@
 //! schema for that attribute. We keep construction simple and const-friendly so
 //! fields can be declared as `pub const F: Field<ShortString> = Field::from(hex!("..."));`.
 
-use core::marker::PhantomData;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
@@ -17,6 +16,7 @@ use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ValueSchema;
 use blake3::Hasher;
+use core::marker::PhantomData;
 /// A typed reference to an attribute id together with its value schema.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Attribute<S: ValueSchema> {
@@ -39,7 +39,11 @@ impl<S: ValueSchema> Attribute<S> {
     /// Construct a `Field` from a raw 16-byte id and static attribute name.
     pub const fn from_id_with_name(raw: RawId, name: &'static str) -> Self {
         let _ = name;
-        Self { raw, handle: None, _schema: PhantomData }
+        Self {
+            raw,
+            handle: None,
+            _schema: PhantomData,
+        }
     }
 
     /// Construct a `Field` from a raw 16-byte id without attaching a static name.
@@ -115,7 +119,9 @@ impl<S: ValueSchema> Attribute<S> {
     /// 16 bytes of `Blake3(handle_bytes || schema_id)`. The resulting attribute
     /// carries no human-readable name; metadata emission will therefore skip
     /// name/shortname unless a name is later injected.
-    pub fn from_handle(handle: &crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>) -> Self {
+    pub fn from_handle(
+        handle: &crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>,
+    ) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(&handle.raw);
         hasher.update(S::id().as_ref());

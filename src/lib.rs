@@ -27,7 +27,7 @@ mod proofs;
 // consumers see it while `triblespace-core` stays lean for proc-macro usage.
 #[cfg(test)]
 mod readme_example {
-    use crate::core::repo::{Repository, memoryrepo::MemoryRepo};
+    use crate::core::repo::{memoryrepo::MemoryRepo, Repository};
     use crate::prelude::blobschemas::LongString;
     use crate::prelude::*;
     use ed25519_dalek::SigningKey;
@@ -35,7 +35,7 @@ mod readme_example {
 
     mod literature {
         use crate::prelude::blobschemas::LongString;
-        use crate::prelude::valueschemas::{Blake3, GenId, Handle, R256, ShortString};
+        use crate::prelude::valueschemas::{Blake3, GenId, Handle, ShortString, R256};
         use crate::prelude::*;
 
         attributes! {

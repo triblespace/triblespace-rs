@@ -6,11 +6,11 @@ use serde_json::{Map, Value as JsonValue};
 
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
-use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::id::ufoid;
+use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
+use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::Metadata;
-use crate::macros::entity;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -325,12 +325,13 @@ where
             }
             JsonValue::Number(number) => {
                 let attr = self.num_attr(field)?;
-                let encoded: Value<F64> = number
-                    .try_to_value()
-                    .map_err(|err| JsonImportError::EncodeNumber {
-                        field: field.to_owned(),
-                        source: EncodeError::from_error(err),
-                    })?;
+                let encoded: Value<F64> =
+                    number
+                        .try_to_value()
+                        .map_err(|err| JsonImportError::EncodeNumber {
+                            field: field.to_owned(),
+                            source: EncodeError::from_error(err),
+                        })?;
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
@@ -506,12 +507,13 @@ where
             JsonValue::Number(number) => {
                 let attr = self.num_attr(field);
                 let attr_id = attr.id();
-                let encoded: Value<F64> = number
-                    .try_to_value()
-                    .map_err(|err| JsonImportError::EncodeNumber {
-                        field: field.to_owned(),
-                        source: EncodeError::from_error(err),
-                    })?;
+                let encoded: Value<F64> =
+                    number
+                        .try_to_value()
+                        .map_err(|err| JsonImportError::EncodeNumber {
+                            field: field.to_owned(),
+                            source: EncodeError::from_error(err),
+                        })?;
                 staged.insert(&Trible::new(entity, &attr_id, &encoded));
                 Ok(())
             }

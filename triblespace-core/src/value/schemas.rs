@@ -2,8 +2,8 @@
 
 pub mod boolean;
 pub mod ed25519;
-pub mod f64;
 pub mod f256;
+pub mod f64;
 pub mod genid;
 pub mod hash;
 pub mod iu256;
@@ -13,9 +13,15 @@ pub mod range;
 pub mod shortstring;
 pub mod time;
 
+#[cfg(feature = "builtin-wasm-formatters")]
+pub(crate) mod wasm_formatters;
+
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
@@ -30,6 +36,20 @@ pub struct UnknownValue {}
 impl ConstMetadata for UnknownValue {
     fn id() -> Id {
         id_hex!("4EC697E8599AC79D667C722E2C8BEBF4")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 impl ValueSchema for UnknownValue {

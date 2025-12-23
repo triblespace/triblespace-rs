@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   examples that call `ConstMetadata::id()`.
 - `Handle` value schemas now forward metadata from their hash protocol and blob
   schema components so composite schema descriptions stay discoverable.
+- `#[value_formatter]` can override the generated WASM byte constant name and
+  visibility via `const_wasm = NAME` and `vis(...)` arguments.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes
   of the Blake3 digest to stay consistent with the ID-to-value layout.
 - Consolidated JSON import into a single deterministic
@@ -58,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LineLocation` value schema for storing explicit `(line, column)` start and
   end coordinates without manual packing, now used by the macro metadata
   instrumentation when recording invocation spans.
+- `builtin-wasm-formatters` feature flag that bundles WebAssembly value
+  formatters for the built-in value schemas and attaches them via
+  `metadata::value_formatter` when emitting schema metadata.
+- `#[value_formatter]` proc macro support in `triblespace-core-macros`, enabling
+  the core crate to compile and embed formatter modules without introducing a
+  dependency cycle.
 - `triblespace-macros` crate wrapping the procedural macros and query helpers
   to record invocation metadata in an optional repository configured via the
   `TRIBLESPACE_METADATA_PILE` and `TRIBLESPACE_METADATA_BRANCH` environment

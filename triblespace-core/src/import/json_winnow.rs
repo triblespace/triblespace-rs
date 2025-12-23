@@ -2,11 +2,13 @@ use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::id::ufoid;
+use crate::id::RawId;
+use crate::id::ID_LEN;
 use crate::id::{ExclusiveId, Id};
 use crate::import::json::{EncodeError, JsonImportError};
 use crate::macros::entity;
-use crate::metadata::Metadata;
 use crate::metadata;
+use crate::metadata::Metadata;
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -15,12 +17,10 @@ use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
 use crate::value::{RawValue, ToValue, Value, ValueSchema};
-use crate::id::RawId;
-use crate::id::ID_LEN;
 use anybytes::Bytes;
-use std::str::FromStr;
 use std::char;
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use winnow::stream::Stream;
 
 /// Winnow-based streaming JSON importer (non-deterministic ids, emits metadata).
@@ -398,11 +398,7 @@ fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
                 b'0'..=b'9' => (h - b'0') as u32,
                 b'a'..=b'f' => (h - b'a' + 10) as u32,
                 b'A'..=b'F' => (h - b'A' + 10) as u32,
-                _ => {
-                    return Err(JsonImportError::Syntax(
-                        "invalid unicode escape".into(),
-                    ))
-                }
+                _ => return Err(JsonImportError::Syntax("invalid unicode escape".into())),
             };
     }
 
@@ -415,7 +411,10 @@ fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
     }
 }
 
-fn parse_string_common(bytes: &mut Bytes, unicode_escape: &mut impl FnMut(&mut Bytes) -> Result<Vec<u8>, JsonImportError>) -> Result<Bytes, JsonImportError> {
+fn parse_string_common(
+    bytes: &mut Bytes,
+    unicode_escape: &mut impl FnMut(&mut Bytes) -> Result<Vec<u8>, JsonImportError>,
+) -> Result<Bytes, JsonImportError> {
     let consume_byte = |bytes: &mut Bytes, expected: u8| -> Result<(), JsonImportError> {
         match bytes.pop_front() {
             Some(b) if b == expected => Ok(()),
@@ -477,9 +476,7 @@ fn parse_string_common(bytes: &mut Bytes, unicode_escape: &mut impl FnMut(&mut B
                     b'r' => out.push(b'\r'),
                     b't' => out.push(b'\t'),
                     b'u' => out.extend_from_slice(&unicode_escape(bytes)?),
-                    _ => {
-                        return Err(JsonImportError::Syntax("invalid escape sequence".into()))
-                    }
+                    _ => return Err(JsonImportError::Syntax("invalid escape sequence".into())),
                 }
             }
             Some(b'\n') | Some(b'\r') | None => {
@@ -780,7 +777,8 @@ where
 
     fn derive_id(&self, pairs: &[(RawId, RawValue)]) -> Result<ExclusiveId, JsonImportError> {
         let mut sorted = pairs.to_vec();
-        sorted.sort_by(|(a_attr, a_val), (b_attr, b_val)| a_attr.cmp(b_attr).then(a_val.cmp(b_val)));
+        sorted
+            .sort_by(|(a_attr, a_val), (b_attr, b_val)| a_attr.cmp(b_attr).then(a_val.cmp(b_val)));
 
         let mut hasher = Hasher::new();
         if let Some(salt) = self.id_salt {

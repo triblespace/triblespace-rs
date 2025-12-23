@@ -1,6 +1,9 @@
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::RawValue;
 use crate::value::ToValue;
@@ -27,6 +30,20 @@ impl ConstMetadata for RangeU128 {
     fn id() -> Id {
         id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A")
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::RANGE_U128_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
+    }
 }
 
 impl ValueSchema for RangeU128 {
@@ -36,6 +53,20 @@ impl ValueSchema for RangeU128 {
 impl ConstMetadata for RangeInclusiveU128 {
     fn id() -> Id {
         id_hex!("1D0D82CA84424CD0A2F98DB37039E152")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::RANGE_INCLUSIVE_U128_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 

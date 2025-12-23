@@ -6,6 +6,9 @@ pub use ed25519_dalek::VerifyingKey;
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -26,6 +29,20 @@ impl ConstMetadata for ED25519RComponent {
     fn id() -> Id {
         id_hex!("995A86FFC83DB95ECEAA17E226208897")
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
+    }
 }
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
@@ -34,6 +51,20 @@ impl ConstMetadata for ED25519SComponent {
     fn id() -> Id {
         id_hex!("10D35B0B628E9E409C549D8EC1FB3598")
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
+    }
 }
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
@@ -41,6 +72,20 @@ impl ValueSchema for ED25519SComponent {
 impl ConstMetadata for ED25519PublicKey {
     fn id() -> Id {
         id_hex!("69A872254E01B4C1ED36E08E40445E93")
+    }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        let _ = blobs;
+
+        #[cfg(feature = "builtin-wasm-formatters")]
+        let tribles = super::wasm_formatters::describe_value_formatter(
+            blobs,
+            Self::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        let tribles = TribleSet::new();
+        tribles
     }
 }
 impl ValueSchema for ED25519PublicKey {

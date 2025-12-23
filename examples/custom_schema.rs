@@ -4,16 +4,16 @@ use triblespace::core::blob::Blob;
 use triblespace::core::blob::BlobSchema;
 use triblespace::core::blob::ToBlob;
 use triblespace::core::blob::TryFromBlob;
-use triblespace::core::repo::BlobStore;
 use triblespace::core::id::id_hex;
 use triblespace::core::id::Id;
 use triblespace::core::metadata::ConstMetadata;
+use triblespace::core::repo::BlobStore;
+use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::value::FromValue;
 use triblespace::core::value::ToValue;
 use triblespace::core::value::Value;
 use triblespace::core::value::ValueSchema;
 use triblespace::core::value::VALUE_LEN;
-use triblespace::core::value::schemas::hash::Blake3;
 
 // ANCHOR: custom_schema
 

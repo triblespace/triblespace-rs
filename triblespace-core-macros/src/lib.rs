@@ -51,3 +51,11 @@ pub fn entity(input: TokenStream) -> TokenStream {
     let tokens = TokenStream2::from(input);
     expand(triblespace_macros_common::entity_impl(tokens, &base_path))
 }
+
+#[proc_macro_attribute]
+pub fn value_formatter(attr: TokenStream, item: TokenStream) -> TokenStream {
+    expand(triblespace_macros_common::value_formatter_impl(
+        TokenStream2::from(attr),
+        TokenStream2::from(item),
+    ))
+}

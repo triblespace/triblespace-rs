@@ -44,6 +44,10 @@ where
     fn id() -> Id {
         <H as ConstMetadata>::id()
     }
+
+    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+        H::describe(blobs)
+    }
 }
 
 impl<H> ValueSchema for Hash<H>
@@ -134,7 +138,16 @@ where
     let mut tribles = TribleSet::new();
 
     let entity = ExclusiveId::force(H::id());
-        tribles += entity! { &entity @ metadata::shortname: H::NAME };
+    tribles += entity! { &entity @ metadata::shortname: H::NAME };
+
+    #[cfg(feature = "builtin-wasm-formatters")]
+    {
+        tribles += super::wasm_formatters::describe_value_formatter(
+            blobs,
+            H::id(),
+            super::wasm_formatters::HEX32_WASM,
+        );
+    }
 
     tribles
 }
@@ -234,6 +247,16 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
             metadata::blob_schema: T::id(),
             metadata::hash_schema: H::id(),
         };
+
+        let _ = blobs;
+        #[cfg(feature = "builtin-wasm-formatters")]
+        {
+            tribles += super::wasm_formatters::describe_value_formatter(
+                blobs,
+                Self::id(),
+                super::wasm_formatters::HEX32_WASM,
+            );
+        }
         tribles
     }
 }

@@ -4,8 +4,8 @@ use std::hint::black_box;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::fucid;
-use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::trible::Trible;
+use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::{BlobStorePut, IdOwner, ToValue, TribleSet, Value};
 
 struct PreparedData {
@@ -38,7 +38,11 @@ fn prepare(size: usize) -> PreparedData {
         blobs.push(format!("blob_payload_{i}"));
     }
 
-    PreparedData { tribles, blobs, quads }
+    PreparedData {
+        tribles,
+        blobs,
+        quads,
+    }
 }
 
 fn bench_inserts(c: &mut Criterion) {
@@ -69,8 +73,9 @@ fn bench_inserts(c: &mut Criterion) {
                     let mut set = TribleSet::new();
                     let mut store = MemoryBlobStore::<Blake3>::new();
                     for (trible, text) in data.tribles.iter().zip(&data.blobs) {
-                        let handle: Value<_> =
-                            store.put::<LongString, _>(text.clone()).expect("blob store insert");
+                        let handle: Value<_> = store
+                            .put::<LongString, _>(text.clone())
+                            .expect("blob store insert");
                         // force allows using the raw ids from the sampled trible
                         let blob_trible = Trible::force(trible.e(), trible.a(), &handle);
                         set.insert(&blob_trible);

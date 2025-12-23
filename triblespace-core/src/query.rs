@@ -601,7 +601,7 @@ macro_rules! find {
 
             $crate::query::Query::new($Constraint,
                 move |_binding| {
-                    
+
             })
         }
     };

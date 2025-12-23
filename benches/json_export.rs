@@ -1,10 +1,10 @@
 use anybytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use serde_json::Value as JsonValue;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
-use serde_json::Value as JsonValue;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
@@ -247,8 +247,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                     };
                     let reader = blobs.reader().expect("reader");
                     let mut buf = String::new();
-                    export_to_json(&merged, root, &reader, &mut buf)
-                        .expect("export JSON");
+                    export_to_json(&merged, root, &reader, &mut buf).expect("export JSON");
                     std::hint::black_box(buf.len());
                 });
             },
@@ -283,8 +282,7 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                     };
                     let reader = blobs.reader().expect("reader");
                     let mut buf = String::new();
-                    export_to_json(&merged, root, &reader, &mut buf)
-                        .expect("export JSON");
+                    export_to_json(&merged, root, &reader, &mut buf).expect("export JSON");
                     std::hint::black_box(buf.len());
                 });
             },
