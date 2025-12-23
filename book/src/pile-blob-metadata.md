@@ -1,37 +1,61 @@
 # Pile Blob Metadata
 
-Every blob stored in a pile begins with a header that records the moment it was
-written and the length of the payload that follows. The `Pile` implementation
-surfaces that information so tools can answer questions such as "when did this
-blob arrive?" without re-parsing the file on disk.
+Every blob stored in a pile begins with a compact header. Besides the payload
+hash (covered in [Pile Format](./pile-format.md)), the header records *when* the
+blob was appended and *how long* the payload is. The `Pile` implementation
+surfaces this information so tooling can answer questions such as "when did this
+blob arrive?" without walking the raw bytes on disk.
+
+## Header fields at a glance
+
+The header written ahead of every blob contains four fields (64 bytes total):
+
+| Field         | Size (bytes) | Purpose                                                                 |
+| ------------- | ------------ | ------------------------------------------------------------------------ |
+| Magic marker  | 16           | Distinguishes blob records from branch updates.                         |
+| Timestamp     | 8            | Milliseconds since the Unix epoch when the payload was appended.        |
+| Length        | 8            | Size of the payload in bytes (padding is stored separately).            |
+| Hash          | 32           | The 256-bit digest of the payload used to validate the stored bytes.    |
+
+[`BlobMetadata`][blobmetadata] re-exposes the timestamp and length fields so
+callers can read when a blob was appended and how large the payload is.
 
 ## `BlobMetadata`
 
-Blob metadata is exposed through the [`BlobMetadata`][blobmetadata] struct. It is
-a simple value type containing two public fields:
+[`BlobMetadata`][blobmetadata] is a lightweight struct shared by all repository
+implementations. It mirrors the timestamp/length pair in the header and leaves
+validation to the reader:
 
-- `timestamp`: the write time stored in the blob header. The pile records the
-  number of **milliseconds since the Unix epoch** when the blob was appended.
-- `length`: the size of the blob payload in bytes. Padding that aligns entries to
-  64&nbsp;byte boundaries is excluded from this value, so it matches the slice
+- `timestamp`: the write time stored in the blob header as a `u64`. A convenient
+  way to turn this into a `SystemTime` is shown below. `Pile::put` records this
+  value using `SystemTime::now()`, so it reflects wall-clock time and can move
+  forward or backward if the system clock is adjusted.
+- `length`: the size of the blob payload in bytes. Padding that aligns entries
+  to 64-byte boundaries is excluded from this value, so it matches the slice
   returned by [`PileReader::get`][get].
 
-[blobmetadata]: ../../src/repo/pile.rs
+[blobmetadata]: ../../src/repo.rs
 [get]: ../../src/repo/pile.rs
 
 ## Looking up blob metadata
 
 `PileReader::metadata` accepts the same `Value<Handle<_, _>>` that other blob
-store APIs use. It returns `Some(BlobMetadata)` when the blob exists and the
-stored bytes hash to the expected value; otherwise it yields `None`.
+store APIs use. The reader consults its in-memory index and, on the first
+request for a handle, lazily hashes the payload to confirm the bytes match the
+handle. Subsequent metadata lookups for the same handle reuse that cached
+validation result. When the payload passes validation the method returns
+`Some(BlobMetadata)`; otherwise it yields `None`.
 
 Readers operate on the snapshot that was current when they were created. Call
 [`Pile::refresh`][refresh] and request a new reader to observe blobs appended
-afterwards.
+afterwards. `PileReader::metadata` never fails for valid snapshots—its error
+type is [`Infallible`](core::convert::Infallible).
 
 [refresh]: ../../src/repo/pile.rs
 
 ```rust,no_run
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anybytes::Bytes;
 use triblespace::blob::schemas::UnknownBlob;
 use triblespace::blob::Blob;
@@ -45,9 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let reader = pile.reader()?;
     if let Some(meta) = reader.metadata(handle) {
+        let appended_at = UNIX_EPOCH + Duration::from_millis(meta.timestamp);
         println!(
-            "Blob length: {} bytes, appended at {} ms",
-            meta.length, meta.timestamp
+            "Blob length: {} bytes, appended at {:?}",
+            meta.length, appended_at
         );
     }
 
@@ -67,8 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   process opened it.
 
 When `None` is returned, callers can treat it the same way they would handle a
-missing blob from `get`: the data is considered absent from the snapshot they are
-reading.
+missing blob from `get`: the data is considered absent from the snapshot they
+are reading. Because validation is cached, later calls will continue to report
+`None` for the same handle until a future refresh revalidates the blob.
 
-For more detail on how the metadata is laid out on disk, see the
-[Pile Format](./pile-format.md) chapter.
+For additional background on the binary layout and how the header interacts
+with padding, see the [Pile Format](./pile-format.md) chapter.
