@@ -128,6 +128,7 @@ The crate also ships with these blob schemas:
   for offline queries. The `SuccinctArchive` helper exposes high-level
   iterators while the `SuccinctArchiveBlob` schema is responsible for the
   serialized byte layout.
+- `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 
 ```rust
@@ -171,3 +172,27 @@ By keeping schema identifiers alongside stored values and blobs you can roll out
 new representations incrementally: ship readers that understand both IDs, update
 your import pipelines, and finally switch writers once everything recognizes the
 replacement schema.
+
+## Value formatters (WASM)
+
+Binary formats are great for portability and performance, but they can be
+painful to inspect if you don’t know the schema ahead of time. Trible Space
+supports an optional schema-level formatter mechanism: a value schema can point
+to a small sandboxed WebAssembly module that turns its raw 32 bytes into a
+human-readable string.
+
+The formatter is stored as a blob (`blobschemas::WasmCode`) and referenced from
+the schema identifier entity via the metadata attribute `metadata::value_formatter`.
+
+The built-in runner lives behind the `wasm-formatters` feature flag and uses
+`wasmi` with tight limits (fuel, memory pages, output size). Modules must not
+import anything and use the following minimal ABI:
+
+- `memory` (linear memory)
+- `format(w0: i64, w1: i64, w2: i64, w3: i64) -> i64`
+
+The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
+(little-endian). The return value packs the output pointer and output length:
+
+- Success returns `(output_len << 32) | output_ptr` with `output_ptr != 0`.
+- Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).

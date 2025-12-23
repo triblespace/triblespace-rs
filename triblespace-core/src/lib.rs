@@ -23,6 +23,9 @@ pub mod repo;
 pub mod trible;
 pub mod value;
 
+#[cfg(feature = "wasm-formatters")]
+pub mod value_formatter;
+
 pub mod debug;
 pub mod examples;
 

@@ -3,6 +3,7 @@
 pub mod longstring;
 pub mod simplearchive;
 pub mod succinctarchive;
+pub mod wasmcode;
 
 use anybytes::Bytes;
 

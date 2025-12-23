@@ -4,13 +4,14 @@
 //! It defines meta attributes that are used to describe other attributes.
 
 use crate::blob::schemas::longstring::LongString;
-use crate::repo::BlobStore;
+use crate::blob::schemas::wasmcode::WasmCode;
 use crate::id::Id;
 use crate::id_hex;
 use crate::prelude::valueschemas;
+use crate::repo::BlobStore;
 use crate::trible::TribleSet;
-use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash;
+use crate::value::schemas::hash::Blake3;
 use core::marker::PhantomData;
 use triblespace_core_macros::attributes;
 
@@ -66,6 +67,7 @@ pub const ATTR_JSON_KIND: Id = id_hex!("A7AFC8C0FAD017CE7EC19587AF682CFF");
 pub const VALUE_SCHEMA: Id = id_hex!("213F89E3F49628A105B3830BD3A6612C");
 pub const BLOB_SCHEMA: Id = id_hex!("43C134652906547383054B1E31E23DF4");
 pub const HASH_SCHEMA: Id = id_hex!("51C08CFABB2C848CE0B4A799F0EFE5EA");
+pub const VALUE_FORMATTER: Id = id_hex!("1A3D520FEDA9E1A4051EBE96E43ABAC7");
 pub const KIND_MULTI: Id = id_hex!("C36D9C16B34729D855BD6C36A624E1BF");
 pub const SHORTNAME: Id = id_hex!("2E26F8BA886495A8DF04ACF0ED3ACBD4");
 pub const NAME: Id = id_hex!("7FB28C0B48E1924687857310EE230414");
@@ -76,6 +78,11 @@ attributes! {
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
     "43C134652906547383054B1E31E23DF4" as blob_schema: valueschemas::GenId;
     "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: valueschemas::GenId;
+    /// Optional WebAssembly module for formatting values governed by this schema.
+    ///
+    /// The value is a `Handle<Blake3, WasmCode>` that points to a sandboxed
+    /// formatter module (see `triblespace_core::value_formatter`).
+    "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: valueschemas::Handle<hash::Blake3, WasmCode>;
     /// Canonical field name stored as a LongString handle.
     "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<hash::Blake3, LongString>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
