@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 use wasmi::Config;
 use wasmi::Engine;
 use wasmi::Linker;
 use wasmi::Module;
 use wasmi::Store;
+
+use quick_cache::sync::Cache;
 
 use crate::blob::schemas::wasmcode::WasmCode;
 use crate::blob::Blob;
@@ -20,6 +24,15 @@ use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Handle;
 use crate::value::Value;
+
+fn shared_engine() -> &'static Engine {
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    ENGINE.get_or_init(|| {
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        Engine::new(&config)
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WasmFormatterLimits {
@@ -133,7 +146,6 @@ impl Error for WasmFormatterError {
 /// - Success returns `(output_len << 32) | output_ptr` with `output_ptr != 0`.
 /// - Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).
 pub struct WasmValueFormatter {
-    engine: Engine,
     module: Module,
     limits: WasmFormatterLimits,
 }
@@ -154,27 +166,21 @@ impl WasmValueFormatter {
             });
         }
 
-        let mut config = Config::default();
-        config.consume_fuel(true);
-        let engine = Engine::new(&config);
-        let module = Module::new(&engine, wasm).map_err(WasmFormatterError::Compile)?;
+        let module = Module::new(shared_engine(), wasm).map_err(WasmFormatterError::Compile)?;
 
         if module.imports().next().is_some() {
             return Err(WasmFormatterError::DisallowedImports);
         }
 
-        Ok(Self {
-            engine,
-            module,
-            limits,
-        })
+        Ok(Self { module, limits })
     }
 
     pub fn format_value(&self, raw: &[u8; 32]) -> Result<String, WasmFormatterError> {
-        let mut store = Store::new(&self.engine, ());
+        let engine = self.module.engine();
+        let mut store = Store::new(engine, ());
         store.add_fuel(self.limits.max_fuel).ok();
 
-        let linker = Linker::<()>::new(&self.engine);
+        let linker = Linker::<()>::new(engine);
         let instance = linker
             .instantiate(&mut store, &self.module)
             .map_err(WasmFormatterError::Instantiate)?
@@ -233,6 +239,14 @@ impl WasmValueFormatter {
     }
 }
 
+impl crate::blob::TryFromBlob<WasmCode> for WasmValueFormatter {
+    type Error = WasmFormatterError;
+
+    fn try_from_blob(b: Blob<WasmCode>) -> Result<Self, Self::Error> {
+        WasmValueFormatter::new(b.bytes.as_ref())
+    }
+}
+
 #[derive(Debug)]
 pub enum LoadWasmValueFormattersError<E> {
     Get(E),
@@ -262,6 +276,121 @@ impl<E: Error + 'static> Error for LoadWasmValueFormattersError<E> {
             Self::Get(err) => Some(err),
             Self::Formatter { source, .. } => Some(source),
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum WasmValueFormatterResolverError<E>
+where
+    E: Error,
+{
+    Get(E),
+    Formatter(WasmFormatterError),
+}
+
+impl<E> fmt::Display for WasmValueFormatterResolverError<E>
+where
+    E: Error,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Get(err) => write!(f, "failed to load wasm formatter blob: {err}"),
+            Self::Formatter(err) => write!(f, "failed to load wasm formatter: {err}"),
+        }
+    }
+}
+
+impl<E> Error for WasmValueFormatterResolverError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Get(err) => Some(err),
+            Self::Formatter(err) => Some(err),
+        }
+    }
+}
+
+/// Lazy loader and cache for schema-provided WebAssembly value formatters.
+///
+/// Modules are cached by `Handle<Blake3, WasmCode>` so multiple schemas can
+/// share a formatter without recompiling it.
+pub struct WasmValueFormatterResolver<B>
+where
+    B: BlobStoreGet<Blake3>,
+{
+    blobs: B,
+    limits: WasmFormatterLimits,
+    by_schema: HashMap<Id, Value<Handle<Blake3, WasmCode>>>,
+    by_handle: Cache<Value<Handle<Blake3, WasmCode>>, Arc<WasmValueFormatter>>,
+}
+
+impl<B> WasmValueFormatterResolver<B>
+where
+    B: BlobStoreGet<Blake3>,
+{
+    pub fn new(space: &TribleSet, blobs: B) -> Self {
+        Self::with_limits(space, blobs, WasmFormatterLimits::default())
+    }
+
+    pub fn with_limits(space: &TribleSet, blobs: B, limits: WasmFormatterLimits) -> Self {
+        let mut by_schema = HashMap::<Id, Value<Handle<Blake3, WasmCode>>>::new();
+        for (schema, handle) in find!(
+            (schema: Id, handle: Value<Handle<Blake3, WasmCode>>),
+            pattern!(space, [{ ?schema @ metadata::value_formatter: ?handle }])
+        ) {
+            by_schema.insert(schema, handle);
+        }
+
+        let cache_cap = by_schema.len().max(16);
+        Self {
+            blobs,
+            limits,
+            by_schema,
+            by_handle: Cache::new(cache_cap),
+        }
+    }
+
+    pub fn formatter(
+        &self,
+        schema: Id,
+    ) -> Result<
+        Option<Arc<WasmValueFormatter>>,
+        WasmValueFormatterResolverError<B::GetError<Infallible>>,
+    > {
+        let Some(handle) = self.by_schema.get(&schema).copied() else {
+            return Ok(None);
+        };
+
+        let blobs = &self.blobs;
+        let limits = self.limits;
+        let formatter = self
+            .by_handle
+            .get_or_insert_with(&handle, || {
+                let blob: Blob<WasmCode> = blobs
+                    .get::<Blob<WasmCode>, WasmCode>(handle)
+                    .map_err(WasmValueFormatterResolverError::Get)?;
+                let formatter = WasmValueFormatter::with_limits(blob.bytes.as_ref(), limits)
+                    .map_err(WasmValueFormatterResolverError::Formatter)?;
+                Ok(Arc::new(formatter))
+            })?;
+
+        Ok(Some(formatter))
+    }
+
+    pub fn format_value(
+        &self,
+        schema: Id,
+        raw: &[u8; 32],
+    ) -> Result<Option<String>, WasmValueFormatterResolverError<B::GetError<Infallible>>> {
+        let Some(formatter) = self.formatter(schema)? else {
+            return Ok(None);
+        };
+        formatter
+            .format_value(raw)
+            .map(Some)
+            .map_err(WasmValueFormatterResolverError::Formatter)
     }
 }
 
