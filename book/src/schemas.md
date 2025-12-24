@@ -184,9 +184,10 @@ human-readable string.
 The formatter is stored as a blob (`blobschemas::WasmCode`) and referenced from
 the schema identifier entity via the metadata attribute `metadata::value_formatter`.
 
-The built-in runner lives behind the `wasm-formatters` feature flag and uses
-`wasmi` with tight limits (fuel, memory pages, output size). Modules must not
-import anything and use the following minimal ABI:
+The built-in runner lives behind the `wasm` feature flag (enabled by default in
+the `triblespace` facade crate) and uses `wasmi` with tight limits (fuel, memory
+pages, output size). Modules must not import anything and use the following
+minimal ABI:
 
 - `memory` (linear memory)
 - `format(w0: i64, w1: i64, w2: i64, w3: i64) -> i64`
@@ -198,7 +199,7 @@ The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
 - Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).
 
 The core crate can optionally ship built-in formatters for its built-in value
-schemas. Enable the `builtin-wasm-formatters` feature to have
+schemas. Enable the `wasm` feature to have
 `ConstMetadata::describe` attach `metadata::value_formatter` entries for the
 standard schemas. This feature requires the `wasm32-unknown-unknown` Rust
 target at build time because the bundled formatters are compiled to WebAssembly

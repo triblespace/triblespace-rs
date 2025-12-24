@@ -140,7 +140,7 @@ where
     let entity = ExclusiveId::force(H::id());
     tribles += entity! { &entity @ metadata::shortname: H::NAME };
 
-    #[cfg(feature = "builtin-wasm-formatters")]
+    #[cfg(feature = "wasm")]
     {
         tribles += super::wasm_formatters::describe_value_formatter(
             blobs,
@@ -249,7 +249,7 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         };
 
         let _ = blobs;
-        #[cfg(feature = "builtin-wasm-formatters")]
+        #[cfg(feature = "wasm")]
         {
             tribles += super::wasm_formatters::describe_value_formatter(
                 blobs,

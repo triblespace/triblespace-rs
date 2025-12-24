@@ -1,4 +1,4 @@
-#![cfg(feature = "builtin-wasm-formatters")]
+#![cfg(feature = "wasm")]
 
 use core::fmt::Write;
 

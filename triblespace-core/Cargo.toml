@@ -67,8 +67,7 @@ rustversion = "1.0"
 default = ["proptest"]
 proptest = ["dep:proptest"]
 kani = []
-wasm-formatters = ["dep:wasmi"]
-builtin-wasm-formatters = []
+wasm = ["dep:wasmi"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

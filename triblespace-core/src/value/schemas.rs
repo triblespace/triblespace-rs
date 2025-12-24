@@ -13,7 +13,7 @@ pub mod range;
 pub mod shortstring;
 pub mod time;
 
-#[cfg(feature = "builtin-wasm-formatters")]
+#[cfg(feature = "wasm")]
 pub(crate) mod wasm_formatters;
 
 use crate::id::Id;
@@ -41,13 +41,13 @@ impl ConstMetadata for UnknownValue {
     fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
         let _ = blobs;
 
-        #[cfg(feature = "builtin-wasm-formatters")]
+        #[cfg(feature = "wasm")]
         let tribles = wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
             wasm_formatters::HEX32_WASM,
         );
-        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
     }

@@ -40,11 +40,10 @@ oxigraph = "0.4.11"
 oxrdf = "0.2.4"
 
 [features]
-default = ["triblespace-core/proptest", "triblespace-core/wasm-formatters"]
+default = ["triblespace-core/proptest", "wasm"]
 proptest = ["triblespace-core/proptest"]
 kani = ["triblespace-core/kani"]
-wasm-formatters = ["triblespace-core/wasm-formatters"]
-builtin-wasm-formatters = ["triblespace-core/builtin-wasm-formatters"]
+wasm = ["triblespace-core/wasm"]
 
 [[bench]]
 name = "benchmark"

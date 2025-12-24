@@ -3,10 +3,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
-use wasmi::Config;
-use wasmi::Engine;
 use wasmi::Linker;
 use wasmi::Module;
 use wasmi::Store;
@@ -21,18 +18,11 @@ use crate::metadata;
 use crate::query::find;
 use crate::repo::BlobStoreGet;
 use crate::trible::TribleSet;
+use crate::wasm::WasmModuleResolver;
+use crate::wasm::WasmModuleResolverError;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Handle;
 use crate::value::Value;
-
-fn shared_engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = Config::default();
-        config.consume_fuel(true);
-        Engine::new(&config)
-    })
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WasmFormatterLimits {
@@ -134,6 +124,17 @@ impl Error for WasmFormatterError {
     }
 }
 
+impl From<crate::wasm::WasmModuleError> for WasmFormatterError {
+    fn from(err: crate::wasm::WasmModuleError) -> Self {
+        match err {
+            crate::wasm::WasmModuleError::ModuleTooLarge { size, max } => {
+                WasmFormatterError::ModuleTooLarge { size, max }
+            }
+            crate::wasm::WasmModuleError::Compile(err) => WasmFormatterError::Compile(err),
+        }
+    }
+}
+
 /// A sandboxed formatter that runs a WebAssembly module to pretty-print a value.
 ///
 /// The module must export:
@@ -146,7 +147,7 @@ impl Error for WasmFormatterError {
 /// - Success returns `(output_len << 32) | output_ptr` with `output_ptr != 0`.
 /// - Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).
 pub struct WasmValueFormatter {
-    module: Module,
+    module: Arc<Module>,
     limits: WasmFormatterLimits,
 }
 
@@ -155,24 +156,26 @@ impl WasmValueFormatter {
         Self::with_limits(wasm, WasmFormatterLimits::default())
     }
 
-    pub fn with_limits(
-        wasm: &[u8],
-        limits: WasmFormatterLimits,
-    ) -> Result<Self, WasmFormatterError> {
-        if wasm.len() > limits.max_module_bytes {
-            return Err(WasmFormatterError::ModuleTooLarge {
-                size: wasm.len(),
-                max: limits.max_module_bytes,
-            });
-        }
-
-        let module = Module::new(shared_engine(), wasm).map_err(WasmFormatterError::Compile)?;
-
+    pub fn from_module(module: Arc<Module>, limits: WasmFormatterLimits) -> Result<Self, WasmFormatterError> {
         if module.imports().next().is_some() {
             return Err(WasmFormatterError::DisallowedImports);
         }
 
         Ok(Self { module, limits })
+    }
+
+    pub fn with_limits(
+        wasm: &[u8],
+        limits: WasmFormatterLimits,
+    ) -> Result<Self, WasmFormatterError> {
+        let module = crate::wasm::compile_module(
+            wasm,
+            crate::wasm::WasmModuleLimits {
+                max_module_bytes: limits.max_module_bytes,
+            },
+        )
+        .map_err(WasmFormatterError::from)?;
+        Self::from_module(Arc::new(module), limits)
     }
 
     pub fn format_value(&self, raw: &[u8; 32]) -> Result<String, WasmFormatterError> {
@@ -182,7 +185,7 @@ impl WasmValueFormatter {
 
         let linker = Linker::<()>::new(engine);
         let instance = linker
-            .instantiate(&mut store, &self.module)
+            .instantiate(&mut store, self.module.as_ref())
             .map_err(WasmFormatterError::Instantiate)?
             .start(&mut store)
             .map_err(WasmFormatterError::Instantiate)?;
@@ -320,7 +323,7 @@ pub struct WasmValueFormatterResolver<B>
 where
     B: BlobStoreGet<Blake3>,
 {
-    blobs: B,
+    modules: WasmModuleResolver<B>,
     limits: WasmFormatterLimits,
     by_schema: HashMap<Id, Value<Handle<Blake3, WasmCode>>>,
     by_handle: Cache<Value<Handle<Blake3, WasmCode>>, Arc<WasmValueFormatter>>,
@@ -345,7 +348,12 @@ where
 
         let cache_cap = by_schema.len().max(16);
         Self {
-            blobs,
+            modules: WasmModuleResolver::with_limits(
+                blobs,
+                crate::wasm::WasmModuleLimits {
+                    max_module_bytes: limits.max_module_bytes,
+                },
+            ),
             limits,
             by_schema,
             by_handle: Cache::new(cache_cap),
@@ -363,16 +371,21 @@ where
             return Ok(None);
         };
 
-        let blobs = &self.blobs;
+        let modules = &self.modules;
         let limits = self.limits;
         let formatter = self
             .by_handle
             .get_or_insert_with(&handle, || {
-                let blob: Blob<WasmCode> = blobs
-                    .get::<Blob<WasmCode>, WasmCode>(handle)
-                    .map_err(WasmValueFormatterResolverError::Get)?;
-                let formatter = WasmValueFormatter::with_limits(blob.bytes.as_ref(), limits)
-                    .map_err(WasmValueFormatterResolverError::Formatter)?;
+                let module = modules
+                    .module(handle)
+                    .map_err(|err| match err {
+                        WasmModuleResolverError::Get(err) => WasmValueFormatterResolverError::Get(err),
+                        WasmModuleResolverError::Module(err) => {
+                            WasmValueFormatterResolverError::Formatter(err.into())
+                        }
+                    })?;
+                let formatter =
+                    WasmValueFormatter::from_module(module, limits).map_err(WasmValueFormatterResolverError::Formatter)?;
                 Ok(Arc::new(formatter))
             })?;
 
@@ -491,7 +504,6 @@ mod tests {
         assert_eq!(formatter.format_value(&raw).unwrap(), "Z");
     }
 
-    #[cfg(feature = "builtin-wasm-formatters")]
     #[test]
     fn builtins_emit_and_run() {
         use crate::blob::schemas::longstring::LongString;

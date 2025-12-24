@@ -23,7 +23,10 @@ pub mod repo;
 pub mod trible;
 pub mod value;
 
-#[cfg(feature = "wasm-formatters")]
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
+#[cfg(feature = "wasm")]
 pub mod value_formatter;
 
 pub mod debug;

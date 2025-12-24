@@ -32,13 +32,13 @@ impl ConstMetadata for F256LE {
     fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
         let _ = blobs;
 
-        #[cfg(feature = "builtin-wasm-formatters")]
+        #[cfg(feature = "wasm")]
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
             super::wasm_formatters::HEX32_REV_WASM,
         );
-        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
     }
@@ -54,13 +54,13 @@ impl ConstMetadata for F256BE {
     fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
         let _ = blobs;
 
-        #[cfg(feature = "builtin-wasm-formatters")]
+        #[cfg(feature = "wasm")]
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
             super::wasm_formatters::HEX32_WASM,
         );
-        #[cfg(not(feature = "builtin-wasm-formatters"))]
+        #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
     }

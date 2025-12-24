@@ -60,9 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LineLocation` value schema for storing explicit `(line, column)` start and
   end coordinates without manual packing, now used by the macro metadata
   instrumentation when recording invocation spans.
-- `builtin-wasm-formatters` feature flag that bundles WebAssembly value
-  formatters for the built-in value schemas and attaches them via
-  `metadata::value_formatter` when emitting schema metadata.
+- `wasm` feature flag that bundles WebAssembly value formatters for the built-in
+  value schemas and attaches them via `metadata::value_formatter` when emitting
+  schema metadata.
 - `#[value_formatter]` proc macro support in `triblespace-core-macros`, enabling
   the core crate to compile and embed formatter modules without introducing a
   dependency cycle.
@@ -84,9 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PATCH entries, and small commit DAGs, and updated the query harness to reuse
   them.
 - `metadata::value_formatter` and `blobschemas::WasmCode` for attaching
-  schema-level WebAssembly value formatters, plus an optional `wasm-formatters`
-  feature (enabled by default in the `triblespace` facade crate) that runs them
-  in a sandboxed `wasmi` interpreter with strict limits.
+  schema-level WebAssembly value formatters, plus an optional `wasm` feature
+  (enabled by default in the `triblespace` facade crate) that runs them in a
+  sandboxed `wasmi` interpreter with strict limits.
 - `#[value_formatter]` proc macro attribute (in `triblespace-macros`) that
   compiles standalone Rust formatter functions into sandboxed WebAssembly
   modules and embeds the resulting bytes in the caller crate.
