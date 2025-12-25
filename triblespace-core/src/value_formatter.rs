@@ -697,7 +697,7 @@ mod tests {
             .expect("hash formatter");
         assert_eq!(
             hash_formatter.format_value(&raw).unwrap(),
-            format!("blake3:{}", "AB".repeat(32))
+            format!("hash:{}", "AB".repeat(32))
         );
 
         let handle_formatter = formatters
@@ -706,7 +706,7 @@ mod tests {
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter.format_value(&raw).unwrap(),
-            format!("handle(blake3):{}", "EF".repeat(32))
+            format!("hash:{}", "EF".repeat(32))
         );
     }
 }

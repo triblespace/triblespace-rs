@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compilation.
 - `triblespace_core::wasm::shared_engine` is no longer part of the public API;
   module compilation uses an internal, lazy-initialized engine.
+- Hash/handle WASM value formatters now always use the generic hex formatter,
+  instead of special-casing specific hash protocols.
+- Hash/handle WASM formatter output now prefixes `hash:` before the hex digest.
 - `#[value_formatter]` can override the generated WASM byte constant name and
   visibility via `const_wasm = NAME` and `vis(...)` arguments.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes

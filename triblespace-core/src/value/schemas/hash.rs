@@ -142,14 +142,11 @@ where
 
     #[cfg(feature = "wasm")]
     {
-        let wasm = if H::NAME == "blake3" {
-            wasm_formatter::BLAKE3_HASH_WASM
-        } else if H::NAME == "blake2" {
-            wasm_formatter::BLAKE2_HASH_WASM
-        } else {
-            wasm_formatter::HASH_HEX_WASM
-        };
-        tribles += super::wasm_formatters::describe_value_formatter(blobs, H::id(), wasm);
+        tribles += super::wasm_formatters::describe_value_formatter(
+            blobs,
+            H::id(),
+            wasm_formatter::HASH_HEX_WASM,
+        );
     }
 
     tribles
@@ -162,71 +159,8 @@ mod wasm_formatter {
     use triblespace_core_macros::value_formatter;
 
     #[value_formatter]
-    pub(crate) fn blake3_hash(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        out.write_str("blake3:").map_err(|_| 1u32)?;
-        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-        for &byte in raw {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0x0F) as usize;
-            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
-            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
-        }
-        Ok(())
-    }
-
-    #[value_formatter]
-    pub(crate) fn blake2_hash(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        out.write_str("blake2:").map_err(|_| 1u32)?;
-        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-        for &byte in raw {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0x0F) as usize;
-            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
-            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
-        }
-        Ok(())
-    }
-
-    #[value_formatter]
     pub(crate) fn hash_hex(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-        for &byte in raw {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0x0F) as usize;
-            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
-            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
-        }
-        Ok(())
-    }
-
-    #[value_formatter]
-    pub(crate) fn blake3_handle(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        out.write_str("handle(blake3):").map_err(|_| 1u32)?;
-        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-        for &byte in raw {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0x0F) as usize;
-            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
-            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
-        }
-        Ok(())
-    }
-
-    #[value_formatter]
-    pub(crate) fn blake2_handle(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        out.write_str("handle(blake2):").map_err(|_| 1u32)?;
-        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-        for &byte in raw {
-            let hi = (byte >> 4) as usize;
-            let lo = (byte & 0x0F) as usize;
-            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
-            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
-        }
-        Ok(())
-    }
-
-    #[value_formatter]
-    pub(crate) fn handle_hex(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        out.write_str("hash:").map_err(|_| 1u32)?;
         const TABLE: &[u8; 16] = b"0123456789ABCDEF";
         for &byte in raw {
             let hi = (byte >> 4) as usize;
@@ -337,14 +271,11 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         let _ = blobs;
         #[cfg(feature = "wasm")]
         {
-            let wasm = if H::NAME == "blake3" {
-                wasm_formatter::BLAKE3_HANDLE_WASM
-            } else if H::NAME == "blake2" {
-                wasm_formatter::BLAKE2_HANDLE_WASM
-            } else {
-                wasm_formatter::HANDLE_HEX_WASM
-            };
-            tribles += super::wasm_formatters::describe_value_formatter(blobs, Self::id(), wasm);
+            tribles += super::wasm_formatters::describe_value_formatter(
+                blobs,
+                Self::id(),
+                wasm_formatter::HASH_HEX_WASM,
+            );
         }
         tribles
     }
