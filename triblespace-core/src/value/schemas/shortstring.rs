@@ -48,11 +48,31 @@ impl ConstMetadata for ShortString {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::SHORTSTRING_WASM,
+            wasm_formatter::SHORTSTRING_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn shortstring(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+
+        if raw[len..].iter().any(|&b| b != 0) {
+            return Err(2);
+        }
+
+        let text = core::str::from_utf8(&raw[..len]).map_err(|_| 3u32)?;
+        out.write_str(text).map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 

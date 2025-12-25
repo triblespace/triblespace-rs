@@ -49,7 +49,7 @@ impl ConstMetadata for R256LE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::R256_LE_WASM,
+            wasm_formatter::R256_LE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -71,11 +71,58 @@ impl ConstMetadata for R256BE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::R256_BE_WASM,
+            wasm_formatter::R256_BE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn r256_le(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[..16]);
+        let numer = i128::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[16..]);
+        let denom = i128::from_le_bytes(buf);
+
+        if denom == 0 {
+            return Err(2);
+        }
+
+        if denom == 1 {
+            write!(out, "{numer}").map_err(|_| 1u32)?;
+        } else {
+            write!(out, "{numer}/{denom}").map_err(|_| 1u32)?;
+        }
+        Ok(())
+    }
+
+    #[value_formatter]
+    pub(crate) fn r256_be(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[..16]);
+        let numer = i128::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..]);
+        let denom = i128::from_be_bytes(buf);
+
+        if denom == 0 {
+            return Err(2);
+        }
+
+        if denom == 1 {
+            write!(out, "{numer}").map_err(|_| 1u32)?;
+        } else {
+            write!(out, "{numer}/{denom}").map_err(|_| 1u32)?;
+        }
+        Ok(())
     }
 }
 impl ValueSchema for R256BE {

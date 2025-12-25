@@ -45,13 +45,34 @@ impl ConstMetadata for UnknownValue {
         let tribles = wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            wasm_formatters::HEX32_WASM,
+            wasm_formatter::UNKNOWN_VALUE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
     }
 }
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn unknown_value(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        out.write_str("unknown:").map_err(|_| 1u32)?;
+        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in raw {
+            let hi = (byte >> 4) as usize;
+            let lo = (byte & 0x0F) as usize;
+            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
+            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
+        }
+        Ok(())
+    }
+}
+
 impl ValueSchema for UnknownValue {
     type ValidationError = Infallible;
 

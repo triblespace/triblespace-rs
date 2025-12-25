@@ -44,7 +44,7 @@ impl ConstMetadata for U256LE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_REV_WASM,
+            wasm_formatter::U256_LE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -66,7 +66,7 @@ impl ConstMetadata for U256BE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::U256_BE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -88,7 +88,7 @@ impl ConstMetadata for I256LE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_REV_WASM,
+            wasm_formatter::I256_LE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -110,7 +110,7 @@ impl ConstMetadata for I256BE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::I256_BE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -119,6 +119,251 @@ impl ConstMetadata for I256BE {
 }
 impl ValueSchema for I256BE {
     type ValidationError = Infallible;
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter(const_wasm = U256_LE_WASM)]
+    pub(crate) fn u256_le(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        fn div_mod10(limbs: &mut [u64; 4]) -> u8 {
+            let mut rem: u128 = 0;
+            for limb in limbs.iter_mut() {
+                let n = (rem << 64) | (*limb as u128);
+                *limb = (n / 10) as u64;
+                rem = n % 10;
+            }
+            rem as u8
+        }
+
+        fn is_zero(limbs: &[u64; 4]) -> bool {
+            limbs.iter().all(|&limb| limb == 0)
+        }
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[0..8]);
+        let w0 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[8..16]);
+        let w1 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[16..24]);
+        let w2 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[24..32]);
+        let w3 = u64::from_le_bytes(buf);
+
+        let mut limbs = [w3, w2, w1, w0];
+        if is_zero(&limbs) {
+            out.write_char('0').map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        let mut digits = [0u8; 78];
+        let mut len = 0usize;
+        while !is_zero(&limbs) {
+            let digit = div_mod10(&mut limbs);
+            digits[len] = b'0' + digit;
+            len += 1;
+        }
+
+        for &digit in digits[..len].iter().rev() {
+            out.write_char(digit as char).map_err(|_| 1u32)?;
+        }
+
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = U256_BE_WASM)]
+    pub(crate) fn u256_be(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        fn div_mod10(limbs: &mut [u64; 4]) -> u8 {
+            let mut rem: u128 = 0;
+            for limb in limbs.iter_mut() {
+                let n = (rem << 64) | (*limb as u128);
+                *limb = (n / 10) as u64;
+                rem = n % 10;
+            }
+            rem as u8
+        }
+
+        fn is_zero(limbs: &[u64; 4]) -> bool {
+            limbs.iter().all(|&limb| limb == 0)
+        }
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[0..8]);
+        let w0 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[8..16]);
+        let w1 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..24]);
+        let w2 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[24..32]);
+        let w3 = u64::from_be_bytes(buf);
+
+        let mut limbs = [w0, w1, w2, w3];
+        if is_zero(&limbs) {
+            out.write_char('0').map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        let mut digits = [0u8; 78];
+        let mut len = 0usize;
+        while !is_zero(&limbs) {
+            let digit = div_mod10(&mut limbs);
+            digits[len] = b'0' + digit;
+            len += 1;
+        }
+
+        for &digit in digits[..len].iter().rev() {
+            out.write_char(digit as char).map_err(|_| 1u32)?;
+        }
+
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = I256_LE_WASM)]
+    pub(crate) fn i256_le(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        fn div_mod10(limbs: &mut [u64; 4]) -> u8 {
+            let mut rem: u128 = 0;
+            for limb in limbs.iter_mut() {
+                let n = (rem << 64) | (*limb as u128);
+                *limb = (n / 10) as u64;
+                rem = n % 10;
+            }
+            rem as u8
+        }
+
+        fn is_zero(limbs: &[u64; 4]) -> bool {
+            limbs.iter().all(|&limb| limb == 0)
+        }
+
+        fn twos_complement(limbs: &mut [u64; 4]) {
+            for limb in limbs.iter_mut() {
+                *limb = !*limb;
+            }
+
+            let mut carry: u128 = 1;
+            for limb in limbs.iter_mut().rev() {
+                let sum = (*limb as u128) + carry;
+                *limb = sum as u64;
+                carry = sum >> 64;
+                if carry == 0 {
+                    break;
+                }
+            }
+        }
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[0..8]);
+        let w0 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[8..16]);
+        let w1 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[16..24]);
+        let w2 = u64::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[24..32]);
+        let w3 = u64::from_le_bytes(buf);
+
+        let mut limbs = [w3, w2, w1, w0];
+        let negative = (limbs[0] & (1u64 << 63)) != 0;
+        if negative {
+            twos_complement(&mut limbs);
+        }
+
+        if is_zero(&limbs) {
+            out.write_char('0').map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        let mut digits = [0u8; 78];
+        let mut len = 0usize;
+        while !is_zero(&limbs) {
+            let digit = div_mod10(&mut limbs);
+            digits[len] = b'0' + digit;
+            len += 1;
+        }
+
+        if negative {
+            out.write_char('-').map_err(|_| 1u32)?;
+        }
+
+        for &digit in digits[..len].iter().rev() {
+            out.write_char(digit as char).map_err(|_| 1u32)?;
+        }
+
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = I256_BE_WASM)]
+    pub(crate) fn i256_be(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        fn div_mod10(limbs: &mut [u64; 4]) -> u8 {
+            let mut rem: u128 = 0;
+            for limb in limbs.iter_mut() {
+                let n = (rem << 64) | (*limb as u128);
+                *limb = (n / 10) as u64;
+                rem = n % 10;
+            }
+            rem as u8
+        }
+
+        fn is_zero(limbs: &[u64; 4]) -> bool {
+            limbs.iter().all(|&limb| limb == 0)
+        }
+
+        fn twos_complement(limbs: &mut [u64; 4]) {
+            for limb in limbs.iter_mut() {
+                *limb = !*limb;
+            }
+
+            let mut carry: u128 = 1;
+            for limb in limbs.iter_mut().rev() {
+                let sum = (*limb as u128) + carry;
+                *limb = sum as u64;
+                carry = sum >> 64;
+                if carry == 0 {
+                    break;
+                }
+            }
+        }
+
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[0..8]);
+        let w0 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[8..16]);
+        let w1 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..24]);
+        let w2 = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[24..32]);
+        let w3 = u64::from_be_bytes(buf);
+
+        let mut limbs = [w0, w1, w2, w3];
+        let negative = (limbs[0] & (1u64 << 63)) != 0;
+        if negative {
+            twos_complement(&mut limbs);
+        }
+
+        if is_zero(&limbs) {
+            out.write_char('0').map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        let mut digits = [0u8; 78];
+        let mut len = 0usize;
+        while !is_zero(&limbs) {
+            let digit = div_mod10(&mut limbs);
+            digits[len] = b'0' + digit;
+            len += 1;
+        }
+
+        if negative {
+            out.write_char('-').map_err(|_| 1u32)?;
+        }
+
+        for &digit in digits[..len].iter().rev() {
+            out.write_char(digit as char).map_err(|_| 1u32)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl ToValue<U256BE> for ethnum::U256 {

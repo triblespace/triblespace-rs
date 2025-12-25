@@ -38,7 +38,7 @@ impl ConstMetadata for RangeU128 {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::RANGE_U128_WASM,
+            wasm_formatters::RANGE_U128_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -62,11 +62,40 @@ impl ConstMetadata for RangeInclusiveU128 {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::RANGE_INCLUSIVE_U128_WASM,
+            wasm_formatters::RANGE_INCLUSIVE_U128_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatters {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn range_u128(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[..16]);
+        let start = u128::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..]);
+        let end = u128::from_be_bytes(buf);
+        write!(out, "{start}..{end}").map_err(|_| 1u32)?;
+        Ok(())
+    }
+
+    #[value_formatter]
+    pub(crate) fn range_inclusive_u128(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[..16]);
+        let start = u128::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..]);
+        let end = u128::from_be_bytes(buf);
+        write!(out, "{start}..={end}").map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 

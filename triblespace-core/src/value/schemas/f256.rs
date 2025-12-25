@@ -36,7 +36,7 @@ impl ConstMetadata for F256LE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_REV_WASM,
+            wasm_formatter::F256_LE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -58,7 +58,7 @@ impl ConstMetadata for F256BE {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::F256_BE_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -67,6 +67,173 @@ impl ConstMetadata for F256BE {
 }
 impl ValueSchema for F256BE {
     type ValidationError = Infallible;
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter(const_wasm = F256_LE_WASM)]
+    pub(crate) fn f256_le(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[0..16]);
+        let lo = u128::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[16..32]);
+        let hi = u128::from_le_bytes(buf);
+
+        const EXP_BITS: u32 = 19;
+        const HI_FRACTION_BITS: u32 = 108;
+        const EXP_MAX: u32 = (1u32 << EXP_BITS) - 1;
+        const EXP_BIAS: i32 = (EXP_MAX >> 1) as i32;
+
+        const HI_SIGN_MASK: u128 = 1u128 << 127;
+        const HI_EXP_MASK: u128 = (EXP_MAX as u128) << HI_FRACTION_BITS;
+        const HI_FRACTION_MASK: u128 = (1u128 << HI_FRACTION_BITS) - 1;
+
+        let sign = (hi & HI_SIGN_MASK) != 0;
+        let exp = ((hi & HI_EXP_MASK) >> HI_FRACTION_BITS) as u32;
+
+        let frac_hi = hi & HI_FRACTION_MASK;
+        let frac_lo = lo;
+        let fraction_is_zero = frac_hi == 0 && frac_lo == 0;
+
+        if exp == EXP_MAX {
+            let text = if fraction_is_zero {
+                if sign { "-inf" } else { "inf" }
+            } else {
+                "nan"
+            };
+            out.write_str(text).map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        if exp == 0 && fraction_is_zero {
+            let text = if sign { "-0" } else { "0" };
+            out.write_str(text).map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+        if sign {
+            out.write_char('-').map_err(|_| 1u32)?;
+        }
+
+        let exp2 = if exp == 0 { 1 - EXP_BIAS } else { exp as i32 - EXP_BIAS };
+        if exp == 0 {
+            out.write_str("0x0").map_err(|_| 1u32)?;
+        } else {
+            out.write_str("0x1").map_err(|_| 1u32)?;
+        }
+
+        let mut digits = [0u8; 59];
+        for i in 0..27 {
+            let shift = (26 - i) * 4;
+            let nibble = ((frac_hi >> shift) & 0xF) as usize;
+            digits[i] = HEX[nibble];
+        }
+        for i in 0..32 {
+            let shift = (31 - i) * 4;
+            let nibble = ((frac_lo >> shift) & 0xF) as usize;
+            digits[27 + i] = HEX[nibble];
+        }
+
+        let mut end = digits.len();
+        while end > 0 && digits[end - 1] == b'0' {
+            end -= 1;
+        }
+        if end > 0 {
+            out.write_char('.').map_err(|_| 1u32)?;
+            for &b in &digits[0..end] {
+                out.write_char(b as char).map_err(|_| 1u32)?;
+            }
+        }
+
+        write!(out, "p{exp2:+}").map_err(|_| 1u32)?;
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = F256_BE_WASM)]
+    pub(crate) fn f256_be(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[0..16]);
+        let hi = u128::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..32]);
+        let lo = u128::from_be_bytes(buf);
+
+        const EXP_BITS: u32 = 19;
+        const HI_FRACTION_BITS: u32 = 108;
+        const EXP_MAX: u32 = (1u32 << EXP_BITS) - 1;
+        const EXP_BIAS: i32 = (EXP_MAX >> 1) as i32;
+
+        const HI_SIGN_MASK: u128 = 1u128 << 127;
+        const HI_EXP_MASK: u128 = (EXP_MAX as u128) << HI_FRACTION_BITS;
+        const HI_FRACTION_MASK: u128 = (1u128 << HI_FRACTION_BITS) - 1;
+
+        let sign = (hi & HI_SIGN_MASK) != 0;
+        let exp = ((hi & HI_EXP_MASK) >> HI_FRACTION_BITS) as u32;
+
+        let frac_hi = hi & HI_FRACTION_MASK;
+        let frac_lo = lo;
+        let fraction_is_zero = frac_hi == 0 && frac_lo == 0;
+
+        if exp == EXP_MAX {
+            let text = if fraction_is_zero {
+                if sign { "-inf" } else { "inf" }
+            } else {
+                "nan"
+            };
+            out.write_str(text).map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        if exp == 0 && fraction_is_zero {
+            let text = if sign { "-0" } else { "0" };
+            out.write_str(text).map_err(|_| 1u32)?;
+            return Ok(());
+        }
+
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+        if sign {
+            out.write_char('-').map_err(|_| 1u32)?;
+        }
+
+        let exp2 = if exp == 0 { 1 - EXP_BIAS } else { exp as i32 - EXP_BIAS };
+        if exp == 0 {
+            out.write_str("0x0").map_err(|_| 1u32)?;
+        } else {
+            out.write_str("0x1").map_err(|_| 1u32)?;
+        }
+
+        let mut digits = [0u8; 59];
+        for i in 0..27 {
+            let shift = (26 - i) * 4;
+            let nibble = ((frac_hi >> shift) & 0xF) as usize;
+            digits[i] = HEX[nibble];
+        }
+        for i in 0..32 {
+            let shift = (31 - i) * 4;
+            let nibble = ((frac_lo >> shift) & 0xF) as usize;
+            digits[27 + i] = HEX[nibble];
+        }
+
+        let mut end = digits.len();
+        while end > 0 && digits[end - 1] == b'0' {
+            end -= 1;
+        }
+        if end > 0 {
+            out.write_char('.').map_err(|_| 1u32)?;
+            for &b in &digits[0..end] {
+                out.write_char(b as char).map_err(|_| 1u32)?;
+            }
+        }
+
+        write!(out, "p{exp2:+}").map_err(|_| 1u32)?;
+        Ok(())
+    }
 }
 
 impl FromValue<'_, F256BE> for f256 {

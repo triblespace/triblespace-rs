@@ -438,7 +438,7 @@ fn read_memory(
 ) -> Result<(), WasmFormatterError> {
     let mem_len = memory.data(store).len();
     let offset = offset as usize;
-    let end = offset as usize + out.len();
+    let end = offset + out.len();
     if end > mem_len {
         return Err(WasmFormatterError::OutOfBoundsMemoryAccess {
             offset: offset as u32,
@@ -533,26 +533,6 @@ mod tests {
         use crate::value::Value;
         use crate::value::ValueSchema;
 
-        fn hex_upper(bytes: &[u8]) -> String {
-            const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for &byte in bytes {
-                out.push(TABLE[(byte >> 4) as usize] as char);
-                out.push(TABLE[(byte & 0x0F) as usize] as char);
-            }
-            out
-        }
-
-        fn hex_upper_rev(bytes: &[u8]) -> String {
-            const TABLE: &[u8; 16] = b"0123456789ABCDEF";
-            let mut out = String::with_capacity(bytes.len() * 2);
-            for &byte in bytes.iter().rev() {
-                out.push(TABLE[(byte >> 4) as usize] as char);
-                out.push(TABLE[(byte & 0x0F) as usize] as char);
-            }
-            out
-        }
-
         let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
         let mut space = TribleSet::new();
         space += Boolean::describe(&mut store);
@@ -610,28 +590,26 @@ mod tests {
             "1.5"
         );
 
-        let u256_expected = format!("{:0>64}", "2A");
         let u256le = formatters.get(&U256LE::id()).expect("u256le formatter");
         assert_eq!(
             u256le.format_value(&U256LE::value_from(42u64).raw).unwrap(),
-            u256_expected
+            "42"
         );
         let u256be = formatters.get(&U256BE::id()).expect("u256be formatter");
         assert_eq!(
             u256be.format_value(&U256BE::value_from(42u64).raw).unwrap(),
-            u256_expected
+            "42"
         );
 
-        let i256_expected = "FF".repeat(32);
         let i256le = formatters.get(&I256LE::id()).expect("i256le formatter");
         assert_eq!(
             i256le.format_value(&I256LE::value_from(-1i8).raw).unwrap(),
-            i256_expected
+            "-1"
         );
         let i256be = formatters.get(&I256BE::id()).expect("i256be formatter");
         assert_eq!(
             i256be.format_value(&I256BE::value_from(-1i8).raw).unwrap(),
-            i256_expected
+            "-1"
         );
 
         let r256le = formatters.get(&R256LE::id()).expect("r256le formatter");
@@ -688,37 +666,63 @@ mod tests {
 
         let f256le = formatters.get(&F256LE::id()).expect("f256le formatter");
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256le.format_value(&raw).unwrap(), hex_upper_rev(&raw));
+        assert_eq!(f256le.format_value(&raw).unwrap(), "0x1p+0");
+
+        let exp = ((1u32 << 19) - 1) >> 1;
+        let hi = ((exp + 2000) as u128) << 108;
+        let mut raw = [0u8; 32];
+        raw[16..32].copy_from_slice(&hi.to_le_bytes());
+        assert_eq!(f256le.format_value(&raw).unwrap(), "0x1p+2000");
 
         let f256be = formatters.get(&F256BE::id()).expect("f256be formatter");
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256be.format_value(&raw).unwrap(), hex_upper(&raw));
+        assert_eq!(f256be.format_value(&raw).unwrap(), "0x1p+0");
+
+        let hi = ((exp + 2000) as u128) << 108;
+        let mut raw = [0u8; 32];
+        raw[0..16].copy_from_slice(&hi.to_be_bytes());
+        assert_eq!(f256be.format_value(&raw).unwrap(), "0x1p+2000");
 
         let ed25519_r = formatters
             .get(&ED25519RComponent::id())
             .expect("ed25519 r formatter");
         let raw = [0xABu8; 32];
-        assert_eq!(ed25519_r.format_value(&raw).unwrap(), "AB".repeat(32));
+        assert_eq!(
+            ed25519_r.format_value(&raw).unwrap(),
+            format!("ed25519:r:{}", "AB".repeat(32))
+        );
 
         let ed25519_s = formatters
             .get(&ED25519SComponent::id())
             .expect("ed25519 s formatter");
-        assert_eq!(ed25519_s.format_value(&raw).unwrap(), "AB".repeat(32));
+        assert_eq!(
+            ed25519_s.format_value(&raw).unwrap(),
+            format!("ed25519:s:{}", "AB".repeat(32))
+        );
 
         let ed25519_pk = formatters
             .get(&ED25519PublicKey::id())
             .expect("ed25519 public key formatter");
-        assert_eq!(ed25519_pk.format_value(&raw).unwrap(), "AB".repeat(32));
+        assert_eq!(
+            ed25519_pk.format_value(&raw).unwrap(),
+            format!("ed25519:pubkey:{}", "AB".repeat(32))
+        );
 
         let unknown = formatters
             .get(&UnknownValue::id())
             .expect("unknown formatter");
-        assert_eq!(unknown.format_value(&raw).unwrap(), "AB".repeat(32));
+        assert_eq!(
+            unknown.format_value(&raw).unwrap(),
+            format!("unknown:{}", "AB".repeat(32))
+        );
 
         let hash_formatter = formatters
             .get(&Hash::<Blake3>::id())
             .expect("hash formatter");
-        assert_eq!(hash_formatter.format_value(&raw).unwrap(), "AB".repeat(32));
+        assert_eq!(
+            hash_formatter.format_value(&raw).unwrap(),
+            format!("blake3:{}", "AB".repeat(32))
+        );
 
         let handle_formatter = formatters
             .get(&Handle::<Blake3, LongString>::id())
@@ -726,7 +730,7 @@ mod tests {
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter.format_value(&raw).unwrap(),
-            "EF".repeat(32)
+            format!("handle(blake3):{}", "EF".repeat(32))
         );
     }
 }

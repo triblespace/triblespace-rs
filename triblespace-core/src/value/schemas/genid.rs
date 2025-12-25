@@ -42,11 +42,33 @@ impl ConstMetadata for GenId {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::GENID_WASM,
+            wasm_formatter::GENID_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn genid(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+
+        let prefix_ok = raw[..16].iter().all(|&b| b == 0);
+        let bytes = if prefix_ok { &raw[16..] } else { &raw[..] };
+        for &byte in bytes {
+            let hi = (byte >> 4) as usize;
+            let lo = (byte & 0x0F) as usize;
+            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
+            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
+        }
+        Ok(())
     }
 }
 impl ValueSchema for GenId {

@@ -116,7 +116,7 @@ impl ValueFormatterArgs {
 fn validate_signature(item_fn: &ItemFn) -> syn::Result<()> {
     if item_fn.sig.asyncness.is_some() {
         return Err(syn::Error::new_spanned(
-            &item_fn.sig.asyncness,
+            item_fn.sig.asyncness,
             "`#[value_formatter]` does not support async functions",
         ));
     }

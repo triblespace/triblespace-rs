@@ -38,3 +38,6 @@ impl ToBlob<WasmCode> for &[u8] {
         Blob::new(Bytes::from_source(self.to_vec()))
     }
 }
+
+#[cfg(feature = "wasm")]
+pub mod runtime;

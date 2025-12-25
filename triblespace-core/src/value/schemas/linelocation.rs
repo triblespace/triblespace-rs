@@ -29,11 +29,34 @@ impl ConstMetadata for LineLocation {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::LINELOCATION_WASM,
+            wasm_formatter::LINELOCATION_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn linelocation(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&raw[..8]);
+        let start_line = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[8..16]);
+        let start_col = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[16..24]);
+        let end_line = u64::from_be_bytes(buf);
+        buf.copy_from_slice(&raw[24..]);
+        let end_col = u64::from_be_bytes(buf);
+
+        write!(out, "{start_line}:{start_col}..{end_line}:{end_col}").map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 

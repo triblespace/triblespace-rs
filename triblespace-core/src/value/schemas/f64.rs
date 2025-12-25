@@ -28,11 +28,27 @@ impl ConstMetadata for F64 {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::F64_WASM,
+            wasm_formatter::F64_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter(const_wasm = F64_WASM)]
+    pub(crate) fn float64(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&raw[..8]);
+        let value = f64::from_le_bytes(bytes);
+        write!(out, "{value}").map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 

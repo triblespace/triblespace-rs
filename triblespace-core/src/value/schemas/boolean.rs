@@ -56,11 +56,35 @@ impl ConstMetadata for Boolean {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::BOOLEAN_WASM,
+            wasm_formatter::BOOLEAN_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn boolean(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let all_zero = raw.iter().all(|&b| b == 0);
+        let all_ones = raw.iter().all(|&b| b == u8::MAX);
+
+        let text = if all_zero {
+            "false"
+        } else if all_ones {
+            "true"
+        } else {
+            return Err(2);
+        };
+
+        out.write_str(text).map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 

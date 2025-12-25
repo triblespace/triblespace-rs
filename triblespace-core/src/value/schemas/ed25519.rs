@@ -37,7 +37,7 @@ impl ConstMetadata for ED25519RComponent {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::ED25519_R_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -59,7 +59,7 @@ impl ConstMetadata for ED25519SComponent {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::ED25519_S_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -81,7 +81,7 @@ impl ConstMetadata for ED25519PublicKey {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::HEX32_WASM,
+            wasm_formatter::ED25519_PUBKEY_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
@@ -90,6 +90,52 @@ impl ConstMetadata for ED25519PublicKey {
 }
 impl ValueSchema for ED25519PublicKey {
     type ValidationError = Infallible;
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter(const_wasm = ED25519_R_WASM)]
+    pub(crate) fn ed25519_r(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        out.write_str("ed25519:r:").map_err(|_| 1u32)?;
+        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in raw {
+            let hi = (byte >> 4) as usize;
+            let lo = (byte & 0x0F) as usize;
+            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
+            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
+        }
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = ED25519_S_WASM)]
+    pub(crate) fn ed25519_s(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        out.write_str("ed25519:s:").map_err(|_| 1u32)?;
+        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in raw {
+            let hi = (byte >> 4) as usize;
+            let lo = (byte & 0x0F) as usize;
+            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
+            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
+        }
+        Ok(())
+    }
+
+    #[value_formatter(const_wasm = ED25519_PUBKEY_WASM)]
+    pub(crate) fn ed25519_pubkey(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        out.write_str("ed25519:pubkey:").map_err(|_| 1u32)?;
+        const TABLE: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in raw {
+            let hi = (byte >> 4) as usize;
+            let lo = (byte & 0x0F) as usize;
+            out.write_char(TABLE[hi] as char).map_err(|_| 1u32)?;
+            out.write_char(TABLE[lo] as char).map_err(|_| 1u32)?;
+        }
+        Ok(())
+    }
 }
 
 impl ED25519RComponent {

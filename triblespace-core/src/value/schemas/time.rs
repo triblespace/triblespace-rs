@@ -34,11 +34,30 @@ impl ConstMetadata for NsTAIInterval {
         let tribles = super::wasm_formatters::describe_value_formatter(
             blobs,
             Self::id(),
-            super::wasm_formatters::NSTAI_INTERVAL_WASM,
+            wasm_formatter::NSTAI_INTERVAL_WASM,
         );
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
+    }
+}
+
+#[cfg(feature = "wasm")]
+mod wasm_formatter {
+    use core::fmt::Write;
+
+    use triblespace_core_macros::value_formatter;
+
+    #[value_formatter]
+    pub(crate) fn nstai_interval(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&raw[0..16]);
+        let lower = i128::from_le_bytes(buf);
+        buf.copy_from_slice(&raw[16..32]);
+        let upper = i128::from_le_bytes(buf);
+
+        write!(out, "{lower}..={upper}").map_err(|_| 1u32)?;
+        Ok(())
     }
 }
 
