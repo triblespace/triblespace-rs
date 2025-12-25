@@ -18,15 +18,14 @@ use crate::metadata;
 use crate::query::find;
 use crate::repo::BlobStoreGet;
 use crate::trible::TribleSet;
-use crate::wasm::WasmModuleResolver;
-use crate::wasm::WasmModuleResolverError;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Handle;
 use crate::value::Value;
+use crate::wasm::WasmModuleResolver;
+use crate::wasm::WasmModuleResolverError;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WasmFormatterLimits {
-    pub max_module_bytes: usize,
     pub max_memory_pages: u32,
     pub max_fuel: u64,
     pub max_output_bytes: usize,
@@ -35,7 +34,6 @@ pub struct WasmFormatterLimits {
 impl Default for WasmFormatterLimits {
     fn default() -> Self {
         Self {
-            max_module_bytes: 256 * 1024,
             max_memory_pages: 8,
             max_fuel: 5_000_000,
             max_output_bytes: 8 * 1024,
@@ -45,10 +43,6 @@ impl Default for WasmFormatterLimits {
 
 #[derive(Debug)]
 pub enum WasmFormatterError {
-    ModuleTooLarge {
-        size: usize,
-        max: usize,
-    },
     Compile(wasmi::Error),
     Instantiate(wasmi::Error),
     Trap(wasmi::core::Trap),
@@ -76,9 +70,6 @@ pub enum WasmFormatterError {
 impl fmt::Display for WasmFormatterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ModuleTooLarge { size, max } => {
-                write!(f, "wasm module is too large ({size} > {max} bytes)")
-            }
             Self::Compile(err) => write!(f, "failed to compile wasm module: {err}"),
             Self::Instantiate(err) => write!(f, "failed to instantiate wasm module: {err}"),
             Self::Trap(err) => write!(f, "wasm execution trapped: {err}"),
@@ -127,9 +118,6 @@ impl Error for WasmFormatterError {
 impl From<crate::wasm::WasmModuleError> for WasmFormatterError {
     fn from(err: crate::wasm::WasmModuleError) -> Self {
         match err {
-            crate::wasm::WasmModuleError::ModuleTooLarge { size, max } => {
-                WasmFormatterError::ModuleTooLarge { size, max }
-            }
             crate::wasm::WasmModuleError::Compile(err) => WasmFormatterError::Compile(err),
         }
     }
@@ -156,7 +144,10 @@ impl WasmValueFormatter {
         Self::with_limits(wasm, WasmFormatterLimits::default())
     }
 
-    pub fn from_module(module: Arc<Module>, limits: WasmFormatterLimits) -> Result<Self, WasmFormatterError> {
+    pub fn from_module(
+        module: Arc<Module>,
+        limits: WasmFormatterLimits,
+    ) -> Result<Self, WasmFormatterError> {
         if module.imports().next().is_some() {
             return Err(WasmFormatterError::DisallowedImports);
         }
@@ -168,13 +159,7 @@ impl WasmValueFormatter {
         wasm: &[u8],
         limits: WasmFormatterLimits,
     ) -> Result<Self, WasmFormatterError> {
-        let module = crate::wasm::compile_module(
-            wasm,
-            crate::wasm::WasmModuleLimits {
-                max_module_bytes: limits.max_module_bytes,
-            },
-        )
-        .map_err(WasmFormatterError::from)?;
+        let module = crate::wasm::compile_module(wasm).map_err(WasmFormatterError::from)?;
         Self::from_module(Arc::new(module), limits)
     }
 
@@ -348,12 +333,7 @@ where
 
         let cache_cap = by_schema.len().max(16);
         Self {
-            modules: WasmModuleResolver::with_limits(
-                blobs,
-                crate::wasm::WasmModuleLimits {
-                    max_module_bytes: limits.max_module_bytes,
-                },
-            ),
+            modules: WasmModuleResolver::new(blobs),
             limits,
             by_schema,
             by_handle: Cache::new(cache_cap),
@@ -373,21 +353,17 @@ where
 
         let modules = &self.modules;
         let limits = self.limits;
-        let formatter = self
-            .by_handle
-            .get_or_insert_with(&handle, || {
-                let module = modules
-                    .module(handle)
-                    .map_err(|err| match err {
-                        WasmModuleResolverError::Get(err) => WasmValueFormatterResolverError::Get(err),
-                        WasmModuleResolverError::Module(err) => {
-                            WasmValueFormatterResolverError::Formatter(err.into())
-                        }
-                    })?;
-                let formatter =
-                    WasmValueFormatter::from_module(module, limits).map_err(WasmValueFormatterResolverError::Formatter)?;
-                Ok(Arc::new(formatter))
+        let formatter = self.by_handle.get_or_insert_with(&handle, || {
+            let module = modules.module(handle).map_err(|err| match err {
+                WasmModuleResolverError::Get(err) => WasmValueFormatterResolverError::Get(err),
+                WasmModuleResolverError::Module(err) => {
+                    WasmValueFormatterResolverError::Formatter(err.into())
+                }
             })?;
+            let formatter = WasmValueFormatter::from_module(module, limits)
+                .map_err(WasmValueFormatterResolverError::Formatter)?;
+            Ok(Arc::new(formatter))
+        })?;
 
         Ok(Some(formatter))
     }

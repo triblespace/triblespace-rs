@@ -149,11 +149,7 @@ where
         } else {
             wasm_formatter::HASH_HEX_WASM
         };
-        tribles += super::wasm_formatters::describe_value_formatter(
-            blobs,
-            H::id(),
-            wasm,
-        );
+        tribles += super::wasm_formatters::describe_value_formatter(blobs, H::id(), wasm);
     }
 
     tribles
@@ -348,11 +344,7 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
             } else {
                 wasm_formatter::HANDLE_HEX_WASM
             };
-            tribles += super::wasm_formatters::describe_value_formatter(
-                blobs,
-                Self::id(),
-                wasm,
-            );
+            tribles += super::wasm_formatters::describe_value_formatter(blobs, Self::id(), wasm);
         }
         tribles
     }

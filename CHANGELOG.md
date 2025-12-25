@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   examples that call `ConstMetadata::id()`.
 - `Handle` value schemas now forward metadata from their hash protocol and blob
   schema components so composite schema descriptions stay discoverable.
+- Removed the WASM module byte-size limit checks from module compilation and
+  formatter loading; callers can enforce limits by checking blob sizes before
+  compilation.
+- `triblespace_core::wasm::shared_engine` is no longer part of the public API;
+  module compilation uses an internal, lazy-initialized engine.
 - `#[value_formatter]` can override the generated WASM byte constant name and
   visibility via `const_wasm = NAME` and `vis(...)` arguments.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes

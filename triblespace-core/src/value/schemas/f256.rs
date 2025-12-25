@@ -101,7 +101,11 @@ mod wasm_formatter {
 
         if exp == EXP_MAX {
             let text = if fraction_is_zero {
-                if sign { "-inf" } else { "inf" }
+                if sign {
+                    "-inf"
+                } else {
+                    "inf"
+                }
             } else {
                 "nan"
             };
@@ -121,7 +125,11 @@ mod wasm_formatter {
             out.write_char('-').map_err(|_| 1u32)?;
         }
 
-        let exp2 = if exp == 0 { 1 - EXP_BIAS } else { exp as i32 - EXP_BIAS };
+        let exp2 = if exp == 0 {
+            1 - EXP_BIAS
+        } else {
+            exp as i32 - EXP_BIAS
+        };
         if exp == 0 {
             out.write_str("0x0").map_err(|_| 1u32)?;
         } else {
@@ -181,7 +189,11 @@ mod wasm_formatter {
 
         if exp == EXP_MAX {
             let text = if fraction_is_zero {
-                if sign { "-inf" } else { "inf" }
+                if sign {
+                    "-inf"
+                } else {
+                    "inf"
+                }
             } else {
                 "nan"
             };
@@ -201,7 +213,11 @@ mod wasm_formatter {
             out.write_char('-').map_err(|_| 1u32)?;
         }
 
-        let exp2 = if exp == 0 { 1 - EXP_BIAS } else { exp as i32 - EXP_BIAS };
+        let exp2 = if exp == 0 {
+            1 - EXP_BIAS
+        } else {
+            exp as i32 - EXP_BIAS
+        };
         if exp == 0 {
             out.write_str("0x0").map_err(|_| 1u32)?;
         } else {

@@ -5,4 +5,3 @@
 //! schema definition. This module exists as a short, stable import path.
 
 pub use crate::blob::schemas::wasmcode::runtime::*;
-

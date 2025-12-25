@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 use quick_cache::sync::Cache;
 use wasmi::Config;
@@ -17,40 +17,20 @@ use crate::value::Value;
 
 use super::WasmCode;
 
-pub fn shared_engine() -> &'static Engine {
-    static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| {
-        let mut config = Config::default();
-        config.consume_fuel(true);
-        Engine::new(&config)
-    })
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct WasmModuleLimits {
-    pub max_module_bytes: usize,
-}
-
-impl Default for WasmModuleLimits {
-    fn default() -> Self {
-        Self {
-            max_module_bytes: 256 * 1024,
-        }
-    }
-}
+static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    Engine::new(&config)
+});
 
 #[derive(Debug)]
 pub enum WasmModuleError {
-    ModuleTooLarge { size: usize, max: usize },
     Compile(wasmi::Error),
 }
 
 impl fmt::Display for WasmModuleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ModuleTooLarge { size, max } => {
-                write!(f, "wasm module is too large ({size} > {max} bytes)")
-            }
             Self::Compile(err) => write!(f, "failed to compile wasm module: {err}"),
         }
     }
@@ -60,27 +40,19 @@ impl Error for WasmModuleError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Compile(err) => Some(err),
-            _ => None,
         }
     }
 }
 
-pub fn compile_module(wasm: &[u8], limits: WasmModuleLimits) -> Result<Module, WasmModuleError> {
-    if wasm.len() > limits.max_module_bytes {
-        return Err(WasmModuleError::ModuleTooLarge {
-            size: wasm.len(),
-            max: limits.max_module_bytes,
-        });
-    }
-
-    Module::new(shared_engine(), wasm).map_err(WasmModuleError::Compile)
+pub fn compile_module(wasm: &[u8]) -> Result<Module, WasmModuleError> {
+    Module::new(&*ENGINE, wasm).map_err(WasmModuleError::Compile)
 }
 
 impl crate::blob::TryFromBlob<WasmCode> for Module {
     type Error = WasmModuleError;
 
     fn try_from_blob(b: Blob<WasmCode>) -> Result<Self, Self::Error> {
-        compile_module(b.bytes.as_ref(), WasmModuleLimits::default())
+        compile_module(b.bytes.as_ref())
     }
 }
 
@@ -126,7 +98,6 @@ where
     B: BlobStoreGet<Blake3>,
 {
     blobs: B,
-    limits: WasmModuleLimits,
     by_handle: Cache<Value<Handle<Blake3, WasmCode>>, Arc<Module>>,
 }
 
@@ -135,13 +106,8 @@ where
     B: BlobStoreGet<Blake3>,
 {
     pub fn new(blobs: B) -> Self {
-        Self::with_limits(blobs, WasmModuleLimits::default())
-    }
-
-    pub fn with_limits(blobs: B, limits: WasmModuleLimits) -> Self {
         Self {
             blobs,
-            limits,
             by_handle: Cache::new(256),
         }
     }
@@ -151,15 +117,13 @@ where
         handle: Value<Handle<Blake3, WasmCode>>,
     ) -> Result<Arc<Module>, WasmModuleResolverError<B::GetError<Infallible>>> {
         let blobs = &self.blobs;
-        let limits = self.limits;
         self.by_handle.get_or_insert_with(&handle, || {
             let blob: Blob<WasmCode> = blobs
                 .get::<Blob<WasmCode>, WasmCode>(handle)
                 .map_err(WasmModuleResolverError::Get)?;
             let module =
-                compile_module(blob.bytes.as_ref(), limits).map_err(WasmModuleResolverError::Module)?;
+                compile_module(blob.bytes.as_ref()).map_err(WasmModuleResolverError::Module)?;
             Ok(Arc::new(module))
         })
     }
 }
-
