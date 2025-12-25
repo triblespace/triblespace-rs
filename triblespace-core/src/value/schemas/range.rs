@@ -14,6 +14,14 @@ use crate::value::ValueSchema;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// A value schema for representing a pair of `u128` values.
 ///
 /// [`RangeU128`] encodes the pair as a half-open interval while
@@ -35,11 +43,13 @@ impl ConstMetadata for RangeU128 {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatters::RANGE_U128_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatters::RANGE_U128_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -59,11 +69,13 @@ impl ConstMetadata for RangeInclusiveU128 {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatters::RANGE_INCLUSIVE_U128_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatters::RANGE_INCLUSIVE_U128_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

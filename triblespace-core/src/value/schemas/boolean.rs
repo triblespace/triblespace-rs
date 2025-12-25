@@ -13,6 +13,15 @@ use crate::value::ValueSchema;
 use crate::value::VALUE_LEN;
 
 use std::convert::Infallible;
+
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// Error raised when a value does not match the [`Boolean`] encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidBoolean;
@@ -53,11 +62,13 @@ impl ConstMetadata for Boolean {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::BOOLEAN_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::BOOLEAN_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

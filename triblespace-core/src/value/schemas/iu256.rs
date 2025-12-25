@@ -12,6 +12,14 @@ use std::convert::Infallible;
 
 use ethnum;
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// A value schema for a 256-bit unsigned integer in little-endian byte order.
 pub struct U256LE;
 
@@ -41,11 +49,13 @@ impl ConstMetadata for U256LE {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::U256_LE_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::U256_LE_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -63,11 +73,13 @@ impl ConstMetadata for U256BE {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::U256_BE_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::U256_BE_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -85,11 +97,13 @@ impl ConstMetadata for I256LE {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::I256_LE_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::I256_LE_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -107,11 +121,13 @@ impl ConstMetadata for I256BE {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::I256_BE_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::I256_BE_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

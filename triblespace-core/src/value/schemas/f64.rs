@@ -13,6 +13,14 @@ use serde_json::Number as JsonNumber;
 use std::convert::Infallible;
 use std::fmt;
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// A value schema for an IEEE-754 double in little-endian byte order.
 pub struct F64;
 
@@ -25,11 +33,13 @@ impl ConstMetadata for F64 {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::F64_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::F64_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

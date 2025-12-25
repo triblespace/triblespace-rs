@@ -21,6 +21,8 @@ use hex::FromHex;
 use hex::FromHexError;
 use std::marker::PhantomData;
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
 /// A trait for hash functions.
 /// This trait is implemented by hash functions that can be in a value schema
 /// for example via a [struct@Hash] or a [Handle].
@@ -142,11 +144,9 @@ where
 
     #[cfg(feature = "wasm")]
     {
-        tribles += super::wasm_formatters::describe_value_formatter(
-            blobs,
-            H::id(),
-            wasm_formatter::HASH_HEX_WASM,
-        );
+        if let Ok(handle) = blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM) {
+            tribles += entity! { &entity @ metadata::value_formatter: handle };
+        }
     }
 
     tribles
@@ -271,11 +271,9 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         let _ = blobs;
         #[cfg(feature = "wasm")]
         {
-            tribles += super::wasm_formatters::describe_value_formatter(
-                blobs,
-                Self::id(),
-                wasm_formatter::HASH_HEX_WASM,
-            );
+            if let Ok(handle) = blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM) {
+                tribles += entity! { &entity @ metadata::value_formatter: handle };
+            }
         }
         tribles
     }

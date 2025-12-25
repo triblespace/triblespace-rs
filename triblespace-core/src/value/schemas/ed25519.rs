@@ -16,6 +16,14 @@ use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// A value schema for the R component of an Ed25519 signature.
 pub struct ED25519RComponent;
 
@@ -34,11 +42,13 @@ impl ConstMetadata for ED25519RComponent {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::ED25519_R_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_R_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -56,11 +66,13 @@ impl ConstMetadata for ED25519SComponent {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::ED25519_S_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_S_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
@@ -78,11 +90,13 @@ impl ConstMetadata for ED25519PublicKey {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::ED25519_PUBKEY_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_PUBKEY_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

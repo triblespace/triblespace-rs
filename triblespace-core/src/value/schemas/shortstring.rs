@@ -14,6 +14,14 @@ use crate::value::ValueSchema;
 use indxvec::Printing;
 use std::str::Utf8Error;
 
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 /// An error that occurs when converting a string to a short string.
 /// This error occurs when the string is too long or contains an interior NUL byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,11 +53,13 @@ impl ConstMetadata for ShortString {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = super::wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::SHORTSTRING_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::SHORTSTRING_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles

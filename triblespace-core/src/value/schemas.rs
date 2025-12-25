@@ -13,9 +13,6 @@ pub mod range;
 pub mod shortstring;
 pub mod time;
 
-#[cfg(feature = "wasm")]
-pub(crate) mod wasm_formatters;
-
 use crate::id::Id;
 use crate::id_hex;
 use crate::metadata::ConstMetadata;
@@ -25,6 +22,15 @@ use crate::value::schemas::hash::Blake3;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
+
+#[cfg(feature = "wasm")]
+use crate::blob::schemas::wasmcode::WasmCode;
+#[cfg(feature = "wasm")]
+use crate::id::ExclusiveId;
+#[cfg(feature = "wasm")]
+use crate::macros::entity;
+#[cfg(feature = "wasm")]
+use crate::metadata;
 
 /// A value schema for an unknown value.
 /// This value schema is used as a fallback when the value schema is not known.
@@ -42,11 +48,13 @@ impl ConstMetadata for UnknownValue {
         let _ = blobs;
 
         #[cfg(feature = "wasm")]
-        let tribles = wasm_formatters::describe_value_formatter(
-            blobs,
-            Self::id(),
-            wasm_formatter::UNKNOWN_VALUE_WASM,
-        );
+        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::UNKNOWN_VALUE_WASM) {
+            Ok(handle) => {
+                let entity = ExclusiveId::force(Self::id());
+                entity! { &entity @ metadata::value_formatter: handle }
+            }
+            Err(_) => TribleSet::new(),
+        };
         #[cfg(not(feature = "wasm"))]
         let tribles = TribleSet::new();
         tribles
