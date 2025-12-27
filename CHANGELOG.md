@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WASM value formatter limits are now supplied per formatting call (with a
   default helper), and the eager formatter loader no longer captures limits at
   construction time.
+- `WasmModuleResolver` has been removed in favor of the generic `BlobCache`.
+- `WasmValueFormatterResolver` has been removed in favor of direct
+  `metadata::value_formatter` lookups with `BlobCache`.
+- `load_wasm_value_formatters` has been removed in favor of `BlobCache` and
+  `metadata::value_formatter` lookups.
 - `#[value_formatter]` can override the generated WASM byte constant name and
   visibility via `const_wasm = NAME` and `vis(...)` arguments.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes
@@ -100,6 +105,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema-level WebAssembly value formatters, plus an optional `wasm` feature
   (enabled by default in the `triblespace` facade crate) that runs them in a
   sandboxed `wasmi` interpreter with strict limits.
+- `BlobCache`, a generic handle-keyed cache for blob conversions.
 - `#[value_formatter]` proc macro attribute (in `triblespace-macros`) that
   compiles standalone Rust formatter functions into sandboxed WebAssembly
   modules and embeds the resulting bytes in the caller crate.

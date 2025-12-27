@@ -33,6 +33,9 @@
   `attributes!` modules in the book.
 - Helper to derive delta `TribleSet`s for `pattern_changes!` so callers don't
   have to compute them manually.
+- Add a diagnosis tool that reports attributes missing `shortname`,
+  `value_schema`, or `value_formatter` metadata so strict renderers can explain
+  omissions.
 - Explore replacing `CommitSelector` ranges with a set-based API
   built on commit reachability. The goal is to mirror git's revision
   selection semantics (similar to `rev-list` or `rev-parse`).

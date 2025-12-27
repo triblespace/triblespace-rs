@@ -8,6 +8,7 @@
 // and `TryFromBlob` are used throughout the codebase.  `TryToBlob` and
 // `FromBlob` were never required and have been removed for simplicity.
 
+mod cache;
 mod memoryblobstore;
 pub mod schemas;
 
@@ -24,6 +25,7 @@ use std::fmt::{self};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
+pub use cache::BlobCache;
 pub use memoryblobstore::MemoryBlobStore;
 
 pub use anybytes::Bytes;

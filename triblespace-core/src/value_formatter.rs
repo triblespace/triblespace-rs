@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -8,21 +6,8 @@ use wasmi::Linker;
 use wasmi::Module;
 use wasmi::Store;
 
-use quick_cache::sync::Cache;
-
 use crate::blob::schemas::wasmcode::WasmCode;
 use crate::blob::Blob;
-use crate::id::Id;
-use crate::macros::pattern;
-use crate::metadata;
-use crate::query::find;
-use crate::repo::BlobStoreGet;
-use crate::trible::TribleSet;
-use crate::value::schemas::hash::Blake3;
-use crate::value::schemas::hash::Handle;
-use crate::value::Value;
-use crate::wasm::WasmModuleResolver;
-use crate::wasm::WasmModuleResolverError;
 
 #[derive(Clone, Copy, Debug)]
 pub struct WasmFormatterLimits {
@@ -232,170 +217,6 @@ impl crate::blob::TryFromBlob<WasmCode> for WasmValueFormatter {
     }
 }
 
-#[derive(Debug)]
-pub enum LoadWasmValueFormattersError<E> {
-    Get(E),
-    Formatter {
-        schema: Id,
-        source: WasmFormatterError,
-    },
-}
-
-impl<E: Error> fmt::Display for LoadWasmValueFormattersError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Get(err) => write!(f, "failed to load wasm formatter blob: {err}"),
-            Self::Formatter { schema, source } => {
-                write!(
-                    f,
-                    "failed to compile wasm formatter for schema {schema}: {source}"
-                )
-            }
-        }
-    }
-}
-
-impl<E: Error + 'static> Error for LoadWasmValueFormattersError<E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Get(err) => Some(err),
-            Self::Formatter { source, .. } => Some(source),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum WasmValueFormatterResolverError<E>
-where
-    E: Error,
-{
-    Get(E),
-    Formatter(WasmFormatterError),
-}
-
-impl<E> fmt::Display for WasmValueFormatterResolverError<E>
-where
-    E: Error,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Get(err) => write!(f, "failed to load wasm formatter blob: {err}"),
-            Self::Formatter(err) => write!(f, "failed to load wasm formatter: {err}"),
-        }
-    }
-}
-
-impl<E> Error for WasmValueFormatterResolverError<E>
-where
-    E: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Get(err) => Some(err),
-            Self::Formatter(err) => Some(err),
-        }
-    }
-}
-
-/// Lazy loader and cache for schema-provided WebAssembly value formatters.
-///
-/// Modules are cached by `Handle<Blake3, WasmCode>` so multiple schemas can
-/// share a formatter without recompiling it.
-pub struct WasmValueFormatterResolver<B>
-where
-    B: BlobStoreGet<Blake3>,
-{
-    modules: WasmModuleResolver<B>,
-    by_schema: HashMap<Id, Value<Handle<Blake3, WasmCode>>>,
-    by_handle: Cache<Value<Handle<Blake3, WasmCode>>, Arc<WasmValueFormatter>>,
-}
-
-impl<B> WasmValueFormatterResolver<B>
-where
-    B: BlobStoreGet<Blake3>,
-{
-    pub fn new(space: &TribleSet, blobs: B) -> Self {
-        let mut by_schema = HashMap::<Id, Value<Handle<Blake3, WasmCode>>>::new();
-        for (schema, handle) in find!(
-            (schema: Id, handle: Value<Handle<Blake3, WasmCode>>),
-            pattern!(space, [{ ?schema @ metadata::value_formatter: ?handle }])
-        ) {
-            by_schema.insert(schema, handle);
-        }
-
-        let cache_cap = by_schema.len().max(16);
-        Self {
-            modules: WasmModuleResolver::new(blobs),
-            by_schema,
-            by_handle: Cache::new(cache_cap),
-        }
-    }
-
-    pub fn formatter(
-        &self,
-        schema: Id,
-    ) -> Result<
-        Option<Arc<WasmValueFormatter>>,
-        WasmValueFormatterResolverError<B::GetError<Infallible>>,
-    > {
-        let Some(handle) = self.by_schema.get(&schema).copied() else {
-            return Ok(None);
-        };
-
-        let modules = &self.modules;
-        let formatter = self.by_handle.get_or_insert_with(&handle, || {
-            let module = modules.module(handle).map_err(|err| match err {
-                WasmModuleResolverError::Get(err) => WasmValueFormatterResolverError::Get(err),
-                WasmModuleResolverError::Module(err) => {
-                    WasmValueFormatterResolverError::Formatter(err.into())
-                }
-            })?;
-            let formatter = WasmValueFormatter::from_module(module)
-                .map_err(WasmValueFormatterResolverError::Formatter)?;
-            Ok(Arc::new(formatter))
-        })?;
-
-        Ok(Some(formatter))
-    }
-
-    pub fn format_value(
-        &self,
-        schema: Id,
-        raw: &[u8; 32],
-        limits: WasmFormatterLimits,
-    ) -> Result<Option<String>, WasmValueFormatterResolverError<B::GetError<Infallible>>> {
-        let Some(formatter) = self.formatter(schema)? else {
-            return Ok(None);
-        };
-        formatter
-            .format_value_with_limits(raw, limits)
-            .map(Some)
-            .map_err(WasmValueFormatterResolverError::Formatter)
-    }
-}
-
-pub fn load_wasm_value_formatters<B>(
-    space: &TribleSet,
-    blobs: &B,
-) -> Result<HashMap<Id, WasmValueFormatter>, LoadWasmValueFormattersError<B::GetError<Infallible>>>
-where
-    B: BlobStoreGet<Blake3>,
-{
-    let mut out = HashMap::<Id, WasmValueFormatter>::new();
-    for (schema, handle) in find!(
-        (schema: Id, handle: Value<Handle<Blake3, WasmCode>>),
-        pattern!(space, [{ ?schema @ metadata::value_formatter: ?handle }])
-    ) {
-        let blob: Blob<WasmCode> = blobs
-            .get::<Blob<WasmCode>, WasmCode>(handle)
-            .map_err(LoadWasmValueFormattersError::Get)?;
-        let formatter = WasmValueFormatter::new(blob.bytes.as_ref())
-            .map_err(|source| LoadWasmValueFormattersError::Formatter { schema, source })?;
-        out.insert(schema, formatter);
-    }
-    Ok(out)
-}
-
 fn read_memory(
     memory: &wasmi::Memory,
     store: &Store<()>,
@@ -424,10 +245,31 @@ fn read_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::BlobCache;
+    use crate::id::Id;
+    use crate::macros::pattern;
+    use crate::metadata;
     use crate::metadata::ConstMetadata;
+    use crate::query::find;
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
+    use crate::trible::TribleSet;
+    use crate::value::schemas::hash::Blake3;
+    use crate::value::schemas::hash::Handle;
+    use crate::value::Value;
     use pretty_assertions::assert_eq;
+
+    fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Value<Handle<Blake3, WasmCode>>> {
+        for (schema_id, handle) in find!(
+            (schema_id: Id, handle: Value<Handle<Blake3, WasmCode>>),
+            pattern!(space, [{ ?schema_id @ metadata::value_formatter: ?handle }])
+        ) {
+            if schema_id == schema {
+                return Some(handle);
+            }
+        }
+        None
+    }
 
     #[test]
     fn loads_and_runs_formatters() {
@@ -461,8 +303,11 @@ mod tests {
             metadata::value_formatter: handle,
         };
 
-        let formatters = load_wasm_value_formatters(&space, &reader).expect("load formatters");
-        let formatter = formatters.get(&schema_id).expect("formatter loaded");
+        let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
+            BlobCache::new(reader);
+        let formatter = formatter_cache
+            .get(formatter_handle(&space, schema_id).expect("formatter handle"))
+            .expect("formatter loaded");
         let limits = WasmFormatterLimits::default();
 
         let mut raw = [0u8; 32];
@@ -528,10 +373,16 @@ mod tests {
         space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store);
 
         let reader = store.reader().expect("blob reader");
-        let formatters = load_wasm_value_formatters(&space, &reader).expect("load formatters");
+        let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
+            BlobCache::new(reader);
         let limits = WasmFormatterLimits::default();
+        let formatter_for = |schema| {
+            formatter_cache
+                .get(formatter_handle(&space, schema).expect("formatter handle"))
+                .expect("formatter loaded")
+        };
 
-        let boolean = formatters.get(&Boolean::id()).expect("boolean formatter");
+        let boolean = formatter_for(Boolean::id());
         assert_eq!(
             boolean
                 .format_value_with_limits(&[0u8; 32], limits)
@@ -546,7 +397,7 @@ mod tests {
         );
 
         let id = crate::id::Id::new([1u8; 16]).expect("non-nil id");
-        let genid = formatters.get(&GenId::id()).expect("genid formatter");
+        let genid = formatter_for(GenId::id());
         assert_eq!(
             genid
                 .format_value_with_limits(&GenId::value_from(id).raw, limits)
@@ -554,9 +405,7 @@ mod tests {
             "01".repeat(16)
         );
 
-        let shortstring = formatters
-            .get(&ShortString::id())
-            .expect("shortstring formatter");
+        let shortstring = formatter_for(ShortString::id());
         assert_eq!(
             shortstring
                 .format_value_with_limits(&ShortString::value_from("hi").raw, limits)
@@ -564,7 +413,7 @@ mod tests {
             "hi"
         );
 
-        let float64 = formatters.get(&F64::id()).expect("f64 formatter");
+        let float64 = formatter_for(F64::id());
         assert_eq!(
             float64
                 .format_value_with_limits(&F64::value_from(1.5f64).raw, limits)
@@ -572,14 +421,14 @@ mod tests {
             "1.5"
         );
 
-        let u256le = formatters.get(&U256LE::id()).expect("u256le formatter");
+        let u256le = formatter_for(U256LE::id());
         assert_eq!(
             u256le
                 .format_value_with_limits(&U256LE::value_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
-        let u256be = formatters.get(&U256BE::id()).expect("u256be formatter");
+        let u256be = formatter_for(U256BE::id());
         assert_eq!(
             u256be
                 .format_value_with_limits(&U256BE::value_from(42u64).raw, limits)
@@ -587,14 +436,14 @@ mod tests {
             "42"
         );
 
-        let i256le = formatters.get(&I256LE::id()).expect("i256le formatter");
+        let i256le = formatter_for(I256LE::id());
         assert_eq!(
             i256le
                 .format_value_with_limits(&I256LE::value_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
-        let i256be = formatters.get(&I256BE::id()).expect("i256be formatter");
+        let i256be = formatter_for(I256BE::id());
         assert_eq!(
             i256be
                 .format_value_with_limits(&I256BE::value_from(-1i8).raw, limits)
@@ -602,14 +451,14 @@ mod tests {
             "-1"
         );
 
-        let r256le = formatters.get(&R256LE::id()).expect("r256le formatter");
+        let r256le = formatter_for(R256LE::id());
         assert_eq!(
             r256le
                 .format_value_with_limits(&R256LE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
-        let r256be = formatters.get(&R256BE::id()).expect("r256be formatter");
+        let r256be = formatter_for(R256BE::id());
         assert_eq!(
             r256be
                 .format_value_with_limits(&R256BE::value_from(-3i128).raw, limits)
@@ -617,18 +466,14 @@ mod tests {
             "-3"
         );
 
-        let range_u128 = formatters
-            .get(&RangeU128::id())
-            .expect("range_u128 formatter");
+        let range_u128 = formatter_for(RangeU128::id());
         assert_eq!(
             range_u128
                 .format_value_with_limits(&RangeU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
-        let range_inclusive_u128 = formatters
-            .get(&RangeInclusiveU128::id())
-            .expect("range_inclusive_u128 formatter");
+        let range_inclusive_u128 = formatter_for(RangeInclusiveU128::id());
         assert_eq!(
             range_inclusive_u128
                 .format_value_with_limits(
