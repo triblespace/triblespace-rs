@@ -136,37 +136,30 @@ impl From<crate::wasm::WasmModuleError> for WasmFormatterError {
 /// - Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).
 pub struct WasmValueFormatter {
     module: Arc<Module>,
-    limits: WasmFormatterLimits,
 }
 
 impl WasmValueFormatter {
     pub fn new(wasm: &[u8]) -> Result<Self, WasmFormatterError> {
-        Self::with_limits(wasm, WasmFormatterLimits::default())
+        let module = crate::wasm::compile_module(wasm).map_err(WasmFormatterError::from)?;
+        Self::from_module(Arc::new(module))
     }
 
-    pub fn from_module(
-        module: Arc<Module>,
-        limits: WasmFormatterLimits,
-    ) -> Result<Self, WasmFormatterError> {
+    pub fn from_module(module: Arc<Module>) -> Result<Self, WasmFormatterError> {
         if module.imports().next().is_some() {
             return Err(WasmFormatterError::DisallowedImports);
         }
 
-        Ok(Self { module, limits })
+        Ok(Self { module })
     }
 
-    pub fn with_limits(
-        wasm: &[u8],
+    pub fn format_value(
+        &self,
+        raw: &[u8; 32],
         limits: WasmFormatterLimits,
-    ) -> Result<Self, WasmFormatterError> {
-        let module = crate::wasm::compile_module(wasm).map_err(WasmFormatterError::from)?;
-        Self::from_module(Arc::new(module), limits)
-    }
-
-    pub fn format_value(&self, raw: &[u8; 32]) -> Result<String, WasmFormatterError> {
+    ) -> Result<String, WasmFormatterError> {
         let engine = self.module.engine();
         let mut store = Store::new(engine, ());
-        store.add_fuel(self.limits.max_fuel).ok();
+        store.add_fuel(limits.max_fuel).ok();
 
         let linker = Linker::<()>::new(engine);
         let instance = linker
@@ -185,10 +178,10 @@ impl WasmValueFormatter {
             .maximum_pages()
             .ok_or(WasmFormatterError::MissingMemoryMaximum)?;
         let max_pages = u32::from(max);
-        if max_pages > self.limits.max_memory_pages {
+        if max_pages > limits.max_memory_pages {
             return Err(WasmFormatterError::MemoryTooLarge {
                 pages: max_pages,
-                max: self.limits.max_memory_pages,
+                max: limits.max_memory_pages,
             });
         }
 
@@ -213,10 +206,10 @@ impl WasmValueFormatter {
 
         let out_len = usize::try_from(out_len).unwrap_or(usize::MAX);
 
-        if out_len > self.limits.max_output_bytes {
+        if out_len > limits.max_output_bytes {
             return Err(WasmFormatterError::OutputTooLarge {
                 len: out_len,
-                max: self.limits.max_output_bytes,
+                max: limits.max_output_bytes,
             });
         }
 
@@ -309,7 +302,6 @@ where
     B: BlobStoreGet<Blake3>,
 {
     modules: WasmModuleResolver<B>,
-    limits: WasmFormatterLimits,
     by_schema: HashMap<Id, Value<Handle<Blake3, WasmCode>>>,
     by_handle: Cache<Value<Handle<Blake3, WasmCode>>, Arc<WasmValueFormatter>>,
 }
@@ -319,10 +311,6 @@ where
     B: BlobStoreGet<Blake3>,
 {
     pub fn new(space: &TribleSet, blobs: B) -> Self {
-        Self::with_limits(space, blobs, WasmFormatterLimits::default())
-    }
-
-    pub fn with_limits(space: &TribleSet, blobs: B, limits: WasmFormatterLimits) -> Self {
         let mut by_schema = HashMap::<Id, Value<Handle<Blake3, WasmCode>>>::new();
         for (schema, handle) in find!(
             (schema: Id, handle: Value<Handle<Blake3, WasmCode>>),
@@ -334,7 +322,6 @@ where
         let cache_cap = by_schema.len().max(16);
         Self {
             modules: WasmModuleResolver::new(blobs),
-            limits,
             by_schema,
             by_handle: Cache::new(cache_cap),
         }
@@ -352,7 +339,6 @@ where
         };
 
         let modules = &self.modules;
-        let limits = self.limits;
         let formatter = self.by_handle.get_or_insert_with(&handle, || {
             let module = modules.module(handle).map_err(|err| match err {
                 WasmModuleResolverError::Get(err) => WasmValueFormatterResolverError::Get(err),
@@ -360,7 +346,7 @@ where
                     WasmValueFormatterResolverError::Formatter(err.into())
                 }
             })?;
-            let formatter = WasmValueFormatter::from_module(module, limits)
+            let formatter = WasmValueFormatter::from_module(module)
                 .map_err(WasmValueFormatterResolverError::Formatter)?;
             Ok(Arc::new(formatter))
         })?;
@@ -372,12 +358,13 @@ where
         &self,
         schema: Id,
         raw: &[u8; 32],
+        limits: WasmFormatterLimits,
     ) -> Result<Option<String>, WasmValueFormatterResolverError<B::GetError<Infallible>>> {
         let Some(formatter) = self.formatter(schema)? else {
             return Ok(None);
         };
         formatter
-            .format_value(raw)
+            .format_value(raw, limits)
             .map(Some)
             .map_err(WasmValueFormatterResolverError::Formatter)
     }
@@ -386,7 +373,6 @@ where
 pub fn load_wasm_value_formatters<B>(
     space: &TribleSet,
     blobs: &B,
-    limits: WasmFormatterLimits,
 ) -> Result<HashMap<Id, WasmValueFormatter>, LoadWasmValueFormattersError<B::GetError<Infallible>>>
 where
     B: BlobStoreGet<Blake3>,
@@ -399,7 +385,7 @@ where
         let blob: Blob<WasmCode> = blobs
             .get::<Blob<WasmCode>, WasmCode>(handle)
             .map_err(LoadWasmValueFormattersError::Get)?;
-        let formatter = WasmValueFormatter::with_limits(blob.bytes.as_ref(), limits)
+        let formatter = WasmValueFormatter::new(blob.bytes.as_ref())
             .map_err(|source| LoadWasmValueFormattersError::Formatter { schema, source })?;
         out.insert(schema, formatter);
     }
@@ -437,6 +423,7 @@ mod tests {
     use crate::metadata::ConstMetadata;
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn loads_and_runs_formatters() {
@@ -470,14 +457,13 @@ mod tests {
             metadata::value_formatter: handle,
         };
 
-        let formatters =
-            load_wasm_value_formatters(&space, &reader, WasmFormatterLimits::default())
-                .expect("load formatters");
+        let formatters = load_wasm_value_formatters(&space, &reader).expect("load formatters");
         let formatter = formatters.get(&schema_id).expect("formatter loaded");
+        let limits = WasmFormatterLimits::default();
 
         let mut raw = [0u8; 32];
         raw[0] = b'Z';
-        assert_eq!(formatter.format_value(&raw).unwrap(), "Z");
+        assert_eq!(formatter.format_value(&raw, limits).unwrap(), "Z");
     }
 
     #[test]
@@ -535,18 +521,22 @@ mod tests {
         space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store);
 
         let reader = store.reader().expect("blob reader");
-        let formatters =
-            load_wasm_value_formatters(&space, &reader, WasmFormatterLimits::default())
-                .expect("load formatters");
+        let formatters = load_wasm_value_formatters(&space, &reader).expect("load formatters");
+        let limits = WasmFormatterLimits::default();
 
         let boolean = formatters.get(&Boolean::id()).expect("boolean formatter");
-        assert_eq!(boolean.format_value(&[0u8; 32]).unwrap(), "false");
-        assert_eq!(boolean.format_value(&[u8::MAX; 32]).unwrap(), "true");
+        assert_eq!(boolean.format_value(&[0u8; 32], limits).unwrap(), "false");
+        assert_eq!(
+            boolean.format_value(&[u8::MAX; 32], limits).unwrap(),
+            "true"
+        );
 
         let id = crate::id::Id::new([1u8; 16]).expect("non-nil id");
         let genid = formatters.get(&GenId::id()).expect("genid formatter");
         assert_eq!(
-            genid.format_value(&GenId::value_from(id).raw).unwrap(),
+            genid
+                .format_value(&GenId::value_from(id).raw, limits)
+                .unwrap(),
             "01".repeat(16)
         );
 
@@ -555,50 +545,60 @@ mod tests {
             .expect("shortstring formatter");
         assert_eq!(
             shortstring
-                .format_value(&ShortString::value_from("hi").raw)
+                .format_value(&ShortString::value_from("hi").raw, limits)
                 .unwrap(),
             "hi"
         );
 
         let float64 = formatters.get(&F64::id()).expect("f64 formatter");
         assert_eq!(
-            float64.format_value(&F64::value_from(1.5f64).raw).unwrap(),
+            float64
+                .format_value(&F64::value_from(1.5f64).raw, limits)
+                .unwrap(),
             "1.5"
         );
 
         let u256le = formatters.get(&U256LE::id()).expect("u256le formatter");
         assert_eq!(
-            u256le.format_value(&U256LE::value_from(42u64).raw).unwrap(),
+            u256le
+                .format_value(&U256LE::value_from(42u64).raw, limits)
+                .unwrap(),
             "42"
         );
         let u256be = formatters.get(&U256BE::id()).expect("u256be formatter");
         assert_eq!(
-            u256be.format_value(&U256BE::value_from(42u64).raw).unwrap(),
+            u256be
+                .format_value(&U256BE::value_from(42u64).raw, limits)
+                .unwrap(),
             "42"
         );
 
         let i256le = formatters.get(&I256LE::id()).expect("i256le formatter");
         assert_eq!(
-            i256le.format_value(&I256LE::value_from(-1i8).raw).unwrap(),
+            i256le
+                .format_value(&I256LE::value_from(-1i8).raw, limits)
+                .unwrap(),
             "-1"
         );
         let i256be = formatters.get(&I256BE::id()).expect("i256be formatter");
         assert_eq!(
-            i256be.format_value(&I256BE::value_from(-1i8).raw).unwrap(),
+            i256be
+                .format_value(&I256BE::value_from(-1i8).raw, limits)
+                .unwrap(),
             "-1"
         );
 
         let r256le = formatters.get(&R256LE::id()).expect("r256le formatter");
         assert_eq!(
             r256le
-                .format_value(&R256LE::value_from(-3i128).raw)
+                .format_value(&R256LE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
         let r256be = formatters.get(&R256BE::id()).expect("r256be formatter");
         assert_eq!(
             r256be
-                .format_value(&R256BE::value_from(-3i128).raw)
+                .format_value(&R256BE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
@@ -608,7 +608,7 @@ mod tests {
             .expect("range_u128 formatter");
         assert_eq!(
             range_u128
-                .format_value(&RangeU128::value_from((5u128, 10u128)).raw)
+                .format_value(&RangeU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
@@ -617,7 +617,7 @@ mod tests {
             .expect("range_inclusive_u128 formatter");
         assert_eq!(
             range_inclusive_u128
-                .format_value(&RangeInclusiveU128::value_from((5u128, 10u128)).raw)
+                .format_value(&RangeInclusiveU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..=10"
         );
@@ -627,7 +627,10 @@ mod tests {
             .expect("linelocation formatter");
         assert_eq!(
             linelocation
-                .format_value(&LineLocation::value_from((1u64, 2u64, 3u64, 4u64)).raw)
+                .format_value(
+                    &LineLocation::value_from((1u64, 2u64, 3u64, 4u64)).raw,
+                    limits
+                )
                 .unwrap(),
             "1:2..3:4"
         );
@@ -638,33 +641,33 @@ mod tests {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&5i128.to_le_bytes());
         raw[16..32].copy_from_slice(&10i128.to_le_bytes());
-        assert_eq!(nstai.format_value(&raw).unwrap(), "5..=10");
+        assert_eq!(nstai.format_value(&raw, limits).unwrap(), "5..=10");
 
         let f256le = formatters.get(&F256LE::id()).expect("f256le formatter");
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256le.format_value(&raw).unwrap(), "0x1p+0");
+        assert_eq!(f256le.format_value(&raw, limits).unwrap(), "0x1p+0");
 
         let exp = ((1u32 << 19) - 1) >> 1;
         let hi = ((exp + 2000) as u128) << 108;
         let mut raw = [0u8; 32];
         raw[16..32].copy_from_slice(&hi.to_le_bytes());
-        assert_eq!(f256le.format_value(&raw).unwrap(), "0x1p+2000");
+        assert_eq!(f256le.format_value(&raw, limits).unwrap(), "0x1p+2000");
 
         let f256be = formatters.get(&F256BE::id()).expect("f256be formatter");
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256be.format_value(&raw).unwrap(), "0x1p+0");
+        assert_eq!(f256be.format_value(&raw, limits).unwrap(), "0x1p+0");
 
         let hi = ((exp + 2000) as u128) << 108;
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&hi.to_be_bytes());
-        assert_eq!(f256be.format_value(&raw).unwrap(), "0x1p+2000");
+        assert_eq!(f256be.format_value(&raw, limits).unwrap(), "0x1p+2000");
 
         let ed25519_r = formatters
             .get(&ED25519RComponent::id())
             .expect("ed25519 r formatter");
         let raw = [0xABu8; 32];
         assert_eq!(
-            ed25519_r.format_value(&raw).unwrap(),
+            ed25519_r.format_value(&raw, limits).unwrap(),
             format!("ed25519:r:{}", "AB".repeat(32))
         );
 
@@ -672,7 +675,7 @@ mod tests {
             .get(&ED25519SComponent::id())
             .expect("ed25519 s formatter");
         assert_eq!(
-            ed25519_s.format_value(&raw).unwrap(),
+            ed25519_s.format_value(&raw, limits).unwrap(),
             format!("ed25519:s:{}", "AB".repeat(32))
         );
 
@@ -680,7 +683,7 @@ mod tests {
             .get(&ED25519PublicKey::id())
             .expect("ed25519 public key formatter");
         assert_eq!(
-            ed25519_pk.format_value(&raw).unwrap(),
+            ed25519_pk.format_value(&raw, limits).unwrap(),
             format!("ed25519:pubkey:{}", "AB".repeat(32))
         );
 
@@ -688,7 +691,7 @@ mod tests {
             .get(&UnknownValue::id())
             .expect("unknown formatter");
         assert_eq!(
-            unknown.format_value(&raw).unwrap(),
+            unknown.format_value(&raw, limits).unwrap(),
             format!("unknown:{}", "AB".repeat(32))
         );
 
@@ -696,7 +699,7 @@ mod tests {
             .get(&Hash::<Blake3>::id())
             .expect("hash formatter");
         assert_eq!(
-            hash_formatter.format_value(&raw).unwrap(),
+            hash_formatter.format_value(&raw, limits).unwrap(),
             format!("hash:{}", "AB".repeat(32))
         );
 
@@ -705,7 +708,7 @@ mod tests {
             .expect("handle formatter");
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
-            handle_formatter.format_value(&raw).unwrap(),
+            handle_formatter.format_value(&raw, limits).unwrap(),
             format!("hash:{}", "EF".repeat(32))
         );
     }
