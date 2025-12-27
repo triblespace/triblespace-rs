@@ -152,7 +152,11 @@ impl WasmValueFormatter {
         Ok(Self { module })
     }
 
-    pub fn format_value(
+    pub fn format_value(&self, raw: &[u8; 32]) -> Result<String, WasmFormatterError> {
+        self.format_value_with_limits(raw, WasmFormatterLimits::default())
+    }
+
+    pub fn format_value_with_limits(
         &self,
         raw: &[u8; 32],
         limits: WasmFormatterLimits,
@@ -364,7 +368,7 @@ where
             return Ok(None);
         };
         formatter
-            .format_value(raw, limits)
+            .format_value_with_limits(raw, limits)
             .map(Some)
             .map_err(WasmValueFormatterResolverError::Formatter)
     }
@@ -463,7 +467,10 @@ mod tests {
 
         let mut raw = [0u8; 32];
         raw[0] = b'Z';
-        assert_eq!(formatter.format_value(&raw, limits).unwrap(), "Z");
+        assert_eq!(
+            formatter.format_value_with_limits(&raw, limits).unwrap(),
+            "Z"
+        );
     }
 
     #[test]
@@ -525,9 +532,16 @@ mod tests {
         let limits = WasmFormatterLimits::default();
 
         let boolean = formatters.get(&Boolean::id()).expect("boolean formatter");
-        assert_eq!(boolean.format_value(&[0u8; 32], limits).unwrap(), "false");
         assert_eq!(
-            boolean.format_value(&[u8::MAX; 32], limits).unwrap(),
+            boolean
+                .format_value_with_limits(&[0u8; 32], limits)
+                .unwrap(),
+            "false"
+        );
+        assert_eq!(
+            boolean
+                .format_value_with_limits(&[u8::MAX; 32], limits)
+                .unwrap(),
             "true"
         );
 
@@ -535,7 +549,7 @@ mod tests {
         let genid = formatters.get(&GenId::id()).expect("genid formatter");
         assert_eq!(
             genid
-                .format_value(&GenId::value_from(id).raw, limits)
+                .format_value_with_limits(&GenId::value_from(id).raw, limits)
                 .unwrap(),
             "01".repeat(16)
         );
@@ -545,7 +559,7 @@ mod tests {
             .expect("shortstring formatter");
         assert_eq!(
             shortstring
-                .format_value(&ShortString::value_from("hi").raw, limits)
+                .format_value_with_limits(&ShortString::value_from("hi").raw, limits)
                 .unwrap(),
             "hi"
         );
@@ -553,7 +567,7 @@ mod tests {
         let float64 = formatters.get(&F64::id()).expect("f64 formatter");
         assert_eq!(
             float64
-                .format_value(&F64::value_from(1.5f64).raw, limits)
+                .format_value_with_limits(&F64::value_from(1.5f64).raw, limits)
                 .unwrap(),
             "1.5"
         );
@@ -561,14 +575,14 @@ mod tests {
         let u256le = formatters.get(&U256LE::id()).expect("u256le formatter");
         assert_eq!(
             u256le
-                .format_value(&U256LE::value_from(42u64).raw, limits)
+                .format_value_with_limits(&U256LE::value_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
         let u256be = formatters.get(&U256BE::id()).expect("u256be formatter");
         assert_eq!(
             u256be
-                .format_value(&U256BE::value_from(42u64).raw, limits)
+                .format_value_with_limits(&U256BE::value_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
@@ -576,14 +590,14 @@ mod tests {
         let i256le = formatters.get(&I256LE::id()).expect("i256le formatter");
         assert_eq!(
             i256le
-                .format_value(&I256LE::value_from(-1i8).raw, limits)
+                .format_value_with_limits(&I256LE::value_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
         let i256be = formatters.get(&I256BE::id()).expect("i256be formatter");
         assert_eq!(
             i256be
-                .format_value(&I256BE::value_from(-1i8).raw, limits)
+                .format_value_with_limits(&I256BE::value_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
@@ -591,14 +605,14 @@ mod tests {
         let r256le = formatters.get(&R256LE::id()).expect("r256le formatter");
         assert_eq!(
             r256le
-                .format_value(&R256LE::value_from(-3i128).raw, limits)
+                .format_value_with_limits(&R256LE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
         let r256be = formatters.get(&R256BE::id()).expect("r256be formatter");
         assert_eq!(
             r256be
-                .format_value(&R256BE::value_from(-3i128).raw, limits)
+                .format_value_with_limits(&R256BE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
@@ -608,7 +622,7 @@ mod tests {
             .expect("range_u128 formatter");
         assert_eq!(
             range_u128
-                .format_value(&RangeU128::value_from((5u128, 10u128)).raw, limits)
+                .format_value_with_limits(&RangeU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
@@ -617,7 +631,10 @@ mod tests {
             .expect("range_inclusive_u128 formatter");
         assert_eq!(
             range_inclusive_u128
-                .format_value(&RangeInclusiveU128::value_from((5u128, 10u128)).raw, limits)
+                .format_value_with_limits(
+                    &RangeInclusiveU128::value_from((5u128, 10u128)).raw,
+                    limits
+                )
                 .unwrap(),
             "5..=10"
         );
@@ -627,7 +644,7 @@ mod tests {
             .expect("linelocation formatter");
         assert_eq!(
             linelocation
-                .format_value(
+                .format_value_with_limits(
                     &LineLocation::value_from((1u64, 2u64, 3u64, 4u64)).raw,
                     limits
                 )
@@ -641,33 +658,48 @@ mod tests {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&5i128.to_le_bytes());
         raw[16..32].copy_from_slice(&10i128.to_le_bytes());
-        assert_eq!(nstai.format_value(&raw, limits).unwrap(), "5..=10");
+        assert_eq!(
+            nstai.format_value_with_limits(&raw, limits).unwrap(),
+            "5..=10"
+        );
 
         let f256le = formatters.get(&F256LE::id()).expect("f256le formatter");
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256le.format_value(&raw, limits).unwrap(), "0x1p+0");
+        assert_eq!(
+            f256le.format_value_with_limits(&raw, limits).unwrap(),
+            "0x1p+0"
+        );
 
         let exp = ((1u32 << 19) - 1) >> 1;
         let hi = ((exp + 2000) as u128) << 108;
         let mut raw = [0u8; 32];
         raw[16..32].copy_from_slice(&hi.to_le_bytes());
-        assert_eq!(f256le.format_value(&raw, limits).unwrap(), "0x1p+2000");
+        assert_eq!(
+            f256le.format_value_with_limits(&raw, limits).unwrap(),
+            "0x1p+2000"
+        );
 
         let f256be = formatters.get(&F256BE::id()).expect("f256be formatter");
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
-        assert_eq!(f256be.format_value(&raw, limits).unwrap(), "0x1p+0");
+        assert_eq!(
+            f256be.format_value_with_limits(&raw, limits).unwrap(),
+            "0x1p+0"
+        );
 
         let hi = ((exp + 2000) as u128) << 108;
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&hi.to_be_bytes());
-        assert_eq!(f256be.format_value(&raw, limits).unwrap(), "0x1p+2000");
+        assert_eq!(
+            f256be.format_value_with_limits(&raw, limits).unwrap(),
+            "0x1p+2000"
+        );
 
         let ed25519_r = formatters
             .get(&ED25519RComponent::id())
             .expect("ed25519 r formatter");
         let raw = [0xABu8; 32];
         assert_eq!(
-            ed25519_r.format_value(&raw, limits).unwrap(),
+            ed25519_r.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:r:{}", "AB".repeat(32))
         );
 
@@ -675,7 +707,7 @@ mod tests {
             .get(&ED25519SComponent::id())
             .expect("ed25519 s formatter");
         assert_eq!(
-            ed25519_s.format_value(&raw, limits).unwrap(),
+            ed25519_s.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:s:{}", "AB".repeat(32))
         );
 
@@ -683,7 +715,7 @@ mod tests {
             .get(&ED25519PublicKey::id())
             .expect("ed25519 public key formatter");
         assert_eq!(
-            ed25519_pk.format_value(&raw, limits).unwrap(),
+            ed25519_pk.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:pubkey:{}", "AB".repeat(32))
         );
 
@@ -691,7 +723,7 @@ mod tests {
             .get(&UnknownValue::id())
             .expect("unknown formatter");
         assert_eq!(
-            unknown.format_value(&raw, limits).unwrap(),
+            unknown.format_value_with_limits(&raw, limits).unwrap(),
             format!("unknown:{}", "AB".repeat(32))
         );
 
@@ -699,7 +731,9 @@ mod tests {
             .get(&Hash::<Blake3>::id())
             .expect("hash formatter");
         assert_eq!(
-            hash_formatter.format_value(&raw, limits).unwrap(),
+            hash_formatter
+                .format_value_with_limits(&raw, limits)
+                .unwrap(),
             format!("hash:{}", "AB".repeat(32))
         );
 
@@ -708,7 +742,9 @@ mod tests {
             .expect("handle formatter");
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
-            handle_formatter.format_value(&raw, limits).unwrap(),
+            handle_formatter
+                .format_value_with_limits(&raw, limits)
+                .unwrap(),
             format!("hash:{}", "EF".repeat(32))
         );
     }

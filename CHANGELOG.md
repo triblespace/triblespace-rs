@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hash/handle WASM formatter output now prefixes `hash:` before the hex digest.
 - Inlined schema-level value formatter metadata emission, removing the
   `wasm_formatters` helper module.
-- WASM value formatter limits are now supplied per formatting call, and the
-  eager formatter loader no longer captures limits at construction time.
+- WASM value formatter limits are now supplied per formatting call (with a
+  default helper), and the eager formatter loader no longer captures limits at
+  construction time.
 - `#[value_formatter]` can override the generated WASM byte constant name and
   visibility via `const_wasm = NAME` and `vis(...)` arguments.
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes

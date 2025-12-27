@@ -23,7 +23,10 @@ fn compiled_wasm_formatter_runs() {
     let mut raw = [0u8; 32];
     raw[0] = b'a';
 
-    assert_eq!(formatter.format_value(&raw, limits).unwrap(), "A");
+    assert_eq!(
+        formatter.format_value_with_limits(&raw, limits).unwrap(),
+        "A"
+    );
 }
 
 #[test]
@@ -34,5 +37,8 @@ fn custom_const_name_runs() {
     let mut raw = [0u8; 32];
     raw[0] = 0xAF;
 
-    assert_eq!(formatter.format_value(&raw, limits).unwrap(), "0xAF");
+    assert_eq!(
+        formatter.format_value_with_limits(&raw, limits).unwrap(),
+        "0xAF"
+    );
 }
