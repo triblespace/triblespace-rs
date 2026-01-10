@@ -147,18 +147,20 @@ where
         self.id()
     }
 
-    fn describe(&self, _blobs: &mut impl crate::repo::BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(&self, _blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: crate::repo::BlobStore<Blake3>,
+    {
         let mut tribles = TribleSet::new();
-
-        let entity = ExclusiveId::force(self.id());
+        let id = self.id();
 
         if let Some(handle) = self.handle {
-            tribles += entity! { &entity @ metadata::name: handle };
+            tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { &entity @ metadata::value_schema: GenId::value_from(S::id()) };
+        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(S::id()) };
 
-        tribles
+        Ok(tribles)
     }
 }
 

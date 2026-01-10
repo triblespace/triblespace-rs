@@ -343,41 +343,41 @@ where
         &self.data
     }
 
-    pub fn metadata(&mut self) -> TribleSet {
+    pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
         for (key, attr) in self.bool_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.num_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.str_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.genid_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
-        meta
+        Ok(meta)
     }
 }
 
@@ -837,41 +837,41 @@ where
         &self.data
     }
 
-    pub fn metadata(&mut self) -> TribleSet {
+    pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
         for (key, attr) in self.bool_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.num_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.str_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
         for (key, attr) in self.genid_attrs.iter() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
-                let entity = ExclusiveId::as_transmute_force(&attr_id);
+                let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
-        meta
+        Ok(meta)
     }
 }
 
@@ -891,7 +891,7 @@ mod tests {
         let roots = importer.import_blob(input.to_blob()).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(importer.data().len(), 2);
-        assert!(!importer.metadata().is_empty());
+        assert!(!importer.metadata().expect("metadata set").is_empty());
     }
 
     #[test]
@@ -902,7 +902,7 @@ mod tests {
         let roots = importer.import_blob(input.to_blob()).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(importer.data().len(), 2);
-        assert!(!importer.metadata().is_empty());
+        assert!(!importer.metadata().expect("metadata set").is_empty());
     }
 
     fn extract_handle_raw(

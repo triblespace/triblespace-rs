@@ -27,7 +27,7 @@ fn exports_json_with_cardinality_hints() {
     let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 
-    let mut merged = importer.metadata();
+    let mut merged = importer.metadata().expect("metadata set");
     merged.union(importer.data().clone());
 
     let reader = blobs.reader().expect("reader");
@@ -83,7 +83,7 @@ fn exports_openai_like_conversation() {
     let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 
-    let mut merged = importer.metadata();
+    let mut merged = importer.metadata().expect("metadata set");
     merged.union(importer.data().clone());
 
     let reader = blobs.reader().expect("reader");

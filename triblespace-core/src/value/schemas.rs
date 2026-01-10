@@ -13,8 +13,11 @@ pub mod range;
 pub mod shortstring;
 pub mod time;
 
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -25,13 +28,6 @@ use std::convert::Infallible;
 
 #[cfg(feature = "wasm")]
 use crate::blob::schemas::wasmcode::WasmCode;
-#[cfg(feature = "wasm")]
-use crate::id::ExclusiveId;
-#[cfg(feature = "wasm")]
-use crate::macros::entity;
-#[cfg(feature = "wasm")]
-use crate::metadata;
-
 /// A value schema for an unknown value.
 /// This value schema is used as a fallback when the value schema is not known.
 /// It is not recommended to use this value schema in practice.
@@ -44,20 +40,24 @@ impl ConstMetadata for UnknownValue {
         id_hex!("4EC697E8599AC79D667C722E2C8BEBF4")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::UNKNOWN_VALUE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::UNKNOWN_VALUE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 

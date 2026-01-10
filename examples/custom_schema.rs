@@ -24,9 +24,12 @@ impl ConstMetadata for U64LE {
         id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> triblespace::core::trible::TribleSet {
+    fn describe<B>(blobs: &mut B) -> Result<triblespace::core::trible::TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
         let _ = blobs;
-        triblespace::core::trible::TribleSet::new()
+        Ok(triblespace::core::trible::TribleSet::new())
     }
 }
 

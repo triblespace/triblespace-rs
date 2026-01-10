@@ -47,7 +47,10 @@ where
         <H as ConstMetadata>::id()
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
         H::describe(blobs)
     }
 }
@@ -132,24 +135,29 @@ where
     }
 }
 
-fn describe_hash<H>(blobs: &mut impl BlobStore<Blake3>) -> TribleSet
+fn describe_hash<H, B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
 where
     H: HashProtocol,
+    B: BlobStore<Blake3>,
 {
-    let _ = blobs;
+    let id = H::id();
     let mut tribles = TribleSet::new();
 
-    let entity = ExclusiveId::force(H::id());
-    tribles += entity! { &entity @ metadata::shortname: H::NAME };
+    tribles += entity! { ExclusiveId::force_ref(&id) @
+        metadata::shortname: H::NAME,
+        metadata::tag: metadata::KIND_VALUE_SCHEMA,
+    };
 
     #[cfg(feature = "wasm")]
     {
-        if let Ok(handle) = blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM) {
-            tribles += entity! { &entity @ metadata::value_formatter: handle };
-        }
+        tribles += entity! { ExclusiveId::force_ref(&id) @
+            metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM)?,
+        };
     }
+    #[cfg(not(feature = "wasm"))]
+    let _ = (blobs, &mut tribles);
 
-    tribles
+    Ok(tribles)
 }
 
 #[cfg(feature = "wasm")]
@@ -190,8 +198,11 @@ impl ConstMetadata for Blake2b {
         id_hex!("91F880222412A49F012BE999942E6199")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        describe_hash::<Self>(blobs)
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        describe_hash::<Self, B>(blobs)
     }
 }
 
@@ -200,8 +211,11 @@ impl ConstMetadata for Blake3 {
         id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        describe_hash::<Self>(blobs)
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        describe_hash::<Self, B>(blobs)
     }
 }
 
@@ -257,25 +271,28 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         Id::new(raw).expect("derived handle schema id must be non-nil")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
         let mut tribles = TribleSet::new();
-        tribles += H::describe(blobs);
-        tribles += T::describe(blobs);
+        tribles += H::describe(blobs)?;
+        tribles += T::describe(blobs)?;
 
-        let entity = ExclusiveId::force(Self::id());
-        tribles += entity! { &entity @
+        tribles += entity! { ExclusiveId::force_ref(&id) @
             metadata::blob_schema: T::id(),
             metadata::hash_schema: H::id(),
+            metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
-        let _ = blobs;
         #[cfg(feature = "wasm")]
         {
-            if let Ok(handle) = blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM) {
-                tribles += entity! { &entity @ metadata::value_formatter: handle };
-            }
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM)?,
+            };
         }
-        tribles
+        Ok(tribles)
     }
 }
 

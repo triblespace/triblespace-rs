@@ -3,9 +3,15 @@ use anybytes::Bytes;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
+use crate::repo::BlobStore;
+use crate::trible::TribleSet;
+use crate::value::schemas::hash::Blake3;
 
 /// A blob schema for WebAssembly bytecode.
 ///
@@ -18,6 +24,16 @@ impl BlobSchema for WasmCode {}
 impl ConstMetadata for WasmCode {
     fn id() -> Id {
         id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52")
+    }
+
+    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        Ok(entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+        })
     }
 }
 

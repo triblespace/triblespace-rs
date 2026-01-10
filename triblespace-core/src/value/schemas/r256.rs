@@ -1,5 +1,8 @@
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -15,12 +18,6 @@ use std::convert::TryInto;
 
 #[cfg(feature = "wasm")]
 use crate::blob::schemas::wasmcode::WasmCode;
-#[cfg(feature = "wasm")]
-use crate::id::ExclusiveId;
-#[cfg(feature = "wasm")]
-use crate::macros::entity;
-#[cfg(feature = "wasm")]
-use crate::metadata;
 use num_rational::Ratio;
 
 /// A 256-bit ratio value.
@@ -50,20 +47,24 @@ impl ConstMetadata for R256LE {
         id_hex!("0A9B43C5C2ECD45B257CDEFC16544358")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::R256_LE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::R256_LE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for R256LE {
@@ -74,20 +75,24 @@ impl ConstMetadata for R256BE {
         id_hex!("CA5EAF567171772C1FFD776E9C7C02D1")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::R256_BE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::R256_BE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 

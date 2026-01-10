@@ -200,7 +200,7 @@ The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
 
 The core crate can optionally ship built-in formatters for its built-in value
 schemas. Enable the `wasm` feature to have
-`ConstMetadata::describe` attach `metadata::value_formatter` entries for the
+`ConstMetadata::describe` (which is fallible) attach `metadata::value_formatter` entries for the
 standard schemas. This feature requires the `wasm32-unknown-unknown` Rust
 target at build time because the bundled formatters are compiled to WebAssembly
 via the `#[value_formatter]` proc macro.

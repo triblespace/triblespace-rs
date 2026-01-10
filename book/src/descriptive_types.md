@@ -28,6 +28,8 @@ Reading the chapter sequentially should equip you to:
 - entity! constructs ad‑hoc entities (like struct literals).
 - Reified kinds/tags are attached via metadata::tag (GenId); projects often
   export canonical KIND_* constants you can pattern-match directly against.
+- Value schema entities are tagged with metadata::KIND_VALUE_SCHEMA; blob schema
+  entities with metadata::KIND_BLOB_SCHEMA.
 - Prefer passing the Workspace + the checkout result (TribleSet) and an
   entity id around — only materialize a concrete Rust view when required.
 - Strongly prefer operating on the tuples returned by `find!`; wrapper

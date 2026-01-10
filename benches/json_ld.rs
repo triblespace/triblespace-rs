@@ -136,7 +136,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         let roots = importer
             .import_blob(import_blob.clone())
             .expect("import JSON-LD as JSON");
-        let mut merged = importer.metadata();
+        let mut merged = importer.metadata().expect("metadata set");
         merged.union(importer.data().clone());
         let reader = blobs.reader().expect("reader");
         let payload_len = import_payload.len();
@@ -271,7 +271,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             let roots = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
-            let mut merged = importer.metadata();
+            let mut merged = importer.metadata().expect("metadata set");
             merged.union(importer.data().clone());
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {

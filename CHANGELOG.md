@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated the README quote to Joe Armstrong’s talk “The Mess We’re In.”
 - `Metadata` and `ConstMetadata` now use a shared `id` method as the canonical
   schema identifier, eliminating the former `metadata_id` accessors.
+- `Metadata::describe` and `ConstMetadata::describe` are now fallible so blob
+  write errors can be propagated instead of silently ignored.
 - `ValueSchema` inherits its identifier and default description behavior from
   `ConstMetadata`, removing duplicate `id`, `metadata_id`, and `describe`
   methods from the schema trait itself.
@@ -33,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hash/handle WASM formatter output now prefixes `hash:` before the hex digest.
 - Inlined schema-level value formatter metadata emission, removing the
   `wasm_formatters` helper module.
+- Metadata describe helpers now bind schema IDs once and inline blob puts when
+  emitting tribles.
+- `entity!` now accepts `ExclusiveId` values in addition to `&ExclusiveId`
+  references.
+- Renamed `ExclusiveId::as_transmute_force` to `ExclusiveId::force_ref`.
 - WASM value formatter limits are now supplied per formatting call (with a
   default helper), and the eager formatter loader no longer captures limits at
   construction time.
@@ -53,6 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Guidance on how `ExclusiveId` ownership narrows safe absence checks while
   keeping queries monotonic across collaborators in the incremental queries
   chapter of the book.
+- `metadata::KIND_VALUE_SCHEMA` and `metadata::KIND_BLOB_SCHEMA` tags, now
+  emitted by built-in schema metadata for discovery.
 - `metadata::Metadata` trait for emitting self-describing `TribleSet` and
   `MemoryBlobStore` pairs, enabling attributes and schemas to publish
   documentation metadata recursively.

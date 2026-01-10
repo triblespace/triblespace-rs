@@ -20,7 +20,9 @@ pub trait Metadata {
     /// Returns the root identifier for this metadata description.
     fn id(&self) -> Id;
 
-    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet;
+    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>;
 }
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
@@ -28,9 +30,12 @@ pub trait ConstMetadata {
     /// Returns the root identifier for this metadata description.
     fn id() -> Id;
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
         let _ = blobs;
-        TribleSet::new()
+        Ok(TribleSet::new())
     }
 }
 
@@ -42,7 +47,10 @@ where
         <S as ConstMetadata>::id()
     }
 
-    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
         <S as ConstMetadata>::describe(blobs)
     }
 }
@@ -55,22 +63,21 @@ where
         T::id()
     }
 
-    fn describe(&self, blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
+    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
         let _ = blobs;
-        TribleSet::new()
+        Ok(TribleSet::new())
     }
 }
-// namespace constants
 
-pub const ATTR_NAME: Id = id_hex!("2E26F8BA886495A8DF04ACF0ED3ACBD4");
-pub const ATTR_JSON_KIND: Id = id_hex!("A7AFC8C0FAD017CE7EC19587AF682CFF");
-pub const VALUE_SCHEMA: Id = id_hex!("213F89E3F49628A105B3830BD3A6612C");
-pub const BLOB_SCHEMA: Id = id_hex!("43C134652906547383054B1E31E23DF4");
-pub const HASH_SCHEMA: Id = id_hex!("51C08CFABB2C848CE0B4A799F0EFE5EA");
-pub const VALUE_FORMATTER: Id = id_hex!("1A3D520FEDA9E1A4051EBE96E43ABAC7");
+// namespace constants
 pub const KIND_MULTI: Id = id_hex!("C36D9C16B34729D855BD6C36A624E1BF");
-pub const SHORTNAME: Id = id_hex!("2E26F8BA886495A8DF04ACF0ED3ACBD4");
-pub const NAME: Id = id_hex!("7FB28C0B48E1924687857310EE230414");
+/// Tag for entities that represent value schemas.
+pub const KIND_VALUE_SCHEMA: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB");
+/// Tag for entities that represent blob schemas.
+pub const KIND_BLOB_SCHEMA: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
 
 attributes! {
     /// Optional short name for quick inspection (fits in ShortString).

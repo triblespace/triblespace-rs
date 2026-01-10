@@ -1,5 +1,8 @@
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -14,12 +17,6 @@ use ethnum;
 
 #[cfg(feature = "wasm")]
 use crate::blob::schemas::wasmcode::WasmCode;
-#[cfg(feature = "wasm")]
-use crate::id::ExclusiveId;
-#[cfg(feature = "wasm")]
-use crate::macros::entity;
-#[cfg(feature = "wasm")]
-use crate::metadata;
 /// A value schema for a 256-bit unsigned integer in little-endian byte order.
 pub struct U256LE;
 
@@ -45,20 +42,24 @@ impl ConstMetadata for U256LE {
         id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::U256_LE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::U256_LE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for U256LE {
@@ -69,20 +70,24 @@ impl ConstMetadata for U256BE {
         id_hex!("DC3CFB719B05F019FB8101A6F471A982")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::U256_BE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::U256_BE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for U256BE {
@@ -93,20 +98,24 @@ impl ConstMetadata for I256LE {
         id_hex!("DB94325A37D96037CBFC6941A4C3B66D")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::I256_LE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::I256_LE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for I256LE {
@@ -117,20 +126,24 @@ impl ConstMetadata for I256BE {
         id_hex!("CE3A7839231F1EB390E9E8E13DAED782")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::I256_BE_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::I256_BE_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for I256BE {

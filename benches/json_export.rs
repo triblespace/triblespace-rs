@@ -68,7 +68,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
                 let root = *roots.first().expect("root entity");
 
                 let data = importer.data().clone();
-                let mut merged = importer.metadata();
+                let mut merged = importer.metadata().expect("metadata set");
                 merged.union(data.clone());
                 (merged, root, data.len())
             };
@@ -241,7 +241,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                             )))
                             .expect("import JSON");
                         let root = *roots.first().expect("root entity");
-                        let mut merged = importer.metadata();
+                        let mut merged = importer.metadata().expect("metadata set");
                         merged.union(importer.data().clone());
                         (merged, root)
                     };
@@ -276,7 +276,7 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                             .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
                             .expect("import JSON");
                         let root = *roots.first().expect("root entity");
-                        let mut merged = importer.metadata();
+                        let mut merged = importer.metadata().expect("metadata set");
                         merged.union(importer.data().clone());
                         (merged, root)
                     };

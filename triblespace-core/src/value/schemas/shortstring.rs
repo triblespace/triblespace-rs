@@ -1,5 +1,8 @@
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -16,12 +19,6 @@ use std::str::Utf8Error;
 
 #[cfg(feature = "wasm")]
 use crate::blob::schemas::wasmcode::WasmCode;
-#[cfg(feature = "wasm")]
-use crate::id::ExclusiveId;
-#[cfg(feature = "wasm")]
-use crate::macros::entity;
-#[cfg(feature = "wasm")]
-use crate::metadata;
 /// An error that occurs when converting a string to a short string.
 /// This error occurs when the string is too long or contains an interior NUL byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,20 +46,24 @@ impl ConstMetadata for ShortString {
         id_hex!("2D848DB0AF112DB226A6BF1A3640D019")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::SHORTSTRING_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::SHORTSTRING_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 

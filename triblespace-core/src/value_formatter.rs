@@ -298,8 +298,8 @@ mod tests {
         let reader = store.reader().expect("blob reader");
 
         let schema_id = crate::value::schemas::shortstring::ShortString::id();
-        let schema_entity = crate::id::ExclusiveId::force(schema_id);
-        let space = crate::macros::entity! { &schema_entity @
+        let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
+        let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
         };
 
@@ -349,28 +349,29 @@ mod tests {
 
         let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
         let mut space = TribleSet::new();
-        space += Boolean::describe(&mut store);
-        space += GenId::describe(&mut store);
-        space += ShortString::describe(&mut store);
-        space += F64::describe(&mut store);
-        space += F256LE::describe(&mut store);
-        space += F256BE::describe(&mut store);
-        space += U256LE::describe(&mut store);
-        space += U256BE::describe(&mut store);
-        space += I256LE::describe(&mut store);
-        space += I256BE::describe(&mut store);
-        space += R256LE::describe(&mut store);
-        space += R256BE::describe(&mut store);
-        space += RangeU128::describe(&mut store);
-        space += RangeInclusiveU128::describe(&mut store);
-        space += LineLocation::describe(&mut store);
-        space += NsTAIInterval::describe(&mut store);
-        space += ED25519RComponent::describe(&mut store);
-        space += ED25519SComponent::describe(&mut store);
-        space += ED25519PublicKey::describe(&mut store);
-        space += UnknownValue::describe(&mut store);
-        space += <Hash<Blake3> as ConstMetadata>::describe(&mut store);
-        space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store);
+        space += Boolean::describe(&mut store).expect("boolean metadata");
+        space += GenId::describe(&mut store).expect("genid metadata");
+        space += ShortString::describe(&mut store).expect("shortstring metadata");
+        space += F64::describe(&mut store).expect("f64 metadata");
+        space += F256LE::describe(&mut store).expect("f256le metadata");
+        space += F256BE::describe(&mut store).expect("f256be metadata");
+        space += U256LE::describe(&mut store).expect("u256le metadata");
+        space += U256BE::describe(&mut store).expect("u256be metadata");
+        space += I256LE::describe(&mut store).expect("i256le metadata");
+        space += I256BE::describe(&mut store).expect("i256be metadata");
+        space += R256LE::describe(&mut store).expect("r256le metadata");
+        space += R256BE::describe(&mut store).expect("r256be metadata");
+        space += RangeU128::describe(&mut store).expect("rangeu128 metadata");
+        space += RangeInclusiveU128::describe(&mut store).expect("rangeu128 inclusive metadata");
+        space += LineLocation::describe(&mut store).expect("linelocation metadata");
+        space += NsTAIInterval::describe(&mut store).expect("nstai interval metadata");
+        space += ED25519RComponent::describe(&mut store).expect("ed25519 r metadata");
+        space += ED25519SComponent::describe(&mut store).expect("ed25519 s metadata");
+        space += ED25519PublicKey::describe(&mut store).expect("ed25519 pubkey metadata");
+        space += UnknownValue::describe(&mut store).expect("unknown metadata");
+        space += <Hash<Blake3> as ConstMetadata>::describe(&mut store).expect("hash metadata");
+        space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store)
+            .expect("handle metadata");
 
         let reader = store.reader().expect("blob reader");
         let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =

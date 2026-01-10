@@ -184,25 +184,25 @@ where
         &self.data
     }
 
-    pub fn metadata(&mut self) -> TribleSet {
+    pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
         for attr in self.bool_attrs.values() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
         }
         for attr in self.num_attrs.values() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
         }
         for attr in self.str_attrs.values() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
         }
         for attr in self.genid_attrs.values() {
-            meta.union(attr.describe(self.store));
+            meta.union(attr.describe(self.store)?);
         }
         for attr_id in &self.multi_attrs {
-            let entity = ExclusiveId::as_transmute_force(attr_id);
+            let entity = ExclusiveId::force_ref(attr_id);
             meta += entity! { entity @ metadata::tag: metadata::KIND_MULTI };
         }
-        meta
+        Ok(meta)
     }
 
     pub fn clear_data(&mut self) {
@@ -531,7 +531,7 @@ where
                 Ok(())
             }
             JsonValue::Array(elements) => {
-                let entity_ref = ExclusiveId::as_transmute_force(&entity.id);
+                let entity_ref = ExclusiveId::force_ref(&entity.id);
                 for element in elements {
                     self.stage_field(entity_ref, field, element, staged)?;
                 }
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(roots.len(), 1);
         let root = roots[0];
         let data: Vec<_> = importer.data().iter().copied().collect();
-        let metadata_set = importer.metadata();
+        let metadata_set = importer.metadata().expect("metadata set");
         let metadata: Vec<_> = metadata_set.iter().copied().collect();
 
         assert_eq!(data.len(), 5);
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(roots.len(), 1);
         let root = roots[0];
         let data: Vec<_> = importer.data().iter().copied().collect();
-        let metadata_set = importer.metadata();
+        let metadata_set = importer.metadata().expect("metadata set");
         let metadata: Vec<_> = metadata_set.iter().copied().collect();
         assert_eq!(data.len(), 4);
 
@@ -884,7 +884,12 @@ mod tests {
         let mut importer = make_importer(&mut blobs);
         let first_roots = importer.import_value(&payload).unwrap();
         assert_eq!(first_roots.len(), 2);
-        let metadata: Vec<_> = importer.metadata().iter().copied().collect();
+        let metadata: Vec<_> = importer
+            .metadata()
+            .expect("metadata set")
+            .iter()
+            .copied()
+            .collect();
         let data: Vec<_> = importer.data().iter().copied().collect();
 
         let title_attr = Attribute::<Handle<Blake3, LongString>>::from_name("title").id();

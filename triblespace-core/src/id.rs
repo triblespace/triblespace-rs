@@ -277,7 +277,7 @@ impl ExclusiveId {
     /// such as a transactional database that tracks checked out IDs for ownership, or distributed ledgers like blockchains.
     ///
     /// This should be done with care, as it allows scenarios where multiple writers can create conflicting information for the same ID.
-    /// Similar caution should be applied when using the `transmute_force` and `forget` methods.
+    /// Similar caution should be applied when using the `force_ref` and `forget` methods.
     ///
     /// # Arguments
     ///
@@ -296,7 +296,7 @@ impl ExclusiveId {
     /// # Arguments
     ///
     /// * `id` - A reference to the `Id` to be transmuted.
-    pub fn as_transmute_force(id: &Id) -> &Self {
+    pub fn force_ref(id: &Id) -> &Self {
         unsafe { std::mem::transmute(id) }
     }
 
@@ -355,6 +355,12 @@ impl Borrow<Id> for ExclusiveId {
 
 impl AsRef<Id> for ExclusiveId {
     fn as_ref(&self) -> &Id {
+        self
+    }
+}
+
+impl AsRef<ExclusiveId> for ExclusiveId {
+    fn as_ref(&self) -> &ExclusiveId {
         self
     }
 }
@@ -558,7 +564,7 @@ impl Deref for OwnedId<'_> {
     type Target = ExclusiveId;
 
     fn deref(&self) -> &Self::Target {
-        ExclusiveId::as_transmute_force(&self.id)
+        ExclusiveId::force_ref(&self.id)
     }
 }
 

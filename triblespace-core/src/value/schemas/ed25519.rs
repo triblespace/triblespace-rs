@@ -3,8 +3,11 @@ use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 pub use ed25519_dalek::VerifyingKey;
 
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
@@ -18,12 +21,6 @@ use std::convert::Infallible;
 
 #[cfg(feature = "wasm")]
 use crate::blob::schemas::wasmcode::WasmCode;
-#[cfg(feature = "wasm")]
-use crate::id::ExclusiveId;
-#[cfg(feature = "wasm")]
-use crate::macros::entity;
-#[cfg(feature = "wasm")]
-use crate::metadata;
 /// A value schema for the R component of an Ed25519 signature.
 pub struct ED25519RComponent;
 
@@ -38,20 +35,24 @@ impl ConstMetadata for ED25519RComponent {
         id_hex!("995A86FFC83DB95ECEAA17E226208897")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_R_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_R_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519RComponent {
@@ -62,20 +63,24 @@ impl ConstMetadata for ED25519SComponent {
         id_hex!("10D35B0B628E9E409C549D8EC1FB3598")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_S_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_S_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519SComponent {
@@ -86,20 +91,24 @@ impl ConstMetadata for ED25519PublicKey {
         id_hex!("69A872254E01B4C1ED36E08E40445E93")
     }
 
-    fn describe(blobs: &mut impl BlobStore<Blake3>) -> TribleSet {
-        let _ = blobs;
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        let mut tribles = entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        };
 
         #[cfg(feature = "wasm")]
-        let tribles = match blobs.put::<WasmCode, _>(wasm_formatter::ED25519_PUBKEY_WASM) {
-            Ok(handle) => {
-                let entity = ExclusiveId::force(Self::id());
-                entity! { &entity @ metadata::value_formatter: handle }
-            }
-            Err(_) => TribleSet::new(),
-        };
+        {
+            tribles += entity! { ExclusiveId::force_ref(&id) @
+                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_PUBKEY_WASM)?,
+            };
+        }
         #[cfg(not(feature = "wasm"))]
-        let tribles = TribleSet::new();
-        tribles
+        let _ = (blobs, &mut tribles);
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519PublicKey {

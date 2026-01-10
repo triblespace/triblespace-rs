@@ -7,13 +7,18 @@ use crate::blob::ToBlob;
 use crate::blob::TryFromBlob;
 use crate::id::id_from_value;
 use crate::id::id_into_value;
+use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::macros::entity;
+use crate::metadata;
 use crate::metadata::ConstMetadata;
 use crate::query::TriblePattern;
+use crate::repo::BlobStore;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
+use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::UnknownValue;
 use crate::value::RawValue;
 use crate::value::Value;
@@ -47,6 +52,16 @@ impl BlobSchema for SuccinctArchiveBlob {}
 impl ConstMetadata for SuccinctArchiveBlob {
     fn id() -> Id {
         id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41")
+    }
+
+    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::id();
+        Ok(entity! {
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+        })
     }
 }
 

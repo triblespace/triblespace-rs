@@ -469,7 +469,10 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
     let id_init: TokenStream2 = if let Some(val) = id {
         match val {
             Value::Expr(expr) => {
-                quote! { let id_ref: &#base_path::id::ExclusiveId = #expr; }
+                quote! {
+                    let id_tmp = #expr;
+                    let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+                }
             }
             Value::Var(ident) => {
                 return Err(syn::Error::new_spanned(
@@ -487,7 +490,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
     } else {
         quote! {
             let id_tmp: #base_path::id::ExclusiveId = #base_path::id::rngid();
-            let id_ref: &#base_path::id::ExclusiveId = &id_tmp;
+            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
         }
     };
 

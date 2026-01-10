@@ -111,7 +111,7 @@ impl Trible {
     /// assert_eq!(trible.e(), &*e);
     /// ```
     pub fn force<V: ValueSchema>(e: &Id, a: &Id, v: &Value<V>) -> Trible {
-        Trible::new(ExclusiveId::as_transmute_force(e), a, v)
+        Trible::new(ExclusiveId::force_ref(e), a, v)
     }
 
     /// Creates a new trible from a raw trible (a 64-byte array).

@@ -238,6 +238,9 @@ for (author, name) in find!(
 }
 ```
 
+The `entity!` macro accepts `ExclusiveId`s by value or reference, so you can
+pass either an owned guard or a borrowed one.
+
 Sometimes you want to compare two attributes without exposing the comparison
 variable outside the pattern. Prefixing the binding with `_?`, such as
 `_?name`, allocates a scoped variable local to the macro invocation. Both
@@ -272,5 +275,3 @@ set of them essentially constitutes a single writer transaction domain,
 allowing for some non-monotonic operations like `if-does-not-exist`, over
 the set of contained entities. Note that this does not make operations that
 would break CALM (consistency as logical monotonicity) safe, e.g. `delete`.
-
-
