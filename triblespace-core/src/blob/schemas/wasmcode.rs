@@ -1,5 +1,6 @@
 use anybytes::Bytes;
 
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
@@ -26,13 +27,18 @@ impl ConstMetadata for WasmCode {
         id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52")
     }
 
-    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
+        let description =
+            blobs.put::<LongString, _>("WebAssembly bytecode blob for formatters.")?;
         Ok(entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "wasmcode",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })
     }
 }

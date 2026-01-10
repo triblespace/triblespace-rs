@@ -82,6 +82,8 @@ pub const KIND_BLOB_SCHEMA: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
 attributes! {
     /// Optional short name for quick inspection (fits in ShortString).
     "2E26F8BA886495A8DF04ACF0ED3ACBD4" as shortname: valueschemas::ShortString;
+    /// Optional longer description stored as a LongString handle.
+    "AE94660A55D2EE3C428D2BB299E02EC3" as description: valueschemas::Handle<hash::Blake3, LongString>;
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
     "43C134652906547383054B1E31E23DF4" as blob_schema: valueschemas::GenId;
     "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: valueschemas::GenId;

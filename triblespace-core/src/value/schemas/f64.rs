@@ -1,3 +1,4 @@
+use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -31,18 +32,22 @@ impl ConstMetadata for F64 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("IEEE-754 double (little-endian).")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "f64",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::F64_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }

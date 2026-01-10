@@ -1,6 +1,7 @@
 mod succinctarchiveconstraint;
 mod universe;
 
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
@@ -54,13 +55,18 @@ impl ConstMetadata for SuccinctArchiveBlob {
         id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41")
     }
 
-    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
+        let description =
+            blobs.put::<LongString, _>("Succinct archive index for fast trible queries.")?;
         Ok(entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "succinctarchive",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })
     }
 }

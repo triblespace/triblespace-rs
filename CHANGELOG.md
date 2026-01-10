@@ -62,6 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chapter of the book.
 - `metadata::KIND_VALUE_SCHEMA` and `metadata::KIND_BLOB_SCHEMA` tags, now
   emitted by built-in schema metadata for discovery.
+- `metadata::description`, a LongString-backed attribute for schema
+  documentation, and `metadata::shortname`/`metadata::description` emission for
+  built-in value and blob schemas.
 - `metadata::Metadata` trait for emitting self-describing `TribleSet` and
   `MemoryBlobStore` pairs, enabling attributes and schemas to publish
   documentation metadata recursively.

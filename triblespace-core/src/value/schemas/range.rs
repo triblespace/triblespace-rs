@@ -1,3 +1,4 @@
+use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -41,18 +42,22 @@ impl ConstMetadata for RangeU128 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("Half-open u128 range (start..end).")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "range_u128",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatters::RANGE_U128_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }
@@ -71,18 +76,22 @@ impl ConstMetadata for RangeInclusiveU128 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("Inclusive u128 range (start..=end).")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "range_u128_inc",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatters::RANGE_INCLUSIVE_U128_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }

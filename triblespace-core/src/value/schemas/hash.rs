@@ -1,3 +1,4 @@
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::BlobSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -141,10 +142,14 @@ where
     B: BlobStore<Blake3>,
 {
     let id = H::id();
+    let name = H::NAME;
+    let description =
+        blobs.put::<LongString, _>(format!("{name} hash digest (256-bit)."))?;
     let mut tribles = TribleSet::new();
 
     tribles += entity! { ExclusiveId::force_ref(&id) @
-        metadata::shortname: H::NAME,
+        metadata::shortname: name,
+        metadata::description: description,
         metadata::tag: metadata::KIND_VALUE_SCHEMA,
     };
 
@@ -154,8 +159,6 @@ where
             metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM)?,
         };
     }
-    #[cfg(not(feature = "wasm"))]
-    let _ = (blobs, &mut tribles);
 
     Ok(tribles)
 }
@@ -276,12 +279,19 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
+        let name = H::NAME;
+        let schema_id = T::id();
+        let description = blobs.put::<LongString, _>(format!(
+            "Handle for blobs hashed with {name} (schema {schema_id:X})."
+        ))?;
         let mut tribles = TribleSet::new();
         tribles += H::describe(blobs)?;
         tribles += T::describe(blobs)?;
 
         tribles += entity! { ExclusiveId::force_ref(&id) @
-            metadata::blob_schema: T::id(),
+            metadata::shortname: "handle",
+            metadata::description: description,
+            metadata::blob_schema: schema_id,
             metadata::hash_schema: H::id(),
             metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

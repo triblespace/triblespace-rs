@@ -3,6 +3,7 @@ use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 pub use ed25519_dalek::VerifyingKey;
 
+use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -40,18 +41,22 @@ impl ConstMetadata for ED25519RComponent {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("Ed25519 signature R component.")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "ed25519:r",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_R_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }
@@ -68,18 +73,22 @@ impl ConstMetadata for ED25519SComponent {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("Ed25519 signature S component.")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "ed25519:s",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_S_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }
@@ -96,18 +105,22 @@ impl ConstMetadata for ED25519PublicKey {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description = blobs.put::<LongString, _>("Ed25519 public key.")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "ed25519:pubkey",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::ED25519_PUBKEY_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }

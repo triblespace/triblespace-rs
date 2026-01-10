@@ -1,3 +1,4 @@
+use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -32,18 +33,23 @@ impl ConstMetadata for LineLocation {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+        let description =
+            blobs.put::<LongString, _>("Line/column span with start and end coordinates.")?;
+        let tribles = entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "line_location",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        {
+        let tribles = {
+            let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::LINELOCATION_WASM)?,
             };
-        }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
+            tribles
+        };
         Ok(tribles)
     }
 }

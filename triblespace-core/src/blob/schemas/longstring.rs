@@ -24,13 +24,18 @@ impl ConstMetadata for LongString {
         id_hex!("8B173C65B7DB601A11E8A190BD774A79")
     }
 
-    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
+        let description =
+            blobs.put::<LongString, _>("UTF-8 string blob of arbitrary length.")?;
         Ok(entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "longstring",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })
     }
 }

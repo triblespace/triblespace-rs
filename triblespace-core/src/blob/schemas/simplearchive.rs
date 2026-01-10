@@ -1,3 +1,4 @@
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
@@ -25,13 +26,19 @@ impl ConstMetadata for SimpleArchive {
         id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6")
     }
 
-    fn describe<B>(_blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
+        let description = blobs.put::<LongString, _>(
+            "Canonical trible sequence stored as raw 64-byte entries.",
+        )?;
         Ok(entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_BLOB_SCHEMA
+            ExclusiveId::force_ref(&id) @
+                metadata::shortname: "simplearchive",
+                metadata::description: description,
+                metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })
     }
 }
