@@ -60,8 +60,9 @@ impl ConstMetadata for SuccinctArchiveBlob {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Succinct archive index for fast trible queries.")?;
+        let description = blobs.put::<LongString, _>(
+            "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
+        )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "succinctarchive",

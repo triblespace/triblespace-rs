@@ -38,8 +38,9 @@ impl ConstMetadata for NsTAIInterval {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Inclusive TAI interval encoded as nanosecond bounds.")?;
+        let description = blobs.put::<LongString, _>(
+            "Inclusive TAI interval encoded as two little-endian i128 nanosecond bounds. TAI is monotonic and does not include leap seconds, making it ideal for precise ordering.\n\nUse for time windows, scheduling, or event ranges where monotonic time matters. If you need civil time, time zones, or calendar semantics, store a separate representation alongside this interval.\n\nIntervals are inclusive on both ends. If you need half-open intervals or offsets, consider RangeU128 with your own epoch mapping.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "nstai_interval",

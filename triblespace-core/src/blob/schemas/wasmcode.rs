@@ -32,8 +32,9 @@ impl ConstMetadata for WasmCode {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("WebAssembly bytecode blob for formatters.")?;
+        let description = blobs.put::<LongString, _>(
+            "WebAssembly bytecode blob for sandboxed helper modules. The modules are expected to be deterministic and import-free, intended for small utilities such as value formatters.\n\nUse when a schema references a formatter via metadata::value_formatter or similar tooling and you want portable, sandboxed code alongside the data. Avoid large or stateful modules; keep the bytecode focused on pure formatting or validation tasks.",
+        )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "wasmcode",

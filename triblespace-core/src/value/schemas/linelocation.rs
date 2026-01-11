@@ -33,8 +33,9 @@ impl ConstMetadata for LineLocation {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Line/column span with start and end coordinates.")?;
+        let description = blobs.put::<LongString, _>(
+            "Line/column span encoded as four big-endian u64 values (start_line, start_col, end_line, end_col). This captures explicit source positions rather than byte offsets.\n\nUse for editor diagnostics, source maps, or human-facing spans. If you need byte offsets or length-based ranges, use RangeU128 instead.\n\nColumns are raw counts and do not account for variable-width graphemes. Store any display conventions separately if needed.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "line_location",

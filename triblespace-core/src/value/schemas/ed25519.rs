@@ -41,7 +41,9 @@ impl ConstMetadata for ED25519RComponent {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Ed25519 signature R component.")?;
+        let description = blobs.put::<LongString, _>(
+            "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob schema (for example LongString with base64 or a custom blob schema).",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "ed25519:r",
@@ -73,7 +75,9 @@ impl ConstMetadata for ED25519SComponent {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Ed25519 signature S component.")?;
+        let description = blobs.put::<LongString, _>(
+            "Ed25519 signature S component stored as a 32-byte field. This is the second half of the standard Ed25519 signature.\n\nUse when storing or querying signatures in a structured form. Pair with the R component to reconstruct or verify the full signature.\n\nAs with the R component, treat this as public data; private signing keys should be stored separately and securely.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "ed25519:s",
@@ -105,7 +109,9 @@ impl ConstMetadata for ED25519PublicKey {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Ed25519 public key.")?;
+        let description = blobs.put::<LongString, _>(
+            "Ed25519 public key stored as a 32-byte field. Public keys verify signatures and identify signing identities.\n\nUse for signer registries, verification records, or key references associated with signatures. Private keys are not represented by a built-in schema and should be handled separately.\n\nEd25519 is widely supported and deterministic; if you need another scheme, define a custom schema with its own metadata.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "ed25519:pubkey",

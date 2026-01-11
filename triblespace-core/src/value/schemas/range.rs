@@ -42,7 +42,9 @@ impl ConstMetadata for RangeU128 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Half-open u128 range (start..end).")?;
+        let description = blobs.put::<LongString, _>(
+            "Half-open range encoded as two big-endian u128 values (start..end). This mirrors common slice semantics where the end is exclusive.\n\nUse for offsets, byte ranges, and spans where length matters and empty ranges are valid. Use RangeInclusiveU128 when both endpoints should be included.\n\nNo normalization is enforced; callers should ensure start <= end and interpret units consistently.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "range_u128",
@@ -76,7 +78,9 @@ impl ConstMetadata for RangeInclusiveU128 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Inclusive u128 range (start..=end).")?;
+        let description = blobs.put::<LongString, _>(
+            "Inclusive range encoded as two big-endian u128 values (start..=end). This is convenient when both endpoints are meaningful.\n\nUse for closed intervals such as line/column ranges or inclusive numeric bounds. Prefer RangeU128 for half-open intervals and length-based calculations.\n\nCallers should decide how to handle empty or reversed ranges; the schema only defines the byte layout.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "range_u128_inc",

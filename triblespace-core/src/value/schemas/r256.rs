@@ -53,8 +53,9 @@ impl ConstMetadata for R256LE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Ratio of two i128 values (little-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Exact ratio stored as two i128 values (numerator/denominator) in little-endian, normalized with a positive denominator. This keeps fractions canonical and comparable.\n\nUse for exact rates, proportions, or unit conversions where rounding is unacceptable. Prefer F64 or F256 when approximate floats are fine or when interfacing with floating-point APIs.\n\nDenominator zero is invalid; the schema expects canonicalized fractions. If you need intervals or ranges instead of ratios, use the range schemas.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "r256le",
@@ -86,8 +87,9 @@ impl ConstMetadata for R256BE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Ratio of two i128 values (big-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "r256be",

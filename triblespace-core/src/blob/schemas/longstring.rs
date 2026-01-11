@@ -29,8 +29,9 @@ impl ConstMetadata for LongString {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("UTF-8 string blob of arbitrary length.")?;
+        let description = blobs.put::<LongString, _>(
+            "Arbitrary-length UTF-8 text stored as a blob. This is the default choice for any textual payload that does not fit in 32 bytes, such as documents, prompts, JSON, or logs.\n\nUse ShortString when you need a fixed-width value embedded directly in tribles, want to derive attributes from the bytes, or need predictable ordering inside value indices. LongString is for payloads where size can vary or exceed the value boundary.",
+        )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "longstring",

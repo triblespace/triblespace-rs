@@ -48,8 +48,9 @@ impl ConstMetadata for U256LE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Unsigned 256-bit integer (little-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Unsigned 256-bit integer stored in little-endian byte order. The full 32 bytes are dedicated to the magnitude.\n\nUse for large counters, identifiers, or domain-specific fixed-width numbers that exceed u128. Prefer U256BE when bytewise ordering or protocol encoding matters.\n\nIf a smaller width suffices, prefer U64 or U128 in your schema to reduce storage and improve readability.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "u256le",
@@ -81,8 +82,9 @@ impl ConstMetadata for U256BE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("Unsigned 256-bit integer (big-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Unsigned 256-bit integer stored in big-endian byte order. Bytewise comparisons align with numeric order.\n\nUse when ordering or network serialization matters. Prefer U256LE for local storage or interop with little-endian APIs.\n\nIf you do not need the full 256-bit range, smaller integer schemas are easier to handle and faster to encode.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "u256be",
@@ -114,7 +116,9 @@ impl ConstMetadata for I256LE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Signed 256-bit integer (little-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Signed 256-bit integer stored in little-endian twos-complement. This enables extremely large signed ranges in a fixed width.\n\nUse for large signed quantities such as balances or offsets beyond i128. Prefer I256BE when bytewise ordering or external protocols require big-endian.\n\nIf values fit within i64 or i128, smaller schemas are more compact and easier to interoperate with.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "i256le",
@@ -146,7 +150,9 @@ impl ConstMetadata for I256BE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>("Signed 256-bit integer (big-endian).")?;
+        let description = blobs.put::<LongString, _>(
+            "Signed 256-bit integer stored in big-endian twos-complement. This variant is convenient for protocol encoding and deterministic ordering.\n\nUse for interoperability or stable bytewise comparisons across systems. Prefer I256LE for local storage or when endianness does not matter.\n\nAs with any signed integer, consider whether the sign bit has semantic meaning and avoid mixing signed and unsigned ranges.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "i256be",

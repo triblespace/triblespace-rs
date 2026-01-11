@@ -52,8 +52,9 @@ impl ConstMetadata for ShortString {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description =
-            blobs.put::<LongString, _>("UTF-8 string up to 32 bytes, NUL-terminated.")?;
+        let description = blobs.put::<LongString, _>(
+            "UTF-8 string stored inline in 32 bytes with NUL termination and zero padding. Keeping the bytes inside the value makes the string sortable and queryable without an extra blob lookup.\n\nUse for short labels, enum-like names, and keys that must fit in the value boundary. For longer or variable text, store a LongString blob and reference it with a Handle.\n\nInterior NUL bytes are invalid and the maximum length is 32 bytes. The schema stores raw bytes, so it does not account for grapheme width or display columns.",
+        )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::shortname: "shortstring",
