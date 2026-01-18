@@ -3,7 +3,7 @@
 ## Potential Removals
 - None at the moment.
 
-## 0.6.0 Release Preparation
+## 0.7.0 Release Preparation
 - **Delta helpers.**
   - Design a helper that produces delta `TribleSet`s for `pattern_changes!` and
     drafts an API signature for review.

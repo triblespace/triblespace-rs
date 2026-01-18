@@ -1,9 +1,12 @@
 [package]
 name = "triblespace-macros-common"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Shared implementation helpers for triblespace procedural macros"
 license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/triblespace-macros-common"
+homepage = "https://trible.space"
+repository = "https://github.com/triblespace/triblespace-rs"
 
 [dependencies]
 proc-macro2 = "1"
