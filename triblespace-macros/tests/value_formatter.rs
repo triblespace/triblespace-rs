@@ -1,5 +1,5 @@
 use pretty_assertions::assert_eq;
-use triblespace_core::value_formatter::WasmFormatterLimits;
+use triblespace_core::value_formatter::WasmLimits;
 use triblespace_core::value_formatter::WasmValueFormatter;
 use triblespace_macros::value_formatter;
 
@@ -18,7 +18,7 @@ fn demo_formatter_custom(raw: &[u8; 32], out: &mut impl core::fmt::Write) -> Res
 #[test]
 fn compiled_wasm_formatter_runs() {
     let formatter = WasmValueFormatter::new(DEMO_FORMATTER_WASM).expect("compile wasm formatter");
-    let limits = WasmFormatterLimits::default();
+    let limits = WasmLimits::default();
 
     let mut raw = [0u8; 32];
     raw[0] = b'a';
@@ -32,7 +32,7 @@ fn compiled_wasm_formatter_runs() {
 #[test]
 fn custom_const_name_runs() {
     let formatter = WasmValueFormatter::new(CUSTOM_WASM_BYTES).expect("compile wasm formatter");
-    let limits = WasmFormatterLimits::default();
+    let limits = WasmLimits::default();
 
     let mut raw = [0u8; 32];
     raw[0] = 0xAF;

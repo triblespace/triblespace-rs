@@ -47,6 +47,25 @@ pub struct TribleSet {
     pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 
+/// O(1) fingerprint for a [`TribleSet`], derived from the PATCH root hash.
+///
+/// This matches the equality semantics of `TribleSet`, but it is not stable
+/// across process boundaries because PATCH uses a per-process hash key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TribleSetFingerprint(Option<u128>);
+
+impl TribleSetFingerprint {
+    pub const EMPTY: Self = Self(None);
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_none()
+    }
+
+    pub fn as_u128(self) -> Option<u128> {
+        self.0
+    }
+}
+
 type TribleSetInner<'a> =
     Map<crate::patch::PATCHIterator<'a, 64, EAVOrder, ()>, fn(&[u8; 64]) -> &Trible>;
 
@@ -108,6 +127,14 @@ impl TribleSet {
         self.len() == 0
     }
 
+    /// Returns a fast fingerprint suitable for in-memory caching.
+    ///
+    /// The fingerprint matches `TribleSet` equality, but it is not stable
+    /// across process boundaries because PATCH uses a per-process hash key.
+    pub fn fingerprint(&self) -> TribleSetFingerprint {
+        TribleSetFingerprint(self.eav.root_hash())
+    }
+
     pub fn insert(&mut self, trible: &Trible) {
         let key = Entry::new(&trible.data);
         self.eav.insert(&key);
@@ -139,6 +166,18 @@ impl PartialEq for TribleSet {
 }
 
 impl Eq for TribleSet {}
+
+impl Default for TribleSetFingerprint {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl From<&TribleSet> for TribleSetFingerprint {
+    fn from(set: &TribleSet) -> Self {
+        set.fingerprint()
+    }
+}
 
 impl AddAssign for TribleSet {
     fn add_assign(&mut self, rhs: Self) {

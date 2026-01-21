@@ -12,6 +12,7 @@ use crate::value::Value;
 use crate::value::ValueSchema;
 
 pub use tribleset::TribleSet;
+pub use tribleset::TribleSetFingerprint;
 
 /// The length of a trible in bytes.
 pub const TRIBLE_LEN: usize = 64;

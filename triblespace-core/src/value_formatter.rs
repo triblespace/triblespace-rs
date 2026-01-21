@@ -9,14 +9,20 @@ use wasmi::Store;
 use crate::blob::schemas::wasmcode::WasmCode;
 use crate::blob::Blob;
 
+/// Resource limits for sandboxed WASM value formatters.
+///
+/// Defaults are a stable contract within a major version:
+/// - `max_memory_pages`: 8
+/// - `max_fuel`: 5_000_000
+/// - `max_output_bytes`: 8 * 1024
 #[derive(Clone, Copy, Debug)]
-pub struct WasmFormatterLimits {
+pub struct WasmLimits {
     pub max_memory_pages: u32,
     pub max_fuel: u64,
     pub max_output_bytes: usize,
 }
 
-impl Default for WasmFormatterLimits {
+impl Default for WasmLimits {
     fn default() -> Self {
         Self {
             max_memory_pages: 8,
@@ -138,13 +144,13 @@ impl WasmValueFormatter {
     }
 
     pub fn format_value(&self, raw: &[u8; 32]) -> Result<String, WasmFormatterError> {
-        self.format_value_with_limits(raw, WasmFormatterLimits::default())
+        self.format_value_with_limits(raw, WasmLimits::default())
     }
 
     pub fn format_value_with_limits(
         &self,
         raw: &[u8; 32],
-        limits: WasmFormatterLimits,
+        limits: WasmLimits,
     ) -> Result<String, WasmFormatterError> {
         let engine = self.module.engine();
         let mut store = Store::new(engine, ());
@@ -308,7 +314,7 @@ mod tests {
         let formatter = formatter_cache
             .get(formatter_handle(&space, schema_id).expect("formatter handle"))
             .expect("formatter loaded");
-        let limits = WasmFormatterLimits::default();
+        let limits = WasmLimits::default();
 
         let mut raw = [0u8; 32];
         raw[0] = b'Z';
@@ -376,7 +382,7 @@ mod tests {
         let reader = store.reader().expect("blob reader");
         let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
             BlobCache::new(reader);
-        let limits = WasmFormatterLimits::default();
+        let limits = WasmLimits::default();
         let formatter_for = |schema| {
             formatter_cache
                 .get(formatter_handle(&space, schema).expect("formatter handle"))

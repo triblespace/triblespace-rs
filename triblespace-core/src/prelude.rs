@@ -58,6 +58,7 @@ pub use crate::repo::BlobStorePut;
 pub use crate::repo::BranchStore;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
+pub use crate::trible::TribleSetFingerprint;
 pub use crate::value::FromValue;
 pub use crate::value::ToValue;
 pub use crate::value::TryFromValue;

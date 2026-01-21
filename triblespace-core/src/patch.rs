@@ -1081,6 +1081,10 @@ where
         self.len() == 0
     }
 
+    pub(crate) fn root_hash(&self) -> Option<u128> {
+        self.root.as_ref().map(|root| root.hash())
+    }
+
     /// Returns the value associated with `key` if present.
     pub fn get(&self, key: &[u8; KEY_LEN]) -> Option<&V> {
         self.root.as_ref().and_then(|root| root.get(0, key))
