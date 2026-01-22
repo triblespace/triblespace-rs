@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+
+### Changed
+
+## [0.8.0] - 2026-01-22
+### Added
 - `TribleSetFingerprint` plus `TribleSet::fingerprint` for fast, in-process
   cache keys that match `TribleSet` equality.
 - `Workspace::commit` now accepts optional commit metadata, plus
