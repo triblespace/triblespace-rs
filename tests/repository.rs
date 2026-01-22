@@ -18,7 +18,7 @@ fn branch_from_and_pull_with_key() {
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), Some("work"));
+    ws.commit(TribleSet::new(), None, Some("work"));
     repo.push(&mut ws).expect("push");
 
     // pull using a different key should succeed

@@ -96,7 +96,7 @@ mod readme_example {
             ),
         };
 
-        ws.commit(library, Some("import dune"));
+        ws.commit(library, None, Some("import dune"));
 
         let catalog = ws.checkout(..)?;
         let title = "Dune";
@@ -134,6 +134,7 @@ mod readme_example {
         // Stage a non-monotonic update that we plan to reconcile manually.
         ws.commit(
             entity! { &author_id @ literature::firstname: "Francis" },
+            None,
             Some("use pen name"),
         );
 
@@ -141,6 +142,7 @@ mod readme_example {
         let mut collaborator = repo.pull(*branch_id).expect("pull collaborator workspace");
         collaborator.commit(
             entity! { &author_id @ literature::firstname: "Franklin" },
+            None,
             Some("record legal first name"),
         );
         repo.push(&mut collaborator)
@@ -172,6 +174,7 @@ mod readme_example {
 
             ws.commit(
                 entity! { &author_id @ literature::alias: "Francis" },
+                None,
                 Some("keep pen-name as an alias"),
             );
 

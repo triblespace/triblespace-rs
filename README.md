@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
-    ws.commit(library, Some("import dune"));
+    ws.commit(library, None, Some("import dune"));
 
     // `checkout(..)` returns the accumulated TribleSet for the branch.
     let catalog = ws.checkout(..)?;
@@ -157,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage a non-monotonic update that we plan to reconcile manually.
     ws.commit(
         entity! { &author_id @ literature::firstname: "Francis" },
+        None,
         Some("use pen name"),
     );
 
@@ -166,6 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("pull collaborator workspace");
     collaborator.commit(
         entity! { &author_id @ literature::firstname: "Franklin" },
+        None,
         Some("record legal first name"),
     );
     repo.push(&mut collaborator)
@@ -194,6 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         ws.commit(
             entity! { &author_id @ literature::alias: "Francis" },
+            None,
             Some("keep pen-name as an alias"),
         );
 

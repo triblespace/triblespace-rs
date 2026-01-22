@@ -267,7 +267,7 @@ writers. Two options are available:
   conflicting workspace on CAS failure):
 
 ```rust
-ws.commit(content, Some("plan-update"));
+ws.commit(content, None, Some("plan-update"));
 let mut current_ws = ws;
 while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
     incoming.merge(&mut current_ws)?;
@@ -279,7 +279,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
   until success or error):
 
 ```rust
-ws.commit(content, Some("plan-update"));
+ws.commit(content, None, Some("plan-update"));
 // `push` will handle merge+retry internally; it returns Ok(()) on success
 // or an error if the operation ultimately failed.
 repo.push(&mut ws)?;

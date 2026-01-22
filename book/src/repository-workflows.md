@@ -113,7 +113,7 @@ returns `Ok(Some(conflict_ws))` when the branch head moved. Choose the latter
 when you need explicit conflict handling:
 
 ```rust
-ws.commit(change, Some("initial commit"));
+ws.commit(change, None, Some("initial commit"));
 repo.push(&mut ws)?;
 ```
 
@@ -230,7 +230,7 @@ let mut change = triblespace::entity! {
 };
 change += triblespace::entity! { repo::content: archive_handle.clone() };
 
-ws.commit(change, Some("Attach annotated dataset"));
+ws.commit(change, None, Some("Attach annotated dataset"));
 // Single-attempt push. Use `push` to let the repository merge and retry automatically.
 repo.try_push(&mut ws).expect("try_push");
 
@@ -268,7 +268,7 @@ There are two ways to handle this:
   `Ok(Some(conflict_ws))` so callers can merge and retry explicitly:
 
 ```rust
-ws.commit(content, Some("codex-turn"));
+ws.commit(content, None, Some("codex-turn"));
 let mut current_ws = ws;
 while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
     // Merge the local staged changes into the incoming workspace and retry.
@@ -282,7 +282,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
   automatically; it either succeeds (returns `Ok(())`) or returns an error.
 
 ```rust
-ws.commit(content, Some("codex-turn"));
+ws.commit(content, None, Some("codex-turn"));
 repo.push(&mut ws)?; // will internally merge and retry until success
 ```
 
@@ -399,7 +399,7 @@ fn open_remote_repo(raw_url: &str) -> anyhow::Result<()> {
 
     let branch_id = repo.create_branch("main", None)?;
     let mut ws = repo.pull(*branch_id)?;
-    ws.commit(TribleSet::new(), Some("initial commit"));
+    ws.commit(TribleSet::new(), None, Some("initial commit"));
 
     while let Some(mut incoming) = repo.try_push(&mut ws)? {
         incoming.merge(&mut ws)?;

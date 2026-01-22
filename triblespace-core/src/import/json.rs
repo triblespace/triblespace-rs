@@ -10,7 +10,7 @@ use crate::id::ufoid;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::Metadata;
+use crate::metadata::{ConstMetadata, Metadata};
 use crate::repo::BlobStore;
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -186,6 +186,12 @@ where
 
     pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
+        meta.union(<Boolean as ConstMetadata>::describe(self.store)?);
+        meta.union(<F64 as ConstMetadata>::describe(self.store)?);
+        meta.union(<GenId as ConstMetadata>::describe(self.store)?);
+        meta.union(<Handle<Blake3, LongString> as ConstMetadata>::describe(
+            self.store,
+        )?);
         for attr in self.bool_attrs.values() {
             meta.union(attr.describe(self.store)?);
         }

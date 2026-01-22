@@ -46,6 +46,7 @@
 //!         literature::firstname: "Frank",
 //!         literature::lastname: "Herbert",
 //!      },
+//!     None,
 //!     Some("initial commit"),
 //! );
 //!
@@ -726,6 +727,16 @@ where
         self.storage
     }
 
+    /// Borrow the underlying storage backend.
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    /// Borrow the underlying storage backend mutably.
+    pub fn storage_mut(&mut self) -> &mut Storage {
+        &mut self.storage
+    }
+
     /// Replace the repository signing key.
     pub fn set_signing_key(&mut self, signing_key: SigningKey) {
         self.signing_key = signing_key;
@@ -735,9 +746,9 @@ where
     /// The metadata blob is stored in the repository's blob store.
     pub fn set_default_metadata(
         &mut self,
-        metadata: TribleSet,
+        metadata_set: TribleSet,
     ) -> Result<MetadataHandle, <Storage as BlobStorePut<Blake3>>::PutError> {
-        let handle = self.storage.put(metadata)?;
+        let handle = self.storage.put(metadata_set)?;
         self.default_metadata = Some(handle);
         Ok(handle)
     }
@@ -849,7 +860,7 @@ where
         // 2. Get the current commit from the branch metadata.
         let reader = self.storage.reader().map_err(PullError::BlobReader)?;
         let base_branch_meta: TribleSet = match reader.get(base_branch_meta_handle) {
-            Ok(metadata) => metadata,
+            Ok(meta_set) => meta_set,
             Err(e) => return Err(PullError::BlobStorage(e)),
         };
 
@@ -881,7 +892,7 @@ where
     pub fn pull_with_metadata(
         &mut self,
         branch_id: Id,
-        metadata: TribleSet,
+        metadata_set: TribleSet,
     ) -> Result<
         Workspace<Storage>,
         PullError<
@@ -891,7 +902,7 @@ where
         >,
     > {
         let mut workspace = self.pull_with_key(branch_id, self.signing_key.clone())?;
-        workspace.set_default_metadata(metadata);
+        workspace.set_default_metadata(metadata_set);
         Ok(workspace)
     }
 
@@ -1654,10 +1665,10 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
 
     /// Sets the default metadata for commits created in this workspace.
     /// The metadata blob is stored in the workspace's local blob store.
-    pub fn set_default_metadata(&mut self, metadata: TribleSet) -> MetadataHandle {
+    pub fn set_default_metadata(&mut self, metadata_set: TribleSet) -> MetadataHandle {
         let handle = self
             .local_blobs
-            .put(metadata)
+            .put(metadata_set)
             .expect("infallible metadata blob put");
         self.default_metadata = Some(handle);
         handle
@@ -1707,25 +1718,23 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// Performs a commit in the workspace.
     /// This method creates a new commit blob (stored in the local blobset)
     /// and updates the current commit handle.
-    /// If a default metadata handle is configured it is attached automatically.
-    /// Use `commit_with_metadata` to attach per-commit metadata.
-    pub fn commit(&mut self, content_: TribleSet, message_: Option<&str>) {
-        self.commit_internal(content_, self.default_metadata, message_);
-    }
-
-    /// Performs a commit with metadata describing the content.
-    /// This does not change the workspace default metadata.
-    pub fn commit_with_metadata(
+    /// If `metadata` is `None`, a configured default metadata handle is attached
+    /// automatically. Supplying metadata does not change the workspace default.
+    pub fn commit(
         &mut self,
         content_: TribleSet,
-        metadata_: TribleSet,
+        metadata_: Option<TribleSet>,
         message_: Option<&str>,
     ) {
-        let metadata_handle = self
-            .local_blobs
-            .put(metadata_)
-            .expect("infallible metadata blob put");
-        self.commit_internal(content_, Some(metadata_handle), message_);
+        let metadata_handle = match metadata_ {
+            Some(metadata_set) => Some(
+                self.local_blobs
+                    .put(metadata_set)
+                    .expect("infallible metadata blob put"),
+            ),
+            None => self.default_metadata,
+        };
+        self.commit_internal(content_, metadata_handle, message_);
     }
 
     fn commit_internal(

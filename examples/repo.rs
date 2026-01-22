@@ -22,7 +22,7 @@ fn main() {
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Alice" };
 
-    ws1.commit(change, Some("add alice"));
+    ws1.commit(change, None, Some("add alice"));
     // Single-attempt push; handle conflicts manually when required.
     repo.try_push(&mut ws1).expect("try_push ws1");
 
@@ -30,7 +30,7 @@ fn main() {
     let mut ws2 = repo.pull(*branch_id).expect("pull");
     let mut change = TribleSet::new();
     change += entity! { &ufoid() @ literature::firstname: "Bob" };
-    ws2.commit(change, Some("add bob"));
+    ws2.commit(change, None, Some("add bob"));
 
     match repo.try_push(&mut ws2).expect("try_push ws2") {
         None => println!("Push ws2 succeeded"),

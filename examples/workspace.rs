@@ -10,7 +10,7 @@ fn main() {
     // create a new branch and add a commit
     let branch_id = repo.create_branch("feature", None).expect("create branch");
     let mut workspace = repo.pull(*branch_id).expect("pull");
-    workspace.commit(TribleSet::new(), Some("start feature work"));
+    workspace.commit(TribleSet::new(), None, Some("start feature work"));
 
     // attempt to push, merging conflicts before retrying
     while let Some(mut incoming) = repo.try_push(&mut workspace).expect("push") {

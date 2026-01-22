@@ -180,7 +180,7 @@ where
         return;
     }
 
-    workspace.commit(set, None);
+    workspace.commit(set, None, None);
 
     {
         let mut context = MetadataContext {
@@ -267,7 +267,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
                 ::triblespace_core::macros::entity! { &entity @ attribute::attribute_type: handle };
         }
 
-        context.workspace().commit(set, None);
+        context.workspace().commit(set, None, None);
     }
 }
 

@@ -19,7 +19,7 @@ fn workspace_commit_updates_head() {
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), Some("change"));
+    ws.commit(TribleSet::new(), None, Some("change"));
 
     repo.push(&mut ws).expect("push");
 }
@@ -52,7 +52,7 @@ fn workspace_checkout_unions_commits() {
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
 
-    ws.commit(s1.clone(), None);
+    ws.commit(s1.clone(), None, None);
     let c1 = ws.head().unwrap();
 
     let e2 = ufoid();
@@ -62,7 +62,7 @@ fn workspace_checkout_unions_commits() {
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
 
-    ws.commit(s2.clone(), None);
+    ws.commit(s2.clone(), None, None);
     let c2 = ws.head().unwrap();
 
     let result = ws.checkout(&[c1, c2][..]).expect("checkout");
@@ -89,7 +89,7 @@ fn workspace_checkout_single_commit() {
     let mut s = TribleSet::new();
     s.insert(&t);
 
-    ws.commit(s.clone(), None);
+    ws.commit(s.clone(), None, None);
     let c = ws.head().unwrap();
 
     let result = ws.checkout(c).expect("checkout single");
@@ -115,7 +115,7 @@ fn workspace_checkout_vec_commits() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
         commits.push(ws.head().unwrap());
     }
@@ -153,11 +153,11 @@ fn workspace_checkout_metadata_unions_commits() {
     let mut m2 = TribleSet::new();
     m2.insert(&t2);
 
-    ws.commit_with_metadata(TribleSet::new(), m1.clone(), None);
+    ws.commit(TribleSet::new(), Some(m1.clone()), None);
     let c1 = ws.head().unwrap();
-    ws.commit_with_metadata(TribleSet::new(), m2.clone(), None);
+    ws.commit(TribleSet::new(), Some(m2.clone()), None);
     let c2 = ws.head().unwrap();
-    ws.commit(TribleSet::new(), None);
+    ws.commit(TribleSet::new(), None, None);
     let c3 = ws.head().unwrap();
 
     let result = ws
@@ -193,7 +193,7 @@ fn workspace_checkout_with_metadata_returns_both() {
     let mut meta = TribleSet::new();
     meta.insert(&meta_t);
 
-    ws.commit_with_metadata(data.clone(), meta.clone(), None);
+    ws.commit(data.clone(), Some(meta.clone()), None);
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
@@ -228,7 +228,7 @@ fn workspace_commit_uses_default_metadata() {
     meta.insert(&meta_t);
 
     ws.set_default_metadata(meta.clone());
-    ws.commit(data.clone(), None);
+    ws.commit(data.clone(), None, None);
     let c = ws.head().unwrap();
 
     let (data_out, meta_out) = ws
@@ -258,7 +258,7 @@ fn repository_default_metadata_seeds_workspaces() {
 
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), None);
+    ws.commit(TribleSet::new(), None, None);
     let c = ws.head().unwrap();
 
     let (_, meta_out) = ws
@@ -269,7 +269,7 @@ fn repository_default_metadata_seeds_workspaces() {
 }
 
 #[test]
-fn commit_with_metadata_does_not_override_default() {
+fn commit_metadata_does_not_override_default() {
     use triblespace::core::value::schemas::r256::R256;
 
     let storage = MemoryRepo::default();
@@ -292,11 +292,11 @@ fn commit_with_metadata_does_not_override_default() {
     let mut alt_meta = TribleSet::new();
     alt_meta.insert(&alt_t);
 
-    ws.commit(TribleSet::new(), None);
+    ws.commit(TribleSet::new(), None, None);
     let c1 = ws.head().unwrap();
-    ws.commit_with_metadata(TribleSet::new(), alt_meta.clone(), None);
+    ws.commit(TribleSet::new(), Some(alt_meta.clone()), None);
     let c2 = ws.head().unwrap();
-    ws.commit(TribleSet::new(), None);
+    ws.commit(TribleSet::new(), None, None);
     let c3 = ws.head().unwrap();
 
     let (_, meta1) = ws.checkout_with_metadata(c1).expect("checkout meta1");
@@ -326,7 +326,7 @@ fn workspace_checkout_range_variants() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -439,7 +439,7 @@ fn workspace_checkout_symmetric_diff() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -469,7 +469,7 @@ fn workspace_checkout_set_operation_selectors() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
         handles.push(ws.head().unwrap());
     }
@@ -513,7 +513,7 @@ fn workspace_get_local_and_base() {
     set.insert(&t);
 
     let handle = ws.put(set.clone());
-    ws.commit(set.clone(), None);
+    ws.commit(set.clone(), None, None);
 
     let local: TribleSet = ws.get(handle).expect("get local");
     assert_eq!(local, set);
@@ -543,7 +543,7 @@ fn workspace_checkout_head_collects_history() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
     }
 
@@ -574,7 +574,7 @@ fn workspace_nth_ancestor_selector() {
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
-        ws.commit(s.clone(), None);
+        ws.commit(s.clone(), None, None);
         sets.push(s);
     }
 
@@ -607,7 +607,7 @@ fn workspace_parents_selector() {
     let t0 = Trible::new(&e0, &a0, &v0);
     let mut s0 = TribleSet::new();
     s0.insert(&t0);
-    ws_main.commit(s0, None);
+    ws_main.commit(s0, None, None);
     repo.push(&mut ws_main).expect("push base");
 
     // Fork a second workspace from the same base commit.
@@ -620,7 +620,7 @@ fn workspace_parents_selector() {
     let t1 = Trible::new(&e1, &a1, &v1);
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
-    ws_main.commit(s1.clone(), None);
+    ws_main.commit(s1.clone(), None, None);
 
     let e2 = ufoid();
     let a2 = ufoid();
@@ -628,7 +628,7 @@ fn workspace_parents_selector() {
     let t2 = Trible::new(&e2, &a2, &v2);
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
-    ws_feature.commit(s2.clone(), None);
+    ws_feature.commit(s2.clone(), None, None);
 
     // Merge the feature workspace into main to create a commit with two parents.
     ws_main.merge(&mut ws_feature).expect("merge workspaces");
@@ -661,15 +661,15 @@ fn workspace_history_of_entity() {
 
     let mut s1 = TribleSet::new();
     s1.insert(&Trible::new(&entity, &a1, &v1));
-    ws.commit(s1.clone(), None);
+    ws.commit(s1.clone(), None, None);
 
     let mut s2 = TribleSet::new();
     s2.insert(&Trible::new(&ufoid(), &a1, &v1));
-    ws.commit(s2.clone(), None);
+    ws.commit(s2.clone(), None, None);
 
     let mut s3 = TribleSet::new();
     s3.insert(&Trible::new(&entity, &a2, &v2));
-    ws.commit(s3.clone(), None);
+    ws.commit(s3.clone(), None, None);
 
     let result = ws.checkout(history_of(*entity)).expect("history_of");
 

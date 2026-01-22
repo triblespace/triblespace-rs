@@ -25,7 +25,7 @@ fn objectstore_workspace_commit_updates_head() {
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), Some("change"));
+    ws.commit(TribleSet::new(), None, Some("change"));
 
     repo.push(&mut ws).expect("push");
 }
@@ -43,7 +43,7 @@ fn objectstore_branch_from_and_pull_with_key() {
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), Some("work"));
+    ws.commit(TribleSet::new(), None, Some("work"));
     repo.push(&mut ws).expect("push");
 
     let other_key = SigningKey::generate(&mut OsRng);
@@ -60,8 +60,8 @@ fn objectstore_push_and_merge_conflict_resolution() {
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), Some("first"));
-    ws2.commit(TribleSet::new(), Some("second"));
+    ws1.commit(TribleSet::new(), None, Some("first"));
+    ws2.commit(TribleSet::new(), None, Some("second"));
 
     repo.push(&mut ws1).expect("push");
 

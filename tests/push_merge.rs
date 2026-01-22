@@ -12,8 +12,8 @@ fn push_and_merge_conflict_resolution() {
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), Some("first"));
-    ws2.commit(TribleSet::new(), Some("second"));
+    ws1.commit(TribleSet::new(), None, Some("first"));
+    ws2.commit(TribleSet::new(), None, Some("second"));
 
     repo.push(&mut ws1).expect("push");
 
