@@ -9,7 +9,7 @@ use triblespace::prelude::*;
 fn branch_update_success_and_conflict() {
     let mut store = MemoryRepo::default();
     let key = SigningKey::generate(&mut OsRng);
-    let commit1 = repo::commit::commit_metadata(&key, [], None, None);
+    let commit1 = repo::commit::commit_metadata(&key, [], None, None, None);
     let h1 = store.put(commit1).unwrap();
     let branch_id = *ufoid();
 
@@ -18,7 +18,7 @@ fn branch_update_success_and_conflict() {
         _ => panic!("expected success"),
     }
 
-    let commit2 = repo::commit::commit_metadata(&key, [h1], None, None);
+    let commit2 = repo::commit::commit_metadata(&key, [h1], None, None, None);
     let h2 = store.put(commit2).unwrap();
 
     match store.update(branch_id, None, h2) {

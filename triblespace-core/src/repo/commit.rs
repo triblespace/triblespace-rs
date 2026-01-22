@@ -32,16 +32,18 @@ impl From<SignatureError> for ValidationError {
     }
 }
 
-/// Constructs commit metadata describing `content` and its parent commits.
+/// Constructs commit metadata describing `content`, optional `metadata`, and its parent commits.
 ///
 /// The resulting [`TribleSet`] is signed using `signing_key` so that its
 /// authenticity can later be verified. If `msg` is provided it is stored as a
-/// long commit message via a LongString blob handle.
+/// long commit message via a LongString blob handle. If `metadata` is provided
+/// it is stored as a SimpleArchive handle.
 pub fn commit_metadata(
     signing_key: &SigningKey,
     parents: impl IntoIterator<Item = Value<Handle<Blake3, SimpleArchive>>>,
     msg: Option<Value<Handle<Blake3, LongString>>>,
     content: Option<Blob<SimpleArchive>>,
+    metadata: Option<Value<Handle<Blake3, SimpleArchive>>>,
 ) -> TribleSet {
     let mut commit = TribleSet::new();
     let commit_entity = crate::id::rngid();
@@ -64,6 +66,12 @@ pub fn commit_metadata(
     if let Some(h) = msg {
         commit += entity! { &commit_entity @
            super::message: h,
+        };
+    }
+
+    if let Some(handle) = metadata {
+        commit += entity! { &commit_entity @
+           super::metadata: handle,
         };
     }
 

@@ -9,8 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `TribleSetFingerprint` plus `TribleSet::fingerprint` for fast, in-process
   cache keys that match `TribleSet` equality.
+- `Workspace::commit_with_metadata`, `Workspace::checkout_metadata`, and
+  `Workspace::checkout_with_metadata` for attaching and reading commit metadata
+  `TribleSet`s. `commit_with_metadata` always attaches the supplied metadata
+  and does not modify the workspace default.
+- `Repository::set_default_metadata` and `Workspace::set_default_metadata`
+  for configuring default commit metadata handles, plus
+  `Repository::pull_with_metadata` for per-workspace overrides.
 ### Changed
 - Renamed `WasmFormatterLimits` to `WasmLimits`.
+- Commits can now carry an optional `metadata` handle alongside `content`.
+- `repo::commit::commit_metadata` now takes an optional metadata handle instead
+  of a metadata blob.
 - `CommitSelector` ranges now treat branches without a head commit as empty
   history, so `Workspace::checkout` returns an empty `TribleSet` instead of an
   error when no commits exist.

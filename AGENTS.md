@@ -17,6 +17,7 @@ The project balances a few key goals:
 * For quick iterations, run `./scripts/devtest.sh` to execute only the tests.
 * Before committing, execute `./scripts/preflight.sh` from the repository root. This script runs formatting checks and tests. Kani proofs run separately via `./scripts/verify.sh`, which normally shouldn't be executed locally.
 * Before starting any new task, read the entire contents of the `./book` directory so you're grounded in the project's concepts and terminology.
+* Use `trible genid` to generate new attribute ids instead of hand-rolling hex values.
 * Avoid committing files in `target/` or other build artifacts listed in `.gitignore`.
 * Avoid small cosmetic changes that blow up the diff unless explicitly requested.
 * Use clear commit messages describing the change.
@@ -62,4 +63,3 @@ Kani verification can be expensive. To keep proof times manageable:
   `verify.sh` or in CI.
 * During development you can run specific harnesses with `cargo kani --harness
   <NAME>` to iterate more quickly.
-

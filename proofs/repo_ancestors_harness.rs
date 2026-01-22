@@ -32,7 +32,7 @@ fn ancestors_respects_bounded_commit_dags() {
             .flatten()
             .map(|&parent_index| commit_handles[parent_index]);
 
-        let metadata = commit::commit_metadata(&signing_key, parent_handles, None, None);
+        let metadata = commit::commit_metadata(&signing_key, parent_handles, None, None, None);
         let handle = storage
             .blobs
             .put(metadata)

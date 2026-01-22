@@ -166,7 +166,6 @@ use crate::blob::TryFromBlob;
 use crate::find;
 use crate::id::ufoid;
 use crate::id::Id;
-use crate::metadata;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
@@ -191,6 +190,8 @@ use crate::value::schemas::time::NsTAIInterval;
 attributes! {
     /// The actual data of the commit.
     "4DD4DDD05CC31734B03ABB4E43188B1F" as pub content: Handle<Blake3, SimpleArchive>;
+    /// Metadata describing the commit content.
+    "88B59BD497540AC5AECDB7518E737C87" as pub metadata: Handle<Blake3, SimpleArchive>;
     /// A commit that this commit is based on.
     "317044B612C690000D798CA660ECFD2A" as pub parent: Handle<Blake3, SimpleArchive>;
     /// A (potentially long) message describing the commit.
@@ -656,6 +657,7 @@ where
 pub struct Repository<Storage: BlobStore<Blake3> + BranchStore<Blake3>> {
     storage: Storage,
     signing_key: SigningKey,
+    default_metadata: Option<MetadataHandle>,
 }
 
 pub enum PullError<BranchStorageErr, BlobReaderErr, BlobStorageErr>
@@ -711,6 +713,7 @@ where
         Self {
             storage,
             signing_key,
+            default_metadata: None,
         }
     }
 
@@ -726,6 +729,27 @@ where
     /// Replace the repository signing key.
     pub fn set_signing_key(&mut self, signing_key: SigningKey) {
         self.signing_key = signing_key;
+    }
+
+    /// Sets the repository default metadata for new workspaces.
+    /// The metadata blob is stored in the repository's blob store.
+    pub fn set_default_metadata(
+        &mut self,
+        metadata: TribleSet,
+    ) -> Result<MetadataHandle, <Storage as BlobStorePut<Blake3>>::PutError> {
+        let handle = self.storage.put(metadata)?;
+        self.default_metadata = Some(handle);
+        Ok(handle)
+    }
+
+    /// Clears the repository default metadata.
+    pub fn clear_default_metadata(&mut self) {
+        self.default_metadata = None;
+    }
+
+    /// Returns the repository default metadata handle, if configured.
+    pub fn default_metadata(&self) -> Option<MetadataHandle> {
+        self.default_metadata
     }
 
     /// Initializes a new branch in the repository.
@@ -788,6 +812,7 @@ where
     }
 
     /// Pulls an existing branch using the repository's signing key.
+    /// The workspace inherits the repository default metadata if configured.
     pub fn pull(
         &mut self,
         branch_id: Id,
@@ -848,7 +873,26 @@ where
             base_branch_id: branch_id,
             base_branch_meta: base_branch_meta_handle,
             signing_key,
+            default_metadata: self.default_metadata,
         })
+    }
+
+    /// Pulls an existing branch and overrides the workspace default metadata.
+    pub fn pull_with_metadata(
+        &mut self,
+        branch_id: Id,
+        metadata: TribleSet,
+    ) -> Result<
+        Workspace<Storage>,
+        PullError<
+            Storage::HeadError,
+            Storage::ReaderError,
+            <Storage::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+        >,
+    > {
+        let mut workspace = self.pull_with_key(branch_id, self.signing_key.clone())?;
+        workspace.set_default_metadata(metadata);
+        Ok(workspace)
     }
 
     /// Pushes the workspace's new blobs and commit to the persistent repository.
@@ -906,7 +950,7 @@ where
             .map_err(PushError::StorageGet)?;
 
         let Ok((branch_name,)) = find!((name: Value<_>),
-            pattern!(base_branch_meta, [{ metadata::shortname: ?name }])
+            pattern!(base_branch_meta, [{ crate::metadata::shortname: ?name }])
         )
         .exactly_one() else {
             return Err(PushError::BadBranchMetadata());
@@ -980,6 +1024,7 @@ where
                     base_branch_id: workspace.base_branch_id,
                     base_branch_meta: conflicting_meta,
                     signing_key: workspace.signing_key.clone(),
+                    default_metadata: workspace.default_metadata,
                 };
 
                 Ok(Some(conflict_ws))
@@ -989,6 +1034,7 @@ where
 }
 
 type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+type MetadataHandle = Value<Handle<Blake3, SimpleArchive>>;
 type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
 type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
 
@@ -1014,6 +1060,8 @@ pub struct Workspace<Blobs: BlobStore<Blake3>> {
     base_head: Option<CommitHandle>,
     /// Signing key used for commit/branch signing.
     signing_key: SigningKey,
+    /// Optional default metadata handle for commits created in this workspace.
+    default_metadata: Option<MetadataHandle>,
 }
 
 impl<Blobs> fmt::Debug for Workspace<Blobs>
@@ -1029,6 +1077,7 @@ where
             .field("base_branch_meta", &self.base_branch_meta)
             .field("base_head", &self.base_head)
             .field("head", &self.head)
+            .field("default_metadata", &self.default_metadata)
             .finish()
     }
 }
@@ -1603,6 +1652,27 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         self.head
     }
 
+    /// Sets the default metadata for commits created in this workspace.
+    /// The metadata blob is stored in the workspace's local blob store.
+    pub fn set_default_metadata(&mut self, metadata: TribleSet) -> MetadataHandle {
+        let handle = self
+            .local_blobs
+            .put(metadata)
+            .expect("infallible metadata blob put");
+        self.default_metadata = Some(handle);
+        handle
+    }
+
+    /// Clears the default metadata for commits created in this workspace.
+    pub fn clear_default_metadata(&mut self) {
+        self.default_metadata = None;
+    }
+
+    /// Returns the default metadata handle, if configured.
+    pub fn default_metadata(&self) -> Option<MetadataHandle> {
+        self.default_metadata
+    }
+
     /// Adds a blob to the workspace's local blob store.
     /// Mirrors [`BlobStorePut::put`](crate::repo::BlobStorePut) for ease of use.
     pub fn put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>
@@ -1637,8 +1707,34 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// Performs a commit in the workspace.
     /// This method creates a new commit blob (stored in the local blobset)
     /// and updates the current commit handle.
+    /// If a default metadata handle is configured it is attached automatically.
+    /// Use `commit_with_metadata` to attach per-commit metadata.
     pub fn commit(&mut self, content_: TribleSet, message_: Option<&str>) {
-        // 1. Create a commit blob from the current head, content and the commit message (if any).
+        self.commit_internal(content_, self.default_metadata, message_);
+    }
+
+    /// Performs a commit with metadata describing the content.
+    /// This does not change the workspace default metadata.
+    pub fn commit_with_metadata(
+        &mut self,
+        content_: TribleSet,
+        metadata_: TribleSet,
+        message_: Option<&str>,
+    ) {
+        let metadata_handle = self
+            .local_blobs
+            .put(metadata_)
+            .expect("infallible metadata blob put");
+        self.commit_internal(content_, Some(metadata_handle), message_);
+    }
+
+    fn commit_internal(
+        &mut self,
+        content_: TribleSet,
+        metadata_handle: Option<MetadataHandle>,
+        message_: Option<&str>,
+    ) {
+        // 1. Create a commit blob from the current head, content, metadata and the commit message.
         let content_blob = content_.to_blob();
         // If a message is provided, store it as a LongString blob and pass the handle.
         let message_handle = message_.map(|m| self.put::<LongString, String>(m.to_string()));
@@ -1649,6 +1745,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
             parents,
             message_handle,
             Some(content_blob.clone()),
+            metadata_handle,
         );
         // 2. Store the content and commit blobs in `self.local_blobs`.
         let _ = self
@@ -1693,6 +1790,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
             parents,
             None, // No message for the merge commit
             None, // No content blob for the merge commit
+            None, // No metadata blob for the merge commit
         );
         // 3. Store the merge commit in self.local_blobs.
         let commit_handle = self
@@ -1720,7 +1818,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         // combining `reachable` with `transfer`).
 
         let parents = self.head.iter().copied().chain(Some(other));
-        let merge_commit = commit_metadata(&self.signing_key, parents, None, None);
+        let merge_commit = commit_metadata(&self.signing_key, parents, None, None, None);
         let commit_handle = self
             .local_blobs
             .put(merge_commit)
@@ -1778,6 +1876,94 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         Ok(result)
     }
 
+    fn checkout_commits_metadata<I>(
+        &mut self,
+        commits: I,
+    ) -> Result<
+        TribleSet,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    >
+    where
+        I: IntoIterator<Item = CommitHandle>,
+    {
+        let local = self.local_blobs.reader().unwrap();
+        let mut result = TribleSet::new();
+        for commit in commits {
+            let meta: TribleSet = local
+                .get(commit)
+                .or_else(|_| self.base_blobs.get(commit))
+                .map_err(WorkspaceCheckoutError::Storage)?;
+
+            let metadata_opt =
+                match find!((c: Value<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                    Ok(Some((c,))) => Some(c),
+                    Ok(None) => None,
+                    Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
+                };
+
+            if let Some(c) = metadata_opt {
+                let set: TribleSet = local
+                    .get(c)
+                    .or_else(|_| self.base_blobs.get(c))
+                    .map_err(WorkspaceCheckoutError::Storage)?;
+                result.union(set);
+            }
+        }
+        Ok(result)
+    }
+
+    fn checkout_commits_with_metadata<I>(
+        &mut self,
+        commits: I,
+    ) -> Result<
+        (TribleSet, TribleSet),
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    >
+    where
+        I: IntoIterator<Item = CommitHandle>,
+    {
+        let local = self.local_blobs.reader().unwrap();
+        let mut data = TribleSet::new();
+        let mut metadata_set = TribleSet::new();
+        for commit in commits {
+            let meta: TribleSet = local
+                .get(commit)
+                .or_else(|_| self.base_blobs.get(commit))
+                .map_err(WorkspaceCheckoutError::Storage)?;
+
+            let content_opt =
+                match find!((c: Value<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
+                    Ok(Some((c,))) => Some(c),
+                    Ok(None) => None,
+                    Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
+                };
+
+            if let Some(c) = content_opt {
+                let set: TribleSet = local
+                    .get(c)
+                    .or_else(|_| self.base_blobs.get(c))
+                    .map_err(WorkspaceCheckoutError::Storage)?;
+                data.union(set);
+            }
+
+            let metadata_opt =
+                match find!((c: Value<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                    Ok(Some((c,))) => Some(c),
+                    Ok(None) => None,
+                    Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
+                };
+
+            if let Some(c) = metadata_opt {
+                let set: TribleSet = local
+                    .get(c)
+                    .or_else(|_| self.base_blobs.get(c))
+                    .map_err(WorkspaceCheckoutError::Storage)?;
+                metadata_set.union(set);
+            }
+        }
+        Ok((data, metadata_set))
+    }
+
     /// Returns the combined [`TribleSet`] for the specified commits or commit
     /// ranges. `spec` can be a single [`CommitHandle`], an iterator of handles
     /// or any of the standard range types over `CommitHandle`.
@@ -1795,13 +1981,47 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         let commits = patch.iter().map(|raw| Value::new(*raw));
         self.checkout_commits(commits)
     }
+
+    /// Returns the combined metadata [`TribleSet`] for the specified commits.
+    /// Commits without metadata handles contribute an empty set.
+    pub fn checkout_metadata<R>(
+        &mut self,
+        spec: R,
+    ) -> Result<
+        TribleSet,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    >
+    where
+        R: CommitSelector<Blobs>,
+    {
+        let patch = spec.select(self)?;
+        let commits = patch.iter().map(|raw| Value::new(*raw));
+        self.checkout_commits_metadata(commits)
+    }
+
+    /// Returns the combined data and metadata [`TribleSet`] for the specified commits.
+    /// Metadata is loaded from each commit's `metadata` handle, when present.
+    pub fn checkout_with_metadata<R>(
+        &mut self,
+        spec: R,
+    ) -> Result<
+        (TribleSet, TribleSet),
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    >
+    where
+        R: CommitSelector<Blobs>,
+    {
+        let patch = spec.select(self)?;
+        let commits = patch.iter().map(|raw| Value::new(*raw));
+        self.checkout_commits_with_metadata(commits)
+    }
 }
 
 #[derive(Debug)]
 pub enum WorkspaceCheckoutError<GetErr: Error> {
     /// Error retrieving blobs from storage.
     Storage(GetErr),
-    /// Commit metadata is malformed or missing required fields.
+    /// Commit metadata is malformed or ambiguous.
     BadCommitMetadata(),
 }
 
@@ -1810,7 +2030,7 @@ impl<E: Error + fmt::Debug> fmt::Display for WorkspaceCheckoutError<E> {
         match self {
             WorkspaceCheckoutError::Storage(e) => write!(f, "storage error: {e}"),
             WorkspaceCheckoutError::BadCommitMetadata() => {
-                write!(f, "commit metadata missing content field")
+                write!(f, "commit metadata malformed")
             }
         }
     }
