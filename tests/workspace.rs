@@ -25,6 +25,18 @@ fn workspace_commit_updates_head() {
 }
 
 #[test]
+fn workspace_checkout_empty_branch_returns_empty_set() {
+    let storage = MemoryRepo::default();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let branch_id = repo.create_branch("main", None).expect("create branch");
+    let mut ws = repo.pull(*branch_id).expect("pull");
+
+    let result = ws.checkout(..).expect("checkout empty branch");
+
+    assert!(result.is_empty());
+}
+
+#[test]
 fn workspace_checkout_unions_commits() {
     use triblespace::core::value::schemas::r256::R256;
 

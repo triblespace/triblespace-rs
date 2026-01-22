@@ -1406,7 +1406,9 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let head_ = ws.head.ok_or(WorkspaceCheckoutError::NoHead)?;
+        let Some(head_) = ws.head else {
+            return Ok(CommitSet::new());
+        };
         let entity = self.0;
         filter(
             ancestors(head_),
@@ -1509,7 +1511,9 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let head_ = ws.head.ok_or(WorkspaceCheckoutError::NoHead)?;
+        let Some(head_) = ws.head else {
+            return Ok(CommitSet::new());
+        };
         let exclude_patch = self.start.select(ws)?;
 
         let mut head_patch = CommitSet::new();
@@ -1547,7 +1551,9 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let head_ = ws.head.ok_or(WorkspaceCheckoutError::NoHead)?;
+        let Some(head_) = ws.head else {
+            return Ok(CommitSet::new());
+        };
         collect_reachable(ws, head_)
     }
 }
@@ -1563,7 +1569,9 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let head_ = ws.head.ok_or(WorkspaceCheckoutError::NoHead)?;
+        let Some(head_) = ws.head else {
+            return Ok(CommitSet::new());
+        };
         let start = self.0;
         let end = self.1;
         filter(
@@ -1795,8 +1803,6 @@ pub enum WorkspaceCheckoutError<GetErr: Error> {
     Storage(GetErr),
     /// Commit metadata is malformed or missing required fields.
     BadCommitMetadata(),
-    /// The workspace has no commits yet.
-    NoHead,
 }
 
 impl<E: Error + fmt::Debug> fmt::Display for WorkspaceCheckoutError<E> {
@@ -1806,7 +1812,6 @@ impl<E: Error + fmt::Debug> fmt::Display for WorkspaceCheckoutError<E> {
             WorkspaceCheckoutError::BadCommitMetadata() => {
                 write!(f, "commit metadata missing content field")
             }
-            WorkspaceCheckoutError::NoHead => write!(f, "workspace has no commits"),
         }
     }
 }

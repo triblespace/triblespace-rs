@@ -44,6 +44,8 @@
   intersect B". Commit sets themselves would be formed by primitives
   like `ancestors(<commit>)` and `descendants(<commit>)` so selectors
   map directly to the commit graph.
+- Add tests that cover `CommitSelector` and `Workspace::checkout` behavior when
+  a branch has no head commit.
 - Generate `attributes!` modules from a `TribleSet` description so tooling can
   derive them programmatically. Rewriting `pattern!` as a procedural
   macro will be the first step toward this automation.

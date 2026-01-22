@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache keys that match `TribleSet` equality.
 ### Changed
 - Renamed `WasmFormatterLimits` to `WasmLimits`.
+- `CommitSelector` ranges now treat branches without a head commit as empty
+  history, so `Workspace::checkout` returns an empty `TribleSet` instead of an
+  error when no commits exist.
 
 ## [0.7.0] - 2026-01-18
 ### Changed
