@@ -6,9 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.9.0] - 2026-02-03
 ### Added
+- Lossless JSON importer that preserves structure and ordering with explicit
+  node/entry entities and content-addressed ids.
+- `FileBytes` blob schema for explicit file-backed byte payloads.
 
 ### Changed
+- Removed the serde-based and non-deterministic JSON importers; the remaining
+  deterministic importer is now `JsonObjectImporter`.
+- Renamed JSON importers for clarity: `JsonImporter` -> `JsonObjectImporter`,
+  `LosslessWinnowJsonImporter` -> `JsonTreeImporter`, and `json_lossless` ->
+  `json_tree`.
+
+### Fixed
+- Added the missing `Value` import in the lossless JSON importer.
 
 ## [0.8.0] - 2026-01-22
 ### Added
@@ -82,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Attribute identifiers derived from hashed names now use the rightmost 16 bytes
   of the Blake3 digest to stay consistent with the ID-to-value layout.
 - Consolidated JSON import into a single deterministic
-  `import::json::JsonImporter` with fixed primitive mappings and optional salt
+  `import::json::JsonObjectImporter` with fixed primitive mappings and optional salt
   support, replacing the prior nondeterministic importer and configurable
   encoder callbacks.
 ### Added
@@ -106,7 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and unpacking helpers that enforce the non-nil invariant.
 - Bundled the `canada.json`, `citm_catalog.json`, and `twitter.json` datasets to
   keep the JSON import benchmark self-contained.
-- `import::json::JsonImporter` for deterministic JSON imports that map strings
+- `import::json::JsonObjectImporter` for deterministic JSON imports that map strings
   to `Handle<Blake3, LongString>`, numbers to `F256`, booleans to `Boolean`,
   and nested objects to `GenId` links, hashing attribute/value pairs (with an
   optional 32-byte salt) to derive stable entity ids, while streaming blobs into
@@ -325,7 +338,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root entities, keeping primitive roots rejected while permitting batches of
   objects.
 - Simplified the JSON importer API to return root ids while exposing data and
-  metadata via accessors on `JsonImporter`, avoiding an extra wrapper type.
+  metadata via accessors on `JsonObjectImporter`, avoiding an extra wrapper type.
 - Simplified JSON importer error diagnostics to avoid tracking JSON paths in
   the hot import loop.
 - JSON importers now emit `metadata::name` and `metadata::attr_value_schema`

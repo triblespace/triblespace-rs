@@ -8,13 +8,19 @@ attributes, and outlines how you can extend the same patterns to new formats.
 ## Import Namespace Overview
 
 The `triblespace_core::import` module collects conversion helpers that translate
-structured documents into raw tribles. Today the namespace ships with a single
-deterministic JSON importer:
+structured documents into raw tribles. Today the namespace ships with two
+deterministic JSON importers:
 
-- `JsonImporter` hashes attribute/value pairs to derive entity identifiers so
-  identical inputs reproduce the same entities. Construct it with a blob sink
-  (e.g., a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte
-  salt when you want to mix in extra entropy to avoid collisions.
+- `JsonObjectImporter` hashes attribute/value pairs to derive entity identifiers
+  so identical inputs reproduce the same entities. It accepts a top-level JSON
+  object (or a top-level array of objects). Construct it with a blob sink (e.g.,
+  a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte salt when
+  you want to mix in extra entropy to avoid collisions.
+- `JsonTreeImporter` preserves the full JSON structure and ordering by emitting
+  explicit node and entry entities (a JSON AST). It derives content-addressed
+  identifiers from the JSON values themselves so identical subtrees deduplicate
+  across overlapping imports. Unlike the object importer it can represent
+  arbitrary JSON roots, including primitives.
 
 The importer uses a fixed mapping for JSON primitives:
 
@@ -26,7 +32,7 @@ Arrays are treated as multi-valued fields; every element becomes its own trible
 under the same attribute identifier. Nested objects recurse automatically,
 linking parent to child entities through `GenId` attributes derived from the
 containing field name. After feeding one or more JSON documents through
-`import_value` or `import_str`, call `data()` to inspect the emitted tribles and
+`import_blob` or `import_str`, call `data()` to inspect the emitted tribles and
 `metadata()` to retrieve attribute descriptors and multi-value hints (a
 `metadata::tag` edge pointing to `metadata::KIND_MULTI`). Use
 `clear_data()` to drop accumulated statements while keeping attribute caches, or
@@ -68,6 +74,22 @@ that points at the child entity, allowing the importer to represent the entire
 object graph as a connected set of tribles. Because those `GenId` attributes are
 also derived from the parent field names they remain stable even when you import
 related documents in separate batches.
+
+## Lossless JSON Import
+
+`JsonTreeImporter` trades the compact attribute/value encoding for a
+lossless JSON AST representation. Each JSON value becomes a node tagged with a
+kind (`json_tree::kind_*`). Objects and arrays emit explicit entry entities
+that store field names and indices (`json_tree::field_*` and
+`json_tree::array_*`), preserving ordering and allowing repeated keys.
+Numbers are stored as raw decimal strings via `Handle<Blake3, LongString>` so
+precision is not lost. Array and field indices are stored as `U256BE` to keep
+ordering exact even for large collections.
+
+Because node identifiers are derived from the content of each value, identical
+subtrees converge automatically when you import overlapping backups. This makes
+lossless imports a good archival layer: you can keep full-fidelity raw JSON and
+still layer semantic projections on top.
 
 ## Managing Entity Identifiers
 

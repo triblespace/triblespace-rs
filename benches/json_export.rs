@@ -10,7 +10,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
-use triblespace::core::import::json_winnow::DeterministicWinnowJsonImporter;
+use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::{BlobStore, TribleSet};
 
@@ -58,8 +58,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .filter_map(|fixture| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let (merged, root, data_tribles) = {
-                let mut importer =
-                    DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+                let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                 let roots = importer
                     .import_blob(Blob::<LongString>::new(Bytes::from(
                         fixture.payload.clone().into_bytes(),
@@ -233,8 +232,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let (merged, root) = {
-                        let mut importer =
-                            DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+                        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                         let roots = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(
                                 prepared.payload.clone().into_bytes(),
@@ -270,8 +268,7 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let (merged, root) = {
-                        let mut importer =
-                            DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+                        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                         let roots = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
                             .expect("import JSON");

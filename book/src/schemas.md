@@ -122,6 +122,7 @@ let schema_id = <ShortString as ConstMetadata>::id();
 The crate also ships with these blob schemas:
 
 - `LongString` for arbitrarily long UTF‑8 strings.
+- `FileBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
   type](https://docs.rs/tribles/latest/tribles/blob/schemas/succinctarchive/struct.SuccinctArchive.html)

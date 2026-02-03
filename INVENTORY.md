@@ -33,6 +33,8 @@
   `attributes!` modules in the book.
 - Helper to derive delta `TribleSet`s for `pattern_changes!` so callers don't
   have to compute them manually.
+- Add an exporter for the lossless JSON schema so archived JSON can be
+  reconstructed (including field ordering).
 - Add a diagnosis tool that reports attributes missing `shortname`,
   `value_schema`, or `value_formatter` metadata so strict renderers can explain
   omissions.

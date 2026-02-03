@@ -4,7 +4,7 @@ use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;
-use triblespace_core::import::json_winnow::DeterministicWinnowJsonImporter;
+use triblespace_core::import::json::JsonObjectImporter;
 use triblespace_core::prelude::valueschemas::Blake3;
 use triblespace_core::prelude::BlobStore;
 
@@ -21,7 +21,7 @@ fn exports_json_with_cardinality_hints() {
     });
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+    let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
     let roots = importer.import_blob(blob).expect("import payload");
@@ -77,7 +77,7 @@ fn exports_openai_like_conversation() {
     });
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
+    let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
     let roots = importer.import_blob(blob).expect("import payload");

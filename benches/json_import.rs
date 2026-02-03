@@ -1,25 +1,19 @@
 use anybytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use memmap2::Mmap;
-use std::fs;
 use std::fs::File;
 use std::path::PathBuf;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::import::json::{EphemeralJsonImporter, JsonImporter};
-use triblespace::core::import::json_winnow::{DeterministicWinnowJsonImporter, WinnowJsonImporter};
+use triblespace::core::import::json::JsonObjectImporter;
+use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::core::value::schemas::hash::Blake3;
 
 struct Fixture {
     name: &'static str,
-    payload: String,
     path: PathBuf,
-}
-
-struct PreparedFixture {
-    fixture: Fixture,
-    element_count: usize,
+    size: u64,
 }
 
 fn load_fixtures() -> Vec<Fixture> {
@@ -35,189 +29,52 @@ fn load_fixtures() -> Vec<Fixture> {
             let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "benches", "data", "json", file]
                 .into_iter()
                 .collect();
-            let payload = fs::read_to_string(&path)
-                .unwrap_or_else(|err| panic!("failed to load {file} for {name} fixture: {err}"));
-            Fixture {
-                name,
-                payload,
-                path,
-            }
+            let size = std::fs::metadata(&path)
+                .unwrap_or_else(|err| panic!("failed to stat {file} for {name} fixture: {err}"))
+                .len();
+            Fixture { name, path, size }
         })
         .collect()
-}
-
-fn prepare_fixtures() -> Vec<PreparedFixture> {
-    load_fixtures()
-        .into_iter()
-        .map(|fixture| {
-            let payload = fixture.payload.as_str();
-
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
-            let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                JsonImporter::new(&mut blobs, None);
-            importer
-                .import_str(payload)
-                .expect("import JSON to determine element count");
-            let element_count = importer.data().len();
-
-            PreparedFixture {
-                fixture,
-                element_count,
-            }
-        })
-        .collect()
-}
-
-fn bench_elements(c: &mut Criterion, fixtures: &[PreparedFixture]) {
-    let mut group = c.benchmark_group("json_import/elements");
-
-    for prepared in fixtures {
-        let fixture = &prepared.fixture;
-
-        group.throughput(Throughput::Elements(prepared.element_count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("json_import", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.clone();
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                        JsonImporter::new(&mut blobs, None);
-                    importer.import_str(payload.as_str()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_ephemeral", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.clone();
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = EphemeralJsonImporter::new(&mut blobs);
-                    importer.import_str(payload.as_str()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_winnow_ephemeral", fixture.name),
-            fixture,
-            |b, fixture| {
-                let file = File::open(&fixture.path).expect("open fixture");
-                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
-                let bytes = Bytes::from_source(mmap);
-                let blob = Blob::<LongString>::new(bytes);
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = WinnowJsonImporter::new(&mut blobs);
-                    importer.import_blob(blob.clone()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_winnow", fixture.name),
-            fixture,
-            |b, fixture| {
-                let file = File::open(&fixture.path).expect("open fixture");
-                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
-                let bytes = Bytes::from_source(mmap);
-                let blob = Blob::<LongString>::new(bytes);
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer =
-                        DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
-                    importer.import_blob(blob.clone()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]) {
-    let mut group = c.benchmark_group("json_import/bytes");
-
-    for prepared in fixtures {
-        let fixture = &prepared.fixture;
-        let bytes = fixture.payload.len() as u64;
-
-        group.throughput(Throughput::Bytes(bytes));
-        group.bench_with_input(
-            BenchmarkId::new("json_import", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.clone();
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer: JsonImporter<'_, MemoryBlobStore<Blake3>, Blake3> =
-                        JsonImporter::new(&mut blobs, None);
-                    importer.import_str(payload.as_str()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_ephemeral", fixture.name),
-            fixture,
-            |b, fixture| {
-                let payload = fixture.payload.clone();
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = EphemeralJsonImporter::new(&mut blobs);
-                    importer.import_str(payload.as_str()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_winnow", fixture.name),
-            fixture,
-            |b, fixture| {
-                let file = File::open(&fixture.path).expect("open fixture");
-                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
-                let bytes = Bytes::from_source(mmap);
-                let blob = Blob::<LongString>::new(bytes);
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer =
-                        DeterministicWinnowJsonImporter::<_, Blake3>::new(&mut blobs, None);
-                    importer.import_blob(blob.clone()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("json_import_winnow_ephemeral", fixture.name),
-            fixture,
-            |b, fixture| {
-                let file = File::open(&fixture.path).expect("open fixture");
-                let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
-                let bytes = Bytes::from_source(mmap);
-                let blob = Blob::<LongString>::new(bytes);
-                b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
-                    let mut importer = WinnowJsonImporter::new(&mut blobs);
-                    importer.import_blob(blob.clone()).expect("import JSON");
-                    std::hint::black_box(importer.data().len());
-                });
-            },
-        );
-    }
-
-    group.finish();
 }
 
 fn json_import_benchmark(c: &mut Criterion) {
-    let fixtures = prepare_fixtures();
+    let fixtures = load_fixtures();
+    let mut group = c.benchmark_group("json_import");
 
-    bench_elements(c, &fixtures);
-    bench_bytes(c, &fixtures);
+    for fixture in fixtures {
+        let file = File::open(&fixture.path).expect("open fixture");
+        let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
+        let bytes = Bytes::from_source(mmap);
+        let blob = Blob::<LongString>::new(bytes);
+
+        group.throughput(Throughput::Bytes(fixture.size));
+        group.bench_with_input(
+            BenchmarkId::new("json_import", fixture.name),
+            &blob,
+            |b, blob| {
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+                    importer.import_blob(blob.clone()).expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("json_import_lossless", fixture.name),
+            &blob,
+            |b, blob| {
+                b.iter(|| {
+                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
+                    importer.import_blob(blob.clone()).expect("import JSON");
+                    std::hint::black_box(importer.data().len());
+                });
+            },
+        );
+    }
+
+    group.finish();
 }
 
 criterion_group!(benches, json_import_benchmark);
