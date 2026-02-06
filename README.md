@@ -114,10 +114,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     library += entity! { &author_id @
         literature::title: "Dune",
         literature::author: &author_id,
-        literature::quote: ws.put::<LongString, _>(
+        literature::quote: ws.put(
             "Deep in the human unconscious is a pervasive need for a logical              universe that makes sense. But the real universe is always one              step beyond logic."
         ),
-        literature::quote: ws.put::<LongString, _>(
+        literature::quote: ws.put(
             "I must not fear. Fear is the mind-killer. Fear is the little-death              that brings total obliteration. I will face my fear. I will permit              it to pass over me and through me. And when it has gone past I will              turn the inner eye to see its path. Where the fear has gone there              will be nothing. Only I will remain."
         ),
     };

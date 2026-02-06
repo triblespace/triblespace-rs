@@ -118,7 +118,7 @@ fn bench_oxigraph(c: &mut Criterion, payload: &str) {
 fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     let import_payload = normalize_for_import(payload);
     let bytes = import_payload.len() as u64;
-    let import_blob = Blob::<LongString>::new(Bytes::from(import_payload.clone().into_bytes()));
+    let import_blob: Blob<LongString> = Blob::new(Bytes::from(import_payload.clone().into_bytes()));
     let mut group = c.benchmark_group("json_ld/tribles");
     group.throughput(Throughput::Bytes(bytes));
 

@@ -31,7 +31,7 @@
 pub mod blobschemas;
 pub mod valueschemas;
 
-pub use crate::attribute::Attribute;
+pub use crate::attribute::{Attribute, AttributeUsage, AttributeUsageSource};
 pub use crate::blob::Blob;
 pub use crate::blob::BlobSchema;
 pub use crate::blob::MemoryBlobStore;

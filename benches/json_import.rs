@@ -45,7 +45,7 @@ fn json_import_benchmark(c: &mut Criterion) {
         let file = File::open(&fixture.path).expect("open fixture");
         let mmap = unsafe { Mmap::map(&file).expect("mmap fixture") };
         let bytes = Bytes::from_source(mmap);
-        let blob = Blob::<LongString>::new(bytes);
+        let blob: Blob<LongString> = Blob::new(bytes);
 
         group.throughput(Throughput::Bytes(fixture.size));
         group.bench_with_input(

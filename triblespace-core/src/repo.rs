@@ -420,8 +420,8 @@ where
 {
     handles.into_iter().map(move |source_handle| {
         let blob: Blob<UnknownBlob> = source.get(source_handle).map_err(TransferError::Load)?;
-        let target_handle = target.put(blob).map_err(TransferError::Store)?;
-        Ok((source_handle, target_handle))
+
+        Ok((source_handle, (target.put(blob).map_err(TransferError::Store)?)))
     })
 }
 
@@ -792,6 +792,11 @@ where
         signing_key: SigningKey,
     ) -> Result<ExclusiveId, BranchError<Storage>> {
         let branch_id = ufoid();
+        let name_blob = branch_name.to_owned().to_blob();
+        let name_handle = name_blob.get_handle::<Blake3>();
+        self.storage
+            .put(name_blob)
+            .map_err(|e| BranchError::StoragePut(e))?;
 
         let branch_set = if let Some(commit) = commit {
             let reader = self
@@ -800,9 +805,9 @@ where
                 .map_err(|e| BranchError::StorageReader(e))?;
             let set: TribleSet = reader.get(commit).map_err(|e| BranchError::StorageGet(e))?;
 
-            branch::branch_metadata(&signing_key, *branch_id, branch_name, Some(set.to_blob()))
+            branch::branch_metadata(&signing_key, *branch_id, name_handle, Some(set.to_blob()))
         } else {
-            branch::branch_unsigned(*branch_id, branch_name, None)
+            branch::branch_unsigned(*branch_id, name_handle, None)
         };
 
         let branch_blob = branch_set.to_blob();
@@ -810,7 +815,6 @@ where
             .storage
             .put(branch_blob)
             .map_err(|e| BranchError::StoragePut(e))?;
-
         let push_result = self
             .storage
             .update(*branch_id, None, branch_handle)
@@ -960,8 +964,9 @@ where
             .get(workspace.base_branch_meta)
             .map_err(PushError::StorageGet)?;
 
-        let Ok((branch_name,)) = find!((name: Value<_>),
-            pattern!(base_branch_meta, [{ crate::metadata::shortname: ?name }])
+        let Ok((branch_name,)) = find!(
+            (name: Value<Handle<Blake3, LongString>>),
+            pattern!(base_branch_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
             return Err(PushError::BadBranchMetadata());
@@ -975,7 +980,7 @@ where
         let branch_meta = branch_metadata(
             &workspace.signing_key,
             workspace.base_branch_id,
-            branch_name.from_value(),
+            branch_name,
             Some(head_.to_blob()),
         );
 
@@ -1746,7 +1751,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         // 1. Create a commit blob from the current head, content, metadata and the commit message.
         let content_blob = content_.to_blob();
         // If a message is provided, store it as a LongString blob and pass the handle.
-        let message_handle = message_.map(|m| self.put::<LongString, String>(m.to_string()));
+        let message_handle = message_.map(|m| self.put(m.to_string()));
         let parents = self.head.iter().copied();
 
         let commit_set = crate::repo::commit::commit_metadata(

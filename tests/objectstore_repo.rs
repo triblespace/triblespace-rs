@@ -36,7 +36,7 @@ fn objectstore_branch_from_and_pull_with_key() {
     let mut store = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
     let key = SigningKey::generate(&mut OsRng);
     let commit_set = repo::commit::commit_metadata(&key, [], None, None, None);
-    let initial = store.put(commit_set).unwrap();
+    ut(commit_set).unwrap();
 
     let mut repo = Repository::new(store, key.clone());
     let branch_id = repo

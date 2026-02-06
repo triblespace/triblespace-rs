@@ -78,11 +78,15 @@ pub const KIND_MULTI: Id = id_hex!("C36D9C16B34729D855BD6C36A624E1BF");
 pub const KIND_VALUE_SCHEMA: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB");
 /// Tag for entities that represent blob schemas.
 pub const KIND_BLOB_SCHEMA: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
+/// Tag for entities that describe an attribute usage in some source context.
+pub const KIND_ATTRIBUTE_USAGE: Id = id_hex!("45759727A79C28D657EC06D5C6013649");
 
 attributes! {
-    /// Optional short name for quick inspection (fits in ShortString).
-    "2E26F8BA886495A8DF04ACF0ED3ACBD4" as shortname: valueschemas::ShortString;
-    /// Optional longer description stored as a LongString handle.
+    /// Optional long-form description stored as a LongString handle.
+    ///
+    /// This attribute is general-purpose: it can describe any entity. Schema
+    /// metadata uses it for documenting value/blob schemas, but it is equally
+    /// valid for domain entities.
     "AE94660A55D2EE3C428D2BB299E02EC3" as description: valueschemas::Handle<hash::Blake3, LongString>;
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
     "43C134652906547383054B1E31E23DF4" as blob_schema: valueschemas::GenId;
@@ -92,8 +96,17 @@ attributes! {
     /// The value is a `Handle<Blake3, WasmCode>` that points to a sandboxed
     /// formatter module (see `triblespace_core::value_formatter`).
     "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: valueschemas::Handle<hash::Blake3, WasmCode>;
-    /// Canonical field name stored as a LongString handle.
+    /// Long-form name stored as a LongString handle.
+    ///
+    /// Names are contextual: multiple usages of the same attribute may carry
+    /// different names depending on the codebase or domain. Use attribute
+    /// usage entities (tagged with KIND_ATTRIBUTE_USAGE) when you need to
+    /// capture multiple names for the same attribute id.
     "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Link a usage annotation entity to the attribute it describes.
+    "F10DE6D8E60E0E86013F1B867173A85C" as attribute: valueschemas::GenId;
+    /// Optional source location or provenance string for a usage annotation.
+    "A56350FD00EC220B4567FE15A5CD68B8" as source: valueschemas::Handle<hash::Blake3, LongString>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: valueschemas::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.

@@ -163,7 +163,7 @@ where
 
     if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
         if !dir.trim().is_empty() {
-            let handle = workspace.put::<LongString, _>(dir);
+            let handle = workspace.put(dir);
             set +=
                 ::triblespace_core::macros::entity! { &entity @ invocation::manifest_dir: handle };
         }
@@ -171,7 +171,7 @@ where
 
     let tokens = input.to_string();
     if !tokens.is_empty() {
-        let handle = workspace.put::<LongString, _>(tokens);
+        let handle = workspace.put(tokens);
         set += ::triblespace_core::macros::entity! { &entity @ invocation::source_tokens: handle };
     }
 
@@ -261,7 +261,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
         if !ty_tokens.is_empty() {
             let handle = {
                 let workspace = context.workspace();
-                workspace.put::<LongString, _>(ty_tokens)
+                workspace.put(ty_tokens)
             };
             set +=
                 ::triblespace_core::macros::entity! { &entity @ attribute::attribute_type: handle };

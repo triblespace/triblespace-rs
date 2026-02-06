@@ -13,7 +13,7 @@ fn refresh_during_restore_truncation_is_safe() {
     // Write a valid blob and flush it
     let mut pile: Pile = Pile::open(&path).unwrap();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"data".to_vec()));
-    let handle = pile.put(blob).unwrap();
+    put(blob).unwrap();
     pile.flush().unwrap();
     drop(pile);
 

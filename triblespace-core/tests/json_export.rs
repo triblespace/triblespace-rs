@@ -23,7 +23,7 @@ fn exports_json_with_cardinality_hints() {
     let mut blobs = MemoryBlobStore::<Blake3>::new();
     let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
-    let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
+    let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
     let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 
@@ -79,7 +79,7 @@ fn exports_openai_like_conversation() {
     let mut blobs = MemoryBlobStore::<Blake3>::new();
     let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
-    let blob = Blob::<LongString>::new(Bytes::from(json.into_bytes()));
+    let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
     let roots = importer.import_blob(blob).expect("import payload");
     let root = roots[0];
 

@@ -19,7 +19,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     let contents = b"hello world".to_vec();
     let blob = Blob::new(Bytes::from(contents.clone()));
 
-    let handle = remote.put::<UnknownBlob, _>(blob)?;
+    let handle = remote.put(blob)?;
 
     // metadata should be present and report the correct length
     use triblespace::prelude::BlobStore;

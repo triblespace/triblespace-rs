@@ -1,5 +1,10 @@
+use triblespace_core::metadata;
+use triblespace_core::metadata::Metadata;
 use triblespace_core::prelude::valueschemas::ShortString;
-use triblespace_core::prelude::{attributes, entity, Attribute, Id, ToValue, Value};
+use triblespace_core::prelude::{
+    attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, TribleSet, Value,
+};
+use triblespace_core::value::schemas::hash::Blake3;
 
 attributes! {
     "11111111111111111111111111111111" as pub fixed: ShortString;
@@ -32,4 +37,17 @@ fn attributes_macro_works_in_entity_macro() {
     assert_eq!(*t.e(), *entity);
     assert_eq!(*t.a(), attr.id());
     assert_eq!(*t.v::<ShortString>(), val);
+}
+
+#[test]
+fn attributes_macro_emits_usage_metadata() {
+    let mut blobs = MemoryBlobStore::<Blake3>::new();
+    let meta: TribleSet = fixed.describe(&mut blobs).expect("metadata");
+    let attr_id = fixed.id();
+    let usage_count = find!(
+        (usage: Id),
+        pattern!(&meta, [{ ?usage @ metadata::attribute: attr_id }])
+    )
+    .count();
+    assert!(usage_count > 0, "expected attribute usage metadata");
 }

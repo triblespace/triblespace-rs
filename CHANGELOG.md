@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Attribute usage annotations with `metadata::attribute`, `metadata::source`,
+  and `KIND_ATTRIBUTE_USAGE` for capturing contextual names/descriptions.
+
+### Changed
+- Clarified `metadata::name` and `metadata::description` as general-purpose
+  entity naming/description attributes in docs and metadata comments.
+- `Attribute::describe` now emits usage annotations when available, and the
+  `attributes!` macro attaches contextual usage metadata (name/description/
+  source) to declared attributes.
+- JSON importers validate UTF-8 strings via `View<str>` while reusing the
+  parsed bytes.
 
 ## [0.9.0] - 2026-02-03
 ### Added
@@ -105,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `metadata::KIND_VALUE_SCHEMA` and `metadata::KIND_BLOB_SCHEMA` tags, now
   emitted by built-in schema metadata for discovery.
 - `metadata::description`, a LongString-backed attribute for schema
-  documentation, and `metadata::shortname`/`metadata::description` emission for
+  documentation, and `metadata::name`/`metadata::description` emission for
   built-in value and blob schemas.
 - `metadata::Metadata` trait for emitting self-describing `TribleSet` and
   `MemoryBlobStore` pairs, enabling attributes and schemas to publish
@@ -202,9 +214,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Attribute` now retains its declared name, uses the field name for dynamic
   attributes, and relies on the `Metadata` trait to emit attribute metadata in
   both code-generated and runtime scenarios.
-- Renamed the attribute constructors to `from_id`, `from_id_with_name`, and
-  `from_name` to clarify when static identifiers carry documentation names and
-  when they are derived dynamically.
+- Simplified the attribute constructors to `from_id`, `from_id_with_usage`, and
+  `from_name`, removing `from_id_with_name`/`from_handle` in favor of explicit
+  usage metadata and internal handle derivation.
 - Simplified attribute naming by replacing the internal `AttributeName` enum
   with an optional `Cow<'static, str>`, keeping const-friendly static ids while
   storing dynamic field names directly.

@@ -300,7 +300,7 @@ mod tests {
         .expect("wat parses");
 
         let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
-        let handle = store.put::<WasmCode, _>(wasm).expect("put wasm module");
+        let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
         let schema_id = crate::value::schemas::shortstring::ShortString::id();

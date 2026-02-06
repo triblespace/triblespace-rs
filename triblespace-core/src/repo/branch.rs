@@ -16,16 +16,18 @@ use crate::metadata;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::trible::TribleSet;
 use crate::value::Value;
+use crate::value::schemas::hash::{Blake3, Handle};
+use crate::blob::schemas::longstring::LongString;
 
 /// Builds a metadata [`TribleSet`] describing a branch and signs it.
 ///
-/// The metadata records the branch `name`, its unique `branch_id` and
+/// The metadata records the branch `name` handle, its unique `branch_id` and
 /// optionally the handle of the initial commit. The commit handle is signed with
 /// `signing_key` allowing the repository to verify its authenticity.
 pub fn branch_metadata(
     signing_key: &SigningKey,
     branch_id: Id,
-    name: &str,
+    name: Value<Handle<Blake3, LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
 ) -> TribleSet {
     let mut metadata: TribleSet = Default::default();
@@ -44,7 +46,7 @@ pub fn branch_metadata(
            super::signature_s: signature,
         };
     }
-    metadata += entity! { &metadata_entity @  metadata::shortname: name  };
+    metadata += entity! { &metadata_entity @  metadata::name: name  };
 
     metadata
 }
@@ -55,7 +57,7 @@ pub fn branch_metadata(
 /// created without access to a private key.
 pub fn branch_unsigned(
     branch_id: Id,
-    name: &str,
+    name: Value<Handle<Blake3, LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
 ) -> TribleSet {
     let metadata_entity = rngid();
@@ -69,7 +71,7 @@ pub fn branch_unsigned(
         metadata += entity! { &metadata_entity @  super::head: handle  };
     }
 
-    metadata += entity! { &metadata_entity @  metadata::shortname: name  };
+    metadata += entity! { &metadata_entity @  metadata::name: name  };
 
     metadata
 }

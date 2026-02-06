@@ -17,11 +17,117 @@ use crate::value::schemas::hash::Blake3;
 use crate::value::ValueSchema;
 use blake3::Hasher;
 use core::marker::PhantomData;
+
+/// Describes a concrete usage of an attribute in source code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttributeUsage {
+    /// Contextual name for this usage (may differ across codebases).
+    pub name: &'static str,
+    /// Optional human-facing description for this usage.
+    pub description: Option<&'static str>,
+    /// Optional source location to disambiguate multiple usages.
+    pub source: Option<AttributeUsageSource>,
+}
+
+/// Source location metadata for attribute usages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AttributeUsageSource {
+    pub module_path: &'static str,
+    pub file: &'static str,
+    pub line: u32,
+    pub column: u32,
+}
+
+impl AttributeUsageSource {
+    fn hash_into(&self, hasher: &mut Hasher) {
+        hasher.update(self.module_path.as_bytes());
+        hasher.update(self.file.as_bytes());
+        hasher.update(&self.line.to_be_bytes());
+        hasher.update(&self.column.to_be_bytes());
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "{} {}:{}:{}",
+            self.module_path, self.file, self.line, self.column
+        )
+    }
+}
+
+impl AttributeUsage {
+    /// Construct a minimal usage entry with a name.
+    pub const fn named(name: &'static str) -> Self {
+        Self {
+            name,
+            description: None,
+            source: None,
+        }
+    }
+
+    /// Set a human-facing description for this usage.
+    pub const fn description(mut self, description: &'static str) -> Self {
+        self.description = Some(description);
+        self
+    }
+
+    /// Set a source location for this usage.
+    pub const fn source(mut self, source: AttributeUsageSource) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    fn usage_id(&self, attribute_id: crate::id::Id) -> crate::id::Id {
+        let mut hasher = Hasher::new();
+        hasher.update(attribute_id.as_ref());
+        hasher.update(self.name.as_bytes());
+        if let Some(source) = self.source {
+            source.hash_into(&mut hasher);
+        }
+        let digest = hasher.finalize();
+        let mut raw = [0u8; crate::id::ID_LEN];
+        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
+        raw.copy_from_slice(lower_half);
+        crate::id::Id::new(raw).expect("usage id must be non-nil")
+    }
+
+    fn describe<B>(
+        &self,
+        blobs: &mut B,
+        attribute_id: crate::id::Id,
+    ) -> Result<TribleSet, B::PutError>
+    where
+        B: crate::repo::BlobStore<Blake3>,
+    {
+        let mut tribles = TribleSet::new();
+        let usage_id = self.usage_id(attribute_id);
+        let usage_entity = ExclusiveId::force_ref(&usage_id);
+
+        tribles += entity! { &usage_entity @ metadata::name: blobs.put(self.name.to_owned())? };
+
+        if let Some(description) = self.description {
+            let description_handle = blobs.put(description.to_owned())?;
+            tribles += entity! { &usage_entity @ metadata::description: description_handle };
+        }
+
+        if let Some(source) = self.source {
+            let source_handle = blobs.put(source.render())?;
+            tribles += entity! { &usage_entity @ metadata::source: source_handle };
+        }
+
+        tribles += entity! { &usage_entity @
+            metadata::attribute: GenId::value_from(attribute_id),
+            metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
+        };
+
+        Ok(tribles)
+    }
+}
 /// A typed reference to an attribute id together with its value schema.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Attribute<S: ValueSchema> {
     raw: RawId,
     handle: Option<crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>>,
+    usage: Option<AttributeUsage>,
     _schema: PhantomData<S>,
 }
 
@@ -30,28 +136,30 @@ impl<S: ValueSchema> Clone for Attribute<S> {
         Self {
             raw: self.raw,
             handle: self.handle,
+            usage: self.usage,
             _schema: PhantomData,
         }
     }
 }
 
 impl<S: ValueSchema> Attribute<S> {
-    /// Construct a `Field` from a raw 16-byte id and static attribute name.
-    pub const fn from_id_with_name(raw: RawId, name: &'static str) -> Self {
-        let _ = name;
+    /// Construct a `Field` from a raw 16-byte id and a fully specified usage.
+    pub const fn from_id_with_usage(raw: RawId, usage: AttributeUsage) -> Self {
         Self {
             raw,
             handle: None,
+            usage: Some(usage),
             _schema: PhantomData,
         }
     }
 
     /// Construct a `Field` from a raw 16-byte id without attaching a static name.
-    /// Prefer [`Attribute::from_id_with_name`] when the name is known at compile time.
+    /// Prefer [`Attribute::from_id_with_usage`] when a static usage is available.
     pub const fn from_id(raw: RawId) -> Self {
         Self {
             raw,
             handle: None,
+            usage: None,
             _schema: PhantomData,
         }
     }
@@ -89,7 +197,13 @@ impl<S: ValueSchema> Attribute<S> {
 
     /// Returns the declared name of this attribute, if any.
     pub fn name(&self) -> Option<&str> {
-        None
+        self.usage.map(|usage| usage.name)
+    }
+
+    /// Attach usage metadata to an attribute.
+    pub const fn with_usage(mut self, usage: AttributeUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 
     /// Derive an attribute id from a dynamic name and this schema's metadata.
@@ -100,30 +214,9 @@ impl<S: ValueSchema> Attribute<S> {
     /// The resulting 32-byte Blake3 digest uses its rightmost 16 bytes to match the
     /// `RawId` layout used by [`Attribute::from_id`].
     pub fn from_name(name: &str) -> Self {
-        let mut hasher = Hasher::new();
-
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
-        hasher.update(&field_handle.raw);
-        hasher.update(S::id().as_ref());
-
-        let digest = hasher.finalize();
-        let mut raw = [0u8; crate::id::ID_LEN];
-        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
-        raw.copy_from_slice(lower_half);
-        Self::from_handle(&field_handle)
-    }
-
-    /// Construct an attribute from a precomputed LongString handle.
-    ///
-    /// The id derivation matches [`Attribute::from_name`], using the rightmost
-    /// 16 bytes of `Blake3(handle_bytes || schema_id)`. The resulting attribute
-    /// carries no human-readable name; metadata emission will therefore skip
-    /// name/shortname unless a name is later injected.
-    pub fn from_handle(
-        handle: &crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>,
-    ) -> Self {
         let mut hasher = Hasher::new();
-        hasher.update(&handle.raw);
+        hasher.update(&field_handle.raw);
         hasher.update(S::id().as_ref());
 
         let digest = hasher.finalize();
@@ -133,7 +226,8 @@ impl<S: ValueSchema> Attribute<S> {
 
         Self {
             raw,
-            handle: Some(*handle),
+            handle: Some(field_handle),
+            usage: None,
             _schema: PhantomData,
         }
     }
@@ -147,7 +241,7 @@ where
         self.id()
     }
 
-    fn describe<B>(&self, _blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: crate::repo::BlobStore<Blake3>,
     {
@@ -159,6 +253,10 @@ where
         }
 
         tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(S::id()) };
+
+        if let Some(usage) = self.usage {
+            tribles += usage.describe(blobs, id)?;
+        }
 
         Ok(tribles)
     }

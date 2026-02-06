@@ -52,7 +52,7 @@ impl ConstMetadata for UnknownValue {
         #[cfg(feature = "wasm")]
         {
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::UNKNOWN_VALUE_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::UNKNOWN_VALUE_WASM)?,
             };
         }
         #[cfg(not(feature = "wasm"))]
