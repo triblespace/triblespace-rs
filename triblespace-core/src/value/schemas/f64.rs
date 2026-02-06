@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -32,12 +31,12 @@ impl ConstMetadata for F64 {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "IEEE-754 double stored in the first 8 bytes (little-endian); remaining bytes are zero. This matches the standard host representation while preserving the 32-byte value width.\n\nUse for typical metrics, measurements, and calculations where floating-point rounding is acceptable. Choose F256 for higher precision or lossless JSON number import, and R256 for exact rational values.\n\nNaN and infinity can be represented; decide whether your application accepts them. If you need deterministic ordering or exact comparisons, prefer integer or rational schemas.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "f64",
+                metadata::name: blobs.put("f64".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -46,7 +45,7 @@ impl ConstMetadata for F64 {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::F64_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::F64_WASM)?,
             };
             tribles
         };

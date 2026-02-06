@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
@@ -45,12 +44,13 @@ impl ConstMetadata for GenId {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example using Attribute::from_name or a hash).",
         )?;
+        let name = blobs.put("genid".to_string())?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "genid",
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -59,7 +59,7 @@ impl ConstMetadata for GenId {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::GENID_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::GENID_WASM)?,
             };
             tribles
         };

@@ -1,7 +1,6 @@
 mod succinctarchiveconstraint;
 mod universe;
 
-use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
@@ -60,12 +59,12 @@ impl ConstMetadata for SuccinctArchiveBlob {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "succinctarchive",
+                metadata::name: blobs.put("succinctarchive".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -40,12 +39,12 @@ impl ConstMetadata for F256LE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "High-precision f256 float stored in little-endian byte order. The format preserves far more precision than f64 and can round-trip large JSON numbers.\n\nUse when precision or exact decimal import matters more than storage or compute cost. Choose the big-endian variant if you need lexicographic ordering or network byte order.\n\nF256 values are heavier to parse and compare than f64. If you only need standard double precision, prefer F64 for faster operations.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "f256le",
+                metadata::name: blobs.put("f256le".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -54,7 +53,7 @@ impl ConstMetadata for F256LE {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::F256_LE_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::F256_LE_WASM)?,
             };
             tribles
         };
@@ -74,12 +73,12 @@ impl ConstMetadata for F256BE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "High-precision f256 float stored in big-endian byte order. This variant is convenient for bytewise ordering or wire formats that expect network order.\n\nUse for high-precision metrics or lossless JSON import when ordering matters across systems. For everyday numeric values, F64 is smaller and faster.\n\nAs with all floats, rounding can still occur at the chosen precision. If you need exact fractions, use R256 instead.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "f256be",
+                metadata::name: blobs.put("f256be".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -88,7 +87,7 @@ impl ConstMetadata for F256BE {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::F256_BE_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::F256_BE_WASM)?,
             };
             tribles
         };

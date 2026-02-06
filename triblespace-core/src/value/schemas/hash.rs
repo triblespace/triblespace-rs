@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::blob::BlobSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -143,13 +142,14 @@ where
 {
     let id = H::id();
     let name = H::NAME;
-    let description = blobs.put::<LongString, _>(format!(
+    let description = blobs.put(format!(
         "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
     ))?;
+    let name_handle = blobs.put(name.to_string())?;
     let mut tribles = TribleSet::new();
 
     tribles += entity! { ExclusiveId::force_ref(&id) @
-        metadata::shortname: name,
+        metadata::name: name_handle,
         metadata::description: description,
         metadata::tag: metadata::KIND_VALUE_SCHEMA,
     };
@@ -157,7 +157,7 @@ where
     #[cfg(feature = "wasm")]
     {
         tribles += entity! { ExclusiveId::force_ref(&id) @
-            metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM)?,
+            metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
         };
     }
 
@@ -282,15 +282,16 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         let id = Self::id();
         let name = H::NAME;
         let schema_id = T::id();
-        let description = blobs.put::<LongString, _>(format!(
+        let description = blobs.put(format!(
             "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at blob schema {schema_id:X}. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
         ))?;
+        let name_handle = blobs.put("handle".to_string())?;
         let mut tribles = TribleSet::new();
         tribles += H::describe(blobs)?;
         tribles += T::describe(blobs)?;
 
         tribles += entity! { ExclusiveId::force_ref(&id) @
-            metadata::shortname: "handle",
+            metadata::name: name_handle,
             metadata::description: description,
             metadata::blob_schema: schema_id,
             metadata::hash_schema: H::id(),
@@ -300,7 +301,7 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
         #[cfg(feature = "wasm")]
         {
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::HASH_HEX_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
             };
         }
         Ok(tribles)

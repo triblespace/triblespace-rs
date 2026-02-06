@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -53,12 +52,12 @@ impl ConstMetadata for R256LE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in little-endian, normalized with a positive denominator. This keeps fractions canonical and comparable.\n\nUse for exact rates, proportions, or unit conversions where rounding is unacceptable. Prefer F64 or F256 when approximate floats are fine or when interfacing with floating-point APIs.\n\nDenominator zero is invalid; the schema expects canonicalized fractions. If you need intervals or ranges instead of ratios, use the range schemas.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "r256le",
+                metadata::name: blobs.put("r256le".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -67,7 +66,7 @@ impl ConstMetadata for R256LE {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::R256_LE_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::R256_LE_WASM)?,
             };
             tribles
         };
@@ -87,12 +86,12 @@ impl ConstMetadata for R256BE {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "r256be",
+                metadata::name: blobs.put("r256be".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -101,7 +100,7 @@ impl ConstMetadata for R256BE {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::R256_BE_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::R256_BE_WASM)?,
             };
             tribles
         };

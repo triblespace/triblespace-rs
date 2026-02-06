@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -38,12 +37,12 @@ impl ConstMetadata for NsTAIInterval {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Inclusive TAI interval encoded as two little-endian i128 nanosecond bounds. TAI is monotonic and does not include leap seconds, making it ideal for precise ordering.\n\nUse for time windows, scheduling, or event ranges where monotonic time matters. If you need civil time, time zones, or calendar semantics, store a separate representation alongside this interval.\n\nIntervals are inclusive on both ends. If you need half-open intervals or offsets, consider RangeU128 with your own epoch mapping.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "nstai_interval",
+                metadata::name: blobs.put("nstai_interval".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -52,7 +51,7 @@ impl ConstMetadata for NsTAIInterval {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::NSTAI_INTERVAL_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::NSTAI_INTERVAL_WASM)?,
             };
             tribles
         };

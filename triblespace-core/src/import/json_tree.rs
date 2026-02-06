@@ -7,14 +7,15 @@
 
 use std::marker::PhantomData;
 
-use anybytes::Bytes;
+use anybytes::{Bytes, View};
 use digest::Digest;
 use winnow::stream::Stream;
 
-use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
+use crate::blob::ToBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
+use crate::import::ImportAttribute;
 use crate::macros::{entity, id_hex};
 use crate::metadata;
 use crate::metadata::{ConstMetadata, Metadata};
@@ -25,12 +26,13 @@ use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::iu256::U256BE;
 use crate::value::Value;
-use crate::value::ValueSchema;
 use triblespace_core_macros::attributes;
 
 use crate::import::json::{
     parse_number_common, parse_string_common, parse_unicode_escape, EncodeError, JsonImportError,
 };
+
+type ParsedString = View<str>;
 
 attributes! {
     "D78B9D5A96029FDBBB327E377418AF51" as pub kind: GenId;
@@ -76,6 +78,11 @@ where
     B: BlobStore<Blake3>,
 {
     let mut metadata = TribleSet::new();
+    let name = |value: &'static str| {
+        Bytes::from_source(value)
+            .view::<str>()
+            .expect("static JSON attribute names are valid UTF-8")
+    };
 
     metadata.union(<GenId as ConstMetadata>::describe(blobs)?);
     metadata.union(<Boolean as ConstMetadata>::describe(blobs)?);
@@ -84,23 +91,83 @@ where
         blobs,
     )?);
 
-    macro_rules! add_attribute {
-        ($attribute:expr, $name:expr) => {
-            metadata.union(describe_attribute(blobs, &$attribute, $name)?);
-        };
-    }
-
-    add_attribute!(kind, "json.kind");
-    add_attribute!(string, "json.string");
-    add_attribute!(number_raw, "json.number_raw");
-    add_attribute!(boolean, "json.boolean");
-    add_attribute!(field_parent, "json.field_parent");
-    add_attribute!(field_name, "json.field_name");
-    add_attribute!(field_index, "json.field_index");
-    add_attribute!(field_value, "json.field_value");
-    add_attribute!(array_parent, "json.array_parent");
-    add_attribute!(array_index, "json.array_index");
-    add_attribute!(array_value, "json.array_value");
+    metadata.union(
+        ImportAttribute::<GenId>::from_raw(
+            kind.raw(),
+            Some(name("json.kind")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+            string.raw(),
+            Some(name("json.string")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+            number_raw.raw(),
+            Some(name("json.number_raw")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<Boolean>::from_raw(
+            boolean.raw(),
+            Some(name("json.boolean")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<GenId>::from_raw(
+            field_parent.raw(),
+            Some(name("json.field_parent")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+            field_name.raw(),
+            Some(name("json.field_name")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<U256BE>::from_raw(
+            field_index.raw(),
+            Some(name("json.field_index")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<GenId>::from_raw(
+            field_value.raw(),
+            Some(name("json.field_value")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<GenId>::from_raw(
+            array_parent.raw(),
+            Some(name("json.array_parent")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<U256BE>::from_raw(
+            array_index.raw(),
+            Some(name("json.array_index")),
+        )
+        .describe(blobs)?,
+    );
+    metadata.union(
+        ImportAttribute::<GenId>::from_raw(
+            array_value.raw(),
+            Some(name("json.array_value")),
+        )
+        .describe(blobs)?,
+    );
 
     metadata += describe_kind(blobs, kind_object, "json.kind.object", "JSON object node.")?;
     metadata += describe_kind(blobs, kind_array, "json.kind.array", "JSON array node.")?;
@@ -124,45 +191,28 @@ where
     Ok(metadata)
 }
 
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = attribute.describe(blobs)?;
-    let handle = blobs.put::<LongString, _>(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::shortname: name,
-        metadata::name: handle,
-    };
-    Ok(tribles)
-}
-
 fn describe_kind<B>(
     blobs: &mut B,
     kind_id: Id,
-    shortname: &str,
+    name: &str,
     description: &str,
 ) -> Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
     let mut tribles = TribleSet::new();
+    let name_handle = blobs.put(name.to_owned())?;
+
     tribles += entity! { ExclusiveId::force_ref(&kind_id) @
-        metadata::shortname: shortname,
-        metadata::name: blobs.put::<LongString, _>(description.to_owned())?,
+        metadata::name: name_handle,
+        metadata::description: blobs.put(description.to_owned())?,
     };
     Ok(tribles)
 }
 
 #[derive(Clone)]
 struct FieldEntry {
-    name: Bytes,
+    name: View<str>,
     name_handle: Value<Handle<Blake3, LongString>>,
     index: u64,
     value: Id,
@@ -204,8 +254,7 @@ where
     }
 
     pub fn import_str(&mut self, input: &str) -> Result<Id, JsonImportError> {
-        let blob = Blob::<LongString>::new(Bytes::from_source(input.to_owned()));
-        self.import_blob(blob)
+        self.import_blob(input.to_owned().to_blob())
     }
 
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Id, JsonImportError> {
@@ -257,14 +306,14 @@ where
             }
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
+                let id = self.hash_tagged(b"string", &[text.as_ref().as_bytes()]);
                 let handle = self
                     .store
-                    .put::<LongString, _>(Blob::new(text.clone()))
+                    .put(text)
                     .map_err(|err| JsonImportError::EncodeString {
                         field: "string".to_string(),
                         source: EncodeError::from_error(err),
                     })?;
-                let id = self.hash_tagged(b"string", &[text.as_ref()]);
                 self.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_string,
                     string: handle,
@@ -275,14 +324,17 @@ where
             Some(b'[') => self.parse_array(bytes),
             _ => {
                 let number = self.parse_number(bytes)?;
+                let number_view = number
+                    .view::<str>()
+                    .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
+                let id = self.hash_tagged(b"number", &[number_view.as_ref().as_bytes()]);
                 let handle = self
                     .store
-                    .put::<LongString, _>(Blob::new(number.clone()))
+                    .put(number_view)
                     .map_err(|err| JsonImportError::EncodeNumber {
                         field: "number".to_string(),
                         source: EncodeError::from_error(err),
                     })?;
-                let id = self.hash_tagged(b"number", &[number.as_ref()]);
                 self.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
@@ -309,7 +361,7 @@ where
                 let value = self.parse_value(bytes)?;
                 let name_handle = self
                     .store
-                    .put::<LongString, _>(Blob::new(name.clone()))
+                    .put(name.clone())
                     .map_err(|err| JsonImportError::EncodeString {
                         field: "field".to_string(),
                         source: EncodeError::from_error(err),
@@ -408,7 +460,7 @@ where
         hash_chunk(&mut hasher, b"object");
         for field in fields {
             let index_bytes = field.index.to_be_bytes();
-            hash_chunk(&mut hasher, field.name.as_ref());
+            hash_chunk(&mut hasher, field.name.as_ref().as_bytes());
             hash_chunk(&mut hasher, &index_bytes);
             hash_chunk(&mut hasher, field.value.as_ref());
         }
@@ -431,7 +483,7 @@ where
         hash_chunk(&mut hasher, b"field");
         let index_bytes = entry.index.to_be_bytes();
         hash_chunk(&mut hasher, parent.as_ref());
-        hash_chunk(&mut hasher, entry.name.as_ref());
+        hash_chunk(&mut hasher, entry.name.as_ref().as_bytes());
         hash_chunk(&mut hasher, &index_bytes);
         hash_chunk(&mut hasher, entry.value.as_ref());
         self.finish_hash(hasher)
@@ -489,8 +541,10 @@ where
         Ok(())
     }
 
-    fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        parse_string_common(bytes, &mut parse_unicode_escape)
+    fn parse_string(&self, bytes: &mut Bytes) -> Result<ParsedString, JsonImportError> {
+        let raw = parse_string_common(bytes, &mut parse_unicode_escape)?;
+        raw.view::<str>()
+            .map_err(|_| JsonImportError::Syntax("invalid utf-8".into()))
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {

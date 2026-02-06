@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -33,12 +32,12 @@ impl ConstMetadata for LineLocation {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Line/column span encoded as four big-endian u64 values (start_line, start_col, end_line, end_col). This captures explicit source positions rather than byte offsets.\n\nUse for editor diagnostics, source maps, or human-facing spans. If you need byte offsets or length-based ranges, use RangeU128 instead.\n\nColumns are raw counts and do not account for variable-width graphemes. Store any display conventions separately if needed.",
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "line_location",
+                metadata::name: blobs.put("line_location".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -47,7 +46,7 @@ impl ConstMetadata for LineLocation {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::LINELOCATION_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::LINELOCATION_WASM)?,
             };
             tribles
         };

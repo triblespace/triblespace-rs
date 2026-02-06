@@ -12,13 +12,14 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::str::FromStr;
 
-use anybytes::Bytes;
+use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
-use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
+use crate::blob::ToBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
+use crate::import::ImportAttribute;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstMetadata, Metadata};
@@ -105,6 +106,8 @@ impl std::error::Error for EncodeError {
     }
 }
 
+type ParsedString = View<str>;
+
 /// Deterministic JSON importer that derives entity ids from attribute/value pairs.
 ///
 /// This importer expects either:
@@ -120,13 +123,13 @@ where
 {
     data: TribleSet,
     store: &'a mut Store,
-    bool_attrs: HashMap<Bytes, Attribute<Boolean>>,
-    num_attrs: HashMap<Bytes, Attribute<F64>>,
-    str_attrs: HashMap<Bytes, Attribute<Handle<Blake3, LongString>>>,
-    genid_attrs: HashMap<Bytes, Attribute<GenId>>,
+    bool_attrs: HashMap<View<str>, ImportAttribute<Boolean>>,
+    num_attrs: HashMap<View<str>, ImportAttribute<F64>>,
+    str_attrs: HashMap<View<str>, ImportAttribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<View<str>, ImportAttribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     _hasher: PhantomData<Hasher>,
-    array_fields: HashSet<Bytes>,
+    array_fields: HashSet<View<str>>,
 }
 
 impl<'a, Store, Hasher> JsonObjectImporter<'a, Store, Hasher>
@@ -136,19 +139,22 @@ where
 {
     fn attr_from_field<S: ValueSchema>(
         &mut self,
-        field: &Bytes,
-    ) -> Result<Attribute<S>, JsonImportError> {
-        let handle_val = self
+        field: &ParsedString,
+    ) -> Result<ImportAttribute<S>, JsonImportError> {
+        let handle = self
             .store
-            .put::<LongString, _>(Blob::new(field.clone()))
+            .put(field.clone())
             .map_err(|err| JsonImportError::EncodeString {
-                field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                field: field.as_ref().to_owned(),
                 source: EncodeError::from_error(err),
             })?;
-        Ok(Attribute::<S>::from_handle(&handle_val))
+        Ok(ImportAttribute::<S>::from_handle(handle, field.clone()))
     }
 
-    fn bool_attr(&mut self, field: &Bytes) -> Result<Attribute<Boolean>, JsonImportError> {
+    fn bool_attr(
+        &mut self,
+        field: &ParsedString,
+    ) -> Result<ImportAttribute<Boolean>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.bool_attrs.get(&key) {
             return Ok(attr.clone());
@@ -158,7 +164,7 @@ where
         Ok(attr)
     }
 
-    fn num_attr(&mut self, field: &Bytes) -> Result<Attribute<F64>, JsonImportError> {
+    fn num_attr(&mut self, field: &ParsedString) -> Result<ImportAttribute<F64>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
@@ -170,8 +176,8 @@ where
 
     fn str_attr(
         &mut self,
-        field: &Bytes,
-    ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
+        field: &ParsedString,
+    ) -> Result<ImportAttribute<Handle<Blake3, LongString>>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
@@ -181,7 +187,7 @@ where
         Ok(attr)
     }
 
-    fn genid_attr(&mut self, field: &Bytes) -> Result<Attribute<GenId>, JsonImportError> {
+    fn genid_attr(&mut self, field: &ParsedString) -> Result<ImportAttribute<GenId>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());
@@ -206,8 +212,7 @@ where
     }
 
     pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
-        let blob = Blob::<LongString>::new(Bytes::from_source(input.to_owned()));
-        self.import_blob(blob)
+        self.import_blob(input.to_owned().to_blob())
     }
 
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Vec<Id>, JsonImportError> {
@@ -305,7 +310,7 @@ where
     fn parse_array(
         &mut self,
         bytes: &mut Bytes,
-        field: &Bytes,
+        field: &ParsedString,
         pairs: &mut Vec<(RawId, RawValue)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
@@ -338,7 +343,7 @@ where
     fn parse_value(
         &mut self,
         bytes: &mut Bytes,
-        field: &Bytes,
+        field: &ParsedString,
         pairs: &mut Vec<(RawId, RawValue)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
@@ -361,11 +366,11 @@ where
             }
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
-                let field_name = String::from_utf8_lossy(field.as_ref()).into_owned();
+                let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
                 let handle = self
                     .store
-                    .put::<LongString, _>(Blob::new(text))
+                    .put(text)
                     .map_err(|err| JsonImportError::EncodeString {
                         field: field_name,
                         source: EncodeError::from_error(err),
@@ -384,16 +389,17 @@ where
             Some(b'[') => self.parse_array(bytes, field, pairs, staged),
             _ => {
                 let num = self.parse_number(bytes)?;
-                let num_str = std::str::from_utf8(num.as_ref())
-                    .map_err(|err| JsonImportError::Syntax(err.to_string()))?;
+                let num_str = num
+                    .view::<str>()
+                    .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
                 let number: f64 =
-                    f64::from_str(num_str).map_err(|err| JsonImportError::EncodeNumber {
-                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                    f64::from_str(num_str.as_ref()).map_err(|err| JsonImportError::EncodeNumber {
+                        field: field.as_ref().to_owned(),
                         source: EncodeError::from_error(err),
                     })?;
                 if !number.is_finite() {
                     return Err(JsonImportError::EncodeNumber {
-                        field: String::from_utf8_lossy(field.as_ref()).into_owned(),
+                        field: field.as_ref().to_owned(),
                         source: EncodeError::message("non-finite number"),
                     });
                 }
@@ -445,8 +451,10 @@ where
         Ok(())
     }
 
-    fn parse_string(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        parse_string_common(bytes, &mut parse_unicode_escape)
+    fn parse_string(&self, bytes: &mut Bytes) -> Result<ParsedString, JsonImportError> {
+        let raw = parse_string_common(bytes, &mut parse_unicode_escape)?;
+        raw.view::<str>()
+            .map_err(|_| JsonImportError::Syntax("invalid utf-8".into()))
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
@@ -639,6 +647,7 @@ mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
     use crate::blob::ToBlob;
+    use crate::prelude::Attribute;
     use crate::value::schemas::hash::Blake3;
     use anybytes::View;
 

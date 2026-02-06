@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -61,12 +60,13 @@ impl ConstMetadata for Boolean {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Boolean stored as all-zero bytes for false and all-0xFF bytes for true. The encoding uses the full 32-byte value, making the two states obvious and cheap to test.\n\nUse for simple flags and binary states. Represent unknown or missing data by omitting the trible rather than inventing a third sentinel value.\n\nMixed patterns are invalid and will fail validation. If you need tri-state or richer states, model it explicitly (for example with ShortString or a dedicated entity).",
         )?;
+        let name = blobs.put("boolean".to_string())?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "boolean",
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -75,7 +75,7 @@ impl ConstMetadata for Boolean {
         let tribles = {
             let mut tribles = tribles;
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put::<WasmCode, _>(wasm_formatter::BOOLEAN_WASM)?,
+                metadata::value_formatter: blobs.put(wasm_formatter::BOOLEAN_WASM)?,
             };
             tribles
         };

@@ -1,4 +1,3 @@
-use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
@@ -33,12 +32,12 @@ impl ConstMetadata for FileBytes {
         B: BlobStore<Blake3>,
     {
         let id = Self::id();
-        let description = blobs.put::<LongString, _>(
+        let description = blobs.put(
             "Opaque file bytes captured as a blob. Use when the payload represents a file snapshot (attachments, dataset artifacts, exported archives) and you want to preserve that provenance in the schema rather than treating it as UnknownBlob. The meaning is given by adjacent metadata attributes such as mime type, filename, and dimensions.",
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::shortname: "filebytes",
+                metadata::name: blobs.put("filebytes".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })
