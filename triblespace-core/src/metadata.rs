@@ -105,8 +105,14 @@ attributes! {
     "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<hash::Blake3, LongString>;
     /// Link a usage annotation entity to the attribute it describes.
     "F10DE6D8E60E0E86013F1B867173A85C" as attribute: valueschemas::GenId;
-    /// Optional source location or provenance string for a usage annotation.
+    /// Optional provenance string for a usage annotation.
     "A56350FD00EC220B4567FE15A5CD68B8" as source: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Optional module path for the usage annotation (from `module_path!()`).
+    "BCB94C7439215641A3E9760CE3F4F432" as source_module: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Optional file path for the usage annotation (from `file!()`).
+    "44D8FAAE90F2ADE720BBAFB8B3BDD1E6" as source_file: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Optional line/column location for the usage annotation.
+    "41899485F816EB00ADCFC6A8E99ACE78" as source_location: valueschemas::LineLocation;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: valueschemas::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.

@@ -45,13 +45,6 @@ impl AttributeUsageSource {
         hasher.update(&self.line.to_be_bytes());
         hasher.update(&self.column.to_be_bytes());
     }
-
-    fn render(&self) -> String {
-        format!(
-            "{} {}:{}:{}",
-            self.module_path, self.file, self.line, self.column
-        )
-    }
 }
 
 impl AttributeUsage {
@@ -110,8 +103,15 @@ impl AttributeUsage {
         }
 
         if let Some(source) = self.source {
-            let source_handle = blobs.put(source.render())?;
-            tribles += entity! { &usage_entity @ metadata::source: source_handle };
+            let module_handle = blobs.put(source.module_path.to_owned())?;
+            tribles += entity! { &usage_entity @ metadata::source_module: module_handle };
+            let file_handle = blobs.put(source.file.to_owned())?;
+            tribles += entity! { &usage_entity @ metadata::source_file: file_handle };
+            let line = source.line as u64;
+            let column = source.column as u64;
+            tribles += entity! { &usage_entity @
+                metadata::source_location: (line, column, line, column),
+            };
         }
 
         tribles += entity! { &usage_entity @

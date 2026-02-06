@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
-- Attribute usage annotations with `metadata::attribute`, `metadata::source`,
+- Attribute usage annotations with `metadata::attribute`,
+  `metadata::source_module`, `metadata::source_file`, `metadata::source_location`,
   and `KIND_ATTRIBUTE_USAGE` for capturing contextual names/descriptions.
 
 ### Changed
