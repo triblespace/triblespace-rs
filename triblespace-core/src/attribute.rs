@@ -38,16 +38,10 @@ pub struct AttributeUsageSource {
     pub column: u32,
 }
 
-impl AttributeUsageSource {
-    fn hash_into(&self, hasher: &mut Hasher) {
-        hasher.update(self.module_path.as_bytes());
-        hasher.update(self.file.as_bytes());
-        hasher.update(&self.line.to_be_bytes());
-        hasher.update(&self.column.to_be_bytes());
-    }
-}
+impl AttributeUsageSource {}
 
 impl AttributeUsage {
+    const USAGE_DOMAIN: &'static [u8] = b"triblespace.attribute_usage";
     /// Construct a minimal usage entry with a name.
     pub const fn named(name: &'static str) -> Self {
         Self {
@@ -71,10 +65,10 @@ impl AttributeUsage {
 
     fn usage_id(&self, attribute_id: crate::id::Id) -> crate::id::Id {
         let mut hasher = Hasher::new();
+        hasher.update(Self::USAGE_DOMAIN);
         hasher.update(attribute_id.as_ref());
-        hasher.update(self.name.as_bytes());
         if let Some(source) = self.source {
-            source.hash_into(&mut hasher);
+            hasher.update(source.module_path.as_bytes());
         }
         let digest = hasher.finalize();
         let mut raw = [0u8; crate::id::ID_LEN];
@@ -105,13 +99,6 @@ impl AttributeUsage {
         if let Some(source) = self.source {
             let module_handle = blobs.put(source.module_path.to_owned())?;
             tribles += entity! { &usage_entity @ metadata::source_module: module_handle };
-            let file_handle = blobs.put(source.file.to_owned())?;
-            tribles += entity! { &usage_entity @ metadata::source_file: file_handle };
-            let line = source.line as u64;
-            let column = source.column as u64;
-            tribles += entity! { &usage_entity @
-                metadata::source_location: (line, column, line, column),
-            };
         }
 
         tribles += entity! { &usage_entity @

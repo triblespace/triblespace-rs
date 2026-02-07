@@ -421,7 +421,10 @@ where
     handles.into_iter().map(move |source_handle| {
         let blob: Blob<UnknownBlob> = source.get(source_handle).map_err(TransferError::Load)?;
 
-        Ok((source_handle, (target.put(blob).map_err(TransferError::Store)?)))
+        Ok((
+            source_handle,
+            (target.put(blob).map_err(TransferError::Store)?),
+        ))
     })
 }
 

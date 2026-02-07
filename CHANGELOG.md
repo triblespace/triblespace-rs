@@ -6,10 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.10.0] - 2026-02-07
 ### Added
 - Attribute usage annotations with `metadata::attribute`,
-  `metadata::source_module`, `metadata::source_file`, `metadata::source_location`,
-  and `KIND_ATTRIBUTE_USAGE` for capturing contextual names/descriptions.
+  `metadata::source_module`, and `KIND_ATTRIBUTE_USAGE` for capturing
+  contextual names/descriptions.
 
 ### Changed
 - Clarified `metadata::name` and `metadata::description` as general-purpose
@@ -17,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Attribute::describe` now emits usage annotations when available, and the
   `attributes!` macro attaches contextual usage metadata (name/description/
   source) to declared attributes.
+- Attribute usage ids are now anchored on the attribute id + module path only,
+  so renames and file/line shifts do not churn usage identities.
 - JSON importers validate UTF-8 strings via `View<str>` while reusing the
   parsed bytes.
 

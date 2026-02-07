@@ -8,6 +8,7 @@ use ed25519_dalek::Verifier;
 use ed25519_dalek::VerifyingKey;
 use itertools::Itertools;
 
+use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::rngid;
@@ -15,9 +16,8 @@ use crate::id::Id;
 use crate::metadata;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::trible::TribleSet;
-use crate::value::Value;
 use crate::value::schemas::hash::{Blake3, Handle};
-use crate::blob::schemas::longstring::LongString;
+use crate::value::Value;
 
 /// Builds a metadata [`TribleSet`] describing a branch and signs it.
 ///

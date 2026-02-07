@@ -141,13 +141,13 @@ where
         &mut self,
         field: &ParsedString,
     ) -> Result<ImportAttribute<S>, JsonImportError> {
-        let handle = self
-            .store
-            .put(field.clone())
-            .map_err(|err| JsonImportError::EncodeString {
-                field: field.as_ref().to_owned(),
-                source: EncodeError::from_error(err),
-            })?;
+        let handle =
+            self.store
+                .put(field.clone())
+                .map_err(|err| JsonImportError::EncodeString {
+                    field: field.as_ref().to_owned(),
+                    source: EncodeError::from_error(err),
+                })?;
         Ok(ImportAttribute::<S>::from_handle(handle, field.clone()))
     }
 
@@ -187,7 +187,10 @@ where
         Ok(attr)
     }
 
-    fn genid_attr(&mut self, field: &ParsedString) -> Result<ImportAttribute<GenId>, JsonImportError> {
+    fn genid_attr(
+        &mut self,
+        field: &ParsedString,
+    ) -> Result<ImportAttribute<GenId>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());
@@ -392,11 +395,12 @@ where
                 let num_str = num
                     .view::<str>()
                     .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
-                let number: f64 =
-                    f64::from_str(num_str.as_ref()).map_err(|err| JsonImportError::EncodeNumber {
+                let number: f64 = f64::from_str(num_str.as_ref()).map_err(|err| {
+                    JsonImportError::EncodeNumber {
                         field: field.as_ref().to_owned(),
                         source: EncodeError::from_error(err),
-                    })?;
+                    }
+                })?;
                 if !number.is_finite() {
                     return Err(JsonImportError::EncodeNumber {
                         field: field.as_ref().to_owned(),

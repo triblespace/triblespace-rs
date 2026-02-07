@@ -17,7 +17,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
 
     let contents = b"hello world".to_vec();
-    let blob = Blob::new(Bytes::from(contents.clone()));
+    let blob: Blob<UnknownBlob> = Blob::new(Bytes::from(contents.clone()));
 
     let handle = remote.put(blob)?;
 

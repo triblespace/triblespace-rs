@@ -92,11 +92,7 @@ where
     )?);
 
     metadata.union(
-        ImportAttribute::<GenId>::from_raw(
-            kind.raw(),
-            Some(name("json.kind")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?,
     );
     metadata.union(
         ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
@@ -113,18 +109,12 @@ where
         .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<Boolean>::from_raw(
-            boolean.raw(),
-            Some(name("json.boolean")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<Boolean>::from_raw(boolean.raw(), Some(name("json.boolean")))
+            .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<GenId>::from_raw(
-            field_parent.raw(),
-            Some(name("json.field_parent")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<GenId>::from_raw(field_parent.raw(), Some(name("json.field_parent")))
+            .describe(blobs)?,
     );
     metadata.union(
         ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
@@ -134,39 +124,24 @@ where
         .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<U256BE>::from_raw(
-            field_index.raw(),
-            Some(name("json.field_index")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<U256BE>::from_raw(field_index.raw(), Some(name("json.field_index")))
+            .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<GenId>::from_raw(
-            field_value.raw(),
-            Some(name("json.field_value")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<GenId>::from_raw(field_value.raw(), Some(name("json.field_value")))
+            .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<GenId>::from_raw(
-            array_parent.raw(),
-            Some(name("json.array_parent")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<GenId>::from_raw(array_parent.raw(), Some(name("json.array_parent")))
+            .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<U256BE>::from_raw(
-            array_index.raw(),
-            Some(name("json.array_index")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<U256BE>::from_raw(array_index.raw(), Some(name("json.array_index")))
+            .describe(blobs)?,
     );
     metadata.union(
-        ImportAttribute::<GenId>::from_raw(
-            array_value.raw(),
-            Some(name("json.array_value")),
-        )
-        .describe(blobs)?,
+        ImportAttribute::<GenId>::from_raw(array_value.raw(), Some(name("json.array_value")))
+            .describe(blobs)?,
     );
 
     metadata += describe_kind(blobs, kind_object, "json.kind.object", "JSON object node.")?;
@@ -328,13 +303,13 @@ where
                     .view::<str>()
                     .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
                 let id = self.hash_tagged(b"number", &[number_view.as_ref().as_bytes()]);
-                let handle = self
-                    .store
-                    .put(number_view)
-                    .map_err(|err| JsonImportError::EncodeNumber {
-                        field: "number".to_string(),
-                        source: EncodeError::from_error(err),
-                    })?;
+                let handle =
+                    self.store
+                        .put(number_view)
+                        .map_err(|err| JsonImportError::EncodeNumber {
+                            field: "number".to_string(),
+                            source: EncodeError::from_error(err),
+                        })?;
                 self.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
@@ -359,13 +334,13 @@ where
                 self.consume_byte(bytes, b':')?;
                 self.skip_ws(bytes);
                 let value = self.parse_value(bytes)?;
-                let name_handle = self
-                    .store
-                    .put(name.clone())
-                    .map_err(|err| JsonImportError::EncodeString {
-                        field: "field".to_string(),
-                        source: EncodeError::from_error(err),
-                    })?;
+                let name_handle =
+                    self.store
+                        .put(name.clone())
+                        .map_err(|err| JsonImportError::EncodeString {
+                            field: "field".to_string(),
+                            source: EncodeError::from_error(err),
+                        })?;
                 fields.push(FieldEntry {
                     name,
                     name_handle,
