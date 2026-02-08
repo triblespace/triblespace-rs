@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-02-08
+### Added
+- Branch tombstone records in the pile format for explicit branch deletion.
+
+### Changed
+- `BranchStore::update` now takes `new: Option<Handle<..>>`; `None` deletes the branch.
+- `Pile` applies tombstones by removing branch heads from its in-memory branch index.
+- `ObjectStoreRemote` represents tombstones as empty branch objects (size=0) and filters them out of `branches()`.
+
 ## [0.10.0] - 2026-02-07
 ### Added
 - Attribute usage annotations with `metadata::attribute`,

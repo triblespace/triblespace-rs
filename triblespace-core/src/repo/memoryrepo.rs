@@ -82,13 +82,20 @@ impl BranchStore<Blake3> for MemoryRepo {
         &mut self,
         id: Id,
         old: Option<Value<Handle<Blake3, SimpleArchive>>>,
-        new: Value<Handle<Blake3, SimpleArchive>>,
+        new: Option<Value<Handle<Blake3, SimpleArchive>>>,
     ) -> Result<PushResult<Blake3>, Self::UpdateError> {
         let current = self.branches.get(&id);
         if current != old.as_ref() {
             return Ok(PushResult::Conflict(current.cloned()));
         }
-        self.branches.insert(id, new);
+        match new {
+            Some(new) => {
+                self.branches.insert(id, new);
+            }
+            None => {
+                self.branches.remove(&id);
+            }
+        }
         Ok(PushResult::Success())
     }
 }

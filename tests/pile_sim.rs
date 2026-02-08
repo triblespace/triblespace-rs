@@ -131,7 +131,7 @@ proptest! {
                             let id = branch_id(branch);
                             let h = handles[handle % handles.len()].transmute();
                             let old = branches.get(&id).copied();
-                            let res = piles[actor].update(id, old, h).unwrap();
+                            let res = piles[actor].update(id, old, Some(h)).unwrap();
                             match res {
                                 PushResult::Success() => {
                                     branches.insert(id, h);

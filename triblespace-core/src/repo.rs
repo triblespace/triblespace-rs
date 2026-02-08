@@ -350,7 +350,7 @@ pub trait BranchStore<H: HashProtocol> {
     ///
     /// # Parameters
     /// * `old` - Expected current value of the branch (None if creating new)
-    /// * `new` - Value to update the branch to
+    /// * `new` - Value to update the branch to (None deletes the branch)
     ///
     /// # Returns
     /// * `Success` - Push completed successfully
@@ -360,7 +360,7 @@ pub trait BranchStore<H: HashProtocol> {
         &mut self,
         id: Id,
         old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Value<Handle<H, SimpleArchive>>,
+        new: Option<Value<Handle<H, SimpleArchive>>>,
     ) -> Result<PushResult<H>, Self::UpdateError>;
 }
 
@@ -820,7 +820,7 @@ where
             .map_err(|e| BranchError::StoragePut(e))?;
         let push_result = self
             .storage
-            .update(*branch_id, None, branch_handle)
+            .update(*branch_id, None, Some(branch_handle))
             .map_err(|e| BranchError::BranchUpdate(e))?;
 
         match push_result {
@@ -998,7 +998,7 @@ where
             .update(
                 workspace.base_branch_id,
                 Some(workspace.base_branch_meta),
-                branch_meta_handle,
+                Some(branch_meta_handle),
             )
             .map_err(PushError::BranchUpdate)?;
 

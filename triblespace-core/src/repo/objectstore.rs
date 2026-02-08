@@ -203,19 +203,25 @@ where
 
     fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
         let prefix = self.prefix.child(BRANCH_INFIX);
-        let stream = self.store.list(Some(&prefix)).map(|r| match r {
-            Ok(meta) => {
-                let name = meta
-                    .location
-                    .filename()
-                    .ok_or(ListBranchesErr::NotAFile("no filename"))?;
-                let digest = RawId::from_hex(name).map_err(ListBranchesErr::BadNameHex)?;
-                let Some(id) = Id::new(digest) else {
-                    return Err(ListBranchesErr::BadId);
-                };
-                Ok(id)
+        let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
+            match r {
+                Ok(meta) if meta.size == 0 => None, // tombstoned branch (0-byte object)
+                Ok(meta) => {
+                    let name = match meta.location.filename() {
+                        Some(name) => name,
+                        None => return Some(Err(ListBranchesErr::NotAFile("no filename"))),
+                    };
+                    let digest = match RawId::from_hex(name) {
+                        Ok(digest) => digest,
+                        Err(e) => return Some(Err(ListBranchesErr::BadNameHex(e))),
+                    };
+                    let Some(id) = Id::new(digest) else {
+                        return Some(Err(ListBranchesErr::BadId));
+                    };
+                    Some(Ok(id))
+                }
+                Err(e) => Some(Err(ListBranchesErr::List(e))),
             }
-            Err(e) => Err(ListBranchesErr::List(e)),
         });
         Ok(BlockingIter::from_stream(
             self.rt.handle().clone(),
@@ -230,6 +236,9 @@ where
         match result {
             Ok(object) => {
                 let bytes = self.rt.block_on(object.bytes())?;
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
                 let value = (&bytes[..]).try_into()?;
                 Ok(Some(Value::new(value)))
             }
@@ -242,10 +251,28 @@ where
         &mut self,
         id: Id,
         old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Value<Handle<H, SimpleArchive>>,
+        new: Option<Value<Handle<H, SimpleArchive>>>,
     ) -> Result<PushResult<H>, Self::UpdateError> {
         let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-        let new_bytes = bytes::Bytes::copy_from_slice(&new.raw);
+        // We encode "deleted branch" as an empty object. This lets us preserve
+        // CAS semantics for delete via conditional PUT (PutMode::Update), since
+        // `object_store` does not currently expose conditional delete.
+        //
+        // TODO: Once `object_store` supports conditional delete, migrate away
+        // from 0-byte tombstones and treat empty objects as corruption.
+        let new_bytes = match new {
+            Some(new) => bytes::Bytes::copy_from_slice(&new.raw),
+            None => bytes::Bytes::new(),
+        };
+
+        let parse_branch = |bytes: &bytes::Bytes| -> Result<Option<Value<Handle<H, SimpleArchive>>>, TryFromSliceError> {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let value = (&bytes[..]).try_into()?;
+            Ok(Some(Value::new(value)))
+        };
+
         if let Some(old_hash) = old {
             let mut result = self.rt.block_on(async { self.store.get(&path).await });
             loop {
@@ -256,10 +283,9 @@ where
                             version: obj.meta.version.clone(),
                         };
                         let stored_bytes = self.rt.block_on(obj.bytes())?;
-                        let stored_value = (&stored_bytes[..]).try_into()?;
-                        let stored_hash = Value::new(stored_value);
-                        if old_hash != stored_hash {
-                            return Ok(PushResult::Conflict(Some(stored_hash)));
+                        let stored_hash = parse_branch(&stored_bytes)?;
+                        if stored_hash != Some(old_hash) {
+                            return Ok(PushResult::Conflict(stored_hash));
                         }
                         match self.rt.block_on(async {
                             self.store
@@ -278,9 +304,7 @@ where
                             Err(e) => return Err(PushBranchErr::StoreErr(e)),
                         }
                     }
-                    Err(object_store::Error::NotFound { .. }) => {
-                        return Ok(PushResult::Conflict(None));
-                    }
+                    Err(object_store::Error::NotFound { .. }) => return Ok(PushResult::Conflict(None)),
                     Err(e) => return Err(PushBranchErr::StoreErr(e)),
                 }
             }
@@ -293,16 +317,41 @@ where
                 }) {
                     Ok(_) => return Ok(PushResult::Success()),
                     Err(object_store::Error::AlreadyExists { .. }) => {
-                        let result = self.rt.block_on(async { self.store.get(&path).await });
-                        match result {
-                            Ok(obj) => {
-                                let bytes = self.rt.block_on(obj.bytes())?;
-                                let value = (&bytes[..]).try_into()?;
-                                return Ok(PushResult::Conflict(Some(Value::new(value))));
+                        let mut result = self.rt.block_on(async { self.store.get(&path).await });
+                        loop {
+                            match result {
+                                Ok(obj) => {
+                                    let version = UpdateVersion {
+                                        e_tag: obj.meta.e_tag.clone(),
+                                        version: obj.meta.version.clone(),
+                                    };
+                                    let stored_bytes = self.rt.block_on(obj.bytes())?;
+                                    let stored_hash = parse_branch(&stored_bytes)?;
+                                    if stored_hash.is_some() {
+                                        return Ok(PushResult::Conflict(stored_hash));
+                                    }
+                                    match self.rt.block_on(async {
+                                        self.store
+                                            .put_opts(
+                                                &path,
+                                                new_bytes.clone().into(),
+                                                PutMode::Update(version).into(),
+                                            )
+                                            .await
+                                    }) {
+                                        Ok(_) => return Ok(PushResult::Success()),
+                                        Err(object_store::Error::Precondition { .. }) => {
+                                            result = self.rt.block_on(async { self.store.get(&path).await });
+                                            continue;
+                                        }
+                                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
+                                    }
+                                }
+                                Err(object_store::Error::NotFound { .. }) => break, // raced with delete; retry create
+                                Err(e) => return Err(PushBranchErr::StoreErr(e)),
                             }
-                            Err(object_store::Error::NotFound { .. }) => continue,
-                            Err(e) => return Err(PushBranchErr::StoreErr(e)),
                         }
+                        continue;
                     }
                     Err(e) => return Err(PushBranchErr::StoreErr(e)),
                 }

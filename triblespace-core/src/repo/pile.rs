@@ -60,6 +60,7 @@ use crate::value::ValueSchema;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
+const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("4A32354DA9DC4F439DF5A09647495DA8");
 
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
@@ -109,6 +110,25 @@ impl BranchHeader {
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
+struct BranchTombstoneHeader {
+    magic_marker: RawId,
+    branch_id: RawId,
+    /// Reserved bytes to preserve 64 byte record alignment.
+    reserved: RawValue,
+}
+
+impl BranchTombstoneHeader {
+    fn new(branch_id: Id) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BRANCH_TOMBSTONE,
+            branch_id: *branch_id,
+            reserved: [0u8; 32],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
 struct BlobHeader {
     magic_marker: RawId,
     timestamp: u64,
@@ -131,6 +151,7 @@ impl BlobHeader {
 enum Applied<H: HashProtocol> {
     Blob { hash: Value<Hash<H>> },
     Branch { id: Id, hash: Value<Hash<H>> },
+    BranchTombstone { id: Id },
 }
 
 #[derive(Debug)]
@@ -588,6 +609,20 @@ impl<H: HashProtocol> Pile<H> {
                     hash,
                 }))
             }
+            MAGIC_MARKER_BRANCH_TOMBSTONE => {
+                let header =
+                    bytes
+                        .view_prefix::<BranchTombstoneHeader>()
+                        .map_err(|_| ReadError::CorruptPile {
+                            valid_length: start_offset,
+                        })?;
+                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
+                    valid_length: start_offset,
+                })?;
+                self.branches.remove(&header.branch_id);
+                self.applied_length = start_offset + std::mem::size_of::<BranchTombstoneHeader>();
+                Ok(Some(Applied::BranchTombstone { id: branch_id }))
+            }
             _ => Err(ReadError::CorruptPile {
                 valid_length: start_offset,
             }),
@@ -861,6 +896,7 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
                         }
                     }
                     Some(Applied::Branch { .. }) => {}
+                    Some(Applied::BranchTombstone { .. }) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
                             "blob missing after write",
@@ -927,7 +963,7 @@ where
         &mut self,
         id: Id,
         old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Value<Handle<H, SimpleArchive>>,
+        new: Option<Value<Handle<H, SimpleArchive>>>,
     ) -> Result<super::PushResult<H>, Self::UpdateError> {
         self.file.lock()?;
         let res = (|| {
@@ -937,11 +973,19 @@ where
                 return Ok(PushResult::Conflict(current_hash));
             }
 
-            let header_len = std::mem::size_of::<BranchHeader>();
-            let header = BranchHeader::new(id, new);
-            let new_hash: Value<Hash<H>> = new.into();
-            let expected = header_len;
-            let write_res = self.file.write(header.as_bytes());
+            let (expected, write_res) = match new {
+                Some(new) => {
+                    let header = BranchHeader::new(id, new);
+                    (std::mem::size_of::<BranchHeader>(), self.file.write(header.as_bytes()))
+                }
+                None => {
+                    let header = BranchTombstoneHeader::new(id);
+                    (
+                        std::mem::size_of::<BranchTombstoneHeader>(),
+                        self.file.write(header.as_bytes()),
+                    )
+                }
+            };
             let written = match write_res {
                 Ok(n) => n,
                 Err(e) => return Err(UpdateBranchError::IoError(e)),
@@ -953,7 +997,12 @@ where
                 )));
             }
             match self.apply_next().map_err(UpdateBranchError::from)? {
-                Some(Applied::Branch { id: bid, hash }) if bid == id && hash == new_hash => {
+                Some(Applied::Branch { id: bid, hash })
+                    if matches!(new, Some(new) if bid == id && hash == new.into()) =>
+                {
+                    Ok(PushResult::Success())
+                }
+                Some(Applied::BranchTombstone { id: bid }) if new.is_none() && bid == id => {
                     Ok(PushResult::Success())
                 }
                 Some(_) => Err(UpdateBranchError::IoError(std::io::Error::other(
@@ -1023,7 +1072,7 @@ mod tests {
     use super::*;
 
     use rand::RngCore;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
@@ -1335,7 +1384,7 @@ mod tests {
 
         let branch_id = Id::new([1; 16]).unwrap();
         let head = Value::<Handle<Blake3, SimpleArchive>>::new([2; 32]);
-        pile.update(branch_id, None, head).unwrap();
+        pile.update(branch_id, None, Some(head)).unwrap();
 
         let data = vec![3u8; 8];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
@@ -1357,7 +1406,7 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, handle1.transmute()).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         pile.put(blob2).unwrap();
@@ -1381,7 +1430,7 @@ mod tests {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![3u8; 5]));
             let handle = pile.put(blob).unwrap();
-            pile.update(branch_id, None, handle.transmute()).unwrap();
+            pile.update(branch_id, None, Some(handle.transmute())).unwrap();
             pile.flush().unwrap();
             std::mem::forget(pile);
             handle
@@ -1395,6 +1444,29 @@ mod tests {
     }
 
     #[test]
+    fn branch_tombstone_removes_head_and_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pile.pile");
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
+        let h = pile.put(blob).unwrap();
+        let branch_id = Id::new([7u8; 16]).unwrap();
+        pile.update(branch_id, None, Some(h.transmute())).unwrap();
+        pile.flush().unwrap();
+
+        assert_eq!(pile.head(branch_id).unwrap(), Some(h.transmute()));
+
+        pile.update(branch_id, Some(h.transmute()), None).unwrap();
+        pile.flush().unwrap();
+
+        assert_eq!(pile.head(branch_id).unwrap(), None);
+        let branches: HashSet<Id> = pile.branches().unwrap().map(|r| r.unwrap()).collect();
+        assert!(!branches.contains(&branch_id));
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn branch_update_detects_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pile.pile");
@@ -1404,14 +1476,14 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([2u8; 16]).unwrap();
-        pile.update(branch_id, None, handle1.transmute()).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         let handle2 = pile.put(blob2).unwrap();
         pile.flush().unwrap();
 
         match pile
-            .update(branch_id, Some(handle2.transmute()), handle2.transmute())
+            .update(branch_id, Some(handle2.transmute()), Some(handle2.transmute()))
             .unwrap()
         {
             PushResult::Conflict(current) => {
@@ -1433,14 +1505,14 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, handle1.transmute()).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
         pile.flush().unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         let handle2 = pile.put(blob2).unwrap();
 
         let result = pile
-            .update(branch_id, Some(handle2.transmute()), handle2.transmute())
+            .update(branch_id, Some(handle2.transmute()), Some(handle2.transmute()))
             .unwrap();
         match result {
             PushResult::Conflict(current) => assert_eq!(current, Some(handle1.transmute())),
@@ -1501,14 +1573,14 @@ mod tests {
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
         let h1 = pile.put(blob1).unwrap();
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, h1.transmute()).unwrap();
+        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
         pile.flush().unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         let h2 = pile.put(blob2).unwrap();
         pile.flush().unwrap();
 
-        match pile.update(branch_id, Some(h2.transmute()), h1.transmute()) {
+        match pile.update(branch_id, Some(h2.transmute()), Some(h1.transmute())) {
             Ok(PushResult::Conflict(existing)) => {
                 assert_eq!(existing, Some(h1.transmute()))
             }
@@ -1655,9 +1727,9 @@ mod tests {
         pile.flush().unwrap();
 
         let branch_id = Id::new([3u8; 16]).unwrap();
-        pile.update(branch_id, None, h1.transmute()).unwrap();
+        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
 
-        match pile.update(branch_id, Some(h2.transmute()), h2.transmute()) {
+        match pile.update(branch_id, Some(h2.transmute()), Some(h2.transmute())) {
             Ok(PushResult::Conflict(existing)) => {
                 assert_eq!(existing, Some(h1.transmute()))
             }

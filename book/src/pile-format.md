@@ -67,8 +67,8 @@ Hash verification only happens when blobs are read. Opening even a very large
 pile is therefore fast while still catching corruption before data is used.
 
 Every record begins with a 16&nbsp;byte magic marker that identifies whether it
-stores a blob or a branch. The sections below illustrate the layout of each
-type.
+stores a blob, a branch head update, or a branch tombstone. The sections below
+illustrate the layout of each type.
 
 ## Usage
 
@@ -180,6 +180,16 @@ Branch entries map a branch identifier to the hash of a blob. Branch appends are
 intentionally lightweight: the pile does not check whether the referenced blob
 exists locally, allowing deployments that store heads on disk while serving blob
 contents from a remote store.
+
+## Branch Tombstones
+```
+            ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐
+          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐
+ header   │ │magic number C││  branch id   ││           reserved           │
+          └ └──────────────┘└──────────────┘└──────────────────────────────┘
+```
+Branch tombstone entries remove a branch head mapping. The reserved bytes are
+unused and exist solely to preserve 64&nbsp;byte record alignment.
 ## Recovery
 Calling [`refresh`](../../src/repo/pile.rs) scans an existing file to ensure
 every header uses a known marker and that the whole record fits. It does not

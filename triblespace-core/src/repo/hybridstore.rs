@@ -87,7 +87,7 @@ where
         &mut self,
         id: Id,
         old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Value<Handle<H, SimpleArchive>>,
+        new: Option<Value<Handle<H, SimpleArchive>>>,
     ) -> Result<PushResult<H>, Self::UpdateError> {
         self.branches.update(id, old, new)
     }
