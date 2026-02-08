@@ -58,11 +58,6 @@ use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
-// Magic markers are 16-byte record discriminators in the pile WAL format.
-//
-// They are part of the on-disk format and must remain stable. When adding a
-// new marker, mint it using `trible genid` (i.e. randomness), not by "making up"
-// a hex constant.
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
