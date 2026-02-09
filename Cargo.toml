@@ -1,6 +1,6 @@
 [package]
 name = "triblespace"
-version = "0.11.0"
+version = "0.12.0"
 authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
 edition = "2021"
 description = "The Triblespace: A lightweight knowledge base for rust."
@@ -19,8 +19,8 @@ members = [
 resolver = "2"
 
 [dependencies]
-triblespace-core = { version = "0.11.0", path = "./triblespace-core" }
-triblespace-macros = { version = "0.11.0", path = "./triblespace-macros" }
+triblespace-core = { version = "0.12.0", path = "./triblespace-core" }
+triblespace-macros = { version = "0.12.0", path = "./triblespace-macros" }
 
 [dev-dependencies]
 criterion = "0.6.0"

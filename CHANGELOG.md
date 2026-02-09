@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.12.0] - 2026-02-09
 ### Changed
 - `Repository::create_branch` now mints branch ids with `genid` (high-entropy random ids) instead of `ufoid` (time-prefixed ids).
 
