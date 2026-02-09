@@ -38,6 +38,7 @@ pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::ToBlob;
 pub use crate::blob::TryFromBlob;
 pub use crate::id::fucid;
+pub use crate::id::genid;
 pub use crate::id::local_ids;
 pub use crate::id::rngid;
 pub use crate::id::ufoid;

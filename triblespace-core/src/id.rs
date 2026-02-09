@@ -22,6 +22,7 @@ use hex::FromHex;
 
 pub use fucid::fucid;
 pub use fucid::FUCIDsource;
+pub use rngid::rngid as genid;
 pub use rngid::rngid;
 pub use ufoid::ufoid;
 

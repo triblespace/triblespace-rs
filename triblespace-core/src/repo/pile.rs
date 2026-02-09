@@ -610,12 +610,11 @@ impl<H: HashProtocol> Pile<H> {
                 }))
             }
             MAGIC_MARKER_BRANCH_TOMBSTONE => {
-                let header =
-                    bytes
-                        .view_prefix::<BranchTombstoneHeader>()
-                        .map_err(|_| ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        })?;
+                let header = bytes.view_prefix::<BranchTombstoneHeader>().map_err(|_| {
+                    ReadError::CorruptPile {
+                        valid_length: start_offset,
+                    }
+                })?;
                 let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
@@ -976,7 +975,10 @@ where
             let (expected, write_res) = match new {
                 Some(new) => {
                     let header = BranchHeader::new(id, new);
-                    (std::mem::size_of::<BranchHeader>(), self.file.write(header.as_bytes()))
+                    (
+                        std::mem::size_of::<BranchHeader>(),
+                        self.file.write(header.as_bytes()),
+                    )
                 }
                 None => {
                     let header = BranchTombstoneHeader::new(id);
@@ -997,9 +999,7 @@ where
                 )));
             }
             match self.apply_next().map_err(UpdateBranchError::from)? {
-                Some(Applied::Branch { id: bid, hash })
-                    if matches!(new, Some(new) if bid == id && hash == new.into()) =>
-                {
+                Some(Applied::Branch { id: bid, hash }) if matches!(new, Some(new) if bid == id && hash == new.into()) => {
                     Ok(PushResult::Success())
                 }
                 Some(Applied::BranchTombstone { id: bid }) if new.is_none() && bid == id => {
@@ -1406,7 +1406,8 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute()))
+            .unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         pile.put(blob2).unwrap();
@@ -1430,7 +1431,8 @@ mod tests {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![3u8; 5]));
             let handle = pile.put(blob).unwrap();
-            pile.update(branch_id, None, Some(handle.transmute())).unwrap();
+            pile.update(branch_id, None, Some(handle.transmute()))
+                .unwrap();
             pile.flush().unwrap();
             std::mem::forget(pile);
             handle
@@ -1476,14 +1478,19 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([2u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute()))
+            .unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         let handle2 = pile.put(blob2).unwrap();
         pile.flush().unwrap();
 
         match pile
-            .update(branch_id, Some(handle2.transmute()), Some(handle2.transmute()))
+            .update(
+                branch_id,
+                Some(handle2.transmute()),
+                Some(handle2.transmute()),
+            )
             .unwrap()
         {
             PushResult::Conflict(current) => {
@@ -1505,14 +1512,19 @@ mod tests {
         let handle1 = pile.put(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
-        pile.update(branch_id, None, Some(handle1.transmute())).unwrap();
+        pile.update(branch_id, None, Some(handle1.transmute()))
+            .unwrap();
         pile.flush().unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
         let handle2 = pile.put(blob2).unwrap();
 
         let result = pile
-            .update(branch_id, Some(handle2.transmute()), Some(handle2.transmute()))
+            .update(
+                branch_id,
+                Some(handle2.transmute()),
+                Some(handle2.transmute()),
+            )
             .unwrap();
         match result {
             PushResult::Conflict(current) => assert_eq!(current, Some(handle1.transmute())),

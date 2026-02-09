@@ -165,7 +165,7 @@ use crate::blob::MemoryBlobStore;
 use crate::blob::ToBlob;
 use crate::blob::TryFromBlob;
 use crate::find;
-use crate::id::ufoid;
+use crate::id::genid;
 use crate::id::Id;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
@@ -794,7 +794,7 @@ where
         commit: Option<CommitHandle>,
         signing_key: SigningKey,
     ) -> Result<ExclusiveId, BranchError<Storage>> {
-        let branch_id = ufoid();
+        let branch_id = genid();
         let name_blob = branch_name.to_owned().to_blob();
         let name_handle = name_blob.get_handle::<Blake3>();
         self.storage

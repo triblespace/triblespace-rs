@@ -265,7 +265,10 @@ where
             None => bytes::Bytes::new(),
         };
 
-        let parse_branch = |bytes: &bytes::Bytes| -> Result<Option<Value<Handle<H, SimpleArchive>>>, TryFromSliceError> {
+        let parse_branch = |bytes: &bytes::Bytes| -> Result<
+            Option<Value<Handle<H, SimpleArchive>>>,
+            TryFromSliceError,
+        > {
             if bytes.is_empty() {
                 return Ok(None);
             }
@@ -304,7 +307,9 @@ where
                             Err(e) => return Err(PushBranchErr::StoreErr(e)),
                         }
                     }
-                    Err(object_store::Error::NotFound { .. }) => return Ok(PushResult::Conflict(None)),
+                    Err(object_store::Error::NotFound { .. }) => {
+                        return Ok(PushResult::Conflict(None))
+                    }
                     Err(e) => return Err(PushBranchErr::StoreErr(e)),
                 }
             }
@@ -341,7 +346,9 @@ where
                                     }) {
                                         Ok(_) => return Ok(PushResult::Success()),
                                         Err(object_store::Error::Precondition { .. }) => {
-                                            result = self.rt.block_on(async { self.store.get(&path).await });
+                                            result = self
+                                                .rt
+                                                .block_on(async { self.store.get(&path).await });
                                             continue;
                                         }
                                         Err(e) => return Err(PushBranchErr::StoreErr(e)),
