@@ -116,15 +116,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_L
     }
 }
 
-impl<const BRANCHING_FACTOR: usize, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
-    for Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>; BRANCHING_FACTOR], V>
-{
-    fn tag(_body: NonNull<Self>) -> HeadTag {
-        debug_assert!(BRANCHING_FACTOR.is_power_of_two());
-        unsafe { transmute((BRANCHING_FACTOR as u32).ilog2() as u8) }
-    }
-}
-
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
     for Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
 {
