@@ -287,13 +287,11 @@ pub(crate) enum HeadTag {
 impl HeadTag {
     #[inline]
     fn from_raw(raw: u8) -> Self {
-        if raw <= HeadTag::Branch256 as u8 {
-            // SAFETY: `HeadTag` is `#[repr(u8)]` with a contiguous discriminant
-            // range 0..=8, so any value in this range is a valid enum value.
-            unsafe { std::mem::transmute(raw) }
-        } else {
-            panic!("invalid head tag: {raw}");
-        }
+        debug_assert!(raw <= HeadTag::Branch256 as u8);
+        // SAFETY: `HeadTag` is `#[repr(u8)]` with a contiguous discriminant
+        // range 0..=8. The tag bits are written by Head::new/set_body and
+        // Branch::tag, which only emit valid discriminants.
+        unsafe { std::mem::transmute(raw) }
     }
 }
 
