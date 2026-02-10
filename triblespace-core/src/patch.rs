@@ -271,17 +271,18 @@ impl<const KEY_LEN: usize> KeySegmentation<KEY_LEN> for SingleSegmentation {
 pub(crate) enum HeadTag {
     // Stored in the low 4 bits of `Head::tptr` (see Head::new).
     //
-    // Branch values encode log2(branch_size) - 1 in the low 3 bits. The high
-    // bit (bit 3) is set for leaf nodes.
-    Branch2 = 0,
-    Branch4 = 1,
-    Branch8 = 2,
-    Branch16 = 3,
-    Branch32 = 4,
-    Branch64 = 5,
-    Branch128 = 6,
-    Branch256 = 7,
-    Leaf = 8,
+    // Branch values encode log2(branch_size) (i.e. `Branch2 == 1`, `Branch256
+    // == 8`). `0` is reserved for leaf nodes, which lets us compute the branch
+    // size as `1 << tag` without any offset.
+    Leaf = 0,
+    Branch2 = 1,
+    Branch4 = 2,
+    Branch8 = 3,
+    Branch16 = 4,
+    Branch32 = 5,
+    Branch64 = 6,
+    Branch128 = 7,
+    Branch256 = 8,
 }
 
 pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
@@ -363,15 +364,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     #[inline]
     pub(crate) fn tag(&self) -> HeadTag {
         match (self.tptr.as_ptr() as u64 & Self::TAG_MASK) as u8 {
-            0 => HeadTag::Branch2,
-            1 => HeadTag::Branch4,
-            2 => HeadTag::Branch8,
-            3 => HeadTag::Branch16,
-            4 => HeadTag::Branch32,
-            5 => HeadTag::Branch64,
-            6 => HeadTag::Branch128,
-            7 => HeadTag::Branch256,
-            8 => HeadTag::Leaf,
+            0 => HeadTag::Leaf,
+            1 => HeadTag::Branch2,
+            2 => HeadTag::Branch4,
+            3 => HeadTag::Branch8,
+            4 => HeadTag::Branch16,
+            5 => HeadTag::Branch32,
+            6 => HeadTag::Branch64,
+            7 => HeadTag::Branch128,
+            8 => HeadTag::Branch256,
             tag => panic!("invalid head tag: {tag}"),
         }
     }
@@ -423,7 +424,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             match self.tag() {
                 HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
                 branch_tag => {
-                    let count = 1 << (branch_tag as usize + 1);
+                    let count = 1 << (branch_tag as usize);
                     BodyPtr::Branch(NonNull::new_unchecked(std::ptr::slice_from_raw_parts(
                         ptr.as_ptr(),
                         count,
