@@ -122,7 +122,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
     fn tag(body: NonNull<Self>) -> HeadTag {
         unsafe {
             let ptr = addr_of!((*body.as_ptr()).child_table);
-            transmute(dst_len(ptr).ilog2() as u8)
+            let exp = dst_len(ptr).ilog2() as u8;
+            debug_assert!((1..=8).contains(&exp));
+            transmute(exp - 1)
         }
     }
 }

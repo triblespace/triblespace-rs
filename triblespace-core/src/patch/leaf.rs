@@ -12,7 +12,7 @@ use std::ptr::addr_of;
 use super::*;
 
 #[derive(Debug)]
-#[repr(C)]
+#[repr(C, align(16))]
 pub(crate) struct Leaf<const KEY_LEN: usize, V> {
     pub key: [u8; KEY_LEN],
     pub hash: u128,

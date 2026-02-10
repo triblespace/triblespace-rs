@@ -269,17 +269,19 @@ impl<const KEY_LEN: usize> KeySegmentation<KEY_LEN> for SingleSegmentation {
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u8)]
 pub(crate) enum HeadTag {
-    // Bit 0-3: Branching factor
-    Branch2 = 1,
-    Branch4 = 2,
-    Branch8 = 3,
-    Branch16 = 4,
-    Branch32 = 5,
-    Branch64 = 6,
-    Branch128 = 7,
-    Branch256 = 8,
-    // Bit 4 indicates that the node is a leaf.
-    Leaf = 16,
+    // Stored in the low 4 bits of `Head::tptr` (see Head::new).
+    //
+    // Branch values encode log2(branch_size) - 1 in the low 3 bits. The high
+    // bit (bit 3) is set for leaf nodes.
+    Branch2 = 0,
+    Branch4 = 1,
+    Branch8 = 2,
+    Branch16 = 3,
+    Branch32 = 4,
+    Branch64 = 5,
+    Branch128 = 6,
+    Branch256 = 7,
+    Leaf = 8,
 }
 
 pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
@@ -317,13 +319,37 @@ unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Send for Head<KEY_LE
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LEN, O, V> {}
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
+    // Tagged pointer layout (64-bit only):
+    // - bits 0..=3:   HeadTag (requires 16-byte aligned bodies)
+    // - bits 4..=55:  body pointer bits (52 bits)
+    // - bits 56..=63: key byte for cuckoo table lookup
+    const TAG_MASK: u64 = 0x0f;
+    const BODY_MASK: u64 = 0x00_ff_ff_ff_ff_ff_ff_f0;
+    const KEY_MASK: u64 = 0xff_00_00_00_00_00_00_00;
+
+    #[inline]
+    fn fix_body_addr(addr: u64) -> u64 {
+        // On x86_64, canonical addresses are sign-extended, so reconstruct the
+        // upper bits from the highest retained bit (55). On aarch64, user
+        // pointers are typically zero-extended, so keep the masked value.
+        #[cfg(target_arch = "x86_64")]
+        {
+            ((addr << 8) as i64 >> 8) as u64
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            addr
+        }
+    }
+
     pub(crate) fn new<T: Body + ?Sized>(key: u8, body: NonNull<T>) -> Self {
         unsafe {
             let tptr =
                 std::ptr::NonNull::new_unchecked((body.as_ptr() as *mut u8).map_addr(|addr| {
-                    ((addr as u64 & 0x00_00_ff_ff_ff_ff_ff_ffu64)
-                        | ((key as u64) << 48)
-                        | ((<T as Body>::tag(body) as u64) << 56)) as usize
+                    debug_assert_eq!(addr as u64 & Self::TAG_MASK, 0);
+                    ((addr as u64 & Self::BODY_MASK)
+                        | ((key as u64) << 56)
+                        | (<T as Body>::tag(body) as u64)) as usize
                 }));
             Self {
                 tptr,
@@ -336,18 +362,29 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     #[inline]
     pub(crate) fn tag(&self) -> HeadTag {
-        unsafe { transmute((self.tptr.as_ptr() as u64 >> 56) as u8) }
+        match (self.tptr.as_ptr() as u64 & Self::TAG_MASK) as u8 {
+            0 => HeadTag::Branch2,
+            1 => HeadTag::Branch4,
+            2 => HeadTag::Branch8,
+            3 => HeadTag::Branch16,
+            4 => HeadTag::Branch32,
+            5 => HeadTag::Branch64,
+            6 => HeadTag::Branch128,
+            7 => HeadTag::Branch256,
+            8 => HeadTag::Leaf,
+            tag => panic!("invalid head tag: {tag}"),
+        }
     }
 
     #[inline]
     pub(crate) fn key(&self) -> u8 {
-        (self.tptr.as_ptr() as u64 >> 48) as u8
+        (self.tptr.as_ptr() as u64 >> 56) as u8
     }
 
     #[inline]
     pub(crate) fn with_key(mut self, key: u8) -> Self {
         self.tptr = std::ptr::NonNull::new(self.tptr.as_ptr().map_addr(|addr| {
-            ((addr as u64 & 0xff_00_ff_ff_ff_ff_ff_ffu64) | ((key as u64) << 48)) as usize
+            ((addr as u64 & !Self::KEY_MASK) | ((key as u64) << 56)) as usize
         }))
         .unwrap();
         self
@@ -357,9 +394,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn set_body<T: Body + ?Sized>(&mut self, body: NonNull<T>) {
         unsafe {
             self.tptr = NonNull::new_unchecked((body.as_ptr() as *mut u8).map_addr(|addr| {
-                ((addr as u64 & 0x00_00_ff_ff_ff_ff_ff_ffu64)
-                    | (self.tptr.as_ptr() as u64 & 0x00_ff_00_00_00_00_00_00u64)
-                    | ((<T as Body>::tag(body) as u64) << 56)) as usize
+                debug_assert_eq!(addr as u64 & Self::TAG_MASK, 0);
+                ((addr as u64 & Self::BODY_MASK)
+                    | (self.tptr.as_ptr() as u64 & Self::KEY_MASK)
+                    | (<T as Body>::tag(body) as u64)) as usize
             }))
         }
     }
@@ -378,21 +416,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     pub(crate) fn body(&self) -> BodyPtr<KEY_LEN, O, V> {
         unsafe {
-            let ptr = NonNull::new_unchecked(
-                self.tptr
-                    .as_ptr()
-                    // Clear the key/tag bytes (bits 48..64) we store in `tptr`.
-                    //
-                    // Do NOT sign-extend bit 47 here: on Linux/aarch64 user-space
-                    // pointers are typically zero-extended even when bit 47 is set
-                    // (e.g. `0xaaaa...`). Sign-extending would yield a different
-                    // address (`0xffffaaaa...`) and break decoding.
-                    .map_addr(|addr| ((addr as u64) & 0x00_00_ff_ff_ff_ff_ff_ffu64) as usize),
-            );
+            let ptr = NonNull::new_unchecked(self.tptr.as_ptr().map_addr(|addr| {
+                let masked = (addr as u64) & Self::BODY_MASK;
+                Self::fix_body_addr(masked) as usize
+            }));
             match self.tag() {
                 HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
                 branch_tag => {
-                    let count = 1 << (branch_tag as usize);
+                    let count = 1 << (branch_tag as usize + 1);
                     BodyPtr::Branch(NonNull::new_unchecked(std::ptr::slice_from_raw_parts(
                         ptr.as_ptr(),
                         count,
@@ -1652,6 +1683,11 @@ mod tests {
     #[test]
     fn head_size() {
         assert_eq!(mem::size_of::<Head<64, IdentitySchema, ()>>(), 8);
+    }
+
+    #[test]
+    fn option_head_size() {
+        assert_eq!(mem::size_of::<Option<Head<64, IdentitySchema, ()>>>(), 8);
     }
 
     #[test]
