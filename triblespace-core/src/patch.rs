@@ -338,21 +338,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     const BODY_MASK: u64 = 0x00_ff_ff_ff_ff_ff_ff_f0;
     const KEY_MASK: u64 = 0xff_00_00_00_00_00_00_00;
 
-    #[inline]
-    fn fix_body_addr(addr: u64) -> u64 {
-        // On x86_64, canonical addresses are sign-extended, so reconstruct the
-        // upper bits from the highest retained bit (55). On aarch64, user
-        // pointers are typically zero-extended, so keep the masked value.
-        #[cfg(target_arch = "x86_64")]
-        {
-            ((addr << 8) as i64 >> 8) as u64
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            addr
-        }
-    }
-
     pub(crate) fn new<T: Body + ?Sized>(key: u8, body: NonNull<T>) -> Self {
         unsafe {
             let tptr =
@@ -418,7 +403,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         unsafe {
             let ptr = NonNull::new_unchecked(self.tptr.as_ptr().map_addr(|addr| {
                 let masked = (addr as u64) & Self::BODY_MASK;
-                Self::fix_body_addr(masked) as usize
+                masked as usize
             }));
             match self.tag() {
                 HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
