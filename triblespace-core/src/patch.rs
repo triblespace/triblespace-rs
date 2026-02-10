@@ -368,10 +368,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     #[inline]
     pub(crate) fn with_key(mut self, key: u8) -> Self {
-        self.tptr = std::ptr::NonNull::new(self.tptr.as_ptr().map_addr(|addr| {
-            ((addr as u64 & !Self::KEY_MASK) | ((key as u64) << 56)) as usize
-        }))
-        .unwrap();
+        self.tptr =
+            std::ptr::NonNull::new(self.tptr.as_ptr().map_addr(|addr| {
+                ((addr as u64 & !Self::KEY_MASK) | ((key as u64) << 56)) as usize
+            }))
+            .unwrap();
         self
     }
 

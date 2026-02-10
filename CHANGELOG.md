@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-02-10
+### Changed
+- PATCH tagged pointers now store node tags in the low 4 bits (16-byte aligned bodies)
+  and keep the per-child key byte in the top byte, freeing address bits for larger
+  virtual address spaces.
+
+### Fixed
+- PATCH no longer performs x86_64 sign-extension when decoding tagged pointers,
+  avoiding incorrect canonicalization on systems with wider virtual addresses.
+
 ## [0.12.1] - 2026-02-10
 ### Fixed
 - Fixed a Linux/aarch64 crash in `PATCH::clone()` when decoding tagged pointers.
