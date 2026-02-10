@@ -381,7 +381,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let ptr = NonNull::new_unchecked(
                 self.tptr
                     .as_ptr()
-                    .map_addr(|addr| ((((addr as u64) << 16) as i64) >> 16) as usize),
+                    // Clear the key/tag bytes (bits 48..64) we store in `tptr`.
+                    //
+                    // Do NOT sign-extend bit 47 here: on Linux/aarch64 user-space
+                    // pointers are typically zero-extended even when bit 47 is set
+                    // (e.g. `0xaaaa...`). Sign-extending would yield a different
+                    // address (`0xffffaaaa...`) and break decoding.
+                    .map_addr(|addr| ((addr as u64) & 0x00_00_ff_ff_ff_ff_ff_ffu64) as usize),
             );
             match self.tag() {
                 HeadTag::Leaf => BodyPtr::Leaf(ptr.cast()),
@@ -1659,6 +1665,15 @@ mod tests {
         let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
+    }
+
+    #[test]
+    fn tree_clone_one() {
+        const KEY_SIZE: usize = 64;
+        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let entry = Entry::new(&[0; KEY_SIZE]);
+        tree.insert(&entry);
+        let _clone = tree.clone();
     }
 
     #[test]
