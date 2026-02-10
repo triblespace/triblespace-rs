@@ -30,7 +30,6 @@ use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::mem::transmute;
 use std::ptr::NonNull;
 use std::sync::Once;
 
@@ -285,6 +284,19 @@ pub(crate) enum HeadTag {
     Branch256 = 8,
 }
 
+impl HeadTag {
+    #[inline]
+    fn from_raw(raw: u8) -> Self {
+        if raw <= HeadTag::Branch256 as u8 {
+            // SAFETY: `HeadTag` is `#[repr(u8)]` with a contiguous discriminant
+            // range 0..=8, so any value in this range is a valid enum value.
+            unsafe { std::mem::transmute(raw) }
+        } else {
+            panic!("invalid head tag: {raw}");
+        }
+    }
+}
+
 pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(NonNull<Leaf<KEY_LEN, V>>),
     Branch(branch::BranchNN<KEY_LEN, O, V>),
@@ -363,18 +375,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     #[inline]
     pub(crate) fn tag(&self) -> HeadTag {
-        match (self.tptr.as_ptr() as u64 & Self::TAG_MASK) as u8 {
-            0 => HeadTag::Leaf,
-            1 => HeadTag::Branch2,
-            2 => HeadTag::Branch4,
-            3 => HeadTag::Branch8,
-            4 => HeadTag::Branch16,
-            5 => HeadTag::Branch32,
-            6 => HeadTag::Branch64,
-            7 => HeadTag::Branch128,
-            8 => HeadTag::Branch256,
-            tag => panic!("invalid head tag: {tag}"),
-        }
+        HeadTag::from_raw((self.tptr.as_ptr() as u64 & Self::TAG_MASK) as u8)
     }
 
     #[inline]
