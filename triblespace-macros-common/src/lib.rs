@@ -547,7 +547,6 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             __pairs.sort_unstable();
 
             let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
-            __hasher.update(b"triblespace.entity.v1");
             let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
             for (__a, __v) in __pairs.iter() {
                 if let Some((__la, __lv)) = __last {
@@ -563,9 +562,6 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             let __digest_bytes = __digest.as_bytes();
             let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
             __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
-            if __raw == [0u8; #base_path::id::ID_LEN] {
-                __raw[0] = 1;
-            }
             let __id = #base_path::id::Id::new(__raw).unwrap();
             let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
             let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
