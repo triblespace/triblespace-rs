@@ -277,11 +277,26 @@ impl Parse for Entity {
         braced!(content in input);
 
         let mut id: Option<Value> = None;
-        let fork = content.fork();
-        if fork.parse::<Value>().is_ok() && fork.peek(Token![@]) {
-            let pv: Value = content.parse()?;
-            content.parse::<Token![@]>()?;
-            id = Some(pv);
+        {
+            let fork = content.fork();
+            // Special-case `_ @` so callers can be explicit about content-derived identity
+            // without colliding with a Rust identifier.
+            if fork.peek(Token![_]) {
+                let fork2 = fork;
+                fork2.parse::<Token![_]>()?;
+                if fork2.peek(Token![@]) {
+                    content.parse::<Token![_]>()?;
+                    content.parse::<Token![@]>()?;
+                }
+            }
+        }
+        if id.is_none() {
+            let fork = content.fork();
+            if fork.parse::<Value>().is_ok() && fork.peek(Token![@]) {
+                let pv: Value = content.parse()?;
+                content.parse::<Token![@]>()?;
+                id = Some(pv);
+            }
         }
 
         let attributes = Punctuated::<_, Token![,]>::parse_terminated(&content)?
@@ -465,36 +480,12 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
     let Entity { id, attributes } = syn::parse2(wrapped)?;
 
     let set_init = quote! { let mut set = #base_path::trible::TribleSet::new(); };
+    let attr_count = attributes.len();
 
-    let id_init: TokenStream2 = if let Some(val) = id {
-        match val {
-            Value::Expr(expr) => {
-                quote! {
-                    let id_tmp = #expr;
-                    let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
-                }
-            }
-            Value::Var(ident) => {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "variable bindings (?ident) are not allowed in entity!; use a literal expression here",
-                ));
-            }
-            Value::LocalVar(ident) => {
-                return Err(syn::Error::new_spanned(
-                    ident,
-                    "local variable bindings (_?ident) are not allowed in entity!; use a literal expression here",
-                ));
-            }
-        }
-    } else {
-        quote! {
-            let id_tmp: #base_path::id::ExclusiveId = #base_path::id::rngid();
-            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
-        }
-    };
-
+    let mut attr_eval_tokens = TokenStream2::new();
     let mut insert_tokens = TokenStream2::new();
+    let mut pair_entries = TokenStream2::new();
+
     for (i, attr) in attributes.into_iter().enumerate() {
         let field_expr = attr.name;
         let value_expr = match attr.value {
@@ -512,22 +503,79 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                 ));
             }
         };
+
         let af_ident = format_ident!("__af{}", i, span = Span::mixed_site());
         let val_ident = format_ident!("__val{}", i, span = Span::mixed_site());
-        let stmt = quote! {
-            {
-                let #af_ident = &#field_expr;
-                let #val_ident = #af_ident.value_from(#value_expr);
-                let __a_id = #af_ident.id();
-                set.insert(&#base_path::trible::Trible::new(id_ref, &__a_id, &#val_ident));
-            }
-        };
-        insert_tokens.extend(stmt);
+        let aid_ident = format_ident!("__a_id{}", i, span = Span::mixed_site());
+
+        attr_eval_tokens.extend(quote! {
+            let #af_ident = &#field_expr;
+            let #val_ident = #af_ident.value_from(#value_expr);
+            let #aid_ident = #af_ident.id();
+        });
+
+        // Used for deterministic id derivation when no explicit id is provided.
+        pair_entries.extend(quote! { (#aid_ident, #val_ident.raw), });
+
+        insert_tokens.extend(quote! {
+            set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
+        });
     }
+
+    let id_init: TokenStream2 = if let Some(val) = id {
+        match val {
+            Value::Expr(expr) => quote! {
+                let id_tmp = #expr;
+                let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+            },
+            Value::Var(ident) => {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    "variable bindings (?ident) are not allowed in entity!; use a literal expression here",
+                ));
+            }
+            Value::LocalVar(ident) => {
+                return Err(syn::Error::new_spanned(
+                    ident,
+                    "local variable bindings (_?ident) are not allowed in entity!; use a literal expression here",
+                ));
+            }
+        }
+    } else {
+        quote! {
+            let mut __pairs: [(#base_path::id::Id, #base_path::value::RawValue); #attr_count] = [#pair_entries];
+            __pairs.sort_unstable();
+
+            let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
+            __hasher.update(b"triblespace.entity.v1");
+            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
+            for (__a, __v) in __pairs.iter() {
+                if let Some((__la, __lv)) = __last {
+                    if *__a == __la && *__v == __lv {
+                        continue;
+                    }
+                }
+                __hasher.update(&__a[..]);
+                __hasher.update(&__v[..]);
+                __last = Some((*__a, *__v));
+            }
+            let __digest = __hasher.finalize();
+            let __digest_bytes = __digest.as_bytes();
+            let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
+            __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
+            if __raw == [0u8; #base_path::id::ID_LEN] {
+                __raw[0] = 1;
+            }
+            let __id = #base_path::id::Id::new(__raw).unwrap();
+            let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
+            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+        }
+    };
 
     let output = quote! {
         {
             #set_init
+            #attr_eval_tokens
             #id_init
             #insert_tokens
             set

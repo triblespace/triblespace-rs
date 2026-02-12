@@ -92,6 +92,33 @@ distinction concrete: the restored ship and the reconstructed ship share the
 same extrinsic identity (they are both "Theseus' ship") but have different
 intrinsic identities because their planks differ.
 
+## Picking entity ids in code
+
+Trible Space lets you mix intrinsic and extrinsic identifiers depending on what
+you are modeling. The `entity!` macro mirrors that split:
+
+```rust
+use triblespace::examples::literature;
+use triblespace::prelude::*;
+
+// Intrinsic identity (default): the id is derived deterministically from the
+// attribute/value pairs, so identical record literals unify.
+let record = entity! {
+    literature::firstname: "Frank",
+    literature::lastname: "Herbert",
+};
+
+// Extrinsic identity: supply an id expression when you want a stable subject
+// whose facts can evolve across edits and commits.
+let alice = ufoid();
+let subject = entity! { &alice @
+    literature::firstname: "Frank",
+};
+
+// `_ @` is an explicit synonym for the intrinsic form.
+let also_intrinsic = entity! { _ @ literature::firstname: "Frank" };
+```
+
 ## Embeddings as Semantic Intrinsic Identifiers
 
 Embeddings blur our neat taxonomy. They are intrinsic because they are computed

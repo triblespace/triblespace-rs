@@ -42,10 +42,19 @@ interest. Selectors power history traversals such as `parents`,
 ### Entity
 The first position in a trible. Entities identify the subject making a
 statement and group the attributes asserted about it. They are represented by
-stable identifiers minted from namespaces or ID owners—not by hashing their
-contents—so multiple facts about the same subject cohere without revealing how
-the identifier was derived. Ownership controls who may mint new facts for a
-given identifier.
+stable identifiers so multiple facts about the same subject cohere.
+
+In practice you pick an identifier policy:
+- **Extrinsic ids** (for example `ufoid`, `fucid`, `genid`) track a conceptual
+  subject across edits and versions. Use these when you intend to accumulate
+  additional facts over time.
+- **Intrinsic ids** (content-derived hashes) are recomputed from the entity's
+  asserted fields. The `entity!` macro uses this policy when you omit the
+  explicit `id @` prefix (or when you write `_ @`), so identical records unify
+  naturally.
+
+Ownership policies and schemas determine who may mint new facts for a given
+identifier.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.
