@@ -1,6 +1,6 @@
 [package]
 name = "triblespace-macros-common"
-version = "0.13.1"
+version = "0.13.2"
 edition = "2021"
 description = "Shared implementation helpers for triblespace procedural macros"
 license = "MIT OR Apache-2.0"

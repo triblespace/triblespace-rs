@@ -245,6 +245,13 @@ struct Entity {
     attributes: Vec<Attribute>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttributeMode {
+    Required,
+    Optional,
+    Repeated,
+}
+
 enum Value {
     Var(Ident),
     LocalVar(Ident),
@@ -253,7 +260,7 @@ enum Value {
 
 struct Attribute {
     name: Expr,
-    optional: bool,
+    mode: AttributeMode,
     value: Value,
 }
 
@@ -310,32 +317,59 @@ impl Parse for Entity {
 
 impl Parse for Attribute {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let mut name: Expr = input.parse()?;
-        let mut optional = false;
+        // Support explicit fact modifiers while keeping `attr: value` flexible:
+        // - `attr: value`   (required, attr can be any expression)
+        // - `attr?: value`  (optional, value must be `Option<T>`)
+        // - `attr*: value`  (repeated, value must be an `IntoIterator<Item = T>`)
+        //
+        // We only recognize `?:` and `*:` after a path-like attribute reference.
+        // That avoids confusing these modifiers with Rust operators in general
+        // expressions (for example `get_attr()? : value`).
+        let fork = input.fork();
+        if let Ok(expr_path) = fork.parse::<syn::ExprPath>() {
+            if fork.peek(Token![?]) {
+                let fork2 = fork.fork();
+                fork2.parse::<Token![?]>()?;
+                if fork2.peek(Token![:]) {
+                    let name = Expr::Path(input.parse::<syn::ExprPath>()?);
+                    input.parse::<Token![?]>()?;
+                    input.parse::<Token![:]>()?;
+                    let value: Value = input.parse()?;
+                    return Ok(Attribute {
+                        name,
+                        mode: AttributeMode::Optional,
+                        value,
+                    });
+                }
+            }
 
-        // Parse `attr?: value` by treating a trailing try (`attr?`) directly
-        // before `:` as an optional marker. This preserves the convenient
-        // syntax without needing special tokens in the Rust grammar.
-        if matches!(name, Expr::Try(_)) && input.peek(Token![:]) {
-            if let Expr::Try(expr_try) = name {
-                name = *expr_try.expr;
-                optional = true;
+            if fork.peek(Token![*]) {
+                let fork2 = fork.fork();
+                fork2.parse::<Token![*]>()?;
+                if fork2.peek(Token![:]) {
+                    let name = Expr::Path(input.parse::<syn::ExprPath>()?);
+                    input.parse::<Token![*]>()?;
+                    input.parse::<Token![:]>()?;
+                    let value: Value = input.parse()?;
+                    return Ok(Attribute {
+                        name,
+                        mode: AttributeMode::Repeated,
+                        value,
+                    });
+                }
             }
-        } else if input.peek(Token![?]) {
-            // Also accept the tokenized form `attr ? : value` (rare, but explicit).
-            let fork = input.fork();
-            fork.parse::<Token![?]>()?;
-            if fork.peek(Token![:]) {
-                input.parse::<Token![?]>()?;
-                optional = true;
-            }
+
+            // Path-like required fact: fall through to the generic branch below,
+            // which keeps attribute expressions flexible.
+            let _ = expr_path;
         }
 
+        let name: Expr = input.parse()?;
         input.parse::<Token![:]>()?;
         let value: Value = input.parse()?;
         Ok(Attribute {
             name,
-            optional,
+            mode: AttributeMode::Required,
             value,
         })
     }
@@ -422,10 +456,16 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 
         for Attribute {
             name: field_expr,
-            optional: _,
+            mode,
             value,
         } in entity.attributes
         {
+            if mode != AttributeMode::Required {
+                return Err(syn::Error::new_spanned(
+                    field_expr,
+                    "`?:` and `*:` are not supported in pattern!; use `attr: value`",
+                ));
+            }
             let key = field_expr.to_token_stream().to_string();
             let (a_var_ident, af_ident) = attr_map
                 .entry(key)
@@ -507,7 +547,9 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let set_init = quote! { let mut set = #base_path::trible::TribleSet::new(); };
     let attr_count = attributes.len();
-    let has_optional = attributes.iter().any(|attr| attr.optional);
+    let has_dynamic_pairs = attributes
+        .iter()
+        .any(|attr| attr.mode != AttributeMode::Required);
 
     let mut attr_eval_tokens = TokenStream2::new();
     let mut insert_tokens = TokenStream2::new();
@@ -515,7 +557,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
     let mut pair_push_tokens = TokenStream2::new();
 
     for (i, attr) in attributes.into_iter().enumerate() {
-        let optional = attr.optional;
+        let mode = attr.mode;
         let field_expr = attr.name;
         let value_expr = match attr.value {
             Value::Expr(e) => e,
@@ -538,47 +580,80 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let aid_ident = format_ident!("__a_id{}", i, span = Span::mixed_site());
 
         attr_eval_tokens.extend(quote! { let #af_ident = &#field_expr; });
-        if optional {
-            attr_eval_tokens.extend(quote! {
-                let #val_ident = {
-                    let __opt: ::std::option::Option<_> = #value_expr;
-                    __opt.map(|__v| #af_ident.value_from(__v))
-                };
-            });
-        } else {
-            attr_eval_tokens.extend(quote! {
-                let #val_ident = #af_ident.value_from(#value_expr);
-            });
+        match mode {
+            AttributeMode::Required => {
+                attr_eval_tokens.extend(quote! {
+                    let #val_ident = #af_ident.value_from(#value_expr);
+                });
+            }
+            AttributeMode::Optional => {
+                attr_eval_tokens.extend(quote! {
+                    let #val_ident = {
+                        let __opt: ::std::option::Option<_> = #value_expr;
+                        __opt.map(|__v| #af_ident.value_from(__v))
+                    };
+                });
+            }
+            AttributeMode::Repeated => {
+                attr_eval_tokens.extend(quote! {
+                    let #val_ident = {
+                        let __iter = #value_expr;
+                        ::std::iter::IntoIterator::into_iter(__iter)
+                            .map(|__v| #af_ident.value_from(__v))
+                            .collect::<::std::vec::Vec<_>>()
+                    };
+                });
+            }
         }
         attr_eval_tokens.extend(quote! { let #aid_ident = #af_ident.id(); });
 
-        if has_optional {
-            if optional {
-                pair_push_tokens.extend(quote! {
-                    if let Some(ref __v) = #val_ident {
-                        __pairs.push((#aid_ident, __v.raw));
-                    }
-                });
-            } else {
-                pair_push_tokens.extend(quote! {
-                    __pairs.push((#aid_ident, #val_ident.raw));
-                });
+        if has_dynamic_pairs {
+            match mode {
+                AttributeMode::Required => {
+                    pair_push_tokens.extend(quote! {
+                        __pairs.push((#aid_ident, #val_ident.raw));
+                    });
+                }
+                AttributeMode::Optional => {
+                    pair_push_tokens.extend(quote! {
+                        if let Some(ref __v) = #val_ident {
+                            __pairs.push((#aid_ident, __v.raw));
+                        }
+                    });
+                }
+                AttributeMode::Repeated => {
+                    pair_push_tokens.extend(quote! {
+                        for __v in #val_ident.iter() {
+                            __pairs.push((#aid_ident, __v.raw));
+                        }
+                    });
+                }
             }
         } else {
             // Used for deterministic id derivation when no explicit id is provided.
             pair_entries.extend(quote! { (#aid_ident, #val_ident.raw), });
         }
 
-        if optional {
-            insert_tokens.extend(quote! {
-                if let Some(ref __v) = #val_ident {
-                    set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
-                }
-            });
-        } else {
-            insert_tokens.extend(quote! {
-                set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
-            });
+        match mode {
+            AttributeMode::Required => {
+                insert_tokens.extend(quote! {
+                    set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
+                });
+            }
+            AttributeMode::Optional => {
+                insert_tokens.extend(quote! {
+                    if let Some(ref __v) = #val_ident {
+                        set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
+                    }
+                });
+            }
+            AttributeMode::Repeated => {
+                insert_tokens.extend(quote! {
+                    for __v in #val_ident.iter() {
+                        set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
+                    }
+                });
+            }
         }
     }
 
@@ -602,7 +677,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             }
         }
     } else {
-        if has_optional {
+        if has_dynamic_pairs {
             quote! {
                 let mut __pairs: ::std::vec::Vec<(#base_path::id::Id, #base_path::value::RawValue)> =
                     ::std::vec::Vec::with_capacity(#attr_count);
@@ -775,10 +850,16 @@ pub fn pattern_changes_impl(
 
         for Attribute {
             name: attr_expr,
-            optional: _,
+            mode,
             value,
         } in entity.attributes
         {
+            if mode != AttributeMode::Required {
+                return Err(syn::Error::new_spanned(
+                    attr_expr,
+                    "`?:` and `*:` are not supported in pattern_changes!; use `attr: value`",
+                ));
+            }
             let key = attr_expr.to_token_stream().to_string();
             let (a_ident, af_ident) = attr_map
                 .entry(key)

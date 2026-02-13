@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-02-13
+### Added
+- `entity!` now supports repeated facts via `attr*: iter_expr`.
+
 ## [0.13.1] - 2026-02-13
 ### Added
 - `entity!` now supports optional facts via `attr?: option_expr`.

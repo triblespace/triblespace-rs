@@ -125,6 +125,14 @@ let with_optional = entity! { _ @
     literature::firstname: "Frank",
     literature::alias?: maybe_alias,
 };
+
+// Repeated facts: use `*:` with an `IntoIterator<Item = T>` to emit multiple
+// facts for the same attribute.
+let aliases = ["Frank", "F.H."];
+let with_repeated = entity! { _ @
+    literature::firstname: "Frank",
+    literature::alias*: aliases,
+};
 ```
 
 ## Embeddings as Semantic Intrinsic Identifiers
