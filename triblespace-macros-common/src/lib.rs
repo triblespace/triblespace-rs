@@ -253,6 +253,7 @@ enum Value {
 
 struct Attribute {
     name: Expr,
+    optional: bool,
     value: Value,
 }
 
@@ -309,10 +310,34 @@ impl Parse for Entity {
 
 impl Parse for Attribute {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        let name: Expr = input.parse()?;
+        let mut name: Expr = input.parse()?;
+        let mut optional = false;
+
+        // Parse `attr?: value` by treating a trailing try (`attr?`) directly
+        // before `:` as an optional marker. This preserves the convenient
+        // syntax without needing special tokens in the Rust grammar.
+        if matches!(name, Expr::Try(_)) && input.peek(Token![:]) {
+            if let Expr::Try(expr_try) = name {
+                name = *expr_try.expr;
+                optional = true;
+            }
+        } else if input.peek(Token![?]) {
+            // Also accept the tokenized form `attr ? : value` (rare, but explicit).
+            let fork = input.fork();
+            fork.parse::<Token![?]>()?;
+            if fork.peek(Token![:]) {
+                input.parse::<Token![?]>()?;
+                optional = true;
+            }
+        }
+
         input.parse::<Token![:]>()?;
         let value: Value = input.parse()?;
-        Ok(Attribute { name, value })
+        Ok(Attribute {
+            name,
+            optional,
+            value,
+        })
     }
 }
 
@@ -397,6 +422,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 
         for Attribute {
             name: field_expr,
+            optional: _,
             value,
         } in entity.attributes
         {
@@ -481,12 +507,15 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let set_init = quote! { let mut set = #base_path::trible::TribleSet::new(); };
     let attr_count = attributes.len();
+    let has_optional = attributes.iter().any(|attr| attr.optional);
 
     let mut attr_eval_tokens = TokenStream2::new();
     let mut insert_tokens = TokenStream2::new();
     let mut pair_entries = TokenStream2::new();
+    let mut pair_push_tokens = TokenStream2::new();
 
     for (i, attr) in attributes.into_iter().enumerate() {
+        let optional = attr.optional;
         let field_expr = attr.name;
         let value_expr = match attr.value {
             Value::Expr(e) => e,
@@ -508,18 +537,49 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let val_ident = format_ident!("__val{}", i, span = Span::mixed_site());
         let aid_ident = format_ident!("__a_id{}", i, span = Span::mixed_site());
 
-        attr_eval_tokens.extend(quote! {
-            let #af_ident = &#field_expr;
-            let #val_ident = #af_ident.value_from(#value_expr);
-            let #aid_ident = #af_ident.id();
-        });
+        attr_eval_tokens.extend(quote! { let #af_ident = &#field_expr; });
+        if optional {
+            attr_eval_tokens.extend(quote! {
+                let #val_ident = {
+                    let __opt: ::std::option::Option<_> = #value_expr;
+                    __opt.map(|__v| #af_ident.value_from(__v))
+                };
+            });
+        } else {
+            attr_eval_tokens.extend(quote! {
+                let #val_ident = #af_ident.value_from(#value_expr);
+            });
+        }
+        attr_eval_tokens.extend(quote! { let #aid_ident = #af_ident.id(); });
 
-        // Used for deterministic id derivation when no explicit id is provided.
-        pair_entries.extend(quote! { (#aid_ident, #val_ident.raw), });
+        if has_optional {
+            if optional {
+                pair_push_tokens.extend(quote! {
+                    if let Some(ref __v) = #val_ident {
+                        __pairs.push((#aid_ident, __v.raw));
+                    }
+                });
+            } else {
+                pair_push_tokens.extend(quote! {
+                    __pairs.push((#aid_ident, #val_ident.raw));
+                });
+            }
+        } else {
+            // Used for deterministic id derivation when no explicit id is provided.
+            pair_entries.extend(quote! { (#aid_ident, #val_ident.raw), });
+        }
 
-        insert_tokens.extend(quote! {
-            set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
-        });
+        if optional {
+            insert_tokens.extend(quote! {
+                if let Some(ref __v) = #val_ident {
+                    set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
+                }
+            });
+        } else {
+            insert_tokens.extend(quote! {
+                set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, &#val_ident));
+            });
+        }
     }
 
     let id_init: TokenStream2 = if let Some(val) = id {
@@ -542,29 +602,58 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             }
         }
     } else {
-        quote! {
-            let mut __pairs: [(#base_path::id::Id, #base_path::value::RawValue); #attr_count] = [#pair_entries];
-            __pairs.sort_unstable();
+        if has_optional {
+            quote! {
+                let mut __pairs: ::std::vec::Vec<(#base_path::id::Id, #base_path::value::RawValue)> =
+                    ::std::vec::Vec::with_capacity(#attr_count);
+                #pair_push_tokens
+                __pairs.sort_unstable();
 
-            let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
-            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
-            for (__a, __v) in __pairs.iter() {
-                if let Some((__la, __lv)) = __last {
-                    if *__a == __la && *__v == __lv {
-                        continue;
+                let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
+                let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
+                for (__a, __v) in __pairs.iter() {
+                    if let Some((__la, __lv)) = __last {
+                        if *__a == __la && *__v == __lv {
+                            continue;
+                        }
                     }
+                    __hasher.update(&__a[..]);
+                    __hasher.update(&__v[..]);
+                    __last = Some((*__a, *__v));
                 }
-                __hasher.update(&__a[..]);
-                __hasher.update(&__v[..]);
-                __last = Some((*__a, *__v));
+                let __digest = __hasher.finalize();
+                let __digest_bytes = __digest.as_bytes();
+                let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
+                __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
+                let __id = #base_path::id::Id::new(__raw).unwrap();
+                let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
+                let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
             }
-            let __digest = __hasher.finalize();
-            let __digest_bytes = __digest.as_bytes();
-            let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
-            __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
-            let __id = #base_path::id::Id::new(__raw).unwrap();
-            let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
-            let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+        } else {
+            quote! {
+                let mut __pairs: [(#base_path::id::Id, #base_path::value::RawValue); #attr_count] = [#pair_entries];
+                __pairs.sort_unstable();
+
+                let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
+                let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
+                for (__a, __v) in __pairs.iter() {
+                    if let Some((__la, __lv)) = __last {
+                        if *__a == __la && *__v == __lv {
+                            continue;
+                        }
+                    }
+                    __hasher.update(&__a[..]);
+                    __hasher.update(&__v[..]);
+                    __last = Some((*__a, *__v));
+                }
+                let __digest = __hasher.finalize();
+                let __digest_bytes = __digest.as_bytes();
+                let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
+                __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
+                let __id = #base_path::id::Id::new(__raw).unwrap();
+                let id_tmp: #base_path::id::ExclusiveId = #base_path::id::ExclusiveId::force(__id);
+                let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
+            }
         }
     };
 
@@ -686,6 +775,7 @@ pub fn pattern_changes_impl(
 
         for Attribute {
             name: attr_expr,
+            optional: _,
             value,
         } in entity.attributes
         {

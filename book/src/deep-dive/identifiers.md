@@ -117,6 +117,14 @@ let subject = entity! { &alice @
 
 // `_ @` is an explicit synonym for the intrinsic form.
 let also_intrinsic = entity! { _ @ literature::firstname: "Frank" };
+
+// Optional facts: use `?:` with an `Option<T>` value to omit missing data
+// without resorting to branching.
+let maybe_alias: Option<&str> = None;
+let with_optional = entity! { _ @
+    literature::firstname: "Frank",
+    literature::alias?: maybe_alias,
+};
 ```
 
 ## Embeddings as Semantic Intrinsic Identifiers
