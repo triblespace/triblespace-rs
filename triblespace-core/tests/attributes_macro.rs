@@ -42,7 +42,7 @@ fn attributes_macro_works_in_entity_macro() {
 #[test]
 fn attributes_macro_emits_usage_metadata() {
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let meta: TribleSet = fixed.describe(&mut blobs).expect("metadata");
+    let meta: TribleSet = fixed.describe(&mut blobs).expect("metadata").into_facts();
     let attr_id = fixed.id();
     let usage_count = find!(
         (usage: Id),

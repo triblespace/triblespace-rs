@@ -11,6 +11,7 @@ use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
 use crate::metadata::{self, Metadata};
+use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Blake3;
@@ -224,11 +225,7 @@ impl<S> Metadata for Attribute<S>
 where
     S: ValueSchema,
 {
-    fn id(&self) -> crate::id::Id {
-        self.id()
-    }
-
-    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: crate::repo::BlobStore<Blake3>,
     {
@@ -245,7 +242,7 @@ where
             tribles += usage.describe(blobs, id)?;
         }
 
-        Ok(tribles)
+        Ok(Fragment::rooted(id, tribles))
     }
 }
 

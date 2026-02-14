@@ -9,6 +9,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::prelude::valueschemas;
 use crate::repo::BlobStore;
+use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash;
 use crate::value::schemas::hash::Blake3;
@@ -17,10 +18,7 @@ use triblespace_core_macros::attributes;
 
 /// Describes metadata that can be emitted for documentation or discovery.
 pub trait Metadata {
-    /// Returns the root identifier for this metadata description.
-    fn id(&self) -> Id;
-
-    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>;
 }
@@ -43,15 +41,14 @@ impl<S> Metadata for PhantomData<S>
 where
     S: ConstMetadata,
 {
-    fn id(&self) -> Id {
-        <S as ConstMetadata>::id()
-    }
-
-    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        <S as ConstMetadata>::describe(blobs)
+        Ok(Fragment::rooted(
+            <S as ConstMetadata>::id(),
+            <S as ConstMetadata>::describe(blobs)?,
+        ))
     }
 }
 
@@ -59,16 +56,11 @@ impl<T> Metadata for T
 where
     T: ConstMetadata,
 {
-    fn id(&self) -> Id {
-        T::id()
-    }
-
-    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let _ = blobs;
-        Ok(TribleSet::new())
+        Ok(Fragment::rooted(T::id(), T::describe(blobs)?))
     }
 }
 

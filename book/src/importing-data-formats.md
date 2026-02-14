@@ -15,14 +15,17 @@ deterministic JSON importers:
   so identical inputs reproduce the same entities. It accepts a top-level JSON
   object (or a top-level array of objects). Construct it with a blob sink (e.g.,
   a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte salt when
-  you want to mix in extra entropy to avoid collisions.
+  you want to mix in extra entropy to avoid collisions. Each `import_*` call
+  returns a [`Fragment`](../src/trible/fragment.rs) that exports the root entity
+  id(s) and contains the emitted facts.
 - `JsonTreeImporter` preserves the full JSON structure and ordering by emitting
   explicit node and entry entities (a JSON AST). It derives content-addressed
   identifiers from the JSON values themselves so identical subtrees deduplicate
   across overlapping imports. Unlike the object importer it can represent
-  arbitrary JSON roots, including primitives.
+  arbitrary JSON roots, including primitives. Each `import_*` call returns a
+  rooted `Fragment` for the imported JSON value.
 
-The importer uses a fixed mapping for JSON primitives:
+`JsonObjectImporter` uses a fixed mapping for JSON primitives:
 
 - strings → `Handle<Blake3, LongString>`
 - numbers → `F64`
@@ -31,12 +34,10 @@ The importer uses a fixed mapping for JSON primitives:
 Arrays are treated as multi-valued fields; every element becomes its own trible
 under the same attribute identifier. Nested objects recurse automatically,
 linking parent to child entities through `GenId` attributes derived from the
-containing field name. After feeding one or more JSON documents through
-`import_blob` or `import_str`, call `data()` to inspect the emitted tribles and
-`metadata()` to retrieve attribute descriptors and multi-value hints (a
-`metadata::tag` edge pointing to `metadata::KIND_MULTI`). Use
-`clear_data()` to drop accumulated statements while keeping attribute caches, or
-`clear()` when you need a completely fresh run.
+containing field name. After one or more imports, call `metadata()` to retrieve
+attribute descriptors and multi-value hints (a `metadata::tag` edge pointing to
+`metadata::KIND_MULTI`). Use `clear()` when you need a completely fresh run
+(drop the per-field attribute caches and multi-value tracking).
 
 ## Mapping JSON Fields to Attributes
 
@@ -48,17 +49,27 @@ encoded and stored under the same attribute identifier, producing one trible per
 element.
 
 After an import completes the importer regenerates metadata from its cached
-attribute map. Call `data()` to inspect the emitted tribles and `metadata()` to
-retrieve attribute descriptors and multi-value hints (via `metadata::tag`
-pointing to `metadata::KIND_MULTI`). Merge those descriptors into your
-repository alongside the imported data when you want queries to discover the
-original JSON field names or project datasets by schema without repeating the
-derivation logic. Field names are stored as `metadata::name` handles to
+attribute map. The returned `Fragment` contains the emitted facts; call
+`metadata()` to retrieve attribute descriptors and multi-value hints (via
+`metadata::tag` pointing to `metadata::KIND_MULTI`). Merge those descriptors
+into your repository alongside the imported facts when you want queries to
+discover the original JSON field names or project datasets by schema without
+repeating the derivation logic. Field names are stored as `metadata::name`
+handles to
 LongString blobs so arbitrarily long keys survive roundtrips; `metadata::name`
 is a general-purpose entity naming attribute, but importers use it for field
 names here. Importers intentionally avoid emitting attribute *usage* annotations;
 those are reserved for code-defined attributes so each codebase can attach its
 own contextual names and descriptions.
+
+You can import multiple documents by merging fragments:
+
+```rust,ignore
+let mut all = Fragment::default();
+all += importer.import_str(doc1)?;
+all += importer.import_str(doc2)?;
+// all.exports() yields the root ids; all.facts() yields the merged tribles.
+```
 
 When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
 `MemoryBlobStore`) to `export_to_json` so longstrings can be inlined. If a blob
@@ -93,6 +104,11 @@ subtrees converge automatically when you import overlapping backups. This makes
 lossless imports a good archival layer: you can keep full-fidelity raw JSON and
 still layer semantic projections on top.
 
+Each `import_*` call returns a rooted `Fragment` containing the JSON AST facts.
+Merge fragments when you ingest multiple documents. `metadata()` returns a
+fixed set of schema descriptors for the `json_tree::*` attributes and kinds; you
+typically merge it once alongside your lossless archive.
+
 ## Managing Entity Identifiers
 
 The importer buffers the encoded attribute/value pairs for each object, sorts
@@ -101,9 +117,9 @@ bytes of that digest become the entity identifier, ensuring identical JSON
 inputs produce identical IDs even across separate runs. You can supply an
 optional 32-byte salt via the constructor to keep deterministic imports from
 colliding with existing data. Once the identifier is established,
-the importer writes the cached pairs into its trible set via `Trible::new`, and
-exposes the data, metadata, and root entity identifiers for each imported
-document through its accessors.
+the importer writes the derived pairs into a `TribleSet` via `Trible::new` and
+returns them as a `Fragment` whose exports are the root entity id(s) for the
+imported document.
 
 This hashing step also changes how repeated structures behave. When a JSON
 document contains identical nested objects—common in fixtures such as

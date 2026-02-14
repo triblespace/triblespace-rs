@@ -59,17 +59,20 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let (merged, root, data_tribles) = {
                 let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-                let roots = importer
+                let fragment = importer
                     .import_blob(Blob::<LongString>::new(Bytes::from(
                         fixture.payload.clone().into_bytes(),
                     )))
                     .expect("import JSON");
-                let root = *roots.first().expect("root entity");
+                let root = fragment
+                    .root()
+                    .expect("fixture payload imports as a single rooted object");
 
-                let data = importer.data().clone();
+                let data = fragment.into_facts();
                 let mut merged = importer.metadata().expect("metadata set");
-                merged.union(data.clone());
-                (merged, root, data.len())
+                let data_tribles = data.len();
+                merged.union(data);
+                (merged, root, data_tribles)
             };
 
             let reader = blobs.reader().expect("reader");
@@ -233,14 +236,16 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-                        let roots = importer
+                        let fragment = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(
                                 prepared.payload.clone().into_bytes(),
                             )))
                             .expect("import JSON");
-                        let root = *roots.first().expect("root entity");
+                        let root = fragment
+                            .root()
+                            .expect("fixture payload imports as a single rooted object");
                         let mut merged = importer.metadata().expect("metadata set");
-                        merged.union(importer.data().clone());
+                        merged.union(fragment.into_facts());
                         (merged, root)
                     };
                     let reader = blobs.reader().expect("reader");
@@ -269,12 +274,14 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                     let mut blobs = MemoryBlobStore::<Blake3>::new();
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-                        let roots = importer
+                        let fragment = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
                             .expect("import JSON");
-                        let root = *roots.first().expect("root entity");
+                        let root = fragment
+                            .root()
+                            .expect("fixture payload imports as a single rooted object");
                         let mut merged = importer.metadata().expect("metadata set");
-                        merged.union(importer.data().clone());
+                        merged.union(fragment.into_facts());
                         (merged, root)
                     };
                     let reader = blobs.reader().expect("reader");

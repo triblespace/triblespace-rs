@@ -24,7 +24,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstMetadata, Metadata};
 use crate::repo::BlobStore;
-use crate::trible::{Trible, TribleSet};
+use crate::trible::{Fragment, Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
@@ -121,7 +121,6 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    data: TribleSet,
     store: &'a mut Store,
     bool_attrs: HashMap<View<str>, ImportAttribute<Boolean>>,
     num_attrs: HashMap<View<str>, ImportAttribute<F64>>,
@@ -202,7 +201,6 @@ where
 
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
-            data: TribleSet::new(),
             store,
             bool_attrs: HashMap::new(),
             num_attrs: HashMap::new(),
@@ -214,19 +212,20 @@ where
         }
     }
 
-    pub fn import_str(&mut self, input: &str) -> Result<Vec<Id>, JsonImportError> {
+    pub fn import_str(&mut self, input: &str) -> Result<Fragment, JsonImportError> {
         self.import_blob(input.to_owned().to_blob())
     }
 
-    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Vec<Id>, JsonImportError> {
+    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
 
         let mut roots = Vec::new();
+        let mut staged = TribleSet::new();
         match bytes.peek_token() {
             Some(b'{') => {
-                let (root, staged) = self.parse_object(&mut bytes)?;
-                self.data.union(staged);
+                let (root, obj_staged) = self.parse_object(&mut bytes)?;
+                staged.union(obj_staged);
                 roots.push(root.forget());
             }
             Some(b'[') => {
@@ -235,7 +234,6 @@ where
                 if bytes.peek_token() == Some(b']') {
                     self.consume_byte(&mut bytes, b']')?;
                 } else {
-                    let mut staged = TribleSet::new();
                     loop {
                         self.skip_ws(&mut bytes);
                         if bytes.peek_token() != Some(b'{') {
@@ -257,14 +255,13 @@ where
                             _ => return Err(JsonImportError::PrimitiveRoot),
                         }
                     }
-                    self.data.union(staged);
                 }
             }
             _ => return Err(JsonImportError::PrimitiveRoot),
         }
 
         self.skip_ws(&mut bytes);
-        Ok(roots)
+        Ok(Fragment::new(roots, staged))
     }
 
     fn parse_object(
@@ -465,10 +462,6 @@ where
         parse_number_common(bytes)
     }
 
-    pub fn data(&self) -> &TribleSet {
-        &self.data
-    }
-
     pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
         meta.union(<Boolean as ConstMetadata>::describe(self.store)?);
@@ -478,7 +471,7 @@ where
             self.store,
         )?);
         for (key, attr) in self.bool_attrs.iter() {
-            meta.union(attr.describe(self.store)?);
+            meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -486,7 +479,7 @@ where
             }
         }
         for (key, attr) in self.num_attrs.iter() {
-            meta.union(attr.describe(self.store)?);
+            meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -494,7 +487,7 @@ where
             }
         }
         for (key, attr) in self.str_attrs.iter() {
-            meta.union(attr.describe(self.store)?);
+            meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -502,7 +495,7 @@ where
             }
         }
         for (key, attr) in self.genid_attrs.iter() {
-            meta.union(attr.describe(self.store)?);
+            meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -512,12 +505,7 @@ where
         Ok(meta)
     }
 
-    pub fn clear_data(&mut self) {
-        self.data = TribleSet::new();
-    }
-
     pub fn clear(&mut self) {
-        self.clear_data();
         self.bool_attrs.clear();
         self.num_attrs.clear();
         self.str_attrs.clear();
@@ -660,19 +648,16 @@ mod tests {
         let input = r#"{ "title": "Dune", "pages": 412 }"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-        let roots = importer.import_blob(input.to_blob()).unwrap();
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+        let roots = fragment.exports().collect::<Vec<_>>();
         assert_eq!(roots.len(), 1);
-        assert_eq!(importer.data().len(), 2);
+        assert_eq!(fragment.facts().len(), 2);
         assert!(!importer.metadata().expect("metadata set").is_empty());
     }
 
-    fn extract_handle_raw(
-        importer: &JsonObjectImporter<'_, MemoryBlobStore<Blake3>, Blake3>,
-        expected_attr: &str,
-    ) -> RawValue {
+    fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {
         let attr = Attribute::<Handle<Blake3, LongString>>::from_name(expected_attr).id();
-        let trible = importer
-            .data()
+        let trible = facts
             .iter()
             .find(|t| *t.a() == attr)
             .expect("missing string trible");
@@ -702,8 +687,8 @@ mod tests {
         let input = r#"{ "text": "hello\nworld" }"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-        importer.import_blob(input.to_blob()).unwrap();
-        let handle = extract_handle_raw(&importer, "text");
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+        let handle = extract_handle_raw(fragment.facts(), "text");
         drop(importer);
         let text = read_text(&mut blobs, handle);
         assert_eq!(text, "hello\nworld");
@@ -714,8 +699,8 @@ mod tests {
         let input = r#"{ "text": "smile: \u263A" }"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-        importer.import_blob(input.to_blob()).unwrap();
-        let handle = extract_handle_raw(&importer, "text");
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+        let handle = extract_handle_raw(fragment.facts(), "text");
         drop(importer);
         let text = read_text(&mut blobs, handle);
         assert_eq!(text, "smile: \u{263A}");

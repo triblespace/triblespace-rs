@@ -133,11 +133,12 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     let export_fixture = {
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-        let roots = importer
+        let fragment = importer
             .import_blob(import_blob.clone())
             .expect("import JSON-LD as JSON");
+        let roots = fragment.exports().collect::<Vec<_>>();
         let mut merged = importer.metadata().expect("metadata set");
-        merged.union(importer.data().clone());
+        merged.union(fragment.into_facts());
         let reader = blobs.reader().expect("reader");
         let payload_len = import_payload.len();
 
@@ -155,9 +156,10 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-            let roots = importer
+            let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
+            let roots = fragment.exports().collect::<Vec<_>>();
             hint::black_box(roots.len());
         });
     });
@@ -167,10 +169,11 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-            importer
+            let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
-            let archive = SimpleArchive::blob_from(&importer.data().clone());
+            let facts = fragment.into_facts();
+            let archive = SimpleArchive::blob_from(&facts);
             hint::black_box(archive.bytes.len());
         });
     });
@@ -180,11 +183,12 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         b.iter(|| {
             let mut blobs = MemoryBlobStore::<Blake3>::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
-            let roots = importer
+            let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
+            let roots = fragment.exports().collect::<Vec<_>>();
             let mut merged = importer.metadata().expect("metadata set");
-            merged.union(importer.data().clone());
+            merged.union(fragment.into_facts());
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {
                 let mut out = String::new();

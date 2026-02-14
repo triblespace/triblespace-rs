@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly need to drop exports and work with a plain `TribleSet`.
 - `Workspace::commit` now accepts `impl Into<TribleSet>` for content, so you can
   commit a `Fragment` directly.
+- `metadata::Metadata::describe` now returns a `Fragment` (with exports as the
+  described root id(s)) and no longer has a separate `id()` accessor.
+- `import::json::JsonObjectImporter::import_*` now returns a `Fragment` instead
+  of root id lists and no longer retains accumulated facts internally (removed
+  `data()`/`clear_data()`; callers merge fragments explicitly).
+- `import::json_tree::JsonTreeImporter::import_*` now returns a rooted `Fragment`
+  and no longer retains accumulated facts internally (removed `data()`).
 
 ## [0.13.2] - 2026-02-13
 ### Added

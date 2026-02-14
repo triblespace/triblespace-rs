@@ -20,6 +20,7 @@ use crate::macros::{entity, id_hex};
 use crate::metadata;
 use crate::metadata::{ConstMetadata, Metadata};
 use crate::repo::BlobStore;
+use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::genid::GenId;
@@ -91,58 +92,43 @@ where
         blobs,
     )?);
 
-    metadata.union(
-        ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?,
-    );
-    metadata.union(
-        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-            string.raw(),
-            Some(name("json.string")),
-        )
-        .describe(blobs)?,
-    );
-    metadata.union(
-        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-            number_raw.raw(),
-            Some(name("json.number_raw")),
-        )
-        .describe(blobs)?,
-    );
-    metadata.union(
-        ImportAttribute::<Boolean>::from_raw(boolean.raw(), Some(name("json.boolean")))
-            .describe(blobs)?,
-    );
-    metadata.union(
+    metadata +=
+        ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?;
+    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+        string.raw(),
+        Some(name("json.string")),
+    )
+    .describe(blobs)?;
+    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+        number_raw.raw(),
+        Some(name("json.number_raw")),
+    )
+    .describe(blobs)?;
+    metadata += ImportAttribute::<Boolean>::from_raw(boolean.raw(), Some(name("json.boolean")))
+        .describe(blobs)?;
+    metadata +=
         ImportAttribute::<GenId>::from_raw(field_parent.raw(), Some(name("json.field_parent")))
-            .describe(blobs)?,
-    );
-    metadata.union(
-        ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-            field_name.raw(),
-            Some(name("json.field_name")),
-        )
-        .describe(blobs)?,
-    );
-    metadata.union(
+            .describe(blobs)?;
+    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
+        field_name.raw(),
+        Some(name("json.field_name")),
+    )
+    .describe(blobs)?;
+    metadata +=
         ImportAttribute::<U256BE>::from_raw(field_index.raw(), Some(name("json.field_index")))
-            .describe(blobs)?,
-    );
-    metadata.union(
+            .describe(blobs)?;
+    metadata +=
         ImportAttribute::<GenId>::from_raw(field_value.raw(), Some(name("json.field_value")))
-            .describe(blobs)?,
-    );
-    metadata.union(
+            .describe(blobs)?;
+    metadata +=
         ImportAttribute::<GenId>::from_raw(array_parent.raw(), Some(name("json.array_parent")))
-            .describe(blobs)?,
-    );
-    metadata.union(
+            .describe(blobs)?;
+    metadata +=
         ImportAttribute::<U256BE>::from_raw(array_index.raw(), Some(name("json.array_index")))
-            .describe(blobs)?,
-    );
-    metadata.union(
+            .describe(blobs)?;
+    metadata +=
         ImportAttribute::<GenId>::from_raw(array_value.raw(), Some(name("json.array_value")))
-            .describe(blobs)?,
-    );
+            .describe(blobs)?;
 
     metadata += describe_kind(blobs, kind_object, "json.kind.object", "JSON object node.")?;
     metadata += describe_kind(blobs, kind_array, "json.kind.array", "JSON array node.")?;
@@ -208,7 +194,6 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    data: TribleSet,
     store: &'a mut Store,
     id_salt: Option<[u8; 32]>,
     _hasher: PhantomData<Hasher>,
@@ -221,42 +206,42 @@ where
 {
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
-            data: TribleSet::new(),
             store,
             id_salt,
             _hasher: PhantomData,
         }
     }
 
-    pub fn import_str(&mut self, input: &str) -> Result<Id, JsonImportError> {
+    pub fn import_str(&mut self, input: &str) -> Result<Fragment, JsonImportError> {
         self.import_blob(input.to_owned().to_blob())
     }
 
-    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Id, JsonImportError> {
+    pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
+        let mut data = TribleSet::new();
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
-        let root = self.parse_value(&mut bytes)?;
+        let root = self.parse_value(&mut bytes, &mut data)?;
         self.skip_ws(&mut bytes);
         if bytes.peek_token().is_some() {
             return Err(JsonImportError::Syntax("trailing tokens".into()));
         }
-        Ok(root)
-    }
-
-    pub fn data(&self) -> &TribleSet {
-        &self.data
+        Ok(Fragment::rooted(root, data))
     }
 
     pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         build_json_tree_metadata(self.store)
     }
 
-    fn parse_value(&mut self, bytes: &mut Bytes) -> Result<Id, JsonImportError> {
+    fn parse_value(
+        &mut self,
+        bytes: &mut Bytes,
+        data: &mut TribleSet,
+    ) -> Result<Id, JsonImportError> {
         match bytes.peek_token() {
             Some(b'n') => {
                 self.consume_literal(bytes, b"null")?;
                 let id = self.hash_tagged(b"null", &[]);
-                self.data += entity! { ExclusiveId::force_ref(&id) @
+                *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_null,
                 };
                 Ok(id)
@@ -264,7 +249,7 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let id = self.hash_tagged(b"bool", &[b"true"]);
-                self.data += entity! { ExclusiveId::force_ref(&id) @
+                *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_bool,
                     boolean: true,
                 };
@@ -273,7 +258,7 @@ where
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let id = self.hash_tagged(b"bool", &[b"false"]);
-                self.data += entity! { ExclusiveId::force_ref(&id) @
+                *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_bool,
                     boolean: false,
                 };
@@ -289,14 +274,14 @@ where
                         field: "string".to_string(),
                         source: EncodeError::from_error(err),
                     })?;
-                self.data += entity! { ExclusiveId::force_ref(&id) @
+                *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_string,
                     string: handle,
                 };
                 Ok(id)
             }
-            Some(b'{') => self.parse_object(bytes),
-            Some(b'[') => self.parse_array(bytes),
+            Some(b'{') => self.parse_object(bytes, data),
+            Some(b'[') => self.parse_array(bytes, data),
             _ => {
                 let number = self.parse_number(bytes)?;
                 let number_view = number
@@ -310,7 +295,7 @@ where
                             field: "number".to_string(),
                             source: EncodeError::from_error(err),
                         })?;
-                self.data += entity! { ExclusiveId::force_ref(&id) @
+                *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
                 };
@@ -319,7 +304,11 @@ where
         }
     }
 
-    fn parse_object(&mut self, bytes: &mut Bytes) -> Result<Id, JsonImportError> {
+    fn parse_object(
+        &mut self,
+        bytes: &mut Bytes,
+        data: &mut TribleSet,
+    ) -> Result<Id, JsonImportError> {
         self.consume_byte(bytes, b'{')?;
         self.skip_ws(bytes);
 
@@ -333,7 +322,7 @@ where
                 self.skip_ws(bytes);
                 self.consume_byte(bytes, b':')?;
                 self.skip_ws(bytes);
-                let value = self.parse_value(bytes)?;
+                let value = self.parse_value(bytes, data)?;
                 let name_handle =
                     self.store
                         .put(name.clone())
@@ -365,13 +354,13 @@ where
         }
 
         let object_id = self.hash_object(&fields);
-        self.data += entity! { ExclusiveId::force_ref(&object_id) @
+        *data += entity! { ExclusiveId::force_ref(&object_id) @
             kind: kind_object,
         };
 
         for field in fields {
             let entry_id = self.hash_field_entry(&object_id, &field);
-            self.data += entity! { ExclusiveId::force_ref(&entry_id) @
+            *data += entity! { ExclusiveId::force_ref(&entry_id) @
                 kind: kind_field,
                 field_parent: object_id,
                 field_name: field.name_handle,
@@ -383,7 +372,11 @@ where
         Ok(object_id)
     }
 
-    fn parse_array(&mut self, bytes: &mut Bytes) -> Result<Id, JsonImportError> {
+    fn parse_array(
+        &mut self,
+        bytes: &mut Bytes,
+        data: &mut TribleSet,
+    ) -> Result<Id, JsonImportError> {
         self.consume_byte(bytes, b'[')?;
         self.skip_ws(bytes);
 
@@ -393,7 +386,7 @@ where
         } else {
             let mut index: u64 = 0;
             loop {
-                let value = self.parse_value(bytes)?;
+                let value = self.parse_value(bytes, data)?;
                 entries.push(ArrayEntry { index, value });
                 index = index.saturating_add(1);
 
@@ -413,13 +406,13 @@ where
         }
 
         let array_id = self.hash_array(&entries);
-        self.data += entity! { ExclusiveId::force_ref(&array_id) @
+        *data += entity! { ExclusiveId::force_ref(&array_id) @
             kind: kind_array,
         };
 
         for entry in entries {
             let entry_id = self.hash_array_entry(&array_id, &entry);
-            self.data += entity! { ExclusiveId::force_ref(&entry_id) @
+            *data += entity! { ExclusiveId::force_ref(&entry_id) @
                 kind: kind_array_entry,
                 array_parent: array_id,
                 array_index: entry.index,
@@ -556,10 +549,18 @@ mod tests {
         let input = r#"{ "a": [1, 2] }"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
-        let root = importer.import_blob(input.to_blob()).unwrap();
+        let root = importer
+            .import_blob(input.to_blob())
+            .unwrap()
+            .root()
+            .expect("import_blob returns a rooted fragment");
         drop(importer);
         let mut other = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
-        let other_root = other.import_blob(input.to_blob()).unwrap();
+        let other_root = other
+            .import_blob(input.to_blob())
+            .unwrap()
+            .root()
+            .expect("import_blob returns a rooted fragment");
         assert_eq!(root, other_root);
     }
 
@@ -568,8 +569,11 @@ mod tests {
         let input = r#"[1, 2]"#;
         let mut blobs = MemoryBlobStore::<Blake3>::new();
         let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
-        let root = importer.import_blob(input.to_blob()).unwrap();
-        let catalog = importer.data();
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+        let root = fragment
+            .root()
+            .expect("import_blob returns a rooted fragment");
+        let catalog = fragment.facts();
         let mut entries = find!(
             (index: ethnum::U256, value: Id),
             pattern!(catalog, [{

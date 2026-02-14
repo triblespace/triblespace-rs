@@ -24,11 +24,13 @@ fn exports_json_with_cardinality_hints() {
     let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
-    let roots = importer.import_blob(blob).expect("import payload");
-    let root = roots[0];
+    let fragment = importer.import_blob(blob).expect("import payload");
+    let root = fragment
+        .root()
+        .expect("payload should import as a single rooted object");
 
     let mut merged = importer.metadata().expect("metadata set");
-    merged.union(importer.data().clone());
+    merged.union(fragment.into_facts());
 
     let reader = blobs.reader().expect("reader");
 
@@ -80,11 +82,13 @@ fn exports_openai_like_conversation() {
     let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
-    let roots = importer.import_blob(blob).expect("import payload");
-    let root = roots[0];
+    let fragment = importer.import_blob(blob).expect("import payload");
+    let root = fragment
+        .root()
+        .expect("payload should import as a single rooted object");
 
     let mut merged = importer.metadata().expect("metadata set");
-    merged.union(importer.data().clone());
+    merged.union(fragment.into_facts());
 
     let reader = blobs.reader().expect("reader");
 

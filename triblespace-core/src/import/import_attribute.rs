@@ -8,6 +8,7 @@ use crate::id::{ExclusiveId, Id, RawId};
 use crate::macros::entity;
 use crate::metadata::{self, Metadata};
 use crate::repo::BlobStore;
+use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
@@ -72,11 +73,7 @@ impl<S> Metadata for ImportAttribute<S>
 where
     S: ValueSchema,
 {
-    fn id(&self) -> Id {
-        self.id()
-    }
-
-    fn describe<B>(&self, blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -90,6 +87,6 @@ where
 
         tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(S::id()) };
 
-        Ok(tribles)
+        Ok(Fragment::rooted(id, tribles))
     }
 }
