@@ -57,7 +57,7 @@ impl ConstMetadata for F256LE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for F256LE {
@@ -91,7 +91,7 @@ impl ConstMetadata for F256BE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for F256BE {

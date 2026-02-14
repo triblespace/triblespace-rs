@@ -102,7 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
     // Workspaces stage TribleSets before committing them. The entity! macro
-    // returns sets that merge cheaply into our current working set.
+    // returns a rooted fragment; merge its facts into a TribleSet via `+=`,
+    // or call `.into_facts()` when you need a plain TribleSet.
     let author_id = ufoid();
     let mut library = TribleSet::new();
 
@@ -156,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stage a non-monotonic update that we plan to reconcile manually.
     ws.commit(
-        entity! { &author_id @ literature::firstname: "Francis" },
+        entity! { &author_id @ literature::firstname: "Francis" }.into_facts(),
         None,
         Some("use pen name"),
     );
@@ -166,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pull(*branch_id)
         .expect("pull collaborator workspace");
     collaborator.commit(
-        entity! { &author_id @ literature::firstname: "Franklin" },
+        entity! { &author_id @ literature::firstname: "Franklin" }.into_facts(),
         None,
         Some("record legal first name"),
     );
@@ -195,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("merge conflicting history");
 
         ws.commit(
-            entity! { &author_id @ literature::alias: "Francis" },
+            entity! { &author_id @ literature::alias: "Francis" }.into_facts(),
             None,
             Some("keep pen-name as an alias"),
         );

@@ -57,6 +57,7 @@ pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStoreList;
 pub use crate::repo::BlobStorePut;
 pub use crate::repo::BranchStore;
+pub use crate::trible::Fragment;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
 pub use crate::trible::TribleSetFingerprint;

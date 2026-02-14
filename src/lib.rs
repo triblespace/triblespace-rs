@@ -133,7 +133,7 @@ mod readme_example {
 
         // Stage a non-monotonic update that we plan to reconcile manually.
         ws.commit(
-            entity! { &author_id @ literature::firstname: "Francis" },
+            entity! { &author_id @ literature::firstname: "Francis" }.into_facts(),
             None,
             Some("use pen name"),
         );
@@ -141,7 +141,7 @@ mod readme_example {
         // Simulate a collaborator racing us with a different update.
         let mut collaborator = repo.pull(*branch_id).expect("pull collaborator workspace");
         collaborator.commit(
-            entity! { &author_id @ literature::firstname: "Franklin" },
+            entity! { &author_id @ literature::firstname: "Franklin" }.into_facts(),
             None,
             Some("record legal first name"),
         );
@@ -173,7 +173,7 @@ mod readme_example {
                 .expect("merge conflicting history");
 
             ws.commit(
-                entity! { &author_id @ literature::alias: "Francis" },
+                entity! { &author_id @ literature::alias: "Francis" }.into_facts(),
                 None,
                 Some("keep pen-name as an alias"),
             );

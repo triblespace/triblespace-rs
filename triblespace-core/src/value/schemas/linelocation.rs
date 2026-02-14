@@ -50,7 +50,7 @@ impl ConstMetadata for LineLocation {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

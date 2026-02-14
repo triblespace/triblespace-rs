@@ -57,7 +57,7 @@ impl ConstMetadata for UnknownValue {
         }
         #[cfg(not(feature = "wasm"))]
         let _ = (blobs, &mut tribles);
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

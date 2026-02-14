@@ -49,7 +49,7 @@ impl ConstMetadata for F64 {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

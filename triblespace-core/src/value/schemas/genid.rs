@@ -63,7 +63,7 @@ impl ConstMetadata for GenId {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

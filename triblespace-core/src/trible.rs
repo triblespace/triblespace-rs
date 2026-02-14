@@ -2,6 +2,7 @@
 //!
 //! For layout details and edge semantics see the [Trible Structure](../book/src/deep-dive/trible-structure.md) chapter of the Tribles Book.
 
+mod fragment;
 mod tribleset;
 
 use std::convert::TryInto;
@@ -11,6 +12,7 @@ use crate::id::Id;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
+pub use fragment::Fragment;
 pub use tribleset::TribleSet;
 pub use tribleset::TribleSetFingerprint;
 

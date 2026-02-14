@@ -70,7 +70,7 @@ impl ConstMetadata for ShortString {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

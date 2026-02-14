@@ -59,7 +59,7 @@ impl ConstMetadata for RangeU128 {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 
@@ -95,7 +95,7 @@ impl ConstMetadata for RangeInclusiveU128 {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

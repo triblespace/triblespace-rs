@@ -59,4 +59,3 @@ fn entity_repeated_affects_id_and_insertions() {
     assert_ne!(entity_id(&base), entity_id(&with_tags));
     assert_eq!(base.len() + 1, with_tags.len());
 }
-

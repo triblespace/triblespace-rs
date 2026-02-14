@@ -37,7 +37,8 @@ impl ConstMetadata for LongString {
                 metadata::name: blobs.put("longstring".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        }
+        .into_facts())
     }
 }
 

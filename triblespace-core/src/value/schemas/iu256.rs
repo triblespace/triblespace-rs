@@ -65,7 +65,7 @@ impl ConstMetadata for U256LE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for U256LE {
@@ -99,7 +99,7 @@ impl ConstMetadata for U256BE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for U256BE {
@@ -133,7 +133,7 @@ impl ConstMetadata for I256LE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for I256LE {
@@ -167,7 +167,7 @@ impl ConstMetadata for I256BE {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for I256BE {

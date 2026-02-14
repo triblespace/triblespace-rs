@@ -79,7 +79,7 @@ impl ConstMetadata for Boolean {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

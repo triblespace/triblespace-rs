@@ -58,7 +58,7 @@ impl ConstMetadata for ED25519RComponent {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for ED25519RComponent {
@@ -92,7 +92,7 @@ impl ConstMetadata for ED25519SComponent {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for ED25519SComponent {
@@ -126,7 +126,7 @@ impl ConstMetadata for ED25519PublicKey {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 impl ValueSchema for ED25519PublicKey {

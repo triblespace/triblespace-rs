@@ -738,7 +738,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             #attr_eval_tokens
             #id_init
             #insert_tokens
-            set
+            #base_path::trible::Fragment::rooted(id_ref.id, set)
         }
     };
 

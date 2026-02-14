@@ -55,7 +55,7 @@ impl ConstMetadata for NsTAIInterval {
             };
             tribles
         };
-        Ok(tribles)
+        Ok(tribles.into_facts())
     }
 }
 

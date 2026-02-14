@@ -40,7 +40,8 @@ impl ConstMetadata for FileBytes {
                 metadata::name: blobs.put("filebytes".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        }
+        .into_facts())
     }
 }
 

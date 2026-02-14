@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-02-14
+### Added
+- `Fragment`: a rooted (or multi-root) graph fragment that bundles a `TribleSet`
+  with exported entity id(s).
+
+### Changed
+- `entity!` now returns a `Fragment` instead of a raw `TribleSet`. Merge facts
+  into datasets via `+=` (only facts are unioned) or call `.into_facts()` when a
+  plain `TribleSet` is required (for example `Workspace::commit`).
+
 ## [0.13.2] - 2026-02-13
 ### Added
 - `entity!` now supports repeated facts via `attr*: iter_expr`.

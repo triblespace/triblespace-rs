@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
     // Workspaces stage TribleSets before committing them. The entity! macro
-    // returns sets that merge cheaply into our current working set.
+    // returns a rooted fragment; merging via `+=` unions only the facts.
     let author_id = ufoid();
     let mut library = TribleSet::new();
 
