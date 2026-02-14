@@ -391,9 +391,9 @@ mod tests {
         let mut kb = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
         for _i in 0..200 {
-            kb.union(entity!{
-                description: blobs.put(Bytes::from_source(Name(EN).fake::<String>()).view().unwrap()).unwrap()
-             });
+            kb += entity! {
+               description: blobs.put(Bytes::from_source(Name(EN).fake::<String>()).view().unwrap()).unwrap()
+            };
         }
         blobs.keep(potential_handles::<Blake3>(&kb));
     }

@@ -5,6 +5,7 @@ use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 
+use super::Trible;
 use super::TribleSet;
 
 /// A rooted (or multi-root) fragment of a knowledge graph.
@@ -86,6 +87,15 @@ impl Deref for Fragment {
 
     fn deref(&self) -> &Self::Target {
         &self.facts
+    }
+}
+
+impl<'a> IntoIterator for &'a Fragment {
+    type Item = &'a Trible;
+    type IntoIter = super::tribleset::TribleSetIterator<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.facts.iter()
     }
 }
 

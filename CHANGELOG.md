@@ -14,8 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `entity!` now returns a `Fragment` instead of a raw `TribleSet`. Merge facts
-  into datasets via `+=` (only facts are unioned) or call `.into_facts()` when a
-  plain `TribleSet` is required (for example `Workspace::commit`).
+  into datasets via `+=` (only facts are unioned). Use `.into_facts()` when you
+  explicitly need to drop exports and work with a plain `TribleSet`.
+- `Workspace::commit` now accepts `impl Into<TribleSet>` for content, so you can
+  commit a `Fragment` directly.
 
 ## [0.13.2] - 2026-02-13
 ### Added

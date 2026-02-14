@@ -286,11 +286,13 @@ mod tests {
                     entity! { &author @
                        literature::firstname: FirstName(EN).fake::<String>(),
                        literature::lastname: LastName(EN).fake::<String>(),
-                    },
+                    }
+                    .into_facts(),
                     entity! { &book @
                        literature::title: Words(1..3).fake::<Vec<String>>().join(" "),
                        literature::author: &author
-                    },
+                    }
+                    .into_facts(),
                 ]
             })
             .reduce(TribleSet::new, |a, b| a + b);

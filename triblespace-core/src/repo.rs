@@ -1730,10 +1730,11 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// automatically. Supplying metadata does not change the workspace default.
     pub fn commit(
         &mut self,
-        content_: TribleSet,
+        content_: impl Into<TribleSet>,
         metadata_: Option<TribleSet>,
         message_: Option<&str>,
     ) {
+        let content_ = content_.into();
         let metadata_handle = match metadata_ {
             Some(metadata_set) => Some(
                 self.local_blobs
