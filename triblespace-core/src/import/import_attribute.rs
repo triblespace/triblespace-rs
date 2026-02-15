@@ -6,7 +6,7 @@ use blake3::Hasher;
 use crate::blob::schemas::longstring::LongString;
 use crate::id::{ExclusiveId, Id, RawId};
 use crate::macros::entity;
-use crate::metadata::{self, Metadata};
+use crate::metadata::{self, Describe};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
@@ -69,7 +69,7 @@ impl<S: ValueSchema> ImportAttribute<S> {
     }
 }
 
-impl<S> Metadata for ImportAttribute<S>
+impl<S> Describe for ImportAttribute<S>
 where
     S: ValueSchema,
 {

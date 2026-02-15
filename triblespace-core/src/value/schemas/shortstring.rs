@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -43,7 +43,7 @@ impl ConstId for ShortString {
     const ID: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
 }
 
-impl ConstMetadata for ShortString {
+impl ConstDescribe for ShortString {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

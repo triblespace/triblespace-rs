@@ -19,10 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly need to drop exports and work with a plain `TribleSet`.
 - `Workspace::commit` now accepts `impl Into<TribleSet>` for content, so you can
   commit a `Fragment` directly.
-- `metadata::Metadata::describe` now returns a `Fragment` (with exports as the
+- Renamed metadata traits: `metadata::Metadata` -> `metadata::Describe` and
+  `metadata::ConstMetadata` -> `metadata::ConstDescribe`.
+- `metadata::Describe::describe` now returns a `Fragment` (with exports as the
   described root id(s)) and no longer has a separate `id()` accessor.
 - Introduced `metadata::ConstId` (`const ID: Id`) for schema identifiers and
-  kept `metadata::ConstMetadata` focused on emitting optional discovery
+  kept `metadata::ConstDescribe` focused on emitting optional discovery
   metadata. Composite `Handle` schema IDs are derived in `const` context via
   the new `const_blake3` workspace crate.
 - `import::json::JsonObjectImporter::import_*` now returns a `Fragment` instead

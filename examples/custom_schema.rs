@@ -6,7 +6,7 @@ use triblespace::core::blob::ToBlob;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::id::Id;
-use triblespace::core::metadata::{ConstId, ConstMetadata};
+use triblespace::core::metadata::{ConstDescribe, ConstId};
 use triblespace::core::repo::BlobStore;
 use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::value::FromValue;
@@ -23,7 +23,7 @@ impl ConstId for U64LE {
     const ID: Id = id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A");
 }
 
-impl ConstMetadata for U64LE {
+impl ConstDescribe for U64LE {
     fn describe<B>(blobs: &mut B) -> Result<triblespace::core::trible::TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -57,8 +57,7 @@ impl ConstId for BytesBlob {
     const ID: Id = id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0");
 }
 
-impl ConstMetadata for BytesBlob {
-}
+impl ConstDescribe for BytesBlob {}
 
 impl BlobSchema for BytesBlob {}
 

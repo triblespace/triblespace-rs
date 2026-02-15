@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -25,7 +25,7 @@ impl ConstId for WasmCode {
     const ID: Id = id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52");
 }
 
-impl ConstMetadata for WasmCode {
+impl ConstDescribe for WasmCode {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

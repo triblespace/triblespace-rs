@@ -10,7 +10,7 @@ use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
-use crate::metadata::{self, Metadata};
+use crate::metadata::{self, Describe};
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
@@ -221,7 +221,7 @@ impl<S: ValueSchema> Attribute<S> {
     }
 }
 
-impl<S> Metadata for Attribute<S>
+impl<S> Describe for Attribute<S>
 where
     S: ValueSchema,
 {

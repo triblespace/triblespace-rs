@@ -12,7 +12,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::query::TriblePattern;
 use crate::repo::BlobStore;
 use crate::trible::Trible;
@@ -53,7 +53,7 @@ impl ConstId for SuccinctArchiveBlob {
     const ID: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
 }
 
-impl ConstMetadata for SuccinctArchiveBlob {
+impl ConstDescribe for SuccinctArchiveBlob {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

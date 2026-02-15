@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -35,7 +35,7 @@ impl ConstId for F256BE {
 /// A type alias for the little-endian version of the 256-bit floating point number.
 pub type F256 = F256LE;
 
-impl ConstMetadata for F256LE {
+impl ConstDescribe for F256LE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -65,7 +65,7 @@ impl ConstMetadata for F256LE {
 impl ValueSchema for F256LE {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for F256BE {
+impl ConstDescribe for F256BE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

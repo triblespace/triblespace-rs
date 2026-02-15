@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -40,7 +40,7 @@ impl ConstId for ED25519PublicKey {
     const ID: Id = id_hex!("69A872254E01B4C1ED36E08E40445E93");
 }
 
-impl ConstMetadata for ED25519RComponent {
+impl ConstDescribe for ED25519RComponent {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -70,7 +70,7 @@ impl ConstMetadata for ED25519RComponent {
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for ED25519SComponent {
+impl ConstDescribe for ED25519SComponent {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -100,7 +100,7 @@ impl ConstMetadata for ED25519SComponent {
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for ED25519PublicKey {
+impl ConstDescribe for ED25519PublicKey {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

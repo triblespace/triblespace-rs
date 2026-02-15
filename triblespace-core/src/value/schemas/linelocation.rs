@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -24,7 +24,7 @@ impl ConstId for LineLocation {
     const ID: Id = id_hex!("DFAED173A908498CB893A076EAD3E578");
 }
 
-impl ConstMetadata for LineLocation {
+impl ConstDescribe for LineLocation {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

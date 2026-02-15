@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -51,7 +51,7 @@ pub type I256 = I256BE;
 /// This type is an alias for [U256BE].
 pub type U256 = U256BE;
 
-impl ConstMetadata for U256LE {
+impl ConstDescribe for U256LE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -81,7 +81,7 @@ impl ConstMetadata for U256LE {
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for U256BE {
+impl ConstDescribe for U256BE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -111,7 +111,7 @@ impl ConstMetadata for U256BE {
 impl ValueSchema for U256BE {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for I256LE {
+impl ConstDescribe for I256LE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -141,7 +141,7 @@ impl ConstMetadata for I256LE {
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for I256BE {
+impl ConstDescribe for I256BE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

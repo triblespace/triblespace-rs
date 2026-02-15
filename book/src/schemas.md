@@ -142,7 +142,7 @@ let schema_id = <LongString as ConstId>::ID;
 ```
 
 Both value and blob schemas can emit optional discovery metadata. Calling
-`ConstMetadata::describe` returns a `TribleSet` that tags the schema entity with
+`ConstDescribe::describe` returns a `TribleSet` that tags the schema entity with
 `metadata::KIND_VALUE_SCHEMA` or `metadata::KIND_BLOB_SCHEMA` and may attach a
 `metadata::name` and `metadata::description` (LongString handles). Persist the
 description blobs alongside the metadata tribles if you want the text to remain
@@ -208,7 +208,7 @@ The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
 
 The core crate can optionally ship built-in formatters for its built-in value
 schemas. Enable the `wasm` feature to have
-`ConstMetadata::describe` (which is fallible) attach `metadata::value_formatter` entries for the
+`ConstDescribe::describe` (which is fallible) attach `metadata::value_formatter` entries for the
 standard schemas. This feature requires the `wasm32-unknown-unknown` Rust
 target at build time because the bundled formatters are compiled to WebAssembly
 via the `#[value_formatter]` proc macro.

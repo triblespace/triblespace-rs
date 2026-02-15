@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -48,7 +48,7 @@ impl ConstId for R256BE {
 
 pub type R256 = R256LE;
 
-impl ConstMetadata for R256LE {
+impl ConstDescribe for R256LE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -78,7 +78,7 @@ impl ConstMetadata for R256LE {
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
-impl ConstMetadata for R256BE {
+impl ConstDescribe for R256BE {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

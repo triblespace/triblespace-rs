@@ -16,8 +16,8 @@ use crate::value::schemas::hash::Blake3;
 use core::marker::PhantomData;
 use triblespace_core_macros::attributes;
 
-/// Describes metadata that can be emitted for documentation or discovery.
-pub trait Metadata {
+/// Emits metadata that can be used for documentation or discovery.
+pub trait Describe {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>;
@@ -29,7 +29,7 @@ pub trait ConstId {
 }
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
-pub trait ConstMetadata: ConstId {
+pub trait ConstDescribe: ConstId {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -39,9 +39,9 @@ pub trait ConstMetadata: ConstId {
     }
 }
 
-impl<S> Metadata for PhantomData<S>
+impl<S> Describe for PhantomData<S>
 where
-    S: ConstMetadata,
+    S: ConstDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
@@ -49,14 +49,14 @@ where
     {
         Ok(Fragment::rooted(
             S::ID,
-            <S as ConstMetadata>::describe(blobs)?,
+            <S as ConstDescribe>::describe(blobs)?,
         ))
     }
 }
 
-impl<T> Metadata for T
+impl<T> Describe for T
 where
-    T: ConstMetadata,
+    T: ConstDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where

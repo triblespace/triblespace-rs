@@ -22,7 +22,7 @@ use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::import::ImportAttribute;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstMetadata, Metadata};
+use crate::metadata::{ConstDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::{Fragment, Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -464,10 +464,10 @@ where
 
     pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
-        meta.union(<Boolean as ConstMetadata>::describe(self.store)?);
-        meta.union(<F64 as ConstMetadata>::describe(self.store)?);
-        meta.union(<GenId as ConstMetadata>::describe(self.store)?);
-        meta.union(<Handle<Blake3, LongString> as ConstMetadata>::describe(
+        meta.union(<Boolean as ConstDescribe>::describe(self.store)?);
+        meta.union(<F64 as ConstDescribe>::describe(self.store)?);
+        meta.union(<GenId as ConstDescribe>::describe(self.store)?);
+        meta.union(<Handle<Blake3, LongString> as ConstDescribe>::describe(
             self.store,
         )?);
         for (key, attr) in self.bool_attrs.iter() {

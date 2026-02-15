@@ -1,5 +1,5 @@
 use triblespace_core::metadata;
-use triblespace_core::metadata::Metadata;
+use triblespace_core::metadata::Describe;
 use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
     attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, TribleSet, Value,

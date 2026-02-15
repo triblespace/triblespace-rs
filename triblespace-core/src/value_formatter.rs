@@ -255,7 +255,7 @@ mod tests {
     use crate::id::Id;
     use crate::macros::pattern;
     use crate::metadata;
-    use crate::metadata::{ConstId, ConstMetadata};
+    use crate::metadata::{ConstDescribe, ConstId};
     use crate::query::find;
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
@@ -375,8 +375,8 @@ mod tests {
         space += ED25519SComponent::describe(&mut store).expect("ed25519 s metadata");
         space += ED25519PublicKey::describe(&mut store).expect("ed25519 pubkey metadata");
         space += UnknownValue::describe(&mut store).expect("unknown metadata");
-        space += <Hash<Blake3> as ConstMetadata>::describe(&mut store).expect("hash metadata");
-        space += <Handle<Blake3, LongString> as ConstMetadata>::describe(&mut store)
+        space += <Hash<Blake3> as ConstDescribe>::describe(&mut store).expect("hash metadata");
+        space += <Handle<Blake3, LongString> as ConstDescribe>::describe(&mut store)
             .expect("handle metadata");
 
         let reader = store.reader().expect("blob reader");

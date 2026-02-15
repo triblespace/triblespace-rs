@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -37,7 +37,7 @@ impl ConstId for RangeInclusiveU128 {
     const ID: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
 }
 
-impl ConstMetadata for RangeU128 {
+impl ConstDescribe for RangeU128 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -69,7 +69,7 @@ impl ValueSchema for RangeU128 {
     type ValidationError = Infallible;
 }
 
-impl ConstMetadata for RangeInclusiveU128 {
+impl ConstDescribe for RangeInclusiveU128 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

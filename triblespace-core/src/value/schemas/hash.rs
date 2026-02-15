@@ -4,7 +4,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::FromValue;
@@ -24,7 +24,7 @@ use std::marker::PhantomData;
 /// A trait for hash functions.
 /// This trait is implemented by hash functions that can be in a value schema
 /// for example via a [struct@Hash] or a [Handle].
-pub trait HashProtocol: Digest<OutputSize = U32> + Clone + Send + 'static + ConstMetadata {
+pub trait HashProtocol: Digest<OutputSize = U32> + Clone + Send + 'static + ConstDescribe {
     const NAME: &'static str;
 }
 
@@ -44,7 +44,7 @@ where
     const ID: Id = H::ID;
 }
 
-impl<H> ConstMetadata for Hash<H>
+impl<H> ConstDescribe for Hash<H>
 where
     H: HashProtocol,
 {
@@ -202,7 +202,7 @@ impl ConstId for Blake2b {
     const ID: Id = id_hex!("91F880222412A49F012BE999942E6199");
 }
 
-impl ConstMetadata for Blake2b {
+impl ConstDescribe for Blake2b {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -215,7 +215,7 @@ impl ConstId for Blake3 {
     const ID: Id = id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3");
 }
 
-impl ConstMetadata for Blake3 {
+impl ConstDescribe for Blake3 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -280,10 +280,10 @@ impl<H: HashProtocol, T: BlobSchema> ConstId for Handle<H, T> {
     };
 }
 
-impl<H, T> ConstMetadata for Handle<H, T>
+impl<H, T> ConstDescribe for Handle<H, T>
 where
     H: HashProtocol,
-    T: BlobSchema + ConstMetadata,
+    T: BlobSchema + ConstDescribe,
 {
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>

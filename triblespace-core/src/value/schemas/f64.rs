@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstId, ConstMetadata};
+use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -23,7 +23,7 @@ impl ConstId for F64 {
     const ID: Id = id_hex!("C80A60F4A6F2FBA5A8DB2531A923EC70");
 }
 
-impl ConstMetadata for F64 {
+impl ConstDescribe for F64 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
