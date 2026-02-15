@@ -16,8 +16,6 @@ use std::convert::Infallible;
 
 use std::convert::TryInto;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 use num_rational::Ratio;
 
 /// A 256-bit ratio value.
@@ -43,15 +41,13 @@ pub struct R256BE;
 pub type R256 = R256LE;
 
 impl ConstMetadata for R256LE {
-    fn id() -> Id {
-        id_hex!("0A9B43C5C2ECD45B257CDEFC16544358")
-    }
+    const ID: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in little-endian, normalized with a positive denominator. This keeps fractions canonical and comparable.\n\nUse for exact rates, proportions, or unit conversions where rounding is unacceptable. Prefer F64 or F256 when approximate floats are fine or when interfacing with floating-point APIs.\n\nDenominator zero is invalid; the schema expects canonicalized fractions. If you need intervals or ranges instead of ratios, use the range schemas.",
         )?;
@@ -77,15 +73,13 @@ impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for R256BE {
-    fn id() -> Id {
-        id_hex!("CA5EAF567171772C1FFD776E9C7C02D1")
-    }
+    const ID: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
         )?;

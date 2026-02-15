@@ -27,9 +27,7 @@ pub struct UnknownBlob;
 impl BlobSchema for UnknownBlob {}
 
 impl ConstMetadata for UnknownBlob {
-    fn id() -> Id {
-        id_hex!("EAB14005141181B0C10C4B5DD7985F8D")
-    }
+    const ID: Id = id_hex!("EAB14005141181B0C10C4B5DD7985F8D");
 }
 
 impl TryFromBlob<UnknownBlob> for Bytes {

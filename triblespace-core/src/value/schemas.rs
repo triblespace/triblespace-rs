@@ -26,8 +26,6 @@ use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for an unknown value.
 /// This value schema is used as a fallback when the value schema is not known.
 /// It is not recommended to use this value schema in practice.
@@ -36,15 +34,13 @@ use crate::blob::schemas::wasmcode::WasmCode;
 /// Any bit pattern can be a valid value of this schema.
 pub struct UnknownValue {}
 impl ConstMetadata for UnknownValue {
-    fn id() -> Id {
-        id_hex!("4EC697E8599AC79D667C722E2C8BEBF4")
-    }
+    const ID: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
         };

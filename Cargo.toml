@@ -11,6 +11,7 @@ repository = "https://github.com/triblespace/triblespace-rs"
 
 [workspace]
 members = [
+    "const-blake3",
     "triblespace-core",
     "triblespace-core-macros",
     "triblespace-macros",

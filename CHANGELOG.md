@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - `Fragment`: a rooted (or multi-root) graph fragment that bundles a `TribleSet`
   with exported entity id(s).
+- `Id::raw()`: a `const` helper returning the raw 16-byte identifier.
 
 ### Changed
 - `entity!` now returns a `Fragment` instead of a raw `TribleSet`. Merge facts
@@ -20,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit a `Fragment` directly.
 - `metadata::Metadata::describe` now returns a `Fragment` (with exports as the
   described root id(s)) and no longer has a separate `id()` accessor.
+- `metadata::ConstMetadata` now exposes schema identifiers as an associated
+  constant `ID: Id` instead of a `id()` method. Composite `Handle` schema IDs
+  are derived in `const` context via the new `const_blake3` workspace crate.
 - `import::json::JsonObjectImporter::import_*` now returns a `Fragment` instead
   of root id lists and no longer retains accumulated facts internally (removed
   `data()`/`clear_data()`; callers merge fragments explicitly).

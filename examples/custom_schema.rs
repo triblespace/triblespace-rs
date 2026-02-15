@@ -20,9 +20,7 @@ use triblespace::core::value::VALUE_LEN;
 pub struct U64LE;
 
 impl ConstMetadata for U64LE {
-    fn id() -> Id {
-        id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A")
-    }
+    const ID: Id = id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A");
 
     fn describe<B>(blobs: &mut B) -> Result<triblespace::core::trible::TribleSet, B::PutError>
     where
@@ -54,9 +52,7 @@ impl FromValue<'_, U64LE> for u64 {
 pub struct BytesBlob;
 
 impl ConstMetadata for BytesBlob {
-    fn id() -> Id {
-        id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0")
-    }
+    const ID: Id = id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0");
 }
 
 impl BlobSchema for BytesBlob {}

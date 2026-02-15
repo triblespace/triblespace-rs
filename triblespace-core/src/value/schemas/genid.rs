@@ -20,8 +20,6 @@ use crate::value::VALUE_LEN;
 
 use std::convert::TryInto;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 use hex::FromHex;
 use hex::FromHexError;
 
@@ -35,15 +33,13 @@ use proptest::prelude::RngCore;
 pub struct GenId;
 
 impl ConstMetadata for GenId {
-    fn id() -> Id {
-        id_hex!("B08EE1D45EB081E8C47618178AFE0D81")
-    }
+    const ID: Id = id_hex!("B08EE1D45EB081E8C47618178AFE0D81");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example using Attribute::from_name or a hash).",
         )?;

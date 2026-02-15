@@ -9,7 +9,6 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
-use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;

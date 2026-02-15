@@ -25,8 +25,8 @@ pub trait Metadata {
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
 pub trait ConstMetadata {
-    /// Returns the root identifier for this metadata description.
-    fn id() -> Id;
+    /// Root identifier for this metadata description.
+    const ID: Id;
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
@@ -46,7 +46,7 @@ where
         B: BlobStore<Blake3>,
     {
         Ok(Fragment::rooted(
-            <S as ConstMetadata>::id(),
+            <S as ConstMetadata>::ID,
             <S as ConstMetadata>::describe(blobs)?,
         ))
     }
@@ -60,7 +60,7 @@ where
     where
         B: BlobStore<Blake3>,
     {
-        Ok(Fragment::rooted(T::id(), T::describe(blobs)?))
+        Ok(Fragment::rooted(T::ID, T::describe(blobs)?))
     }
 }
 

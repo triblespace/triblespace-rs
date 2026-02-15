@@ -113,6 +113,16 @@ impl Id {
     pub fn aquire(&self) -> Option<ExclusiveId> {
         OWNED_IDS.with(|owner| owner.take(self))
     }
+
+    /// Returns the raw 16-byte representation of this identifier.
+    ///
+    /// This is `const` so schema identifiers can be composed at compile time.
+    pub const fn raw(self) -> RawId {
+        // SAFETY: `Id` is a transparent 16-byte wrapper around a non-zero 128-bit
+        // integer. Its representation matches `RawId` by construction, as
+        // `Id::new` already transmutes from `RawId` to `Option<Id>`.
+        unsafe { std::mem::transmute::<Id, RawId>(self) }
+    }
 }
 
 impl PartialOrd for Id {

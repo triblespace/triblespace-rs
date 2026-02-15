@@ -17,8 +17,6 @@ use crate::value::ValueSchema;
 use indxvec::Printing;
 use std::str::Utf8Error;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// An error that occurs when converting a string to a short string.
 /// This error occurs when the string is too long or contains an interior NUL byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,15 +40,13 @@ pub enum ValidationError {
 pub struct ShortString;
 
 impl ConstMetadata for ShortString {
-    fn id() -> Id {
-        id_hex!("2D848DB0AF112DB226A6BF1A3640D019")
-    }
+    const ID: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "UTF-8 string stored inline in 32 bytes with NUL termination and zero padding. Keeping the bytes inside the value makes the string sortable and queryable without an extra blob lookup.\n\nUse for short labels, enum-like names, and keys that must fit in the value boundary. For longer or variable text, store a LongString blob and reference it with a Handle.\n\nInterior NUL bytes are invalid and the maximum length is 32 bytes. The schema stores raw bytes, so it does not account for grapheme width or display columns.",
         )?;

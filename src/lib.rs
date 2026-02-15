@@ -28,7 +28,6 @@ mod proofs;
 #[cfg(test)]
 mod readme_example {
     use crate::core::repo::{memoryrepo::MemoryRepo, Repository};
-    use crate::prelude::blobschemas::LongString;
     use crate::prelude::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;

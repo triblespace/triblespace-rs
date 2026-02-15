@@ -18,8 +18,6 @@ use std::fmt;
 use f256::f256;
 use serde_json::Number as JsonNumber;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for a 256-bit floating point number in little-endian byte order.
 pub struct F256LE;
 
@@ -30,15 +28,13 @@ pub struct F256BE;
 pub type F256 = F256LE;
 
 impl ConstMetadata for F256LE {
-    fn id() -> Id {
-        id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2")
-    }
+    const ID: Id = id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "High-precision f256 float stored in little-endian byte order. The format preserves far more precision than f64 and can round-trip large JSON numbers.\n\nUse when precision or exact decimal import matters more than storage or compute cost. Choose the big-endian variant if you need lexicographic ordering or network byte order.\n\nF256 values are heavier to parse and compare than f64. If you only need standard double precision, prefer F64 for faster operations.",
         )?;
@@ -64,15 +60,13 @@ impl ValueSchema for F256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for F256BE {
-    fn id() -> Id {
-        id_hex!("A629176D4656928D96B155038F9F2220")
-    }
+    const ID: Id = id_hex!("A629176D4656928D96B155038F9F2220");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "High-precision f256 float stored in big-endian byte order. This variant is convenient for bytewise ordering or wire formats that expect network order.\n\nUse for high-precision metrics or lossless JSON import when ordering matters across systems. For everyday numeric values, F64 is smaller and faster.\n\nAs with all floats, rounding can still occur at the chosen precision. If you need exact fractions, use R256 instead.",
         )?;

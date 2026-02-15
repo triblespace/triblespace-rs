@@ -160,7 +160,7 @@ fn render_schema_value(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
     out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
-    if schema == Boolean::id() {
+    if schema == Boolean::ID {
         let value = value.transmute::<Boolean>();
         let _ = out.write_str(if value.from_value::<bool>() {
             "true"
@@ -169,7 +169,7 @@ fn render_schema_value(
         });
         return Ok(());
     }
-    if schema == F64::id() {
+    if schema == F64::ID {
         let value = value.transmute::<F64>();
         let number = value.from_value::<f64>();
         if !number.is_finite() {
@@ -185,11 +185,11 @@ fn render_schema_value(
         }
         return Ok(());
     }
-    if schema == GenId::id() {
+    if schema == GenId::ID {
         let child_id = value.transmute::<GenId>().from_value::<Id>();
         return write_entity(merged, child_id, visited, ctx, out);
     }
-    if schema == Handle::<Blake3, LongString>::id() {
+    if schema == Handle::<Blake3, LongString>::ID {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
         let text = resolve_string(ctx, handle)?;
         write_escaped_str(text.as_ref(), out);

@@ -23,15 +23,13 @@ pub struct FileBytes;
 impl BlobSchema for FileBytes {}
 
 impl ConstMetadata for FileBytes {
-    fn id() -> Id {
-        id_hex!("5DE76157AE4FDEA830019916805E80A4")
-    }
+    const ID: Id = id_hex!("5DE76157AE4FDEA830019916805E80A4");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Opaque file bytes captured as a blob. Use when the payload represents a file snapshot (attachments, dataset artifacts, exported archives) and you want to preserve that provenance in the schema rather than treating it as UnknownBlob. The meaning is given by adjacent metadata attributes such as mime type, filename, and dimensions.",
         )?;

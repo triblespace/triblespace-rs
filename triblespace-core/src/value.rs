@@ -18,9 +18,7 @@
 //!
 //! // Implement the ValueSchema trait for the schema type.
 //! impl ConstMetadata for MyNumber {
-//!    fn id() -> Id {
-//!        id_hex!("345EAC0C5B5D7D034C87777280B88AE2")
-//!    }
+//!    const ID: Id = id_hex!("345EAC0C5B5D7D034C87777280B88AE2");
 //! }
 //! impl ValueSchema for MyNumber {
 //!    type ValidationError = ();

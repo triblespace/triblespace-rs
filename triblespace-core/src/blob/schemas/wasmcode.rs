@@ -22,15 +22,13 @@ pub struct WasmCode;
 impl BlobSchema for WasmCode {}
 
 impl ConstMetadata for WasmCode {
-    fn id() -> Id {
-        id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52")
-    }
+    const ID: Id = id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "WebAssembly bytecode blob for sandboxed helper modules. The modules are expected to be deterministic and import-free, intended for small utilities such as value formatters.\n\nUse when a schema references a formatter via metadata::value_formatter or similar tooling and you want portable, sandboxed code alongside the data. Avoid large or stateful modules; keep the bytecode focused on pure formatting or validation tasks.",
         )?;

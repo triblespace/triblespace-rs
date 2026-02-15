@@ -15,23 +15,19 @@ use crate::value::ValueSchema;
 use proc_macro::Span;
 use std::convert::Infallible;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for representing a span using explicit line and column
 /// coordinates.
 #[derive(Debug, Clone, Copy)]
 pub struct LineLocation;
 
 impl ConstMetadata for LineLocation {
-    fn id() -> Id {
-        id_hex!("DFAED173A908498CB893A076EAD3E578")
-    }
+    const ID: Id = id_hex!("DFAED173A908498CB893A076EAD3E578");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Line/column span encoded as four big-endian u64 values (start_line, start_col, end_line, end_col). This captures explicit source positions rather than byte offsets.\n\nUse for editor diagnostics, source maps, or human-facing spans. If you need byte offsets or length-based ranges, use RangeU128 instead.\n\nColumns are raw counts and do not account for variable-width graphemes. Store any display conventions separately if needed.",
         )?;

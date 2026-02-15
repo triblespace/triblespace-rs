@@ -17,8 +17,6 @@ use crate::value::ValueSchema;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for representing a pair of `u128` values.
 ///
 /// [`RangeU128`] encodes the pair as a half-open interval while
@@ -32,15 +30,13 @@ pub struct RangeU128;
 pub struct RangeInclusiveU128;
 
 impl ConstMetadata for RangeU128 {
-    fn id() -> Id {
-        id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A")
-    }
+    const ID: Id = id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Half-open range encoded as two big-endian u128 values (start..end). This mirrors common slice semantics where the end is exclusive.\n\nUse for offsets, byte ranges, and spans where length matters and empty ranges are valid. Use RangeInclusiveU128 when both endpoints should be included.\n\nNo normalization is enforced; callers should ensure start <= end and interpret units consistently.",
         )?;
@@ -68,15 +64,13 @@ impl ValueSchema for RangeU128 {
 }
 
 impl ConstMetadata for RangeInclusiveU128 {
-    fn id() -> Id {
-        id_hex!("1D0D82CA84424CD0A2F98DB37039E152")
-    }
+    const ID: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Inclusive range encoded as two big-endian u128 values (start..=end). This is convenient when both endpoints are meaningful.\n\nUse for closed intervals such as line/column ranges or inclusive numeric bounds. Prefer RangeU128 for half-open intervals and length-based calculations.\n\nCallers should decide how to handle empty or reversed ranges; the schema only defines the byte layout.",
         )?;

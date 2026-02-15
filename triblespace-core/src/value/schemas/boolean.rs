@@ -17,8 +17,6 @@ use crate::value::VALUE_LEN;
 
 use std::convert::Infallible;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// Error raised when a value does not match the [`Boolean`] encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidBoolean;
@@ -51,15 +49,13 @@ impl Boolean {
 }
 
 impl ConstMetadata for Boolean {
-    fn id() -> Id {
-        id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5")
-    }
+    const ID: Id = id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Boolean stored as all-zero bytes for false and all-0xFF bytes for true. The encoding uses the full 32-byte value, making the two states obvious and cheap to test.\n\nUse for simple flags and binary states. Represent unknown or missing data by omitting the trible rather than inventing a third sentinel value.\n\nMixed patterns are invalid and will fail validation. If you need tri-state or richer states, model it explicitly (for example with ShortString or a dedicated entity).",
         )?;

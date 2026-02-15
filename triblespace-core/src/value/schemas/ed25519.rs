@@ -19,8 +19,6 @@ use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for the R component of an Ed25519 signature.
 pub struct ED25519RComponent;
 
@@ -31,15 +29,13 @@ pub struct ED25519SComponent;
 pub struct ED25519PublicKey;
 
 impl ConstMetadata for ED25519RComponent {
-    fn id() -> Id {
-        id_hex!("995A86FFC83DB95ECEAA17E226208897")
-    }
+    const ID: Id = id_hex!("995A86FFC83DB95ECEAA17E226208897");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob schema (for example LongString with base64 or a custom blob schema).",
         )?;
@@ -65,15 +61,13 @@ impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for ED25519SComponent {
-    fn id() -> Id {
-        id_hex!("10D35B0B628E9E409C549D8EC1FB3598")
-    }
+    const ID: Id = id_hex!("10D35B0B628E9E409C549D8EC1FB3598");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Ed25519 signature S component stored as a 32-byte field. This is the second half of the standard Ed25519 signature.\n\nUse when storing or querying signatures in a structured form. Pair with the R component to reconstruct or verify the full signature.\n\nAs with the R component, treat this as public data; private signing keys should be stored separately and securely.",
         )?;
@@ -99,15 +93,13 @@ impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for ED25519PublicKey {
-    fn id() -> Id {
-        id_hex!("69A872254E01B4C1ED36E08E40445E93")
-    }
+    const ID: Id = id_hex!("69A872254E01B4C1ED36E08E40445E93");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Ed25519 public key stored as a 32-byte field. Public keys verify signatures and identify signing identities.\n\nUse for signer registries, verification records, or key references associated with signatures. Private keys are not represented by a built-in schema and should be handled separately.\n\nEd25519 is widely supported and deterministic; if you need another scheme, define a custom schema with its own metadata.",
         )?;

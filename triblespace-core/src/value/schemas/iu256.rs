@@ -15,8 +15,6 @@ use std::convert::Infallible;
 
 use ethnum;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A value schema for a 256-bit unsigned integer in little-endian byte order.
 pub struct U256LE;
 
@@ -38,15 +36,13 @@ pub type I256 = I256BE;
 pub type U256 = U256BE;
 
 impl ConstMetadata for U256LE {
-    fn id() -> Id {
-        id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E")
-    }
+    const ID: Id = id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Unsigned 256-bit integer stored in little-endian byte order. The full 32 bytes are dedicated to the magnitude.\n\nUse for large counters, identifiers, or domain-specific fixed-width numbers that exceed u128. Prefer U256BE when bytewise ordering or protocol encoding matters.\n\nIf a smaller width suffices, prefer U64 or U128 in your schema to reduce storage and improve readability.",
         )?;
@@ -72,15 +68,13 @@ impl ValueSchema for U256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for U256BE {
-    fn id() -> Id {
-        id_hex!("DC3CFB719B05F019FB8101A6F471A982")
-    }
+    const ID: Id = id_hex!("DC3CFB719B05F019FB8101A6F471A982");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Unsigned 256-bit integer stored in big-endian byte order. Bytewise comparisons align with numeric order.\n\nUse when ordering or network serialization matters. Prefer U256LE for local storage or interop with little-endian APIs.\n\nIf you do not need the full 256-bit range, smaller integer schemas are easier to handle and faster to encode.",
         )?;
@@ -106,15 +100,13 @@ impl ValueSchema for U256BE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for I256LE {
-    fn id() -> Id {
-        id_hex!("DB94325A37D96037CBFC6941A4C3B66D")
-    }
+    const ID: Id = id_hex!("DB94325A37D96037CBFC6941A4C3B66D");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Signed 256-bit integer stored in little-endian twos-complement. This enables extremely large signed ranges in a fixed width.\n\nUse for large signed quantities such as balances or offsets beyond i128. Prefer I256BE when bytewise ordering or external protocols require big-endian.\n\nIf values fit within i64 or i128, smaller schemas are more compact and easier to interoperate with.",
         )?;
@@ -140,15 +132,13 @@ impl ValueSchema for I256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for I256BE {
-    fn id() -> Id {
-        id_hex!("CE3A7839231F1EB390E9E8E13DAED782")
-    }
+    const ID: Id = id_hex!("CE3A7839231F1EB390E9E8E13DAED782");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Signed 256-bit integer stored in big-endian twos-complement. This variant is convenient for protocol encoding and deterministic ordering.\n\nUse for interoperability or stable bytewise comparisons across systems. Prefer I256LE for local storage or when endianness does not matter.\n\nAs with any signed integer, consider whether the sign bit has semantic meaning and avoid mixing signed and unsigned ranges.",
         )?;

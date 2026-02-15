@@ -1,0 +1,17 @@
+[package]
+name = "const_blake3"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "const_blake3"
+path = "src/lib.rs"
+
+[target.'cfg(kani)'.dependencies]
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[package.metadata.kani.flags]
+default-unwind = "32"

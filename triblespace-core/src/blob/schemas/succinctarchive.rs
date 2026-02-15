@@ -50,15 +50,13 @@ pub struct SuccinctArchiveBlob;
 impl BlobSchema for SuccinctArchiveBlob {}
 
 impl ConstMetadata for SuccinctArchiveBlob {
-    fn id() -> Id {
-        id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41")
-    }
+    const ID: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
         )?;

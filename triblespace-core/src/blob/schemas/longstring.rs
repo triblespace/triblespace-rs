@@ -20,15 +20,13 @@ pub struct LongString {}
 impl BlobSchema for LongString {}
 
 impl ConstMetadata for LongString {
-    fn id() -> Id {
-        id_hex!("8B173C65B7DB601A11E8A190BD774A79")
-    }
+    const ID: Id = id_hex!("8B173C65B7DB601A11E8A190BD774A79");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let description = blobs.put(
             "Arbitrary-length UTF-8 text stored as a blob. This is the default choice for any textual payload that does not fit in 32 bytes, such as documents, prompts, JSON, or logs.\n\nUse ShortString when you need a fixed-width value embedded directly in tribles, want to derive attributes from the bytes, or need predictable ordering inside value indices. LongString is for payloads where size can vary or exceed the value boundary.",
         )?;

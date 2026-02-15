@@ -21,8 +21,6 @@ use hex::FromHex;
 use hex::FromHexError;
 use std::marker::PhantomData;
 
-#[cfg(feature = "wasm")]
-use crate::blob::schemas::wasmcode::WasmCode;
 /// A trait for hash functions.
 /// This trait is implemented by hash functions that can be in a value schema
 /// for example via a [struct@Hash] or a [Handle].
@@ -43,9 +41,7 @@ impl<H> ConstMetadata for Hash<H>
 where
     H: HashProtocol,
 {
-    fn id() -> Id {
-        <H as ConstMetadata>::id()
-    }
+    const ID: Id = <H as ConstMetadata>::ID;
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
@@ -140,7 +136,7 @@ where
     H: HashProtocol,
     B: BlobStore<Blake3>,
 {
-    let id = H::id();
+    let id = H::ID;
     let name = H::NAME;
     let description = blobs.put(format!(
         "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
@@ -198,9 +194,7 @@ impl HashProtocol for Blake3 {
 }
 
 impl ConstMetadata for Blake2b {
-    fn id() -> Id {
-        id_hex!("91F880222412A49F012BE999942E6199")
-    }
+    const ID: Id = id_hex!("91F880222412A49F012BE999942E6199");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
@@ -211,9 +205,7 @@ impl ConstMetadata for Blake2b {
 }
 
 impl ConstMetadata for Blake3 {
-    fn id() -> Id {
-        id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3")
-    }
+    const ID: Id = id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3");
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
@@ -260,28 +252,31 @@ impl<H: HashProtocol, T: BlobSchema> From<Value<Handle<H, T>>> for Value<Hash<H>
 }
 
 impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
-    // NOTE: This can't be a `const fn` while we rely on the runtime `blake3`
-    // hasher to derive the identifier. Once a const-friendly hashing API is
-    // available we can revisit this.
-    fn id() -> Id {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(Hash::<H>::id().as_ref());
-        hasher.update(T::id().as_ref());
-        let digest = hasher.finalize();
+    const ID: Id = {
+        let mut hasher = const_blake3::Hasher::new();
+        hasher.update(&Hash::<H>::ID.raw());
+        hasher.update(&T::ID.raw());
+        let mut digest = [0u8; 32];
+        hasher.finalize(&mut digest);
         let mut raw = [0u8; 16];
-        let bytes: &[u8] = digest.as_ref();
-        let lower_half = &bytes[bytes.len() - raw.len()..];
-        raw.copy_from_slice(lower_half);
-        Id::new(raw).expect("derived handle schema id must be non-nil")
-    }
+        let mut i = 0;
+        while i < raw.len() {
+            raw[i] = digest[16 + i];
+            i += 1;
+        }
+        match Id::new(raw) {
+            Some(id) => id,
+            None => panic!("derived handle schema id must be non-nil"),
+        }
+    };
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::id();
+        let id = Self::ID;
         let name = H::NAME;
-        let schema_id = T::id();
+        let schema_id = T::ID;
         let description = blobs.put(format!(
             "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at blob schema {schema_id:X}. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
         ))?;
@@ -294,7 +289,7 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
             metadata::name: name_handle,
             metadata::description: description,
             metadata::blob_schema: schema_id,
-            metadata::hash_schema: H::id(),
+            metadata::hash_schema: H::ID,
             metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 

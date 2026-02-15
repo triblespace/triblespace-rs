@@ -303,7 +303,7 @@ mod tests {
         let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
-        let schema_id = crate::value::schemas::shortstring::ShortString::id();
+        let schema_id = crate::value::schemas::shortstring::ShortString::ID;
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
         let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
@@ -389,7 +389,7 @@ mod tests {
                 .expect("formatter loaded")
         };
 
-        let boolean = formatter_for(Boolean::id());
+        let boolean = formatter_for(Boolean::ID);
         assert_eq!(
             boolean
                 .format_value_with_limits(&[0u8; 32], limits)
@@ -404,7 +404,7 @@ mod tests {
         );
 
         let id = crate::id::Id::new([1u8; 16]).expect("non-nil id");
-        let genid = formatter_for(GenId::id());
+        let genid = formatter_for(GenId::ID);
         assert_eq!(
             genid
                 .format_value_with_limits(&GenId::value_from(id).raw, limits)
@@ -412,7 +412,7 @@ mod tests {
             "01".repeat(16)
         );
 
-        let shortstring = formatter_for(ShortString::id());
+        let shortstring = formatter_for(ShortString::ID);
         assert_eq!(
             shortstring
                 .format_value_with_limits(&ShortString::value_from("hi").raw, limits)
@@ -420,7 +420,7 @@ mod tests {
             "hi"
         );
 
-        let float64 = formatter_for(F64::id());
+        let float64 = formatter_for(F64::ID);
         assert_eq!(
             float64
                 .format_value_with_limits(&F64::value_from(1.5f64).raw, limits)
@@ -428,14 +428,14 @@ mod tests {
             "1.5"
         );
 
-        let u256le = formatter_for(U256LE::id());
+        let u256le = formatter_for(U256LE::ID);
         assert_eq!(
             u256le
                 .format_value_with_limits(&U256LE::value_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
-        let u256be = formatter_for(U256BE::id());
+        let u256be = formatter_for(U256BE::ID);
         assert_eq!(
             u256be
                 .format_value_with_limits(&U256BE::value_from(42u64).raw, limits)
@@ -443,14 +443,14 @@ mod tests {
             "42"
         );
 
-        let i256le = formatter_for(I256LE::id());
+        let i256le = formatter_for(I256LE::ID);
         assert_eq!(
             i256le
                 .format_value_with_limits(&I256LE::value_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
-        let i256be = formatter_for(I256BE::id());
+        let i256be = formatter_for(I256BE::ID);
         assert_eq!(
             i256be
                 .format_value_with_limits(&I256BE::value_from(-1i8).raw, limits)
@@ -458,14 +458,14 @@ mod tests {
             "-1"
         );
 
-        let r256le = formatter_for(R256LE::id());
+        let r256le = formatter_for(R256LE::ID);
         assert_eq!(
             r256le
                 .format_value_with_limits(&R256LE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
-        let r256be = formatter_for(R256BE::id());
+        let r256be = formatter_for(R256BE::ID);
         assert_eq!(
             r256be
                 .format_value_with_limits(&R256BE::value_from(-3i128).raw, limits)
@@ -473,14 +473,14 @@ mod tests {
             "-3"
         );
 
-        let range_u128 = formatter_for(RangeU128::id());
+        let range_u128 = formatter_for(RangeU128::ID);
         assert_eq!(
             range_u128
                 .format_value_with_limits(&RangeU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
-        let range_inclusive_u128 = formatter_for(RangeInclusiveU128::id());
+        let range_inclusive_u128 = formatter_for(RangeInclusiveU128::ID);
         assert_eq!(
             range_inclusive_u128
                 .format_value_with_limits(
@@ -492,7 +492,7 @@ mod tests {
         );
 
         let linelocation = formatters
-            .get(&LineLocation::id())
+            .get(&LineLocation::ID)
             .expect("linelocation formatter");
         assert_eq!(
             linelocation
@@ -505,7 +505,7 @@ mod tests {
         );
 
         let nstai = formatters
-            .get(&NsTAIInterval::id())
+            .get(&NsTAIInterval::ID)
             .expect("nstai_interval formatter");
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&5i128.to_le_bytes());
@@ -515,7 +515,7 @@ mod tests {
             "5..=10"
         );
 
-        let f256le = formatters.get(&F256LE::id()).expect("f256le formatter");
+        let f256le = formatters.get(&F256LE::ID).expect("f256le formatter");
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256le.format_value_with_limits(&raw, limits).unwrap(),
@@ -531,7 +531,7 @@ mod tests {
             "0x1p+2000"
         );
 
-        let f256be = formatters.get(&F256BE::id()).expect("f256be formatter");
+        let f256be = formatters.get(&F256BE::ID).expect("f256be formatter");
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256be.format_value_with_limits(&raw, limits).unwrap(),
@@ -547,7 +547,7 @@ mod tests {
         );
 
         let ed25519_r = formatters
-            .get(&ED25519RComponent::id())
+            .get(&ED25519RComponent::ID)
             .expect("ed25519 r formatter");
         let raw = [0xABu8; 32];
         assert_eq!(
@@ -556,7 +556,7 @@ mod tests {
         );
 
         let ed25519_s = formatters
-            .get(&ED25519SComponent::id())
+            .get(&ED25519SComponent::ID)
             .expect("ed25519 s formatter");
         assert_eq!(
             ed25519_s.format_value_with_limits(&raw, limits).unwrap(),
@@ -564,7 +564,7 @@ mod tests {
         );
 
         let ed25519_pk = formatters
-            .get(&ED25519PublicKey::id())
+            .get(&ED25519PublicKey::ID)
             .expect("ed25519 public key formatter");
         assert_eq!(
             ed25519_pk.format_value_with_limits(&raw, limits).unwrap(),
@@ -572,7 +572,7 @@ mod tests {
         );
 
         let unknown = formatters
-            .get(&UnknownValue::id())
+            .get(&UnknownValue::ID)
             .expect("unknown formatter");
         assert_eq!(
             unknown.format_value_with_limits(&raw, limits).unwrap(),
@@ -580,7 +580,7 @@ mod tests {
         );
 
         let hash_formatter = formatters
-            .get(&Hash::<Blake3>::id())
+            .get(&Hash::<Blake3>::ID)
             .expect("hash formatter");
         assert_eq!(
             hash_formatter
@@ -590,7 +590,7 @@ mod tests {
         );
 
         let handle_formatter = formatters
-            .get(&Handle::<Blake3, LongString>::id())
+            .get(&Handle::<Blake3, LongString>::ID)
             .expect("handle formatter");
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
