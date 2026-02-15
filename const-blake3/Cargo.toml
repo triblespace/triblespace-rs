@@ -2,6 +2,10 @@
 name = "const_blake3"
 version = "0.0.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A minimal const-evaluable subset of BLAKE3 used by TribleSpace for schema identifier derivation."
+repository = "https://github.com/triblespace/triblespace-rs"
+homepage = "https://trible.space"
 
 [lib]
 name = "const_blake3"
