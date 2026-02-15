@@ -6,7 +6,7 @@ use crate::id::RawId;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -32,9 +32,11 @@ use proptest::prelude::RngCore;
 /// See the [crate::id] module documentation for a discussion on the role of this identifier.
 pub struct GenId;
 
-impl ConstMetadata for GenId {
+impl ConstId for GenId {
     const ID: Id = id_hex!("B08EE1D45EB081E8C47618178AFE0D81");
+}
 
+impl ConstMetadata for GenId {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

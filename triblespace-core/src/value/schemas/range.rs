@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -29,9 +29,15 @@ pub struct RangeU128;
 #[derive(Debug, Clone, Copy)]
 pub struct RangeInclusiveU128;
 
-impl ConstMetadata for RangeU128 {
+impl ConstId for RangeU128 {
     const ID: Id = id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A");
+}
 
+impl ConstId for RangeInclusiveU128 {
+    const ID: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
+}
+
+impl ConstMetadata for RangeU128 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -64,8 +70,6 @@ impl ValueSchema for RangeU128 {
 }
 
 impl ConstMetadata for RangeInclusiveU128 {
-    const ID: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

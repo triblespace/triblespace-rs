@@ -11,7 +11,7 @@ use anybytes::Bytes;
 use crate::blob::BlobSchema;
 use crate::id::Id;
 use crate::id_hex;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 
 use super::Blob;
 use super::ToBlob;
@@ -26,8 +26,11 @@ use super::TryFromBlob;
 pub struct UnknownBlob;
 impl BlobSchema for UnknownBlob {}
 
-impl ConstMetadata for UnknownBlob {
+impl ConstId for UnknownBlob {
     const ID: Id = id_hex!("EAB14005141181B0C10C4B5DD7985F8D");
+}
+
+impl ConstMetadata for UnknownBlob {
 }
 
 impl TryFromBlob<UnknownBlob> for Bytes {

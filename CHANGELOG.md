@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit a `Fragment` directly.
 - `metadata::Metadata::describe` now returns a `Fragment` (with exports as the
   described root id(s)) and no longer has a separate `id()` accessor.
-- `metadata::ConstMetadata` now exposes schema identifiers as an associated
-  constant `ID: Id` instead of a `id()` method. Composite `Handle` schema IDs
-  are derived in `const` context via the new `const_blake3` workspace crate.
+- Introduced `metadata::ConstId` (`const ID: Id`) for schema identifiers and
+  kept `metadata::ConstMetadata` focused on emitting optional discovery
+  metadata. Composite `Handle` schema IDs are derived in `const` context via
+  the new `const_blake3` workspace crate.
 - `import::json::JsonObjectImporter::import_*` now returns a `Fragment` instead
   of root id lists and no longer retains accumulated facts internally (removed
   `data()`/`clear_data()`; callers merge fragments explicitly).

@@ -6,7 +6,7 @@ use crate::and;
 use crate::blob::schemas::longstring::LongString;
 use crate::id::Id;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::ConstId;
 use crate::prelude::{find, pattern};
 use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;

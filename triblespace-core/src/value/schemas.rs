@@ -18,7 +18,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -33,9 +33,12 @@ use std::convert::Infallible;
 ///
 /// Any bit pattern can be a valid value of this schema.
 pub struct UnknownValue {}
-impl ConstMetadata for UnknownValue {
-    const ID: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
 
+impl ConstId for UnknownValue {
+    const ID: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
+}
+
+impl ConstMetadata for UnknownValue {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

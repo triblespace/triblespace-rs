@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -22,15 +22,25 @@ use std::convert::Infallible;
 /// A value schema for the R component of an Ed25519 signature.
 pub struct ED25519RComponent;
 
+impl ConstId for ED25519RComponent {
+    const ID: Id = id_hex!("995A86FFC83DB95ECEAA17E226208897");
+}
+
 /// A value schema for the S component of an Ed25519 signature.
 pub struct ED25519SComponent;
+
+impl ConstId for ED25519SComponent {
+    const ID: Id = id_hex!("10D35B0B628E9E409C549D8EC1FB3598");
+}
 
 /// A value schema for an Ed25519 public key.
 pub struct ED25519PublicKey;
 
-impl ConstMetadata for ED25519RComponent {
-    const ID: Id = id_hex!("995A86FFC83DB95ECEAA17E226208897");
+impl ConstId for ED25519PublicKey {
+    const ID: Id = id_hex!("69A872254E01B4C1ED36E08E40445E93");
+}
 
+impl ConstMetadata for ED25519RComponent {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -61,8 +71,6 @@ impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for ED25519SComponent {
-    const ID: Id = id_hex!("10D35B0B628E9E409C549D8EC1FB3598");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -93,8 +101,6 @@ impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for ED25519PublicKey {
-    const ID: Id = id_hex!("69A872254E01B4C1ED36E08E40445E93");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

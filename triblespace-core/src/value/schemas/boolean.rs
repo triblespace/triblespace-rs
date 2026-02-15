@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -28,6 +28,10 @@ pub struct InvalidBoolean;
 /// scanning large collections of flags.
 pub struct Boolean;
 
+impl ConstId for Boolean {
+    const ID: Id = id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5");
+}
+
 impl Boolean {
     fn encode(flag: bool) -> Value<Self> {
         if flag {
@@ -49,8 +53,6 @@ impl Boolean {
 }
 
 impl ConstMetadata for Boolean {
-    const ID: Id = id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

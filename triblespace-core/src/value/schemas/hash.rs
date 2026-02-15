@@ -4,7 +4,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::FromValue;
@@ -37,12 +37,17 @@ pub struct Hash<H> {
     _hasher: PhantomData<fn(H) -> ()>,
 }
 
+impl<H> ConstId for Hash<H>
+where
+    H: HashProtocol,
+{
+    const ID: Id = H::ID;
+}
+
 impl<H> ConstMetadata for Hash<H>
 where
     H: HashProtocol,
 {
-    const ID: Id = <H as ConstMetadata>::ID;
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -193,9 +198,11 @@ impl HashProtocol for Blake3 {
     const NAME: &'static str = "blake3";
 }
 
-impl ConstMetadata for Blake2b {
+impl ConstId for Blake2b {
     const ID: Id = id_hex!("91F880222412A49F012BE999942E6199");
+}
 
+impl ConstMetadata for Blake2b {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -204,9 +211,11 @@ impl ConstMetadata for Blake2b {
     }
 }
 
-impl ConstMetadata for Blake3 {
+impl ConstId for Blake3 {
     const ID: Id = id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3");
+}
 
+impl ConstMetadata for Blake3 {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -251,7 +260,7 @@ impl<H: HashProtocol, T: BlobSchema> From<Value<Handle<H, T>>> for Value<Hash<H>
     }
 }
 
-impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
+impl<H: HashProtocol, T: BlobSchema> ConstId for Handle<H, T> {
     const ID: Id = {
         let mut hasher = const_blake3::Hasher::new();
         hasher.update(&Hash::<H>::ID.raw());
@@ -269,6 +278,13 @@ impl<H: HashProtocol, T: BlobSchema> ConstMetadata for Handle<H, T> {
             None => panic!("derived handle schema id must be non-nil"),
         }
     };
+}
+
+impl<H, T> ConstMetadata for Handle<H, T>
+where
+    H: HashProtocol,
+    T: BlobSchema + ConstMetadata,
+{
 
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where

@@ -48,7 +48,7 @@ impl<S: ValueSchema> ImportAttribute<S> {
     pub fn from_handle(handle: Value<Handle<Blake3, LongString>>, name: View<str>) -> Self {
         let mut hasher = Hasher::new();
         hasher.update(&handle.raw);
-        hasher.update(&<S as crate::metadata::ConstMetadata>::ID.raw());
+        hasher.update(&<S as crate::metadata::ConstId>::ID.raw());
 
         let digest = hasher.finalize();
         let mut raw = [0u8; crate::id::ID_LEN];
@@ -85,7 +85,7 @@ where
             tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstMetadata>::ID) };
+        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstId>::ID) };
 
         Ok(Fragment::rooted(id, tribles))
     }

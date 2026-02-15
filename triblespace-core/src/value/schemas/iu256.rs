@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -18,14 +18,30 @@ use ethnum;
 /// A value schema for a 256-bit unsigned integer in little-endian byte order.
 pub struct U256LE;
 
+impl ConstId for U256LE {
+    const ID: Id = id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E");
+}
+
 /// A value schema for a 256-bit unsigned integer in big-endian byte order.
 pub struct U256BE;
+
+impl ConstId for U256BE {
+    const ID: Id = id_hex!("DC3CFB719B05F019FB8101A6F471A982");
+}
 
 /// A value schema for a 256-bit signed integer in little-endian byte order.
 pub struct I256LE;
 
+impl ConstId for I256LE {
+    const ID: Id = id_hex!("DB94325A37D96037CBFC6941A4C3B66D");
+}
+
 /// A value schema for a 256-bit signed integer in big-endian byte order.
 pub struct I256BE;
+
+impl ConstId for I256BE {
+    const ID: Id = id_hex!("CE3A7839231F1EB390E9E8E13DAED782");
+}
 
 /// A type alias for a 256-bit signed integer.
 /// This type is an alias for [I256BE].
@@ -36,8 +52,6 @@ pub type I256 = I256BE;
 pub type U256 = U256BE;
 
 impl ConstMetadata for U256LE {
-    const ID: Id = id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -68,8 +82,6 @@ impl ValueSchema for U256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for U256BE {
-    const ID: Id = id_hex!("DC3CFB719B05F019FB8101A6F471A982");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -100,8 +112,6 @@ impl ValueSchema for U256BE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for I256LE {
-    const ID: Id = id_hex!("DB94325A37D96037CBFC6941A4C3B66D");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -132,8 +142,6 @@ impl ValueSchema for I256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for I256BE {
-    const ID: Id = id_hex!("CE3A7839231F1EB390E9E8E13DAED782");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

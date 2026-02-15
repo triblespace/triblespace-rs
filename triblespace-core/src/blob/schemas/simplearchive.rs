@@ -7,7 +7,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
@@ -20,9 +20,11 @@ pub struct SimpleArchive;
 
 impl BlobSchema for SimpleArchive {}
 
-impl ConstMetadata for SimpleArchive {
+impl ConstId for SimpleArchive {
     const ID: Id = id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6");
+}
 
+impl ConstMetadata for SimpleArchive {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

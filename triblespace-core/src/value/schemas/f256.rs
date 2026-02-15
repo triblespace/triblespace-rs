@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -21,15 +21,21 @@ use serde_json::Number as JsonNumber;
 /// A value schema for a 256-bit floating point number in little-endian byte order.
 pub struct F256LE;
 
+impl ConstId for F256LE {
+    const ID: Id = id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2");
+}
+
 /// A value schema for a 256-bit floating point number in big-endian byte order.
 pub struct F256BE;
+
+impl ConstId for F256BE {
+    const ID: Id = id_hex!("A629176D4656928D96B155038F9F2220");
+}
 
 /// A type alias for the little-endian version of the 256-bit floating point number.
 pub type F256 = F256LE;
 
 impl ConstMetadata for F256LE {
-    const ID: Id = id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -60,8 +66,6 @@ impl ValueSchema for F256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for F256BE {
-    const ID: Id = id_hex!("A629176D4656928D96B155038F9F2220");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

@@ -7,7 +7,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -19,9 +19,11 @@ pub struct LongString {}
 
 impl BlobSchema for LongString {}
 
-impl ConstMetadata for LongString {
+impl ConstId for LongString {
     const ID: Id = id_hex!("8B173C65B7DB601A11E8A190BD774A79");
+}
 
+impl ConstMetadata for LongString {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

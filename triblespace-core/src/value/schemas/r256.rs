@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -28,6 +28,10 @@ use num_rational::Ratio;
 /// For a big-endian version, see [R256BE].
 pub struct R256LE;
 
+impl ConstId for R256LE {
+    const ID: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
+}
+
 /// A 256-bit ratio value.
 /// It is stored as two 128-bit signed integers, the numerator and the denominator.
 /// The ratio is always reduced to its canonical form, which mean that the numerator and the denominator
@@ -38,11 +42,13 @@ pub struct R256LE;
 /// For a little-endian version, see [R256LE].
 pub struct R256BE;
 
+impl ConstId for R256BE {
+    const ID: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
+}
+
 pub type R256 = R256LE;
 
 impl ConstMetadata for R256LE {
-    const ID: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -73,8 +79,6 @@ impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
 impl ConstMetadata for R256BE {
-    const ID: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
-
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

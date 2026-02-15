@@ -198,14 +198,14 @@ impl<S: ValueSchema> Attribute<S> {
     ///
     /// The identifier is computed by hashing the field name handle produced as a
     /// `Handle<Blake3, crate::blob::schemas::longstring::LongString>` together with the
-    /// schema's [`ConstMetadata::ID`].
+    /// schema's [`crate::metadata::ConstId::ID`].
     /// The resulting 32-byte Blake3 digest uses its rightmost 16 bytes to match the
     /// `RawId` layout used by [`Attribute::from_id`].
     pub fn from_name(name: &str) -> Self {
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
         let mut hasher = Hasher::new();
         hasher.update(&field_handle.raw);
-        hasher.update(&<S as crate::metadata::ConstMetadata>::ID.raw());
+        hasher.update(&<S as crate::metadata::ConstId>::ID.raw());
 
         let digest = hasher.finalize();
         let mut raw = [0u8; crate::id::ID_LEN];
@@ -236,7 +236,7 @@ where
             tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstMetadata>::ID) };
+        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstId>::ID) };
 
         if let Some(usage) = self.usage {
             tribles += usage.describe(blobs, id)?;

@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -25,9 +25,11 @@ use hifitime::prelude::*;
 /// Both the lower and upper bounds are inclusive. That is, the interval contains all TAI epochs between the lower and upper bounds.
 pub struct NsTAIInterval;
 
-impl ConstMetadata for NsTAIInterval {
+impl ConstId for NsTAIInterval {
     const ID: Id = id_hex!("675A2E885B12FCBC0EEC01E6AEDD8AA8");
+}
 
+impl ConstMetadata for NsTAIInterval {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

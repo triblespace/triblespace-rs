@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::ConstMetadata;
+use crate::metadata::{ConstId, ConstMetadata};
 use crate::repo::BlobStore;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
@@ -39,9 +39,11 @@ pub enum ValidationError {
 /// If the string is exactly 32 bytes, then there is no zero terminator.
 pub struct ShortString;
 
-impl ConstMetadata for ShortString {
+impl ConstId for ShortString {
     const ID: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
+}
 
+impl ConstMetadata for ShortString {
     fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,

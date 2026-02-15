@@ -255,7 +255,7 @@ mod tests {
     use crate::id::Id;
     use crate::macros::pattern;
     use crate::metadata;
-    use crate::metadata::ConstMetadata;
+    use crate::metadata::{ConstId, ConstMetadata};
     use crate::query::find;
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;

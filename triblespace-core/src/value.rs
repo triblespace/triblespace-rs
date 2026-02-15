@@ -6,7 +6,7 @@
 //!
 //! ```
 //! use triblespace_core::value::{Value, ValueSchema, ToValue, FromValue};
-//! use triblespace_core::metadata::ConstMetadata;
+//! use triblespace_core::metadata::ConstId;
 //! use triblespace_core::id::Id;
 //! use triblespace_core::macros::id_hex;
 //! use std::convert::TryInto;
@@ -17,7 +17,7 @@
 //! pub struct MyNumber;
 //!
 //! // Implement the ValueSchema trait for the schema type.
-//! impl ConstMetadata for MyNumber {
+//! impl ConstId for MyNumber {
 //!    const ID: Id = id_hex!("345EAC0C5B5D7D034C87777280B88AE2");
 //! }
 //! impl ValueSchema for MyNumber {
@@ -74,7 +74,7 @@
 
 pub mod schemas;
 
-use crate::metadata::ConstMetadata;
+use crate::metadata::ConstId;
 
 use core::fmt;
 use std::borrow::Borrow;
@@ -308,7 +308,7 @@ impl<T: ValueSchema> Debug for Value<T> {
 ///
 /// See the [value](crate::value) module for more information.
 /// See the [BlobSchema](crate::blob::BlobSchema) trait for the counterpart trait for blobs.
-pub trait ValueSchema: ConstMetadata + Sized + 'static {
+pub trait ValueSchema: ConstId + Sized + 'static {
     type ValidationError;
 
     /// Check if the given value conforms to this schema.
