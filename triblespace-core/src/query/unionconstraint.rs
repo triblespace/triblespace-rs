@@ -31,8 +31,15 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if the variants do not all declare the same variable set.
+    /// Panics if `constraints` is empty (a zero-arm union has no
+    /// well-defined variable set), or if the variants do not all
+    /// declare the same variable set.
     pub fn new(constraints: Vec<C>) -> Self {
+        assert!(
+            !constraints.is_empty(),
+            "UnionConstraint requires at least one variant; \
+             use a different constraint type for the empty case"
+        );
         assert!(constraints
             .iter()
             .map(|c| c.variables())
@@ -134,3 +141,17 @@ macro_rules! or {
 
 /// Re-export of the [`or!`] macro.
 pub use or;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::constantconstraint::ConstantConstraint;
+
+    #[test]
+    #[should_panic(expected = "UnionConstraint requires at least one variant")]
+    fn empty_union_panics_at_construction() {
+        // Without this assert, `variables()` would later panic on
+        // `self.constraints[0]` with an unhelpful index-out-of-bounds.
+        let _: UnionConstraint<ConstantConstraint> = UnionConstraint::new(vec![]);
+    }
+}
