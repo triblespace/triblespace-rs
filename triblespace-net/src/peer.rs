@@ -43,6 +43,46 @@ pub use crate::host::PeerConfig;
 /// A store wrapped in distributed network sync.
 ///
 /// See the [module-level docs](self) for the full mental model.
+///
+/// # Example
+///
+/// Single-user team-of-one setup against a [`Pile`]: the user is
+/// their own team root, and the relay accepts only caps signed by
+/// (or chained from) their own key. The `self_cap = [0u8; 32]`
+/// sentinel will fail any remote `OP_AUTH` it sends — fine for
+/// solo workflows where the peer is purely a server.
+///
+/// Multi-user setups load `team_root` and `self_cap` from the
+/// `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` environment variables;
+/// see the [Capability Auth] book chapter for the full team
+/// lifecycle.
+///
+/// [`Pile`]: triblespace_core::repo::pile::Pile
+/// [Capability Auth]: https://docs.rs/triblespace/latest/triblespace/book/capability-auth/index.html
+///
+/// ```rust,no_run
+/// use std::collections::HashSet;
+/// use std::path::Path;
+/// use ed25519_dalek::SigningKey;
+/// use rand::rngs::OsRng;
+/// use triblespace_core::repo::pile::Pile;
+/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_net::peer::{Peer, PeerConfig};
+///
+/// let key = SigningKey::generate(&mut OsRng);
+/// let pile: Pile<Blake3> = Pile::open(Path::new("./team.pile")).unwrap();
+/// let peer = Peer::new(pile, key.clone(), PeerConfig {
+///     peers: vec![],                       // bootstrap nodes
+///     gossip_topic: Some("my-team".into()), // None = serve-only mode
+///     team_root: key.verifying_key(),      // single-user fallback
+///     revoked: HashSet::new(),
+///     self_cap: [0u8; 32],
+/// });
+/// // From here `peer` is just a `BlobStore + BlobStorePut +
+/// // BranchStore` — wrap it in `Repository::new` and use it like
+/// // any other triblespace storage.
+/// drop(peer);
+/// ```
 pub struct Peer<S>
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
