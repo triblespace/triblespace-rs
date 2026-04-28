@@ -72,6 +72,15 @@ fn self_cap_from_env() -> Result<[u8; 32]> {
 pub enum Command {
     /// Show this node's network identity.
     Identity {
+        /// Path to the node's signing key.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Show the auth configuration this node would use for sync /
+    /// pull operations: node id, team root, and self_cap (if any).
+    /// Useful for debugging why a remote peer rejects auth.
+    Status {
+        /// Path to the node's signing key.
         #[arg(long)]
         key: Option<PathBuf>,
     },
@@ -99,6 +108,7 @@ pub enum Command {
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
+        Command::Status { key } => run_status(key),
         Command::Sync { pile, peers, topic, key } => {
             run_sync(pile, peers, topic, key)
         }
@@ -115,6 +125,44 @@ fn run_identity(sk: Option<PathBuf>) -> Result<()> {
     let key = load_or_create_key(&sk, &cwd)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
     println!("node: {public}");
+    Ok(())
+}
+
+// ── Status ───────────────────────────────────────────────────────────
+
+fn run_status(sk: Option<PathBuf>) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = load_or_create_key(&sk, &cwd)?;
+    let public = triblespace_net::identity::iroh_secret(&key).public();
+    println!("node:      {public}");
+
+    // team_root: explicit env var or single-user fallback to own pubkey.
+    match std::env::var("TRIBLE_TEAM_ROOT") {
+        Ok(s) => {
+            let trimmed = s.trim();
+            println!("team_root: {trimmed}  (from TRIBLE_TEAM_ROOT)");
+        }
+        Err(_) => {
+            println!(
+                "team_root: {}  (single-user fallback — own pubkey)",
+                hex::encode(key.verifying_key().to_bytes()),
+            );
+        }
+    }
+
+    // self_cap: explicit env var or all-zeros sentinel.
+    match std::env::var("TRIBLE_TEAM_CAP") {
+        Ok(s) => {
+            let trimmed = s.trim();
+            println!("self_cap:  {trimmed}  (from TRIBLE_TEAM_CAP)");
+        }
+        Err(_) => {
+            println!(
+                "self_cap:  {}  (NOT SET — remote will reject OP_AUTH)",
+                "0".repeat(64),
+            );
+        }
+    }
     Ok(())
 }
 
