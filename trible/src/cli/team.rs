@@ -68,6 +68,11 @@ pub enum Command {
         /// Scope to grant. Must be a subset of the issuer's own scope.
         #[arg(long, value_enum, default_value = "read")]
         scope: ScopeArg,
+        /// Restrict the cap to specific branches (hex branch ids,
+        /// 32-char). Repeatable. Without this flag the cap applies
+        /// to every branch within the granted permission set.
+        #[arg(long = "branch", value_name = "BRANCH_HEX")]
+        branches: Vec<String>,
     },
     /// Issue a revocation for a pubkey. Must be signed by the team
     /// root keypair (loaded from `--team-root-secret` /
@@ -121,7 +126,8 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             invitee,
             scope,
-        } => run_invite(pile, team_root, cap, key, invitee, scope),
+            branches,
+        } => run_invite(pile, team_root, cap, key, invitee, scope, branches),
         Command::Revoke {
             pile,
             team_root_secret,
@@ -332,12 +338,25 @@ fn run_invite(
     key: Option<PathBuf>,
     invitee_hex: String,
     scope: ScopeArg,
+    branches_hex: Vec<String>,
 ) -> Result<()> {
     let mut pile = open_pile(&pile_path)?;
     let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
     let invitee = parse_pubkey_hex(&invitee_hex)?;
+    let branches: Vec<Id> = branches_hex
+        .iter()
+        .map(|h| {
+            let bytes: [u8; 16] = hex::decode(h.trim())
+                .map_err(|e| anyhow!("--branch decode '{h}': {e}"))?
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("--branch '{h}' must be 16 bytes (32 hex chars)"))?;
+            Id::new(bytes)
+                .ok_or_else(|| anyhow!("--branch '{h}' is the all-zeros nil id"))
+        })
+        .collect::<Result<_>>()?;
 
     // Verify the issuer's cap chain first — we don't sign delegations
     // off invalid/expired caps. This also confirms the cap blobs are
@@ -370,14 +389,25 @@ fn run_invite(
     let (parent_cap_blob, parent_sig_blob) =
         fetch_cap_blob_pair(&mut pile_for_fetch, issuer_cap_sig_handle)?;
 
-    // Build the invitee's scope.
+    // Build the invitee's scope: a permission tag plus zero or
+    // more `scope_branch` restrictions. Caller is responsible for
+    // ensuring the requested branch set is a subset of the
+    // issuer's own scope; verify_chain rejects the issued cap
+    // chain at use time if not (the relay's scope_subsumes check
+    // catches it).
     let scope_root = *triblespace_core::id::ufoid();
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::macros::entity;
-    let scope_facts = TribleSet::from(entity! {
+    let mut scope_facts = TribleSet::from(entity! {
         ExclusiveId::force_ref(&scope_root) @
         triblespace_core::metadata::tag: scope.perm_id(),
     });
+    for branch in &branches {
+        scope_facts += TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            capability::scope_branch: *branch,
+        });
+    }
 
     let expiry = now_plus_30_days();
     let (cap_blob, sig_blob) = capability::build_capability(
