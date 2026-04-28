@@ -35,6 +35,7 @@
 //! assert_eq!(view.to_vec(), lens);
 //! ```
 
+use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
@@ -238,16 +239,30 @@ impl SuccinctDocLens {
     /// Build a succinct doc-lens table. Returns the frozen
     /// [`Bytes`] region and [`CompactVectorMeta`] needed to
     /// reconstruct a view with [`Self::from_bytes`].
+    ///
+    /// Allocates a fresh [`ByteArea`] internally; for the
+    /// canonical-bytes pattern (multiple sections sharing one
+    /// area) call [`Self::build_into`] with the area's writer.
     pub fn build(lens: &[u32]) -> Result<(Bytes, CompactVectorMeta), SuccinctDocLensError> {
-        let width = required_width(lens);
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
-        let mut builder = CompactVectorBuilder::with_capacity(lens.len(), width, &mut sections)?;
-        builder.set_ints(0..lens.len(), lens.iter().map(|&n| n as usize))?;
-        let cv = builder.freeze();
-        let meta = cv.metadata();
+        let meta = Self::build_into(&mut sections, lens)?;
         let bytes = area.freeze()?;
         Ok((bytes, meta))
+    }
+
+    /// Build into a caller-owned [`SectionWriter`] so multiple
+    /// sections can share one [`ByteArea`]. Returns just the
+    /// metadata; the caller drives the eventual `area.freeze()`.
+    pub fn build_into(
+        sections: &mut SectionWriter<'_>,
+        lens: &[u32],
+    ) -> Result<CompactVectorMeta, SuccinctDocLensError> {
+        let width = required_width(lens);
+        let mut builder = CompactVectorBuilder::with_capacity(lens.len(), width, sections)?;
+        builder.set_ints(0..lens.len(), lens.iter().map(|&n| n as usize))?;
+        let cv = builder.freeze();
+        Ok(cv.metadata())
     }
 
     /// Reconstruct a view from the frozen bytes + metadata.
@@ -328,12 +343,36 @@ impl<const N: usize> FixedBytesTable<N> {
     /// Serialize `rows` into a flat `Bytes` buffer. The companion
     /// [`Self::from_bytes`] reconstructs a view; callers persist
     /// `rows.len()` out-of-band (e.g., in a BlobHeader).
+    ///
+    /// Standalone path — allocates a fresh `Vec<u8>`. For the
+    /// canonical-bytes pattern (multiple sections sharing one
+    /// [`ByteArea`]) call [`Self::build_into`] with the area's
+    /// writer instead.
     pub fn build(rows: &[[u8; N]]) -> Bytes {
         let mut buf = Vec::with_capacity(rows.len() * N);
         for row in rows {
             buf.extend_from_slice(row);
         }
         Bytes::from_source(buf)
+    }
+
+    /// Reserve a section of `rows.len()` `[u8; N]` slots inside
+    /// the caller-owned [`SectionWriter`], copy the rows in, and
+    /// return the [`SectionHandle`] needed to view back into the
+    /// frozen area's bytes.
+    pub fn build_into(
+        sections: &mut SectionWriter<'_>,
+        rows: &[[u8; N]],
+    ) -> Result<SectionHandle<[u8; N]>, std::io::Error> {
+        let mut sec = sections.reserve::<[u8; N]>(rows.len())?;
+        sec.as_mut_slice().copy_from_slice(rows);
+        let handle = sec.handle();
+        // Flushing through `freeze` ensures the section's writes
+        // are visible when the area is later mmapped read-only.
+        // We discard the returned per-section Bytes — the canonical
+        // view goes through `area.freeze()` + `from_section_handle`.
+        let _ = sec.freeze()?;
+        Ok(handle)
     }
 
     /// View `bytes` as `len` rows of `N` bytes each.
@@ -351,6 +390,29 @@ impl<const N: usize> FixedBytesTable<N> {
             });
         }
         Ok(Self { bytes, len })
+    }
+
+    /// View into a frozen [`ByteArea`]'s bytes via the
+    /// [`SectionHandle`] returned by [`Self::build_into`].
+    pub fn from_section_handle(
+        bytes: Bytes,
+        handle: SectionHandle<[u8; N]>,
+    ) -> Result<Self, SuccinctDocLensError> {
+        let end = handle.offset.checked_add(handle.len).ok_or(
+            SuccinctDocLensError::SizeMismatch {
+                bytes: bytes.len(),
+                expected: usize::MAX,
+            },
+        )?;
+        if end > bytes.len() {
+            return Err(SuccinctDocLensError::SizeMismatch {
+                bytes: bytes.len(),
+                expected: end,
+            });
+        }
+        let slice = bytes.slice(handle.offset..end);
+        let len = handle.len / N;
+        Ok(Self { bytes: slice, len })
     }
 
     /// Number of rows.
@@ -504,8 +566,30 @@ impl SuccinctPostings {
     pub fn build_with<F>(
         n_docs: u32,
         n_terms: usize,
-        mut materialize_term: F,
+        materialize_term: F,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError>
+    where
+        F: FnMut(usize, &mut Vec<(u32, f32)>),
+    {
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+        let meta = Self::build_with_into(&mut sections, n_docs, n_terms, materialize_term)?;
+        let bytes = area.freeze()?;
+        Ok((bytes, meta))
+    }
+
+    /// Streaming build into a caller-owned [`SectionWriter`] so
+    /// the three [`CompactVector`] sections (`doc_idx`, `offsets`,
+    /// `scores`) land in a shared [`ByteArea`] alongside other
+    /// blob sections. Returns just the metadata; the caller
+    /// drives `area.freeze()`. Same two-pass closure contract as
+    /// [`Self::build_with`].
+    pub fn build_with_into<F>(
+        sections: &mut SectionWriter<'_>,
+        n_docs: u32,
+        n_terms: usize,
+        mut materialize_term: F,
+    ) -> Result<SuccinctPostingsMeta, SuccinctDocLensError>
     where
         F: FnMut(usize, &mut Vec<(u32, f32)>),
     {
@@ -527,14 +611,11 @@ impl SuccinctPostings {
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
 
-        let mut area = ByteArea::new()?;
-        let mut sections = area.sections();
-
         let mut doc_idx_b =
-            CompactVectorBuilder::with_capacity(total, doc_idx_width, &mut sections)?;
+            CompactVectorBuilder::with_capacity(total, doc_idx_width, sections)?;
         let mut offsets_b =
-            CompactVectorBuilder::with_capacity(n_terms + 1, offsets_width, &mut sections)?;
-        let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, &mut sections)?;
+            CompactVectorBuilder::with_capacity(n_terms + 1, offsets_width, sections)?;
+        let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, sections)?;
         offsets_b.set_int(0, 0)?;
 
         // ── Pass 2: write all three CompactVectors. ──────────────
@@ -550,27 +631,17 @@ impl SuccinctPostings {
             offsets_b.set_int(t + 1, pos)?;
         }
 
-        let doc_idx = doc_idx_b.freeze();
-        let doc_idx_meta = doc_idx.metadata();
-        let offsets = offsets_b.freeze();
-        let offsets_meta = offsets.metadata();
-        let scores = scores_b.freeze();
-        let scores_meta = scores.metadata();
+        let doc_idx_meta = doc_idx_b.freeze().metadata();
+        let offsets_meta = offsets_b.freeze().metadata();
+        let scores_meta = scores_b.freeze().metadata();
 
-        // Release the section handles so `area.freeze()` can move
-        // the ByteArea; clippy flags `drop()` on non-Drop types.
-        let _ = (doc_idx, offsets, scores);
-        let _ = sections;
-        let bytes = area.freeze()?;
-
-        let meta = SuccinctPostingsMeta {
+        Ok(SuccinctPostingsMeta {
             doc_idx: doc_idx_meta,
             offsets: offsets_meta,
             scores: scores_meta,
             max_score,
             n_terms: n_terms as u64,
-        };
-        Ok((bytes, meta))
+        })
     }
 
     /// Reconstruct from metadata + the combined byte region.
@@ -698,6 +769,21 @@ impl SuccinctGraph {
         layer_graph: &[Vec<Vec<u32>>],
         n_nodes: usize,
     ) -> Result<(Bytes, SuccinctGraphMeta), SuccinctDocLensError> {
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+        let meta = Self::build_into(&mut sections, layer_graph, n_nodes)?;
+        let bytes = area.freeze()?;
+        Ok((bytes, meta))
+    }
+
+    /// Build into a caller-owned [`SectionWriter`] so the two
+    /// [`CompactVector`] sections (`neighbours`, `offsets`) land
+    /// in a shared [`ByteArea`] alongside other blob sections.
+    pub fn build_into(
+        sections: &mut SectionWriter<'_>,
+        layer_graph: &[Vec<Vec<u32>>],
+        n_nodes: usize,
+    ) -> Result<SuccinctGraphMeta, SuccinctDocLensError> {
         let n_layers = layer_graph.len();
         // Sanity: every layer must have `n_nodes` entries.
         for layer in layer_graph {
@@ -727,11 +813,8 @@ impl SuccinctGraph {
         let offsets_width = width_for(total_edges + 1);
         let offsets_len = n_layers * (n_nodes + 1);
 
-        let mut area = ByteArea::new()?;
-        let mut sections = area.sections();
-
         let mut neighbours_b =
-            CompactVectorBuilder::with_capacity(total_edges, neighbours_width, &mut sections)?;
+            CompactVectorBuilder::with_capacity(total_edges, neighbours_width, sections)?;
         let mut pos = 0usize;
         for layer in layer_graph {
             for list in layer {
@@ -741,11 +824,10 @@ impl SuccinctGraph {
                 }
             }
         }
-        let neighbours = neighbours_b.freeze();
-        let neighbours_meta = neighbours.metadata();
+        let neighbours_meta = neighbours_b.freeze().metadata();
 
         let mut offsets_b =
-            CompactVectorBuilder::with_capacity(offsets_len, offsets_width, &mut sections)?;
+            CompactVectorBuilder::with_capacity(offsets_len, offsets_width, sections)?;
         let mut cum = 0usize;
         let mut slot = 0usize;
         for layer in layer_graph {
@@ -763,20 +845,14 @@ impl SuccinctGraph {
             offsets_b.set_int(slot, cum)?;
             slot += 1;
         }
-        let offsets = offsets_b.freeze();
-        let offsets_meta = offsets.metadata();
+        let offsets_meta = offsets_b.freeze().metadata();
 
-        let _ = (neighbours, offsets);
-        let _ = sections;
-        let bytes = area.freeze()?;
-
-        let meta = SuccinctGraphMeta {
+        Ok(SuccinctGraphMeta {
             neighbours: neighbours_meta,
             offsets: offsets_meta,
             n_nodes: n_nodes as u64,
             n_layers: n_layers as u64,
-        };
-        Ok((bytes, meta))
+        })
     }
 
     /// Reconstruct from bytes + metadata.
