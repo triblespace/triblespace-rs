@@ -94,6 +94,14 @@ fn team_full_lifecycle() {
         list1_out.contains("revocations in pile:   0"),
         "post-create has zero revocations; got:\n{list1_out}"
     );
+    // The capability detail line lists the founder cap with
+    // PERM_ADMIN scope. Format: `<short-hex> → <short-hex> (PERM_ADMIN, expires …)`.
+    assert!(
+        list1_out.contains("capabilities:")
+            && list1_out.contains("PERM_ADMIN")
+            && list1_out.contains("expires"),
+        "post-create lists the founder cap with PERM_ADMIN + expiry; got:\n{list1_out}"
+    );
 
     let identity = Command::cargo_bin("trible")
         .unwrap()
@@ -162,6 +170,12 @@ fn team_full_lifecycle() {
     assert!(
         list2_out.contains("revocations in pile:   0"),
         "still zero revocations; got:\n{list2_out}"
+    );
+    // The invitee was issued a PERM_READ scope cap; both that and
+    // the founder's PERM_ADMIN cap should appear in the detail.
+    assert!(
+        list2_out.contains("PERM_ADMIN") && list2_out.contains("PERM_READ"),
+        "post-invite lists both PERM_ADMIN (founder) and PERM_READ (invitee); got:\n{list2_out}"
     );
 
     Command::cargo_bin("trible")
