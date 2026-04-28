@@ -194,6 +194,23 @@ fn now_plus_30_days() -> Value<triblespace_core::value::schemas::time::NsTAIInte
     (now, later).try_to_value().expect("valid interval")
 }
 
+/// Format the upper bound of an `NsTAIInterval` value as a
+/// human-readable UTC timestamp for diagnostic output. Used by
+/// `team create` / `team invite` to surface when the freshly-issued
+/// cap expires — operators rotate caps before that point.
+fn format_expiry(
+    interval: &Value<triblespace_core::value::schemas::time::NsTAIInterval>,
+) -> String {
+    use triblespace_core::value::TryFromValue;
+    match <(hifitime::Epoch, hifitime::Epoch)>::try_from_value(interval) {
+        Ok((_lower, upper)) => {
+            let (y, mo, d, h, mi, s, _ns) = upper.to_gregorian_utc();
+            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
+        }
+        Err(_) => "<malformed>".to_string(),
+    }
+}
+
 fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
     pile.put::<SimpleArchive, _>(blob)
         .map_err(|e| anyhow!("put blob: {e:?}"))?;
@@ -266,13 +283,14 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         triblespace_core::metadata::tag: capability::PERM_ADMIN,
     });
 
+    let expiry = now_plus_30_days();
     let (cap_blob, sig_blob) = capability::build_capability(
         &team_root,
         founder_key.verifying_key(),
         None,
         scope_root,
         scope_facts,
-        now_plus_30_days(),
+        expiry,
     )
     .map_err(|e| anyhow!("build founder cap: {e:?}"))?;
 
@@ -298,6 +316,7 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     println!("team root SECRET:  {}", hex::encode(team_root.to_bytes()));
     println!("founder cap blob:  {}", hex::encode(cap_handle.raw));
     println!("founder cap (sig): {}", hex::encode(sig_handle.raw));
+    println!("expires:           {}", format_expiry(&expiry));
     println!();
     println!("Set these in your environment to use the team:");
     println!("  export TRIBLE_TEAM_ROOT={}", hex::encode(team_root_pubkey.to_bytes()));
@@ -360,13 +379,14 @@ fn run_invite(
         triblespace_core::metadata::tag: scope.perm_id(),
     });
 
+    let expiry = now_plus_30_days();
     let (cap_blob, sig_blob) = capability::build_capability(
         &issuer_key,
         invitee,
         Some((parent_cap_blob, parent_sig_blob)),
         scope_root,
         scope_facts,
-        now_plus_30_days(),
+        expiry,
     )
     .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
 
@@ -379,6 +399,7 @@ fn run_invite(
     let _ = pile.close();
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
+    println!("expires:           {}", format_expiry(&expiry));
     println!();
     println!("Share with the invitee:");
     println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
