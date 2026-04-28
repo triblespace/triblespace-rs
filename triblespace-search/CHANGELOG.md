@@ -10,6 +10,39 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `peak_build_memory` example — tracking-allocator validation of streaming refactors
+
+New `examples/peak_build_memory.rs` measures peak heap allocation
+through `BM25Builder::build_naive`, `BM25Builder::build`, and
+`SuccinctBM25Index::to_bytes` via a process-global tracking
+allocator (CAS-loop on a `PEAK` atomic). Each phase resets the
+peak watermark to current resident, runs the operation, and
+reports `peak_during - baseline`.
+
+Observed numbers at 50 k docs / 20 k vocab / 96 tokens-per-doc
+(release build, single laptop run):
+
+| phase                                     | peak +     |
+| :---------------------------------------- | ---------: |
+| `BM25Builder::build_naive`                | 203.7 MiB  |
+| `BM25Builder::build` (streaming succinct) | 209.4 MiB  |
+| `SuccinctBM25Index::to_bytes`             |  20.1 MiB  |
+
+Honest takeaway: the build-side streaming win is *masked* at this
+scale — `term_to_tfs: HashMap<RawValue, HashMap<u32, u32>>`
+dominates at ~150 MiB, dwarfing the
+`Vec<Vec<(u32, f32)>>` intermediate the streaming refactor
+removed (~24 MiB at 50 k, ~144 MiB at 100 k+ where the
+optimization actually starts mattering). The to_bytes peak,
+however, bottoms out at the SB25 blob size — what remains is
+effectively the output buffer; the streaming refactor erased
+the triple-allocation pattern that previously inflated this
+phase by ~50 MiB at 50 k scale.
+
+The example is a measurement aid for "how much does this
+optimization actually save" claims, not a regression test —
+`tests/scale_smoke.rs` covers byte-identity of the layout.
+
 ### `to_bytes` re-serialization streamed — drops triple-allocation pattern
 
 Both blob types now stream their re-serialization paths through
