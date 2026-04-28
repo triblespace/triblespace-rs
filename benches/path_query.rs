@@ -349,6 +349,36 @@ mod hybrid {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Approach 5: Pure path! macro (transitive closure as an engine constraint)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// `path!(set, s social::follows+ d)` compiles into a `RegularPathConstraint`
+// that the engine evaluates natively — no manual BFS, no HashSet-dedup, no
+// post-filter Rust. The query *is* the query. Hardcoded to
+// `bench_social::follows` because path! requires the attribute as a
+// compile-time path expression; the other approaches accept `attr` at
+// runtime and ignore the macro form.
+
+mod path_macro {
+    use super::*;
+    use triblespace::core::value::Value;
+
+    pub fn reachable_from(set: &TribleSet, _attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let start_id = Id::new(*start).unwrap();
+        let start_val: Value<GenId> = (&start_id).to_value();
+        find!(
+            (s: Value<GenId>, d: Value<GenId>),
+            and!(
+                s.is(start_val),
+                path!(set.clone(), s bench_social::follows+ d)
+            )
+        )
+        .filter_map(|(_, d)| value_to_raw_id(&d.raw))
+        .collect()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Graph builders
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -418,6 +448,9 @@ fn bench_compare_chain(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("hybrid", len), &len, |b, _| {
             b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
         });
+        group.bench_with_input(BenchmarkId::new("path_macro", len), &len, |b, _| {
+            b.iter(|| black_box(path_macro::reachable_from(&set, &attr, &start)))
+        });
     }
     group.finish();
 }
@@ -441,6 +474,9 @@ fn bench_compare_tree(c: &mut Criterion) {
         });
         group.bench_with_input(BenchmarkId::new("hybrid", depth), &depth, |b, _| {
             b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("path_macro", depth), &depth, |b, _| {
+            b.iter(|| black_box(path_macro::reachable_from(&set, &attr, &start)))
         });
     }
     group.finish();
@@ -469,6 +505,9 @@ fn bench_compare_sparse(c: &mut Criterion) {
         );
         group.bench_with_input(BenchmarkId::new("hybrid", total), &total, |b, _| {
             b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("path_macro", total), &total, |b, _| {
+            b.iter(|| black_box(path_macro::reachable_from(&set, &attr, &start)))
         });
     }
     group.finish();
