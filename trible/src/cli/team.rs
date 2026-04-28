@@ -436,7 +436,21 @@ struct CapSummary {
     subject: VerifyingKey,
     issuer: VerifyingKey,
     perms: Vec<Id>,
+    branches: Vec<Id>,
     expires_at: Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+}
+
+/// Extract the upper-bound `Epoch` of an expiry interval. Used to
+/// sort caps by "expires soonest first" — caps without an expiry
+/// (none should currently exist; defensive) sort to the end.
+fn expiry_upper(
+    interval: &Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+) -> Option<hifitime::Epoch> {
+    use triblespace_core::value::TryFromValue;
+    let v = interval.as_ref()?;
+    <(hifitime::Epoch, hifitime::Epoch)>::try_from_value(v)
+        .ok()
+        .map(|(_lower, upper)| upper)
 }
 
 /// Format a permission tag as a short label (PERM_READ/WRITE/ADMIN
@@ -511,10 +525,11 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 triblespace_core::metadata::expires_at: ?exp,
             }])
         ) {
-            // Walk the scope sub-graph for permission tags. A scope
-            // can carry zero or more PERM_* tags; a malformed cap
-            // with no perms surfaces as an empty list rather than
-            // breaking the whole listing.
+            // Walk the scope sub-graph for permission tags AND any
+            // `scope_branch` restrictions. A scope can carry zero or
+            // more of either; a malformed cap with no perms surfaces
+            // as an empty list rather than breaking the whole
+            // listing.
             let perms: Vec<Id> = find!(
                 (perm: Id),
                 pattern!(&set, [{
@@ -523,10 +538,19 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             )
             .map(|(p,)| p)
             .collect();
+            let branches: Vec<Id> = find!(
+                (b: Id),
+                pattern!(&set, [{
+                    scope_root @ capability::scope_branch: ?b
+                }])
+            )
+            .map(|(b,)| b)
+            .collect();
             caps.push(CapSummary {
                 subject,
                 issuer,
                 perms,
+                branches,
                 expires_at: Some(expires_at),
             });
         }
@@ -547,6 +571,17 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     println!("revocations in pile:   {revocations_found}");
 
     if !caps.is_empty() {
+        // Sort by expiry ascending (soonest-to-expire first), so
+        // operators scanning the list see what needs rotation up
+        // top. Caps without a parseable expiry sort to the end.
+        caps.sort_by_key(|c| {
+            expiry_upper(&c.expires_at).map(|e| {
+                // hifitime::Epoch is comparable but not Ord-clean
+                // across constructors; use the nanosecond TAI
+                // duration since J2000 as a stable sort key.
+                e.to_tai_duration().to_parts()
+            })
+        });
         println!("  capabilities:");
         for cap in &caps {
             let perm_str = if cap.perms.is_empty() {
@@ -558,16 +593,34 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("|")
             };
+            let branch_str = if cap.branches.is_empty() {
+                String::new()
+            } else {
+                let mut bs: Vec<String> = cap
+                    .branches
+                    .iter()
+                    .map(|b| {
+                        // Branch ids are 16 bytes; show the first 8
+                        // hex chars so the line stays readable when
+                        // a cap covers multiple branches.
+                        let bytes: [u8; 16] = (*b).into();
+                        hex::encode(&bytes[..4])
+                    })
+                    .collect();
+                bs.sort();
+                format!(", branches=[{}]", bs.join(","))
+            };
             let expiry_str = cap
                 .expires_at
                 .as_ref()
                 .map(format_expiry)
                 .unwrap_or_else(|| "<no expiry>".to_string());
             println!(
-                "    {} → {} ({}, expires {})",
+                "    {} → {} ({}{}, expires {})",
                 hex::encode(&cap.issuer.to_bytes()[..4]),
                 hex::encode(&cap.subject.to_bytes()[..4]),
                 perm_str,
+                branch_str,
                 expiry_str,
             );
         }
