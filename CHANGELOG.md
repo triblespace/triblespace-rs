@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-04-28
+
+The chain-of-trust capability auth release. New
+`triblespace_core::repo::capability` module + protocol v4 + `trible
+team` CLI surface. See `book/src/capability-auth.md` for the
+user-facing chapter and the per-crate CHANGELOGs
+(`triblespace-net/CHANGELOG.md`, `trible/CHANGELOG.md`) for the
+surface-level details. Highlights:
+
+### Added
+- **`triblespace_core::repo::capability`** — chain-of-trust
+  capability lib: `build_capability` / `verify_chain` /
+  `build_revocation` / `extract_revocation_pairs` /
+  `scope_subsumes`, plus the `VerifiedCapability` type with
+  `permissions` / `granted_branches` / `grants_read` /
+  `grants_read_on` helpers. 27 lib tests; runnable rustdoc
+  examples on every primary public fn.
+- **Pile-sync protocol v4** (`/triblespace/pile-sync/4`):
+  mandatory `OP_AUTH` first stream, two-tier scope gate
+  (branch level on `OP_LIST` / `OP_HEAD`, blob-reachability on
+  `OP_GET_BLOB` / `OP_CHILDREN`), live revocation propagation
+  through snapshot rescans.
+- **`trible team {create, invite, revoke, list}`** subcommand group;
+  `team invite --branch <BRANCH_HEX>` for branch-restricted caps;
+  `team list` audits caps with issuer→subject, scope, expiry sorted
+  soonest-first.
+
+### Changed
+- `triblespace::net::peer::PeerConfig` is now non-`Default` —
+  every construction site must specify `team_root`, `revoked`,
+  `self_cap`.
+- `trible pile net sync` / `pile net pull` read `TRIBLE_TEAM_ROOT`
+  + `TRIBLE_TEAM_CAP` env vars for multi-user team operation.
+
 ## [0.19.0] - 2026-03-13
 ### Changed
 - **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
