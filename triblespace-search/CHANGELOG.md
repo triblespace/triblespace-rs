@@ -10,6 +10,89 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### Canonical-bytes pattern for `SuccinctBM25Index` — `to_blob` is O(1)
+
+Major architectural shift to mirror `triblespace-core`'s
+`SuccinctArchive` shape: every section (`keys`, `doc_lens`,
+`terms`, `postings`) lives in **one** shared `anybytes::ByteArea`,
+the new `SuccinctBM25Meta` header sits as a typed suffix-section,
+and the area is frozen exactly once. The resulting `bytes: Bytes`
+field on `SuccinctBM25Index` *is* the blob. Persistence is then
+free.
+
+Before:
+```rust
+fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+    Blob::new(Bytes::from_source(self.to_bytes()))  // rebuild every section
+}
+```
+
+After:
+```rust
+fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+    Blob::new(self.bytes)  // O(1) — refcounted handover
+}
+```
+
+Measured on the `peak_build_memory` example at 50 k docs:
+
+| phase                       | before  | after   |
+| :-------------------------- | ------: | ------: |
+| `to_bytes` time             | 274 ms  |   2 ms  |
+| `to_bytes` peak             | 20.1 MB |  20.1 MB (just a memcpy of the canonical bytes) |
+| `ToBlob` (refcounted clone) | n/a     |  ~ns    |
+
+Streaming the rebuild was a transitional fix; the canonical-bytes
+pattern eliminates the rebuild entirely. `to_bytes()` is now just
+`self.bytes.as_ref().to_vec()` — kept around for callers that
+need an owned `Vec<u8>`, but the recommended persistence path is
+`ToBlob`'s O(1) handover.
+
+#### Wire format change — schema id rotated
+
+The custom 264 B header is gone. The new layout:
+
+```
+[ keys section          ]   CompressedUniverse (in shared area)
+[ doc_lens section      ]   CompactVector (in shared area)
+[ terms section         ]   FixedBytesTable<32> (in shared area)
+[ postings sections     ]   3 × CompactVector (in shared area)
+[ suffix meta           ]   SuccinctBM25Meta (zerocopy-readable)
+```
+
+`SuccinctBM25Blob` schema id rotates from
+`5A1EF3FFD638B15E3EBEAA1E92660441` to
+`DA527A8FF09A3709B2AC6425CD5AF7A8` (minted via `trible genid`).
+The compiler treats the new id as a different type, so any
+mismatched-layout deserialization is a type error rather than a
+runtime failure.
+
+#### What's still on the table
+
+`SuccinctHNSWIndex` still uses the custom-header `to_bytes` path
+(`SH25_HEADER_LEN = 128`). The same canonical-bytes refactor
+applies — that's the next iteration. The `_into` section
+builders (`SuccinctGraph::build_into`, `FixedBytesTable::
+build_into`, `SuccinctPostings::build_with_into`) are already in
+place from the previous commit, so the scaffolding is ready.
+
+#### Internal changes
+
+- `SuccinctBM25Meta` zerocopy struct (`FromBytes + KnownLayout +
+  Immutable`) — embedded directly as a `reserve::<SuccinctBM25Meta>(1)`
+  section in the area, read back via `Bytes::view_suffix`.
+- `SuccinctPostingsMeta` reordered (largest-alignment-first)
+  and gained zerocopy derives so it nests cleanly inside
+  `SuccinctBM25Meta`.
+- `SuccinctBM25Index::from_bytes(meta, bytes)` — shared-bytes
+  view reconstruction, used by both the builder and the
+  `TryFromBlob` path.
+- `FixedBytesTable::from_section_handle(bytes, handle)` — slice
+  the row table out of a shared area's bytes via the
+  `SectionHandle<[u8; N]>` `build_into` returned.
+- Dead code removed: `CompressedUniverseMetaOnDisk` (only used
+  by the retired custom header), `SUCCINCT_HEADER_LEN`.
+
 ### `peak_build_memory` example — tracking-allocator validation of streaming refactors
 
 New `examples/peak_build_memory.rs` measures peak heap allocation

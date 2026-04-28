@@ -95,75 +95,6 @@ impl From<CompactVectorMeta> for CompactVectorMetaOnDisk {
     }
 }
 
-/// Byte-layout mirror of triblespace's [`CompressedUniverseMeta`].
-///
-/// Same upstream-frozen-derives issue as [`CompactVectorMetaOnDisk`]:
-/// the upstream meta derives `FromBytes` but not `IntoBytes`, so
-/// we can't `as_bytes` it for our own header. Mirror the layout
-/// on our side, static-assert the size, and convert via zerocopy.
-///
-/// Layout (all `#[repr(C)]` on 64-bit targets):
-/// ```text
-/// CompressedUniverseMeta:
-///   fragments: SectionHandle<[u8; 4]>  (offset: usize, len: usize, phantom)
-///   data:      DacsByteMeta
-///     num_levels: usize
-///     levels:     SectionHandle<LevelMeta>  (offset, len, phantom)
-///
-/// Total: 5 × 8 = 40 bytes.
-/// ```
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-#[repr(C)]
-struct CompressedUniverseMetaOnDisk {
-    fragments_offset: u64,
-    fragments_len: u64,
-    dacs_num_levels: u64,
-    dacs_levels_offset: u64,
-    dacs_levels_len: u64,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<CompressedUniverseMetaOnDisk>() == 40,
-    "CompressedUniverseMetaOnDisk must be 40 bytes",
-);
-const _: () = assert!(
-    std::mem::size_of::<CompressedUniverseMeta>() == 40,
-    "CompressedUniverseMeta must be 40 bytes (assumes 64-bit target)",
-);
-
-impl CompressedUniverseMetaOnDisk {
-    fn to_jerky(self) -> CompressedUniverseMeta {
-        // Both structs are #[repr(C)] and size_of == 40 with
-        // matching field order on 64-bit. read_from_bytes
-        // validates.
-        CompressedUniverseMeta::read_from_bytes(self.as_bytes())
-            .expect("CompressedUniverseMeta has same 40-byte repr(C) layout on 64-bit")
-    }
-}
-
-impl From<CompressedUniverseMeta> for CompressedUniverseMetaOnDisk {
-    fn from(m: CompressedUniverseMeta) -> Self {
-        // Upstream only derives FromBytes. Safety: both types
-        // are `#[repr(C)]`, same size (static-asserted), and
-        // every field is plain data.
-        let mut out = Self {
-            fragments_offset: 0,
-            fragments_len: 0,
-            dacs_num_levels: 0,
-            dacs_levels_offset: 0,
-            dacs_levels_len: 0,
-        };
-        let src_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (&m as *const CompressedUniverseMeta) as *const u8,
-                std::mem::size_of::<CompressedUniverseMeta>(),
-            )
-        };
-        out.as_mut_bytes().copy_from_slice(src_bytes);
-        out
-    }
-}
-
 impl CompactVectorMetaOnDisk {
     /// Convert back to jerky's meta. Because `SectionHandle` has
     /// a private `_type: PhantomData<T>` we can't construct one
@@ -496,8 +427,19 @@ pub struct SuccinctPostings {
 }
 
 /// Serialized layout metadata for [`SuccinctPostings`].
-#[derive(Debug, Clone, Copy)]
+///
+/// Layout-stable so callers can embed this inside a parent meta
+/// stored as a typed section in a [`ByteArea`] (see
+/// [`SuccinctBM25Meta`]). Field order is largest-alignment-first
+/// to avoid implicit padding; the trailing `_pad` rounds to an
+/// 8-byte multiple.
+#[derive(
+    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+)]
+#[repr(C)]
 pub struct SuccinctPostingsMeta {
+    /// Number of terms (== `offsets.len() - 1`).
+    pub n_terms: u64,
     /// Meta for the `doc_idx` CompactVector.
     pub doc_idx: CompactVectorMeta,
     /// Meta for the `offsets` CompactVector.
@@ -507,8 +449,8 @@ pub struct SuccinctPostingsMeta {
     /// Quantization scale: the largest original score in the
     /// corpus. Zero when no postings or all zeros.
     pub max_score: f32,
-    /// Number of terms (== `offsets.len() - 1`).
-    pub n_terms: u64,
+    /// Padding to keep this struct's size a multiple of 8.
+    _pad: u32,
 }
 
 /// u16 quantization width.
@@ -636,11 +578,12 @@ impl SuccinctPostings {
         let scores_meta = scores_b.freeze().metadata();
 
         Ok(SuccinctPostingsMeta {
+            n_terms: n_terms as u64,
             doc_idx: doc_idx_meta,
             offsets: offsets_meta,
             scores: scores_meta,
             max_score,
-            n_terms: n_terms as u64,
+            _pad: 0,
         })
     }
 
@@ -1564,10 +1507,56 @@ where
 /// let blob_bytes = idx.to_bytes();
 /// assert!(blob_bytes.len() > 0);
 /// ```
+/// Self-contained metadata header for a [`SuccinctBM25Index`]
+/// blob. Stored as a typed suffix-section in the canonical
+/// [`Bytes`]; loaders read it via
+/// [`anybytes::Bytes::view_suffix`]
+/// before reconstructing the section views.
+///
+/// Field order is largest-alignment-first to keep the struct
+/// `repr(C)` padding-free, matching the
+/// [`crate::ConstId`]-style "no magic, no version" convention —
+/// any breaking layout change rotates the [`SuccinctBM25Blob`]
+/// schema id rather than carrying an in-band version field.
+#[derive(
+    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+)]
+#[repr(C)]
+pub struct SuccinctBM25Meta {
+    /// Number of documents in the index.
+    pub n_docs: u64,
+    /// Number of distinct terms.
+    pub n_terms: u64,
+    /// Average document length used at build time (BM25 `b`
+    /// length-normalisation reference).
+    pub avg_doc_len: f32,
+    /// BM25 `k1` term-frequency saturation.
+    pub k1: f32,
+    /// BM25 `b` length-normalisation factor.
+    pub b: f32,
+    /// Padding to keep the next field 8-byte aligned.
+    _pad: u32,
+    /// Compressed doc-key universe metadata.
+    pub keys: CompressedUniverseMeta,
+    /// Per-doc length CompactVector metadata.
+    pub doc_lens: CompactVectorMeta,
+    /// Per-term scored-postings metadata.
+    pub postings: SuccinctPostingsMeta,
+    /// Section handle for the sorted 32-byte term table.
+    pub terms: SectionHandle<[u8; 32]>,
+}
+
 pub struct SuccinctBM25Index<
     D: ValueSchema = triblespace_core::value::schemas::genid::GenId,
     T: ValueSchema = crate::tokens::WordHash,
 > {
+    /// Canonical blob bytes — single owner of every section's
+    /// backing memory. `to_blob` is `O(1)` (refcounted clone of
+    /// these bytes); `from_bytes` views back into them via
+    /// section handles in [`SuccinctBM25Meta`]. Mirrors the
+    /// `SuccinctArchive` shape where the index *is* its blob.
+    pub bytes: Bytes,
+
     /// Sorted, deduplicated, compressed doc-key table. For
     /// entity-keyed corpora (`Value<GenId>`), 16 of the 32 bytes
     /// per key are always zero; plus real-world ID patterns
@@ -1605,39 +1594,44 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// [`BM25Builder`][crate::bm25::BM25Builder] and produce the
     /// succinct index in a single pass through the docs.
     ///
-    /// The universe is built first (sort + dedup keys into
-    /// `CompressedUniverse` codes), then tf accumulation and
-    /// scoring use those codes as the identifier from the start
-    /// — no insertion-order → universe-code remap, no per-term
-    /// resort pass. `BM25Builder::build()` delegates here.
+    /// Canonical-bytes builder: every section lands in one
+    /// shared [`ByteArea`], the [`SuccinctBM25Meta`] header is
+    /// appended as a typed suffix-section, and the area is
+    /// frozen exactly once. The resulting `bytes` field is the
+    /// blob — [`ToBlob`] is then an O(1) refcounted clone.
+    /// Mirrors the `SuccinctArchive` shape (the index *is* its
+    /// blob).
+    ///
+    /// The universe is built first so its codes can drive tf
+    /// accumulation directly — no insertion-order → universe-code
+    /// remap, no per-term resort pass. `BM25Builder::build()`
+    /// delegates here.
     pub(crate) fn from_builder(
         builder: crate::bm25::BM25Builder<D, T>,
     ) -> Self {
         let crate::bm25::BM25Builder { docs, k1, b, _phantom: _ } = builder;
 
-        // ── 1. keys: sort + dedup into CompressedUniverse. ─────────
-        let (keys_bytes, keys_meta) = {
-            let mut area = ByteArea::new().expect("alloc ByteArea");
-            let mut sections = area.sections();
-            let universe =
-                CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
-            let meta = universe.metadata();
-            let _ = universe;
-            let _ = sections;
-            (area.freeze().expect("freeze ByteArea"), meta)
-        };
-        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes)
-            .expect("round-trip the universe we just built");
-        let n_universe = keys.len();
+        let mut area = ByteArea::new().expect("alloc ByteArea");
+        let mut sections = area.sections();
+
+        // ── 1. keys: CompressedUniverse over the doc keys. ─────────
+        // The universe lookup (`search`) is used during tf
+        // accumulation below; we rebuild a view from `bytes` once
+        // the area is frozen, but the build-time universe is
+        // self-contained and doesn't borrow `sections`.
+        let build_universe =
+            CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
+        let keys_meta = build_universe.metadata();
+        let n_universe = build_universe.len();
 
         // ── 2. tf accumulation keyed by universe_code from the
-        // start; doc_lens indexed by code, last-write-wins for
-        // duplicate keys (same semantics as the naive+remap
-        // flow). ───────────────────────────────────────────────────
+        // start; doc_lens indexed by code. Last-write-wins for
+        // duplicate keys, matching the naive+remap flow's
+        // semantics. ───────────────────────────────────────────────
         let mut doc_lens_vec = vec![0u32; n_universe];
         let mut term_to_tfs: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
         for (key, terms) in docs {
-            let code = keys
+            let code = build_universe
                 .search(&key)
                 .expect("key just inserted into universe") as u32;
             doc_lens_vec[code as usize] = terms.len() as u32;
@@ -1645,6 +1639,10 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
                 *term_to_tfs.entry(term).or_default().entry(code).or_insert(0) += 1;
             }
         }
+        // Done with the build-time universe — its sections are
+        // already written; we'll reconstruct a view via from_bytes
+        // after the area freezes.
+        drop(build_universe);
         let avg_doc_len = if n_universe == 0 {
             0.0
         } else {
@@ -1652,32 +1650,27 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
                 / n_universe as f32
         };
 
-        // ── 3. doc_lens → succinct. ────────────────────────────────
-        let (doc_lens_bytes, doc_lens_meta) =
-            SuccinctDocLens::build(&doc_lens_vec).expect("build doc_lens");
-        let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)
-            .expect("round-trip doc_lens");
+        // ── 3. doc_lens → succinct CompactVector. ──────────────────
+        let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)
+            .expect("build doc_lens");
 
-        // ── 4. terms: sort ascending, pack flat. ──────────────────
+        // ── 4. terms: sort ascending, write a [u8;32] section. ────
         let mut term_rows: Vec<RawValue> = term_to_tfs.keys().copied().collect();
         term_rows.sort_unstable();
-        let terms_bytes = FixedBytesTable::<32>::build(&term_rows);
-        let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, term_rows.len())
-            .expect("round-trip terms table");
+        let n_terms = term_rows.len();
+        let terms_handle = FixedBytesTable::<32>::build_into(&mut sections, &term_rows)
+            .expect("build terms");
 
-        // ── 5. per-term scored postings, each sorted ascending
-        // by universe_code (required by SuccinctPostings).
-        //
-        // Streaming: SuccinctPostings::build_with materializes
-        // one term's postings at a time into a reused buffer
-        // instead of allocating a Vec<Vec<(u32, f32)>> for the
-        // whole corpus. At 100 k docs / 300 k terms / Heaps-law
-        // vocabulary that's the difference between ~400 KB peak
-        // and ~144 MB peak for the postings staging area. ─────────
+        // ── 5. per-term scored postings, streamed into the
+        // shared area. The closure materializes one term's
+        // postings at a time into a reused buffer — peak temp
+        // stays ~400 KB at 100 k docs vs. the ~144 MB
+        // Vec<Vec<...>> the slice-based path would allocate. ───────
         let n = n_universe as f32;
-        let (postings_bytes, postings_meta) = SuccinctPostings::build_with(
+        let postings_meta = SuccinctPostings::build_with_into(
+            &mut sections,
             n_universe as u32,
-            term_rows.len(),
+            n_terms,
             |t, buf| {
                 let tfs = &term_to_tfs[&term_rows[t]];
                 let df = tfs.len() as f32;
@@ -1697,19 +1690,73 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             },
         )
         .expect("build postings");
-        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)
-            .expect("round-trip postings");
 
-        Self {
+        // ── 6. Append the suffix-meta section. Loaders read it
+        // back via `Bytes::view_suffix::<SuccinctBM25Meta>()`. ─────
+        let meta = SuccinctBM25Meta {
+            n_docs: n_universe as u64,
+            n_terms: n_terms as u64,
+            avg_doc_len,
+            k1,
+            b,
+            _pad: 0,
+            keys: keys_meta,
+            doc_lens: doc_lens_meta,
+            postings: postings_meta,
+            terms: terms_handle,
+        };
+        {
+            let mut meta_sec = sections
+                .reserve::<SuccinctBM25Meta>(1)
+                .expect("reserve meta section");
+            meta_sec.as_mut_slice()[0] = meta;
+            meta_sec.freeze().expect("freeze meta section");
+        }
+
+        // Drop the writer (the area's section state is now final)
+        // and freeze the area to obtain canonical Bytes.
+        drop(sections);
+        let bytes = area.freeze().expect("freeze ByteArea");
+
+        Self::from_bytes(meta, bytes).expect("round-trip the bytes we just built")
+    }
+
+    /// Reconstruct the index from canonical bytes plus its
+    /// (already-decoded) header. Used by [`Self::try_from_bytes`]
+    /// and [`TryFromBlob`] after pulling the suffix-meta out of
+    /// `bytes`.
+    pub fn from_bytes(
+        meta: SuccinctBM25Meta,
+        bytes: Bytes,
+    ) -> Result<Self, SuccinctLoadError> {
+        let keys = CompressedUniverse::from_bytes(meta.keys, bytes.clone())
+            .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
+        let doc_lens = SuccinctDocLens::from_bytes(meta.doc_lens, bytes.clone())
+            .map_err(|_| SuccinctLoadError::TruncatedSection("doc_lens"))?;
+        let terms = FixedBytesTable::<32>::from_section_handle(bytes.clone(), meta.terms)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("terms"))?;
+        let postings = SuccinctPostings::from_bytes(meta.postings, bytes.clone())
+            .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
+        Ok(Self {
+            bytes,
             keys,
             doc_lens,
             terms,
             postings,
-            avg_doc_len,
-            k1,
-            b,
+            avg_doc_len: meta.avg_doc_len,
+            k1: meta.k1,
+            b: meta.b,
             _phantom: std::marker::PhantomData,
-        }
+        })
+    }
+
+    /// Snapshot the metadata header by reading the suffix-section
+    /// out of the canonical bytes — `O(1)` zerocopy view.
+    pub fn meta(&self) -> SuccinctBM25Meta {
+        let mut tail = self.bytes.clone();
+        *tail
+            .view_suffix::<SuccinctBM25Meta>()
+            .expect("canonical bytes carry meta as suffix-section")
     }
 
     /// Number of documents.
@@ -1793,249 +1840,32 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         out
     }
 
-    /// Serialize to a self-contained blob. The layout:
-    ///
-    /// ```text
-    /// [header         ] SUCCINCT_HEADER_LEN B
-    /// [keys           ] n_docs × 32 B
-    /// [terms          ] n_terms × 32 B
-    /// [doc_lens_bytes ] variable (CompactVector body)
-    /// [postings_bytes ] variable (3 × CompactVector in one ByteArea:
-    ///                            doc_idx + offsets + u16 scores)
-    /// ```
-    ///
-    /// The header carries the scalar params, four
-    /// `CompactVectorMeta` structures (doc_lens,
-    /// postings.doc_idx, postings.offsets, postings.scores), the
-    /// score quantization scale `max_score`, and 4 section
-    /// (offset, length) pairs.
+    /// Serialize to a self-contained `Vec<u8>` blob. With the
+    /// canonical-bytes pattern, this is just a copy of
+    /// `self.bytes` — the index *is* its blob. Prefer the
+    /// `ToBlob<SuccinctBM25Blob>` impl for pile persistence;
+    /// it's `O(1)` (a refcounted `Bytes::clone`) instead of
+    /// allocating a fresh `Vec`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let n_docs = self.doc_count() as u64;
-        let n_terms = self.term_count() as u64;
-
-        // keys: re-serialize through a fresh CompressedUniverse
-        // so the embedded section handles match the freshly-
-        // allocated ByteArea offsets.
-        let keys_sorted: Vec<RawValue> =
-            (0..self.doc_count()).map(|i| self.keys.access(i)).collect();
-        let (keys_region, keys_meta) = {
-            let mut area = ByteArea::new().expect("byte area");
-            let mut sections = area.sections();
-            let universe = CompressedUniverse::with_sorted_dedup(
-                keys_sorted.into_iter(),
-                &mut sections,
-            );
-            let meta = universe.metadata();
-            let _ = universe;
-            let _ = sections;
-            (area.freeze().expect("freeze"), meta)
-        };
-        let keys_meta_on_disk: CompressedUniverseMetaOnDisk = keys_meta.into();
-
-        // doc_lens: re-serialize so the blob owns the bytes
-        // AND so the meta's handle offsets match the fresh
-        // ByteArea (the stale in-memory meta points at the
-        // original area).
-        let (doc_lens_region, doc_lens_meta_fresh) =
-            SuccinctDocLens::build(&self.doc_lens.to_vec()).expect("re-serialize");
-        let doc_lens_meta: CompactVectorMetaOnDisk = doc_lens_meta_fresh.into();
-        // postings: round-trip through build to get fresh bytes
-        // + a matching meta (handle offsets re-relative to the
-        // fresh ByteArea start). Streamed via build_with so the
-        // re-serialization peak temp drops from ~144 MB at 100 k
-        // docs to ~400 KB (one term's postings at a time).
-        let (postings_region, postings_meta) = SuccinctPostings::build_with(
-            self.doc_count() as u32,
-            self.term_count(),
-            |t, buf| {
-                buf.extend(self.postings.postings_for(t).unwrap());
-            },
-        )
-        .expect("re-serialize");
-        let postings_doc_idx_meta: CompactVectorMetaOnDisk = postings_meta.doc_idx.into();
-        let postings_offsets_meta: CompactVectorMetaOnDisk = postings_meta.offsets.into();
-        let postings_scores_meta: CompactVectorMetaOnDisk = postings_meta.scores.into();
-
-        // Round each section's start offset up to 8-byte
-        // alignment. jerky's CompactVector / Universe views
-        // reinterpret the bytes as u64 words and fail with an
-        // `Alignment` error if the slice doesn't start on an
-        // 8-byte boundary.
-        fn align8(n: u64) -> u64 {
-            (n + 7) & !7
-        }
-        let keys_off = 0u64;
-        let keys_len = keys_region.len() as u64;
-        let terms_off = align8(keys_off + keys_len);
-        // Each term row is exactly 32 bytes (FixedBytesTable<32>),
-        // so the section size is computable without materializing
-        // a Vec<u8> just to read its `.len()`. Saves 9.6 MB at
-        // 300 k terms / 100 k docs.
-        let terms_len = self.term_count() as u64 * 32;
-        let doc_lens_off = align8(terms_off + terms_len);
-        let doc_lens_len = doc_lens_region.len() as u64;
-        let postings_off = align8(doc_lens_off + doc_lens_len);
-        let postings_len = postings_region.len() as u64;
-
-        let body_len = postings_off + postings_len;
-        let mut buf = Vec::with_capacity(SUCCINCT_HEADER_LEN + body_len as usize);
-
-        // ── header (264 B) ────────────────────────────────────
-        buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.b.to_le_bytes()); // 4
-        buf.extend_from_slice(&postings_meta.max_score.to_le_bytes()); // 4
-        buf.extend_from_slice(&n_docs.to_le_bytes()); // 8
-        buf.extend_from_slice(&n_terms.to_le_bytes()); // 8
-        buf.extend_from_slice(doc_lens_meta.as_bytes()); // 32
-        buf.extend_from_slice(postings_doc_idx_meta.as_bytes()); // 32
-        buf.extend_from_slice(postings_offsets_meta.as_bytes()); // 32
-        buf.extend_from_slice(postings_scores_meta.as_bytes()); // 32
-        buf.extend_from_slice(keys_meta_on_disk.as_bytes()); // 40
-        buf.extend_from_slice(&keys_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&keys_len.to_le_bytes());
-        buf.extend_from_slice(&terms_off.to_le_bytes());
-        buf.extend_from_slice(&terms_len.to_le_bytes());
-        buf.extend_from_slice(&doc_lens_off.to_le_bytes());
-        buf.extend_from_slice(&doc_lens_len.to_le_bytes());
-        buf.extend_from_slice(&postings_off.to_le_bytes());
-        buf.extend_from_slice(&postings_len.to_le_bytes());
-        debug_assert_eq!(buf.len(), SUCCINCT_HEADER_LEN);
-
-        // ── body ──────────────────────────────────────────────
-        // Pad to the aligned section offsets we computed above.
-        let write_section = |buf: &mut Vec<u8>, target_off: u64, payload: &[u8]| {
-            let target = SUCCINCT_HEADER_LEN + target_off as usize;
-            if target > buf.len() {
-                buf.resize(target, 0);
-            }
-            buf.extend_from_slice(payload);
-        };
-        write_section(&mut buf, keys_off, &keys_region);
-        // Terms section: stream rows from FixedBytesTable directly
-        // into the output buffer without an intermediate Vec<u8>.
-        {
-            let target = SUCCINCT_HEADER_LEN + terms_off as usize;
-            if target > buf.len() {
-                buf.resize(target, 0);
-            }
-            for i in 0..self.term_count() {
-                let row = self.terms.get(i).copied().unwrap_or([0u8; 32]);
-                buf.extend_from_slice(&row);
-            }
-        }
-        write_section(&mut buf, doc_lens_off, &doc_lens_region);
-        write_section(&mut buf, postings_off, &postings_region);
-        buf
+        self.bytes.as_ref().to_vec()
     }
 
-    /// Reload from bytes previously produced by [`Self::to_bytes`].
+    /// Reload from canonical bytes previously produced by
+    /// [`Self::to_bytes`] (or equivalently, the bytes carried by
+    /// a [`SuccinctBM25Blob`]).
+    ///
+    /// Reads [`SuccinctBM25Meta`] from the bytes' suffix-section
+    /// then dispatches to [`Self::from_bytes`].
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, SuccinctLoadError> {
-        if bytes.len() < SUCCINCT_HEADER_LEN {
-            return Err(SuccinctLoadError::ShortHeader);
-        }
-        let avg_doc_len = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let k1 = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let b = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let max_score = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let n_docs = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-        let n_terms = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-
-        let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[32..64])
-            .map_err(|_| SuccinctLoadError::BadMeta("doc_lens"))?
-            .to_jerky();
-        let postings_doc_idx_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[64..96])
-            .map_err(|_| SuccinctLoadError::BadMeta("postings_doc_idx"))?
-            .to_jerky();
-        let postings_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[96..128])
-            .map_err(|_| SuccinctLoadError::BadMeta("postings_offsets"))?
-            .to_jerky();
-        let postings_scores_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[128..160])
-            .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
-            .to_jerky();
-        let keys_meta = CompressedUniverseMetaOnDisk::read_from_bytes(&bytes[160..200])
-            .map_err(|_| SuccinctLoadError::BadMeta("keys"))?
-            .to_jerky();
-
-        let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let keys_off = read_u64(200) as usize;
-        let keys_len = read_u64(208) as usize;
-        let terms_off = read_u64(216) as usize;
-        let terms_len = read_u64(224) as usize;
-        let doc_lens_off = read_u64(232) as usize;
-        let doc_lens_len = read_u64(240) as usize;
-        let postings_off = read_u64(248) as usize;
-        let postings_len = read_u64(256) as usize;
-        debug_assert_eq!(SUCCINCT_HEADER_LEN, 264);
-
-        let body_start = SUCCINCT_HEADER_LEN;
-        let body = &bytes[body_start..];
-        let check = |end: usize, name: &'static str| -> Result<(), SuccinctLoadError> {
-            if end > body.len() {
-                Err(SuccinctLoadError::TruncatedSection(name))
-            } else {
-                Ok(())
-            }
-        };
-        check(keys_off + keys_len, "keys")?;
-        check(terms_off + terms_len, "terms")?;
-        check(doc_lens_off + doc_lens_len, "doc_lens")?;
-        check(postings_off + postings_len, "postings")?;
-
-        let body_bytes = Bytes::from_source(body.to_vec());
-        let keys_bytes = body_bytes.slice(keys_off..keys_off + keys_len);
-        let terms_bytes = body_bytes.slice(terms_off..terms_off + terms_len);
-        let doc_lens_bytes = body_bytes.slice(doc_lens_off..doc_lens_off + doc_lens_len);
-        let postings_bytes = body_bytes.slice(postings_off..postings_off + postings_len);
-
-        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
-        debug_assert_eq!(keys.len(), n_docs);
-        let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, n_terms)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("terms"))?;
-        let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("doc_lens"))?;
-        let postings_meta = SuccinctPostingsMeta {
-            doc_idx: postings_doc_idx_meta,
-            offsets: postings_offsets_meta,
-            scores: postings_scores_meta,
-            max_score,
-            n_terms: n_terms as u64,
-        };
-        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
-
-        Ok(Self {
-            keys,
-            doc_lens,
-            terms,
-            postings,
-            avg_doc_len,
-            k1,
-            b,
-            _phantom: std::marker::PhantomData,
-        })
+        let bytes = Bytes::from_source(bytes.to_vec());
+        let mut tail = bytes.clone();
+        let meta = *tail
+            .view_suffix::<SuccinctBM25Meta>()
+            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
+        Self::from_bytes(meta, bytes)
     }
 }
 
-
-/// Header length in bytes for an `SuccinctBM25Index` blob.
-///
-/// Layout: 4 avg_doc_len, 4 k1, 4 b, 4 max_score, 8 n_docs,
-/// 8 n_terms, 4×32 CompactVectorMeta (doc_lens,
-/// postings.doc_idx, postings.offsets, postings.scores), 1×40
-/// CompressedUniverseMeta (keys), 4×16 section (offset, len)
-/// = 264.
-///
-/// No magic, no version field — a typed `BlobSchema` handle on
-/// the pile side carries the identity. Breaking format changes
-/// mint a new schema id.
-///
-/// 264 is a multiple of 8, so `body_offset = SUCCINCT_HEADER_LEN
-/// + section_offset` lands on a u64-aligned absolute address —
-/// jerky's view types reinterpret the slice as `[u64]` and
-/// refuse misaligned starts with an `Alignment` error.
-const SUCCINCT_HEADER_LEN: usize = 264;
 
 /// Errors loading a `SuccinctBM25Index` or `SuccinctHNSWIndex`
 /// blob.
@@ -2064,22 +1894,30 @@ impl std::fmt::Display for SuccinctLoadError {
 impl std::error::Error for SuccinctLoadError {}
 
 /// Content-addressed [`BlobSchema`] marker for the succinct
-/// BM25 blob format — 264 B header + bit-packed body.
+/// BM25 blob format — canonical-bytes layout where every
+/// section (keys, doc_lens, terms, postings) lives in one
+/// shared [`anybytes::ByteArea`] and the [`SuccinctBM25Meta`]
+/// header sits at the suffix. The index *is* its blob, so
+/// [`ToBlob`] is an `O(1)` refcounted clone.
 ///
 /// Schema id minted fresh via `trible genid`:
-/// `5A1EF3FFD638B15E3EBEAA1E92660441`. Any breaking format
-/// change mints a new id (i.e. a new type), which the
-/// compiler treats as a different blob entirely — so readers
-/// can't accidentally deserialize a mismatched layout.
+/// `DA527A8FF09A3709B2AC6425CD5AF7A8`. Any breaking layout
+/// change mints a new id; the compiler treats a different id
+/// as a different type, so readers can't accidentally
+/// deserialize a mismatched layout.
 ///
-/// Previous id `68C03764D04D05DF65E49589FBBA1441` retired
-/// when the blob dropped its magic+version preamble and the
-/// now-unnecessary reserved u32, so it's not drop-in
-/// compatible with older blobs.
+/// Retired ids:
+/// - `68C03764D04D05DF65E49589FBBA1441` — original layout
+///   (magic + version preamble + custom 264 B header).
+/// - `5A1EF3FFD638B15E3EBEAA1E92660441` — same custom-header
+///   shape with the magic dropped, retired here in favour of
+///   the canonical-bytes pattern (suffix-meta, no custom
+///   header at all — the bytes mirror the in-memory layout
+///   produced by the shared `ByteArea`).
 pub enum SuccinctBM25Blob {}
 
 impl ConstId for SuccinctBM25Blob {
-    const ID: Id = id_hex!("5A1EF3FFD638B15E3EBEAA1E92660441");
+    const ID: Id = id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8");
 }
 
 impl BlobSchema for SuccinctBM25Blob {}
@@ -2092,13 +1930,15 @@ impl ConstDescribe for SuccinctBM25Blob {}
 
 impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index<D, T> {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
-        Blob::new(Bytes::from_source(self.to_bytes()))
+        // Canonical-bytes pattern: the index *is* its blob, so
+        // we just hand over a refcounted clone of the bytes.
+        Blob::new(self.bytes.clone())
     }
 }
 
 impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
-        (&self).to_blob()
+        Blob::new(self.bytes)
     }
 }
 
@@ -2106,7 +1946,12 @@ impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctB
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctBM25Blob>) -> Result<Self, Self::Error> {
-        SuccinctBM25Index::try_from_bytes(blob.bytes.as_ref())
+        let bytes = blob.bytes;
+        let mut tail = bytes.clone();
+        let meta = *tail
+            .view_suffix::<SuccinctBM25Meta>()
+            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
+        SuccinctBM25Index::from_bytes(meta, bytes)
     }
 }
 
@@ -2522,12 +2367,15 @@ mod tests {
 
     #[test]
     fn succinct_bm25_rejects_short_header() {
+        // Canonical-bytes pattern: the suffix-meta read fails
+        // when bytes are too short to hold a `SuccinctBM25Meta`.
+        // We surface that as `BadMeta("suffix")`.
         let err = SuccinctBM25Index::<
             triblespace_core::value::schemas::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_bytes(&[0u8; 10])
         .unwrap_err();
-        assert_eq!(err, SuccinctLoadError::ShortHeader);
+        assert_eq!(err, SuccinctLoadError::BadMeta("suffix"));
     }
 
     // Magic/version rejection tests retired along with the
@@ -2537,6 +2385,14 @@ mod tests {
 
     #[test]
     fn succinct_bm25_rejects_truncation() {
+        // Truncating the canonical bytes shifts the
+        // suffix-meta's section handles past the end of the
+        // available bytes. The `view_suffix` parse may still
+        // succeed (it reinterprets the trailing bytes), but the
+        // section handles point past valid data, so a
+        // `TruncatedSection` surfaces from one of the section
+        // loaders. If the suffix itself can't be parsed we get
+        // `BadMeta("suffix")`; either is a load failure.
         let bytes = build_succinct_sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
         let err = SuccinctBM25Index::<
@@ -2544,7 +2400,13 @@ mod tests {
             crate::tokens::WordHash,
         >::try_from_bytes(truncated)
         .unwrap_err();
-        assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
+        assert!(
+            matches!(
+                err,
+                SuccinctLoadError::TruncatedSection(_) | SuccinctLoadError::BadMeta(_),
+            ),
+            "expected TruncatedSection or BadMeta, got {err:?}",
+        );
     }
 
     #[test]
