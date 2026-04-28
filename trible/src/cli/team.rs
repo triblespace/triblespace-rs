@@ -431,6 +431,28 @@ fn run_revoke(
     Ok(())
 }
 
+/// Describe a single capability for the `team list` audit view.
+struct CapSummary {
+    subject: VerifyingKey,
+    issuer: VerifyingKey,
+    perms: Vec<Id>,
+    expires_at: Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+}
+
+/// Format a permission tag as a short label (PERM_READ/WRITE/ADMIN
+/// or "unknown(<hex>)" for caller-defined tags).
+fn perm_label(perm: &Id) -> String {
+    if *perm == capability::PERM_READ {
+        "PERM_READ".to_string()
+    } else if *perm == capability::PERM_WRITE {
+        "PERM_WRITE".to_string()
+    } else if *perm == capability::PERM_ADMIN {
+        "PERM_ADMIN".to_string()
+    } else {
+        format!("unknown({})", hex::encode(<[u8; 16]>::from(*perm)))
+    }
+}
+
 fn run_list(pile_path: PathBuf) -> Result<()> {
     use triblespace_core::macros::pattern;
     use triblespace_core::query::find;
@@ -443,7 +465,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
         .reader()
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
-    let mut caps_found = 0usize;
+    let mut caps: Vec<CapSummary> = Vec::new();
     let mut revocations_found = 0usize;
     // Buffer all SimpleArchive-decodable blobs so we can pair revocation
     // (rev, sig) blobs after the scan.
@@ -469,23 +491,44 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Err(_) => continue,
         };
 
-        let cap_count = find!(
+        // Each cap blob has exactly one entity carrying these
+        // attributes (the cap itself); embedded parent sigs are
+        // sub-entities with `signed_by`/`signature_*` and don't
+        // match this shape.
+        for (_e, subject, issuer, scope_root, expires_at) in find!(
             (
                 e: Id,
                 subject: VerifyingKey,
                 issuer: VerifyingKey,
-                root: Id
+                root: Id,
+                exp: Value<triblespace_core::value::schemas::time::NsTAIInterval>,
             ),
             pattern!(&set, [{
                 ?e @
                 capability::cap_subject: ?subject,
                 capability::cap_issuer: ?issuer,
                 capability::cap_scope_root: ?root,
+                triblespace_core::metadata::expires_at: ?exp,
             }])
-        )
-        .count();
-        if cap_count > 0 {
-            caps_found += cap_count;
+        ) {
+            // Walk the scope sub-graph for permission tags. A scope
+            // can carry zero or more PERM_* tags; a malformed cap
+            // with no perms surfaces as an empty list rather than
+            // breaking the whole listing.
+            let perms: Vec<Id> = find!(
+                (perm: Id),
+                pattern!(&set, [{
+                    scope_root @ triblespace_core::metadata::tag: ?perm
+                }])
+            )
+            .map(|(p,)| p)
+            .collect();
+            caps.push(CapSummary {
+                subject,
+                issuer,
+                perms,
+                expires_at: Some(expires_at),
+            });
         }
 
         let rev_count = find!(
@@ -500,8 +543,35 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
 
     let _ = pile.close();
 
-    println!("capabilities in pile:  {caps_found}");
+    println!("capabilities in pile:  {}", caps.len());
     println!("revocations in pile:   {revocations_found}");
+
+    if !caps.is_empty() {
+        println!("  capabilities:");
+        for cap in &caps {
+            let perm_str = if cap.perms.is_empty() {
+                "no perms".to_string()
+            } else {
+                cap.perms
+                    .iter()
+                    .map(perm_label)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            };
+            let expiry_str = cap
+                .expires_at
+                .as_ref()
+                .map(format_expiry)
+                .unwrap_or_else(|| "<no expiry>".to_string());
+            println!(
+                "    {} → {} ({}, expires {})",
+                hex::encode(&cap.issuer.to_bytes()[..4]),
+                hex::encode(&cap.subject.to_bytes()[..4]),
+                perm_str,
+                expiry_str,
+            );
+        }
+    }
 
     if revocations_found > 0 {
         // Pair rev+sig blobs and surface the (revoker, target) tuples.
