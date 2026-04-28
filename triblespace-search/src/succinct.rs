@@ -1023,13 +1023,13 @@ impl SuccinctHNSWIndex {
         let n_nodes = self.doc_count() as u64;
         let n_layers = self.graph.n_layers() as u64;
 
-        // Re-serialize each body region so the blob owns its
-        // bytes end-to-end.
-        let handle_rows: Vec<RawValue> = (0..self.doc_count())
-            .map(|i| self.handles.get(i).copied().unwrap_or([0u8; 32]))
-            .collect();
-        let handles_bytes = FixedBytesTable::<32>::build(&handle_rows);
-        let handles_flat: Vec<u8> = handles_bytes.as_ref().to_vec();
+        // Handles section: every row is exactly 32 bytes
+        // (FixedBytesTable<32>), so the section size is computable
+        // up front. We stream rows from the existing view directly
+        // into the output buffer at write time, dropping a triple
+        // allocation (rows Vec + ByteArea + flat copy ≈ 10 MB at
+        // 100 k nodes) that the previous round-trip cost.
+        let handles_len = self.doc_count() as u64 * 32;
 
         // Rebuild the graph from the current view so we get fresh
         // bytes with offsets starting at 0 inside the region.
@@ -1053,7 +1053,6 @@ impl SuccinctHNSWIndex {
         // Section offsets inside the body (relative to end of
         // header).
         let handles_off = 0u64;
-        let handles_len = handles_flat.len() as u64;
         let graph_off = handles_off + handles_len;
         let graph_len = graph_region.len() as u64;
 
@@ -1081,7 +1080,12 @@ impl SuccinctHNSWIndex {
         debug_assert_eq!(buf.len(), SH25_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
-        buf.extend_from_slice(&handles_flat);
+        // Handles: stream rows directly from the current view —
+        // no Vec<RawValue> rebuild, no ByteArea round-trip.
+        for i in 0..self.doc_count() {
+            let row = self.handles.get(i).copied().unwrap_or([0u8; 32]);
+            buf.extend_from_slice(&row);
+        }
         buf.extend_from_slice(&graph_region);
         buf
     }
@@ -1752,9 +1756,6 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         };
         let keys_meta_on_disk: CompressedUniverseMetaOnDisk = keys_meta.into();
 
-        let terms_bytes: Vec<u8> = (0..self.term_count())
-            .flat_map(|i| self.terms.get(i).copied().unwrap_or([0u8; 32]))
-            .collect();
         // doc_lens: re-serialize so the blob owns the bytes
         // AND so the meta's handle offsets match the fresh
         // ByteArea (the stale in-memory meta points at the
@@ -1764,12 +1765,17 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         let doc_lens_meta: CompactVectorMetaOnDisk = doc_lens_meta_fresh.into();
         // postings: round-trip through build to get fresh bytes
         // + a matching meta (handle offsets re-relative to the
-        // fresh ByteArea start).
-        let lists: Vec<Vec<(u32, f32)>> = (0..self.term_count())
-            .map(|t| self.postings.postings_for(t).unwrap().collect())
-            .collect();
-        let (postings_region, postings_meta) =
-            SuccinctPostings::build(&lists, self.doc_count() as u32).expect("re-serialize");
+        // fresh ByteArea start). Streamed via build_with so the
+        // re-serialization peak temp drops from ~144 MB at 100 k
+        // docs to ~400 KB (one term's postings at a time).
+        let (postings_region, postings_meta) = SuccinctPostings::build_with(
+            self.doc_count() as u32,
+            self.term_count(),
+            |t, buf| {
+                buf.extend(self.postings.postings_for(t).unwrap());
+            },
+        )
+        .expect("re-serialize");
         let postings_doc_idx_meta: CompactVectorMetaOnDisk = postings_meta.doc_idx.into();
         let postings_offsets_meta: CompactVectorMetaOnDisk = postings_meta.offsets.into();
         let postings_scores_meta: CompactVectorMetaOnDisk = postings_meta.scores.into();
@@ -1785,7 +1791,11 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         let keys_off = 0u64;
         let keys_len = keys_region.len() as u64;
         let terms_off = align8(keys_off + keys_len);
-        let terms_len = terms_bytes.len() as u64;
+        // Each term row is exactly 32 bytes (FixedBytesTable<32>),
+        // so the section size is computable without materializing
+        // a Vec<u8> just to read its `.len()`. Saves 9.6 MB at
+        // 300 k terms / 100 k docs.
+        let terms_len = self.term_count() as u64 * 32;
         let doc_lens_off = align8(terms_off + terms_len);
         let doc_lens_len = doc_lens_region.len() as u64;
         let postings_off = align8(doc_lens_off + doc_lens_len);
@@ -1826,7 +1836,18 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             buf.extend_from_slice(payload);
         };
         write_section(&mut buf, keys_off, &keys_region);
-        write_section(&mut buf, terms_off, &terms_bytes);
+        // Terms section: stream rows from FixedBytesTable directly
+        // into the output buffer without an intermediate Vec<u8>.
+        {
+            let target = SUCCINCT_HEADER_LEN + terms_off as usize;
+            if target > buf.len() {
+                buf.resize(target, 0);
+            }
+            for i in 0..self.term_count() {
+                let row = self.terms.get(i).copied().unwrap_or([0u8; 32]);
+                buf.extend_from_slice(&row);
+            }
+        }
         write_section(&mut buf, doc_lens_off, &doc_lens_region);
         write_section(&mut buf, postings_off, &postings_region);
         buf

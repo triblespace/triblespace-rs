@@ -10,6 +10,32 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `to_bytes` re-serialization streamed — drops triple-allocation pattern
+
+Both blob types now stream their re-serialization paths through
+the same closure-based build APIs `from_builder` already uses.
+Specifically:
+
+- `SuccinctBM25Index::to_bytes`: postings re-serialization routes
+  through `SuccinctPostings::build_with` (drops the
+  `Vec<Vec<(u32, f32)>>` re-collection — ~144 MB peak drop at
+  100 k docs); terms section streams rows from the existing
+  `FixedBytesTable<32>` view straight into the output buffer
+  with `terms_len = n_terms × 32` computed up front (drops a
+  9.6 MB `Vec<u8>` round-trip at 300 k terms).
+- `SuccinctHNSWIndex::to_bytes`: handles section streams from
+  the existing view directly into the output buffer (drops
+  three redundant copies — `Vec<RawValue>` build input, a
+  fresh `FixedBytesTable<32>::build` ByteArea, and a
+  `.as_ref().to_vec()` flat copy — collectively ~10 MB at
+  100 k nodes).
+
+The serialized layouts are bit-identical to the previous paths;
+the existing `pile_roundtrip` and `scale_smoke` integration
+tests all pass unchanged. This closes the loop on the streaming
+`build_with` work landed in the previous commit, applying the
+same pattern to re-serialization too.
+
 ### Streaming `SuccinctPostings::build_with` — drops peak build memory
 
 `SuccinctPostings` gains a closure-based builder that materializes
