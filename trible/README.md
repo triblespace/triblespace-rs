@@ -119,6 +119,7 @@ the full design.
 - `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--branch HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--branch` (repeatable) restricts the cap to specific branches; without it the cap applies to every branch within the granted permission set.
 - `team revoke --pile PATH --team-root-secret HEX --target HEX` — issue a team-root-signed revocation against a pubkey. Cascades transitively through any chain involving the revoked key.
 - `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first) plus the (revoker, target) pair for each verifiable revocation.
+- `team show --pile PATH --cap HEX` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, blob handles, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
 
 ### Work with remote stores
 
