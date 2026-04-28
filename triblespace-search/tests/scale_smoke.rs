@@ -220,9 +220,13 @@ fn succinct_bm25_1k_docs_matches_naive() {
         }
     }
 
-    // Blob round-trip at this scale.
-    let bytes = succinct.to_bytes();
-    let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid");
+    // Blob round-trip at this scale — refcounted handover via
+    // `ToBlob` / `TryFromBlob` (`to_bytes` + `try_from_bytes`
+    // retired with the canonical-bytes refactor).
+    use triblespace_core::blob::{Blob, TryFromBlob};
+    let blob: Blob<triblespace_search::succinct::SuccinctBM25Blob> =
+        Blob::new(succinct.bytes.clone());
+    let reloaded = SuccinctBM25Index::try_from_blob(blob).expect("valid");
     assert_eq!(reloaded.doc_count(), succinct.doc_count());
     let term = hash_tokens("w7");
     let mut a: Vec<_> = succinct.query_term(&term[0]).collect();
@@ -302,7 +306,7 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let succinct = builder.build();
 
     let naive_size = naive.byte_size();
-    let succinct_size = succinct.to_bytes().len();
+    let succinct_size = succinct.bytes.len();
     assert!(
         succinct_size < naive_size,
         "succinct blob {succinct_size} should be < naive baseline {naive_size}"

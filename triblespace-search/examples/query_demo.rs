@@ -47,10 +47,14 @@ fn main() {
         idx.avg_doc_len()
     );
 
-    // Serialize round-trip — the same bytes end-to-end.
-    let bytes = idx.to_bytes();
-    let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
-    println!("\nblob size: {} bytes", bytes.len());
+    // Serialize round-trip — the same bytes end-to-end. With
+    // canonical-bytes the index *is* its blob, so the round trip
+    // is a refcounted handover (`to_blob` + `try_from_blob`).
+    use triblespace_core::blob::{ToBlob, TryFromBlob};
+    let blob = (&idx).to_blob();
+    let reloaded: SuccinctBM25Index =
+        SuccinctBM25Index::try_from_blob(blob.clone()).expect("valid blob");
+    println!("\nblob size: {} bytes", blob.bytes.len());
     assert_eq!(reloaded.doc_count(), idx.doc_count());
 
     // Single-term query — iterate the posting list directly.

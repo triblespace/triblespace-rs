@@ -11,11 +11,10 @@
 //!   that is *masked* by `term_to_tfs` at modest scales; the win
 //!   becomes visible at 100 k+ docs where the intermediate hits
 //!   ~144 MiB and matters versus the HashMap's ~360 MiB.
-//! - `to_bytes` peak is the cleaner before/after window: with the
-//!   streaming refactor it bottoms out near the SB25 blob size
-//!   (no `Vec<u8>` term re-collection, no `Vec<Vec<...>>` posting
-//!   re-collection, no triple-copy handle round-trip) — the peak
-//!   you see *is* effectively the output buffer.
+//! - `to_blob` peak should be near zero — under the
+//!   canonical-bytes pattern the index *is* its blob, so
+//!   `to_blob` is a refcounted `Bytes::clone`. The phase peak
+//!   reports just the `Blob` wrapper (a few words).
 //!
 //! Methodology: each measured phase resets `PEAK` to the current
 //! resident allocation, runs the operation, then reports
@@ -174,17 +173,19 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
         fresh_builder().build()
     });
 
-    // to_bytes goes through SuccinctPostings::build_with on the
-    // re-serialization side too — peak is the sum of body regions
-    // plus the output buffer, no triple-allocation pattern.
-    let succinct_bytes = measure("SuccinctBM25Index::to_bytes (streaming)", || {
-        succinct.to_bytes()
+    // ToBlob is now O(1) under the canonical-bytes pattern —
+    // the index *is* its blob, so this is just a refcounted
+    // `Bytes::clone`. Peak should be ~zero (the only allocation
+    // is the small `Blob` wrapper itself).
+    use triblespace_core::blob::ToBlob;
+    let blob = measure("SuccinctBM25Index::to_blob (refcounted clone)", || {
+        (&succinct).to_blob()
     });
 
     println!(
         "  naive byte_size = {}, SB25 blob = {}",
         fmt_bytes(naive.byte_size()),
-        fmt_bytes(succinct_bytes.len()),
+        fmt_bytes(blob.bytes.len()),
     );
 }
 

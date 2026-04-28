@@ -10,6 +10,51 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `to_bytes` / `try_from_bytes` retired — `pub bytes: Bytes` is the surface
+
+The wrapper methods predated the canonical-bytes refactor. With
+the index *being* its blob, the right shape mirrors
+[`triblespace_core::SuccinctArchive`] — a single `pub bytes:
+Bytes` field, no accessor methods, and a single typed loader
+([`TryFromBlob<…Blob>`]).
+
+What changed:
+
+- `SuccinctBM25Index::to_bytes(&self) -> Vec<u8>` and
+  `SuccinctHNSWIndex::to_bytes(&self) -> Vec<u8>` deleted —
+  they were just `self.bytes.as_ref().to_vec()`, a wasteful
+  20 MB memcpy at 50 k docs that defeated the canonical-bytes
+  win at the user-facing API. Callers that genuinely need an
+  owned `Vec<u8>` write that themselves; everything else uses
+  the `bytes` field directly.
+- `SuccinctBM25Index::try_from_bytes(&[u8])` and
+  `SuccinctHNSWIndex::try_from_bytes(&[u8])` deleted — naming
+  evoked `zerocopy::TryFromBytes` semantics they didn't satisfy
+  (they actually allocated a `Bytes::from_source(buf.to_vec())`
+  before parsing). Callers wrap raw bytes in
+  `Blob::new(bytes)` and route through `TryFromBlob<…Blob>`,
+  matching `SuccinctArchive` exactly.
+- All call sites migrated:
+  - `idx.to_bytes().len()` → `idx.bytes.len()`
+  - `let bytes = idx.to_bytes();
+    Self::try_from_bytes(&bytes)` →
+    `let blob = Blob::new(idx.bytes.clone());
+     Self::try_from_blob(blob)`
+  - `assert_eq!(a.to_bytes(), b.to_bytes())` →
+    `assert_eq!(a.bytes.as_ref(), b.bytes.as_ref())`
+- Updated 5 tests, 3 examples (`query_demo`,
+  `blob_sizes_at_scale`, `peak_build_memory`), and one doctest.
+  `peak_build_memory` now measures `(&idx).to_blob()` instead
+  of `to_bytes`, reporting **0 B peak at every scale** — the
+  canonical-bytes win finally visible at the user-facing API.
+- `blob_sizes_at_scale`'s manual `keys_len_from_header` byte
+  scrape (which decoded the now-retired custom 264 B header)
+  is replaced with `keys_len_from_blob(&idx)` reading the
+  suffix-meta directly via `idx.meta()`.
+
+158 tests still pass; all serialization round-trips go through
+`ToBlob` / `TryFromBlob` end-to-end.
+
 ### `FixedBytesTable<N>` retired — switch to `View<[[u8; N]]>` directly
 
 The wrapper type added nothing on top of what `View<[[u8; N]]>`

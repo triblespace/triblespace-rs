@@ -929,27 +929,6 @@ impl SuccinctHNSWIndex {
         }
     }
 
-    /// Serialize to a self-contained `Vec<u8>` blob. With the
-    /// canonical-bytes pattern, this is a copy of `self.bytes` —
-    /// the index *is* its blob. Prefer the
-    /// `ToBlob<SuccinctHNSWBlob>` impl for pile persistence;
-    /// it's `O(1)` (a refcounted `Bytes::clone`) instead of
-    /// allocating a fresh `Vec`.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.bytes.as_ref().to_vec()
-    }
-
-    /// Reload from canonical bytes previously produced by
-    /// [`Self::to_bytes`] (or equivalently, the bytes carried by
-    /// a [`SuccinctHNSWBlob`]).
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, SuccinctLoadError> {
-        let bytes = Bytes::from_source(bytes.to_vec());
-        let mut tail = bytes.clone();
-        let meta = *tail
-            .view_suffix::<SuccinctHNSWMeta>()
-            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
-        Self::from_bytes(meta, bytes)
-    }
 }
 
 /// A [`SuccinctHNSWIndex`] paired with the blob store its
@@ -1275,9 +1254,12 @@ where
 /// let hits: Vec<_> = idx.query_term(&fox).collect();
 /// assert_eq!(hits.len(), 2);
 ///
-/// // Persist via to_bytes / ToBlob<SuccinctBM25Blob> for pile storage.
-/// let blob_bytes = idx.to_bytes();
-/// assert!(blob_bytes.len() > 0);
+/// // Persist via ToBlob<SuccinctBM25Blob> — the index *is* its
+/// // blob, so this is an O(1) refcounted handover of the
+/// // canonical bytes.
+/// use triblespace_core::blob::ToBlob;
+/// let blob = (&idx).to_blob();
+/// assert!(blob.bytes.len() > 0);
 /// ```
 /// Self-contained metadata header for a [`SuccinctBM25Index`]
 /// blob. Stored as a typed suffix-section in the canonical
@@ -1498,9 +1480,10 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     }
 
     /// Reconstruct the index from canonical bytes plus its
-    /// (already-decoded) header. Used by [`Self::try_from_bytes`]
-    /// and [`TryFromBlob`] after pulling the suffix-meta out of
-    /// `bytes`.
+    /// (already-decoded) header. The lower-level entry point —
+    /// [`TryFromBlob<SuccinctBM25Blob>`] is the standard path
+    /// and pulls the suffix-meta out of `bytes` before calling
+    /// this.
     pub fn from_bytes(
         meta: SuccinctBM25Meta,
         bytes: Bytes,
@@ -1618,30 +1601,6 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         out
     }
 
-    /// Serialize to a self-contained `Vec<u8>` blob. With the
-    /// canonical-bytes pattern, this is just a copy of
-    /// `self.bytes` — the index *is* its blob. Prefer the
-    /// `ToBlob<SuccinctBM25Blob>` impl for pile persistence;
-    /// it's `O(1)` (a refcounted `Bytes::clone`) instead of
-    /// allocating a fresh `Vec`.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.bytes.as_ref().to_vec()
-    }
-
-    /// Reload from canonical bytes previously produced by
-    /// [`Self::to_bytes`] (or equivalently, the bytes carried by
-    /// a [`SuccinctBM25Blob`]).
-    ///
-    /// Reads [`SuccinctBM25Meta`] from the bytes' suffix-section
-    /// then dispatches to [`Self::from_bytes`].
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, SuccinctLoadError> {
-        let bytes = Bytes::from_source(bytes.to_vec());
-        let mut tail = bytes.clone();
-        let meta = *tail
-            .view_suffix::<SuccinctBM25Meta>()
-            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
-        Self::from_bytes(meta, bytes)
-    }
 }
 
 
@@ -2091,9 +2050,10 @@ mod tests {
     #[test]
     fn succinct_bm25_bytes_round_trip() {
         use crate::tokens::hash_tokens;
+        use triblespace_core::blob::{Blob, TryFromBlob};
         let original = build_succinct_sample();
-        let bytes = original.to_bytes();
-        let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
+        let blob: Blob<SuccinctBM25Blob> = Blob::new(original.bytes.clone());
+        let reloaded = SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
 
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.term_count(), original.term_count());
@@ -2124,11 +2084,12 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_round_trip() {
         use crate::bm25::BM25Builder;
+        use triblespace_core::blob::{Blob, TryFromBlob};
         use triblespace_core::value::schemas::genid::GenId;
         let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
-        let bytes = idx.to_bytes();
+        let blob: Blob<SuccinctBM25Blob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctBM25Index =
-            SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
+            SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         assert_eq!(reloaded.term_count(), 0);
     }
@@ -2138,10 +2099,12 @@ mod tests {
         // Canonical-bytes pattern: the suffix-meta read fails
         // when bytes are too short to hold a `SuccinctBM25Meta`.
         // We surface that as `BadMeta("suffix")`.
+        use triblespace_core::blob::{Blob, TryFromBlob};
+        let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source([0u8; 10].to_vec()));
         let err = SuccinctBM25Index::<
             triblespace_core::value::schemas::genid::GenId,
             crate::tokens::WordHash,
-        >::try_from_bytes(&[0u8; 10])
+        >::try_from_blob(blob)
         .unwrap_err();
         assert_eq!(err, SuccinctLoadError::BadMeta("suffix"));
     }
@@ -2161,12 +2124,15 @@ mod tests {
         // `TruncatedSection` surfaces from one of the section
         // loaders. If the suffix itself can't be parsed we get
         // `BadMeta("suffix")`; either is a load failure.
-        let bytes = build_succinct_sample().to_bytes();
-        let truncated = &bytes[..bytes.len() - 2];
+        use triblespace_core::blob::{Blob, TryFromBlob};
+        let sample = build_succinct_sample();
+        let full = sample.bytes.as_ref();
+        let truncated = full[..full.len() - 2].to_vec();
+        let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source(truncated));
         let err = SuccinctBM25Index::<
             triblespace_core::value::schemas::genid::GenId,
             crate::tokens::WordHash,
-        >::try_from_bytes(truncated)
+        >::try_from_blob(blob)
         .unwrap_err();
         assert!(
             matches!(
@@ -2192,9 +2158,9 @@ mod tests {
     fn succinct_bm25_blob_is_deterministic() {
         // Content-addressing guarantee: same corpus must produce
         // identical bytes across runs.
-        let a = build_succinct_sample().to_bytes();
-        let b = build_succinct_sample().to_bytes();
-        assert_eq!(a, b);
+        let a = build_succinct_sample();
+        let b = build_succinct_sample();
+        assert_eq!(a.bytes.as_ref(), b.bytes.as_ref());
     }
 
     #[test]
@@ -2326,9 +2292,10 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_bytes_round_trip() {
+        use triblespace_core::blob::{Blob, TryFromBlob};
         let (original, mut store, handles) = build_succinct_hnsw_sample();
-        let bytes = original.to_bytes();
-        let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        let blob: Blob<SuccinctHNSWBlob> = Blob::new(original.bytes.clone());
+        let reloaded = SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.dim(), original.dim());
         assert_eq!(reloaded.m(), original.m());
@@ -2356,13 +2323,13 @@ mod tests {
     #[test]
     fn succinct_hnsw_empty_round_trip() {
         use crate::hnsw::HNSWBuilder;
-        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
         use triblespace_core::repo::BlobStore;
         use triblespace_core::value::schemas::hash::Blake3;
         let idx = HNSWBuilder::new(3).build();
-        let bytes = idx.to_bytes();
+        let blob: Blob<SuccinctHNSWBlob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctHNSWIndex =
-            SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+            SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
         let probe = crate::schemas::put_embedding::<_, Blake3>(
@@ -2381,7 +2348,9 @@ mod tests {
     fn succinct_hnsw_rejects_short_header() {
         // Canonical-bytes pattern: too-short bytes can't carry a
         // valid `SuccinctHNSWMeta` suffix → `BadMeta("suffix")`.
-        let err = SuccinctHNSWIndex::try_from_bytes(&[0u8; 10]).unwrap_err();
+        use triblespace_core::blob::{Blob, TryFromBlob};
+        let blob: Blob<SuccinctHNSWBlob> = Blob::new(Bytes::from_source([0u8; 10].to_vec()));
+        let err = SuccinctHNSWIndex::try_from_blob(blob).unwrap_err();
         assert_eq!(err, SuccinctLoadError::BadMeta("suffix"));
     }
 
@@ -2397,10 +2366,12 @@ mod tests {
         // either the suffix-meta parse fails (`BadMeta`) or one
         // of the section loaders surfaces `TruncatedSection`.
         // Either is a load failure.
+        use triblespace_core::blob::{Blob, TryFromBlob};
         let (idx, _, _) = build_succinct_hnsw_sample();
-        let bytes = idx.to_bytes();
-        let truncated = &bytes[..bytes.len() - 2];
-        let err = SuccinctHNSWIndex::try_from_bytes(truncated).unwrap_err();
+        let full = idx.bytes.as_ref();
+        let truncated = full[..full.len() - 2].to_vec();
+        let blob: Blob<SuccinctHNSWBlob> = Blob::new(Bytes::from_source(truncated));
+        let err = SuccinctHNSWIndex::try_from_blob(blob).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -2425,7 +2396,7 @@ mod tests {
     fn succinct_hnsw_blob_is_deterministic() {
         let (a, _, _) = build_succinct_hnsw_sample();
         let (b, _, _) = build_succinct_hnsw_sample();
-        assert_eq!(a.to_bytes(), b.to_bytes());
+        assert_eq!(a.bytes.as_ref(), b.bytes.as_ref());
     }
 
     #[test]
@@ -2493,15 +2464,13 @@ mod tests {
             b.insert(id, hash_tokens(&text));
         }
         let naive_size = b.clone().build_naive().byte_size();
-        let succinct_bytes = b.build().to_bytes();
+        let succinct_size = b.build().bytes.len();
         // The target is a real savings; at this scale we expect
         // the succinct blob to be strictly smaller than the naive
         // flat-array baseline.
         assert!(
-            succinct_bytes.len() < naive_size,
-            "succinct {} should be < naive baseline {}",
-            succinct_bytes.len(),
-            naive_size,
+            succinct_size < naive_size,
+            "succinct {succinct_size} should be < naive baseline {naive_size}",
         );
     }
 

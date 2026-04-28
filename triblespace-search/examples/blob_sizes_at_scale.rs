@@ -62,15 +62,20 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
     words.join(" ")
 }
 
-/// Read the keys-section length from an SB25 blob header.
-///
-/// Offset layout (see `SuccinctBM25Index::to_bytes` in
-/// `src/succinct.rs`): 16 B scalars + 32 B × 4 jerky metas +
-/// 40 B universe meta + 8 B keys_off = 208, then 8 B keys_len.
-fn keys_len_from_header(bytes: &[u8]) -> u64 {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&bytes[208..216]);
-    u64::from_le_bytes(b)
+/// Read the keys-section length from an SB25 blob's
+/// suffix-meta. The canonical-bytes layout puts a typed
+/// [`SuccinctBM25Meta`] at the end of the bytes, with
+/// [`SuccinctBM25Meta::keys`] holding a
+/// [`CompressedUniverseMeta`] whose two section handles bound
+/// the bytes the keys actually occupy.
+fn keys_len_from_blob(idx: &triblespace_search::succinct::SuccinctBM25Index) -> usize {
+    let meta = idx.meta();
+    // CompressedUniverse stores two sections in the area:
+    // `fragments` (the 4-byte fragment dictionary) and `data`
+    // (the DacsByte payload, which itself owns one further
+    // section for its per-level metadata). Summing the three
+    // gives the bytes attributable to the keys universe.
+    meta.keys.fragments.len + meta.keys.data.levels.len
 }
 
 #[derive(Clone, Copy)]
@@ -136,11 +141,11 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
     let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     let naive_size = naive.byte_size();
-    let succinct_bytes = succinct.to_bytes();
+    let succinct_size = succinct.bytes.len();
 
-    let ratio = succinct_bytes.len() as f64 / naive_size as f64;
+    let ratio = succinct_size as f64 / naive_size as f64;
     let speedup = build_ms_serial / build_ms_par;
-    let keys_bytes = keys_len_from_header(&succinct_bytes) as usize;
+    let keys_bytes = keys_len_from_blob(&succinct);
     // A flat `n_docs × 32 B` table is the Phase-1 baseline for
     // keys — diffing against it reports what `CompressedUniverse`
     // actually saved on this key distribution.
@@ -157,7 +162,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
          ({speedup:>3.1}×)  succinct-encode {encode_ms:>5.0}ms \
          | naive {:>8}  SB25 {:>8}  ratio {:.2}×  keys {:>8}/{:>8} ({:.2}×)",
         fmt_bytes(naive_size),
-        fmt_bytes(succinct_bytes.len()),
+        fmt_bytes(succinct_size),
         ratio,
         fmt_bytes(keys_bytes),
         fmt_bytes(keys_flat),
