@@ -52,65 +52,9 @@ use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{RawValue, Value, ValueSchema};
 
 use crate::schemas::{EmbHandle, Embedding};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::collections::HashMap;
 use crate::hnsw::HNSWIndex;
-
-/// Byte-layout mirror of [`CompactVectorMeta`] that's safe to
-/// serialize through our own blob format.
-///
-/// jerky's `CompactVectorMeta` is `FromBytes + KnownLayout +
-/// Immutable` but not `IntoBytes` (it has no way to opt in from
-/// downstream), so we can't `as_bytes` it directly. This mirror
-/// owns the derives we need on our side, and the From/To impls
-/// document + check the layout equivalence (both are `repr(C)`
-/// with four `u64`-sized fields on 64-bit platforms).
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
-#[repr(C)]
-struct CompactVectorMetaOnDisk {
-    len: u64,
-    width: u64,
-    handle_offset: u64,
-    handle_len: u64,
-}
-
-const _: () = assert!(
-    std::mem::size_of::<CompactVectorMetaOnDisk>() == 32,
-    "CompactVectorMetaOnDisk must be 32 bytes",
-);
-const _: () = assert!(
-    std::mem::size_of::<CompactVectorMeta>() == 32,
-    "CompactVectorMeta must be 32 bytes (assumes 64-bit target)",
-);
-
-impl From<CompactVectorMeta> for CompactVectorMetaOnDisk {
-    fn from(m: CompactVectorMeta) -> Self {
-        Self {
-            len: m.len as u64,
-            width: m.width as u64,
-            handle_offset: m.handle.offset as u64,
-            handle_len: m.handle.len as u64,
-        }
-    }
-}
-
-impl CompactVectorMetaOnDisk {
-    /// Convert back to jerky's meta. Because `SectionHandle` has
-    /// a private `_type: PhantomData<T>` we can't construct one
-    /// with a struct literal — but its layout is identical to
-    /// `(usize, usize)` and it's `#[repr(C)]` with a known layout,
-    /// so we transmute through a matching byte layout.
-    fn to_jerky(self) -> CompactVectorMeta {
-        // Build a 32-byte scratch in the on-disk layout, then
-        // `read_from_bytes` it into `CompactVectorMeta` — sound
-        // because both are `repr(C)`, both are 32 bytes, and
-        // both share the same field order on 64-bit targets.
-        let disk_bytes = self.as_bytes();
-        CompactVectorMeta::read_from_bytes(disk_bytes)
-            .expect("CompactVectorMeta has same 32-byte repr(C) layout on 64-bit")
-    }
-}
 
 /// Errors produced by the succinct building blocks.
 #[derive(Debug)]
@@ -691,16 +635,23 @@ pub struct SuccinctGraph {
 }
 
 /// Serialized layout metadata for [`SuccinctGraph`].
-#[derive(Debug, Clone, Copy)]
+///
+/// Layout-stable so callers can embed this inside a parent meta
+/// stored as a typed section in a [`ByteArea`] (see
+/// [`SuccinctHNSWMeta`]).
+#[derive(
+    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+)]
+#[repr(C)]
 pub struct SuccinctGraphMeta {
-    /// Meta for `neighbours`.
-    pub neighbours: CompactVectorMeta,
-    /// Meta for `offsets`.
-    pub offsets: CompactVectorMeta,
     /// Number of nodes in the graph.
     pub n_nodes: u64,
     /// Number of layers (0..n_layers; layer 0 is the full graph).
     pub n_layers: u64,
+    /// Meta for `neighbours`.
+    pub neighbours: CompactVectorMeta,
+    /// Meta for `offsets`.
+    pub offsets: CompactVectorMeta,
 }
 
 impl SuccinctGraph {
@@ -878,7 +829,57 @@ impl SuccinctGraph {
 /// assert!(hits.contains(&handles[0]));
 /// assert!(hits.contains(&handles[2]));  // 0.9*1 + 0.1*0 ≈ 0.994
 /// ```
+/// Self-contained metadata header for a [`SuccinctHNSWIndex`]
+/// blob. Stored as a typed suffix-section in the canonical
+/// bytes; loaders read it via [`anybytes::Bytes::view_suffix`]
+/// before reconstructing section views.
+///
+/// Largest-alignment-first ordering keeps the `repr(C)` layout
+/// padding-free, with a trailing `_pad` rounding the size to a
+/// multiple of 8.
+#[derive(
+    Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+)]
+#[repr(C)]
+pub struct SuccinctHNSWMeta {
+    /// Number of nodes (graph vertices) in the index.
+    pub n_nodes: u64,
+    /// Layer-major neighbour graph metadata.
+    pub graph: SuccinctGraphMeta,
+    /// Section handle for the 32-byte content-addressed handle
+    /// table — one handle per node, in node-id order.
+    pub handles: SectionHandle<[u8; 32]>,
+    /// Embedding dimensionality (header-only — the embeddings
+    /// themselves live as separate blobs in the pile).
+    pub dim: u32,
+    /// Entry-point node id (only meaningful when
+    /// `has_entry_point != 0`).
+    pub entry_point: u32,
+    /// HNSW upper-layer degree cap.
+    pub m: u16,
+    /// HNSW layer-0 degree cap.
+    pub m0: u16,
+    /// Highest layer any node was promoted to.
+    pub max_level: u8,
+    /// Boolean: 1 = `entry_point` is valid; 0 = empty index.
+    pub has_entry_point: u8,
+    /// Padding to round the struct to a multiple-of-8 size.
+    _pad: [u8; 10],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<SuccinctHNSWMeta>() == 128,
+    "SuccinctHNSWMeta must be 128 bytes — re-tune _pad if the layout shifts",
+);
+
 pub struct SuccinctHNSWIndex {
+    /// Canonical blob bytes — single owner of every section's
+    /// backing memory. `to_blob` is `O(1)` (refcounted clone of
+    /// these bytes); `from_bytes` views back into them via
+    /// section handles in [`SuccinctHNSWMeta`]. Mirrors the
+    /// `SuccinctArchive` shape.
+    pub bytes: Bytes,
+
     dim: usize,
     m: u16,
     m0: u16,
@@ -905,20 +906,27 @@ impl std::fmt::Debug for SuccinctHNSWIndex {
 }
 
 impl SuccinctHNSWIndex {
-    /// Re-encode a naive [`HNSWIndex`] into the succinct form.
+    /// Re-encode a naive [`HNSWIndex`] into the succinct form
+    /// using the canonical-bytes pattern: every section
+    /// (`handles`, `graph`) lands in one shared
+    /// [`anybytes::ByteArea`], the [`SuccinctHNSWMeta`] header
+    /// sits as a typed suffix-section, and the area is frozen
+    /// exactly once. The resulting `bytes: Bytes` field is the
+    /// blob — [`ToBlob`] is then an `O(1)` refcounted clone.
     pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
         let n = idx.doc_count();
         let dim = idx.dim();
         let max_level = idx.max_level();
         let n_layers = max_level as usize + 1;
 
-        // handles: 32-byte content-addressed pointers to
-        // Embedding blobs.
-        let handle_rows: Vec<RawValue> = idx.handles().iter().map(|h| h.raw).collect();
-        let handles_bytes = FixedBytesTable::<32>::build(&handle_rows);
-        let handles = FixedBytesTable::<32>::from_bytes(handles_bytes, n)?;
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
 
-        // Build layer-major graph: layer_graph[L][i] = neighbours.
+        // 1. handles section
+        let handle_rows: Vec<RawValue> = idx.handles().iter().map(|h| h.raw).collect();
+        let handles_handle = FixedBytesTable::<32>::build_into(&mut sections, &handle_rows)?;
+
+        // 2. layer-major graph: layer_graph[L][i] = neighbours.
         // Empty lists are fine for nodes not promoted to layer L —
         // the search walks through them as dead ends.
         let mut layer_graph: Vec<Vec<Vec<u32>>> = (0..n_layers)
@@ -932,18 +940,69 @@ impl SuccinctHNSWIndex {
                 }
             }
         }
-        let (graph_bytes, graph_meta) = SuccinctGraph::build(&layer_graph, n)?;
-        let graph = SuccinctGraph::from_bytes(graph_meta, graph_bytes)?;
+        let graph_meta = SuccinctGraph::build_into(&mut sections, &layer_graph, n)?;
 
-        Ok(Self {
-            dim,
+        // 3. suffix-meta section
+        let entry_point_raw = idx.entry_point();
+        let meta = SuccinctHNSWMeta {
+            n_nodes: n as u64,
+            graph: graph_meta,
+            handles: handles_handle,
+            dim: dim as u32,
+            entry_point: entry_point_raw.unwrap_or(u32::MAX),
             m: idx.m(),
             m0: idx.m0(),
             max_level,
-            entry_point: idx.entry_point(),
+            has_entry_point: entry_point_raw.is_some() as u8,
+            _pad: [0u8; 10],
+        };
+        {
+            let mut meta_sec = sections.reserve::<SuccinctHNSWMeta>(1)?;
+            meta_sec.as_mut_slice()[0] = meta;
+            meta_sec.freeze()?;
+        }
+
+        drop(sections);
+        let bytes = area.freeze()?;
+        Self::from_bytes(meta, bytes).map_err(|_| SuccinctDocLensError::SizeMismatch {
+            bytes: 0,
+            expected: 0,
+        })
+    }
+
+    /// Reconstruct from canonical bytes plus its decoded header.
+    pub fn from_bytes(
+        meta: SuccinctHNSWMeta,
+        bytes: Bytes,
+    ) -> Result<Self, SuccinctLoadError> {
+        let handles = FixedBytesTable::<32>::from_section_handle(bytes.clone(), meta.handles)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("handles"))?;
+        let graph = SuccinctGraph::from_bytes(meta.graph, bytes.clone())
+            .map_err(|_| SuccinctLoadError::TruncatedSection("graph"))?;
+        Ok(Self {
+            bytes,
+            dim: meta.dim as usize,
+            m: meta.m,
+            m0: meta.m0,
+            max_level: meta.max_level,
+            entry_point: if meta.has_entry_point != 0 {
+                Some(meta.entry_point)
+            } else {
+                None
+            },
             handles,
             graph,
         })
+    }
+
+    /// Snapshot the metadata header by reading the
+    /// suffix-section out of the canonical bytes — `O(1)`
+    /// zerocopy view.
+    pub fn meta(&self) -> SuccinctHNSWMeta {
+        let mut tail = self.bytes.clone();
+        *tail
+            .view_suffix::<SuccinctHNSWMeta>()
+            .expect("canonical bytes carry meta as suffix-section")
     }
 
     /// Vector dimensionality.
@@ -995,189 +1054,27 @@ impl SuccinctHNSWIndex {
         }
     }
 
-    /// Serialize to a self-contained blob. Layout:
-    ///
-    /// ```text
-    /// [header 152 B]
-    ///   magic u32     = "SH25"
-    ///   version u16   (FORMAT_VERSION)
-    ///   reserved u16
-    ///   dim u32                  ; embedding dimensionality
-    ///   M u16, M0 u16            ; HNSW degree caps
-    ///   max_level u8
-    ///   reserved u8
-    ///   has_entry_point u8
-    ///   reserved u8
-    ///   entry_point u32
-    ///   n_nodes u64
-    ///   n_layers u64
-    ///   graph_neighbours_meta  32 B   ; CompactVectorMetaOnDisk
-    ///   graph_offsets_meta     32 B   ; CompactVectorMetaOnDisk
-    ///   (section_offset, section_len) × 3 = 48 B
-    ///
-    /// [keys    ] n_nodes × 32 B    ; FixedBytesTable<32> raw;
-    ///                                each entry is the doc's
-    ///                                `RawValue` identifier
-    ///                                (GenId / ShortString / …).
-    /// [handles ] n_nodes × 32 B    ; Value<Handle<Blake3, Embedding>>;
-    ///                                content-addressed pointer
-    ///                                to the doc's embedding blob
-    ///                                in the pile's blob store.
-    /// [graph   ] variable          ; SuccinctGraph body = two
-    ///                                jerky CompactVectors in one
-    ///                                ByteArea:
-    ///                                  neighbours (width log₂(n+1))
-    ///                                  offsets    (width log₂(E+1))
-    /// ```
-    ///
-    /// The header carries scalar HNSW parameters, the graph's
-    /// two `CompactVectorMeta` structures, and `(offset, length)`
-    /// pairs for each body section.
-    ///
-    /// Embeddings are **not** in this blob — they live in the
-    /// pile's blob store, referenced by handle. Queries resolve
-    /// handles at traversal time through
-    /// [`AttachedSuccinctHNSWIndex`]'s internal `BlobCache`.
+    /// Serialize to a self-contained `Vec<u8>` blob. With the
+    /// canonical-bytes pattern, this is a copy of `self.bytes` —
+    /// the index *is* its blob. Prefer the
+    /// `ToBlob<SuccinctHNSWBlob>` impl for pile persistence;
+    /// it's `O(1)` (a refcounted `Bytes::clone`) instead of
+    /// allocating a fresh `Vec`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let n_nodes = self.doc_count() as u64;
-        let n_layers = self.graph.n_layers() as u64;
-
-        // Handles section: every row is exactly 32 bytes
-        // (FixedBytesTable<32>), so the section size is computable
-        // up front. We stream rows from the existing view directly
-        // into the output buffer at write time, dropping a triple
-        // allocation (rows Vec + ByteArea + flat copy ≈ 10 MB at
-        // 100 k nodes) that the previous round-trip cost.
-        let handles_len = self.doc_count() as u64 * 32;
-
-        // Rebuild the graph from the current view so we get fresh
-        // bytes with offsets starting at 0 inside the region.
-        let mut layer_graph: Vec<Vec<Vec<u32>>> = (0..self.graph.n_layers())
-            .map(|_| {
-                (0..self.graph.n_nodes())
-                    .map(|_| Vec::new())
-                    .collect::<Vec<Vec<u32>>>()
-            })
-            .collect();
-        for (l, row) in layer_graph.iter_mut().enumerate() {
-            for (i, slot) in row.iter_mut().enumerate() {
-                *slot = self.graph.neighbours(i, l).collect();
-            }
-        }
-        let (graph_region, graph_meta) =
-            SuccinctGraph::build(&layer_graph, self.graph.n_nodes()).expect("re-serialize graph");
-        let graph_neighbours_meta: CompactVectorMetaOnDisk = graph_meta.neighbours.into();
-        let graph_offsets_meta: CompactVectorMetaOnDisk = graph_meta.offsets.into();
-
-        // Section offsets inside the body (relative to end of
-        // header).
-        let handles_off = 0u64;
-        let graph_off = handles_off + handles_len;
-        let graph_len = graph_region.len() as u64;
-
-        let body_len = graph_off + graph_len;
-        let mut buf = Vec::with_capacity(SH25_HEADER_LEN + body_len as usize);
-
-        // ── header (128 B) ────────────────────────────────────
-        buf.extend_from_slice(&(self.dim as u32).to_le_bytes()); // 4
-        buf.extend_from_slice(&self.m.to_le_bytes()); // 2
-        buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
-        buf.push(self.max_level); // 1
-        buf.push(0u8); // reserved, 1
-        buf.push(self.entry_point.is_some() as u8); // 1
-        buf.push(0u8); // reserved, 1
-        let ep = self.entry_point.unwrap_or(u32::MAX);
-        buf.extend_from_slice(&ep.to_le_bytes()); // 4
-        buf.extend_from_slice(&n_nodes.to_le_bytes()); // 8
-        buf.extend_from_slice(&n_layers.to_le_bytes()); // 8
-        buf.extend_from_slice(graph_neighbours_meta.as_bytes()); // 32
-        buf.extend_from_slice(graph_offsets_meta.as_bytes()); // 32
-        buf.extend_from_slice(&handles_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&handles_len.to_le_bytes()); // 8
-        buf.extend_from_slice(&graph_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&graph_len.to_le_bytes()); // 8
-        debug_assert_eq!(buf.len(), SH25_HEADER_LEN);
-
-        // ── body ──────────────────────────────────────────────
-        // Handles: stream rows directly from the current view —
-        // no Vec<RawValue> rebuild, no ByteArea round-trip.
-        for i in 0..self.doc_count() {
-            let row = self.handles.get(i).copied().unwrap_or([0u8; 32]);
-            buf.extend_from_slice(&row);
-        }
-        buf.extend_from_slice(&graph_region);
-        buf
+        self.bytes.as_ref().to_vec()
     }
 
-    /// Reload from bytes previously produced by [`Self::to_bytes`].
+    /// Reload from canonical bytes previously produced by
+    /// [`Self::to_bytes`] (or equivalently, the bytes carried by
+    /// a [`SuccinctHNSWBlob`]).
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, SuccinctLoadError> {
-        if bytes.len() < SH25_HEADER_LEN {
-            return Err(SuccinctLoadError::ShortHeader);
-        }
-        let dim = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let m = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let m0 = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        let max_level = bytes[8];
-        let has_ep = bytes[10] != 0;
-        let ep_raw = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let entry_point = if has_ep { Some(ep_raw) } else { None };
-        let n_nodes = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
-        let _n_layers = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-
-        let graph_neighbours_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[32..64])
-            .map_err(|_| SuccinctLoadError::BadMeta("graph.neighbours"))?
-            .to_jerky();
-        let graph_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[64..96])
-            .map_err(|_| SuccinctLoadError::BadMeta("graph.offsets"))?
-            .to_jerky();
-
-        let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let handles_off = read_u64(96) as usize;
-        let handles_len = read_u64(104) as usize;
-        let graph_off = read_u64(112) as usize;
-        let graph_len = read_u64(120) as usize;
-        debug_assert_eq!(SH25_HEADER_LEN, 128);
-        let _ = dim; // dim stays header-only; no inline vectors.
-
-        let body_start = SH25_HEADER_LEN;
-        let body = &bytes[body_start..];
-        let check = |end: usize, name: &'static str| -> Result<(), SuccinctLoadError> {
-            if end > body.len() {
-                Err(SuccinctLoadError::TruncatedSection(name))
-            } else {
-                Ok(())
-            }
-        };
-        check(handles_off + handles_len, "handles")?;
-        check(graph_off + graph_len, "graph")?;
-
-        let body_bytes = Bytes::from_source(body.to_vec());
-        let handles_bytes = body_bytes.slice(handles_off..handles_off + handles_len);
-        let graph_bytes = body_bytes.slice(graph_off..graph_off + graph_len);
-
-        let handles = FixedBytesTable::<32>::from_bytes(handles_bytes, n_nodes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("handles"))?;
-
-        let graph_meta = SuccinctGraphMeta {
-            neighbours: graph_neighbours_meta,
-            offsets: graph_offsets_meta,
-            n_nodes: n_nodes as u64,
-            n_layers: _n_layers as u64,
-        };
-        let graph = SuccinctGraph::from_bytes(graph_meta, graph_bytes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("graph"))?;
-
-        Ok(Self {
-            dim,
-            m,
-            m0,
-            max_level,
-            entry_point,
-            handles,
-            graph,
-        })
+        let bytes = Bytes::from_source(bytes.to_vec());
+        let mut tail = bytes.clone();
+        let meta = *tail
+            .view_suffix::<SuccinctHNSWMeta>()
+            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
+        Self::from_bytes(meta, bytes)
     }
-
 }
 
 /// A [`SuccinctHNSWIndex`] paired with the blob store its
@@ -1955,30 +1852,22 @@ impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctB
     }
 }
 
-/// Header length in bytes for a `SuccinctHNSWIndex` blob.
-///
-/// Layout: 4 dim + 2 m + 2 m0 + 1 max_level + 1 reserved +
-/// 1 has_entry + 1 reserved + 4 entry_point + 8 n_nodes +
-/// 8 n_layers + 2 × 32 CompactVectorMeta + 4 × 8 section
-/// (offset, len) = 128.
-///
-/// No magic, no version — schema identity is carried by the
-/// typed `BlobSchema` handle. Breaking format changes mint a
-/// new schema id.
-const SH25_HEADER_LEN: usize = 128;
-
 /// Content-addressed [`BlobSchema`] marker for the succinct
-/// HNSW blob format — 128 B header + handles + jerky-packed
-/// graph. Embeddings themselves live as separate blobs in the
+/// HNSW blob format — canonical-bytes layout where handles +
+/// graph live in one shared [`anybytes::ByteArea`] and the
+/// [`SuccinctHNSWMeta`] header sits at the suffix. The index
+/// *is* its blob, so [`ToBlob`] is an `O(1)` refcounted clone.
+/// Embeddings themselves still live as separate blobs in the
 /// pile, referenced by handle.
 ///
-/// Schema id minted via `trible genid`:
-/// `A96890DE5F85A4F2285C365549B21BC2`. Any breaking format
-/// change mints a new id (i.e. a new type), so the compiler
-/// rules out mismatched-layout deserialization.
+/// Schema id minted fresh via `trible genid`:
+/// `8DF997D25C15B73EDCEE9E08076F251E`. Any breaking layout
+/// change mints a new id; the compiler treats a different id
+/// as a different type, so readers can't accidentally
+/// deserialize a mismatched layout.
 ///
-/// Retired IDs (bytes in the wild under these tags have the
-/// old layouts and can't be loaded by the current code):
+/// Retired ids (bytes in the wild under these tags can't be
+/// loaded by the current code):
 ///
 /// - `27D71A473EF22DA4D916F61810AC5D86` — carried a keys
 ///   section alongside handles (schema-tagged doc keys). The
@@ -1986,10 +1875,13 @@ const SH25_HEADER_LEN: usize = 128;
 ///   doc↔handle tribles, so the split was dropped.
 /// - `7AFE59E7F895B23F05452FF7919E12E4` — pre-magic/version
 ///   rotation.
+/// - `A96890DE5F85A4F2285C365549B21BC2` — custom 128 B header
+///   layout, retired in favour of the canonical-bytes pattern
+///   (suffix-meta, no custom header at all).
 pub enum SuccinctHNSWBlob {}
 
 impl ConstId for SuccinctHNSWBlob {
-    const ID: Id = id_hex!("A96890DE5F85A4F2285C365549B21BC2");
+    const ID: Id = id_hex!("8DF997D25C15B73EDCEE9E08076F251E");
 }
 
 impl BlobSchema for SuccinctHNSWBlob {}
@@ -1998,13 +1890,14 @@ impl ConstDescribe for SuccinctHNSWBlob {}
 
 impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
-        Blob::new(Bytes::from_source(self.to_bytes()))
+        // Canonical-bytes pattern: refcounted handover.
+        Blob::new(self.bytes.clone())
     }
 }
 
 impl ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
-        (&self).to_blob()
+        Blob::new(self.bytes)
     }
 }
 
@@ -2012,7 +1905,12 @@ impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctHNSWBlob>) -> Result<Self, Self::Error> {
-        SuccinctHNSWIndex::try_from_bytes(blob.bytes.as_ref())
+        let bytes = blob.bytes;
+        let mut tail = bytes.clone();
+        let meta = *tail
+            .view_suffix::<SuccinctHNSWMeta>()
+            .map_err(|_| SuccinctLoadError::BadMeta("suffix"))?;
+        SuccinctHNSWIndex::from_bytes(meta, bytes)
     }
 }
 
@@ -2611,8 +2509,10 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_rejects_short_header() {
+        // Canonical-bytes pattern: too-short bytes can't carry a
+        // valid `SuccinctHNSWMeta` suffix → `BadMeta("suffix")`.
         let err = SuccinctHNSWIndex::try_from_bytes(&[0u8; 10]).unwrap_err();
-        assert_eq!(err, SuccinctLoadError::ShortHeader);
+        assert_eq!(err, SuccinctLoadError::BadMeta("suffix"));
     }
 
     // Magic/version rejection tests retired — `SuccinctHNSWBlob`
@@ -2622,11 +2522,22 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_rejects_truncation() {
+        // Truncating canonical bytes shifts the suffix-meta's
+        // section handles past the end of the available data, so
+        // either the suffix-meta parse fails (`BadMeta`) or one
+        // of the section loaders surfaces `TruncatedSection`.
+        // Either is a load failure.
         let (idx, _, _) = build_succinct_hnsw_sample();
         let bytes = idx.to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
         let err = SuccinctHNSWIndex::try_from_bytes(truncated).unwrap_err();
-        assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
+        assert!(
+            matches!(
+                err,
+                SuccinctLoadError::TruncatedSection(_) | SuccinctLoadError::BadMeta(_),
+            ),
+            "expected TruncatedSection or BadMeta, got {err:?}",
+        );
     }
 
     #[test]

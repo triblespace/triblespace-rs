@@ -10,6 +10,52 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### Canonical-bytes pattern for `SuccinctHNSWIndex` — `to_blob` is O(1)
+
+Same shape as the BM25 commit: `SuccinctHNSWIndex` gains a
+`bytes: Bytes` field, `from_naive` builds every section
+(handles, graph) into one shared `anybytes::ByteArea`, the new
+`SuccinctHNSWMeta` header sits as a typed suffix-section, and
+the area is frozen exactly once. `ToBlob<SuccinctHNSWBlob>` is
+now a refcounted `Bytes::clone` instead of a full graph rebuild.
+
+#### Wire format change — schema id rotated
+
+The custom 128 B header is gone (no more
+`SH25_HEADER_LEN`-shaped scalar+offset preamble). The new
+layout:
+
+```
+[ handles section       ]   FixedBytesTable<32> (in shared area)
+[ graph sections        ]   2 × CompactVector (in shared area)
+[ suffix meta           ]   SuccinctHNSWMeta (zerocopy-readable, 128 B)
+```
+
+`SuccinctHNSWBlob` schema id rotates from
+`A96890DE5F85A4F2285C365549B21BC2` to
+`8DF997D25C15B73EDCEE9E08076F251E` (minted via `trible genid`).
+
+#### Internal changes
+
+- `SuccinctHNSWMeta` zerocopy struct (size statically asserted
+  at 128 bytes — `_pad: [u8; 10]` rounds to a multiple of 8).
+- `SuccinctGraphMeta` reordered (largest-alignment-first) and
+  gained zerocopy derives so it nests cleanly inside
+  `SuccinctHNSWMeta`.
+- `SuccinctHNSWIndex::from_bytes(meta, bytes)` — shared-bytes
+  view reconstruction, used by both `from_naive` and the
+  `TryFromBlob` path.
+- `SuccinctHNSWIndex::meta(&self)` — `O(1)` zerocopy
+  suffix-view of the canonical bytes.
+- `to_bytes` simplified to `self.bytes.as_ref().to_vec()`.
+- Dead code removed: `CompactVectorMetaOnDisk` (last user was
+  the retired HNSW custom header), `SH25_HEADER_LEN`, the
+  `zerocopy::IntoBytes` import.
+
+162 tests still pass; pile_roundtrip's three round-trip tests
+(BM25 round-trip, HNSW round-trip, shared-embedding-blob
+verification) all pass through the new path.
+
 ### Canonical-bytes pattern for `SuccinctBM25Index` — `to_blob` is O(1)
 
 Major architectural shift to mirror `triblespace-core`'s
