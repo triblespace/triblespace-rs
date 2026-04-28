@@ -18,6 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - `team list` audits the pile: per-cap details (issuer → subject,
     PERM_*/branches/expiry — sorted soonest-expiry-first) plus the
     `(revoker, target)` pairs for each verifiable revocation.
+  - `team show --cap HEX` walks one chain end-to-end and prints
+    each level (subject, issuer, scope, expiry, sig blob handle,
+    cap blob handle, signer-matches-issuer check). Bounded by
+    `MAX_DEPTH = 32`; embedded parent sigs at depth N>0 render
+    with the `(embedded in level above)` label rather than a
+    separate handle. The diagnostic deep-dive for "why is this
+    cap rejected" — complements `team list`'s summary view.
 - `pile net sync` / `pile net pull` now read `TRIBLE_TEAM_ROOT` and
   `TRIBLE_TEAM_CAP` env vars for multi-user team operation; without them,
   fall back to single-user team-of-one (`team_root = signing_key.verifying_key()`).

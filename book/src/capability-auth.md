@@ -74,8 +74,19 @@ trible team revoke --pile PATH --team-root-secret HEX --target HEX
     those.
 
 trible team list --pile PATH
-    Audit view: counts of capabilities and revocations in the pile,
-    plus the (revoker, target) pair for each verifiable revocation.
+    Audit summary: per-cap detail line (issuer → subject, scope,
+    expiry — sorted soonest-expiry-first) plus the (revoker,
+    target) pair for each verifiable revocation.
+
+trible team show --pile PATH --cap HEX
+    Walk one chain end-to-end. Prints each level with subject,
+    issuer, scope, expiry, sig blob handle, cap blob handle, and
+    a signer-matches-issuer (`✓` / `✗ MISMATCH`) check. Bounded
+    by MAX_DEPTH=32; chains beyond root render the embedded
+    parent sig as `(embedded in level above)`. Use when `list`
+    shows a cap is present but a connection still fails — `show`
+    surfaces structural mismatches (signer ≠ issuer, missing
+    parent sig fields) that the summary view hides.
 ```
 
 A typical bootstrap flow:
