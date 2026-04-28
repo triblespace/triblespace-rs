@@ -101,9 +101,10 @@ pub enum Command {
     /// (subject, issuer, scope, expiry). Diagnostic deep-dive
     /// for "why is this cap rejected" — `team list` gives
     /// summaries, `team show` gives a single chain's full
-    /// vertical slice. No cryptographic verification — use
-    /// the relay's `OP_AUTH` round-trip via `pile net sync`
-    /// for that.
+    /// vertical slice. The structural walk verifies that each
+    /// link's `signed_by` matches the cap's `cap_issuer`; pass
+    /// `--verify` with the team root pubkey to additionally
+    /// run `verify_chain` for the full cryptographic check.
     Show {
         /// Path to the local pile file.
         #[arg(long)]
@@ -112,6 +113,20 @@ pub enum Command {
         /// The leaf to start the walk from.
         #[arg(long)]
         cap: String,
+        /// Run `verify_chain` against the given team root pubkey
+        /// (hex). Reports the same Ok/Err the relay would see
+        /// at OP_AUTH time. Falls back to env `TRIBLE_TEAM_ROOT`
+        /// when the flag is omitted (matching `pile net sync`'s
+        /// configuration).
+        #[arg(long, env = "TRIBLE_TEAM_ROOT")]
+        verify: Option<String>,
+        /// Subject pubkey the cap is supposed to authorise (hex).
+        /// `verify_chain` checks that the leaf cap's
+        /// `cap_subject` equals this. Defaults to the cap's own
+        /// declared subject — pass explicitly if you want to
+        /// detect a subject-substitution attack.
+        #[arg(long)]
+        expected_subject: Option<String>,
     },
 }
 
@@ -150,7 +165,12 @@ pub fn run(cmd: Command) -> Result<()> {
             target,
         } => run_revoke(pile, team_root_secret, target),
         Command::List { pile } => run_list(pile),
-        Command::Show { pile, cap } => run_show(pile, cap),
+        Command::Show {
+            pile,
+            cap,
+            verify,
+            expected_subject,
+        } => run_show(pile, cap, verify, expected_subject),
     }
 }
 
@@ -702,7 +722,12 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_show(pile_path: PathBuf, cap_hex: String) -> Result<()> {
+fn run_show(
+    pile_path: PathBuf,
+    cap_hex: String,
+    verify_team_root: Option<String>,
+    expected_subject_hex: Option<String>,
+) -> Result<()> {
     use triblespace_core::blob::TryFromBlob;
     use triblespace_core::macros::pattern;
     use triblespace_core::query::find;
@@ -882,6 +907,105 @@ fn run_show(pile_path: PathBuf, cap_hex: String) -> Result<()> {
                 current_signer = next_signer;
                 current_sig_label = "(embedded in level above)".to_string();
                 depth += 1;
+            }
+        }
+    }
+
+    // Optional: full cryptographic verification via verify_chain.
+    if let Some(root_hex) = verify_team_root {
+        println!("== Verification ==");
+        let team_root = parse_pubkey_hex(&root_hex)
+            .map_err(|e| anyhow!("--verify (or TRIBLE_TEAM_ROOT): {e}"))?;
+
+        // Determine which subject to verify against. Default to
+        // the leaf cap's own cap_subject (re-decode it) — matches
+        // what the relay would check against the connecting peer.
+        let leaf_subject: VerifyingKey = match expected_subject_hex {
+            Some(s) => parse_pubkey_hex(&s)
+                .map_err(|e| anyhow!("--expected-subject: {e}"))?,
+            None => {
+                // Re-fetch the leaf sig blob to find what cap it
+                // signs, then extract that cap's subject. Yes,
+                // this is a redundant fetch — verify_chain will
+                // also do it — but it keeps the diagnostic
+                // self-contained and the cost is one blob read.
+                use triblespace_core::blob::TryFromBlob;
+                use triblespace_core::macros::pattern;
+                use triblespace_core::query::find;
+                let leaf_sig_blob: Blob<SimpleArchive> = reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
+                    .map_err(|e| anyhow!("re-fetch leaf sig: {e:?}"))?;
+                let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
+                    .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
+                let raw_iter = find!(
+                    (sig: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+                    pattern!(&leaf_sig_set, [{
+                        ?sig @ capability::sig_signs: ?h
+                    }])
+                );
+                let mut iter = raw_iter.map(|(_sig, h)| (h,));
+                let cap_h: Value<Handle<Blake3, SimpleArchive>> = match iter.next() {
+                    Some((h,)) => h,
+                    None => return Err(anyhow!("leaf sig blob malformed")),
+                };
+                let cap_b: Blob<SimpleArchive> = reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(cap_h)
+                    .map_err(|e| anyhow!("re-fetch leaf cap: {e:?}"))?;
+                let cap_s: TribleSet = TryFromBlob::try_from_blob(cap_b)
+                    .map_err(|e| anyhow!("parse leaf cap: {e:?}"))?;
+                let mut subj_iter = find!(
+                    (e: Id, s: VerifyingKey),
+                    pattern!(&cap_s, [{
+                        ?e @ capability::cap_subject: ?s
+                    }])
+                );
+                match subj_iter.next() {
+                    Some((_e, s)) => s,
+                    None => return Err(anyhow!("leaf cap missing cap_subject")),
+                }
+            }
+        };
+
+        // Build the fetch_blob closure verify_chain expects, backed
+        // by the same pile reader the structural walk used.
+        let fetch = |h: Value<Handle<Blake3, SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+            use triblespace_core::repo::BlobStoreGet;
+            reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(h)
+                .ok()
+        };
+        let revoked: std::collections::HashSet<VerifyingKey> =
+            std::collections::HashSet::new();
+
+        match capability::verify_chain(
+            team_root,
+            leaf_sig,
+            leaf_subject,
+            &revoked,
+            fetch,
+        ) {
+            Ok(verified) => {
+                println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
+                println!("  expected_subject: {}", hex::encode(leaf_subject.to_bytes()));
+                println!("  scope_root:       {:?}", verified.scope_root);
+                println!("  result:           ✓ VERIFIED");
+                println!();
+                println!(
+                    "  This chain WOULD pass `OP_AUTH` against a relay configured \
+                     with the given team root."
+                );
+            }
+            Err(e) => {
+                println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
+                println!("  expected_subject: {}", hex::encode(leaf_subject.to_bytes()));
+                println!("  result:           ✗ FAILED — {e:?}");
+                println!();
+                println!(
+                    "  This is the SAME error the relay would raise on \
+                     `OP_AUTH`. Check that the team root matches what the \
+                     relay was configured with, and that no link in the \
+                     chain has expired or been revoked."
+                );
             }
         }
     }
