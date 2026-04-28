@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] - 2026-04-28
+### Added
+- `team` subcommand group for capability-based team management:
+  - `team create` mints a fresh team root keypair, signs the founder's
+    self-cap with admin scope, prints the team root pubkey + SECRET (to
+    archive offline) + cap handles + the cap's expiry timestamp.
+  - `team invite` issues a sub-cap to a teammate, delegating from the
+    running node's own cap. Optional `--branch <BRANCH_HEX>` (repeatable)
+    restricts the cap to specific branches.
+  - `team revoke` issues a team-root-signed revocation against a pubkey,
+    cascading transitively through any chain involving the revoked key.
+  - `team list` audits the pile: per-cap details (issuer → subject,
+    PERM_*/branches/expiry — sorted soonest-expiry-first) plus the
+    `(revoker, target)` pairs for each verifiable revocation.
+- `pile net sync` / `pile net pull` now read `TRIBLE_TEAM_ROOT` and
+  `TRIBLE_TEAM_CAP` env vars for multi-user team operation; without them,
+  fall back to single-user team-of-one (`team_root = signing_key.verifying_key()`).
+### Changed
+- Pile-sync wire protocol bumped to v4 (`/triblespace/pile-sync/4`):
+  every connection's first stream must be `OP_AUTH` presenting the
+  caller's cap-sig handle; the server walks the chain back to the
+  configured team root and either accepts (subsequent streams gated by
+  the verified cap's scope) or rejects. Branch- and blob-level scope
+  gates: `OP_LIST` / `OP_HEAD` filter by `granted_branches`, while
+  `OP_GET_BLOB` / `OP_CHILDREN` reject blobs outside the reachable set
+  from allowed heads (closes the raw-hash bypass).
+- `team list`'s revocations section surfaces full `(revoker, target)`
+  pairs, not just a count.
+
 ## [0.35.0] - 2026-04-18
 ### Added
 - `pile branch reflog` command to list historical branch head updates (including tombstones) stored in a pile file.
