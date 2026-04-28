@@ -13,6 +13,7 @@ use cli::store::StoreCommand;
 use cli::team::Command as TeamCommand;
 
 #[derive(Parser)]
+#[command(version, about, long_about = None)]
 /// A knowledge graph and meta file system for object stores.
 ///
 enum TribleCli {
