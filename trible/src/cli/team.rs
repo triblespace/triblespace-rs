@@ -483,8 +483,8 @@ fn expiry_upper(
         .map(|(_lower, upper)| upper)
 }
 
-/// Format a permission tag as a short label (PERM_READ/WRITE/ADMIN
-/// or "unknown(<hex>)" for caller-defined tags).
+/// Format a permission tag as a short label (`PERM_READ`/`PERM_WRITE`/
+/// `PERM_ADMIN` or `"unknown(<hex>)"` for caller-defined tags).
 fn perm_label(perm: &Id) -> String {
     if *perm == capability::PERM_READ {
         "PERM_READ".to_string()

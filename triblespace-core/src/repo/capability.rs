@@ -21,10 +21,16 @@
 //!   hash-agnostic across any future Blake3 migration.
 //!
 //! Scope is encoded as tribles inside the cap blob, anchored at
-//! [`cap_scope_root`]. Permissions are tagged via [`metadata::tag`] linking
-//! to constants like [`PERM_READ`], [`PERM_WRITE`], [`PERM_ADMIN`]. Optional
-//! per-resource restrictions like [`scope_branch`] narrow a permission to a
+//! `cap_scope_root`. Permissions are tagged via `metadata::tag` linking
+//! to constants like `PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`. Optional
+//! per-resource restrictions like `scope_branch` narrow a permission to a
 //! specific branch.
+//!
+//! (Names like `cap_scope_root`, `metadata::tag`, `scope_branch`, and
+//! `PERM_*` are spelled in plain code formatting rather than as
+//! intra-doc links because the macro-generated attribute items and
+//! the `id_hex!`-defined constants don't reliably resolve as
+//! rustdoc link targets from a `//!` block.)
 //!
 //! See `docs/sync_relay_auth_design.md` (or the `shared.pile` wiki fragment
 //! titled "Sync Relay Auth Design") for the full design rationale.

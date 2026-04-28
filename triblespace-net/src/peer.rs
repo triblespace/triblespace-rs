@@ -209,7 +209,7 @@ where
     /// local store, and decode it to `T`. Returns `None` if the remote
     /// didn't have it.
     ///
-    /// Mirrors [`BlobStoreGet::get`] in shape — pass a typed handle,
+    /// Mirrors [`BlobStoreGet::get`][bsg] in shape — pass a typed handle,
     /// pick what you want out the other side. Request `Blob<Sch>` for
     /// "just the bytes" with zero decode cost; request `TribleSet`,
     /// `anybytes::View<str>`, etc. for the decoded value.
@@ -217,6 +217,8 @@ where
     /// Unlike [`track`](Self::track), this is a single blob (no
     /// reachable closure traversal) and blocks until the round trip
     /// completes.
+    ///
+    /// [bsg]: triblespace_core::repo::BlobStoreGet::get
     pub fn fetch<T, Sch>(
         &mut self,
         peer: EndpointId,
@@ -475,7 +477,7 @@ where
 
 /// Resolve a branch *name* on a remote peer to its `(Id, head)`.
 ///
-/// Composes [`Peer::list_remote_branches`] and [`Peer::fetch_blob`]:
+/// Composes [`Peer::list_remote_branches`] and [`Peer::fetch`]:
 /// lists the remote's branches, pulls each metadata blob into the local
 /// store, queries for `metadata::name`, fetches the name string blob, and
 /// matches against the requested name. Returns `Ok(None)` if no branch

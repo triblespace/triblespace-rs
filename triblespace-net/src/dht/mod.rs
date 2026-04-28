@@ -2041,10 +2041,12 @@ fn create_node_impl<P: ClientPool>(
 
 // ── ContentDiscovery implementation for iroh-blobs ───────────────────
 
-/// A [`ContentDiscovery`] implementation backed by the iroh DHT.
+/// A [`ContentDiscovery`][cd] implementation backed by the iroh DHT.
 ///
 /// Wraps an [`ApiClient`] and uses Blake3Provider records to discover
 /// which nodes have a given blob.
+///
+/// [cd]: iroh_blobs::api::downloader::ContentDiscovery
 #[derive(Debug, Clone)]
 pub struct DhtContentDiscovery {
     api: api::ApiClient,
