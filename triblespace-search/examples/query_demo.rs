@@ -6,6 +6,7 @@
 //! ```
 
 use triblespace_core::id::Id;
+use triblespace_core::macros::find;
 use triblespace_core::value::schemas::genid::GenId;
 use triblespace_core::value::{ToValue, Value};
 use triblespace_search::bm25::BM25Builder;
@@ -60,17 +61,16 @@ fn main() {
         println!("  {id}  score={score:.3}");
     }
 
-    // Multi-term ranking: filter via `matches`, score precisely
-    // via `score`, sort, truncate.
+    // Multi-term ranking: filter via `matches_text` (tokenises
+    // the query string internally — no `hash_tokens` ceremony),
+    // score precisely via `score_text`, sort, truncate.
     println!("\nquery: 'fragment wiki'");
-    let q = hash_tokens("fragment wiki");
-    let mut hits: Vec<(Id, f32)> = (1u8..=20)
-        .filter_map(|byte| {
-            let id_v: Value<GenId> = (&Id::new([byte; 16])?).to_value();
-            let s = reloaded.score(&id_v, &q);
-            (s > 0.0).then_some((Id::new([byte; 16])?, s))
-        })
-        .collect();
+    let mut hits: Vec<(Id, f32)> = find!(
+        (doc: Id),
+        reloaded.matches_text(doc, "fragment wiki", 0.0)
+    )
+    .map(|(d,)| (d, reloaded.score_text(&(&d).to_value(), "fragment wiki")))
+    .collect();
     hits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (doc, score) in hits.into_iter().take(3) {
         println!("  {doc}  score={score:.3}");
