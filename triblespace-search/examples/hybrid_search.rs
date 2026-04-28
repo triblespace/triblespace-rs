@@ -127,8 +127,9 @@ fn main() {
 
     // The headline query: title contains "graph" AND embedding
     // close to [1,0,0,0] (cos ≥ 0.8). One `find!`, three
-    // constraints joined on `?paper` and `?emb`.
-    let graph_terms = hash_tokens("graph");
+    // constraints joined on `?paper` and `?emb`. `matches_text`
+    // tokenises "graph" internally — no `hash_tokens` ceremony
+    // for a one-shot query like this.
     let floor = 0.8f32;
     println!("\nQuery: title contains 'graph' AND embedding close to [1,0,0,0] (cos ≥ {floor})");
 
@@ -137,7 +138,7 @@ fn main() {
         temp!(
             (emb),
             and!(
-                bm25.matches(paper, &graph_terms, 0.0),
+                bm25.matches_text(paper, "graph", 0.0),
                 pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
                 hnsw_view.similar_to(query_handle, emb, floor)
             )
