@@ -47,10 +47,11 @@ remaining open items are perf/encoding refinements, not architecture.
   the engine filters, same pattern as HNSW's
   `similar`/recompute split.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
-  ids via `FixedBytesTable<16>`, terms via `FixedBytesTable<32>`,
-  doc-lengths + postings via `CompactVector`. Same query
-  surface; SB25 blob format lands directly in a pile via
-  `ToBlob`/`TryFromBlob`.
+  keys via `CompressedUniverse`, terms as a typed
+  `View<[[u8; 32]]>` row table, doc-lengths + postings via
+  `CompactVector`. The index *is* its blob: every section lives
+  in one shared `anybytes::ByteArea`, so `ToBlob`/`TryFromBlob`
+  are O(1) refcounted handovers.
 * **`FlatIndex`**: brute-force exact cosine baseline. Same
   `similar(a, b, score_floor)` constraint as HNSW — useful for
   ground truth and small corpora.
@@ -59,10 +60,10 @@ remaining open items are perf/encoding refinements, not architecture.
   Validated at 1 000 handles / 32-dim against `FlatIndex` at
   ≥ 70 % above-threshold recall.
 * **`SuccinctHNSWIndex`**: jerky-backed zero-copy view — a
-  `FixedBytesTable<32>` of embedding handles plus a CSR graph
-  encoded as two `CompactVector`s. Nodes IS the handle; the
-  caller's doc → embedding mapping lives in their tribles, not
-  here.
+  `View<[[u8; 32]]>` row table of embedding handles plus a CSR
+  graph encoded as two `CompactVector`s, all in one canonical
+  `Bytes`. Nodes IS the handle; the caller's doc → embedding
+  mapping lives in their tribles, not here.
 * **Binary-relation similarity constraint** `similar(a, b,
   score_floor)` produced by the `similar()` method on any
   attached view. `a` and `b` are `Variable<Handle<Blake3,

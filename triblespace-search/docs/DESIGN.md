@@ -109,8 +109,9 @@ Four `u64` fields, 32 bytes each, `#[repr(C)]`. The
 `succinct.rs` lock the size and layout equivalence.
 
 Lookup algorithm:
-1. Binary-search the term in `terms` (FixedBytesTable) → term
-   index *t*.
+1. Binary-search the term in `terms` (typed
+   `View<[[u8; 32]]>` over the canonical bytes — slice's
+   `binary_search`) → term index *t*.
 2. Read `(offsets[t], offsets[t+1])` from the postings offsets
    CompactVector.
 3. For each *i* in that range, read `doc_idx[i]` (a
@@ -179,9 +180,10 @@ Lookup algorithm:
   worth it if ranking drift bites at larger corpora.
 - **Wavelet matrix on the term table** — would let rank/select
   queries hit terms without a linear-compare binary search.
-  For identification-only lookups the current FixedBytesTable
-  binary search is competitive; this unlocks range queries
-  over terms (useful for n-gram prefix scans).
+  For identification-only lookups the current
+  `View<[[u8; 32]]>` slice-binary-search is competitive; the
+  wavelet matrix would unlock range queries over terms (useful
+  for n-gram prefix scans).
 
 ## `SuccinctHNSWIndex` — SH25 blob layout
 

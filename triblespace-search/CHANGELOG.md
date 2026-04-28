@@ -10,6 +10,43 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `FixedBytesTable<N>` retired — switch to `View<[[u8; N]]>` directly
+
+The wrapper type added nothing on top of what `View<[[u8; N]]>`
+already gives via slice methods. With the canonical-bytes
+refactor, the only surface that mattered was reading rows back
+through a `SectionHandle<[u8; N]>`, and `SectionHandle::view(&bytes)`
+returns `View<[[u8; N]]>` directly. The `View` derefs to
+`[[u8; N]]`, so `binary_search`, `get`, `len`, `is_empty`,
+`to_vec` are all native slice methods — no wrapper-type
+forwarding.
+
+What changed:
+
+- `SuccinctBM25Index.terms` and `SuccinctHNSWIndex.handles`
+  field types switch from `FixedBytesTable<32>` to
+  `View<[[u8; 32]]>`. All call sites
+  (`self.terms.binary_search(&term.raw)`,
+  `self.handles.len()`, etc.) keep working — the View-deref
+  routes them through the same slice methods.
+- `pack_byte_table::<N>(sections, rows) -> SectionHandle<[u8; N]>`
+  is the lone remaining helper — a small free function around
+  `sections.reserve::<[u8; N]>` + `copy_from_slice` + `freeze`.
+- `from_bytes` paths use `meta.terms.view(&bytes)?` /
+  `meta.handles.view(&bytes)?` directly — the existing
+  anybytes API.
+- `FixedBytesTable<N>` struct + 4 standalone-API methods
+  (`build`, `build_into`, `from_bytes`, `from_section_handle`)
+  + 5 internal methods (`len`, `is_empty`, `get`,
+  `binary_search`, `to_vec`) all deleted. Two new
+  `pack_byte_table` round-trip tests cover the new helper.
+
+Test count: 162 → 158 (5 `fixed_table_*` tests removed,
+2 `pack_byte_table_*` tests added; one doctest gone with the
+struct). The pile_roundtrip / scale_smoke / engine_integration
+suites all keep passing — the refactor is purely a
+representation switch, no behavior change.
+
 ### Canonical-bytes pattern for `SuccinctHNSWIndex` — `to_blob` is O(1)
 
 Same shape as the BM25 commit: `SuccinctHNSWIndex` gains a

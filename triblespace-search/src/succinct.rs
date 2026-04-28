@@ -36,6 +36,7 @@
 //! ```
 
 use anybytes::area::{SectionHandle, SectionWriter};
+use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
@@ -184,159 +185,28 @@ fn required_width(lens: &[u32]) -> usize {
     }
 }
 
-/// Fixed-row-size table of bytes, zero-copy loaded from a
-/// contiguous [`Bytes`] region.
+/// Reserve a `[u8; N]` section in a caller-owned [`SectionWriter`],
+/// copy the rows in, and return the [`SectionHandle`] needed to
+/// view back into the frozen area's bytes.
 ///
-/// Parameterized on the row width `N`. Used for BM25's doc-id
-/// table (`N = 16`) and term table (`N = 32`). No jerky
-/// compression — each row is already fixed-size and can be
-/// sliced out of the raw bytes with a pointer, which is what
-/// makes this "succinct" at all: the caller's `Bytes` handle is
-/// the ground truth and no data is duplicated into structs.
-///
-/// The caller is responsible for sorting the table at build time
-/// if they want binary-search lookups (see [`Self::binary_search`]).
-///
-/// # Build / view
-///
-/// ```
-/// use triblespace_search::succinct::FixedBytesTable;
-///
-/// let rows = vec![[1u8; 16], [3u8; 16], [7u8; 16]];
-/// let bytes = FixedBytesTable::<16>::build(&rows);
-/// let view = FixedBytesTable::<16>::from_bytes(bytes, rows.len()).unwrap();
-/// assert_eq!(view.binary_search(&[3u8; 16]), Ok(1));
-/// assert_eq!(view.binary_search(&[5u8; 16]), Err(2));
-/// ```
-#[derive(Debug)]
-pub struct FixedBytesTable<const N: usize> {
-    bytes: Bytes,
-    len: usize,
-}
-
-impl<const N: usize> FixedBytesTable<N> {
-    /// Serialize `rows` into a flat `Bytes` buffer. The companion
-    /// [`Self::from_bytes`] reconstructs a view; callers persist
-    /// `rows.len()` out-of-band (e.g., in a BlobHeader).
-    ///
-    /// Standalone path — allocates a fresh `Vec<u8>`. For the
-    /// canonical-bytes pattern (multiple sections sharing one
-    /// [`ByteArea`]) call [`Self::build_into`] with the area's
-    /// writer instead.
-    pub fn build(rows: &[[u8; N]]) -> Bytes {
-        let mut buf = Vec::with_capacity(rows.len() * N);
-        for row in rows {
-            buf.extend_from_slice(row);
-        }
-        Bytes::from_source(buf)
-    }
-
-    /// Reserve a section of `rows.len()` `[u8; N]` slots inside
-    /// the caller-owned [`SectionWriter`], copy the rows in, and
-    /// return the [`SectionHandle`] needed to view back into the
-    /// frozen area's bytes.
-    pub fn build_into(
-        sections: &mut SectionWriter<'_>,
-        rows: &[[u8; N]],
-    ) -> Result<SectionHandle<[u8; N]>, std::io::Error> {
-        let mut sec = sections.reserve::<[u8; N]>(rows.len())?;
-        sec.as_mut_slice().copy_from_slice(rows);
-        let handle = sec.handle();
-        // Flushing through `freeze` ensures the section's writes
-        // are visible when the area is later mmapped read-only.
-        // We discard the returned per-section Bytes — the canonical
-        // view goes through `area.freeze()` + `from_section_handle`.
-        let _ = sec.freeze()?;
-        Ok(handle)
-    }
-
-    /// View `bytes` as `len` rows of `N` bytes each.
-    pub fn from_bytes(bytes: Bytes, len: usize) -> Result<Self, SuccinctDocLensError> {
-        let expected = len
-            .checked_mul(N)
-            .ok_or(SuccinctDocLensError::SizeMismatch {
-                bytes: bytes.len(),
-                expected: usize::MAX,
-            })?;
-        if bytes.len() < expected {
-            return Err(SuccinctDocLensError::SizeMismatch {
-                bytes: bytes.len(),
-                expected,
-            });
-        }
-        Ok(Self { bytes, len })
-    }
-
-    /// View into a frozen [`ByteArea`]'s bytes via the
-    /// [`SectionHandle`] returned by [`Self::build_into`].
-    pub fn from_section_handle(
-        bytes: Bytes,
-        handle: SectionHandle<[u8; N]>,
-    ) -> Result<Self, SuccinctDocLensError> {
-        let end = handle.offset.checked_add(handle.len).ok_or(
-            SuccinctDocLensError::SizeMismatch {
-                bytes: bytes.len(),
-                expected: usize::MAX,
-            },
-        )?;
-        if end > bytes.len() {
-            return Err(SuccinctDocLensError::SizeMismatch {
-                bytes: bytes.len(),
-                expected: end,
-            });
-        }
-        let slice = bytes.slice(handle.offset..end);
-        let len = handle.len / N;
-        Ok(Self { bytes: slice, len })
-    }
-
-    /// Number of rows.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// `true` if the table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Row at position `i`, or `None` if out of range. Zero-copy:
-    /// returns a reference into the backing `Bytes`.
-    pub fn get(&self, i: usize) -> Option<&[u8; N]> {
-        if i >= self.len {
-            return None;
-        }
-        let start = i * N;
-        let end = start + N;
-        // A byte array has trivial alignment, so the slice
-        // directly coerces to `&[u8; N]`.
-        self.bytes[start..end].try_into().ok()
-    }
-
-    /// Binary-search for `needle`. Returns `Ok(index)` if found,
-    /// `Err(insertion_point)` otherwise. Requires the table to be
-    /// sorted at build time.
-    pub fn binary_search(&self, needle: &[u8; N]) -> std::result::Result<usize, usize> {
-        let mut lo = 0;
-        let mut hi = self.len;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            // `.expect` is safe: mid < hi ≤ self.len, and get()
-            // validates against that.
-            let row = self.get(mid).expect("binary search in-bounds");
-            match row.as_slice().cmp(needle.as_slice()) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Ok(mid),
-            }
-        }
-        Err(lo)
-    }
-
-    /// Collect into a `Vec<[u8; N]>` for tests / inspection.
-    pub fn to_vec(&self) -> Vec<[u8; N]> {
-        (0..self.len).map(|i| *self.get(i).unwrap()).collect()
-    }
+/// Used for the doc-key / term / handle tables in BM25 and HNSW.
+/// On the read side, callers reconstruct the table as a
+/// `View<[[u8; N]]>` via `handle.view(&bytes)?` — slice methods
+/// (`len`, `get`, `binary_search`, etc.) do the rest, so no
+/// dedicated wrapper type is needed.
+pub fn pack_byte_table<const N: usize>(
+    sections: &mut SectionWriter<'_>,
+    rows: &[[u8; N]],
+) -> Result<SectionHandle<[u8; N]>, std::io::Error> {
+    let mut sec = sections.reserve::<[u8; N]>(rows.len())?;
+    sec.as_mut_slice().copy_from_slice(rows);
+    let handle = sec.handle();
+    // Flushing through `freeze` ensures the section's writes are
+    // visible when the area is later mmapped read-only. The
+    // returned per-section Bytes is discarded — the canonical
+    // view goes through `area.freeze()` + `handle.view(&bytes)`.
+    let _ = sec.freeze()?;
+    Ok(handle)
 }
 
 /// Per-term posting lists backed by jerky primitives.
@@ -793,7 +663,8 @@ impl SuccinctGraph {
 /// `candidates_above(handle, floor)`), but the graph lives in a
 /// [`SuccinctGraph`] (bit-packed CSR over (layer, node) →
 /// neighbours) and nodes are `Value<Handle<Blake3, Embedding>>`
-/// in a [`FixedBytesTable<32>`]. Embeddings live in the pile's
+/// rows in a [`View<[[u8; 32]]>`] section of the canonical
+/// bytes. Embeddings live in the pile's
 /// blob store, content-addressed — queries resolve handles
 /// through the attached reader at walk time.
 ///
@@ -889,9 +760,11 @@ pub struct SuccinctHNSWIndex {
     /// blob. The node IS the handle — no separate doc-key
     /// identity. Distance evaluations resolve handles through
     /// a caller-supplied [`BlobStoreGet`][g] at query time.
+    /// Backed by a typed [`View<[[u8; 32]]>`] into the canonical
+    /// `bytes` — slice methods do all the work.
     ///
     /// [g]: triblespace_core::repo::BlobStoreGet
-    handles: FixedBytesTable<32>,
+    handles: View<[[u8; 32]]>,
     graph: SuccinctGraph,
 }
 
@@ -924,7 +797,7 @@ impl SuccinctHNSWIndex {
 
         // 1. handles section
         let handle_rows: Vec<RawValue> = idx.handles().iter().map(|h| h.raw).collect();
-        let handles_handle = FixedBytesTable::<32>::build_into(&mut sections, &handle_rows)?;
+        let handles_handle = pack_byte_table::<32>(&mut sections, &handle_rows)?;
 
         // 2. layer-major graph: layer_graph[L][i] = neighbours.
         // Empty lists are fine for nodes not promoted to layer L —
@@ -975,7 +848,9 @@ impl SuccinctHNSWIndex {
         meta: SuccinctHNSWMeta,
         bytes: Bytes,
     ) -> Result<Self, SuccinctLoadError> {
-        let handles = FixedBytesTable::<32>::from_section_handle(bytes.clone(), meta.handles)
+        let handles = meta
+            .handles
+            .view(&bytes)
             .map_err(|_| SuccinctLoadError::TruncatedSection("handles"))?;
         let graph = SuccinctGraph::from_bytes(meta.graph, bytes.clone())
             .map_err(|_| SuccinctLoadError::TruncatedSection("graph"))?;
@@ -1459,14 +1334,18 @@ pub struct SuccinctBM25Index<
     /// per key are always zero; plus real-world ID patterns
     /// share 4-byte fragments across docs. `CompressedUniverse`
     /// frequency-sorts fragments and stores indices via
-    /// DACs-byte — typical 3-5× savings vs. flat `FixedBytesTable`.
+    /// DACs-byte — typical 3-5× savings vs. a flat row table.
     ///
     /// The doc_idx in the postings table is the key's position
     /// in the sorted universe (not insertion order).
     /// `keys.access(code)` decodes back to `RawValue`.
     keys: CompressedUniverse,
     doc_lens: SuccinctDocLens,
-    terms: FixedBytesTable<32>,
+    /// Sorted 32-byte term table. Backed by a typed
+    /// [`View<[[u8; 32]]>`] into the canonical `bytes` — slice
+    /// methods (`binary_search`, `get`, `len`, etc.) work
+    /// directly on it; no wrapper type, no manual offset math.
+    terms: View<[[u8; 32]]>,
     postings: SuccinctPostings,
     avg_doc_len: f32,
     k1: f32,
@@ -1555,7 +1434,7 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
         let mut term_rows: Vec<RawValue> = term_to_tfs.keys().copied().collect();
         term_rows.sort_unstable();
         let n_terms = term_rows.len();
-        let terms_handle = FixedBytesTable::<32>::build_into(&mut sections, &term_rows)
+        let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows)
             .expect("build terms");
 
         // ── 5. per-term scored postings, streamed into the
@@ -1630,7 +1509,9 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
         let doc_lens = SuccinctDocLens::from_bytes(meta.doc_lens, bytes.clone())
             .map_err(|_| SuccinctLoadError::TruncatedSection("doc_lens"))?;
-        let terms = FixedBytesTable::<32>::from_section_handle(bytes.clone(), meta.terms)
+        let terms = meta
+            .terms
+            .view(&bytes)
             .map_err(|_| SuccinctLoadError::TruncatedSection("terms"))?;
         let postings = SuccinctPostings::from_bytes(meta.postings, bytes.clone())
             .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
@@ -1988,53 +1869,42 @@ mod tests {
     }
 
     #[test]
-    fn fixed_table_16_roundtrip() {
-        let rows = vec![[7u8; 16], [3u8; 16], [99u8; 16]];
-        let bytes = FixedBytesTable::<16>::build(&rows);
-        let view = FixedBytesTable::<16>::from_bytes(bytes, rows.len()).unwrap();
-        assert_eq!(view.len(), 3);
-        assert_eq!(view.get(0), Some(&[7u8; 16]));
-        assert_eq!(view.get(2), Some(&[99u8; 16]));
-        assert_eq!(view.get(3), None);
-    }
-
-    #[test]
-    fn fixed_table_32_roundtrip() {
-        let rows = vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
-        let bytes = FixedBytesTable::<32>::build(&rows);
-        let view = FixedBytesTable::<32>::from_bytes(bytes, rows.len()).unwrap();
-        assert_eq!(view.to_vec(), rows);
-    }
-
-    #[test]
-    fn fixed_table_binary_search_finds_term() {
-        // Sorted table of 32-byte terms — what BM25's term table
-        // wants.
-        let mut rows = vec![[5u8; 32], [1u8; 32], [9u8; 32], [3u8; 32]];
+    fn pack_byte_table_round_trip_via_section_handle() {
+        // Canonical-bytes pattern at the smallest level: write a
+        // sorted [u8; 32] section into a fresh ByteArea, freeze
+        // the area, and view the section back through the
+        // returned SectionHandle. Slice methods on the resulting
+        // `View<[[u8; 32]]>` are what BM25's term table and HNSW's
+        // handle table use directly — no wrapper type.
+        let mut rows: Vec<[u8; 32]> =
+            vec![[5u8; 32], [1u8; 32], [9u8; 32], [3u8; 32]];
         rows.sort();
-        let bytes = FixedBytesTable::<32>::build(&rows);
-        let view = FixedBytesTable::<32>::from_bytes(bytes, rows.len()).unwrap();
-        assert_eq!(view.binary_search(&[3u8; 32]), Ok(1));
-        assert_eq!(view.binary_search(&[5u8; 32]), Ok(2));
-        assert_eq!(view.binary_search(&[7u8; 32]), Err(3));
+
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let handle = pack_byte_table::<32>(&mut sections, &rows).unwrap();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+
+        let view: View<[[u8; 32]]> = handle.view(&bytes).unwrap();
+        let view_slice: &[[u8; 32]] = &view;
+        assert_eq!(view_slice.len(), rows.len());
+        assert_eq!(view_slice, rows.as_slice());
+        // Slice methods (binary_search, get, len, is_empty) work
+        // through the View deref — no wrapper-type forwarding.
+        assert_eq!(view_slice.binary_search(&[3u8; 32]), Ok(1));
+        assert_eq!(view_slice.binary_search(&[7u8; 32]), Err(3));
     }
 
     #[test]
-    fn fixed_table_rejects_size_mismatch() {
-        // 3 rows × 16 bytes = 48 bytes; claim 4 rows -> error.
-        let rows = vec![[0u8; 16], [1u8; 16], [2u8; 16]];
-        let bytes = FixedBytesTable::<16>::build(&rows);
-        let err = FixedBytesTable::<16>::from_bytes(bytes, 4).unwrap_err();
-        assert!(matches!(err, SuccinctDocLensError::SizeMismatch { .. }));
-    }
-
-    #[test]
-    fn fixed_table_empty_is_empty() {
-        let bytes = FixedBytesTable::<16>::build(&[]);
-        let view = FixedBytesTable::<16>::from_bytes(bytes, 0).unwrap();
+    fn pack_byte_table_empty_section() {
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let handle = pack_byte_table::<16>(&mut sections, &[]).unwrap();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+        let view: View<[[u8; 16]]> = handle.view(&bytes).unwrap();
         assert!(view.is_empty());
-        assert_eq!(view.get(0), None);
-        assert_eq!(view.binary_search(&[0u8; 16]), Err(0));
     }
 
     #[test]
