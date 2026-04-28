@@ -21,6 +21,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - `pile net sync` / `pile net pull` now read `TRIBLE_TEAM_ROOT` and
   `TRIBLE_TEAM_CAP` env vars for multi-user team operation; without them,
   fall back to single-user team-of-one (`team_root = signing_key.verifying_key()`).
+- `pile net status` diagnostic subcommand: prints the node id, team
+  root, and self_cap that the running peer would present on
+  `OP_AUTH`, annotated with their source ("from TRIBLE_TEAM_ROOT"
+  vs "single-user fallback" vs "NOT SET — remote will reject"). For
+  debugging stuck-auth scenarios in one shot.
 ### Changed
 - Pile-sync wire protocol bumped to v4 (`/triblespace/pile-sync/4`):
   every connection's first stream must be `OP_AUTH` presenting the
