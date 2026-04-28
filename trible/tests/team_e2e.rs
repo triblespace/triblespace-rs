@@ -286,3 +286,118 @@ fn invite_rejects_invalid_issuer_cap() {
         .assert()
         .failure();
 }
+
+#[test]
+fn invite_with_branch_restriction_renders_in_list() {
+    // Mint a team, mint a fresh branch id, invite a peer with
+    // `--branch <id>`. `team list` should surface the cap with a
+    // `branches=[<short-hex>]` suffix proving the scope_branch
+    // triple landed in the cap blob.
+    let dir = tempdir().expect("tempdir");
+    let pile_path = dir.path().join("team.pile");
+    std::fs::File::create(&pile_path).expect("create pile file");
+    let founder_key_path = dir.path().join("founder.key");
+    let invitee_key_path = dir.path().join("invitee.key");
+
+    let create = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "create",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--key",
+            founder_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let (team_root_pubkey, _team_root_secret, founder_cap_sig) =
+        parse_create_output(
+            std::str::from_utf8(&create.get_output().stdout).unwrap(),
+        );
+
+    let identity = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "net",
+            "identity",
+            "--key",
+            invitee_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
+        .expect("identity prints `node:`");
+
+    // Mint a fresh branch id via `trible genid` — same primitive
+    // the user would run interactively when scoping a cap.
+    let genid = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["genid"])
+        .assert()
+        .success();
+    let branch_id = String::from_utf8(genid.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(branch_id.len(), 32, "genid prints a 32-char hex id");
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "invite",
+            "--pile",
+            pile_path.to_str().unwrap(),
+            "--team-root",
+            &team_root_pubkey,
+            "--cap",
+            &founder_cap_sig,
+            "--key",
+            founder_key_path.to_str().unwrap(),
+            "--invitee",
+            &invitee_pubkey,
+            "--scope",
+            "read",
+            "--branch",
+            &branch_id,
+        ])
+        .assert()
+        .success();
+
+    let list = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team",
+            "list",
+            "--pile",
+            pile_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let list_out =
+        String::from_utf8(list.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        list_out.contains("capabilities in pile:  2"),
+        "post-invite has two caps; got:\n{list_out}"
+    );
+    // The branches list shows the first 4 bytes (8 hex chars) of
+    // the branch id. `team list`'s formatter calls `hex::encode`
+    // on a 4-byte slice so the substring lookup is direct.
+    let short_branch = &branch_id.to_lowercase()[..8];
+    assert!(
+        list_out.contains(&format!("branches=[{short_branch}]")),
+        "invitee cap shows branches=[{short_branch}]; got:\n{list_out}",
+    );
+    // PERM_READ should appear on the invitee line; PERM_ADMIN on
+    // the founder line.
+    assert!(
+        list_out.contains("PERM_READ") && list_out.contains("PERM_ADMIN"),
+        "list shows both PERM_READ (invitee) and PERM_ADMIN (founder); got:\n{list_out}",
+    );
+}
