@@ -28,6 +28,17 @@ An abstraction that persists blobs. Implementations back local piles, in-memory
 workspaces, or remote object stores while presenting a common `BlobStore`
 interface that handles hashing, deduplication, and retrieval.
 
+### Capability
+A signed authorisation to act with a specific scope on a triblespace network.
+Each capability is two `SimpleArchive` blobs: a `cap` blob carrying
+`cap_subject` (the pubkey it authorises), `cap_issuer`, `cap_scope_root`, and
+`metadata::expires_at`; and a `sig` blob whose `sig_signs` points at the cap
+blob's handle and carries the issuer's `signed_by` + `signature_r/s`. Caps chain
+off the team root (or off another cap with admin scope) and verify by walking
+back to the configured `team_root`. Holders present the sig blob's handle on
+connection (`OP_AUTH`); the relay enforces the verified scope on every
+subsequent op. See the [Capability Auth](capability-auth.md) chapter.
+
 ### Checkout
 The result of `Workspace::checkout`. A `Checkout` pairs a `TribleSet` with the
 `CommitSet` that produced it. It derefs to `TribleSet` for querying and its
