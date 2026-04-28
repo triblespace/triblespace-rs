@@ -18,7 +18,12 @@ use crate::channel::{NetCommand, NetEvent};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 
-/// Configuration for the host thread.
+/// Configuration for [`Peer::new`](crate::peer::Peer::new). No
+/// `Default` impl — auth is mandatory in protocol v4 so every peer
+/// construction site must explicitly choose a team root. For solo
+/// workflows the convention is `team_root = signing_key.verifying_key()`
+/// (the user is the team root and the founder of a team-of-one);
+/// see the `Peer` struct's doctest for the full pattern.
 pub struct PeerConfig {
     /// Peers to connect to (used for both gossip and DHT bootstrap).
     pub peers: Vec<EndpointId>,
