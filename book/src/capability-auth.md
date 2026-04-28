@@ -78,7 +78,7 @@ trible team list --pile PATH
     expiry — sorted soonest-expiry-first) plus the (revoker,
     target) pair for each verifiable revocation.
 
-trible team show --pile PATH --cap HEX
+trible team show --pile PATH --cap HEX [--verify TEAM_ROOT_HEX]
     Walk one chain end-to-end. Prints each level with subject,
     issuer, scope, expiry, sig blob handle, cap blob handle, and
     a signer-matches-issuer (`✓` / `✗ MISMATCH`) check. Bounded
@@ -87,6 +87,15 @@ trible team show --pile PATH --cap HEX
     shows a cap is present but a connection still fails — `show`
     surfaces structural mismatches (signer ≠ issuer, missing
     parent sig fields) that the summary view hides.
+
+    `--verify <TEAM_ROOT_HEX>` (or env `TRIBLE_TEAM_ROOT`)
+    additionally runs `verify_chain` against the given team root
+    and reports `✓ VERIFIED` or `✗ FAILED — <VerifyError>` —
+    the same code path the relay's `OP_AUTH` uses, so the
+    result is the local-side rehearsal of what a real connection
+    attempt would produce. Add `--expected-subject HEX` to
+    override the default subject check (the leaf cap's declared
+    `cap_subject`) for subject-substitution-attack detection.
 ```
 
 A typical bootstrap flow:

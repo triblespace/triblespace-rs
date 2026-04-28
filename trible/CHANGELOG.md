@@ -25,6 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
     with the `(embedded in level above)` label rather than a
     separate handle. The diagnostic deep-dive for "why is this
     cap rejected" — complements `team list`'s summary view.
+  - `team show --verify <PUBKEY_HEX>` runs `verify_chain` against
+    the given team root and prints `✓ VERIFIED` or `✗ FAILED —
+    <VerifyError>`. The same code path the relay's `OP_AUTH`
+    uses, so the result mirrors what a real connection attempt
+    would see. Reads `TRIBLE_TEAM_ROOT` env var by default;
+    `--expected-subject` overrides the default check (leaf cap's
+    own subject) for subject-substitution-attack detection.
 - `pile net sync` / `pile net pull` now read `TRIBLE_TEAM_ROOT` and
   `TRIBLE_TEAM_CAP` env vars for multi-user team operation; without them,
   fall back to single-user team-of-one (`team_root = signing_key.verifying_key()`).

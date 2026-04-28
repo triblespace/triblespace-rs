@@ -523,3 +523,109 @@ fn show_walks_chain_end_to_end() {
         "signer ✓ appears at each level (length-2 → 2 ticks); got:\n{chain_out}"
     );
 }
+
+#[test]
+fn show_verify_pass_and_fail() {
+    // Build a team and an invitee cap, then run `team show
+    // --verify <team-root>` for both the correct team-root
+    // (should print ✓ VERIFIED) and a deliberately-wrong
+    // all-zeros pubkey (should print ✗ FAILED with the
+    // VerifyError variant straight from the library).
+    let dir = tempdir().expect("tempdir");
+    let pile_path = dir.path().join("team.pile");
+    std::fs::File::create(&pile_path).expect("create pile file");
+    let founder_key_path = dir.path().join("founder.key");
+    let invitee_key_path = dir.path().join("invitee.key");
+
+    let create = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team", "create",
+            "--pile", pile_path.to_str().unwrap(),
+            "--key", founder_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let (team_root_pubkey, _, founder_cap_sig) = parse_create_output(
+        std::str::from_utf8(&create.get_output().stdout).unwrap(),
+    );
+
+    let identity = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile", "net", "identity",
+            "--key", invitee_key_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let invitee_pubkey = String::from_utf8(identity.get_output().stdout.clone())
+        .unwrap()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("node:").map(|s| s.trim().to_string()))
+        .expect("identity prints `node:`");
+
+    let invite = Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "team", "invite",
+            "--pile", pile_path.to_str().unwrap(),
+            "--team-root", &team_root_pubkey,
+            "--cap", &founder_cap_sig,
+            "--key", founder_key_path.to_str().unwrap(),
+            "--invitee", &invitee_pubkey,
+            "--scope", "read",
+        ])
+        .assert()
+        .success();
+    let invitee_cap_sig = parse_invite_output(
+        std::str::from_utf8(&invite.get_output().stdout).unwrap(),
+    );
+
+    // PASS: real team root.
+    let pass = Command::cargo_bin("trible")
+        .unwrap()
+        .env_remove("TRIBLE_TEAM_ROOT")
+        .args([
+            "team", "show",
+            "--pile", pile_path.to_str().unwrap(),
+            "--cap", &invitee_cap_sig,
+            "--verify", &team_root_pubkey,
+        ])
+        .assert()
+        .success();
+    let pass_out = String::from_utf8(pass.get_output().stdout.clone()).unwrap();
+    assert!(
+        pass_out.contains("== Verification ==")
+            && pass_out.contains("✓ VERIFIED"),
+        "verify against the real team root prints ✓ VERIFIED; got:\n{pass_out}"
+    );
+    assert!(
+        pass_out.contains("WOULD pass `OP_AUTH`"),
+        "VERIFIED block names the parity with relay OP_AUTH; got:\n{pass_out}"
+    );
+
+    // FAIL: all-zeros team root — chain doesn't terminate at it,
+    // verify_chain bottoms out with NonRootMissingParent.
+    let zero_root = "0".repeat(64);
+    let fail = Command::cargo_bin("trible")
+        .unwrap()
+        .env_remove("TRIBLE_TEAM_ROOT")
+        .args([
+            "team", "show",
+            "--pile", pile_path.to_str().unwrap(),
+            "--cap", &invitee_cap_sig,
+            "--verify", &zero_root,
+        ])
+        .assert()
+        .success();
+    let fail_out = String::from_utf8(fail.get_output().stdout.clone()).unwrap();
+    assert!(
+        fail_out.contains("== Verification ==")
+            && fail_out.contains("✗ FAILED"),
+        "verify against all-zeros team root prints ✗ FAILED; got:\n{fail_out}"
+    );
+    assert!(
+        fail_out.contains("SAME error the relay would raise"),
+        "FAILED block names the relay-parity message; got:\n{fail_out}"
+    );
+}
