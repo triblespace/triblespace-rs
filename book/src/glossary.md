@@ -123,6 +123,24 @@ map the fixed 32-byte payload of a trible to native types, while blob schemas
 describe arbitrarily long payloads so tribles referencing those blobs stay
 portable.
 
+### Scope
+The set of permissions a [Capability](#capability) grants. Encoded as tribles
+hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
+triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
+`scope_branch: <branch_id>` triples that restrict the permission to specific
+branches. An empty branch-restriction set means "every branch within the
+permission set." Sub-capabilities issued via delegation must have a scope that
+is a subset of the parent's; the verifier enforces this via `scope_subsumes`
+during chain walk.
+
+### Team Root
+The single immutable keypair that anchors a triblespace network's
+[capability](#capability) chain. Generated once at team creation, used to sign
+exactly one capability (the founder's), and then archived offline — the team
+root never operates online. Like a CA: bootstrapping authority, not runtime
+authority. The relay hard-codes the team root pubkey via
+`PeerConfig.team_root` and rejects any cap chain that doesn't terminate at it.
+
 ### Trible
 A three-part tuple of entity, attribute, and value stored in a fixed 64-byte
 layout. Tribles capture atomic facts, and query engines compose them into joins
