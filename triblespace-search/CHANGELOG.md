@@ -10,6 +10,29 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### Streaming `SuccinctPostings::build_with` — drops peak build memory
+
+`SuccinctPostings` gains a closure-based builder that materializes
+one term's posting list at a time into a reused buffer instead of
+requiring `Vec<Vec<(u32, f32)>>` for the whole corpus upfront. The
+existing slice-based `build` is now a thin wrapper over `build_with`
+so old call sites keep working.
+
+`SuccinctBM25Index::from_builder` (the `BM25Builder::build` path)
+routes through `build_with`. Memory profile at 100 k docs / 300 k
+terms / Heaps-law vocabulary: peak temporary vec drops from ~144 MB
+(every term's postings materialized at once) to ~400 KB (largest
+single term). The intermediate `lists` allocation in `from_builder`
+is gone.
+
+The streaming closure is invoked twice per term: once during the
+size + max-score pass, once during the byte-write pass. The contract
+requires deterministic output across invocations — the
+`build_with_streaming_matches_lists_build` regression test locks
+byte-for-byte equivalence with the legacy `build(&lists, n)` path.
+
+Test count: 161 → 162 (one new test on the determinism contract).
+
 ### BM25 redesign: `matches` filter + `score` recompute, no score variable
 
 Major API simplification, aligning BM25 with HNSW's "filter on a

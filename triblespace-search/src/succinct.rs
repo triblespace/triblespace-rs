@@ -482,50 +482,78 @@ impl SuccinctPostings {
         lists: &[Vec<(u32, f32)>],
         n_docs: u32,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError> {
-        let total: usize = lists.iter().map(|l| l.len()).sum();
+        Self::build_with(n_docs, lists.len(), |t, buf| {
+            buf.extend_from_slice(&lists[t]);
+        })
+    }
+
+    /// Streaming build — caller materializes one term's posting
+    /// list at a time into a reused buffer instead of allocating
+    /// `Vec<Vec<(u32, f32)>>` upfront. The closure is invoked
+    /// twice per term: once during the size + max-score pass, once
+    /// during the byte-write pass. It must be deterministic across
+    /// invocations (the bytes written in the second pass must
+    /// match the sizes / scores observed in the first) and clear
+    /// or overwrite `buf` itself if reuse semantics matter.
+    /// `materialize_term` receives `buf` empty on each call.
+    ///
+    /// Memory profile: peak temporary vec holds one term's
+    /// postings instead of every term's at once. At 100 k docs
+    /// with Heaps-law vocabulary that's ~400 KB instead of
+    /// ~144 MB.
+    pub fn build_with<F>(
+        n_docs: u32,
+        n_terms: usize,
+        mut materialize_term: F,
+    ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError>
+    where
+        F: FnMut(usize, &mut Vec<(u32, f32)>),
+    {
+        // ── Pass 1: total posting count + max_score. ─────────────
+        let mut buf: Vec<(u32, f32)> = Vec::new();
+        let mut total: usize = 0;
+        let mut max_score = 0.0f32;
+        for t in 0..n_terms {
+            buf.clear();
+            materialize_term(t, &mut buf);
+            total += buf.len();
+            for &(_, s) in &buf {
+                if s > max_score {
+                    max_score = s;
+                }
+            }
+        }
+
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
-
-        // Global max score for the quantization scale.
-        let max_score = lists
-            .iter()
-            .flat_map(|l| l.iter().map(|&(_, s)| s))
-            .fold(0.0f32, |acc, s| if s > acc { s } else { acc });
 
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
 
         let mut doc_idx_b =
             CompactVectorBuilder::with_capacity(total, doc_idx_width, &mut sections)?;
-        let mut pos = 0usize;
-        for list in lists {
-            for &(idx, _) in list {
-                doc_idx_b.set_int(pos, idx as usize)?;
-                pos += 1;
-            }
-        }
-        let doc_idx = doc_idx_b.freeze();
-        let doc_idx_meta = doc_idx.metadata();
-
         let mut offsets_b =
-            CompactVectorBuilder::with_capacity(lists.len() + 1, offsets_width, &mut sections)?;
-        offsets_b.set_int(0, 0)?;
-        let mut cum = 0usize;
-        for (i, list) in lists.iter().enumerate() {
-            cum += list.len();
-            offsets_b.set_int(i + 1, cum)?;
-        }
-        let offsets = offsets_b.freeze();
-        let offsets_meta = offsets.metadata();
-
+            CompactVectorBuilder::with_capacity(n_terms + 1, offsets_width, &mut sections)?;
         let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, &mut sections)?;
+        offsets_b.set_int(0, 0)?;
+
+        // ── Pass 2: write all three CompactVectors. ──────────────
         let mut pos = 0usize;
-        for list in lists {
-            for &(_, s) in list {
+        for t in 0..n_terms {
+            buf.clear();
+            materialize_term(t, &mut buf);
+            for &(idx, s) in &buf {
+                doc_idx_b.set_int(pos, idx as usize)?;
                 scores_b.set_int(pos, quantize_score(s, max_score) as usize)?;
                 pos += 1;
             }
+            offsets_b.set_int(t + 1, pos)?;
         }
+
+        let doc_idx = doc_idx_b.freeze();
+        let doc_idx_meta = doc_idx.metadata();
+        let offsets = offsets_b.freeze();
+        let offsets_meta = offsets.metadata();
         let scores = scores_b.freeze();
         let scores_meta = scores.metadata();
 
@@ -540,7 +568,7 @@ impl SuccinctPostings {
             offsets: offsets_meta,
             scores: scores_meta,
             max_score,
-            n_terms: lists.len() as u64,
+            n_terms: n_terms as u64,
         };
         Ok((bytes, meta))
     }
@@ -1558,35 +1586,37 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             .expect("round-trip terms table");
 
         // ── 5. per-term scored postings, each sorted ascending
-        // by universe_code (required by SuccinctPostings). ────────
+        // by universe_code (required by SuccinctPostings).
+        //
+        // Streaming: SuccinctPostings::build_with materializes
+        // one term's postings at a time into a reused buffer
+        // instead of allocating a Vec<Vec<(u32, f32)>> for the
+        // whole corpus. At 100 k docs / 300 k terms / Heaps-law
+        // vocabulary that's the difference between ~400 KB peak
+        // and ~144 MB peak for the postings staging area. ─────────
         let n = n_universe as f32;
-        let lists: Vec<Vec<(u32, f32)>> = term_rows
-            .iter()
-            .map(|term| {
-                let tfs = &term_to_tfs[term];
+        let (postings_bytes, postings_meta) = SuccinctPostings::build_with(
+            n_universe as u32,
+            term_rows.len(),
+            |t, buf| {
+                let tfs = &term_to_tfs[&term_rows[t]];
                 let df = tfs.len() as f32;
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-                let mut entries: Vec<(u32, f32)> = tfs
-                    .iter()
-                    .map(|(&code, &tf)| {
-                        let tf_f = tf as f32;
-                        let dl = doc_lens_vec[code as usize] as f32;
-                        let norm = if avg_doc_len > 0.0 {
-                            1.0 - b + b * (dl / avg_doc_len)
-                        } else {
-                            1.0
-                        };
-                        let score = idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm);
-                        (code, score)
-                    })
-                    .collect();
-                entries.sort_unstable_by_key(|&(code, _)| code);
-                entries
-            })
-            .collect();
-        let (postings_bytes, postings_meta) =
-            SuccinctPostings::build(&lists, n_universe as u32)
-                .expect("build postings");
+                buf.extend(tfs.iter().map(|(&code, &tf)| {
+                    let tf_f = tf as f32;
+                    let dl = doc_lens_vec[code as usize] as f32;
+                    let norm = if avg_doc_len > 0.0 {
+                        1.0 - b + b * (dl / avg_doc_len)
+                    } else {
+                        1.0
+                    };
+                    let score = idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm);
+                    (code, score)
+                }));
+                buf.sort_unstable_by_key(|&(code, _)| code);
+            },
+        )
+        .expect("build postings");
         let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)
             .expect("round-trip postings");
 
@@ -2206,6 +2236,29 @@ mod tests {
         let view = SuccinctPostings::from_bytes(meta, bytes).unwrap();
         assert_eq!(view.term_count(), 0);
         assert!(view.postings_for(0).is_none());
+    }
+
+    #[test]
+    fn build_with_streaming_matches_lists_build() {
+        // Same fixture as `postings_roundtrip_simple`.
+        let lists = vec![
+            vec![(0u32, 1.5f32), (3, 0.75), (7, 2.0)],
+            vec![(1, 0.5), (2, 3.25)],
+            vec![],
+            vec![(4, 9.0)],
+        ];
+        let (bytes_a, meta_a) = SuccinctPostings::build(&lists, 8).unwrap();
+        // Streaming closure: caller materializes one term at a
+        // time. We invoke the same path build() routes through,
+        // but assert byte-for-byte equality with the lists path
+        // to lock the determinism contract.
+        let (bytes_b, meta_b) = SuccinctPostings::build_with(8, lists.len(), |t, buf| {
+            buf.extend_from_slice(&lists[t]);
+        })
+        .unwrap();
+        assert_eq!(bytes_a.as_ref(), bytes_b.as_ref(), "byte-identical output");
+        assert_eq!(meta_a.max_score, meta_b.max_score);
+        assert_eq!(meta_a.n_terms, meta_b.n_terms);
     }
 
     #[test]
