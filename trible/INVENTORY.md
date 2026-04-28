@@ -6,7 +6,6 @@
 ## Desired Functionality
 - Inspection utilities for listing entities, attributes, and relations, with optional filtering.
 - Progress reporting for blob transfers and other long-running operations.
-- `team show <cap-sig-handle>` — walk the chain back to the team root and print each level (subject, issuer, scope, expiry) for diagnostic deep-dive on a single capability. Complements `team list` (per-cap summaries) by exposing chain depth + per-link verification status.
 - Custom maximum pile size when creating piles.
 - Consolidate shared blob-handling logic across `pile` and `store` commands.
 - Centralize branch ID resolution helpers across CLI commands.
