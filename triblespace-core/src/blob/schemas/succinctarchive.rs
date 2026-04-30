@@ -344,6 +344,45 @@ where
         })
     }
 
+    /// Like [`enumerate_domain`], but bounded to the half-open code range
+    /// `[code_range.start, code_range.end)`. Output-sensitive: iterates
+    /// only over codes that actually appear in `prefix` *and* fall within
+    /// the range. Empty groups are skipped via the `select1`-based stride.
+    ///
+    /// Combined with [`Universe::search_range`], this gives O(K) range
+    /// proposals where K = distinct codes-in-range that have at least one
+    /// occurrence on the indexed axis.
+    pub fn enumerate_domain_in_range<'a>(
+        &'a self,
+        prefix: &'a BitVector<Rank9SelIndex>,
+        code_range: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = RawValue> + 'a {
+        let zero_count_total = prefix.num_bits() - (self.domain.len() + 1);
+        let end_code = code_range.end;
+        // Seek to the first 0-bit (first trible) at or after `code_range.start`'s
+        // group boundary. select1(start) is the position of the start-code's
+        // group's leading 1-bit; rank0 of that position is the trible-index of
+        // the first trible whose code >= start.
+        let mut z = if code_range.start >= self.domain.len() + 1 {
+            zero_count_total
+        } else {
+            let start_pos = prefix.select1(code_range.start).unwrap();
+            prefix.rank0(start_pos).unwrap()
+        };
+        std::iter::from_fn(move || {
+            if z >= zero_count_total {
+                return None;
+            }
+            let pos = prefix.select0(z).unwrap();
+            let id = prefix.rank1(pos).unwrap() - 1;
+            if id >= end_code {
+                return None;
+            }
+            z = prefix.rank0(prefix.select1(id + 1).unwrap()).unwrap();
+            Some(self.domain.access(id))
+        })
+    }
+
     /// Returns the serialization metadata header for this archive.
     pub fn meta(&self) -> SuccinctArchiveMeta<U::Meta>
     where

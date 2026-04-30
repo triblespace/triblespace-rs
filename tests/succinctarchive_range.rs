@@ -99,10 +99,15 @@ fn value_in_range_proposes_correctly() {
 }
 
 #[test]
-fn estimate_counts_distinct_v_position_codes() {
-    // Three distinct scores in V position, each shared by multiple
-    // entities. The estimate should report 3 (codes in V) regardless of
-    // how many tribles point at them.
+fn estimate_is_universe_code_range_upper_bound() {
+    // The cardinality estimate is the *upper bound*: the count of
+    // universe codes whose byte-lex value falls in [min, max], not
+    // restricted to those that appear in V position. That's an O(1)
+    // cached value; the V-position filter happens during propose.
+    //
+    // The estimate must always be >= the actual distinct V-codes that
+    // would be proposed. For three distinct V-position codes (10, 50,
+    // 90) all in the range [0, 100], the estimate must be >= 3.
     let v10: Value<R256BE> = 10i128.to_value();
     let v50: Value<R256BE> = 50i128.to_value();
     let v90: Value<R256BE> = 90i128.to_value();
@@ -125,10 +130,20 @@ fn estimate_counts_distinct_v_position_codes() {
     let max: Value<R256BE> = 100i128.to_value();
     let constraint = archive.value_in_range(v, min, max);
 
-    let estimate = constraint.estimate(v.index, &Default::default());
+    let estimate = constraint
+        .estimate(v.index, &Default::default())
+        .expect("estimate is Some for the V variable");
+    assert!(
+        estimate >= 3,
+        "estimate must upper-bound actual V-codes-in-range; got {estimate}, need >= 3"
+    );
+    // Verify propose enumerates exactly the 3 distinct V values.
+    use triblespace::core::query::Binding;
+    let mut proposals = Vec::new();
+    constraint.propose(v.index, &Binding::default(), &mut proposals);
     assert_eq!(
-        estimate,
-        Some(3),
-        "estimate must count distinct V-position codes in range"
+        proposals.len(),
+        3,
+        "propose must yield exactly the V-position codes in range"
     );
 }

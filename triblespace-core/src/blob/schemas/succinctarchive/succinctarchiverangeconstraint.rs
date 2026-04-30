@@ -7,23 +7,27 @@ use crate::query::VariableSet;
 use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
-use jerky::bit_vector::Select;
 
 /// Value-range constraint for [`SuccinctArchive`].
 ///
-/// Mirrors [`TribleSetRangeConstraint`](crate::trible::tribleset::triblesetrangeconstraint::TribleSetRangeConstraint)
-/// but operates on the archive's universe + V-axis prefix vector. The
-/// universe's [`Universe::search_range`] returns the half-open code
-/// range whose values fall in `[min, max]`; for each such code we
-/// check the V-axis prefix vector to verify the code actually appears
-/// in V position before emitting it as a proposal.
+/// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
+/// The implementation leans on two archive primitives:
 ///
-/// Selectivity: with an `OrderedUniverse` the universe lookup is
-/// O(log n) (two binary searches); the per-code V-position check is
-/// O(1) via the bit vector's `select1`. Total propose cost is
-/// O(log n + k) where k = codes in the range that appear in V.
+/// - [`Universe::search_range`] turns the inclusive value range
+///   `[min, max]` into a half-open code range `[lo, hi)` in O(log n).
+///   This works because [`Universe`] guarantees value-ordered codes.
+/// - [`SuccinctArchive::enumerate_domain_in_range`] walks only the codes
+///   that actually appear on the indexed axis (here: V) within `[lo, hi)`,
+///   skipping empty groups via the same `select1` stride that powers the
+///   unbounded [`enumerate_domain`].
 ///
-/// Use via [`SuccinctArchive::value_in_range`]:
+/// Total propose cost is O(log n + K) where K is the count of distinct
+/// V-position codes whose values fall in the range. The `cached_estimate`
+/// is the upper bound `hi - lo` (codes in range, before V-presence
+/// filtering) — computed once at construction in O(log n) and returned
+/// in O(1) at planning time.
+///
+/// # Example
 ///
 /// ```rust,ignore
 /// find!(ts: Value<NsTAIInterval>,
@@ -41,9 +45,9 @@ where
     min: RawValue,
     max: RawValue,
     archive: &'a SuccinctArchive<U>,
-    /// Cached estimate: count of distinct universe codes in
-    /// `[lo, hi)` that have at least one occurrence in the V column.
-    /// Computed at construction so `estimate` is O(1) at query time.
+    /// Cached upper-bound estimate: width of the universe code range
+    /// covering `[min, max]`. Computed once at construction so
+    /// `estimate` is O(1) at planning time.
     cached_estimate: usize,
 }
 
@@ -57,7 +61,10 @@ where
         max: Value<V>,
         archive: &'a SuccinctArchive<U>,
     ) -> Self {
-        let cached_estimate = code_range_v_count(archive, &min.raw, &max.raw);
+        // O(log n) range lookup once at construction; query-time estimate
+        // is just the cached width.
+        let code_range = archive.domain.search_range(&min.raw, &max.raw);
+        let cached_estimate = code_range.end.saturating_sub(code_range.start);
         SuccinctArchiveRangeConstraint {
             variable_v: variable_v.index,
             min: min.raw,
@@ -66,44 +73,6 @@ where
             cached_estimate,
         }
     }
-}
-
-/// Counts universe codes in `[min, max]` that have at least one
-/// trible in V position. Used for both the cached estimate and
-/// (logically) the propose enumeration.
-fn code_range_v_count<U>(archive: &SuccinctArchive<U>, min: &RawValue, max: &RawValue) -> usize
-where
-    U: Universe,
-{
-    let code_range = archive.domain.search_range(min, max);
-    let mut count = 0;
-    for code in code_range {
-        if v_position_count(archive, code) > 0 {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Number of tribles whose V-position universe code equals `code`.
-/// Returns 0 if the code never appears as a value.
-fn v_position_count<U>(archive: &SuccinctArchive<U>, code: usize) -> usize
-where
-    U: Universe,
-{
-    // The v_a bit vector is unary-encoded group sizes for the V column:
-    // select1(code) marks the boundary between code-1 and code, so
-    // (select1(code+1) - (code+1)) - (select1(code) - code) is the
-    // count of tribles whose V-code equals `code`.
-    let lo = match archive.v_a.select1(code) {
-        Some(p) => p - code,
-        None => return 0,
-    };
-    let hi = match archive.v_a.select1(code + 1) {
-        Some(p) => p - (code + 1),
-        None => return 0,
-    };
-    hi.saturating_sub(lo)
 }
 
 impl<'a, U> Constraint<'a> for SuccinctArchiveRangeConstraint<'a, U>
@@ -126,11 +95,10 @@ where
             return;
         }
         let code_range = self.archive.domain.search_range(&self.min, &self.max);
-        for code in code_range {
-            if v_position_count(self.archive, code) > 0 {
-                proposals.push(self.archive.domain.access(code));
-            }
-        }
+        proposals.extend(
+            self.archive
+                .enumerate_domain_in_range(&self.archive.v_a, code_range),
+        );
     }
 
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {

@@ -34,6 +34,11 @@ pub trait Universe: Serializable {
     }
 
     /// Returns the raw value at integer code `pos`.
+    ///
+    /// Implementations promise that `access` is *monotonic in `pos`*:
+    /// if `i < j` and both are valid codes, then `access(i) <= access(j)`
+    /// in byte-lexicographic order. This is what makes [`search`] and
+    /// [`search_range`] log-time over the universe size.
     fn access(&self, pos: usize) -> RawValue;
     /// Returns the integer code for `v`, or `None` if absent.
     fn search(&self, v: &RawValue) -> Option<usize>;
@@ -47,31 +52,45 @@ pub trait Universe: Serializable {
     /// `lo <= code < hi`, `access(code)` is in the inclusive value range
     /// `[min, max]`. An empty range (`lo == hi`) means no values match.
     ///
-    /// The default implementation linearly scans every code via [`access`]
-    /// and is correct for any [`Universe`]. Implementations whose code
-    /// ordering matches value ordering should override this with an
-    /// O(log n) lookup — see [`OrderedUniverse::search_range`].
+    /// The default implementation does two binary searches via [`access`]
+    /// — O(log n) on the universe size, given the monotonicity promise on
+    /// [`access`]. Implementations with a flat sorted slice should override
+    /// to skip the virtual-call overhead.
     fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
-        if min > max {
+        if min > max || self.is_empty() {
             return 0..0;
         }
+        // Two partition points via access. Both monotonic in code.
         let n = self.len();
-        let mut lo = n;
-        let mut hi = 0;
-        for code in 0..n {
-            let v = self.access(code);
-            if v >= *min && v <= *max {
-                if code < lo {
-                    lo = code;
+        // First code whose value is >= min.
+        let lo = {
+            let mut lo = 0usize;
+            let mut hi = n;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.access(mid) < *min {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
                 }
-                hi = code + 1;
             }
-        }
-        if lo >= hi {
-            0..0
-        } else {
-            lo..hi
-        }
+            lo
+        };
+        // First code whose value is > max.
+        let hi = {
+            let mut lo2 = lo;
+            let mut hi2 = n;
+            while lo2 < hi2 {
+                let mid = lo2 + (hi2 - lo2) / 2;
+                if self.access(mid) <= *max {
+                    lo2 = mid + 1;
+                } else {
+                    hi2 = mid;
+                }
+            }
+            lo2
+        };
+        lo..hi
     }
 }
 
