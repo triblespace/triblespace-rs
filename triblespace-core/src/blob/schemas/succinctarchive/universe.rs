@@ -48,49 +48,61 @@ pub trait Universe: Serializable {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Returns the smallest code `c` such that `access(c) >= v`, or
+    /// `len()` if every value is `< v`. Equivalent to a `lower_bound` /
+    /// `partition_point(|x| x < v)` on the value-ordered code domain.
+    ///
+    /// The default implementation does one binary search via [`access`]
+    /// — O(log n) on the universe size, given the monotonicity promise on
+    /// [`access`]. Implementations with a flat sorted slice should override
+    /// to skip the virtual-call overhead.
+    fn search_lower(&self, v: &RawValue) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.access(mid) < *v {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Returns the smallest code `c` such that `access(c) > v`, or
+    /// `len()` if every value is `<= v`. Equivalent to an `upper_bound` /
+    /// `partition_point(|x| x <= v)` on the value-ordered code domain.
+    ///
+    /// The default implementation does one binary search via [`access`]
+    /// — O(log n) on the universe size, given the monotonicity promise on
+    /// [`access`]. Implementations with a flat sorted slice should override
+    /// to skip the virtual-call overhead.
+    fn search_upper(&self, v: &RawValue) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.access(mid) <= *v {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Returns the half-open code range `[lo, hi)` such that for every
     /// `lo <= code < hi`, `access(code)` is in the inclusive value range
     /// `[min, max]`. An empty range (`lo == hi`) means no values match.
     ///
-    /// The default implementation does two binary searches via [`access`]
-    /// — O(log n) on the universe size, given the monotonicity promise on
-    /// [`access`]. Implementations with a flat sorted slice should override
-    /// to skip the virtual-call overhead.
+    /// Composes [`search_lower`] and [`search_upper`]; override only if a
+    /// fused implementation can beat two independent binary searches.
     fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
-        if min > max || self.is_empty() {
+        if min > max {
             return 0..0;
         }
-        // Two partition points via access. Both monotonic in code.
-        let n = self.len();
-        // First code whose value is >= min.
-        let lo = {
-            let mut lo = 0usize;
-            let mut hi = n;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if self.access(mid) < *min {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
-        // First code whose value is > max.
-        let hi = {
-            let mut lo2 = lo;
-            let mut hi2 = n;
-            while lo2 < hi2 {
-                let mid = lo2 + (hi2 - lo2) / 2;
-                if self.access(mid) <= *max {
-                    lo2 = mid + 1;
-                } else {
-                    hi2 = mid;
-                }
-            }
-            lo2
-        };
-        lo..hi
+        self.search_lower(min)..self.search_upper(max)
     }
 }
 
@@ -125,17 +137,18 @@ impl Universe for OrderedUniverse {
         self.values.len()
     }
 
-    /// O(log n) binary search on the sorted values array. Codes for an
-    /// `OrderedUniverse` are positions in the byte-sorted values slice,
-    /// so the half-open range of codes whose values fall in `[min, max]`
-    /// is exactly `[partition_point(< min), partition_point(<= max))`.
-    fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
-        if min > max {
-            return 0..0;
-        }
-        let lo = self.values.partition_point(|v| v < min);
-        let hi = self.values.partition_point(|v| v <= max);
-        lo..hi
+    /// O(log n) `partition_point` on the byte-sorted values slice;
+    /// avoids the virtual-call overhead of the default `access`-driven
+    /// binary search.
+    fn search_lower(&self, v: &RawValue) -> usize {
+        self.values.partition_point(|x| x < v)
+    }
+
+    /// O(log n) `partition_point` on the byte-sorted values slice;
+    /// avoids the virtual-call overhead of the default `access`-driven
+    /// binary search.
+    fn search_upper(&self, v: &RawValue) -> usize {
+        self.values.partition_point(|x| x <= v)
     }
 }
 
