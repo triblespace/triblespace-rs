@@ -1,4 +1,5 @@
 mod succinctarchiveconstraint;
+mod succinctarchiverangeconstraint;
 mod universe;
 
 use crate::blob::Blob;
@@ -235,6 +236,36 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe,
 {
+    /// A value-range constraint that proposes only V-position values
+    /// in the inclusive byte-lexicographic range `[min, max]`.
+    ///
+    /// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
+    /// The cost is O(log n + k) for an [`OrderedUniverse`] (n = universe
+    /// size, k = matching values that appear in V position) — closes
+    /// the date-window query collapse documented in the SPB case study's
+    /// storage-axis appendix.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// find!(ts: Value<NsTAIInterval>,
+    ///     and!(
+    ///         pattern!(&archive, [{ ?id @ attr: ?ts }]),
+    ///         archive.value_in_range(ts, min_ts, max_ts),
+    ///     )
+    /// )
+    /// ```
+    pub fn value_in_range<V: ValueSchema>(
+        &self,
+        variable: crate::query::Variable<V>,
+        min: Value<V>,
+        max: Value<V>,
+    ) -> succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint<'_, U> {
+        succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint::new(
+            variable, min, max, self,
+        )
+    }
+
     /// Iterates over all tribles by walking the EAV wavelet matrix and
     /// resolving each triple through the domain mapping.
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Trible> + 'a {

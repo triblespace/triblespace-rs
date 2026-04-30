@@ -43,6 +43,36 @@ pub trait Universe: Serializable {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Returns the half-open code range `[lo, hi)` such that for every
+    /// `lo <= code < hi`, `access(code)` is in the inclusive value range
+    /// `[min, max]`. An empty range (`lo == hi`) means no values match.
+    ///
+    /// The default implementation linearly scans every code via [`access`]
+    /// and is correct for any [`Universe`]. Implementations whose code
+    /// ordering matches value ordering should override this with an
+    /// O(log n) lookup — see [`OrderedUniverse::search_range`].
+    fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
+        if min > max {
+            return 0..0;
+        }
+        let n = self.len();
+        let mut lo = n;
+        let mut hi = 0;
+        for code in 0..n {
+            let v = self.access(code);
+            if v >= *min && v <= *max {
+                if code < lo {
+                    lo = code;
+                }
+                hi = code + 1;
+            }
+        }
+        if lo >= hi {
+            0..0
+        } else {
+            lo..hi
+        }
+    }
 }
 
 /// Universe backed by a flat sorted array of raw values.
@@ -74,6 +104,19 @@ impl Universe for OrderedUniverse {
 
     fn len(&self) -> usize {
         self.values.len()
+    }
+
+    /// O(log n) binary search on the sorted values array. Codes for an
+    /// `OrderedUniverse` are positions in the byte-sorted values slice,
+    /// so the half-open range of codes whose values fall in `[min, max]`
+    /// is exactly `[partition_point(< min), partition_point(<= max))`.
+    fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
+        if min > max {
+            return 0..0;
+        }
+        let lo = self.values.partition_point(|v| v < min);
+        let hi = self.values.partition_point(|v| v <= max);
+        lo..hi
     }
 }
 
