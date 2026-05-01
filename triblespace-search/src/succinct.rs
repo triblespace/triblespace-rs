@@ -130,7 +130,11 @@ impl SuccinctDocLens {
     /// Build into a caller-owned [`SectionWriter`] so multiple
     /// sections can share one [`ByteArea`]. Returns just the
     /// metadata; the caller drives the eventual `area.freeze()`.
-    pub fn build_into(
+    ///
+    /// Crate-private — the canonical-bytes composition path is
+    /// in flux while the design settles. Callers who want the
+    /// section as a standalone blob use [`Self::build`].
+    pub(crate) fn build_into(
         sections: &mut SectionWriter<'_>,
         lens: &[u32],
     ) -> Result<CompactVectorMeta, SuccinctDocLensError> {
@@ -194,7 +198,10 @@ fn required_width(lens: &[u32]) -> usize {
 /// `View<[[u8; N]]>` via `handle.view(&bytes)?` — slice methods
 /// (`len`, `get`, `binary_search`, etc.) do the rest, so no
 /// dedicated wrapper type is needed.
-pub fn pack_byte_table<const N: usize>(
+///
+/// Crate-private while the canonical-bytes composition path is
+/// still settling.
+pub(crate) fn pack_byte_table<const N: usize>(
     sections: &mut SectionWriter<'_>,
     rows: &[[u8; N]],
 ) -> Result<SectionHandle<[u8; N]>, std::io::Error> {
@@ -340,7 +347,10 @@ impl SuccinctPostings {
     /// blob sections. Returns just the metadata; the caller
     /// drives `area.freeze()`. Same two-pass closure contract as
     /// [`Self::build_with`].
-    pub fn build_with_into<F>(
+    ///
+    /// Crate-private while the canonical-bytes composition path
+    /// is still settling.
+    pub(crate) fn build_with_into<F>(
         sections: &mut SectionWriter<'_>,
         n_docs: u32,
         n_terms: usize,
@@ -543,7 +553,10 @@ impl SuccinctGraph {
     /// Build into a caller-owned [`SectionWriter`] so the two
     /// [`CompactVector`] sections (`neighbours`, `offsets`) land
     /// in a shared [`ByteArea`] alongside other blob sections.
-    pub fn build_into(
+    ///
+    /// Crate-private while the canonical-bytes composition path
+    /// is still settling.
+    pub(crate) fn build_into(
         sections: &mut SectionWriter<'_>,
         layer_graph: &[Vec<Vec<u32>>],
         n_nodes: usize,
