@@ -10,6 +10,41 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `candidates_above` hidden from rustdoc — `similar_to` is the idiomatic surface
+
+`Attached*Index::candidates_above` is the underlying graph walk
+that `Similar` / `SimilarTo` constraints wrap. Two near-equivalent
+public APIs side-by-side risked teaching new users to bypass the
+engine — the constraint version composes with `pattern!` /
+`bm25.matches` / range filters in one `find!` pass; the leaf
+returns a `Vec<EmbHandle>` and forces them to thread it through
+the next stage by hand.
+
+Three changes:
+
+1. **`#[doc(hidden)]`** on `candidates_above` in all three impls
+   (`AttachedHNSWIndex`, `AttachedFlatIndex`,
+   `AttachedSuccinctHNSWIndex`). Still callable — tests
+   (`scale_smoke`, `pile_roundtrip`, `find_macro`) and
+   benchmarks (`query_latency`) keep using it as a correctness
+   oracle and a "walk-only" timing surface — but rustdoc no
+   longer advertises it. The visible similarity surface in the
+   rendered docs is `similar_to(probe, var, floor)` /
+   `similar(a, b, floor)`.
+
+2. **`compose_hnsw_and_pattern` example** rewritten to use the
+   engine path even for the standalone-similarity case. Same
+   results, idiomatic shape — copy-paste teaches the right
+   pattern.
+
+3. **Doc language** in this CHANGELOG and method docstrings
+   recast `candidates_above` as "leaf for tests/benchmarks";
+   `similar_to` is "the production surface."
+
+No behaviour change; same wire format; same query results. Pure
+API-affordance reshaping so the engine path is the obvious
+default.
+
 ### `SuccinctPostings::build_with_into` is now single-pass — caller supplies sizing scalars
 
 `build_with_into` previously walked the closure twice per term:
@@ -505,11 +540,15 @@ TribleSpace taste:
   the constraint — two methods (`neighbours_above`,
   `cosine_between`), infallible at the trait boundary (fetch
   failures fail-open as "no match" per engine protocol).
-- **`candidates_above(handle, floor)`** is the core inherent
-  primitive the constraint wraps. Exposed on every attached
-  view for direct callers who want the walk without the
-  constraint. Bounded by `ef_search` (default 200, override
-  with `.with_ef_search(n)`).
+- **`candidates_above(handle, floor)`** is the leaf graph-walk
+  the `Similar` / `SimilarTo` constraints wrap. Available on
+  every attached view but `#[doc(hidden)]` — production callers
+  go through the engine via `similar_to(...)` inside `find!` so
+  the result composes with other constraints (BM25, pattern,
+  range) in one engine pass. The leaf is for tests
+  (cross-backend correctness oracles) and benchmarks (timing
+  the walk in isolation). Bounded by `ef_search` (default 200,
+  override with `.with_ef_search(n)`).
 - **Blob schema rotations.** `SuccinctHNSWBlob::ID` rotates to
   `A96890DE5F85A4F2285C365549B21BC2` (retires
   `27D71A473EF22DA4D916F61810AC5D86`) to reflect the

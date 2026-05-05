@@ -1025,15 +1025,18 @@ where
         crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
-    /// Walk the graph from `from_handle`'s embedding and return
-    /// every handle whose cosine similarity is at least
-    /// `score_floor`. The core primitive the similarity
-    /// constraint calls; exposed for tests and for callers who
-    /// want the walk without the constraint wrapper.
+    /// Leaf graph-walk primitive used by [`Self::similar_to`]
+    /// and [`Self::similar`] under the hood. Surfaced for tests
+    /// (correctness oracles, cross-backend agreement checks) and
+    /// benchmarks (timing the walk in isolation from engine
+    /// overhead). **Production callers should use the engine
+    /// path** so the result composes with other constraints in
+    /// one `find!` pass.
     ///
     /// Bound by the view's `ef_search` (default 200) — callers
     /// pushing lots of above-threshold results need a wider
     /// beam via [`with_ef_search`][Self::with_ef_search].
+    #[doc(hidden)]
     pub fn candidates_above(
         &self,
         from_handle: Value<EmbHandle>,

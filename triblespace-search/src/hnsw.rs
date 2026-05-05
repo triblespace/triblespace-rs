@@ -628,15 +628,21 @@ where
         crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
-    /// Walk the graph from `from_handle`'s embedding and return
-    /// every handle whose cosine similarity is at least
-    /// `score_floor`. The core primitive that the similarity
-    /// constraint calls; exposed for tests and for callers who
-    /// want the walk without the constraint wrapper.
+    /// Leaf graph-walk primitive used by [`Self::similar_to`]
+    /// and [`Self::similar`] under the hood. Surfaced for tests
+    /// (correctness oracles) and benchmarks (timing the walk in
+    /// isolation from engine overhead). **Production callers
+    /// should use the engine path** —
+    /// [`Self::similar_to`] / [`Self::similar`] inside a
+    /// `find!` / `pattern!` / `and!` query — so the result
+    /// composes with other constraints (BM25, pattern, range)
+    /// in one engine pass instead of materialising a Vec just
+    /// to feed the next stage.
     ///
     /// Bound by the view's `ef_search` (default 200) — callers
     /// pushing lots of above-threshold results need a wider
     /// beam via [`with_ef_search`][Self::with_ef_search].
+    #[doc(hidden)]
     pub fn candidates_above(
         &self,
         from_handle: Value<EmbHandle>,
@@ -1033,12 +1039,16 @@ where
         crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
-    /// Walk every stored handle and return those with cosine
-    /// similarity ≥ `score_floor` to the embedding referenced by
-    /// `from_handle`. Mirrors [`AttachedHNSWIndex::candidates_above`][a]
-    /// for the brute-force case — O(N) in the corpus.
+    /// Brute-force counterpart to
+    /// [`AttachedHNSWIndex::candidates_above`][a] — `O(N)` over
+    /// the corpus, returns every above-threshold handle (no
+    /// approximation, no `ef_search` cap). Same expectation
+    /// applies: production callers go through the engine via
+    /// [`Self::similar_to`] / [`Self::similar`] inside a
+    /// `find!`; this leaf is for tests and benchmarks.
     ///
     /// [a]: crate::hnsw::AttachedHNSWIndex::candidates_above
+    #[doc(hidden)]
     pub fn candidates_above(
         &self,
         from_handle: Value<EmbHandle>,

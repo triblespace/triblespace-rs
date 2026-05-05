@@ -126,14 +126,27 @@ fn main() {
     );
 
     // Standalone similarity — should surface books A and C.
+    // Even when there's no other constraint to compose with, the
+    // engine path is the idiomatic shape: the same `similar_to`
+    // call works whether you AND it with patterns or run it
+    // alone. Reaching past the constraint into the leaf walk is
+    // a benchmark/test pattern, not an application pattern.
     println!("\nsimilarity-only (no author filter), cos ≥ 0.8:");
-    for h in view.candidates_above(query_handle, 0.8).unwrap() {
-        let book = handles
-            .iter()
-            .find(|(_, v)| **v == h)
-            .map(|(k, _)| *k)
-            .unwrap();
-        println!("  {book}");
+    let similar_only: Vec<(Id,)> = find!(
+        (book: Id),
+        temp!(
+            (emb),
+            and!(
+                view.similar_to(query_handle, emb, 0.8),
+                pattern!(&kb, [{ ?book @
+                    search_attrs::book_embedding: ?emb,
+                }]),
+            )
+        )
+    )
+    .collect();
+    for (b,) in &similar_only {
+        println!("  {b}");
     }
 
     // Headline query: similar to the query AND authored by
