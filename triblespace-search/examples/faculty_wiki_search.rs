@@ -57,7 +57,18 @@ mod wiki {
             as pub title: valueschemas::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
             as pub body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "768BFF023339F236B4174BDF2DC35F2B"
+        // `index` rotated 2026-05-05 alongside the
+        // `SuccinctBM25Blob` schema id rotation
+        // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
+        // `DA527A8FF09A3709B2AC6425CD5AF7A8`). Old triples under
+        // the previous attribute id `768BFF023339F236B4174BDF2DC35F2B`
+        // were written against the retired blob layout and can't be
+        // loaded by the current code; the rotation makes that
+        // incompatibility explicit at the trible level rather than
+        // letting old/new bytes collide under one attribute. See
+        // `docs/FACULTY_INTEGRATION.md` § "What the caller has to
+        // rotate" for the migration recipe.
+        "EBDECCC621ABA8DA8C81D48A9B19347C"
             as pub index: valueschemas::Handle<valueschemas::Blake3, SuccinctBM25Blob>;
     }
 
