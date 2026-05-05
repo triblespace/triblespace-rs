@@ -10,6 +10,54 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `SuccinctPostings::build_with_into` is now single-pass — caller supplies sizing scalars
+
+`build_with_into` previously walked the closure twice per term:
+once to discover `total` (sum of posting counts) and `max_score`
+(quantization scale), then again to write the bit-packed
+CompactVectors. The closure-must-be-deterministic-across-calls
+contract was a usability footgun, and for our one in-tree
+caller — `SuccinctBM25Index::from_builder` — pass 1 was
+duplicate work the BM25 path could have computed cheaply.
+
+Refactored: `build_with_into` now takes `total: usize` and
+`max_score: f32` as caller-supplied parameters and invokes the
+closure exactly once per term during the byte-write pass. The
+closure no longer has to be deterministic across calls.
+
+`SuccinctBM25Index::from_builder` precomputes:
+
+- `total = term_to_tfs.values().map(|m| m.len()).sum()` — a
+  free walk over outer-HashMap sizes, no inner traversal.
+- `max_score` = a per-term scan that runs the BM25 score formula
+  to find the corpus max. Same per-posting score eval as before,
+  but skips the per-term sort that `build_with_into`'s pass 1
+  used to do — net work drops from "score-eval×2 + sort×2" to
+  "score-eval×2 + sort×1" (the write pass still sorts to produce
+  ascending-doc-code postings).
+
+The standalone `SuccinctPostings::build_with` keeps its
+two-pass closure contract — it does the sizing pass internally
+before delegating to `build_with_into`, since callers using the
+standalone path don't have side knowledge of their data sizes.
+
+Measured at 50 k docs / 20 k vocab:
+
+| phase                       | before  | after  |
+| :-------------------------- | ------: | -----: |
+| `BM25Builder::build` time   | ~1024 ms | **~939 ms** |
+| Peak memory                 | 209 MiB  | 209 MiB (unchanged) |
+| Output bytes                | identical | identical |
+
+The ~10-15% speedup matches the saved per-term sort. Output is
+byte-identical — `scale_smoke` and `pile_roundtrip` integration
+tests both pass without modification.
+
+A `debug_assert_eq!(pos, total, …)` inside `build_with_into`
+catches caller miscounts in test builds; release builds rely on
+the caller to get `total` right (bit-packing is silent on
+overflow).
+
 ### `to_bytes` / `try_from_bytes` retired — `pub bytes: Bytes` is the surface
 
 The wrapper methods predated the canonical-bytes refactor. With

@@ -326,40 +326,26 @@ impl SuccinctPostings {
     /// postings instead of every term's at once. At 100 k docs
     /// with Heaps-law vocabulary that's ~400 KB instead of
     /// ~144 MB.
+    ///
+    /// Internally drives a sizing pass that calls `materialize_term`
+    /// once per term to discover `total` and `max_score`, then
+    /// hands off to [`Self::build_with_into`] for the byte-write
+    /// pass. Callers that already know `total` and `max_score`
+    /// (e.g. [`crate::bm25::BM25Builder::build`] computes them
+    /// from its tf accumulator) should call `build_with_into`
+    /// directly to avoid the redundant scoring pass.
     pub fn build_with<F>(
         n_docs: u32,
         n_terms: usize,
-        materialize_term: F,
+        mut materialize_term: F,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError>
     where
         F: FnMut(usize, &mut Vec<(u32, f32)>),
     {
-        let mut area = ByteArea::new()?;
-        let mut sections = area.sections();
-        let meta = Self::build_with_into(&mut sections, n_docs, n_terms, materialize_term)?;
-        let bytes = area.freeze()?;
-        Ok((bytes, meta))
-    }
-
-    /// Streaming build into a caller-owned [`SectionWriter`] so
-    /// the three [`CompactVector`] sections (`doc_idx`, `offsets`,
-    /// `scores`) land in a shared [`ByteArea`] alongside other
-    /// blob sections. Returns just the metadata; the caller
-    /// drives `area.freeze()`. Same two-pass closure contract as
-    /// [`Self::build_with`].
-    ///
-    /// Crate-private while the canonical-bytes composition path
-    /// is still settling.
-    pub(crate) fn build_with_into<F>(
-        sections: &mut SectionWriter<'_>,
-        n_docs: u32,
-        n_terms: usize,
-        mut materialize_term: F,
-    ) -> Result<SuccinctPostingsMeta, SuccinctDocLensError>
-    where
-        F: FnMut(usize, &mut Vec<(u32, f32)>),
-    {
-        // ── Pass 1: total posting count + max_score. ─────────────
+        // Sizing pass — discover total + max_score by invoking the
+        // closure once per term. The closure must be deterministic
+        // across calls (the byte-write pass invokes it again per
+        // term).
         let mut buf: Vec<(u32, f32)> = Vec::new();
         let mut total: usize = 0;
         let mut max_score = 0.0f32;
@@ -374,6 +360,52 @@ impl SuccinctPostings {
             }
         }
 
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+        let meta = Self::build_with_into(
+            &mut sections,
+            n_docs,
+            n_terms,
+            total,
+            max_score,
+            materialize_term,
+        )?;
+        let bytes = area.freeze()?;
+        Ok((bytes, meta))
+    }
+
+    /// Single-pass streaming build into a caller-owned
+    /// [`SectionWriter`]. The three [`CompactVector`] sections
+    /// (`doc_idx`, `offsets`, `scores`) land in the shared
+    /// [`ByteArea`] alongside other blob sections; returns just
+    /// the metadata; the caller drives `area.freeze()`.
+    ///
+    /// Caller responsibilities (lifted out of the function so the
+    /// closure is only invoked once per term):
+    /// - `total` = `Σ_t materialize_term(t).len()`. Used to size
+    ///   the `offsets` CompactVector's bit width
+    ///   (`ceil(log₂(total + 1))`). Bit-packing is silent on
+    ///   overflow, so an undersized `total` corrupts the
+    ///   blob — get this right.
+    /// - `max_score` = max f32 score the closure will write.
+    ///   Used as the u16 quantization scale: each `f32` score
+    ///   becomes `round(score / max_score · 65535)`. Scores
+    ///   above this clip to `u16::MAX`. Always supply the true
+    ///   corpus max, not an estimate.
+    ///
+    /// Crate-private while the canonical-bytes composition path
+    /// is still settling.
+    pub(crate) fn build_with_into<F>(
+        sections: &mut SectionWriter<'_>,
+        n_docs: u32,
+        n_terms: usize,
+        total: usize,
+        max_score: f32,
+        mut materialize_term: F,
+    ) -> Result<SuccinctPostingsMeta, SuccinctDocLensError>
+    where
+        F: FnMut(usize, &mut Vec<(u32, f32)>),
+    {
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
 
@@ -384,7 +416,7 @@ impl SuccinctPostings {
         let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, sections)?;
         offsets_b.set_int(0, 0)?;
 
-        // ── Pass 2: write all three CompactVectors. ──────────────
+        let mut buf: Vec<(u32, f32)> = Vec::new();
         let mut pos = 0usize;
         for t in 0..n_terms {
             buf.clear();
@@ -396,6 +428,10 @@ impl SuccinctPostings {
             }
             offsets_b.set_int(t + 1, pos)?;
         }
+        debug_assert_eq!(
+            pos, total,
+            "build_with_into: closure produced {pos} postings; caller said total = {total}"
+        );
 
         let doc_idx_meta = doc_idx_b.freeze().metadata();
         let offsets_meta = offsets_b.freeze().metadata();
@@ -1433,30 +1469,57 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             .expect("build terms");
 
         // ── 5. per-term scored postings, streamed into the
-        // shared area. The closure materializes one term's
-        // postings at a time into a reused buffer — peak temp
-        // stays ~400 KB at 100 k docs vs. the ~144 MB
-        // Vec<Vec<...>> the slice-based path would allocate. ───────
+        // shared area. We pre-compute `total` and `max_score`
+        // here (the BM25-specific path) so `build_with_into` can
+        // run as a single pass — invoking the closure once per
+        // term instead of twice.
+        //
+        // - `total` is a free walk over outer-HashMap sizes
+        //   (no inner traversal beyond reading lengths).
+        // - `max_score` is a per-term scan that mirrors the
+        //   BM25 formula but skips the per-term sort that the
+        //   write-pass closure does. Same per-posting work,
+        //   half the per-term work, no Vec materialisation.
+        //
+        // Peak temp stays ~one term's postings (~400 KB at 100 k
+        // docs / Heaps-law) instead of ~144 MB Vec<Vec<...>>. ──────
         let n = n_universe as f32;
+        let bm25_score = |df: f32, idf: f32, tf: u32, code: u32| -> f32 {
+            let tf_f = tf as f32;
+            let dl = doc_lens_vec[code as usize] as f32;
+            let norm = if avg_doc_len > 0.0 {
+                1.0 - b + b * (dl / avg_doc_len)
+            } else {
+                1.0
+            };
+            let _ = df;
+            idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm)
+        };
+
+        let total: usize = term_to_tfs.values().map(|m| m.len()).sum();
+        let max_score: f32 = term_rows.iter().fold(0.0f32, |acc, term| {
+            let tfs = &term_to_tfs[term];
+            let df = tfs.len() as f32;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            tfs.iter().fold(acc, |m, (&code, &tf)| {
+                m.max(bm25_score(df, idf, tf, code))
+            })
+        });
+
         let postings_meta = SuccinctPostings::build_with_into(
             &mut sections,
             n_universe as u32,
             n_terms,
+            total,
+            max_score,
             |t, buf| {
                 let tfs = &term_to_tfs[&term_rows[t]];
                 let df = tfs.len() as f32;
                 let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-                buf.extend(tfs.iter().map(|(&code, &tf)| {
-                    let tf_f = tf as f32;
-                    let dl = doc_lens_vec[code as usize] as f32;
-                    let norm = if avg_doc_len > 0.0 {
-                        1.0 - b + b * (dl / avg_doc_len)
-                    } else {
-                        1.0
-                    };
-                    let score = idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm);
-                    (code, score)
-                }));
+                buf.extend(
+                    tfs.iter()
+                        .map(|(&code, &tf)| (code, bm25_score(df, idf, tf, code))),
+                );
                 buf.sort_unstable_by_key(|&(code, _)| code);
             },
         )
