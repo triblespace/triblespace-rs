@@ -163,8 +163,18 @@ where
     /// Build a filter from a pre-computed doc list. Use the
     /// `matches` method on [`BM25Index`] or `SuccinctBM25Index`
     /// rather than constructing directly.
-    pub fn from_entries(doc: Variable<S>, entries: Vec<RawValue>) -> Self {
-        Self { doc, entries }
+    ///
+    /// Accepts any `IntoIterator<Item = RawValue>` so callers
+    /// can pass a `Vec<RawValue>` or a streaming iterator
+    /// without forcing a collect.
+    pub fn from_entries<I>(doc: Variable<S>, entries: I) -> Self
+    where
+        I: IntoIterator<Item = RawValue>,
+    {
+        Self {
+            doc,
+            entries: entries.into_iter().collect(),
+        }
     }
 }
 

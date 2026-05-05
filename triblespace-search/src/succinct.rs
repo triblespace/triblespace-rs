@@ -22,18 +22,13 @@
 //! arrays. Get the mechanics right here with a tiny surface
 //! area, then expand.
 //!
-//! ```
-//! use triblespace_search::succinct::SuccinctDocLens;
-//!
-//! let lens = vec![3u32, 7, 1, 15, 2];
-//! let (bytes, meta) = SuccinctDocLens::build(&lens).expect("build");
-//! let view = SuccinctDocLens::from_bytes(meta, bytes).expect("load");
-//!
-//! assert_eq!(view.len(), 5);
-//! assert_eq!(view.get(0), Some(3));
-//! assert_eq!(view.get(3), Some(15));
-//! assert_eq!(view.to_vec(), lens);
-//! ```
+//! `SuccinctDocLens` itself is `pub(crate)` — the canonical-bytes
+//! flow embeds it inside [`SuccinctBM25Index`], and external
+//! callers never need to construct one standalone. The pattern
+//! it demonstrates (build into a [`anybytes::ByteArea`] section,
+//! freeze, view back through the metadata) extends to
+//! [`SuccinctGraph`] and the postings sections that *are*
+//! exposed.
 
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
@@ -107,33 +102,17 @@ impl From<jerky::error::Error> for SuccinctDocLensError {
 /// so short-doc corpora (common for wiki fragments) pay a fraction
 /// of the `u32` cost.
 #[derive(Debug)]
-pub struct SuccinctDocLens {
+pub(crate) struct SuccinctDocLens {
     inner: CompactVector,
 }
 
 impl SuccinctDocLens {
-    /// Build a succinct doc-lens table. Returns the frozen
-    /// [`Bytes`] region and [`CompactVectorMeta`] needed to
-    /// reconstruct a view with [`Self::from_bytes`].
-    ///
-    /// Allocates a fresh [`ByteArea`] internally; for the
-    /// canonical-bytes pattern (multiple sections sharing one
-    /// area) call [`Self::build_into`] with the area's writer.
-    pub fn build(lens: &[u32]) -> Result<(Bytes, CompactVectorMeta), SuccinctDocLensError> {
-        let mut area = ByteArea::new()?;
-        let mut sections = area.sections();
-        let meta = Self::build_into(&mut sections, lens)?;
-        let bytes = area.freeze()?;
-        Ok((bytes, meta))
-    }
-
     /// Build into a caller-owned [`SectionWriter`] so multiple
     /// sections can share one [`ByteArea`]. Returns just the
     /// metadata; the caller drives the eventual `area.freeze()`.
     ///
     /// Crate-private — the canonical-bytes composition path is
-    /// in flux while the design settles. Callers who want the
-    /// section as a standalone blob use [`Self::build`].
+    /// in flux while the design settles.
     pub(crate) fn build_into(
         sections: &mut SectionWriter<'_>,
         lens: &[u32],
@@ -145,35 +124,51 @@ impl SuccinctDocLens {
         Ok(cv.metadata())
     }
 
+    /// Test-only standalone-area wrapper around `build_into`.
+    /// Allocates a fresh [`ByteArea`], writes one section, freezes.
+    /// Production code uses [`Self::build_into`] inside the shared
+    /// area driven by `SuccinctBM25Index::from_builder`.
+    #[cfg(test)]
+    pub(crate) fn build(
+        lens: &[u32],
+    ) -> Result<(Bytes, CompactVectorMeta), SuccinctDocLensError> {
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+        let meta = Self::build_into(&mut sections, lens)?;
+        let bytes = area.freeze()?;
+        Ok((bytes, meta))
+    }
+
     /// Reconstruct a view from the frozen bytes + metadata.
-    pub fn from_bytes(meta: CompactVectorMeta, bytes: Bytes) -> Result<Self, SuccinctDocLensError> {
+    pub(crate) fn from_bytes(
+        meta: CompactVectorMeta,
+        bytes: Bytes,
+    ) -> Result<Self, SuccinctDocLensError> {
         let inner = CompactVector::from_bytes(meta, bytes)?;
         Ok(Self { inner })
     }
 
-    /// Number of entries.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// `true` if there are no entries.
-    pub fn is_empty(&self) -> bool {
-        self.inner.len() == 0
-    }
-
     /// Document length at position `i`, or `None` if out of range.
-    pub fn get(&self, i: usize) -> Option<u32> {
+    pub(crate) fn get(&self, i: usize) -> Option<u32> {
         // get_int returns usize; doc_lens fit in u32 by construction.
         self.inner.get_int(i).map(|n| n as u32)
     }
 
-    /// Collect into a `Vec<u32>` for ergonomic inspection.
-    pub fn to_vec(&self) -> Vec<u32> {
+    /// Test-only accessors used by the unit tests' assertions.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<u32> {
         self.inner.to_vec().into_iter().map(|n| n as u32).collect()
     }
-
-    /// Bit width per entry (log₂ of max value + 1).
-    pub fn width(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn width(&self) -> usize {
         self.inner.metadata().width
     }
 }
@@ -239,7 +234,7 @@ pub(crate) fn pack_byte_table<const N: usize>(
 ///
 /// [`build`]: Self::build
 #[derive(Debug)]
-pub struct SuccinctPostings {
+pub(crate) struct SuccinctPostings {
     doc_idx: CompactVector,
     offsets: CompactVector,
     scores: CompactVector,
@@ -258,7 +253,7 @@ pub struct SuccinctPostings {
     Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
 )]
 #[repr(C)]
-pub struct SuccinctPostingsMeta {
+pub(crate) struct SuccinctPostingsMeta {
     /// Number of terms (== `offsets.len() - 1`).
     pub n_terms: u64,
     /// Meta for the `doc_idx` CompactVector.
@@ -300,10 +295,13 @@ fn dequantize_score(q: u16, max_score: f32) -> f32 {
 }
 
 impl SuccinctPostings {
-    /// Serialize `lists[t]` as the posting list for term index
-    /// `t`. Returns `(bytes, meta)`. `n_docs` is the total
-    /// document count (sets the bit width for `doc_idx`).
-    pub fn build(
+    /// Test-only slice-based wrapper around `build_with_into`.
+    /// Computes `total` + `max_score` from the materialised
+    /// `lists` and delegates. Production code computes those
+    /// scalars directly from the corpus state and calls
+    /// `build_with_into` with no closure recursion.
+    #[cfg(test)]
+    pub(crate) fn build(
         lists: &[Vec<(u32, f32)>],
         n_docs: u32,
     ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError> {
@@ -312,29 +310,13 @@ impl SuccinctPostings {
         })
     }
 
-    /// Streaming build — caller materializes one term's posting
-    /// list at a time into a reused buffer instead of allocating
-    /// `Vec<Vec<(u32, f32)>>` upfront. The closure is invoked
-    /// twice per term: once during the size + max-score pass, once
-    /// during the byte-write pass. It must be deterministic across
-    /// invocations (the bytes written in the second pass must
-    /// match the sizes / scores observed in the first) and clear
-    /// or overwrite `buf` itself if reuse semantics matter.
-    /// `materialize_term` receives `buf` empty on each call.
-    ///
-    /// Memory profile: peak temporary vec holds one term's
-    /// postings instead of every term's at once. At 100 k docs
-    /// with Heaps-law vocabulary that's ~400 KB instead of
-    /// ~144 MB.
-    ///
-    /// Internally drives a sizing pass that calls `materialize_term`
-    /// once per term to discover `total` and `max_score`, then
-    /// hands off to [`Self::build_with_into`] for the byte-write
-    /// pass. Callers that already know `total` and `max_score`
-    /// (e.g. [`crate::bm25::BM25Builder::build`] computes them
-    /// from its tf accumulator) should call `build_with_into`
-    /// directly to avoid the redundant scoring pass.
-    pub fn build_with<F>(
+    /// Test-only closure-based wrapper around `build_with_into`.
+    /// Drives a sizing pass that calls `materialize_term` once
+    /// per term to discover `total` and `max_score`, then hands
+    /// off to [`Self::build_with_into`]. Production code
+    /// computes those scalars from corpus state directly.
+    #[cfg(test)]
+    pub(crate) fn build_with<F>(
         n_docs: u32,
         n_terms: usize,
         mut materialize_term: F,
@@ -342,10 +324,6 @@ impl SuccinctPostings {
     where
         F: FnMut(usize, &mut Vec<(u32, f32)>),
     {
-        // Sizing pass — discover total + max_score by invoking the
-        // closure once per term. The closure must be deterministic
-        // across calls (the byte-write pass invokes it again per
-        // term).
         let mut buf: Vec<(u32, f32)> = Vec::new();
         let mut total: usize = 0;
         let mut max_score = 0.0f32;
@@ -464,14 +442,11 @@ impl SuccinctPostings {
         })
     }
 
-    /// Number of terms.
-    pub fn term_count(&self) -> usize {
+    /// Test-only accessor for `n_terms` — used by unit-test
+    /// assertions on the term count.
+    #[cfg(test)]
+    pub(crate) fn term_count(&self) -> usize {
         self.n_terms
-    }
-
-    /// Corpus max score — the quantization scale.
-    pub fn max_score(&self) -> f32 {
-        self.max_score
     }
 
     /// Equality tolerance callers should use when matching a
@@ -575,6 +550,10 @@ impl SuccinctGraph {
     /// `layer_graph[L][i]` = neighbours of node `i` on layer `L`.
     /// Every node must have an entry at every layer (possibly
     /// empty) so offsets stay aligned.
+    ///
+    /// Standalone path — allocates a fresh [`ByteArea`]. For
+    /// embedding inside a larger blob's shared area, use
+    /// [`Self::build_into`].
     pub fn build(
         layer_graph: &[Vec<Vec<u32>>],
         n_nodes: usize,
@@ -762,28 +741,22 @@ impl SuccinctGraph {
 )]
 #[repr(C)]
 pub struct SuccinctHNSWMeta {
-    /// Number of nodes (graph vertices) in the index.
-    pub n_nodes: u64,
-    /// Layer-major neighbour graph metadata.
-    pub graph: SuccinctGraphMeta,
-    /// Section handle for the 32-byte content-addressed handle
-    /// table — one handle per node, in node-id order.
-    pub handles: SectionHandle<[u8; 32]>,
-    /// Embedding dimensionality (header-only — the embeddings
-    /// themselves live as separate blobs in the pile).
-    pub dim: u32,
-    /// Entry-point node id (only meaningful when
-    /// `has_entry_point != 0`).
-    pub entry_point: u32,
-    /// HNSW upper-layer degree cap.
-    pub m: u16,
-    /// HNSW layer-0 degree cap.
-    pub m0: u16,
-    /// Highest layer any node was promoted to.
-    pub max_level: u8,
-    /// Boolean: 1 = `entry_point` is valid; 0 = empty index.
-    pub has_entry_point: u8,
-    /// Padding to round the struct to a multiple-of-8 size.
+    // All fields are crate-private: this struct is an opaque
+    // load token at the public boundary. Callers obtain it via
+    // `SuccinctHNSWIndex::meta(&self)` and round-trip it through
+    // `SuccinctHNSWIndex::from_bytes(meta, bytes)`. Wire-format
+    // details (section handles, nested metas) stay internal so
+    // we can evolve the layout freely; breaking changes still
+    // rotate `SuccinctHNSWBlob::ID`.
+    pub(crate) n_nodes: u64,
+    pub(crate) graph: SuccinctGraphMeta,
+    pub(crate) handles: SectionHandle<[u8; 32]>,
+    pub(crate) dim: u32,
+    pub(crate) entry_point: u32,
+    pub(crate) m: u16,
+    pub(crate) m0: u16,
+    pub(crate) max_level: u8,
+    pub(crate) has_entry_point: u8,
     _pad: [u8; 10],
 }
 
@@ -1326,27 +1299,26 @@ where
 )]
 #[repr(C)]
 pub struct SuccinctBM25Meta {
-    /// Number of documents in the index.
-    pub n_docs: u64,
-    /// Number of distinct terms.
-    pub n_terms: u64,
-    /// Average document length used at build time (BM25 `b`
-    /// length-normalisation reference).
-    pub avg_doc_len: f32,
-    /// BM25 `k1` term-frequency saturation.
-    pub k1: f32,
-    /// BM25 `b` length-normalisation factor.
-    pub b: f32,
-    /// Padding to keep the next field 8-byte aligned.
+    // All fields are crate-private: this struct is an opaque
+    // load token at the public boundary. Callers obtain it via
+    // `SuccinctBM25Index::meta(&self)` and round-trip it through
+    // `SuccinctBM25Index::from_bytes(meta, bytes)`. Wire-format
+    // details (section handles, nested metas, scalars) stay
+    // internal so we can evolve the layout freely; breaking
+    // changes still rotate `SuccinctBM25Blob::ID`. Read scalar
+    // properties via `SuccinctBM25Index::doc_count()` /
+    // `term_count()` / `avg_doc_len()` / `k1()` / `b()` after
+    // loading.
+    pub(crate) n_docs: u64,
+    pub(crate) n_terms: u64,
+    pub(crate) avg_doc_len: f32,
+    pub(crate) k1: f32,
+    pub(crate) b: f32,
     _pad: u32,
-    /// Compressed doc-key universe metadata.
-    pub keys: CompressedUniverseMeta,
-    /// Per-doc length CompactVector metadata.
-    pub doc_lens: CompactVectorMeta,
-    /// Per-term scored-postings metadata.
-    pub postings: SuccinctPostingsMeta,
-    /// Section handle for the sorted 32-byte term table.
-    pub terms: SectionHandle<[u8; 32]>,
+    pub(crate) keys: CompressedUniverseMeta,
+    pub(crate) doc_lens: CompactVectorMeta,
+    pub(crate) postings: SuccinctPostingsMeta,
+    pub(crate) terms: SectionHandle<[u8; 32]>,
 }
 
 pub struct SuccinctBM25Index<
@@ -1619,6 +1591,15 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// BM25 `b` used at build time.
     pub fn b(&self) -> f32 {
         self.b
+    }
+
+    /// Bytes attributable to the doc-key section in the canonical
+    /// blob — the `CompressedUniverse`'s fragment dictionary plus
+    /// its DacsByte payload. Useful for size-attribution
+    /// instrumentation (see `examples/blob_sizes_at_scale.rs`).
+    pub fn keys_size_bytes(&self) -> usize {
+        let meta = self.meta();
+        meta.keys.fragments.len + meta.keys.data.levels.len
     }
 
     /// Length of doc `i`, or `None` if out of range.

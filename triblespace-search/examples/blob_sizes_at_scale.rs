@@ -62,20 +62,13 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
     words.join(" ")
 }
 
-/// Read the keys-section length from an SB25 blob's
-/// suffix-meta. The canonical-bytes layout puts a typed
-/// [`SuccinctBM25Meta`] at the end of the bytes, with
-/// [`SuccinctBM25Meta::keys`] holding a
-/// [`CompressedUniverseMeta`] whose two section handles bound
-/// the bytes the keys actually occupy.
+/// Read the keys-section length from a built index. Wraps
+/// [`SuccinctBM25Index::keys_size_bytes`] so the wire-format
+/// layout (where the fragment-dictionary and DacsByte payload
+/// sections live inside the canonical bytes) stays inside the
+/// crate.
 fn keys_len_from_blob(idx: &triblespace_search::succinct::SuccinctBM25Index) -> usize {
-    let meta = idx.meta();
-    // CompressedUniverse stores two sections in the area:
-    // `fragments` (the 4-byte fragment dictionary) and `data`
-    // (the DacsByte payload, which itself owns one further
-    // section for its per-level metadata). Summing the three
-    // gives the bytes attributable to the keys universe.
-    meta.keys.fragments.len + meta.keys.data.levels.len
+    idx.keys_size_bytes()
 }
 
 #[derive(Clone, Copy)]

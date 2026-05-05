@@ -157,7 +157,17 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     /// [`crate::tokens::hash_tokens`] for the usual token-handle
     /// default). Order of terms is irrelevant; duplicates
     /// contribute to term frequency.
-    pub fn insert<K: ToValue<D>>(&mut self, key: K, terms: Vec<Value<T>>) {
+    ///
+    /// Accepts any `IntoIterator<Item = Value<T>>`, so a
+    /// `Vec<Value<T>>` from `hash_tokens(...)` works directly,
+    /// and so does an iterator chain
+    /// (`tokens.iter().filter(...).copied()`, `(0..n).map(...)`,
+    /// etc.) without an intermediate `.collect()`.
+    pub fn insert<K, I>(&mut self, key: K, terms: I)
+    where
+        K: ToValue<D>,
+        I: IntoIterator<Item = Value<T>>,
+    {
         // Value<_> is repr(transparent) around RawValue; strip
         // the phantom at the boundary, store raw bytes.
         let key_val: Value<D> = key.to_value();
