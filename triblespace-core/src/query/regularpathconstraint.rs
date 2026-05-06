@@ -43,12 +43,23 @@ pub enum PathOp {
     /// but recognised inline so the zero-step branch reuses the
     /// bound start node directly instead of materialising every node.
     Optional,
+    /// Inverse (`^`): reverse the direction of the preceding sub-
+    /// expression. `^p` traverses `p` backwards (object → subject).
+    /// Compound expressions (`^(a/b)`, `^(a+)`) are normalised at
+    /// `from_postfix` time: Inverse is pushed down to `Attr` leaves
+    /// via the standard rewrites
+    /// `^(a/b) ↔ ^b/^a`, `^(a|b) ↔ ^a|^b`, `^(a+) ↔ (^a)+`, etc.
+    Inverse,
 }
 
 /// Tree-structured path expression for recursive evaluation.
 #[derive(Clone)]
 enum PathExpr {
     Attr(RawId),
+    /// `^p` — single-attribute hop in reverse (object → subject).
+    /// Always a leaf after `from_postfix` normalisation; inverse over
+    /// compound expressions is rewritten down to leaves.
+    InverseAttr(RawId),
     Concat(Box<PathExpr>, Box<PathExpr>),
     Union(Box<PathExpr>, Box<PathExpr>),
     Star(Box<PathExpr>),
@@ -84,6 +95,10 @@ impl PathExpr {
                     let a = stack.pop().unwrap();
                     stack.push(PathExpr::Optional(Box::new(a)));
                 }
+                PathOp::Inverse => {
+                    let a = stack.pop().unwrap();
+                    stack.push(invert(a));
+                }
             }
         }
         // Distribute `Optional` and `Union` out of `Concat` so the
@@ -114,6 +129,14 @@ impl PathExpr {
                 constraints.push(Box::new(set.pattern(start, a, dest)));
                 dest
             }
+            PathExpr::InverseAttr(attr_id) => {
+                // ^p: dest p start (subject and value swap)
+                let a = ctx.next_variable::<GenId>();
+                let dest = ctx.next_variable::<GenId>();
+                constraints.push(Box::new(a.is(attr_id.to_value())));
+                constraints.push(Box::new(set.pattern(dest, a, start)));
+                dest
+            }
             PathExpr::Concat(lhs, rhs) => {
                 let mid = lhs.build_constraint(set, ctx, start, constraints);
                 rhs.build_constraint(set, ctx, mid, constraints)
@@ -128,6 +151,24 @@ impl PathExpr {
     }
 }
 
+/// Push `Inverse` down to `Attr` leaves via the standard reversal
+/// rewrites: `^(a/b) ↔ ^b/^a` (sequence reverses), `^(a|b) ↔ ^a|^b`,
+/// `^(a*) ↔ (^a)*`, `^(a+) ↔ (^a)+`, `^(a?) ↔ (^a)?`, `^^a ↔ a`.
+/// Result tree has `InverseAttr` only at leaves; no `Inverse` node is
+/// ever stored.
+fn invert(expr: PathExpr) -> PathExpr {
+    match expr {
+        PathExpr::Attr(a) => PathExpr::InverseAttr(a),
+        PathExpr::InverseAttr(a) => PathExpr::Attr(a),
+        // Sequence reverses: ^(a / b) = ^b / ^a
+        PathExpr::Concat(lhs, rhs) => PathExpr::Concat(Box::new(invert(*rhs)), Box::new(invert(*lhs))),
+        PathExpr::Union(lhs, rhs) => PathExpr::Union(Box::new(invert(*lhs)), Box::new(invert(*rhs))),
+        PathExpr::Star(body) => PathExpr::Star(Box::new(invert(*body))),
+        PathExpr::Plus(body) => PathExpr::Plus(Box::new(invert(*body))),
+        PathExpr::Optional(body) => PathExpr::Optional(Box::new(invert(*body))),
+    }
+}
+
 /// Distribute `Optional` and `Union` out of `Concat` so that
 /// `Concat(_, Optional(_))` and `Concat(Union(_,_), _)` become a top-
 /// level `Union` of pure-Concat branches, which the `build_constraint`
@@ -138,6 +179,7 @@ impl PathExpr {
 fn normalize(expr: PathExpr) -> PathExpr {
     match expr {
         PathExpr::Attr(a) => PathExpr::Attr(a),
+        PathExpr::InverseAttr(a) => PathExpr::InverseAttr(a),
         PathExpr::Concat(lhs, rhs) => {
             let l = normalize(*lhs);
             let r = normalize(*rhs);
@@ -221,9 +263,27 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
     results
 }
 
+/// Inverse single-attribute hop: enumerate subjects `s` such that
+/// `s attr start` holds. Uses the VAE index (Value, Attribute,
+/// Entity ordering) so the prefix `[start_as_value (32B), attr
+/// (16B)]` lands directly at the slice of matching entity bytes.
+fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+    let mut results = HashSet::new();
+    let start_value = id_into_value(start);
+    let mut prefix = [0u8; 32 + ID_LEN];
+    prefix[..32].copy_from_slice(&start_value);
+    prefix[32..].copy_from_slice(attr);
+    set.vae
+        .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
+            results.insert(*entity);
+        });
+    results
+}
+
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
         PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, start);
             Query::new(constraint, move |binding: &Binding| {
@@ -270,6 +330,7 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
         PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, from);
             Query::new(constraint, move |binding: &Binding| {
@@ -328,6 +389,13 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
             prefix[..ID_LEN].copy_from_slice(start);
             prefix[ID_LEN..].copy_from_slice(attr);
             set.eav.segmented_len(&prefix) as usize
+        }
+        PathExpr::InverseAttr(attr) => {
+            let start_value = id_into_value(start);
+            let mut prefix = [0u8; 32 + ID_LEN];
+            prefix[..32].copy_from_slice(&start_value);
+            prefix[32..].copy_from_slice(attr);
+            set.vae.segmented_len(&prefix) as usize
         }
         PathExpr::Union(lhs, rhs) => {
             estimate_from(set, lhs, start) + estimate_from(set, rhs, start)

@@ -881,6 +881,79 @@ proptest! {
     }
 
     #[test]
+    fn path_inverse_standalone_swaps_subject_object(
+        n_predecessors in 0..6usize,
+    ) {
+        // Standalone `^link` from a target: enumerate all entities
+        // whose `link` points TO that target. The forward triples
+        // are e_i `link` target; the inverse hop from target should
+        // yield {e_0, ..., e_{n-1}}. No macro for `^` yet, build the
+        // postfix array directly: `[Attr(link), Inverse]`.
+        let mut set = TribleSet::new();
+        let target = rngid();
+        let predecessors: Vec<_> = (0..n_predecessors).map(|_| rngid()).collect();
+        for p in &predecessors {
+            set += entity! { &*p @ test_ns::link: &target };
+        }
+        let attr_id = test_ns::link.raw();
+
+        let target_val = (&target).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(target_val),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[PathOp::Attr(attr_id), PathOp::Inverse],
+                ),
+            )
+        ).collect();
+
+        let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
+        prop_assert_eq!(dests.len(), n_predecessors,
+            "expected {} predecessors, got {}", n_predecessors, dests.len());
+        for p in &predecessors {
+            prop_assert!(dests.contains(&(&*p).to_value()),
+                "inverse hop missing predecessor");
+        }
+    }
+
+    #[test]
+    fn path_inverse_double_negation_equals_forward(
+        n_neighbors in 0..5usize,
+    ) {
+        // ^^p ↔ p (double-inverse cancels). Postfix `[Attr(p),
+        // Inverse, Inverse]` should yield the same result as
+        // `[Attr(p)]` from the same start. Tests the `invert`
+        // helper's `^^a → a` arm.
+        let mut set = TribleSet::new();
+        let start = rngid();
+        let neighbors: Vec<_> = (0..n_neighbors).map(|_| rngid()).collect();
+        for n in &neighbors {
+            set += entity! { &start @ test_ns::link: &*n };
+        }
+        let attr_id = test_ns::link.raw();
+        let start_val = (&start).to_value();
+
+        let forward: HashSet<_> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val),
+                RegularPathConstraint::new(set.clone(), s, d, &[PathOp::Attr(attr_id)]),
+            )
+        ).map(|(_, d)| d).collect();
+        let double_inv: HashSet<_> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[PathOp::Attr(attr_id), PathOp::Inverse, PathOp::Inverse],
+                ),
+            )
+        ).map(|(_, d)| d).collect();
+        prop_assert_eq!(forward, double_inv,
+            "^^p should equal p");
+    }
+
+    #[test]
     fn path_optional_concat_normalizes_to_union(
         chain_len in 2..5usize,
     ) {
