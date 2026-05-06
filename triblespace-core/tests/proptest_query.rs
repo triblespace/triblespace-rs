@@ -918,6 +918,66 @@ proptest! {
     }
 
     #[test]
+    fn path_inverse_co_x_via_shared_object_walks_bipartite(
+        n_links in 2..5usize,
+    ) {
+        // (^link / link)+: WDBench paths/067 shape. Given a hub
+        // entity h, walk back one `link` (find subjects that point
+        // to h via link), then forward one `link` (find their other
+        // link targets). Plus = repeat 1+ times. The expected result
+        // is the set of "co-link" entities reachable through 1+
+        // shared-target hops.
+        //
+        // Setup: a hub h with n linkers; each linker also has 1
+        // additional `link` target. From h, ^link reaches all
+        // linkers; / link reaches each linker's "other" target +
+        // h itself (since the linkers point at h too). Plus over
+        // that: more hops, but with finite data we eventually visit
+        // every reachable node and stop.
+        let mut set = TribleSet::new();
+        let h = rngid();
+        let mut other_targets = Vec::new();
+        for _ in 0..n_links {
+            let linker = rngid();
+            set += entity! { &linker @ test_ns::link: &h };
+            let other = rngid();
+            set += entity! { &linker @ test_ns::link: &other };
+            other_targets.push(other);
+        }
+        let attr_id = test_ns::link.raw();
+
+        let h_val = (&h).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(h_val),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[
+                        PathOp::Attr(attr_id),
+                        PathOp::Inverse,
+                        PathOp::Attr(attr_id),
+                        PathOp::Concat,
+                        PathOp::Plus,
+                    ],
+                ),
+            )
+        ).collect();
+
+        let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
+
+        // First-iteration reachability from h: ^link → all linkers
+        // → / link → {h itself, plus each linker's other target}.
+        // h must appear (every linker points back at h via link).
+        prop_assert!(dests.contains(&h_val),
+            "(^link / link)+ from h should include h itself (linkers point back)");
+        // Every "other target" must appear (linker → other via link).
+        for o in &other_targets {
+            prop_assert!(dests.contains(&(&*o).to_value()),
+                "(^link / link)+ should reach the other-targets of h's linkers");
+        }
+    }
+
+    #[test]
     fn path_inverse_double_negation_equals_forward(
         n_neighbors in 0..5usize,
     ) {
