@@ -344,7 +344,7 @@ where
         })
     }
 
-    /// Like [`enumerate_domain`], but bounded to the half-open code range
+    /// Like [`Self::enumerate_domain`], but bounded to the half-open code range
     /// `[code_range.start, code_range.end)`. Output-sensitive: iterates
     /// only over codes that actually appear in `prefix` *and* fall within
     /// the range. Empty groups are skipped via the `select1`-based stride.

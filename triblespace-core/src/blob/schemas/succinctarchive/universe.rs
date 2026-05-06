@@ -37,8 +37,8 @@ pub trait Universe: Serializable {
     ///
     /// Implementations promise that `access` is *monotonic in `pos`*:
     /// if `i < j` and both are valid codes, then `access(i) <= access(j)`
-    /// in byte-lexicographic order. This is what makes [`search`] and
-    /// [`search_range`] log-time over the universe size.
+    /// in byte-lexicographic order. This is what makes [`Self::search`]
+    /// and [`Self::search_range`] log-time over the universe size.
     fn access(&self, pos: usize) -> RawValue;
     /// Returns the integer code for `v`, or `None` if absent.
     fn search(&self, v: &RawValue) -> Option<usize>;
@@ -52,10 +52,11 @@ pub trait Universe: Serializable {
     /// `len()` if every value is `< v`. Equivalent to a `lower_bound` /
     /// `partition_point(|x| x < v)` on the value-ordered code domain.
     ///
-    /// The default implementation does one binary search via [`access`]
-    /// — O(log n) on the universe size, given the monotonicity promise on
-    /// [`access`]. Implementations with a flat sorted slice should override
-    /// to skip the virtual-call overhead.
+    /// The default implementation does one binary search via
+    /// [`Self::access`] — O(log n) on the universe size, given the
+    /// monotonicity promise on [`Self::access`]. Implementations with a
+    /// flat sorted slice should override to skip the virtual-call
+    /// overhead.
     fn search_lower(&self, v: &RawValue) -> usize {
         let mut lo = 0usize;
         let mut hi = self.len();
@@ -74,10 +75,11 @@ pub trait Universe: Serializable {
     /// `len()` if every value is `<= v`. Equivalent to an `upper_bound` /
     /// `partition_point(|x| x <= v)` on the value-ordered code domain.
     ///
-    /// The default implementation does one binary search via [`access`]
-    /// — O(log n) on the universe size, given the monotonicity promise on
-    /// [`access`]. Implementations with a flat sorted slice should override
-    /// to skip the virtual-call overhead.
+    /// The default implementation does one binary search via
+    /// [`Self::access`] — O(log n) on the universe size, given the
+    /// monotonicity promise on [`Self::access`]. Implementations with a
+    /// flat sorted slice should override to skip the virtual-call
+    /// overhead.
     fn search_upper(&self, v: &RawValue) -> usize {
         let mut lo = 0usize;
         let mut hi = self.len();
@@ -96,8 +98,9 @@ pub trait Universe: Serializable {
     /// `lo <= code < hi`, `access(code)` is in the inclusive value range
     /// `[min, max]`. An empty range (`lo == hi`) means no values match.
     ///
-    /// Composes [`search_lower`] and [`search_upper`]; override only if a
-    /// fused implementation can beat two independent binary searches.
+    /// Composes [`Self::search_lower`] and [`Self::search_upper`];
+    /// override only if a fused implementation can beat two independent
+    /// binary searches.
     fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
         if min > max {
             return 0..0;

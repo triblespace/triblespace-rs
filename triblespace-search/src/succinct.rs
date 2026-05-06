@@ -551,9 +551,10 @@ impl SuccinctGraph {
     /// Every node must have an entry at every layer (possibly
     /// empty) so offsets stay aligned.
     ///
-    /// Standalone path — allocates a fresh [`ByteArea`]. For
-    /// embedding inside a larger blob's shared area, use
-    /// [`Self::build_into`].
+    /// Standalone path — allocates a fresh [`ByteArea`]. The
+    /// canonical-bytes composition path (used by
+    /// `SuccinctHNSWIndex::from_naive`) writes into a shared
+    /// area via the crate-private `build_into` instead.
     pub fn build(
         layer_graph: &[Vec<Vec<u32>>],
         n_nodes: usize,
@@ -684,50 +685,6 @@ impl SuccinctGraph {
     }
 }
 
-/// Zero-copy, jerky-backed HNSW index.
-///
-/// Same query surface as [`HNSWIndex`] (Malkov-Yashunin greedy
-/// descent + ef-search, threshold-gated via
-/// `candidates_above(handle, floor)`), but the graph lives in a
-/// [`SuccinctGraph`] (bit-packed CSR over (layer, node) →
-/// neighbours) and nodes are `Value<Handle<Blake3, Embedding>>`
-/// rows in a [`View<[[u8; 32]]>`] section of the canonical
-/// bytes. Embeddings live in the pile's
-/// blob store, content-addressed — queries resolve handles
-/// through the attached reader at walk time.
-///
-/// Built via [`Self::from_naive`]; a direct builder skipping the
-/// naive intermediate is a later optimization.
-///
-/// # Example
-///
-/// ```
-/// use triblespace_core::blob::MemoryBlobStore;
-/// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::value::schemas::hash::Blake3;
-/// use triblespace_search::hnsw::HNSWBuilder;
-/// use triblespace_search::schemas::put_embedding;
-/// use triblespace_search::succinct::SuccinctHNSWIndex;
-///
-/// let mut store = MemoryBlobStore::<Blake3>::new();
-/// let mut b = HNSWBuilder::new(4).with_seed(1);
-/// let mut handles = Vec::new();
-/// for v in [
-///     vec![1.0f32, 0.0, 0.0, 0.0],
-///     vec![0.0, 1.0, 0.0, 0.0],
-///     vec![0.9, 0.1, 0.0, 0.0],
-/// ] {
-///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-///     b.insert(h, v).unwrap();
-///     handles.push(h);
-/// }
-/// let idx: SuccinctHNSWIndex = b.build();
-///
-/// let reader = store.reader().unwrap();
-/// let hits = idx.attach(&reader).candidates_above(handles[0], 0.8).unwrap();
-/// assert!(hits.contains(&handles[0]));
-/// assert!(hits.contains(&handles[2]));  // 0.9*1 + 0.1*0 ≈ 0.994
-/// ```
 /// Self-contained metadata header for a [`SuccinctHNSWIndex`]
 /// blob. Stored as a typed suffix-section in the canonical
 /// bytes; loaders read it via [`anybytes::Bytes::view_suffix`]
@@ -765,6 +722,61 @@ const _: () = assert!(
     "SuccinctHNSWMeta must be 128 bytes — re-tune _pad if the layout shifts",
 );
 
+/// Zero-copy, jerky-backed HNSW index.
+///
+/// Same query surface as [`HNSWIndex`] (Malkov-Yashunin greedy
+/// descent + ef-search, threshold-gated similarity), but the
+/// graph lives in a [`SuccinctGraph`] (bit-packed CSR over
+/// (layer, node) → neighbours) and nodes are
+/// `Value<Handle<Blake3, Embedding>>` rows in a
+/// [`View<[[u8; 32]]>`] section of the canonical bytes.
+/// Embeddings live in the pile's blob store, content-addressed
+/// — queries resolve handles through the attached reader at
+/// walk time.
+///
+/// Built via [`Self::from_naive`]; a direct builder skipping
+/// the naive intermediate is a later optimization. Query the
+/// index by calling [`Self::attach`] with a blob-store reader
+/// and using [`AttachedSuccinctHNSWIndex::similar_to`] /
+/// [`AttachedSuccinctHNSWIndex::similar`] inside `find!`.
+///
+/// # Example
+///
+/// ```
+/// use triblespace_core::blob::MemoryBlobStore;
+/// use triblespace_core::find;
+/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::value::schemas::hash::{Blake3, Handle};
+/// use triblespace_core::value::Value;
+/// use triblespace_search::hnsw::HNSWBuilder;
+/// use triblespace_search::schemas::{put_embedding, Embedding};
+/// use triblespace_search::succinct::SuccinctHNSWIndex;
+///
+/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut b = HNSWBuilder::new(4).with_seed(1);
+/// let mut handles = Vec::new();
+/// for v in [
+///     vec![1.0f32, 0.0, 0.0, 0.0],
+///     vec![0.0, 1.0, 0.0, 0.0],
+///     vec![0.9, 0.1, 0.0, 0.0],
+/// ] {
+///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     b.insert(h, v).unwrap();
+///     handles.push(h);
+/// }
+/// let idx: SuccinctHNSWIndex = b.build();
+///
+/// let reader = store.reader().unwrap();
+/// let view = idx.attach(&reader);
+/// let hits: Vec<_> = find!(
+///     (n: Value<Handle<Blake3, Embedding>>),
+///     view.similar_to(handles[0], n, 0.8)
+/// )
+/// .map(|(h,)| h)
+/// .collect();
+/// assert!(hits.contains(&handles[0]));
+/// assert!(hits.contains(&handles[2]));  // 0.9*1 + 0.1*0 ≈ 0.994
+/// ```
 pub struct SuccinctHNSWIndex {
     /// Canonical blob bytes — single owner of every section's
     /// backing memory. `to_blob` is `O(1)` (refcounted clone of
@@ -1238,54 +1250,6 @@ where
     }
 }
 
-/// Zero-copy, jerky-backed BM25 index.
-///
-/// Same query surface as [`crate::bm25::BM25Index`], but postings
-/// and doc_lens live in bit-packed [`CompactVector`]s and the
-/// doc-id / term tables are sliced directly out of an
-/// [`anybytes::Bytes`] region without copying.
-///
-/// For 100k wiki fragments the naive blob is ~157 MiB; this
-/// representation cuts it to ~86 MiB via bit-packed doc_idx
-/// and u16-quantized scores. The quantization step is
-/// internal — query-time scoring goes through
-/// [`Self::score`], which returns the f32 sum derived from
-/// the stored postings.
-///
-/// Built directly via
-/// [`BM25Builder::build`][crate::bm25::BM25Builder::build]: the
-/// builder sorts + dedups the keys into a `CompressedUniverse`
-/// first, then accumulates tf and scores keyed by the universe
-/// code from the start — no insertion-order intermediate. The
-/// naive [`crate::bm25::BM25Index`] is kept as a pub reference
-/// oracle only.
-///
-/// # Example
-///
-/// ```
-/// use triblespace_core::id::Id;
-/// use triblespace_search::bm25::BM25Builder;
-/// use triblespace_search::succinct::SuccinctBM25Index;
-/// use triblespace_search::tokens::hash_tokens;
-///
-/// let mut b = BM25Builder::new();
-/// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-/// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-/// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
-/// let idx = b.build();
-///
-/// // Same query API as BM25Index — "fox" hits two docs.
-/// let fox = hash_tokens("fox")[0];
-/// let hits: Vec<_> = idx.query_term(&fox).collect();
-/// assert_eq!(hits.len(), 2);
-///
-/// // Persist via ToBlob<SuccinctBM25Blob> — the index *is* its
-/// // blob, so this is an O(1) refcounted handover of the
-/// // canonical bytes.
-/// use triblespace_core::blob::ToBlob;
-/// let blob = (&idx).to_blob();
-/// assert!(blob.bytes.len() > 0);
-/// ```
 /// Self-contained metadata header for a [`SuccinctBM25Index`]
 /// blob. Stored as a typed suffix-section in the canonical
 /// [`Bytes`]; loaders read it via
@@ -1293,10 +1257,11 @@ where
 /// before reconstructing the section views.
 ///
 /// Field order is largest-alignment-first to keep the struct
-/// `repr(C)` padding-free, matching the
-/// [`crate::ConstId`]-style "no magic, no version" convention —
-/// any breaking layout change rotates the [`SuccinctBM25Blob`]
-/// schema id rather than carrying an in-band version field.
+/// `repr(C)` padding-free. The crate follows a "no magic, no
+/// version" convention (mirroring
+/// [`triblespace_core::metadata::ConstId`]): any breaking
+/// layout change rotates the [`SuccinctBM25Blob`] schema id
+/// rather than carrying an in-band version field.
 #[derive(
     Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
 )]
@@ -1324,6 +1289,54 @@ pub struct SuccinctBM25Meta {
     pub(crate) terms: SectionHandle<[u8; 32]>,
 }
 
+/// Zero-copy, jerky-backed BM25 index.
+///
+/// Same query surface as [`crate::bm25::BM25Index`], but
+/// postings and doc_lens live in bit-packed [`CompactVector`]s
+/// and the doc-id / term tables are sliced directly out of an
+/// [`anybytes::Bytes`] region without copying.
+///
+/// For 100k wiki fragments the naive blob is ~157 MiB; this
+/// representation cuts it to ~86 MiB via bit-packed doc_idx
+/// and u16-quantized scores. The quantization step is
+/// internal — query-time scoring goes through
+/// [`SuccinctBM25Index::score`], which returns the f32 sum
+/// derived from the stored postings.
+///
+/// Built directly via
+/// [`BM25Builder::build`][crate::bm25::BM25Builder::build]:
+/// the builder sorts + dedups the keys into a
+/// `CompressedUniverse` first, then accumulates tf and scores
+/// keyed by the universe code from the start — no
+/// insertion-order intermediate. The naive
+/// [`crate::bm25::BM25Index`] is kept as a reference oracle.
+///
+/// # Example
+///
+/// ```
+/// use triblespace_core::id::Id;
+/// use triblespace_search::bm25::BM25Builder;
+/// use triblespace_search::succinct::SuccinctBM25Index;
+/// use triblespace_search::tokens::hash_tokens;
+///
+/// let mut b = BM25Builder::new();
+/// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+/// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+/// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+/// let idx = b.build();
+///
+/// // Same query API as BM25Index — "fox" hits two docs.
+/// let fox = hash_tokens("fox")[0];
+/// let hits: Vec<_> = idx.query_term(&fox).collect();
+/// assert_eq!(hits.len(), 2);
+///
+/// // Persist via ToBlob<SuccinctBM25Blob> — the index *is* its
+/// // blob, so this is an O(1) refcounted handover of the
+/// // canonical bytes.
+/// use triblespace_core::blob::ToBlob;
+/// let blob = (&idx).to_blob();
+/// assert!(blob.bytes.len() > 0);
+/// ```
 pub struct SuccinctBM25Index<
     D: ValueSchema = triblespace_core::value::schemas::genid::GenId,
     T: ValueSchema = crate::tokens::WordHash,
@@ -1611,8 +1624,11 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     }
 
     /// Equality tolerance for bound-score matching, derived from
-    /// the stored quantization scale. See
-    /// [`SuccinctPostings::score_tolerance`].
+    /// the stored quantization scale. Postings store u16-bucket
+    /// quantized scores, so equality checks against a recomputed
+    /// f32 score should accept anything within one bucket
+    /// (`max_score / 65534` for non-empty corpora,
+    /// `f32::EPSILON` for empty).
     pub fn score_tolerance(&self) -> f32 {
         self.postings.score_tolerance()
     }
