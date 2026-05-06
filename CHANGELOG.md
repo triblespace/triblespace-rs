@@ -57,6 +57,13 @@ range-query primitive in core.
   must be typed `Variable<UnknownValue>` (compile-time
   enforced); decoding to a concrete schema is an explicit
   `try_from_value::<S>()` step at the use site.
+- **`PathOp::Optional` (`(p)?`) primitive** in the path-query
+  language. Zero-or-one application of a sub-path; recognised
+  inline so the zero-step branch reuses the bound start node.
+  Plus a `from_postfix`-time normalisation pass that lifts
+  `Optional`/`Union` out of `Concat` (`a / b? ↔ a | (a / b)`)
+  so the typical WDBench shape `p / q?` actually translates.
+  See `triblespace-core/CHANGELOG.md`.
 - **`PathOp::Inverse` (`^p`) primitive** in the path-query
   language. Per-attribute reverse traversal via the VAE
   index; compound expressions normalise via standard reversal

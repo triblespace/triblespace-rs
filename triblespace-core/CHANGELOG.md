@@ -12,6 +12,24 @@ are documented at the workspace level in
 [`../CHANGELOG.md`](../CHANGELOG.md).
 
 ### Added
+- **`PathOp::Optional` (`(p)?`) primitive** in the path-query
+  language. `Optional(p)` matches zero-or-one applications of
+  `p`; semantically `Union(Identity, p)` but recognised inline
+  so the zero-step branch reuses the bound start node directly
+  instead of materialising every node as an `Identity`
+  candidate. Same shape as the `Star` arm but with the zero-
+  step alone (no transitive frontier). Plus a `from_postfix`-
+  time normalisation pass that distributes `Optional` and
+  `Union` out of `Concat` via the standard rewrites
+  (`a / b? ↔ a | (a / b)`, `(a | b) / c ↔ (a / c) | (b / c)`,
+  etc.) — without it, the typical WDBench shape
+  `Concat(Attr, Optional(Attr))` (`p / q?`) would hit the
+  `build_constraint` `unreachable!()` arm. Macro syntax in
+  `path!` (`(p)?`) is the follow-up; until then callers
+  construct `PathOp::Optional` postfix-style via
+  `RegularPathConstraint::new`. Two proptests cover the
+  standalone `(p)?` boundary case and the `p / p?` Concat-
+  with-Optional case post-normalisation.
 - **`PathOp::Inverse` (`^p`) primitive** in the path-query
   language. `^attr` reverses the direction of an attribute
   edge (VAE-index lookup yielding entity bytes, mirroring the
