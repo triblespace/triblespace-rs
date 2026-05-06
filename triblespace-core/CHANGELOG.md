@@ -12,6 +12,18 @@ are documented at the workspace level in
 [`../CHANGELOG.md`](../CHANGELOG.md).
 
 ### Added
+- **`PathOp::Inverse` (`^p`) primitive** in the path-query
+  language. `^attr` reverses the direction of an attribute
+  edge (VAE-index lookup yielding entity bytes, mirroring the
+  existing forward `eval_attr` / EAV-index path). Compound
+  expressions push down via the standard reversal rewrites
+  (`^(a/b) ↔ ^b/^a`, `^(a+) ↔ (^a)+`); double negation
+  (`^^a → a`) cancels at `from_postfix`-time. Macro syntax in
+  `path!` (`^p`) is the follow-up; until then callers
+  construct `PathOp::Inverse` postfix-style via
+  `RegularPathConstraint::new`. Two proptests cover
+  standalone `^link` and `(^p / p)+` (mid-path inverse inside
+  a Plus loop).
 - **`Universe::search_range(min, max) -> Range<usize>`**, plus
   the underlying `search_lower(v)` / `search_upper(v)`
   primitives. `O(log n)` half-open code range over a monotonic

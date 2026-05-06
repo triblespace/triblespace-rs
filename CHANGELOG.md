@@ -49,6 +49,18 @@ range-query primitive in core.
   (`book/src/capability-auth.md`) covering the model, CLI
   lifecycle, wire protocol, two-tier scope gate, and
   revocation. Linked from the workspace TOC.
+- **`pattern!` free-attribute form** — `{ ?e @ ?attr: ?val }`
+  patterns where the predicate slot is a query variable.
+  Building block for SPB-style outer projections (Q3/Q4
+  `?cw ?pred ?value`) and general-purpose schema-erased
+  iteration over an entity's triples. The value variable
+  must be typed `Variable<UnknownValue>` (compile-time
+  enforced); decoding to a concrete schema is an explicit
+  `try_from_value::<S>()` step at the use site.
+- **`PathOp::Inverse` (`^p`) primitive** in the path-query
+  language. Per-attribute reverse traversal via the VAE
+  index; compound expressions normalise via standard reversal
+  rewrites. See `triblespace-core/CHANGELOG.md`.
 
 ### Changed
 - **Pile-sync protocol stays at v4** (`/triblespace/pile-sync/4`)
