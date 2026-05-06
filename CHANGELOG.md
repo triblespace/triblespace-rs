@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-05-06
+
+The search release. `triblespace-search` (BM25 + HNSW indexes
+on top of triblespace piles) lands as a first-class workspace
+crate; the umbrella re-exports it at `triblespace::search`
+behind the `search` feature. Includes the canonical-bytes
+storage-layout refactor, the auth-arc test maturation, and a
+range-query primitive in core.
+
+### Added
+- **`triblespace-search`** — first crates.io release of the
+  BM25 + HNSW search crate. Two blob types
+  (`SuccinctBM25Blob`, `SuccinctHNSWBlob`) backed by zero-copy
+  `anybytes`-frozen `ByteArea` bytes; the index *is* its blob,
+  so `ToBlob` is an `O(1)` refcounted clone. Re-exported at
+  `triblespace::search` behind the `search` feature. Full
+  surface details in `triblespace-search/CHANGELOG.md`.
+- **`Universe::search_range` / `search_lower` / `search_upper`**
+  in `triblespace-core` — log-time range primitives over a
+  monotonic universe, with `O(log n + K)` `value_in_range`
+  proposals on `SuccinctArchive`. See
+  `triblespace-core/CHANGELOG.md`.
+- **`trible team show [--verify]`** end-to-end chain walk +
+  `verify_chain` rehearsal against a configured team root.
+  Same code path the relay's `OP_AUTH` uses; result mirrors
+  what a real connection attempt would see.
+- **`trible team invite --branch <BRANCH_HEX>`** restricts the
+  issued cap to the named branch(es); `team list` surfaces
+  the per-cap details (issuer → subject, perms, branches,
+  expiry — sorted soonest-first) and the `(revoker, target)`
+  pairs for each verifiable revocation.
+- **`pile net status`** diagnostic prints the node id, team
+  root, and self_cap a peer would present on `OP_AUTH`,
+  annotated with their source ("from `TRIBLE_TEAM_ROOT`",
+  "single-user fallback", "NOT SET — remote will reject").
+- **Live revocation propagation** in `triblespace-net`: each
+  `Peer::refresh` rescans the new snapshot for `(rev, sig)`
+  blob pairs signed by the configured team root and unions
+  them into the live revoked set. No restart needed for a
+  revocation gossiped into the pile.
+- **Capability auth book chapter**
+  (`book/src/capability-auth.md`) covering the model, CLI
+  lifecycle, wire protocol, two-tier scope gate, and
+  revocation. Linked from the workspace TOC.
+
+### Changed
+- **Pile-sync protocol stays at v4** (`/triblespace/pile-sync/4`)
+  but the test suite matures: e2e iroh-backed auth tests are
+  un-ignored, three pass green over real `TestNetwork`
+  endpoints (smoke + AUTH_OK + AUTH_REJECTED). Reachability
+  BFS for `OP_CHILDREN` is amortised across responses.
+- **`triblespace-search`'s `pub bytes: Bytes` is the persistence
+  surface** — the canonical-bytes pattern (mirroring
+  `SuccinctArchive`) means `ToBlob` is `Bytes::clone`,
+  `to_bytes` / `try_from_bytes` retired. Schema ids rotated
+  for both blob types — see search CHANGELOG.
+- **`Cargo.lock` ethnum bumped to 1.5.3** (was 1.5.2). Fixes
+  the transmute UB on nightly that was failing docs.rs builds
+  for `triblespace 0.36.0`. Constraint stayed at `^1.5.0`, so
+  this release picks up the fix automatically; the failing
+  build will be replaced when 0.37.0 publishes.
+
+### Removed
+- Pre-existing rustdoc-link warnings across the workspace —
+  14 `unresolved link` / `links to private item` warnings
+  cleared in `triblespace-core` and `triblespace-search`.
+  `cargo doc --workspace --no-deps` is now warning-free.
+
 ## [0.36.0] - 2026-04-28
 
 The chain-of-trust capability auth release. New

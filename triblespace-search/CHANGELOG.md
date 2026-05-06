@@ -1,14 +1,16 @@
 # Changelog
 
-All notable changes to `triblespace-search`. The crate is
-pre-alpha and version-locked at `0.0.0` until the first
-non-scaffold release — entries below capture the shape of the
-crate as it is today.
+All notable changes to `triblespace-search`.
 
-Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
-dates are commit dates rather than release dates.
+Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
-## Unreleased / pre-alpha
+## [0.37.0] - 2026-05-06
+
+First crates.io release. Aligned with the workspace minor;
+re-exported at `triblespace::search` behind the `search`
+feature. Entries below cover the canonical-bytes architectural
+shift and the API-affordance tightening that brought the public
+surface to a shape we're willing to commit to.
 
 ### `candidates_above` hidden from rustdoc — `similar_to` is the idiomatic surface
 

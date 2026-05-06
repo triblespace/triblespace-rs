@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-05-06
+
+### Added
+- `team show <CAP_HEX>` — chain-walk diagnostic for a single
+  capability. Prints each level (subject, issuer, scope,
+  expiry, sig blob handle, cap blob handle) plus a
+  signer-matches-issuer check at every step. Bounded by
+  `MAX_DEPTH = 32`; embedded parent sigs at depth `N>0`
+  render with `(embedded in level above)` rather than a
+  separate handle. Complements `team list`'s summary view —
+  use `show` when `list` reports a cap is present but a
+  connection still fails.
+- `team show --verify <PUBKEY_HEX>` runs `verify_chain`
+  against the given team root and prints `✓ VERIFIED` or
+  `✗ FAILED — <VerifyError>`. Same code path the relay's
+  `OP_AUTH` uses; the result is the local-side rehearsal of
+  what a real connection attempt would produce. Reads
+  `TRIBLE_TEAM_ROOT` env var by default;
+  `--expected-subject` overrides the default leaf-subject
+  check for subject-substitution detection.
+- `--version` / `-V` flag — basic CLI hygiene; prints the
+  binary's `CARGO_PKG_VERSION` and exits.
+
+### Changed
+- `team list` now sorts capabilities by expiry
+  soonest-first, surfaces `(revoker, target)` pairs for each
+  verifiable revocation, and includes branch-scope details
+  when a cap was issued with `--branch`.
+- `team {create, invite}` echo the cap's expiry timestamp
+  in the printed output so the operator sees rotation
+  deadlines without an extra `team list` call.
+- `pile net {sync, pull}` now read `TRIBLE_TEAM_ROOT` and
+  `TRIBLE_TEAM_CAP` env vars consistently; missing-env
+  diagnosis goes through `pile net status`.
+
+### Documentation
+- `README` documents `pile net` and `team` subcommand groups
+  alongside the existing `pile branch` / `pile blob` /
+  `store` sections.
+
 ## [0.36.0] - 2026-04-28
 ### Added
 - `team` subcommand group for capability-based team management:

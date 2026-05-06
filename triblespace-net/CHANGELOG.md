@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] - 2026-05-06
+
+The auth-arc tests-and-polish release. No protocol changes —
+pile-sync stays at v4 with the auth model from 0.36.0 — but
+the testing surface and the runtime ergonomics matured
+substantially.
+
+### Added
+- **End-to-end iroh auth tests un-ignored.** Three tests
+  (smoke handshake + AUTH_OK + AUTH_REJECTED) pass green over
+  real `TestNetwork` endpoints using the
+  `/triblespace/pile-sync/4` ALPN. Catches QUIC-stream-level
+  regressions that the lib-only tests miss. The lesson saved
+  for future test authors: helpers must return `(router,
+  endpoint, connection)` — dropping an iroh `Endpoint` tears
+  down all its owned `Connection`s silently, so a helper
+  returning only the `Connection` produces tests that fail
+  for non-obvious reasons.
+- **Runnable `Peer` doctest** showing the canonical
+  construction shape (`PeerConfig { team_root, self_cap,
+  peers, gossip_topic, revoked }`).
+
+### Changed
+- **Live revocation pickup** every `Peer::refresh` (auto-called
+  on every read or write through the Peer). The update path
+  rescans the snapshot for `(rev, sig)` blob pairs signed by
+  the configured team root and unions them into the live
+  revoked set. A revocation gossiped into the pile is
+  therefore picked up on the next snapshot refresh — no
+  relay restart.
+- **Reachability BFS amortised across `OP_CHILDREN` responses.**
+  The blob-level scope gate's reachability scan was previously
+  recomputed per request; it's now cached across responses
+  within one connection so a peer fetching many children pays
+  the BFS once.
+- **`PeerConfig` doc surface** points at `Peer::new` and
+  records the deliberate "no `Default` impl" rationale (every
+  construction site must specify a team root because auth is
+  mandatory).
+
 ## [0.36.0] - 2026-04-28
 
 The 0.36 line is the **chain-of-trust capability auth** release. Wire
