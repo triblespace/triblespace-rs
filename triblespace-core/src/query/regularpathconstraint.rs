@@ -86,7 +86,15 @@ impl PathExpr {
                 }
             }
         }
-        stack.pop().unwrap()
+        // Distribute `Optional` and `Union` out of `Concat` so the
+        // tail-of-Concat-is-a-closure case (e.g. `p / q?`) becomes a
+        // `Union` of pure-Concat branches. The build_constraint arm
+        // for Concat assumes Attr-only descent — without this rewrite
+        // shapes like `Concat(Attr, Optional(Attr))` would hit the
+        // unreachable!() arm. Star/Plus inside Concat are still
+        // unsupported (their unbounded nature can't be folded into a
+        // finite Union); they remain a future-work limitation.
+        normalize(stack.pop().unwrap())
     }
 
     /// Build constraints for this expression, returning the destination variable.
@@ -117,6 +125,60 @@ impl PathExpr {
                 unreachable!("closures, unions, and optionals handled at eval_from level")
             }
         }
+    }
+}
+
+/// Distribute `Optional` and `Union` out of `Concat` so that
+/// `Concat(_, Optional(_))` and `Concat(Union(_,_), _)` become a top-
+/// level `Union` of pure-Concat branches, which the `build_constraint`
+/// machinery handles via the WCO sweep. Idempotent on already-normal
+/// trees. `Star`/`Plus` inside a Concat are NOT distributed —
+/// unbounded closures would expand to an infinite Union — so those
+/// shapes remain unsupported.
+fn normalize(expr: PathExpr) -> PathExpr {
+    match expr {
+        PathExpr::Attr(a) => PathExpr::Attr(a),
+        PathExpr::Concat(lhs, rhs) => {
+            let l = normalize(*lhs);
+            let r = normalize(*rhs);
+            distribute_concat(l, r)
+        }
+        PathExpr::Union(lhs, rhs) => {
+            PathExpr::Union(Box::new(normalize(*lhs)), Box::new(normalize(*rhs)))
+        }
+        PathExpr::Star(body) => PathExpr::Star(Box::new(normalize(*body))),
+        PathExpr::Plus(body) => PathExpr::Plus(Box::new(normalize(*body))),
+        PathExpr::Optional(body) => PathExpr::Optional(Box::new(normalize(*body))),
+    }
+}
+
+/// Build a `Concat(l, r)`, distributing `Optional`/`Union` from
+/// either side outward so the result has only pure-Attr/Concat
+/// chains under top-level `Union`/closure operations.
+fn distribute_concat(l: PathExpr, r: PathExpr) -> PathExpr {
+    match (l, r) {
+        // (a | b) / c  ↦  (a / c) | (b / c)
+        (PathExpr::Union(a, b), c) => PathExpr::Union(
+            Box::new(distribute_concat(*a, c.clone())),
+            Box::new(distribute_concat(*b, c)),
+        ),
+        // a / (b | c)  ↦  (a / b) | (a / c)
+        (a, PathExpr::Union(b, c)) => PathExpr::Union(
+            Box::new(distribute_concat(a.clone(), *b)),
+            Box::new(distribute_concat(a, *c)),
+        ),
+        // a? / c  ↦  c | (a / c)
+        (PathExpr::Optional(a), c) => PathExpr::Union(
+            Box::new(c.clone()),
+            Box::new(distribute_concat(*a, c)),
+        ),
+        // a / b?  ↦  a | (a / b)
+        (a, PathExpr::Optional(b)) => PathExpr::Union(
+            Box::new(a.clone()),
+            Box::new(distribute_concat(a, *b)),
+        ),
+        // Pure pattern: build the Concat directly.
+        (l, r) => PathExpr::Concat(Box::new(l), Box::new(r)),
     }
 }
 

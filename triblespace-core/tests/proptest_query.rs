@@ -881,6 +881,51 @@ proptest! {
     }
 
     #[test]
+    fn path_optional_concat_normalizes_to_union(
+        chain_len in 2..5usize,
+    ) {
+        // Postfix `[Attr(p), Attr(p), Optional, Concat]` encodes
+        // `p / p?`. The `from_postfix` normalize pass distributes
+        // the Optional out of the Concat: `p / p?` → `p | (p / p)`.
+        // Required first hop always reaches chain[1]; optional second
+        // hop reaches chain[2] via the Concat branch.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let attr_id = test_ns::link.raw();
+
+        let start_val = (&entities[0]).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[
+                        PathOp::Attr(attr_id),
+                        PathOp::Attr(attr_id),
+                        PathOp::Optional,
+                        PathOp::Concat,
+                    ],
+                ),
+            )
+        ).collect();
+
+        let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
+        prop_assert!(dests.contains(&(&entities[1]).to_value()),
+            "p / p? should always include first-hop destination");
+        if chain_len > 2 {
+            prop_assert!(dests.contains(&(&entities[2]).to_value()),
+                "p / p? should include second-hop via the optional");
+        }
+        if chain_len > 3 {
+            prop_assert!(!dests.contains(&(&entities[3]).to_value()),
+                "p / p? should not reach 3-hop neighbor");
+        }
+    }
+
+    #[test]
     fn path_alternation_union_of_both(
         n_links in 1..4usize,
         n_labels in 1..4usize,
