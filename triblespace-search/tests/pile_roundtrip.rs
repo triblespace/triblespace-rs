@@ -11,11 +11,15 @@
 //! pile-backed write path exercises the same traits.
 
 use triblespace_core::blob::MemoryBlobStore;
+use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::Value;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
+use triblespace_search::schemas::Embedding;
 use triblespace_search::succinct::{
     SuccinctBM25Blob, SuccinctBM25Index, SuccinctHNSWBlob, SuccinctHNSWIndex,
 };
@@ -105,22 +109,26 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     assert_eq!(reloaded.dim(), original.dim());
     assert_eq!(reloaded.max_level(), original.max_level());
 
-    // Same above-threshold set for the same probe handle — both
-    // attach to the same reader so the embedding-handle lookups
-    // resolve against the same backing pile.
+    // Same above-threshold set for the same probe handle. Going
+    // through the engine path (`find!` + `similar_to`) here
+    // rather than the leaf `candidates_above`: that's the
+    // pipeline a real consumer runs after loading an index from
+    // a pile, and it's the shape we want tests to demonstrate.
     let probe = handles[0];
-    let a: HashSet<_> = original
-        .attach(&reader)
-        .candidates_above(probe, 0.4)
-        .unwrap()
-        .into_iter()
-        .collect();
-    let r: HashSet<_> = reloaded
-        .attach(&reader)
-        .candidates_above(probe, 0.4)
-        .unwrap()
-        .into_iter()
-        .collect();
+    let original_view = original.attach(&reader);
+    let reloaded_view = reloaded.attach(&reader);
+    let a: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
+        (n: Value<Handle<Blake3, Embedding>>),
+        original_view.similar_to(probe, n, 0.4)
+    )
+    .map(|(h,)| h)
+    .collect();
+    let r: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
+        (n: Value<Handle<Blake3, Embedding>>),
+        reloaded_view.similar_to(probe, n, 0.4)
+    )
+    .map(|(h,)| h)
+    .collect();
     assert_eq!(a, r, "pile round-trip diverged on {probe:?}");
 }
 
@@ -187,10 +195,23 @@ fn hnsw_indexes_share_embedding_blobs() {
 
     // Both indexes, attached to the same reader, find the shared
     // handle when probed from it — the exact match is always
-    // above any finite threshold.
+    // above any finite threshold. Engine path through `find!`,
+    // matching what a consumer actually runs.
     let probe = idx_a.handles()[0];
-    let hits_a = idx_a.attach(&reader).candidates_above(probe, 0.99).unwrap();
-    let hits_b = idx_b.attach(&reader).candidates_above(probe, 0.99).unwrap();
+    let view_a = idx_a.attach(&reader);
+    let view_b = idx_b.attach(&reader);
+    let hits_a: Vec<_> = find!(
+        (n: Value<Handle<Blake3, Embedding>>),
+        view_a.similar_to(probe, n, 0.99)
+    )
+    .map(|(h,)| h)
+    .collect();
+    let hits_b: Vec<_> = find!(
+        (n: Value<Handle<Blake3, Embedding>>),
+        view_b.similar_to(probe, n, 0.99)
+    )
+    .map(|(h,)| h)
+    .collect();
     assert!(hits_a.contains(&probe));
     assert!(hits_b.contains(&probe));
 }
