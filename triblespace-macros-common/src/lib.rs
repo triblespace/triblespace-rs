@@ -261,7 +261,34 @@ enum Value {
 }
 
 struct Attribute {
-    name: Expr,
+    /// Attribute identifier in the pattern's `name: value` slot.
+    /// Three shapes are supported:
+    ///   - `Value::Expr(e)`     — known attribute constant, e.g.
+    ///                            `cwork_title`. The macro resolves
+    ///                            the attribute Id and uses its
+    ///                            schema to type the value.
+    ///   - `Value::Var(ident)`  — free attribute, bound to a
+    ///                            `find!`-projected
+    ///                            `Variable<GenId>`. The value
+    ///                            position is required to be a
+    ///                            `Variable<UnknownValue>` — the
+    ///                            macro emits a compile-time type
+    ///                            assertion to that effect.
+    ///                            Without a fixed predicate the
+    ///                            value bytes can come from any
+    ///                            schema, so the user must take an
+    ///                            explicit `try_from_value::<S>()`
+    ///                            step to decode them and that
+    ///                            transmutation has to live at the
+    ///                            use site rather than the
+    ///                            projection.
+    ///   - `Value::LocalVar(_)` — pattern-local helper variable in
+    ///                            the attribute slot. Free-attribute
+    ///                            in the value slot is rejected
+    ///                            (no schema to infer); the user
+    ///                            should project a `Variable<UnknownValue>`
+    ///                            via `find!` instead.
+    name: Value,
     mode: AttributeMode,
     value: Value,
 }
@@ -320,20 +347,22 @@ impl Parse for Entity {
 impl Parse for Attribute {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         // Support explicit fact modifiers while keeping `attr: value` flexible:
-        // - `attr: value`   (required, attr can be any expression)
+        // - `attr: value`   (required, attr can be any expression OR `?ident` / `_?ident`)
         // - `attr?: value`  (optional, value must be `Option<T>`)
         // - `attr*: value`  (repeated, value must be an `IntoIterator<Item = T>`)
         //
-        // We only recognize `?:` and `*:` after a path-like attribute reference.
-        // That avoids confusing these modifiers with Rust operators in general
-        // expressions (for example `get_attr()? : value`).
+        // The `?:` and `*:` modifiers only make sense for known
+        // attribute constants (Optional/Repeated need the
+        // attribute's schema to type the value), so they're parsed
+        // only after a path-like attribute reference. Free
+        // attributes (`?attr`, `_?attr`) are required-mode only.
         let fork = input.fork();
         if let Ok(expr_path) = fork.parse::<syn::ExprPath>() {
             if fork.peek(Token![?]) {
                 let fork2 = fork.fork();
                 fork2.parse::<Token![?]>()?;
                 if fork2.peek(Token![:]) {
-                    let name = Expr::Path(input.parse::<syn::ExprPath>()?);
+                    let name = Value::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
                     input.parse::<Token![?]>()?;
                     input.parse::<Token![:]>()?;
                     let value: Value = input.parse()?;
@@ -349,7 +378,7 @@ impl Parse for Attribute {
                 let fork2 = fork.fork();
                 fork2.parse::<Token![*]>()?;
                 if fork2.peek(Token![:]) {
-                    let name = Expr::Path(input.parse::<syn::ExprPath>()?);
+                    let name = Value::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
                     input.parse::<Token![*]>()?;
                     input.parse::<Token![:]>()?;
                     let value: Value = input.parse()?;
@@ -361,12 +390,13 @@ impl Parse for Attribute {
                 }
             }
 
-            // Path-like required fact: fall through to the generic branch below,
-            // which keeps attribute expressions flexible.
+            // Path-like required fact: fall through to the generic
+            // Value branch below, which also accepts `?ident` /
+            // `_?ident`.
             let _ = expr_path;
         }
 
-        let name: Expr = input.parse()?;
+        let name: Value = input.parse()?;
         input.parse::<Token![:]>()?;
         let value: Value = input.parse()?;
         Ok(Attribute {
@@ -412,7 +442,11 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
     use std::collections::HashMap;
     let mut attr_idx = 0usize;
     let mut val_idx = 0usize;
-    let mut attr_map: HashMap<String, (Ident, Ident)> = HashMap::new();
+    // Tuple in the map is (attribute variable ident, optional
+    // attribute-constant reference ident). The reference is None
+    // for free-attribute patterns (`?attr` / `_?attr`) where no
+    // `Attribute` constant is available.
+    let mut attr_map: HashMap<String, (Ident, Option<Ident>)> = HashMap::new();
     let mut local_tokens = TokenStream2::new();
     let mut local_map: HashMap<String, Ident> = HashMap::new();
     let mut local_idx = 0usize;
@@ -464,31 +498,67 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
         };
         entity_tokens.extend(init);
 
-        for Attribute {
-            name: field_expr,
-            mode,
-            value,
-        } in entity.attributes
-        {
+        for Attribute { name, mode, value } in entity.attributes {
             if mode != AttributeMode::Required {
+                let span_for_err = match &name {
+                    Value::Expr(e) => e.to_token_stream(),
+                    Value::Var(i) => i.to_token_stream(),
+                    Value::LocalVar(i) => i.to_token_stream(),
+                };
                 return Err(syn::Error::new_spanned(
-                    field_expr,
+                    span_for_err,
                     "`?:` and `*:` are not supported in pattern!; use `attr: value`",
                 ));
             }
-            let key = field_expr.to_token_stream().to_string();
-            let (a_var_ident, af_ident) = attr_map
+
+            // Set up (or reuse) the attribute variable for this slot.
+            // For Value::Expr (concrete attribute) we keep the
+            // existing behaviour: emit a `let __af = &expr` reference
+            // to the Attribute constant so downstream value codegen
+            // can call `.value_from(...)` / `.as_variable(...)` on
+            // it. For Value::Var / Value::LocalVar (free attribute)
+            // there is no schema available — `__af` is `None` and
+            // the value position must use the opaque `UnknownValue`
+            // schema.
+            let key = match &name {
+                Value::Var(ident) => format!("?{}", ident),
+                Value::LocalVar(ident) => format!("_?{}", ident),
+                Value::Expr(expr) => expr.to_token_stream().to_string(),
+            };
+            let (a_var_ident, af_ident_opt) = attr_map
                 .entry(key)
                 .or_insert_with(|| {
-                    let a_ident = format_ident!("__a{}", attr_idx, span = Span::mixed_site());
-                    let af_ident = format_ident!("__af{}", attr_idx, span = Span::mixed_site());
+                    let a_ident =
+                        format_ident!("__a{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
-                    attr_tokens.extend(quote! {
-                        let #af_ident = &#field_expr;
-                        let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#a_ident.is(#base_path::value::ToValue::to_value(#af_ident.id()))));
-                    });
-                    (a_ident, af_ident)
+                    match &name {
+                        Value::Expr(expr) => {
+                            let af_ident = format_ident!(
+                                "__af{}",
+                                attr_idx,
+                                span = Span::mixed_site()
+                            );
+                            attr_tokens.extend(quote! {
+                                let #af_ident = &#expr;
+                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                                constraints.push(Box::new(#a_ident.is(#base_path::value::ToValue::to_value(#af_ident.id()))));
+                            });
+                            (a_ident, Some(af_ident))
+                        }
+                        Value::Var(user_ident) => {
+                            attr_tokens.extend(quote! {
+                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #user_ident;
+                            });
+                            (a_ident, None)
+                        }
+                        Value::LocalVar(local_ident) => {
+                            let local_var = get_local_var(local_ident);
+                            attr_tokens.extend(quote! {
+                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #local_var;
+                            });
+                            (a_ident, None)
+                        }
+                    }
                 })
                 .clone();
 
@@ -499,7 +569,9 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             };
             let v_tmp_ident = format_ident!("__v{}", val_id, span = Span::mixed_site());
 
-            // Check if the value variable is the same as the entity variable.
+            // Self-reference detection (only meaningful for projected
+            // variables, where the entity and value bind the same
+            // user variable).
             let value_var_key: Option<(bool, String)> = match value {
                 Value::Var(ref ident) => Some((false, ident.to_string())),
                 Value::LocalVar(ref ident) => Some((true, ident.to_string())),
@@ -508,9 +580,13 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             let self_ref = entity_var_key.is_some()
                 && entity_var_key == value_var_key;
 
-            let triple_tokens = match value {
-                Value::Var(ref var_ident) if self_ref => {
-                    // Self-referencing via projected variable: { ?e @ attr: ?e }
+            // Emit the per-trible constraint. The shape splits along
+            // two axes: Value variant (Var / LocalVar / Expr) and
+            // whether the attribute is concrete (`af_ident_opt =
+            // Some`) or free (`af_ident_opt = None`).
+            let triple_tokens = match (value, af_ident_opt.as_ref()) {
+                // ---- concrete attribute paths (existing) ----
+                (Value::Var(ref var_ident), Some(af_ident)) if self_ref => {
                     let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
                     quote! {
                         {
@@ -522,7 +598,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                Value::Var(ref var_ident) => {
+                (Value::Var(ref var_ident), Some(af_ident)) => {
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
@@ -531,8 +607,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                Value::LocalVar(ref var_ident) if self_ref => {
-                    // Self-referencing via local variable: { _?e @ attr: _?e }
+                (Value::LocalVar(ref var_ident), Some(af_ident)) if self_ref => {
                     let _local_ident = get_local_var(var_ident);
                     let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
                     quote! {
@@ -545,7 +620,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                Value::LocalVar(ref var_ident) => {
+                (Value::LocalVar(ref var_ident), Some(af_ident)) => {
                     let local_ident = get_local_var(var_ident);
                     quote! {
                         {
@@ -555,7 +630,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                Value::Expr(ref expr) => {
+                (Value::Expr(ref expr), Some(af_ident)) => {
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
@@ -565,6 +640,49 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
                         }
                     }
+                }
+
+                // ---- free attribute paths (new) ----
+                //
+                // No Attribute constant is available, so the macro
+                // can't apply a schema cast and the engine is going
+                // to match bytes regardless of the schema the user
+                // typed the variable with. Letting any
+                // `Variable<S>` through would compile, the join
+                // would still find the right rows, but
+                // `try_from_value::<S>()` on the result would lie
+                // for every row whose predicate isn't actually an
+                // `S`. To make that footgun a compile-time error,
+                // we emit a static type assertion that the user's
+                // variable is exactly `Variable<UnknownValue>` —
+                // forcing the receiver to do an explicit
+                // `try_from_value::<RealSchema>()` at the use site
+                // when they know which predicate they're decoding.
+                (Value::Var(ref var_ident), None) => {
+                    quote! {
+                        {
+                            #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                            // Compile-time enforcement: the value variable
+                            // for a free-attribute pattern must be typed
+                            // `Variable<UnknownValue>`. Any other schema
+                            // is rejected here so users can't quietly
+                            // misinterpret the bytes downstream.
+                            let _: &#base_path::query::Variable<#base_path::value::schemas::UnknownValue> = &#var_ident;
+                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, #var_ident)));
+                        }
+                    }
+                }
+                (Value::LocalVar(ref var_ident), None) => {
+                    return Err(syn::Error::new_spanned(
+                        var_ident,
+                        "local helper variables (_?ident) in the value position are not supported with a free attribute (?attr); use a `find!`-projected `Variable<UnknownValue>` (`?val`) instead",
+                    ));
+                }
+                (Value::Expr(ref expr), None) => {
+                    return Err(syn::Error::new_spanned(
+                        expr,
+                        "free attribute (?ident) requires a `Variable<UnknownValue>` query variable in the value position; concrete value expressions need a known attribute so the macro can apply its schema",
+                    ));
                 }
             };
             entity_tokens.extend(triple_tokens);
@@ -606,7 +724,24 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     for (i, attr) in attributes.into_iter().enumerate() {
         let mode = attr.mode;
-        let field_expr = attr.name;
+        // entity! requires a concrete attribute constant — there's
+        // no meaningful way to "insert" a fact with a free
+        // attribute Id. Free attributes are a query-only construct.
+        let field_expr = match attr.name {
+            Value::Expr(e) => e,
+            Value::Var(id) => {
+                return Err(syn::Error::new_spanned(
+                    id,
+                    "variable attribute bindings (?ident) are not allowed in entity!; use a literal attribute reference here",
+                ));
+            }
+            Value::LocalVar(id) => {
+                return Err(syn::Error::new_spanned(
+                    id,
+                    "local variable attribute bindings (_?ident) are not allowed in entity!; use a literal attribute reference here",
+                ));
+            }
+        };
         let value_expr = match attr.value {
             Value::Expr(e) => e,
             Value::Var(id) => {
@@ -904,14 +1039,34 @@ pub fn pattern_changes_impl(
         }
 
         for Attribute {
-            name: attr_expr,
+            name: attr_name,
             mode,
             value,
         } in entity.attributes
         {
+            // pattern_changes! currently requires concrete attribute
+            // constants — free-attribute (`?attr` / `_?attr`)
+            // support is a follow-up; the incremental delta walk
+            // needs more thought to remain spec-correct without a
+            // known schema for the value position.
+            let attr_expr = match attr_name {
+                Value::Expr(e) => e,
+                Value::Var(ident) => {
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        "free attribute (?ident) is not yet supported in pattern_changes!; use a concrete attribute constant",
+                    ));
+                }
+                Value::LocalVar(ident) => {
+                    return Err(syn::Error::new_spanned(
+                        ident,
+                        "free attribute (_?ident) is not yet supported in pattern_changes!; use a concrete attribute constant",
+                    ));
+                }
+            };
             if mode != AttributeMode::Required {
                 return Err(syn::Error::new_spanned(
-                    attr_expr,
+                    &attr_expr,
                     "`?:` and `*:` are not supported in pattern_changes!; use `attr: value`",
                 ));
             }
