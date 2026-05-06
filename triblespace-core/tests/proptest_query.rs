@@ -3,6 +3,7 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
+use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 use triblespace_core::query::{
     Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
 };
@@ -828,6 +829,55 @@ proptest! {
         // Start must be in results
         prop_assert!(results.iter().any(|(_, d)| *d == start_val),
             "reflexive closure missing start node");
+    }
+
+    #[test]
+    fn path_optional_includes_start_and_one_step(
+        chain_len in 2..5usize,
+    ) {
+        // PathOp::Optional (zero-or-one) on `link` from start: result
+        // set is `{start} ∪ one-step-neighbors`. Decoys past one hop
+        // (chain_len > 2) prove we don't reach them. No macro syntax
+        // for `?` yet, so build the postfix path directly.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let start = &entities[0];
+        let one_hop = &entities[1];
+
+        let start_val = (&*start).to_value();
+        let attr_id = test_ns::link.raw();
+        let set_clone = set.clone();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(
+                s.is(start_val),
+                RegularPathConstraint::new(
+                    set_clone.clone(),
+                    s,
+                    d,
+                    &[PathOp::Attr(attr_id), PathOp::Optional],
+                ),
+            )
+        ).collect();
+
+        // Exactly two destinations: start (zero-step) and one_hop (one-step).
+        prop_assert_eq!(results.len(), 2,
+            "Optional should yield start + one_hop = 2 rows, got {}", results.len());
+        let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
+        prop_assert!(dests.contains(&start_val),
+            "Optional missing start (zero-step)");
+        prop_assert!(dests.contains(&(&*one_hop).to_value()),
+            "Optional missing one-hop neighbor");
+        // Decoy: chain_len > 2 means a 2-hop neighbor exists. Optional
+        // must not reach it.
+        if chain_len > 2 {
+            let two_hop = &entities[2];
+            prop_assert!(!dests.contains(&(&*two_hop).to_value()),
+                "Optional should not reach 2-hop neighbor (zero-or-one only)");
+        }
     }
 
     #[test]

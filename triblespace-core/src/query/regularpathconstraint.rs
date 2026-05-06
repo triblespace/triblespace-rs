@@ -38,6 +38,11 @@ pub enum PathOp {
     Star,
     /// Transitive closure (`+`): one or more repetitions.
     Plus,
+    /// Zero-or-one (`?`): match the preceding sub-expression once or
+    /// not at all. Semantically `Optional(p) ↔ Union(Identity, p)`,
+    /// but recognised inline so the zero-step branch reuses the
+    /// bound start node directly instead of materialising every node.
+    Optional,
 }
 
 /// Tree-structured path expression for recursive evaluation.
@@ -48,6 +53,7 @@ enum PathExpr {
     Union(Box<PathExpr>, Box<PathExpr>),
     Star(Box<PathExpr>),
     Plus(Box<PathExpr>),
+    Optional(Box<PathExpr>),
 }
 
 impl PathExpr {
@@ -73,6 +79,10 @@ impl PathExpr {
                 PathOp::Plus => {
                     let a = stack.pop().unwrap();
                     stack.push(PathExpr::Plus(Box::new(a)));
+                }
+                PathOp::Optional => {
+                    let a = stack.pop().unwrap();
+                    stack.push(PathExpr::Optional(Box::new(a)));
                 }
             }
         }
@@ -100,8 +110,11 @@ impl PathExpr {
                 let mid = lhs.build_constraint(set, ctx, start, constraints);
                 rhs.build_constraint(set, ctx, mid, constraints)
             }
-            PathExpr::Union(..) | PathExpr::Star(..) | PathExpr::Plus(..) => {
-                unreachable!("closures and unions handled at eval_from level")
+            PathExpr::Union(..)
+            | PathExpr::Star(..)
+            | PathExpr::Plus(..)
+            | PathExpr::Optional(..) => {
+                unreachable!("closures, unions, and optionals handled at eval_from level")
             }
         }
     }
@@ -184,6 +197,11 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             results.insert(*start);
             results
         }
+        PathExpr::Optional(body) => {
+            let mut results = eval_from(set, body, start);
+            results.insert(*start);
+            results
+        }
     }
 }
 
@@ -223,6 +241,12 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
             }
             has_path(set, &PathExpr::Plus(body.clone()), from, to)
         }
+        PathExpr::Optional(body) => {
+            if from == to {
+                return true;
+            }
+            has_path(set, body, from, to)
+        }
     }
 }
 
@@ -231,7 +255,9 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
 fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
     // Unwrap closure to get the body for estimation.
     let body = match expr {
-        PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.as_ref(),
+        PathExpr::Star(inner) | PathExpr::Plus(inner) | PathExpr::Optional(inner) => {
+            inner.as_ref()
+        }
         other => other,
     };
     match body {
