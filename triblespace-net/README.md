@@ -20,9 +20,12 @@ triblespace = { version = "0.35", features = ["net"] }
 use triblespace::net::peer::{Peer, PeerConfig};
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
-let peer = Peer::new(pile, signing_key, PeerConfig {
+let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint_id],
-    gossip_topic: Some("my-team-graph".into()),
+    gossip: true,
+    team_root: signing_key.verifying_key(), // single-user fallback
+    revoked: HashSet::new(),
+    self_cap: [0u8; 32],
 });
 // From here it's just a triblespace store — commit, push, pull, query.
 ```

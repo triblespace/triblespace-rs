@@ -127,7 +127,7 @@ The invitee then runs the relay (or any pile-net peer) with
 ```bash
 $ TRIBLE_TEAM_ROOT=1a8a6a9d... \
   TRIBLE_TEAM_CAP=7afe59e7... \
-  trible pile net sync /path/to/their.pile --peers <founder-id> --topic team-graph
+  trible pile net sync /path/to/their.pile --peers <founder-id>
 ```
 
 Without those env vars the peer falls back to a single-user
@@ -234,8 +234,9 @@ use std::collections::HashSet;
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint_id],
-    gossip_topic: Some("my-team-graph".into()),
-    team_root: team_root_pubkey,            // 32 bytes, the team's CA
+    gossip: true,                           // false = pull/serve-only
+    team_root: team_root_pubkey,            // 32 bytes — the team's CA AND
+                                            // the gossip mesh id when gossip=true
     revoked: HashSet::new(),                // boot-time seed (usually empty)
     self_cap: my_own_cap_sig_handle,        // what we present on OP_AUTH
 });

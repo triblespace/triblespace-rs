@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Removed (breaking)
+- **`pile net sync --topic` flag.** The gossip mesh is now
+  identified by `TRIBLE_TEAM_ROOT` directly — every team has
+  exactly one gossip mesh, derived from its identity. Users no
+  longer pick + coordinate a separate topic string with
+  invitees. Migration: drop the `--topic` flag from any sync
+  invocation; the mesh topic is now always the team root
+  pubkey. Falls back to single-user team-of-one (the node's
+  own pubkey) when `TRIBLE_TEAM_ROOT` isn't set.
+
 ## [0.37.0] - 2026-05-06
 
 ### Added

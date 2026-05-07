@@ -15,7 +15,7 @@
 //!
 //! Use [`track`](Peer::track) to start tracking a remote branch from a
 //! specific peer (the `pile net pull` workflow), and [`fetch`](Peer::fetch)
-//! for single-blob pulls. Set `gossip_topic: None` in [`PeerConfig`] for
+//! for single-blob pulls. Set `gossip: false` in [`PeerConfig`] for
 //! pull-only mode where the peer doesn't subscribe to a flood mesh.
 
 use std::collections::HashMap;
@@ -73,7 +73,7 @@ pub use crate::host::PeerConfig;
 /// let pile: Pile<Blake3> = Pile::open(Path::new("./team.pile")).unwrap();
 /// let peer = Peer::new(pile, key.clone(), PeerConfig {
 ///     peers: vec![],                       // bootstrap nodes
-///     gossip_topic: Some("my-team".into()), // None = serve-only mode
+///     gossip: true,                        // false = serve/pull-only
 ///     team_root: key.verifying_key(),      // single-user fallback
 ///     revoked: HashSet::new(),
 ///     self_cap: [0u8; 32],
@@ -141,8 +141,8 @@ where
     /// reachable from its head and materialize a local tracking branch.
     ///
     /// Used by `pile net pull` and other "go get this from over there"
-    /// workflows. Does not require `gossip_topic` to be set — works in
-    /// pull-only mode too. The fetched data lands in the wrapped store
+    /// workflows. Does not require `gossip = true` — works in pull-
+    /// only mode too. The fetched data lands in the wrapped store
     /// via the same auto-drain path that `refresh` uses.
     ///
     /// Fire-and-forget: returns immediately. Use [`pull_branch`](Self::pull_branch)

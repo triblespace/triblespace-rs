@@ -84,13 +84,14 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
-    /// Sync with peers. No topic = serve only. With topic = live bidirectional sync.
+    /// Sync with peers — live bidirectional gossip on the team's
+    /// gossip mesh (topic = team root pubkey). The team root is read
+    /// from `TRIBLE_TEAM_ROOT`, falling back to this node's own
+    /// pubkey for single-user / team-of-one workflows.
     Sync {
         pile: PathBuf,
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
-        #[arg(long)]
-        topic: Option<String>,
         #[arg(long)]
         key: Option<PathBuf>,
     },
@@ -109,8 +110,8 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
         Command::Status { key } => run_status(key),
-        Command::Sync { pile, peers, topic, key } => {
-            run_sync(pile, peers, topic, key)
+        Command::Sync { pile, peers, key } => {
+            run_sync(pile, peers, key)
         }
         Command::Pull { pile, remote, branch, key } => {
             run_pull(pile, remote, branch, key)
@@ -168,7 +169,7 @@ fn run_status(sk: Option<PathBuf>) -> Result<()> {
 
 // ── Sync ─────────────────────────────────────────────────────────────
 
-fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, key_path: Option<PathBuf>) -> Result<()> {
+fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf>) -> Result<()> {
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
@@ -183,7 +184,7 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, k
     let self_cap = self_cap_from_env()?;
     let peer = Peer::new(pile, key.clone(), PeerConfig {
         peers,
-        gossip_topic: topic.clone(),
+        gossip: true,
         team_root,
         revoked: std::collections::HashSet::new(),
         self_cap,
@@ -192,12 +193,8 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, k
         .map_err(|e| anyhow!("repo: {e:?}"))?;
 
     eprintln!("node: {}", repo.storage().id());
-    if let Some(ref t) = topic {
-        eprintln!("topic: {t}");
-        eprintln!("live sync active. (Ctrl-C to stop)\n");
-    } else {
-        eprintln!("serving. (Ctrl-C to stop)");
-    }
+    eprintln!("team_root: {}  (gossip topic)", hex::encode(team_root.to_bytes()));
+    eprintln!("live sync active. (Ctrl-C to stop)\n");
 
     // Initial broadcast so peers connecting later can learn our state.
     repo.storage_mut().republish_branches();
@@ -207,7 +204,7 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, k
         // Periodic re-broadcast: helps newly-joined gossip neighbors learn
         // about us. iroh-gossip dedupes identical messages so re-publishing
         // the same state is cheap.
-        if topic.is_some() && last_announce.elapsed() > std::time::Duration::from_secs(10) {
+        if last_announce.elapsed() > std::time::Duration::from_secs(10) {
             repo.storage_mut().republish_branches();
             last_announce = std::time::Instant::now();
         }
@@ -246,7 +243,7 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
         .map_err(|e| anyhow!("bad node ID: {e}"))?;
     let remote_endpoint: iroh_base::EndpointId = remote_key.into();
 
-    // Spin up the Peer — pull-only mode (gossip_topic: None), no flood
+    // Spin up the Peer — pull-only mode (gossip: false), no flood
     // subscription, just direct fetch + DHT.
     use triblespace_core::repo::Repository;
     let pile = open_pile(&pile_path)?;
@@ -254,7 +251,7 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
     let self_cap = self_cap_from_env()?;
     let peer = Peer::new(pile, key.clone(), PeerConfig {
         peers: Vec::new(),
-        gossip_topic: None,
+        gossip: false,
         team_root,
         revoked: std::collections::HashSet::new(),
         self_cap,

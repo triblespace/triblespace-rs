@@ -27,11 +27,15 @@ use crate::protocol::*;
 pub struct PeerConfig {
     /// Peers to connect to (used for both gossip and DHT bootstrap).
     pub peers: Vec<EndpointId>,
-    /// Gossip topic name (None = no gossip, serve-only).
-    pub gossip_topic: Option<String>,
+    /// Whether to subscribe to live HEAD-update gossip. The topic id
+    /// is the team root pubkey's 32 bytes — every team has exactly
+    /// one gossip mesh, derived from its identity. `false` = serve-
+    /// /pull-only (no subscription, no broadcasts).
+    pub gossip: bool,
     /// The team root public key — verifies all incoming capability
     /// chains. Every connection's first stream must present a cap that
     /// chains back to this key. See `triblespace_core::repo::capability`.
+    /// When `gossip = true`, also serves as the gossip topic id.
     pub team_root: ed25519_dalek::VerifyingKey,
     /// Pubkeys whose capabilities are revoked. Cascades transitively
     /// through the chain.
@@ -386,13 +390,15 @@ async fn host_loop(
 
     // Gossip.
     let mut gossip_sender: Option<GossipSender> = None;
-    if let Some(topic_name) = config.gossip_topic {
+    if config.gossip {
         let gossip = Gossip::builder().spawn(ep.clone());
         router_builder = router_builder.accept(iroh_gossip::ALPN, gossip.clone());
 
-        let topic_id = iroh_gossip::TopicId::from_bytes(
-            *blake3::hash(topic_name.as_bytes()).as_bytes()
-        );
+        // Topic id is the team root pubkey directly: the team root is
+        // already 32 uniform bytes (an ed25519 pubkey), so no hashing
+        // is needed. One gossip mesh per team — knowing the team
+        // identifies the rendezvous channel.
+        let topic_id = iroh_gossip::TopicId::from_bytes(config.team_root.to_bytes());
         // Always use subscribe (non-blocking). The join happens in the background
         // as peers come online. subscribe_and_join blocks until at least one peer
         // is reachable, which causes hangs if peers start at different times.

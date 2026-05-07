@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed (breaking)
+- **`PeerConfig.gossip_topic: Option<String>` →
+  `PeerConfig.gossip: bool`.** The gossip topic is now derived
+  from `team_root` directly (an ed25519 pubkey is already 32
+  uniform bytes — perfect as a `TopicId`, no hashing needed),
+  so users no longer pick + coordinate a separate topic
+  string. One identifier per team handles both auth (cap
+  chain) and rendezvous (gossip mesh) — no way to join the
+  right team on the wrong gossip channel and silently see no
+  HEAD updates.
+  Migration: `gossip_topic: Some(_)` → `gossip: true`,
+  `gossip_topic: None` → `gossip: false`.
+
 ## [0.37.0] - 2026-05-06
 
 The auth-arc tests-and-polish release. No protocol changes —

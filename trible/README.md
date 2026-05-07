@@ -103,7 +103,7 @@ their own team root).
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net status [--key PATH]` — print the auth configuration this node would present on `OP_AUTH`: node id, team root, self_cap, and where each value comes from (env var vs fallback). For debugging stuck-auth scenarios.
-- `pile net sync <PILE> [--peers ID,...] [--topic NAME] [--key PATH]` — long-running bidirectional sync. Without `--topic`, serves only (accepts direct pulls but doesn't gossip). With `--topic`, joins the gossip mesh and auto-merges incoming tracking branches into same-named local ones every tick. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars for multi-user team operation.
+- `pile net sync <PILE> [--peers ID,...] [--key PATH]` — long-running bidirectional sync on the team's gossip mesh. The mesh is identified by the team root pubkey directly (no separate topic argument): every team has exactly one mesh, derived from its identity. Auto-merges incoming tracking branches into same-named local ones every tick. Reads `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars; falls back to the node's own pubkey for single-user / team-of-one workflows.
 - `pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]` — one-shot pull of a named branch from a specific peer (REMOTE is the peer's iroh node id, 64-char hex). Pull-only mode — no gossip subscription, direct QUIC + DHT fetch, materializes a tracking branch and merges into local. Same env-var fallback as `sync`.
 
 ### Capability auth

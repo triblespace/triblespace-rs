@@ -46,9 +46,11 @@ use std::collections::HashSet;
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint_id],
-    gossip_topic: Some("my-team-graph".into()),
+    gossip: true,                            // false = pull/serve-only
     // Auth is mandatory — see the Capability Auth chapter for the
     // team-root + self_cap setup, or run `trible team create`.
+    // The team root pubkey doubles as the gossip mesh id when
+    // `gossip = true`.
     team_root: signing_key.verifying_key(),  // single-user team-of-one
     revoked: HashSet::new(),
     self_cap: [0u8; 32],
@@ -201,13 +203,15 @@ The `trible` CLI exposes sync via the `pile net` subcommand:
 trible pile net identity [--key PATH]
     Print this node's iroh identity (generates a key if needed).
 
-trible pile net sync <PILE> [--peers ...] [--topic T] [--key PATH]
-    Long-running bidirectional sync. Without --topic, serves only
-    (accepts direct pulls but doesn't gossip). With --topic, joins
-    the gossip mesh and auto-merges incoming tracking branches into
-    same-named local ones every tick. Reads `TRIBLE_TEAM_ROOT` and
-    `TRIBLE_TEAM_CAP` env vars for multi-user team operation; falls
-    back to single-user team-of-one without them.
+trible pile net sync <PILE> [--peers ...] [--key PATH]
+    Long-running bidirectional sync on the team's gossip mesh.
+    The mesh is identified by the team root pubkey directly (no
+    separate --topic flag): every team has exactly one mesh,
+    derived from its identity. Auto-merges incoming tracking
+    branches into same-named local ones every tick. Reads
+    `TRIBLE_TEAM_ROOT` and `TRIBLE_TEAM_CAP` env vars for multi-
+    user team operation; falls back to single-user team-of-one
+    using the node's own pubkey when those aren't set.
 
 trible pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]
     One-shot pull of a named branch from a specific peer (REMOTE is
