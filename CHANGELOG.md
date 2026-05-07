@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-05-07
+
+The team-rooted-gossip release. The gossip mesh id is now
+derived directly from the team root pubkey, so `triblespace-net`
+and `trible` no longer ask users to coordinate a separate topic
+string with their team. One identifier per team handles both
+auth (cap chain verification) and rendezvous (gossip mesh).
+
+### Changed (breaking)
+- **`triblespace::net::peer::PeerConfig.gossip_topic:
+  Option<String>` → `gossip: bool`.** When `gossip = true`, the
+  topic is `team_root.to_bytes()` directly (32 uniform bytes
+  from the ed25519 pubkey — perfect as a `TopicId`, no hashing
+  needed). `gossip = false` is serve/pull-only (no mesh
+  subscription). Migration: `Some(_)` → `true`, `None` → `false`.
+  See `triblespace-net/CHANGELOG.md`.
+- **`trible pile net sync --topic NAME` flag removed.** Sync
+  always joins the team's gossip mesh, identified by
+  `TRIBLE_TEAM_ROOT` (or single-user fallback to the node's own
+  pubkey when unset). Migration: drop the `--topic` flag from
+  any sync invocation. See `trible/CHANGELOG.md`.
+- All 8 workspace crates bumped 0.37.0 → 0.38.0 in lock-step
+  (`triblespace`, `triblespace-core`, `triblespace-core-macros`,
+  `triblespace-macros`, `triblespace-macros-common`,
+  `triblespace-net`, `triblespace-search`, `trible`). Only
+  `triblespace-net` and `trible` carry source changes; the rest
+  bump to keep workspace versions aligned.
+
 ## [0.37.0] - 2026-05-06
 
 The search release. `triblespace-search` (BM25 + HNSW indexes
