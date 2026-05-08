@@ -174,6 +174,102 @@ fn xsd_datatypes_map_to_native_schemas() {
 }
 
 #[test]
+fn xsd_temporal_and_binary_types() {
+    use triblespace_core::blob::schemas::rawbytes::RawBytes;
+    use triblespace_core::value::schemas::time::{NsDuration, NsTAIInterval};
+
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    let data = br#"
+<http://ex/a> <http://ex/born> "1879-03-14T11:30:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
+<http://ex/a> <http://ex/lived> "1879-03-14"^^<http://www.w3.org/2001/XMLSchema#date> .
+<http://ex/a> <http://ex/century> "1900"^^<http://www.w3.org/2001/XMLSchema#gYear> .
+<http://ex/a> <http://ex/era> "1900-01"^^<http://www.w3.org/2001/XMLSchema#gYearMonth> .
+<http://ex/a> <http://ex/lifespan> "P76DT0H"^^<http://www.w3.org/2001/XMLSchema#duration> .
+<http://ex/a> <http://ex/checksum> "DEADBEEF"^^<http://www.w3.org/2001/XMLSchema#hexBinary> .
+<http://ex/a> <http://ex/avatar> "SGVsbG8="^^<http://www.w3.org/2001/XMLSchema#base64Binary> .
+<http://ex/a> <http://ex/homepage> "http://example.org"^^<http://www.w3.org/2001/XMLSchema#anyURI> .
+"#;
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..]));
+    assert_eq!(count, 8);
+
+    // dateTime → NsTAIInterval [t, t]
+    let born = Attribute::<NsTAIInterval>::from_name("http://ex/born");
+    let born_count = find!(
+        (v: Value<NsTAIInterval>),
+        pattern!(&facts, [{ _?e @ born: ?v }])
+    )
+    .count();
+    assert_eq!(born_count, 1, "dateTime stored as NsTAIInterval");
+
+    // date → NsTAIInterval (one day)
+    let lived = Attribute::<NsTAIInterval>::from_name("http://ex/lived");
+    assert_eq!(
+        find!(
+            (v: Value<NsTAIInterval>),
+            pattern!(&facts, [{ _?e @ lived: ?v }])
+        )
+        .count(),
+        1
+    );
+
+    // gYear / gYearMonth → NsTAIInterval
+    let century = Attribute::<NsTAIInterval>::from_name("http://ex/century");
+    assert_eq!(
+        find!(
+            (v: Value<NsTAIInterval>),
+            pattern!(&facts, [{ _?e @ century: ?v }])
+        )
+        .count(),
+        1
+    );
+
+    // duration → NsDuration
+    let lifespan = Attribute::<NsDuration>::from_name("http://ex/lifespan");
+    assert_eq!(
+        find!(
+            (v: Value<NsDuration>),
+            pattern!(&facts, [{ _?e @ lifespan: ?v }])
+        )
+        .count(),
+        1
+    );
+
+    // hexBinary / base64Binary → Handle<Blake3, RawBytes>
+    let checksum = Attribute::<Handle<Blake3, RawBytes>>::from_name("http://ex/checksum");
+    assert_eq!(
+        find!(
+            (h: Value<Handle<Blake3, RawBytes>>),
+            pattern!(&facts, [{ _?e @ checksum: ?h }])
+        )
+        .count(),
+        1
+    );
+    let avatar = Attribute::<Handle<Blake3, RawBytes>>::from_name("http://ex/avatar");
+    assert_eq!(
+        find!(
+            (h: Value<Handle<Blake3, RawBytes>>),
+            pattern!(&facts, [{ _?e @ avatar: ?h }])
+        )
+        .count(),
+        1
+    );
+
+    // anyURI → GenId via uri_to_id (same path as `<...>` objects).
+    let homepage = Attribute::<valueschemas::GenId>::from_name("http://ex/homepage");
+    assert_eq!(
+        find!(
+            (id: Id),
+            pattern!(&facts, [{ _?e @ homepage: ?id }])
+        )
+        .count(),
+        1
+    );
+}
+
+#[test]
 fn lang_tagged_literals_reify_into_entities() {
     use triblespace_core::import::{rdf_lang, rdf_text};
 

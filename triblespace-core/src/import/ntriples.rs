@@ -16,7 +16,14 @@
 //! - `xsd:float` / `xsd:double` → `F64`
 //! - `xsd:boolean` → `Boolean`
 //! - `xsd:string`, untyped → `Handle<Blake3, LongString>`
-//! - URI objects → `GenId`
+//! - URI objects (and `xsd:anyURI` literals) → `GenId`
+//! - `xsd:dateTime` → `NsTAIInterval` as `[t, t]` (degenerate instant)
+//! - `xsd:date` → `NsTAIInterval` (whole day, inclusive bounds)
+//! - `xsd:gYear` / `xsd:gYearMonth` → `NsTAIInterval` (year / month)
+//! - `xsd:duration` / `xsd:dayTimeDuration` → `NsDuration`
+//!   (year/month-only durations fall through to text since their
+//!   ns count depends on context)
+//! - `xsd:hexBinary` / `xsd:base64Binary` → `Handle<Blake3, RawBytes>`
 //!
 //! Language-tagged literals (`"text"@lang`) are reified into a small
 //! entity carrying [`rdf_lang`](crate::import::rdf_lang) and
@@ -28,6 +35,9 @@ use std::borrow::Cow;
 use std::io::BufRead;
 use std::path::Path;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+use hifitime::prelude::*;
 use num_rational::Ratio;
 use winnow::error::InputError;
 use winnow::token::take_while;
@@ -35,6 +45,7 @@ use winnow::Parser;
 
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
+use crate::blob::schemas::rawbytes::RawBytes;
 use crate::id::{ExclusiveId, Id};
 use crate::macros::entity;
 use crate::prelude::valueschemas;
@@ -42,6 +53,7 @@ use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::shortstring::ShortString;
+use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::value::{ToValue, TryToValue, Value};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -190,6 +202,240 @@ fn parse_decimal(s: &str) -> Option<Ratio<i128>> {
         let n: i128 = s.parse().ok()?;
         Some(Ratio::from_integer(n))
     }
+}
+
+// ── XSD temporal parsers ────────────────────────────────────────────
+//
+// xsd:dateTime / xsd:date / xsd:gYear* lexical forms are deliberately
+// strict subsets of ISO 8601. We parse the components ourselves and
+// hand them to hifitime's `from_gregorian_utc`, so leap-second handling
+// and pre-Gregorian dates fall out of hifitime's correctness — we just
+// have to be permissive about timezone notation (`Z`, `+HH:MM`,
+// missing — RDF data uses all three).
+
+/// Eat `[-]YYYY` from the front of `s`, returning the signed year and
+/// the remainder.
+fn parse_year(mut s: &str) -> Option<(i32, &str)> {
+    let neg = if let Some(rest) = s.strip_prefix('-') {
+        s = rest;
+        true
+    } else {
+        false
+    };
+    let digits_end = s
+        .as_bytes()
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .unwrap_or(s.len());
+    if digits_end < 4 {
+        return None;
+    }
+    let year_abs: i64 = s[..digits_end].parse().ok()?;
+    let year: i32 = if neg {
+        i32::try_from(-year_abs).ok()?
+    } else {
+        i32::try_from(year_abs).ok()?
+    };
+    Some((year, &s[digits_end..]))
+}
+
+/// Strip an `xsd` timezone suffix (`Z` or `±HH:MM`) and return the
+/// offset in seconds. Missing timezone → 0 (UTC convention for RDF).
+fn parse_timezone_offset(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    if s == "Z" {
+        return Some(0);
+    }
+    let bytes = s.as_bytes();
+    let sign = match bytes.first()? {
+        b'+' => 1i64,
+        b'-' => -1i64,
+        _ => return None,
+    };
+    if bytes.len() != 6 || bytes[3] != b':' {
+        return None;
+    }
+    let hh: i64 = std::str::from_utf8(&bytes[1..3]).ok()?.parse().ok()?;
+    let mm: i64 = std::str::from_utf8(&bytes[4..6]).ok()?.parse().ok()?;
+    Some(sign * (hh * 3600 + mm * 60))
+}
+
+/// Build an [`Epoch`] (UTC) from Gregorian fields and a timezone offset
+/// in seconds. The offset is *subtracted* — `12:00 +05:00` is `07:00 UTC`.
+fn epoch_from_gregorian_with_offset(
+    year: i32,
+    month: u8,
+    day: u8,
+    hh: u8,
+    mm: u8,
+    ss: u8,
+    ns: u32,
+    offset_secs: i64,
+) -> Epoch {
+    let local = Epoch::from_gregorian_utc(year, month, day, hh, mm, ss, ns);
+    local - Duration::from_seconds(offset_secs as f64)
+}
+
+/// xsd:dateTime — `[-]YYYY-MM-DDThh:mm:ss[.f][Z|±HH:MM]`.
+fn parse_xsd_datetime(s: &str) -> Option<i128> {
+    let (year, rest) = parse_year(s)?;
+    let mut chars = rest.as_bytes();
+    if chars.first() != Some(&b'-') {
+        return None;
+    }
+    let month: u8 = std::str::from_utf8(chars.get(1..3)?).ok()?.parse().ok()?;
+    if chars.get(3) != Some(&b'-') {
+        return None;
+    }
+    let day: u8 = std::str::from_utf8(chars.get(4..6)?).ok()?.parse().ok()?;
+    if chars.get(6) != Some(&b'T') {
+        return None;
+    }
+    let hh: u8 = std::str::from_utf8(chars.get(7..9)?).ok()?.parse().ok()?;
+    if chars.get(9) != Some(&b':') {
+        return None;
+    }
+    let mm: u8 = std::str::from_utf8(chars.get(10..12)?).ok()?.parse().ok()?;
+    if chars.get(12) != Some(&b':') {
+        return None;
+    }
+    let ss: u8 = std::str::from_utf8(chars.get(13..15)?).ok()?.parse().ok()?;
+    chars = &chars[15..];
+
+    let mut ns: u32 = 0;
+    if chars.first() == Some(&b'.') {
+        chars = &chars[1..];
+        let frac_end = chars
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(chars.len());
+        // Pad / truncate to 9 digits (nanosecond resolution).
+        let frac_str = std::str::from_utf8(&chars[..frac_end]).ok()?;
+        let mut padded = String::with_capacity(9);
+        padded.push_str(frac_str);
+        while padded.len() < 9 {
+            padded.push('0');
+        }
+        ns = padded[..9].parse().ok()?;
+        chars = &chars[frac_end..];
+    }
+
+    let tz = std::str::from_utf8(chars).ok()?;
+    let offset = parse_timezone_offset(tz)?;
+    let epoch = epoch_from_gregorian_with_offset(year, month, day, hh, mm, ss, ns, offset);
+    Some(epoch.to_tai_duration().total_nanoseconds())
+}
+
+/// xsd:date — `[-]YYYY-MM-DD[Z|±HH:MM]`. Returned as inclusive bounds
+/// `[day_start, day_end]`.
+fn parse_xsd_date(s: &str) -> Option<(i128, i128)> {
+    let (year, rest) = parse_year(s)?;
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'-') {
+        return None;
+    }
+    let month: u8 = std::str::from_utf8(bytes.get(1..3)?).ok()?.parse().ok()?;
+    if bytes.get(3) != Some(&b'-') {
+        return None;
+    }
+    let day: u8 = std::str::from_utf8(bytes.get(4..6)?).ok()?.parse().ok()?;
+    let tz = std::str::from_utf8(&bytes[6..]).ok()?;
+    let offset = parse_timezone_offset(tz)?;
+    let lower = epoch_from_gregorian_with_offset(year, month, day, 0, 0, 0, 0, offset)
+        .to_tai_duration()
+        .total_nanoseconds();
+    // Day end: lower + 86_400 s - 1 ns. (Inclusive upper.)
+    let upper = lower + 86_400_000_000_000i128 - 1;
+    Some((lower, upper))
+}
+
+/// xsd:gYear — `[-]YYYY[Z|±HH:MM]`. Returned as the whole year as an
+/// inclusive interval.
+fn parse_xsd_gyear(s: &str) -> Option<(i128, i128)> {
+    let (year, rest) = parse_year(s)?;
+    let offset = parse_timezone_offset(rest)?;
+    let lower = epoch_from_gregorian_with_offset(year, 1, 1, 0, 0, 0, 0, offset)
+        .to_tai_duration()
+        .total_nanoseconds();
+    let next_year = year.checked_add(1)?;
+    let upper_excl = epoch_from_gregorian_with_offset(next_year, 1, 1, 0, 0, 0, 0, offset)
+        .to_tai_duration()
+        .total_nanoseconds();
+    Some((lower, upper_excl - 1))
+}
+
+/// xsd:gYearMonth — `[-]YYYY-MM[Z|±HH:MM]`. Whole month, inclusive.
+fn parse_xsd_gyearmonth(s: &str) -> Option<(i128, i128)> {
+    let (year, rest) = parse_year(s)?;
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'-') {
+        return None;
+    }
+    let month: u8 = std::str::from_utf8(bytes.get(1..3)?).ok()?.parse().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let tz = std::str::from_utf8(&bytes[3..]).ok()?;
+    let offset = parse_timezone_offset(tz)?;
+    let lower = epoch_from_gregorian_with_offset(year, month, 1, 0, 0, 0, 0, offset)
+        .to_tai_duration()
+        .total_nanoseconds();
+    let (next_year, next_month) = if month == 12 {
+        (year.checked_add(1)?, 1u8)
+    } else {
+        (year, month + 1)
+    };
+    let upper_excl = epoch_from_gregorian_with_offset(next_year, next_month, 1, 0, 0, 0, 0, offset)
+        .to_tai_duration()
+        .total_nanoseconds();
+    Some((lower, upper_excl - 1))
+}
+
+/// xsd:duration — `[-]P[nY][nM][nD][T[nH][nM][nS]]`. We reject mixed
+/// year/month durations (their second-count depends on context); pure
+/// dayTime durations (`PnDTnHnMnS`) convert to a single ns count.
+fn parse_xsd_duration(s: &str) -> Option<i128> {
+    let mut s = s;
+    let neg = if let Some(rest) = s.strip_prefix('-') {
+        s = rest;
+        true
+    } else {
+        false
+    };
+    let mut s = s.strip_prefix('P')?;
+    let mut total_ns: i128 = 0;
+
+    let mut in_time = false;
+    while !s.is_empty() {
+        if let Some(rest) = s.strip_prefix('T') {
+            in_time = true;
+            s = rest;
+            continue;
+        }
+        let num_end = s
+            .as_bytes()
+            .iter()
+            .position(|b| !(b.is_ascii_digit() || *b == b'.'))?;
+        let num_str = &s[..num_end];
+        let unit = s.as_bytes().get(num_end).copied()?;
+        s = &s[num_end + 1..];
+        let value: f64 = num_str.parse().ok()?;
+        match (in_time, unit) {
+            (false, b'Y') | (false, b'M') => {
+                // Years and months can't be expressed in fixed ns —
+                // their second count depends on which year/month.
+                return None;
+            }
+            (false, b'D') => total_ns = total_ns.checked_add((value * 86_400e9) as i128)?,
+            (true, b'H') => total_ns = total_ns.checked_add((value * 3_600e9) as i128)?,
+            (true, b'M') => total_ns = total_ns.checked_add((value * 60e9) as i128)?,
+            (true, b'S') => total_ns = total_ns.checked_add((value * 1e9) as i128)?,
+            _ => return None,
+        }
+    }
+    Some(if neg { -total_ns } else { total_ns })
 }
 
 // ── URI → Id ────────────────────────────────────────────────────────
@@ -386,11 +632,76 @@ fn emit_typed_literal<Blobs>(
                 }
                 _ => {}
             },
+            "dateTime" => {
+                if let Some(ns) = parse_xsd_datetime(text.as_ref()) {
+                    emit_interval(facts, e, predicate, ns, ns);
+                    return;
+                }
+            }
+            "date" => {
+                if let Some((lo, hi)) = parse_xsd_date(text.as_ref()) {
+                    emit_interval(facts, e, predicate, lo, hi);
+                    return;
+                }
+            }
+            "gYear" => {
+                if let Some((lo, hi)) = parse_xsd_gyear(text.as_ref()) {
+                    emit_interval(facts, e, predicate, lo, hi);
+                    return;
+                }
+            }
+            "gYearMonth" => {
+                if let Some((lo, hi)) = parse_xsd_gyearmonth(text.as_ref()) {
+                    emit_interval(facts, e, predicate, lo, hi);
+                    return;
+                }
+            }
+            "duration" | "dayTimeDuration" => {
+                if let Some(ns) = parse_xsd_duration(text.as_ref()) {
+                    let attr = Attribute::<NsDuration>::from_name(predicate);
+                    let v: Value<NsDuration> = ns.to_value();
+                    facts.insert(&Trible::new(e, &attr.id(), &v));
+                    return;
+                }
+            }
+            "hexBinary" => {
+                if let Ok(bytes) = hex::decode(text.as_ref()) {
+                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_name(predicate);
+                    let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
+                    facts.insert(&Trible::new(e, &attr.id(), &handle));
+                    return;
+                }
+            }
+            "base64Binary" => {
+                if let Ok(bytes) = BASE64.decode(text.as_ref()) {
+                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_name(predicate);
+                    let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
+                    facts.insert(&Trible::new(e, &attr.id(), &handle));
+                    return;
+                }
+            }
+            "anyURI" => {
+                // Treat the literal as an IRI reference — same path as
+                // bracketed `<...>` objects, so `"http://x"^^xsd:anyURI`
+                // and `<http://x>` collapse to the same entity id.
+                emit_uri_object(ws, facts, e, predicate, text.as_ref());
+                return;
+            }
             _ => {}
         }
     }
     // Unknown / unparseable typed literal: fall back to text storage.
     emit_text_literal(ws, facts, e, predicate, text);
+}
+
+/// Helper to emit an `[lo, hi]` interval trible.
+fn emit_interval(facts: &mut TribleSet, e: &ExclusiveId, predicate: &str, lo: i128, hi: i128) {
+    let attr = Attribute::<NsTAIInterval>::from_name(predicate);
+    let mut raw = [0u8; 32];
+    raw[0..16].copy_from_slice(&i128_to_ordered_be(lo));
+    raw[16..32].copy_from_slice(&i128_to_ordered_be(hi));
+    let v: Value<NsTAIInterval> = Value::new(raw);
+    facts.insert(&Trible::new(e, &attr.id(), &v));
 }
 
 fn emit_lang_literal<Blobs>(
@@ -513,5 +824,80 @@ mod tests {
         let r = parse_decimal("-0.5").unwrap();
         assert_eq!(*r.numer(), -1);
         assert_eq!(*r.denom(), 2);
+    }
+
+    #[test]
+    fn xsd_datetime_z_and_offset() {
+        // The two strings should parse to the same instant.
+        let utc = parse_xsd_datetime("2020-01-01T12:00:00Z").unwrap();
+        let plus5 = parse_xsd_datetime("2020-01-01T17:00:00+05:00").unwrap();
+        assert_eq!(utc, plus5);
+    }
+
+    #[test]
+    fn xsd_datetime_with_fractional_seconds() {
+        let no_frac = parse_xsd_datetime("2020-01-01T00:00:00Z").unwrap();
+        let with_frac = parse_xsd_datetime("2020-01-01T00:00:00.5Z").unwrap();
+        assert_eq!(with_frac - no_frac, 500_000_000);
+    }
+
+    #[test]
+    fn xsd_datetime_bce_year() {
+        // Negative year → year before 1 CE in proleptic Gregorian.
+        // Just check it parses (round-trip semantics is hifitime's problem).
+        assert!(parse_xsd_datetime("-0500-01-01T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn xsd_date_spans_one_day() {
+        let (lo, hi) = parse_xsd_date("2020-01-01").unwrap();
+        // 86400 seconds in nanoseconds, minus 1 for inclusive upper.
+        assert_eq!(hi - lo, 86_400_000_000_000 - 1);
+    }
+
+    #[test]
+    fn xsd_gyear_spans_full_year() {
+        let (lo_2020, hi_2020) = parse_xsd_gyear("2020").unwrap();
+        let (lo_2021, _) = parse_xsd_gyear("2021").unwrap();
+        // 2020 was a leap year — 366 days.
+        assert_eq!(hi_2020 - lo_2020, 366 * 86_400_000_000_000 - 1);
+        // 2020 immediately precedes 2021.
+        assert_eq!(hi_2020 + 1, lo_2021);
+    }
+
+    #[test]
+    fn xsd_gyearmonth_spans_one_month() {
+        let (lo_jan, hi_jan) = parse_xsd_gyearmonth("2020-01").unwrap();
+        // January has 31 days.
+        assert_eq!(hi_jan - lo_jan, 31 * 86_400_000_000_000 - 1);
+
+        let (_, hi_feb) = parse_xsd_gyearmonth("2020-02").unwrap();
+        let (lo_mar, _) = parse_xsd_gyearmonth("2020-03").unwrap();
+        assert_eq!(hi_feb + 1, lo_mar);
+    }
+
+    #[test]
+    fn xsd_duration_daytime_only() {
+        // P1DT2H3M4.5S = 1 day + 2h + 3m + 4.5s
+        let ns = parse_xsd_duration("P1DT2H3M4.5S").unwrap();
+        let expected = 86_400_000_000_000i128
+            + 2 * 3_600_000_000_000
+            + 3 * 60_000_000_000
+            + 4_500_000_000;
+        assert_eq!(ns, expected);
+    }
+
+    #[test]
+    fn xsd_duration_negative() {
+        let ns = parse_xsd_duration("-PT5S").unwrap();
+        assert_eq!(ns, -5_000_000_000);
+    }
+
+    #[test]
+    fn xsd_duration_rejects_year_month() {
+        // Year/month durations don't have a fixed ns count.
+        assert!(parse_xsd_duration("P1Y").is_none());
+        assert!(parse_xsd_duration("P1M").is_none());
+        assert!(parse_xsd_duration("P1Y2M").is_none());
     }
 }
