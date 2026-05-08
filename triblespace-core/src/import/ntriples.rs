@@ -65,6 +65,14 @@ fn parse_line(line: &str) -> Option<(String, String, NtObject)> {
     let object = if rest.starts_with('<') {
         let (uri, _) = parse_uri(rest)?;
         NtObject::Uri(uri)
+    } else if rest.starts_with("_:") {
+        // Blank-node objects (e.g. Wikidata's date-with-precision pseudo-
+        // entities) are mapped to the synthetic URI `_:label` so they
+        // round-trip deterministically through `uri_to_id`.
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '.')
+            .unwrap_or(rest.len());
+        NtObject::Uri(rest[..end].to_string())
     } else if rest.starts_with('"') {
         let (text, datatype) = parse_literal_with_datatype(rest)?;
         NtObject::Literal(typed_literal(text, datatype.as_deref()))
@@ -174,7 +182,12 @@ fn typed_literal(text: String, datatype: Option<&str>) -> RdfLiteral {
 
 // ── URI → Id ────────────────────────────────────────────────────────
 
-fn uri_to_id<Blobs>(ws: &mut Workspace<Blobs>, uri: &str) -> Id
+/// Map an RDF URI to a triblespace [`Id`] deterministically by routing it
+/// through an `rdf_uri` fragment. The same URI always produces the same
+/// `Id` — across processes, machines, and repeated imports — so callers
+/// outside this module can use this to derive ids for query constants
+/// that match what [`ingest_ntriples`] inserts.
+pub fn uri_to_id<Blobs>(ws: &mut Workspace<Blobs>, uri: &str) -> Id
 where
     Blobs: BlobStore<Blake3>,
 {
@@ -292,6 +305,16 @@ mod tests {
         let line = r#"<http://example.org/s> <http://example.org/p> "hello" ."#;
         let (_, _, o) = parse_line(line).unwrap();
         assert!(matches!(o, NtObject::Literal(RdfLiteral::Text(ref t)) if t == "hello"));
+    }
+
+    #[test]
+    fn parse_bnode_object() {
+        let line =
+            r#"<http://example.org/s> <http://example.org/p> _:bf55954f96378f65ddb1da9836e2eb87 ."#;
+        let (s, p, o) = parse_line(line).unwrap();
+        assert_eq!(s, "http://example.org/s");
+        assert_eq!(p, "http://example.org/p");
+        assert!(matches!(o, NtObject::Uri(ref u) if u == "_:bf55954f96378f65ddb1da9836e2eb87"));
     }
 
     #[test]
