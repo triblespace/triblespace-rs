@@ -8,6 +8,8 @@ pub use crate::blob::schemas::array::{Array, ArrayElement};
 pub use crate::blob::schemas::filebytes::FileBytes;
 /// Re-export of [`LongString`].
 pub use crate::blob::schemas::longstring::LongString;
+/// Re-export of [`RawBytes`].
+pub use crate::blob::schemas::rawbytes::RawBytes;
 /// Re-export of [`SimpleArchive`].
 pub use crate::blob::schemas::simplearchive::SimpleArchive;
 

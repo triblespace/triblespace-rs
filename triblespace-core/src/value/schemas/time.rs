@@ -7,6 +7,7 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
+use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -55,12 +56,12 @@ const SIGN_BIT: u128 = 1u128 << 127;
 
 /// Encode i128 as order-preserving big-endian: flip sign bit, then BE.
 /// Maps i128::MIN→0, 0→2^127, i128::MAX→u128::MAX.
-fn i128_to_ordered_be(v: i128) -> [u8; 16] {
+pub(crate) fn i128_to_ordered_be(v: i128) -> [u8; 16] {
     ((v as u128) ^ SIGN_BIT).to_be_bytes()
 }
 
 /// Decode order-preserving big-endian back to i128.
-fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
+pub(crate) fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
     (u128::from_be_bytes(bytes) ^ SIGN_BIT) as i128
 }
 
@@ -196,6 +197,105 @@ pub struct InvertedIntervalError {
     pub upper: i128,
 }
 
+/// A value schema for a signed nanosecond duration delta.
+///
+/// log2(ns / Planck second) ≈ 113.8, so a 128-bit ns count comfortably
+/// holds every duration physics has an opinion about. We use the upper
+/// 16 bytes for the i128 nanosecond magnitude (sign-bit-XOR'd big-
+/// endian, same trick as [`NsTAIInterval`]) and reserve the lower 16
+/// bytes as zero. Today's readers/writers ignore the lower half;
+/// future implementations can use those bits to carry sub-nanosecond
+/// precision (picoseconds, femtoseconds, eventually Planck seconds)
+/// without breaking byte-lex ordering or trie compatibility — older
+/// values just sort before any future-precision values that share the
+/// same ns count.
+pub struct NsDuration;
+
+impl ConstId for NsDuration {
+    const ID: Id = id_hex!("951D5249DB193D3B3F208B994B1072C4");
+}
+
+impl ConstDescribe for NsDuration {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let id = Self::ID;
+        let description = blobs.put(
+            "Signed nanosecond duration delta encoded as an offset-big-endian i128 in the upper 16 bytes; the lower 16 bytes are reserved (zero today, sub-nanosecond precision in the future). XOR'ing the i128 with i128::MIN before big-endian write makes byte-lexicographic order match numeric order across the full i128 range, so range scans on a sorted trie work natively.",
+        )?;
+        Ok(entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: blobs.put("ns_duration")?,
+                metadata::description: description,
+                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+        })
+    }
+}
+
+impl ValueSchema for NsDuration {
+    type ValidationError = ReservedBitsNonZero;
+
+    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+        if value.raw[16..32] != [0u8; 16] {
+            return Err(ReservedBitsNonZero);
+        }
+        Ok(value)
+    }
+}
+
+/// The reserved (lower 16 bytes) of an [`NsDuration`] encoding contained
+/// non-zero bytes. Future precision-extending readers must accept those
+/// values; today they're rejected at validation so we don't silently
+/// drop precision through a round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedBitsNonZero;
+
+impl std::fmt::Display for ReservedBitsNonZero {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "NsDuration reserved bits (bytes 16..32) are non-zero — \
+             this value carries sub-nanosecond precision that the \
+             current reader does not understand"
+        )
+    }
+}
+
+impl ToValue<NsDuration> for i128 {
+    fn to_value(self) -> Value<NsDuration> {
+        let mut raw = [0u8; 32];
+        raw[0..16].copy_from_slice(&i128_to_ordered_be(self));
+        Value::new(raw)
+    }
+}
+
+impl TryFromValue<'_, NsDuration> for i128 {
+    type Error = ReservedBitsNonZero;
+
+    fn try_from_value(v: &Value<NsDuration>) -> Result<Self, Self::Error> {
+        if v.raw[16..32] != [0u8; 16] {
+            return Err(ReservedBitsNonZero);
+        }
+        Ok(i128_from_ordered_be(v.raw[0..16].try_into().unwrap()))
+    }
+}
+
+impl ToValue<NsDuration> for Duration {
+    fn to_value(self) -> Value<NsDuration> {
+        self.total_nanoseconds().to_value()
+    }
+}
+
+impl TryFromValue<'_, NsDuration> for Duration {
+    type Error = ReservedBitsNonZero;
+
+    fn try_from_value(v: &Value<NsDuration>) -> Result<Self, Self::Error> {
+        let ns: i128 = v.try_from_value()?;
+        Ok(Duration::from_total_nanoseconds(ns))
+    }
+}
+
 impl std::fmt::Display for InvertedIntervalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -292,5 +392,64 @@ mod tests {
         for v in [i128::MIN, -1, 0, 1, i128::MAX] {
             assert_eq!(i128_from_ordered_be(i128_to_ordered_be(v)), v);
         }
+    }
+
+    #[test]
+    fn ns_duration_roundtrip_i128() {
+        for ns in [
+            i128::MIN,
+            -1_000_000_000_000,
+            -1,
+            0,
+            1,
+            42,
+            1_000_000_000,
+            i128::MAX,
+        ] {
+            let v: Value<NsDuration> = ns.to_value();
+            // Reserved lower 16 bytes are zero today.
+            assert_eq!(v.raw[16..32], [0u8; 16], "lower bits must be reserved=0");
+            let back: i128 = v.try_from_value().unwrap();
+            assert_eq!(ns, back);
+        }
+    }
+
+    #[test]
+    fn ns_duration_byte_order_matches_numeric_order() {
+        // Sorting by byte-lex on the upper 16 bytes must match numeric order.
+        let mut values: Vec<(i128, Value<NsDuration>)> = vec![
+            i128::MIN,
+            -1_000_000_000,
+            -1,
+            0,
+            1,
+            1_000_000_000,
+            i128::MAX,
+        ]
+        .into_iter()
+        .map(|n| (n, n.to_value()))
+        .collect();
+        values.sort_by(|a, b| a.1.raw.cmp(&b.1.raw));
+        let sorted_ns: Vec<i128> = values.iter().map(|(n, _)| *n).collect();
+        let mut expected = sorted_ns.clone();
+        expected.sort();
+        assert_eq!(sorted_ns, expected);
+    }
+
+    #[test]
+    fn ns_duration_hifitime_duration_roundtrips() {
+        let d_in = Duration::from_total_nanoseconds(1_234_567_890_123);
+        let v: Value<NsDuration> = d_in.to_value();
+        let d_out: Duration = v.try_from_value().unwrap();
+        assert_eq!(d_in.total_nanoseconds(), d_out.total_nanoseconds());
+    }
+
+    #[test]
+    fn ns_duration_validate_rejects_dirty_reserved_bits() {
+        let mut raw = [0u8; 32];
+        raw[0..16].copy_from_slice(&i128_to_ordered_be(0));
+        raw[20] = 1; // dirty reserved byte
+        let v: Value<NsDuration> = Value::new(raw);
+        assert!(NsDuration::validate(v).is_err());
     }
 }

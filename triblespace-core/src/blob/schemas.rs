@@ -6,6 +6,8 @@ pub mod array;
 pub mod filebytes;
 /// Arbitrary-length UTF-8 text blob schema.
 pub mod longstring;
+/// Opaque raw bytes blob schema (positive choice, distinct from UnknownBlob).
+pub mod rawbytes;
 /// Canonical trible sequence blob schema.
 pub mod simplearchive;
 /// Succinct (Ring-based) compressed trible archive blob schema.
