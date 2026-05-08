@@ -9,7 +9,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::id::Id;
-use triblespace_core::import::ntriples::ingest_ntriples;
+use triblespace_core::import::ntriples::{ingest_ntriples, IngestError};
 use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{find, pattern};
 use triblespace_core::prelude::valueschemas::{self, Blake3, Handle};
@@ -37,7 +37,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     let branch_id = repo.ensure_branch("main", None).expect("branch");
     let mut ws = repo.pull(branch_id).expect("workspace");
 
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(NT_SAMPLE));
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(count, 4, "four non-empty triples in the sample");
 
     // Each subject URI produces one `rdf_uri` edge (emitted per triple), so
@@ -98,8 +98,8 @@ fn uri_to_id_is_deterministic_across_workspaces() {
     let mut ws_a = repo_a.pull(branch_a).unwrap();
     let mut ws_b = repo_b.pull(branch_b).unwrap();
 
-    let (facts_a, _) = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE));
-    let (facts_b, _) = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE));
+    let (facts_a, _) = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
+    let (facts_b, _) = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
     let frank_attr =
         Attribute::<Handle<Blake3, LongString>>::from_name("http://example.org/firstname");
@@ -133,7 +133,7 @@ fn xsd_datatypes_map_to_native_schemas() {
 <http://ex/a> <http://ex/b> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <http://ex/a> <http://ex/f> "2.5"^^<http://www.w3.org/2001/XMLSchema#double> .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..]));
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 4);
 
     let i_attr = Attribute::<valueschemas::I256BE>::from_name("http://ex/i");
@@ -192,7 +192,7 @@ fn xsd_temporal_and_binary_types() {
 <http://ex/a> <http://ex/avatar> "SGVsbG8="^^<http://www.w3.org/2001/XMLSchema#base64Binary> .
 <http://ex/a> <http://ex/homepage> "http://example.org"^^<http://www.w3.org/2001/XMLSchema#anyURI> .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..]));
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 8);
 
     // dateTime → NsTAIInterval [t, t]
@@ -284,7 +284,7 @@ fn lang_tagged_literals_reify_into_entities() {
 <http://ex/q5> <http://ex/label> "Mensch"@de .
 <http://ex/h1> <http://ex/label> "human"@en .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..]));
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 3);
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
@@ -329,5 +329,135 @@ fn lang_tagged_literals_reify_into_entities() {
     )
     .count();
     assert_eq!(text_count, 2, "two distinct text handles, one per language");
+}
 
+#[test]
+fn bnode_subjects_emit_with_intrinsic_ids() {
+    // Two structurally identical bnodes (same outgoing facts) should
+    // collapse to the same intrinsic id — that's the content-addressed
+    // dedup property of the entity! macro applied to RDF's existential
+    // semantics.
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    let data = br#"
+_:a <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:b <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(count, 3);
+
+    // Three input lines but `_:a` and `_:b` collapse — only two distinct
+    // subjects emit a trible.
+    let age = Attribute::<valueschemas::I256BE>::from_name("http://ex/age");
+    let subjects: std::collections::HashSet<_> = find!(
+        (e: Id),
+        pattern!(&facts, [{ ?e @ age: _?v }])
+    )
+    .map(|(e,)| e)
+    .collect();
+    assert_eq!(
+        subjects.len(),
+        2,
+        "(_:a, age=42) and (_:b, age=42) share an id; (_:c, age=43) is distinct"
+    );
+}
+
+#[test]
+fn bnode_object_resolves_to_intrinsic_id() {
+    // <s> <p> _:b1 . _:b1 <q> "x" .
+    // — `_:b1` has one outgoing fact, so its id is the entity! hash of
+    //   that fact. The incoming reference resolves to the same id once
+    //   the bnode's outgoing facts are seen.
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    let data = br#"
+<http://ex/s> <http://ex/p> _:b1 .
+_:b1 <http://ex/q> "x" .
+"#;
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(count, 2);
+
+    let p = Attribute::<valueschemas::GenId>::from_name("http://ex/p");
+    let q = Attribute::<Handle<Blake3, LongString>>::from_name("http://ex/q");
+
+    let (target,) = find!(
+        (id: Id),
+        pattern!(&facts, [{ _?s @ p: ?id }])
+    )
+    .next()
+    .expect("incoming reference emitted");
+
+    // The same id appears as the subject of the bnode's outgoing fact.
+    let outgoing_count = find!(
+        (h: Value<Handle<Blake3, LongString>>),
+        pattern!(&facts, [{ target @ q: ?h }])
+    )
+    .count();
+    assert_eq!(
+        outgoing_count, 1,
+        "bnode's outgoing fact uses the same id the incoming reference resolved to"
+    );
+}
+
+#[test]
+fn bnode_cycle_is_an_error() {
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    let data = br#"
+_:a <http://ex/p> _:b .
+_:b <http://ex/p> _:a .
+"#;
+    let err = ingest_ntriples(&mut ws, Cursor::new(&data[..])).unwrap_err();
+    match err {
+        IngestError::BnodeCycle { labels } => {
+            assert!(labels.contains(&"_:a".to_string()));
+            assert!(labels.contains(&"_:b".to_string()));
+        }
+    }
+}
+
+#[test]
+fn orphan_bnode_skolemizes_per_import() {
+    // An orphan _:b1 (referenced as object but never appears as subject)
+    // gets a per-import salt, so two separate ingest calls produce
+    // *different* ids for the same label. This matches RDF's existential
+    // semantics — orphan bnodes in different documents are distinct
+    // "some-things."
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws_a = repo.pull(branch_id).unwrap();
+    let mut ws_b = repo.pull(branch_id).unwrap();
+
+    let data = br#"
+<http://ex/s> <http://ex/p> _:b1 .
+"#;
+    let (facts_a, _) =
+        ingest_ntriples(&mut ws_a, Cursor::new(&data[..])).expect("clean ntriples");
+    let (facts_b, _) =
+        ingest_ntriples(&mut ws_b, Cursor::new(&data[..])).expect("clean ntriples");
+
+    let p = Attribute::<valueschemas::GenId>::from_name("http://ex/p");
+    let (id_a,) = find!(
+        (id: Id),
+        pattern!(&facts_a, [{ _?s @ p: ?id }])
+    )
+    .next()
+    .expect("import A emits an orphan bnode");
+    let (id_b,) = find!(
+        (id: Id),
+        pattern!(&facts_b, [{ _?s @ p: ?id }])
+    )
+    .next()
+    .expect("import B emits an orphan bnode");
+    assert_ne!(
+        id_a, id_b,
+        "orphan bnodes in separate ingests must not collide"
+    );
 }

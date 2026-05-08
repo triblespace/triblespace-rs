@@ -30,13 +30,26 @@
 //! [`rdf_text`](crate::import::rdf_text). The owning predicate then
 //! holds a `GenId` pointing at that entity, so language handling falls
 //! out of normal joins instead of needing a `lang()` builtin.
+//!
+//! Blank nodes are resolved via the same content-address path the
+//! `entity!` macro uses: a bnode's id is the Blake3 of its sorted
+//! `(attribute, value)` pairs. Two bnodes with the same outgoing facts
+//! collapse to a single entity automatically — the bnode IS the entity
+//! that has these facts. Orphan bnodes (referenced but never appear as
+//! subject) get a per-import salt so they're distinct existentials
+//! across separate ingest calls. Cyclic blank-node graphs return
+//! [`IngestError::BnodeCycle`] — there's no fixed-point id assignment
+//! without symmetry-breaking, and we'd rather refuse than guess.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::io::BufRead;
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use blake3::Hasher;
 use hifitime::prelude::*;
 use num_rational::Ratio;
 use winnow::error::InputError;
@@ -46,17 +59,299 @@ use winnow::Parser;
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::rawbytes::RawBytes;
-use crate::id::{ExclusiveId, Id};
+use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
 use crate::prelude::valueschemas;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
+use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::shortstring::ShortString;
 use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
-use crate::value::{ToValue, TryToValue, Value};
+use crate::value::schemas::UnknownValue;
+use crate::value::{RawValue, ToValue, TryToValue, Value};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+/// Error returned by [`ingest_ntriples`] when the input cannot be
+/// completed without compromising semantics.
+#[derive(Debug, Clone)]
+pub enum IngestError {
+    /// A blank-node cycle was detected. Each label's intrinsic id depends
+    /// on its neighbors' ids, so a cycle has no fixed-point assignment
+    /// without a more elaborate symmetry-breaking scheme (see RDF-Canon's
+    /// gossip-path algorithm). We refuse rather than emit something
+    /// arbitrary.
+    BnodeCycle {
+        /// The bnode labels that participate in the unresolved cycle.
+        labels: Vec<String>,
+    },
+}
+
+impl fmt::Display for IngestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BnodeCycle { labels } => {
+                write!(f, "blank-node cycle in input: {}", labels.join(", "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for IngestError {}
+
+// ── Blank-node buffering ────────────────────────────────────────────
+//
+// Bnode identity in RDF is existential ("some thing with these
+// properties"). We materialise that by deriving each bnode's
+// triblespace `Id` from the set of its outgoing facts via the same
+// content-hash the `entity!` macro uses — the bnode IS the entity that
+// has these facts. Two bnodes with identical outgoing facts collapse
+// to the same id automatically, which is what RDF semantics promise.
+//
+// For bnodes with no outgoing facts (only referenced from elsewhere),
+// we skolemise with a per-import salt so they're treated as distinct
+// existentials across separate ingest calls. Same call, same label →
+// same id; different calls, same label → different ids.
+//
+// Cycles in the bnode reference graph produce `IngestError::BnodeCycle`
+// — there is no fixed point to assign without arbitrarily breaking
+// symmetry, and we'd rather refuse than emit something wrong.
+
+/// One outgoing edge from a bnode subject.
+enum OutgoingFact {
+    /// Fully-resolved value (URI handle, literal, lang-entity reference).
+    Resolved { attr_id: Id, value_raw: RawValue },
+    /// Bnode-to-bnode edge; both subject and target are deferred. The
+    /// `attr_id` is already the GenId-typed predicate-attribute id.
+    BnodeRef { attr_id: Id, target_label: String },
+}
+
+/// One triple of the form `<resolved_subject> <predicate> _:target`.
+/// Emitted after `target` is resolved.
+struct IncomingFact {
+    subject_id: Id,
+    attr_id: Id,
+    target_label: String,
+}
+
+/// Per-import buffer for blank-node triples.
+struct BnodeBuffer {
+    /// Outgoing facts, keyed by bnode subject label.
+    outgoing: HashMap<String, Vec<OutgoingFact>>,
+    /// Triples whose object is a bnode (subject is already resolved).
+    incoming: Vec<IncomingFact>,
+    /// Per-import salt for orphan-bnode skolemisation.
+    salt: [u8; 16],
+}
+
+impl BnodeBuffer {
+    fn new() -> Self {
+        // Random salt → orphans differ across ingest calls, matching
+        // their "fresh existential" RDF semantics. Within a call, the
+        // salt is constant so the same orphan label always produces
+        // the same id.
+        let mut salt = [0u8; 16];
+        rand::Rng::fill(&mut rand::thread_rng(), &mut salt[..]);
+        Self {
+            outgoing: HashMap::new(),
+            incoming: Vec::new(),
+            salt,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.outgoing.is_empty() && self.incoming.is_empty()
+    }
+
+    fn push_outgoing(&mut self, label: String, fact: OutgoingFact) {
+        self.outgoing.entry(label).or_default().push(fact);
+    }
+
+    fn push_incoming(&mut self, fact: IncomingFact) {
+        self.incoming.push(fact);
+    }
+
+    /// Resolve every buffered bnode and emit its tribles into `facts`.
+    fn flush(self, facts: &mut TribleSet) -> Result<(), IngestError> {
+        if self.is_empty() {
+            return Ok(());
+        }
+
+        // 1. Build dependency graph: label → labels its outgoing facts reference.
+        //    Also collect every label that appears anywhere (subject or target).
+        let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut all_labels: HashSet<String> = HashSet::new();
+        for (label, edges) in &self.outgoing {
+            all_labels.insert(label.clone());
+            let entry = deps.entry(label.clone()).or_default();
+            for edge in edges {
+                if let OutgoingFact::BnodeRef { target_label, .. } = edge {
+                    entry.insert(target_label.clone());
+                    all_labels.insert(target_label.clone());
+                }
+            }
+        }
+        for inc in &self.incoming {
+            all_labels.insert(inc.target_label.clone());
+        }
+
+        // 2. Topo-sort. Cycle → error.
+        let order = topo_sort(&all_labels, &deps).map_err(|labels| {
+            let mut sorted = labels;
+            sorted.sort();
+            IngestError::BnodeCycle { labels: sorted }
+        })?;
+
+        // 3. Resolve each bnode's id in dependency order. By the time
+        //    we visit a label, all labels its outgoing facts reference
+        //    are already in `resolved`.
+        let mut resolved: HashMap<String, Id> = HashMap::new();
+        for label in order {
+            let id = resolve_bnode_id(&label, &self.outgoing, &resolved, &self.salt);
+            resolved.insert(label, id);
+        }
+
+        // 4. Emit outgoing tribles (bnode-as-subject).
+        for (label, edges) in self.outgoing {
+            let subject_id = resolved[&label];
+            let e = ExclusiveId::force_ref(&subject_id);
+            for edge in edges {
+                let (attr_id, value_raw) = match edge {
+                    OutgoingFact::Resolved { attr_id, value_raw } => (attr_id, value_raw),
+                    OutgoingFact::BnodeRef {
+                        attr_id,
+                        target_label,
+                    } => {
+                        let target_id = resolved[&target_label];
+                        (attr_id, { let v: Value<GenId> = target_id.to_value(); v.raw })
+                    }
+                };
+                let v: Value<UnknownValue> = Value::new(value_raw);
+                facts.insert(&Trible::new(e, &attr_id, &v));
+            }
+        }
+
+        // 5. Emit incoming tribles (bnode-as-object, subject already known).
+        for inc in self.incoming {
+            let target_id = resolved[&inc.target_label];
+            let e = ExclusiveId::force_ref(&inc.subject_id);
+            let v: Value<UnknownValue> = Value::new({ let v: Value<GenId> = target_id.to_value(); v.raw });
+            facts.insert(&Trible::new(e, &inc.attr_id, &v));
+        }
+
+        Ok(())
+    }
+}
+
+/// Compute the intrinsic id for a single bnode given its outgoing facts.
+/// Mirrors the `entity!` macro's derivation: sort `(attr_id, value_raw)`
+/// pairs, dedupe consecutive duplicates, hash with Blake3, and take the
+/// last 16 bytes as the id.
+///
+/// For orphans (no outgoing facts), falls back to skolemisation:
+/// `Blake3(salt || label)[16..]`.
+fn resolve_bnode_id(
+    label: &str,
+    outgoing: &HashMap<String, Vec<OutgoingFact>>,
+    resolved: &HashMap<String, Id>,
+    salt: &[u8; 16],
+) -> Id {
+    let mut pairs: Vec<(Id, RawValue)> = outgoing
+        .get(label)
+        .map(|edges| {
+            edges
+                .iter()
+                .map(|edge| match edge {
+                    OutgoingFact::Resolved { attr_id, value_raw } => (*attr_id, *value_raw),
+                    OutgoingFact::BnodeRef {
+                        attr_id,
+                        target_label,
+                    } => {
+                        let target_id = resolved
+                            .get(target_label)
+                            .expect("topo order resolved this target first");
+                        (*attr_id, { let v: Value<GenId> = target_id.to_value(); v.raw })
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if pairs.is_empty() {
+        // Orphan: skolemise via salt.
+        let mut hasher = Hasher::new();
+        hasher.update(salt);
+        hasher.update(label.as_bytes());
+        let digest = hasher.finalize();
+        let mut raw = [0u8; ID_LEN];
+        raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
+        return Id::new(raw).expect("non-nil from random salt");
+    }
+
+    pairs.sort_unstable();
+    let mut hasher = Hasher::new();
+    let mut last: Option<(Id, RawValue)> = None;
+    for (a, v) in &pairs {
+        if let Some((la, lv)) = last {
+            if *a == la && *v == lv {
+                continue;
+            }
+        }
+        hasher.update(&a[..]);
+        hasher.update(&v[..]);
+        last = Some((*a, *v));
+    }
+    let digest = hasher.finalize();
+    let mut raw = [0u8; ID_LEN];
+    raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
+    Id::new(raw).expect("intrinsic id from non-empty pairs")
+}
+
+/// Kahn's topological sort. Returns an ordering where every node comes
+/// after the labels it depends on (its outgoing-fact targets). Returns
+/// the unresolved cycle labels as `Err` if no full ordering exists.
+fn topo_sort(
+    nodes: &HashSet<String>,
+    edges: &HashMap<String, HashSet<String>>,
+) -> Result<Vec<String>, Vec<String>> {
+    let mut in_degree: HashMap<String, usize> = nodes.iter().map(|n| (n.clone(), 0)).collect();
+    for dsts in edges.values() {
+        for dst in dsts {
+            *in_degree.entry(dst.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut queue: VecDeque<String> = in_degree
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+    while let Some(n) = queue.pop_front() {
+        if let Some(dsts) = edges.get(&n) {
+            for dst in dsts {
+                let d = in_degree.get_mut(dst).expect("dst recorded above");
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(dst.clone());
+                }
+            }
+        }
+        order.push(n);
+    }
+    if order.len() < nodes.len() {
+        let cycle: Vec<String> = nodes
+            .iter()
+            .filter(|n| in_degree.get(*n).copied().unwrap_or(0) > 0)
+            .cloned()
+            .collect();
+        Err(cycle)
+    } else {
+        Ok(order)
+    }
+}
 
 // ── Parsing ─────────────────────────────────────────────────────────
 //
@@ -465,29 +760,33 @@ where
 pub fn ingest_ntriples<Blobs>(
     ws: &mut Workspace<Blobs>,
     reader: impl BufRead,
-) -> (TribleSet, usize)
+) -> Result<(TribleSet, usize), IngestError>
 where
     Blobs: BlobStore<Blake3>,
 {
     let mut facts = TribleSet::new();
+    let mut bnodes = BnodeBuffer::new();
     let mut count = 0;
 
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        if try_emit_line(ws, &mut facts, &line) {
+        if try_emit_line(ws, &mut facts, &mut bnodes, &line) {
             count += 1;
         }
     }
 
-    (facts, count)
+    bnodes.flush(&mut facts)?;
+    Ok((facts, count))
 }
 
-/// Parse one line and emit its facts inline. Returns `true` iff a
-/// triple was emitted (lines that are blank, comments, or malformed
-/// return `false`).
+/// Parse one line and emit its facts. Plain triples emit directly into
+/// `facts`; triples touching a blank node go into `bnodes` for deferred
+/// resolution. Returns `true` iff a triple was accepted (lines that
+/// are blank, comments, or malformed return `false`).
 fn try_emit_line<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    bnodes: &mut BnodeBuffer,
     line: &str,
 ) -> bool
 where
@@ -498,50 +797,188 @@ where
         return false;
     }
 
-    let Some(subject) = take_iri(&mut cursor) else {
+    // Subject — IRI or bnode label.
+    let subject_label: Option<&str>;
+    let subject_iri: Option<&str>;
+    if cursor.starts_with('<') {
+        let Some(uri) = take_iri(&mut cursor) else {
+            return false;
+        };
+        subject_iri = Some(uri);
+        subject_label = None;
+    } else if cursor.starts_with("_:") {
+        let Some(label) = take_bnode(&mut cursor) else {
+            return false;
+        };
+        subject_iri = None;
+        subject_label = Some(label);
+    } else {
         return false;
-    };
+    }
     cursor = cursor.trim_start();
+
     let Some(predicate) = take_iri(&mut cursor) else {
         return false;
     };
     cursor = cursor.trim_start();
 
-    // Anchor the subject before emitting any of its tribles so
-    // `ws.put` and `uri_to_id` see a stable workspace.
-    let subject_id = uri_to_id(ws, subject);
-    let sub_h: Value<Handle<Blake3, LongString>> = ws.put(subject.to_owned());
-    *facts += entity! { crate::import::rdf_uri: sub_h };
-    let e = ExclusiveId::force_ref(&subject_id);
+    // Anchor the IRI subject up-front so its rdf_uri annotation lands
+    // alongside the same emission paths used today. Bnode subjects
+    // resolve later in `flush`.
+    let iri_subject_anchor: Option<Id> = subject_iri.map(|uri| {
+        let id = uri_to_id(ws, uri);
+        let sub_h: Value<Handle<Blake3, LongString>> = ws.put(uri.to_owned());
+        *facts += entity! { crate::import::rdf_uri: sub_h };
+        id
+    });
 
+    // Object — IRI, bnode, or literal.
     if cursor.starts_with('<') {
         let Some(obj_uri) = take_iri(&mut cursor) else {
             return false;
         };
-        emit_uri_object(ws, facts, e, predicate, obj_uri);
+        match (iri_subject_anchor, subject_label) {
+            (Some(s_id), None) => {
+                emit_uri_object(ws, facts, &ExclusiveId::force_ref(&s_id), predicate, obj_uri);
+            }
+            (None, Some(s_label)) => {
+                // Bnode → URI: outgoing fact with resolved value.
+                let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+                let obj_id = uri_to_id(ws, obj_uri);
+                let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri.to_owned());
+                *facts += entity! { crate::import::rdf_uri: obj_h };
+                bnodes.push_outgoing(
+                    s_label.to_owned(),
+                    OutgoingFact::Resolved {
+                        attr_id: attr.id(),
+                        value_raw: { let v: Value<GenId> = obj_id.to_value(); v.raw },
+                    },
+                );
+            }
+            _ => unreachable!("subject is exactly one of iri/bnode"),
+        }
         return true;
     }
     if cursor.starts_with("_:") {
-        let Some(label) = take_bnode(&mut cursor) else {
+        let Some(target_label) = take_bnode(&mut cursor) else {
             return false;
         };
-        emit_uri_object(ws, facts, e, predicate, label);
+        let attr_id = Attribute::<valueschemas::GenId>::from_name(predicate).id();
+        match (iri_subject_anchor, subject_label) {
+            (Some(s_id), None) => {
+                // IRI → bnode: emit later when target resolves.
+                bnodes.push_incoming(IncomingFact {
+                    subject_id: s_id,
+                    attr_id,
+                    target_label: target_label.to_owned(),
+                });
+            }
+            (None, Some(s_label)) => {
+                // Bnode → bnode: outgoing edge with reference value.
+                bnodes.push_outgoing(
+                    s_label.to_owned(),
+                    OutgoingFact::BnodeRef {
+                        attr_id,
+                        target_label: target_label.to_owned(),
+                    },
+                );
+            }
+            _ => unreachable!("subject is exactly one of iri/bnode"),
+        }
         return true;
     }
     if cursor.starts_with('"') {
         let Some((text, suffix)) = take_literal(&mut cursor) else {
             return false;
         };
-        match suffix {
-            LiteralSuffix::None => emit_text_literal(ws, facts, e, predicate, text),
-            LiteralSuffix::Datatype(dt) => emit_typed_literal(ws, facts, e, predicate, text, dt),
-            LiteralSuffix::Language(lang) => {
-                emit_lang_literal(ws, facts, e, predicate, lang, text)
+        match (iri_subject_anchor, subject_label) {
+            (Some(s_id), None) => {
+                let e = ExclusiveId::force_ref(&s_id);
+                match suffix {
+                    LiteralSuffix::None => emit_text_literal(ws, facts, e, predicate, text),
+                    LiteralSuffix::Datatype(dt) => {
+                        emit_typed_literal(ws, facts, e, predicate, text, dt)
+                    }
+                    LiteralSuffix::Language(lang) => {
+                        emit_lang_literal(ws, facts, e, predicate, lang, text)
+                    }
+                }
             }
+            (None, Some(s_label)) => {
+                // Bnode subject with literal value — pre-resolve the value
+                // (and any side-effect blob writes) and stash as Resolved.
+                if let Some(fact) = build_resolved_outgoing(ws, facts, predicate, text, suffix) {
+                    bnodes.push_outgoing(s_label.to_owned(), fact);
+                }
+            }
+            _ => unreachable!("subject is exactly one of iri/bnode"),
         }
         return true;
     }
     false
+}
+
+/// Materialise a literal-valued bnode-outgoing fact: blob writes /
+/// reified-language entities happen now, and we hand back the
+/// (attr_id, value_raw) pair to be inserted once the bnode subject id
+/// is resolved.
+fn build_resolved_outgoing<Blobs>(
+    ws: &mut Workspace<Blobs>,
+    facts: &mut TribleSet,
+    predicate: &str,
+    text: Cow<'_, str>,
+    suffix: LiteralSuffix<'_>,
+) -> Option<OutgoingFact>
+where
+    Blobs: BlobStore<Blake3>,
+{
+    match suffix {
+        LiteralSuffix::None => {
+            let attr = Attribute::<Handle<Blake3, LongString>>::from_name(predicate);
+            let handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+            Some(OutgoingFact::Resolved {
+                attr_id: attr.id(),
+                value_raw: handle.raw,
+            })
+        }
+        LiteralSuffix::Datatype(dt) => {
+            // Build a temporary scratch trible to reuse the existing
+            // emit_typed_literal logic, then steal the (attr, value)
+            // back out of it. Cheaper than re-implementing per-type.
+            let mut scratch = TribleSet::new();
+            let scratch_id = Id::new([0xFF; ID_LEN]).expect("non-nil scratch id");
+            let scratch_e = ExclusiveId::force_ref(&scratch_id);
+            emit_typed_literal(ws, &mut scratch, scratch_e, predicate, text, dt);
+            let pair = scratch
+                .iter()
+                .next()
+                .map(|t| (*t.a(), t.v::<UnknownValue>().raw));
+            pair.map(|(attr_id, value_raw)| OutgoingFact::Resolved { attr_id, value_raw })
+        }
+        LiteralSuffix::Language(lang) => {
+            // Reify into the @lang entity now; the parent bnode's
+            // outgoing fact carries a GenId reference to it. Side
+            // effects (the lang-entity tribles) land in `facts`
+            // immediately since they don't depend on the parent id.
+            let Ok(lang_value): Result<Value<ShortString>, _> = lang.try_to_value() else {
+                return None;
+            };
+            let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+            let label_fragment = entity! {
+                crate::import::rdf_lang: lang_value,
+                crate::import::rdf_text: text_handle,
+            };
+            let label_id = label_fragment
+                .root()
+                .expect("intrinsic id from rdf_lang+rdf_text");
+            *facts += label_fragment;
+            let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+            Some(OutgoingFact::Resolved {
+                attr_id: attr.id(),
+                value_raw: { let v: Value<GenId> = label_id.to_value(); v.raw },
+            })
+        }
+    }
 }
 
 fn emit_uri_object<Blobs>(
@@ -744,7 +1181,9 @@ where
 {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
-    Ok(ingest_ntriples(ws, reader))
+    let result = ingest_ntriples(ws, reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(result)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
