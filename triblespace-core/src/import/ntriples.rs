@@ -433,17 +433,23 @@ fn skip_inline_ws(bytes: &mut Bytes) {
 /// Fast path: scan for `>` with no `\` along the way → return the
 /// slice directly, zero copy. Slow path (any `\u`/`\U` UCHAR escape):
 /// decode into a fresh `Bytes`-backed buffer.
+///
+/// Per the N-Triples grammar, an IRIREF is `'<' (([^#x00-#x20<>"{}|^`\]
+/// | UCHAR))* '>'` — bytes in `0x00..=0x20`, `<`, `>`, `"`, `{`, `}`,
+/// `|`, `^`, `\`` and lone `\` are all rejected literal-form.
 fn take_iri(bytes: &mut Bytes) -> Option<View<str>> {
     if bytes.peek_token() != Some(b'<') {
         return None;
     }
     bytes.pop_front();
 
-    // Fast path.
+    // Fast path: scan unescaped chars, rejecting any forbidden byte.
     {
         let mut tentative = bytes.clone();
         let mut take = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b != b'>' && b != b'\\' && b != b'\n' && b != b'\r'
+            // Accept: anything that isn't terminator (`>`), escape
+            // (`\\`), or one of the spec-forbidden literal chars.
+            b > 0x20 && !matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\')
         });
         if let Ok(prefix) = take.parse_next(&mut tentative) {
             if tentative.peek_token() == Some(b'>') {
@@ -454,7 +460,9 @@ fn take_iri(bytes: &mut Bytes) -> Option<View<str>> {
         }
     }
 
-    // Slow path: handle `\uXXXX` / `\UXXXXXXXX` escapes.
+    // Slow path: handle `\uXXXX` / `\UXXXXXXXX` escapes. We arrive
+    // here only if the fast path bailed — either an escape was seen
+    // or a forbidden byte was hit.
     let mut out: Vec<u8> = Vec::new();
     while let Some(b) = bytes.peek_token() {
         match b {
@@ -472,7 +480,8 @@ fn take_iri(bytes: &mut Bytes) -> Option<View<str>> {
                 };
                 out.extend_from_slice(&decoded);
             }
-            b'\n' | b'\r' => return None,
+            // Forbidden literal bytes — reject.
+            0..=0x20 | b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' => return None,
             _ => {
                 out.push(b);
                 bytes.pop_front();

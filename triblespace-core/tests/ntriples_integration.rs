@@ -462,3 +462,145 @@ fn orphan_bnode_skolemizes_per_import() {
         "orphan bnodes in separate ingests must not collide"
     );
 }
+
+// ─── W3C N-Triples test-suite spot checks ──────────────────────────────
+//
+// Curated subset of the W3C 2013 N-Triples test suite. Full suite at
+// https://www.w3.org/2013/N-TriplesTests/. We embed the most-revealing
+// tests inline rather than committing 70 fixture files: positives that
+// exercise edge cases of the lexer (escapes, controls, comments,
+// whitespace), and negatives that the parser MUST reject so we don't
+// silently accept malformed input.
+
+fn assert_parses(name: &str, input: &[u8]) {
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+    let result = ingest_ntriples(&mut ws, Cursor::new(input));
+    assert!(
+        result.is_ok(),
+        "W3C `{name}` (positive) should parse, got {:?}",
+        result.err()
+    );
+}
+
+fn assert_rejects(name: &str, input: &[u8]) {
+    // The parser is line-tolerant: malformed lines are skipped rather
+    // than aborting the whole ingest. So "rejects" is operationalised
+    // as "produces zero accepted triples on a single-triple input."
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+    let result = ingest_ntriples(&mut ws, Cursor::new(input));
+    let count = result.map(|(_, c)| c).unwrap_or(0);
+    assert_eq!(
+        count, 0,
+        "W3C `{name}` (negative) should reject, got {count} accepted triples"
+    );
+}
+
+#[test]
+fn w3c_positive_literal_all_controls() {
+    assert_parses(
+        "literal_all_controls",
+        br#"<http://a.example/s> <http://a.example/p> " \t" .
+"#,
+    );
+}
+
+#[test]
+fn w3c_positive_numeric_escape_4_and_8() {
+    assert_parses(
+        "literal_with_numeric_escape4",
+        br#"<http://a.example/s> <http://a.example/p> "o" .
+"#,
+    );
+    assert_parses(
+        "literal_with_numeric_escape8",
+        br#"<http://a.example/s> <http://a.example/p> "\U0000006F" .
+"#,
+    );
+}
+
+#[test]
+fn w3c_positive_langtagged() {
+    assert_parses(
+        "langtagged_string",
+        br#"<http://a.example/s> <http://a.example/p> "chat"@en .
+"#,
+    );
+    assert_parses(
+        "lantag_with_subtag",
+        br#"<http://a.example/s> <http://a.example/p> "chat"@en-us .
+"#,
+    );
+}
+
+#[test]
+fn w3c_positive_comment_and_minimal_whitespace() {
+    // Comment after a triple, then an empty line.
+    assert_parses(
+        "comment_following_triple",
+        br#"<http://a.example/s> <http://a.example/p> <http://a.example/o> . # comment
+"#,
+    );
+    // Tabs as separators, not spaces.
+    assert_parses(
+        "minimal_whitespace",
+        b"<http://a.example/s>\t<http://a.example/p>\t<http://a.example/o>\t.\n",
+    );
+}
+
+#[test]
+fn w3c_positive_dquote_in_literal() {
+    assert_parses(
+        "literal_with_dquote",
+        br#"<http://a.example/s> <http://a.example/p> "x\"y" .
+"#,
+    );
+}
+
+#[test]
+fn w3c_negative_bad_uri_unescaped_space() {
+    // IRIs may not contain a literal space.
+    assert_rejects(
+        "nt-syntax-bad-uri-04",
+        b"<http://example/ space> <http://example/p> <http://example/o> .\n",
+    );
+}
+
+#[test]
+fn w3c_negative_bad_string_unterminated() {
+    assert_rejects(
+        "nt-syntax-bad-string-04",
+        b"<http://a.example/s> <http://a.example/p> \"abc .\n",
+    );
+}
+
+#[test]
+fn w3c_negative_bad_struct_missing_dot() {
+    assert_rejects(
+        "nt-syntax-bad-struct-01",
+        b"<http://a.example/s> <http://a.example/p> <http://a.example/o>\n",
+    );
+}
+
+#[test]
+fn w3c_negative_bad_esc_invalid_escape() {
+    // `\m` is not a valid ECHAR.
+    assert_rejects(
+        "nt-syntax-bad-esc-01",
+        br#"<http://a.example/s> <http://a.example/p> "abc\m" .
+"#,
+    );
+}
+
+#[test]
+fn w3c_negative_bad_lang_empty_tag() {
+    // `@` followed by nothing isn't a valid language tag.
+    assert_rejects(
+        "nt-syntax-bad-lang-01",
+        br#"<http://a.example/s> <http://a.example/p> "abc"@ .
+"#,
+    );
+}
