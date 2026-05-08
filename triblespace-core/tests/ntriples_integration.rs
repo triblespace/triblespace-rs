@@ -9,7 +9,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::id::Id;
-use triblespace_core::import::ntriples::{ingest_ntriples, IngestError};
+use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{find, pattern};
 use triblespace_core::prelude::valueschemas::{self, Blake3, Handle};
@@ -593,6 +593,26 @@ fn w3c_negative_bad_esc_invalid_escape() {
         br#"<http://a.example/s> <http://a.example/p> "abc\m" .
 "#,
     );
+}
+
+#[test]
+fn uri_to_id_pure_matches_workspace_version() {
+    // The workspace-side-effect-free `uri_to_id_pure` must produce
+    // the same id that `uri_to_id` (with workspace-storage) does, so
+    // callers writing query constants can use either interchangeably.
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    for uri in [
+        "http://www.wikidata.org/entity/Q5",
+        "http://www.wikidata.org/prop/direct/P31",
+        "_:bf55954f96378f65ddb1da9836e2eb87",
+    ] {
+        let with_ws = uri_to_id(&mut ws, uri);
+        let pure = uri_to_id_pure(uri);
+        assert_eq!(with_ws, pure, "uri_to_id mismatch for {uri}");
+    }
 }
 
 #[test]

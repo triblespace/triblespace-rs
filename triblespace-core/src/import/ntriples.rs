@@ -79,7 +79,7 @@ use winnow::Parser;
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::rawbytes::RawBytes;
-use crate::blob::Blob;
+use crate::blob::{Blob, ToBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
 use crate::prelude::valueschemas;
@@ -894,6 +894,20 @@ where
     Blobs: BlobStore<Blake3>,
 {
     let handle: Value<Handle<Blake3, LongString>> = ws.put(uri.to_owned());
+    let fragment = entity! { crate::import::rdf_uri: handle };
+    fragment.root().expect("intrinsic URI entity")
+}
+
+/// Same id as [`uri_to_id`] but without the workspace side effect.
+///
+/// `uri_to_id` does two things: derive the entity id, and record the
+/// URI string as a blob in the workspace so the inverse mapping is
+/// recoverable. Callers writing query constants only need the former
+/// — they're matching against ids that some prior `ingest_ntriples`
+/// already emitted. This pure variant is for them.
+pub fn uri_to_id_pure(uri: &str) -> Id {
+    let handle: Value<Handle<Blake3, LongString>> =
+        uri.to_owned().to_blob().get_handle::<Blake3>();
     let fragment = entity! { crate::import::rdf_uri: handle };
     fragment.root().expect("intrinsic URI entity")
 }
