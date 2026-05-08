@@ -717,9 +717,13 @@ fn epoch_from_gregorian_with_offset(
     ss: u8,
     ns: u32,
     offset_secs: i64,
-) -> Epoch {
-    let local = Epoch::from_gregorian_utc(year, month, day, hh, mm, ss, ns);
-    local - Duration::from_seconds(offset_secs as f64)
+) -> Option<Epoch> {
+    // hifitime panics on overflow when out of its representable range
+    // (Wikidata has dateTime values like year 1e9 that hifitime can't
+    // hold). Use the checked variant so we fall through to text
+    // storage instead of crashing the importer.
+    let local = Epoch::maybe_from_gregorian_utc(year, month, day, hh, mm, ss, ns).ok()?;
+    Some(local - Duration::from_seconds(offset_secs as f64))
 }
 
 /// xsd:dateTime — `[-]YYYY-MM-DDThh:mm:ss[.f][Z|±HH:MM]`.
@@ -768,7 +772,7 @@ fn parse_xsd_datetime(s: &str) -> Option<i128> {
 
     let tz = std::str::from_utf8(chars).ok()?;
     let offset = parse_timezone_offset(tz)?;
-    let epoch = epoch_from_gregorian_with_offset(year, month, day, hh, mm, ss, ns, offset);
+    let epoch = epoch_from_gregorian_with_offset(year, month, day, hh, mm, ss, ns, offset)?;
     Some(epoch.to_tai_duration().total_nanoseconds())
 }
 
@@ -787,11 +791,11 @@ fn parse_xsd_date(s: &str) -> Option<(i128, i128)> {
     let day: u8 = std::str::from_utf8(bytes.get(4..6)?).ok()?.parse().ok()?;
     let tz = std::str::from_utf8(&bytes[6..]).ok()?;
     let offset = parse_timezone_offset(tz)?;
-    let lower = epoch_from_gregorian_with_offset(year, month, day, 0, 0, 0, 0, offset)
+    let lower = epoch_from_gregorian_with_offset(year, month, day, 0, 0, 0, 0, offset)?
         .to_tai_duration()
         .total_nanoseconds();
     // Day end: lower + 86_400 s - 1 ns. (Inclusive upper.)
-    let upper = lower + 86_400_000_000_000i128 - 1;
+    let upper = lower.checked_add(86_400_000_000_000i128 - 1)?;
     Some((lower, upper))
 }
 
@@ -800,14 +804,14 @@ fn parse_xsd_date(s: &str) -> Option<(i128, i128)> {
 fn parse_xsd_gyear(s: &str) -> Option<(i128, i128)> {
     let (year, rest) = parse_year(s)?;
     let offset = parse_timezone_offset(rest)?;
-    let lower = epoch_from_gregorian_with_offset(year, 1, 1, 0, 0, 0, 0, offset)
+    let lower = epoch_from_gregorian_with_offset(year, 1, 1, 0, 0, 0, 0, offset)?
         .to_tai_duration()
         .total_nanoseconds();
     let next_year = year.checked_add(1)?;
-    let upper_excl = epoch_from_gregorian_with_offset(next_year, 1, 1, 0, 0, 0, 0, offset)
+    let upper_excl = epoch_from_gregorian_with_offset(next_year, 1, 1, 0, 0, 0, 0, offset)?
         .to_tai_duration()
         .total_nanoseconds();
-    Some((lower, upper_excl - 1))
+    Some((lower, upper_excl.checked_sub(1)?))
 }
 
 /// xsd:gYearMonth — `[-]YYYY-MM[Z|±HH:MM]`. Whole month, inclusive.
@@ -823,7 +827,7 @@ fn parse_xsd_gyearmonth(s: &str) -> Option<(i128, i128)> {
     }
     let tz = std::str::from_utf8(&bytes[3..]).ok()?;
     let offset = parse_timezone_offset(tz)?;
-    let lower = epoch_from_gregorian_with_offset(year, month, 1, 0, 0, 0, 0, offset)
+    let lower = epoch_from_gregorian_with_offset(year, month, 1, 0, 0, 0, 0, offset)?
         .to_tai_duration()
         .total_nanoseconds();
     let (next_year, next_month) = if month == 12 {
@@ -831,10 +835,10 @@ fn parse_xsd_gyearmonth(s: &str) -> Option<(i128, i128)> {
     } else {
         (year, month + 1)
     };
-    let upper_excl = epoch_from_gregorian_with_offset(next_year, next_month, 1, 0, 0, 0, 0, offset)
+    let upper_excl = epoch_from_gregorian_with_offset(next_year, next_month, 1, 0, 0, 0, 0, offset)?
         .to_tai_duration()
         .total_nanoseconds();
-    Some((lower, upper_excl - 1))
+    Some((lower, upper_excl.checked_sub(1)?))
 }
 
 /// xsd:duration — `[-]P[nY][nM][nD][T[nH][nM][nS]]`. We reject mixed
