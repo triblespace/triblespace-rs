@@ -280,11 +280,37 @@ fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<Ra
     results
 }
 
+/// Does this expression contain a transitive closure (Plus or Star)
+/// anywhere in its subtree? Concat-with-closure can't go through the
+/// WCO sweep because `build_constraint` doesn't have a Plus/Star
+/// arm — we fall back to per-mid evaluation instead.
+fn has_unbounded_closure(expr: &PathExpr) -> bool {
+    match expr {
+        PathExpr::Plus(_) | PathExpr::Star(_) => true,
+        PathExpr::Attr(_) | PathExpr::InverseAttr(_) => false,
+        PathExpr::Concat(a, b) | PathExpr::Union(a, b) => {
+            has_unbounded_closure(a) || has_unbounded_closure(b)
+        }
+        PathExpr::Optional(body) => has_unbounded_closure(body),
+    }
+}
+
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
-        PathExpr::Concat(_, _) => {
+        PathExpr::Concat(lhs, rhs) => {
+            if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) {
+                // Per-mid fallback: eval lhs from start, then for
+                // each mid value run eval_from(rhs, mid). Avoids
+                // build_constraint's `unreachable!()` arm for
+                // Plus/Star inside Concat.
+                let mut results = HashSet::new();
+                for mid in eval_from(set, lhs, start) {
+                    results.extend(eval_from(set, rhs, &mid));
+                }
+                return results;
+            }
             let (constraint, dest_idx) = build_join(set, expr, start);
             Query::new(constraint, move |binding: &Binding| {
                 let raw = binding.get(dest_idx)?;
@@ -331,6 +357,15 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
+        PathExpr::Concat(lhs, rhs) if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) => {
+            // Per-mid fallback (matches eval_from arm).
+            for mid in eval_from(set, lhs, from) {
+                if has_path(set, rhs, &mid, to) {
+                    return true;
+                }
+            }
+            false
+        }
         PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, from);
             Query::new(constraint, move |binding: &Binding| {
@@ -400,6 +435,11 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         PathExpr::Union(lhs, rhs) => {
             estimate_from(set, lhs, start) + estimate_from(set, rhs, start)
         }
+        // Concat with a Plus/Star sub-tree can't go through
+        // build_join (the per-mid fallback in eval_from is what
+        // makes it work). For an estimate, fall back to actually
+        // computing the result set size.
+        _ if has_unbounded_closure(body) => eval_from(set, body, start).len(),
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
             let mut binding = Binding::default();
@@ -493,6 +533,29 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 if let Some(start_id) = id_from_value(start_val) {
                     let reachable = eval_from(&self.set, &self.expr, &start_id);
                     proposals.extend(reachable.iter().map(id_into_value));
+                }
+                return;
+            }
+        }
+        if variable == self.start {
+            if let Some(end_val) = binding.get(self.end) {
+                // End is bound; propose only those start nodes that
+                // actually reach `end` via `expr`. Without this
+                // filter, callers assuming the proposing constraint
+                // emits valid candidates (and skipping `confirm` on
+                // the same constraint) would see Cartesian-style
+                // results when no other constraint touches `start`.
+                if let Some(end_id) = id_from_value(end_val) {
+                    // Candidates = all_nodes ∪ {end_id}. The end
+                    // itself is a valid start for reflexive paths
+                    // (`(p)*`, `(p)?`) per SPARQL semantics, even if
+                    // it doesn't otherwise appear in the graph.
+                    let mut candidates = self.all_nodes();
+                    candidates.push(id_into_value(&end_id));
+                    proposals.extend(candidates.into_iter().filter(|v| {
+                        id_from_value(v)
+                            .map_or(false, |sid| has_path(&self.set, &self.expr, &sid, &end_id))
+                    }));
                 }
                 return;
             }
