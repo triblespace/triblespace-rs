@@ -40,25 +40,46 @@
 //! across separate ingest calls. Cyclic blank-node graphs return
 //! [`IngestError::BnodeCycle`] — there's no fixed-point id assignment
 //! without symmetry-breaking, and we'd rather refuse than guess.
+//!
+//! ## API
+//!
+//! [`import_bytes`] is the core entry point — it parses a `Bytes`
+//! buffer (e.g. a memory-mapped file, an over-the-wire payload, or a
+//! `String::into_bytes`'d test fixture) without copying string slices.
+//! [`import_blob`] is a convenience over `Blob<LongString>`, mirroring
+//! [`crate::import::json::JsonObjectImporter::import_blob`].
+//! [`ingest_ntriples`] adapts a `BufRead` by slurping it into a
+//! `Bytes`. [`ingest_ntriples_file`] opens a path and forwards.
+//!
+//! Inside, the parser is winnow-driven over `anybytes::Bytes`. URI and
+//! bnode label slices come back as `View<str>` — Arc-shared into the
+//! input buffer, so storing them in the bnode-resolution buffer costs
+//! nothing. Literal lexical forms come back as `Bytes`: zero-copy on
+//! the no-escape fast path, freshly-allocated only when ECHAR / UCHAR
+//! escapes forced decoding. ECHAR `\b`, `\f`, `\'`, `\n`, `\r`, `\t`,
+//! `\"`, `\\` and UCHAR `\uXXXX` / `\UXXXXXXXX` are all supported in
+//! both string literals and IRIs.
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::Path;
 
+use anybytes::{Bytes, View};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use blake3::Hasher;
 use hifitime::prelude::*;
 use num_rational::Ratio;
 use winnow::error::InputError;
-use winnow::token::take_while;
+use winnow::stream::Stream;
+use winnow::token::{take, take_while};
 use winnow::Parser;
 
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::rawbytes::RawBytes;
+use crate::blob::Blob;
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
 use crate::prelude::valueschemas;
@@ -88,6 +109,8 @@ pub enum IngestError {
         /// The bnode labels that participate in the unresolved cycle.
         labels: Vec<String>,
     },
+    /// The underlying reader returned an I/O error.
+    Io(String),
 }
 
 impl fmt::Display for IngestError {
@@ -96,6 +119,7 @@ impl fmt::Display for IngestError {
             Self::BnodeCycle { labels } => {
                 write!(f, "blank-node cycle in input: {}", labels.join(", "))
             }
+            Self::Io(msg) => write!(f, "i/o error reading n-triples: {msg}"),
         }
     }
 }
@@ -126,7 +150,10 @@ enum OutgoingFact {
     Resolved { attr_id: Id, value_raw: RawValue },
     /// Bnode-to-bnode edge; both subject and target are deferred. The
     /// `attr_id` is already the GenId-typed predicate-attribute id.
-    BnodeRef { attr_id: Id, target_label: String },
+    BnodeRef {
+        attr_id: Id,
+        target_label: View<str>,
+    },
 }
 
 /// One triple of the form `<resolved_subject> <predicate> _:target`.
@@ -134,13 +161,15 @@ enum OutgoingFact {
 struct IncomingFact {
     subject_id: Id,
     attr_id: Id,
-    target_label: String,
+    target_label: View<str>,
 }
 
-/// Per-import buffer for blank-node triples.
+/// Per-import buffer for blank-node triples. Keys are `View<str>`
+/// slices into the underlying input `Bytes`, so storing a label costs
+/// nothing — the slice Arc-shares the input buffer.
 struct BnodeBuffer {
     /// Outgoing facts, keyed by bnode subject label.
-    outgoing: HashMap<String, Vec<OutgoingFact>>,
+    outgoing: HashMap<View<str>, Vec<OutgoingFact>>,
     /// Triples whose object is a bnode (subject is already resolved).
     incoming: Vec<IncomingFact>,
     /// Per-import salt for orphan-bnode skolemisation.
@@ -166,7 +195,7 @@ impl BnodeBuffer {
         self.outgoing.is_empty() && self.incoming.is_empty()
     }
 
-    fn push_outgoing(&mut self, label: String, fact: OutgoingFact) {
+    fn push_outgoing(&mut self, label: View<str>, fact: OutgoingFact) {
         self.outgoing.entry(label).or_default().push(fact);
     }
 
@@ -182,8 +211,8 @@ impl BnodeBuffer {
 
         // 1. Build dependency graph: label → labels its outgoing facts reference.
         //    Also collect every label that appears anywhere (subject or target).
-        let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut all_labels: HashSet<String> = HashSet::new();
+        let mut deps: HashMap<View<str>, HashSet<View<str>>> = HashMap::new();
+        let mut all_labels: HashSet<View<str>> = HashSet::new();
         for (label, edges) in &self.outgoing {
             all_labels.insert(label.clone());
             let entry = deps.entry(label.clone()).or_default();
@@ -200,7 +229,7 @@ impl BnodeBuffer {
 
         // 2. Topo-sort. Cycle → error.
         let order = topo_sort(&all_labels, &deps).map_err(|labels| {
-            let mut sorted = labels;
+            let mut sorted: Vec<String> = labels.iter().map(|v| v.as_ref().to_owned()).collect();
             sorted.sort();
             IngestError::BnodeCycle { labels: sorted }
         })?;
@@ -208,7 +237,7 @@ impl BnodeBuffer {
         // 3. Resolve each bnode's id in dependency order. By the time
         //    we visit a label, all labels its outgoing facts reference
         //    are already in `resolved`.
-        let mut resolved: HashMap<String, Id> = HashMap::new();
+        let mut resolved: HashMap<View<str>, Id> = HashMap::new();
         for label in order {
             let id = resolve_bnode_id(&label, &self.outgoing, &resolved, &self.salt);
             resolved.insert(label, id);
@@ -226,7 +255,8 @@ impl BnodeBuffer {
                         target_label,
                     } => {
                         let target_id = resolved[&target_label];
-                        (attr_id, { let v: Value<GenId> = target_id.to_value(); v.raw })
+                        let v: Value<GenId> = target_id.to_value();
+                        (attr_id, v.raw)
                     }
                 };
                 let v: Value<UnknownValue> = Value::new(value_raw);
@@ -238,7 +268,8 @@ impl BnodeBuffer {
         for inc in self.incoming {
             let target_id = resolved[&inc.target_label];
             let e = ExclusiveId::force_ref(&inc.subject_id);
-            let v: Value<UnknownValue> = Value::new({ let v: Value<GenId> = target_id.to_value(); v.raw });
+            let g: Value<GenId> = target_id.to_value();
+            let v: Value<UnknownValue> = Value::new(g.raw);
             facts.insert(&Trible::new(e, &inc.attr_id, &v));
         }
 
@@ -254,12 +285,12 @@ impl BnodeBuffer {
 /// For orphans (no outgoing facts), falls back to skolemisation:
 /// `Blake3(salt || label)[16..]`.
 fn resolve_bnode_id(
-    label: &str,
-    outgoing: &HashMap<String, Vec<OutgoingFact>>,
-    resolved: &HashMap<String, Id>,
+    label: &View<str>,
+    outgoing: &HashMap<View<str>, Vec<OutgoingFact>>,
+    resolved: &HashMap<View<str>, Id>,
     salt: &[u8; 16],
 ) -> Id {
-    let mut pairs: Vec<(Id, RawValue)> = outgoing
+    let pairs: Vec<(Id, RawValue)> = outgoing
         .get(label)
         .map(|edges| {
             edges
@@ -273,7 +304,8 @@ fn resolve_bnode_id(
                         let target_id = resolved
                             .get(target_label)
                             .expect("topo order resolved this target first");
-                        (*attr_id, { let v: Value<GenId> = target_id.to_value(); v.raw })
+                        let v: Value<GenId> = target_id.to_value();
+                        (*attr_id, v.raw)
                     }
                 })
                 .collect()
@@ -284,13 +316,14 @@ fn resolve_bnode_id(
         // Orphan: skolemise via salt.
         let mut hasher = Hasher::new();
         hasher.update(salt);
-        hasher.update(label.as_bytes());
+        hasher.update(label.as_ref().as_bytes());
         let digest = hasher.finalize();
         let mut raw = [0u8; ID_LEN];
         raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
         return Id::new(raw).expect("non-nil from random salt");
     }
 
+    let mut pairs = pairs;
     pairs.sort_unstable();
     let mut hasher = Hasher::new();
     let mut last: Option<(Id, RawValue)> = None;
@@ -314,21 +347,22 @@ fn resolve_bnode_id(
 /// after the labels it depends on (its outgoing-fact targets). Returns
 /// the unresolved cycle labels as `Err` if no full ordering exists.
 fn topo_sort(
-    nodes: &HashSet<String>,
-    edges: &HashMap<String, HashSet<String>>,
-) -> Result<Vec<String>, Vec<String>> {
-    let mut in_degree: HashMap<String, usize> = nodes.iter().map(|n| (n.clone(), 0)).collect();
+    nodes: &HashSet<View<str>>,
+    edges: &HashMap<View<str>, HashSet<View<str>>>,
+) -> Result<Vec<View<str>>, Vec<View<str>>> {
+    let mut in_degree: HashMap<View<str>, usize> =
+        nodes.iter().map(|n| (n.clone(), 0)).collect();
     for dsts in edges.values() {
         for dst in dsts {
             *in_degree.entry(dst.clone()).or_insert(0) += 1;
         }
     }
-    let mut queue: VecDeque<String> = in_degree
+    let mut queue: VecDeque<View<str>> = in_degree
         .iter()
         .filter(|(_, d)| **d == 0)
         .map(|(n, _)| n.clone())
         .collect();
-    let mut order: Vec<String> = Vec::with_capacity(nodes.len());
+    let mut order: Vec<View<str>> = Vec::with_capacity(nodes.len());
     while let Some(n) = queue.pop_front() {
         if let Some(dsts) = edges.get(&n) {
             for dst in dsts {
@@ -342,7 +376,7 @@ fn topo_sort(
         order.push(n);
     }
     if order.len() < nodes.len() {
-        let cycle: Vec<String> = nodes
+        let cycle: Vec<View<str>> = nodes
             .iter()
             .filter(|n| in_degree.get(*n).copied().unwrap_or(0) > 0)
             .cloned()
@@ -353,135 +387,241 @@ fn topo_sort(
     }
 }
 
-// ── Parsing ─────────────────────────────────────────────────────────
+// ── Parsing — Bytes/winnow ──────────────────────────────────────────
 //
-// Each parser step returns the matched span as a borrowed `&str` and
-// the remainder of the input — no per-line String allocations. The
-// fast path for unescaped string literals (overwhelmingly the common
-// case) returns a `Cow::Borrowed`, escaping only when actually
-// necessary (mirrors `json::parse_string_common`).
+// Each parser step takes `&mut Bytes` and returns a `View<str>` (or a
+// `Bytes` for literal lexical forms whose fast/slow path differ). View
+// slices Arc-share the input buffer, so storing them in `BnodeBuffer`
+// across line-equivalent boundaries costs nothing — no copy or alloc.
+// Mirrors `json::parse_string_common`'s shape.
 
 /// What follows a closing `"` on an N-Triples literal:
 /// `^^<datatype>`, `@language`, or nothing.
-enum LiteralSuffix<'a> {
+enum LiteralSuffix {
     None,
-    Datatype(&'a str),
-    Language(&'a str),
+    Datatype(View<str>),
+    Language(View<str>),
 }
 
-fn take_iri<'a>(input: &mut &'a str) -> Option<&'a str> {
-    let bytes = input.as_bytes();
-    if bytes.first() != Some(&b'<') {
-        return None;
-    }
-    let close = bytes[1..].iter().position(|&b| b == b'>')?;
-    let iri = &input[1..1 + close];
-    *input = &input[close + 2..];
-    Some(iri)
-}
-
-fn take_bnode<'a>(input: &mut &'a str) -> Option<&'a str> {
-    if !input.starts_with("_:") {
-        return None;
-    }
-    // BLANK_NODE_LABEL terminates at the first whitespace or `.` — we
-    // accept it as a synthetic URI, prefix included.
-    let end = input
-        .find(|c: char| c.is_whitespace() || c == '.')
-        .unwrap_or(input.len());
-    let label = &input[..end];
-    *input = &input[end..];
-    Some(label)
-}
-
-/// Take a literal `"..."` plus optional `^^<dt>` / `@lang` suffix.
-///
-/// Returns the lexical form as `Cow::Borrowed` when no escape sequence
-/// was encountered (the common case) and `Cow::Owned` only when escapes
-/// forced re-encoding.
-fn take_literal<'a>(input: &mut &'a str) -> Option<(Cow<'a, str>, LiteralSuffix<'a>)> {
-    if !input.starts_with('"') {
-        return None;
-    }
-
-    // Fast path: scan for the closing quote without touching escapes.
-    // If we find one before any `\`, return the inner slice as borrowed.
-    {
-        let body = &input[1..];
-        let mut tentative = body;
-        let mut take = take_while::<_, _, InputError<&str>>(0.., |c: char| c != '"' && c != '\\');
-        if let Ok(prefix) = take.parse_next(&mut tentative) {
-            if tentative.starts_with('"') {
-                let lex_len = prefix.len();
-                let after_quote = &input[1 + lex_len + 1..];
-                let suffix = parse_literal_suffix(after_quote, input)?;
-                return Some((Cow::Borrowed(prefix), suffix));
+fn skip_ws_and_comments(bytes: &mut Bytes) {
+    loop {
+        // Eat whitespace bytes. N-Triples grammar permits HT/LF/CR/SP.
+        while matches!(bytes.peek_token(), Some(b) if matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+            bytes.pop_front();
+        }
+        // Eat `# ... \n` comments.
+        if bytes.peek_token() == Some(b'#') {
+            while let Some(b) = bytes.pop_front() {
+                if b == b'\n' {
+                    break;
+                }
             }
-            // fall through to slow path — `\` was hit
+            continue;
+        }
+        break;
+    }
+}
+
+fn skip_inline_ws(bytes: &mut Bytes) {
+    while matches!(bytes.peek_token(), Some(b' ') | Some(b'\t')) {
+        bytes.pop_front();
+    }
+}
+
+/// Take an `<iri>` and return its content as a `View<str>`.
+///
+/// Fast path: scan for `>` with no `\` along the way → return the
+/// slice directly, zero copy. Slow path (any `\u`/`\U` UCHAR escape):
+/// decode into a fresh `Bytes`-backed buffer.
+fn take_iri(bytes: &mut Bytes) -> Option<View<str>> {
+    if bytes.peek_token() != Some(b'<') {
+        return None;
+    }
+    bytes.pop_front();
+
+    // Fast path.
+    {
+        let mut tentative = bytes.clone();
+        let mut take = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+            b != b'>' && b != b'\\' && b != b'\n' && b != b'\r'
+        });
+        if let Ok(prefix) = take.parse_next(&mut tentative) {
+            if tentative.peek_token() == Some(b'>') {
+                tentative.pop_front();
+                *bytes = tentative;
+                return prefix.view::<str>().ok();
+            }
         }
     }
 
-    // Slow path: an escape was present; allocate and decode in one pass.
-    let bytes = input.as_bytes();
-    let mut out = String::new();
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if i + 1 < bytes.len() => {
-                match bytes[i + 1] {
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    other => {
-                        out.push('\\');
-                        out.push(other as char);
-                    }
-                }
-                i += 2;
+    // Slow path: handle `\uXXXX` / `\UXXXXXXXX` escapes.
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(b) = bytes.peek_token() {
+        match b {
+            b'>' => {
+                bytes.pop_front();
+                return Bytes::from_source(out).view::<str>().ok();
             }
-            b'"' => {
-                let after_quote = &input[i + 1..];
-                let suffix = parse_literal_suffix(after_quote, input)?;
-                return Some((Cow::Owned(out), suffix));
+            b'\\' => {
+                bytes.pop_front();
+                let kind = bytes.pop_front()?;
+                let decoded = match kind {
+                    b'u' => parse_uchar(bytes, 4)?,
+                    b'U' => parse_uchar(bytes, 8)?,
+                    _ => return None, // IRIs allow only UCHAR escapes
+                };
+                out.extend_from_slice(&decoded);
             }
-            other => {
-                out.push(other as char);
-                i += 1;
+            b'\n' | b'\r' => return None,
+            _ => {
+                out.push(b);
+                bytes.pop_front();
             }
         }
     }
     None
 }
 
-/// Match the optional `^^<dt>` / `@lang` suffix and advance `input` to
-/// just past it. `after_quote` points at what's after the closing `"`;
-/// `input` is the literal's full slice, mutated to consume the whole
-/// `"..."<suffix>` span on success.
-fn parse_literal_suffix<'a>(
-    after_quote: &'a str,
-    input: &mut &'a str,
-) -> Option<LiteralSuffix<'a>> {
-    if let Some(rest) = after_quote.strip_prefix("^^") {
-        let mut cursor = rest;
-        let dt = take_iri(&mut cursor)?;
-        *input = cursor;
-        return Some(LiteralSuffix::Datatype(dt));
+/// Take a `_:label` blank-node label as a `View<str>`. Per BLANK_NODE_LABEL,
+/// labels can contain dots in the middle — we terminate purely on
+/// whitespace, since the triple-ending `.` is always preceded by it.
+fn take_bnode(bytes: &mut Bytes) -> Option<View<str>> {
+    if bytes.peek_token() != Some(b'_') {
+        return None;
     }
-    if let Some(rest) = after_quote.strip_prefix('@') {
-        let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-            .unwrap_or(rest.len());
-        if end == 0 {
-            return None;
+    let mut tentative = bytes.clone();
+    let mut prefix = take::<_, _, InputError<Bytes>>(2usize);
+    let head = prefix.parse_next(&mut tentative).ok()?;
+    if head.as_ref() != b"_:" {
+        return None;
+    }
+    let mut take_label = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
+        !matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    });
+    let label = take_label.parse_next(&mut tentative).ok()?;
+    *bytes = tentative;
+
+    // Re-include the `_:` prefix so callers see the literal label form.
+    // We rebuild from `out` rather than try to reconstruct a contiguous
+    // slice — `View<str>` allocation cost is one Vec, comparable to a
+    // `String::from`. (Future optimisation: have anybytes expose a
+    // contiguous-slice constructor that re-merges adjacent Bytes.)
+    let mut combined = Vec::with_capacity(2 + label.len());
+    combined.extend_from_slice(b"_:");
+    combined.extend_from_slice(label.as_ref());
+    Bytes::from_source(combined).view::<str>().ok()
+}
+
+/// Take a `"..."` literal plus optional `^^<datatype>` / `@language`
+/// suffix. Returns the lexical form as `Bytes` (use `.view::<str>()`)
+/// — zero-copy on the no-escape fast path, freshly-allocated only when
+/// escapes forced decoding.
+fn take_literal(bytes: &mut Bytes) -> Option<(Bytes, LiteralSuffix)> {
+    if bytes.peek_token() != Some(b'"') {
+        return None;
+    }
+    bytes.pop_front();
+
+    // Fast path: scan for the closing quote without any `\`.
+    {
+        let mut tentative = bytes.clone();
+        let mut take = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
+            b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
+        });
+        if let Ok(prefix) = take.parse_next(&mut tentative) {
+            if tentative.peek_token() == Some(b'"') {
+                tentative.pop_front();
+                *bytes = tentative;
+                let suffix = parse_literal_suffix(bytes)?;
+                return Some((prefix, suffix));
+            }
         }
-        let lang = &rest[..end];
-        *input = &rest[end..];
-        return Some(LiteralSuffix::Language(lang));
     }
-    *input = after_quote;
-    Some(LiteralSuffix::None)
+
+    // Slow path: full ECHAR + UCHAR decoding.
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let b = bytes.peek_token()?;
+        match b {
+            b'"' => {
+                bytes.pop_front();
+                let suffix = parse_literal_suffix(bytes)?;
+                return Some((Bytes::from_source(out), suffix));
+            }
+            b'\\' => {
+                bytes.pop_front();
+                let kind = bytes.pop_front()?;
+                match kind {
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'"' => out.push(b'"'),
+                    b'\'' => out.push(b'\''),
+                    b'\\' => out.push(b'\\'),
+                    b'u' => {
+                        let decoded = parse_uchar(bytes, 4)?;
+                        out.extend_from_slice(&decoded);
+                    }
+                    b'U' => {
+                        let decoded = parse_uchar(bytes, 8)?;
+                        out.extend_from_slice(&decoded);
+                    }
+                    _ => return None,
+                }
+            }
+            b'\n' | b'\r' => return None,
+            _ => {
+                out.push(b);
+                bytes.pop_front();
+            }
+        }
+    }
+}
+
+/// Decode `\uXXXX` (4 hex digits) or `\UXXXXXXXX` (8) into UTF-8 bytes.
+/// Caller has already consumed the leading `\u` / `\U`.
+fn parse_uchar(bytes: &mut Bytes, hex_digits: usize) -> Option<Vec<u8>> {
+    let mut grab = take::<_, _, InputError<Bytes>>(hex_digits);
+    let hex = grab.parse_next(bytes).ok()?;
+    let mut code: u32 = 0;
+    for h in hex.as_ref() {
+        code = (code << 4)
+            | match h {
+                b'0'..=b'9' => (h - b'0') as u32,
+                b'a'..=b'f' => (h - b'a' + 10) as u32,
+                b'A'..=b'F' => (h - b'A' + 10) as u32,
+                _ => return None,
+            };
+    }
+    let ch = char::from_u32(code)?;
+    let mut buf = [0u8; 4];
+    Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
+}
+
+/// Match the optional `^^<datatype>` / `@language` suffix.
+fn parse_literal_suffix(bytes: &mut Bytes) -> Option<LiteralSuffix> {
+    match bytes.peek_token() {
+        Some(b'^') => {
+            // expect `^^`
+            bytes.pop_front();
+            if bytes.pop_front() != Some(b'^') {
+                return None;
+            }
+            let dt = take_iri(bytes)?;
+            Some(LiteralSuffix::Datatype(dt))
+        }
+        Some(b'@') => {
+            bytes.pop_front();
+            let mut take = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
+                b.is_ascii_alphanumeric() || b == b'-'
+            });
+            let tag = take.parse_next(bytes).ok()?;
+            tag.view::<str>().ok().map(LiteralSuffix::Language)
+        }
+        _ => Some(LiteralSuffix::None),
+    }
 }
 
 /// Parse a decimal string into a `Ratio<i128>`.
@@ -751,15 +891,12 @@ where
 
 // ── Ingestion ───────────────────────────────────────────────────────
 
-/// Read N-Triples from `reader` and produce a [`TribleSet`] of facts plus
-/// the number of triples consumed. Literal blobs (strings, URIs) are
-/// written into `ws`'s local blob store.
-///
-/// Merge the returned [`TribleSet`] into a workspace via
-/// [`Workspace::commit`] or `+=` to materialize the import.
-pub fn ingest_ntriples<Blobs>(
+/// Import an N-Triples document already loaded as `Bytes`. This is the
+/// core entry point — every other adapter funnels here. Mirrors
+/// [`crate::import::json::JsonObjectImporter::import_blob`]'s shape.
+pub fn import_bytes<Blobs>(
     ws: &mut Workspace<Blobs>,
-    reader: impl BufRead,
+    mut bytes: Bytes,
 ) -> Result<(TribleSet, usize), IngestError>
 where
     Blobs: BlobStore<Blake3>,
@@ -768,10 +905,22 @@ where
     let mut bnodes = BnodeBuffer::new();
     let mut count = 0;
 
-    for line in reader.lines() {
-        let Ok(line) = line else { continue };
-        if try_emit_line(ws, &mut facts, &mut bnodes, &line) {
+    loop {
+        skip_ws_and_comments(&mut bytes);
+        if bytes.peek_token().is_none() {
+            break;
+        }
+        if parse_triple(ws, &mut facts, &mut bnodes, &mut bytes) {
             count += 1;
+        } else {
+            // Malformed triple — skip to next newline so a single bad
+            // line doesn't abort the import. Mirrors the line-skip
+            // tolerance the BufRead version had.
+            while let Some(b) = bytes.pop_front() {
+                if b == b'\n' {
+                    break;
+                }
+            }
         }
     }
 
@@ -779,143 +928,210 @@ where
     Ok((facts, count))
 }
 
-/// Parse one line and emit its facts. Plain triples emit directly into
-/// `facts`; triples touching a blank node go into `bnodes` for deferred
-/// resolution. Returns `true` iff a triple was accepted (lines that
-/// are blank, comments, or malformed return `false`).
-fn try_emit_line<Blobs>(
+/// Convenience wrapper around [`import_bytes`] for a `Blob<LongString>`
+/// — the on-disk / on-wire representation N-Triples shows up as.
+pub fn import_blob<Blobs>(
+    ws: &mut Workspace<Blobs>,
+    blob: Blob<LongString>,
+) -> Result<(TribleSet, usize), IngestError>
+where
+    Blobs: BlobStore<Blake3>,
+{
+    import_bytes(ws, blob.bytes)
+}
+
+/// `BufRead` adapter — slurps the reader into a `Bytes` and forwards
+/// to [`import_bytes`].
+pub fn ingest_ntriples<Blobs>(
+    ws: &mut Workspace<Blobs>,
+    mut reader: impl BufRead,
+) -> Result<(TribleSet, usize), IngestError>
+where
+    Blobs: BlobStore<Blake3>,
+{
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| IngestError::Io(e.to_string()))?;
+    import_bytes(ws, Bytes::from_source(buf))
+}
+
+/// Parse one triple from the front of `bytes` and emit its facts.
+/// Plain triples emit directly into `facts`; triples touching a blank
+/// node go into `bnodes` for deferred resolution. Returns `true` on
+/// success, `false` on malformed input (caller skips to next line).
+fn parse_triple<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
     bnodes: &mut BnodeBuffer,
-    line: &str,
+    bytes: &mut Bytes,
 ) -> bool
 where
     Blobs: BlobStore<Blake3>,
 {
-    let mut cursor = line.trim_start();
-    if cursor.is_empty() || cursor.starts_with('#') {
-        return false;
-    }
-
     // Subject — IRI or bnode label.
-    let subject_label: Option<&str>;
-    let subject_iri: Option<&str>;
-    if cursor.starts_with('<') {
-        let Some(uri) = take_iri(&mut cursor) else {
-            return false;
+    let (subject_iri, subject_label): (Option<View<str>>, Option<View<str>>) =
+        match bytes.peek_token() {
+            Some(b'<') => match take_iri(bytes) {
+                Some(uri) => (Some(uri), None),
+                None => return false,
+            },
+            Some(b'_') => match take_bnode(bytes) {
+                Some(label) => (None, Some(label)),
+                None => return false,
+            },
+            _ => return false,
         };
-        subject_iri = Some(uri);
-        subject_label = None;
-    } else if cursor.starts_with("_:") {
-        let Some(label) = take_bnode(&mut cursor) else {
-            return false;
-        };
-        subject_iri = None;
-        subject_label = Some(label);
-    } else {
-        return false;
-    }
-    cursor = cursor.trim_start();
+    skip_inline_ws(bytes);
 
-    let Some(predicate) = take_iri(&mut cursor) else {
+    let Some(predicate) = take_iri(bytes) else {
         return false;
     };
-    cursor = cursor.trim_start();
+    skip_inline_ws(bytes);
 
-    // Anchor the IRI subject up-front so its rdf_uri annotation lands
-    // alongside the same emission paths used today. Bnode subjects
-    // resolve later in `flush`.
-    let iri_subject_anchor: Option<Id> = subject_iri.map(|uri| {
-        let id = uri_to_id(ws, uri);
-        let sub_h: Value<Handle<Blake3, LongString>> = ws.put(uri.to_owned());
+    // Anchor the IRI subject up front so its rdf_uri annotation lands
+    // before any emission. Bnode subjects resolve in `flush`.
+    let iri_subject_anchor: Option<Id> = subject_iri.as_ref().map(|uri| {
+        let s = uri.as_ref();
+        let id = uri_to_id(ws, s);
+        let sub_h: Value<Handle<Blake3, LongString>> = ws.put(uri.clone());
         *facts += entity! { crate::import::rdf_uri: sub_h };
         id
     });
 
     // Object — IRI, bnode, or literal.
-    if cursor.starts_with('<') {
-        let Some(obj_uri) = take_iri(&mut cursor) else {
-            return false;
-        };
-        match (iri_subject_anchor, subject_label) {
-            (Some(s_id), None) => {
-                emit_uri_object(ws, facts, &ExclusiveId::force_ref(&s_id), predicate, obj_uri);
-            }
-            (None, Some(s_label)) => {
-                // Bnode → URI: outgoing fact with resolved value.
-                let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
-                let obj_id = uri_to_id(ws, obj_uri);
-                let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri.to_owned());
-                *facts += entity! { crate::import::rdf_uri: obj_h };
-                bnodes.push_outgoing(
-                    s_label.to_owned(),
-                    OutgoingFact::Resolved {
-                        attr_id: attr.id(),
-                        value_raw: { let v: Value<GenId> = obj_id.to_value(); v.raw },
-                    },
-                );
-            }
-            _ => unreachable!("subject is exactly one of iri/bnode"),
+    let outcome = match bytes.peek_token() {
+        Some(b'<') => {
+            let Some(obj_uri) = take_iri(bytes) else {
+                return false;
+            };
+            emit_object_iri(
+                ws,
+                facts,
+                bnodes,
+                iri_subject_anchor,
+                subject_label,
+                predicate.as_ref(),
+                obj_uri,
+            );
+            true
         }
-        return true;
-    }
-    if cursor.starts_with("_:") {
-        let Some(target_label) = take_bnode(&mut cursor) else {
-            return false;
-        };
-        let attr_id = Attribute::<valueschemas::GenId>::from_name(predicate).id();
-        match (iri_subject_anchor, subject_label) {
-            (Some(s_id), None) => {
-                // IRI → bnode: emit later when target resolves.
-                bnodes.push_incoming(IncomingFact {
-                    subject_id: s_id,
-                    attr_id,
-                    target_label: target_label.to_owned(),
-                });
-            }
-            (None, Some(s_label)) => {
-                // Bnode → bnode: outgoing edge with reference value.
-                bnodes.push_outgoing(
-                    s_label.to_owned(),
-                    OutgoingFact::BnodeRef {
+        Some(b'_') => {
+            let Some(target_label) = take_bnode(bytes) else {
+                return false;
+            };
+            let attr_id = Attribute::<valueschemas::GenId>::from_name(predicate.as_ref()).id();
+            match (iri_subject_anchor, subject_label) {
+                (Some(s_id), None) => {
+                    bnodes.push_incoming(IncomingFact {
+                        subject_id: s_id,
                         attr_id,
-                        target_label: target_label.to_owned(),
-                    },
-                );
+                        target_label,
+                    });
+                }
+                (None, Some(s_label)) => {
+                    bnodes.push_outgoing(
+                        s_label,
+                        OutgoingFact::BnodeRef {
+                            attr_id,
+                            target_label,
+                        },
+                    );
+                }
+                _ => return false,
             }
-            _ => unreachable!("subject is exactly one of iri/bnode"),
+            true
         }
-        return true;
-    }
-    if cursor.starts_with('"') {
-        let Some((text, suffix)) = take_literal(&mut cursor) else {
+        Some(b'"') => {
+            let Some((text_bytes, suffix)) = take_literal(bytes) else {
+                return false;
+            };
+            let Ok(text) = text_bytes.view::<str>() else {
+                return false;
+            };
+            match (iri_subject_anchor, subject_label) {
+                (Some(s_id), None) => {
+                    let e = ExclusiveId::force_ref(&s_id);
+                    match suffix {
+                        LiteralSuffix::None => {
+                            emit_text_literal(ws, facts, e, predicate.as_ref(), text)
+                        }
+                        LiteralSuffix::Datatype(dt) => {
+                            emit_typed_literal(ws, facts, e, predicate.as_ref(), text, dt.as_ref())
+                        }
+                        LiteralSuffix::Language(lang) => emit_lang_literal(
+                            ws,
+                            facts,
+                            e,
+                            predicate.as_ref(),
+                            lang.as_ref(),
+                            text,
+                        ),
+                    }
+                }
+                (None, Some(s_label)) => {
+                    if let Some(fact) =
+                        build_resolved_outgoing(ws, facts, predicate.as_ref(), text, suffix)
+                    {
+                        bnodes.push_outgoing(s_label, fact);
+                    }
+                }
+                _ => return false,
+            }
+            true
+        }
+        _ => false,
+    };
+
+    if outcome {
+        skip_inline_ws(bytes);
+        // The trailing `.` terminator. Tolerant: missing-dot gets the
+        // line skipped by the outer loop.
+        if bytes.peek_token() != Some(b'.') {
             return false;
-        };
-        match (iri_subject_anchor, subject_label) {
-            (Some(s_id), None) => {
-                let e = ExclusiveId::force_ref(&s_id);
-                match suffix {
-                    LiteralSuffix::None => emit_text_literal(ws, facts, e, predicate, text),
-                    LiteralSuffix::Datatype(dt) => {
-                        emit_typed_literal(ws, facts, e, predicate, text, dt)
-                    }
-                    LiteralSuffix::Language(lang) => {
-                        emit_lang_literal(ws, facts, e, predicate, lang, text)
-                    }
-                }
-            }
-            (None, Some(s_label)) => {
-                // Bnode subject with literal value — pre-resolve the value
-                // (and any side-effect blob writes) and stash as Resolved.
-                if let Some(fact) = build_resolved_outgoing(ws, facts, predicate, text, suffix) {
-                    bnodes.push_outgoing(s_label.to_owned(), fact);
-                }
-            }
-            _ => unreachable!("subject is exactly one of iri/bnode"),
         }
-        return true;
+        bytes.pop_front();
     }
-    false
+    outcome
+}
+
+fn emit_object_iri<Blobs>(
+    ws: &mut Workspace<Blobs>,
+    facts: &mut TribleSet,
+    bnodes: &mut BnodeBuffer,
+    iri_subject_anchor: Option<Id>,
+    subject_label: Option<View<str>>,
+    predicate: &str,
+    obj_uri: View<str>,
+) where
+    Blobs: BlobStore<Blake3>,
+{
+    match (iri_subject_anchor, subject_label) {
+        (Some(s_id), None) => {
+            emit_uri_object(
+                ws,
+                facts,
+                &ExclusiveId::force_ref(&s_id),
+                predicate,
+                obj_uri.as_ref(),
+            );
+        }
+        (None, Some(s_label)) => {
+            let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+            let obj_id = uri_to_id(ws, obj_uri.as_ref());
+            let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri);
+            *facts += entity! { crate::import::rdf_uri: obj_h };
+            let g: Value<GenId> = obj_id.to_value();
+            bnodes.push_outgoing(
+                s_label,
+                OutgoingFact::Resolved {
+                    attr_id: attr.id(),
+                    value_raw: g.raw,
+                },
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Materialise a literal-valued bnode-outgoing fact: blob writes /
@@ -926,8 +1142,8 @@ fn build_resolved_outgoing<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
     predicate: &str,
-    text: Cow<'_, str>,
-    suffix: LiteralSuffix<'_>,
+    text: View<str>,
+    suffix: LiteralSuffix,
 ) -> Option<OutgoingFact>
 where
     Blobs: BlobStore<Blake3>,
@@ -935,7 +1151,7 @@ where
     match suffix {
         LiteralSuffix::None => {
             let attr = Attribute::<Handle<Blake3, LongString>>::from_name(predicate);
-            let handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+            let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
             Some(OutgoingFact::Resolved {
                 attr_id: attr.id(),
                 value_raw: handle.raw,
@@ -948,7 +1164,7 @@ where
             let mut scratch = TribleSet::new();
             let scratch_id = Id::new([0xFF; ID_LEN]).expect("non-nil scratch id");
             let scratch_e = ExclusiveId::force_ref(&scratch_id);
-            emit_typed_literal(ws, &mut scratch, scratch_e, predicate, text, dt);
+            emit_typed_literal(ws, &mut scratch, scratch_e, predicate, text, dt.as_ref());
             let pair = scratch
                 .iter()
                 .next()
@@ -960,10 +1176,10 @@ where
             // outgoing fact carries a GenId reference to it. Side
             // effects (the lang-entity tribles) land in `facts`
             // immediately since they don't depend on the parent id.
-            let Ok(lang_value): Result<Value<ShortString>, _> = lang.try_to_value() else {
+            let Ok(lang_value): Result<Value<ShortString>, _> = lang.as_ref().try_to_value() else {
                 return None;
             };
-            let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+            let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text);
             let label_fragment = entity! {
                 crate::import::rdf_lang: lang_value,
                 crate::import::rdf_text: text_handle,
@@ -973,9 +1189,10 @@ where
                 .expect("intrinsic id from rdf_lang+rdf_text");
             *facts += label_fragment;
             let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+            let g: Value<GenId> = label_id.to_value();
             Some(OutgoingFact::Resolved {
                 attr_id: attr.id(),
-                value_raw: { let v: Value<GenId> = label_id.to_value(); v.raw },
+                value_raw: g.raw,
             })
         }
     }
@@ -994,7 +1211,8 @@ fn emit_uri_object<Blobs>(
     let obj_id = uri_to_id(ws, obj_uri);
     let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri.to_owned());
     *facts += entity! { crate::import::rdf_uri: obj_h };
-    facts.insert(&Trible::new(e, &attr.id(), &obj_id.to_value()));
+    let g: Value<GenId> = obj_id.to_value();
+    facts.insert(&Trible::new(e, &attr.id(), &g));
 }
 
 fn emit_text_literal<Blobs>(
@@ -1002,12 +1220,12 @@ fn emit_text_literal<Blobs>(
     facts: &mut TribleSet,
     e: &ExclusiveId,
     predicate: &str,
-    text: Cow<'_, str>,
+    text: View<str>,
 ) where
     Blobs: BlobStore<Blake3>,
 {
     let attr = Attribute::<Handle<Blake3, LongString>>::from_name(predicate);
-    let handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+    let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
     facts.insert(&Trible::new(e, &attr.id(), &handle));
 }
 
@@ -1016,7 +1234,7 @@ fn emit_typed_literal<Blobs>(
     facts: &mut TribleSet,
     e: &ExclusiveId,
     predicate: &str,
-    text: Cow<'_, str>,
+    text: View<str>,
     datatype: &str,
 ) where
     Blobs: BlobStore<Blake3>,
@@ -1147,7 +1365,7 @@ fn emit_lang_literal<Blobs>(
     e: &ExclusiveId,
     predicate: &str,
     lang: &str,
-    text: Cow<'_, str>,
+    text: View<str>,
 ) where
     Blobs: BlobStore<Blake3>,
 {
@@ -1157,7 +1375,7 @@ fn emit_lang_literal<Blobs>(
     let Ok(lang_value): Result<Value<ShortString>, _> = lang.try_to_value() else {
         return; // tag too long; BCP-47 caps subtags at 8 chars
     };
-    let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text.into_owned());
+    let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text);
     let label_fragment = entity! {
         crate::import::rdf_lang: lang_value,
         crate::import::rdf_text: text_handle,
@@ -1170,20 +1388,22 @@ fn emit_lang_literal<Blobs>(
     facts.insert(&Trible::new(e, &attr.id(), &label_id.to_value()));
 }
 
-/// Convenience wrapper around [`ingest_ntriples`] that opens a file at
-/// `path` and streams it line-by-line.
+/// Convenience wrapper around [`import_bytes`] that opens a file at
+/// `path`, slurps it into a `Bytes`, and ingests.
 pub fn ingest_ntriples_file<Blobs>(
     ws: &mut Workspace<Blobs>,
     path: &Path,
-) -> Result<(TribleSet, usize), std::io::Error>
+) -> Result<(TribleSet, usize), IngestError>
 where
     Blobs: BlobStore<Blake3>,
 {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    let result = ingest_ntriples(ws, reader)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(result)
+    let file = std::fs::File::open(path).map_err(|e| IngestError::Io(e.to_string()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| IngestError::Io(e.to_string()))?;
+    import_bytes(ws, Bytes::from_source(buf))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1192,62 +1412,120 @@ where
 mod tests {
     use super::*;
 
+    fn bytes_of(s: &str) -> Bytes {
+        Bytes::from_source(s.as_bytes().to_vec())
+    }
+
     #[test]
     fn take_iri_consumes_brackets() {
-        let mut input = "<http://example.org/s> rest";
+        let mut input = bytes_of("<http://example.org/s> rest");
         let iri = take_iri(&mut input).unwrap();
-        assert_eq!(iri, "http://example.org/s");
-        assert_eq!(input, " rest");
+        assert_eq!(iri.as_ref(), "http://example.org/s");
+        // Remaining bytes should start with " rest".
+        let remaining: Vec<u8> = (0..)
+            .scan(input.clone(), |b, _| b.pop_front())
+            .collect();
+        assert_eq!(&remaining[..5], b" rest");
     }
 
     #[test]
     fn take_bnode_includes_prefix() {
-        let mut input = "_:bf55954f96378f65ddb1da9836e2eb87 .";
+        let mut input = bytes_of("_:bf55954f96378f65ddb1da9836e2eb87 .");
         let label = take_bnode(&mut input).unwrap();
-        assert_eq!(label, "_:bf55954f96378f65ddb1da9836e2eb87");
+        assert_eq!(label.as_ref(), "_:bf55954f96378f65ddb1da9836e2eb87");
     }
 
     #[test]
-    fn take_literal_unescaped_is_borrowed() {
-        let mut input = r#""hello" ."#;
+    fn take_bnode_allows_internal_dot() {
+        // BLANK_NODE_LABEL grammar permits dots in the middle of labels.
+        // The trailing triple-`.` is always preceded by whitespace, so
+        // whitespace-only termination handles both.
+        let mut input = bytes_of("_:foo.bar .");
+        let label = take_bnode(&mut input).unwrap();
+        assert_eq!(label.as_ref(), "_:foo.bar");
+    }
+
+    #[test]
+    fn take_literal_unescaped() {
+        let mut input = bytes_of(r#""hello" ."#);
         let (text, suffix) = take_literal(&mut input).unwrap();
-        assert!(matches!(text, Cow::Borrowed("hello")));
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "hello");
         assert!(matches!(suffix, LiteralSuffix::None));
     }
 
     #[test]
     fn take_literal_with_datatype_suffix() {
-        let mut input = r#""42"^^<http://www.w3.org/2001/XMLSchema#integer> ."#;
+        let mut input = bytes_of(r#""42"^^<http://www.w3.org/2001/XMLSchema#integer> ."#);
         let (text, suffix) = take_literal(&mut input).unwrap();
-        assert_eq!(text.as_ref(), "42");
-        assert!(
-            matches!(suffix, LiteralSuffix::Datatype(dt) if dt == "http://www.w3.org/2001/XMLSchema#integer")
-        );
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "42");
+        assert!(matches!(
+            suffix,
+            LiteralSuffix::Datatype(ref dt)
+                if dt.as_ref() == "http://www.w3.org/2001/XMLSchema#integer"
+        ));
     }
 
     #[test]
     fn take_literal_with_lang_tag() {
-        let mut input = r#""hello"@en ."#;
+        let mut input = bytes_of(r#""hello"@en ."#);
         let (text, suffix) = take_literal(&mut input).unwrap();
-        assert_eq!(text.as_ref(), "hello");
-        assert!(matches!(suffix, LiteralSuffix::Language("en")));
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "hello");
+        assert!(matches!(
+            suffix,
+            LiteralSuffix::Language(ref tag) if tag.as_ref() == "en"
+        ));
     }
 
     #[test]
     fn take_literal_with_lang_region() {
-        let mut input = r#""labor"@en-US ."#;
+        let mut input = bytes_of(r#""labor"@en-US ."#);
         let (text, suffix) = take_literal(&mut input).unwrap();
-        assert_eq!(text.as_ref(), "labor");
-        assert!(matches!(suffix, LiteralSuffix::Language("en-US")));
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "labor");
+        assert!(matches!(
+            suffix,
+            LiteralSuffix::Language(ref tag) if tag.as_ref() == "en-US"
+        ));
     }
 
     #[test]
-    fn take_literal_with_escapes_allocates() {
-        let mut input = r#""line\nbreak" ."#;
-        let (text, suffix) = take_literal(&mut input).unwrap();
-        assert!(matches!(text, Cow::Owned(_)));
-        assert_eq!(text.as_ref(), "line\nbreak");
-        assert!(matches!(suffix, LiteralSuffix::None));
+    fn take_literal_with_basic_escapes() {
+        let mut input = bytes_of(r#""line\nbreak" ."#);
+        let (text, _) = take_literal(&mut input).unwrap();
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "line\nbreak");
+    }
+
+    #[test]
+    fn take_literal_with_extended_echar() {
+        // \b, \f, \' are valid N-Triples ECHAR but were previously unsupported.
+        let mut input = bytes_of(r#""a\bb\fc\'d" ."#);
+        let (text, _) = take_literal(&mut input).unwrap();
+        assert_eq!(
+            text.view::<str>().unwrap().as_ref(),
+            "a\u{0008}b\u{000c}c'd"
+        );
+    }
+
+    #[test]
+    fn take_literal_with_unicode_escape_4() {
+        let mut input = bytes_of(r#""smile ☺ here" ."#);
+        let (text, _) = take_literal(&mut input).unwrap();
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "smile ☺ here");
+    }
+
+    #[test]
+    fn take_literal_with_unicode_escape_8() {
+        // \U with 8 hex digits — N-Triples-only (JSON has no \U).
+        let mut input = bytes_of(r#""grin \U0001F600 here" ."#);
+        let (text, _) = take_literal(&mut input).unwrap();
+        assert_eq!(text.view::<str>().unwrap().as_ref(), "grin 😀 here");
+    }
+
+    #[test]
+    fn take_iri_with_unicode_escape() {
+        // IRIs may carry \u escapes for non-ASCII path components.
+        let mut input = bytes_of(r#"<http://ex/é> rest"#);
+        let iri = take_iri(&mut input).unwrap();
+        assert_eq!(iri.as_ref(), "http://ex/é");
     }
 
     #[test]

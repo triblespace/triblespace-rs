@@ -420,6 +420,7 @@ _:b <http://ex/p> _:a .
             assert!(labels.contains(&"_:a".to_string()));
             assert!(labels.contains(&"_:b".to_string()));
         }
+        IngestError::Io(_) => panic!("unexpected I/O error"),
     }
 }
 
