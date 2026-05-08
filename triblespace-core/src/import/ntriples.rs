@@ -15,8 +15,14 @@
 //! - `xsd:decimal` → `R256BE` (exact rational)
 //! - `xsd:float` / `xsd:double` → `F64`
 //! - `xsd:boolean` → `Boolean`
-//! - `xsd:string`, untyped, language-tagged strings → `Handle<Blake3, LongString>`
+//! - `xsd:string`, untyped → `Handle<Blake3, LongString>`
 //! - URI objects → `GenId`
+//!
+//! Language-tagged literals (`"text"@lang`) are reified into a small
+//! entity carrying [`rdf_lang`](crate::import::rdf_lang) and
+//! [`rdf_text`](crate::import::rdf_text). The owning predicate then
+//! holds a `GenId` pointing at that entity, so language handling falls
+//! out of normal joins instead of needing a `lang()` builtin.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -31,7 +37,8 @@ use crate::prelude::valueschemas;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::{ToValue, Value};
+use crate::value::schemas::shortstring::ShortString;
+use crate::value::{ToValue, TryToValue, Value};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -48,6 +55,11 @@ enum RdfLiteral {
 enum NtObject {
     Uri(String),
     Literal(RdfLiteral),
+    /// `"text"@lang` — RDF's `rdf:langString`. Reified by the importer
+    /// into a small entity carrying `rdf_lang` and `rdf_text` attributes,
+    /// so language-tagged string handling is pure data and equality
+    /// follows from the engine's normal join semantics.
+    LangText { lang: String, text: String },
 }
 
 // ── Parsing ─────────────────────────────────────────────────────────
@@ -74,8 +86,13 @@ fn parse_line(line: &str) -> Option<(String, String, NtObject)> {
             .unwrap_or(rest.len());
         NtObject::Uri(rest[..end].to_string())
     } else if rest.starts_with('"') {
-        let (text, datatype) = parse_literal_with_datatype(rest)?;
-        NtObject::Literal(typed_literal(text, datatype.as_deref()))
+        match parse_literal_suffix(rest)? {
+            (text, LiteralSuffix::None) => NtObject::Literal(typed_literal(text, None)),
+            (text, LiteralSuffix::Datatype(dt)) => {
+                NtObject::Literal(typed_literal(text, Some(&dt)))
+            }
+            (text, LiteralSuffix::Language(lang)) => NtObject::LangText { lang, text },
+        }
     } else {
         return None;
     };
@@ -91,7 +108,15 @@ fn parse_uri(input: &str) -> Option<(String, &str)> {
     Some((input[1..=end].to_string(), &input[end + 2..]))
 }
 
-fn parse_literal_with_datatype(input: &str) -> Option<(String, Option<String>)> {
+/// What follows a closing `"` on an N-Triples literal:
+/// `^^<datatype>`, `@language`, or nothing.
+enum LiteralSuffix {
+    None,
+    Datatype(String),
+    Language(String),
+}
+
+fn parse_literal_suffix(input: &str) -> Option<(String, LiteralSuffix)> {
     if !input.starts_with('"') {
         return None;
     }
@@ -116,9 +141,20 @@ fn parse_literal_with_datatype(input: &str) -> Option<(String, Option<String>)> 
             let rest = &input[i + 1..];
             if let Some(rest) = rest.strip_prefix("^^") {
                 let (dt, _) = parse_uri(rest)?;
-                return Some((text, Some(dt)));
+                return Some((text, LiteralSuffix::Datatype(dt)));
             }
-            return Some((text, None));
+            if let Some(rest) = rest.strip_prefix('@') {
+                // BCP-47 tags use ASCII letters/digits/hyphens; terminate
+                // at the first character that can't appear in a tag.
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .unwrap_or(rest.len());
+                if end == 0 {
+                    return None;
+                }
+                return Some((text, LiteralSuffix::Language(rest[..end].to_string())));
+            }
+            return Some((text, LiteralSuffix::None));
         } else {
             text.push(bytes[i] as char);
             i += 1;
@@ -263,6 +299,27 @@ where
                 let attr = Attribute::<valueschemas::Boolean>::from_name(&predicate);
                 facts.insert(&Trible::new(e, &attr.id(), &val.to_value()));
             }
+            NtObject::LangText { lang, text } => {
+                // Reify `"text"@lang` into a small entity carrying
+                // `rdf_lang` and `rdf_text`. The intrinsic id derived
+                // from those facts deduplicates `(lang, text)` pairs
+                // across the whole import.
+                let lang_value: Value<ShortString> = match lang.as_str().try_to_value() {
+                    Ok(v) => v,
+                    Err(_) => continue, // tag too long; spec caps subtags at 8 chars
+                };
+                let text_handle: Value<Handle<Blake3, LongString>> = ws.put(text);
+                let label_fragment = entity! {
+                    crate::import::rdf_lang: lang_value,
+                    crate::import::rdf_text: text_handle,
+                };
+                let label_id = label_fragment
+                    .root()
+                    .expect("intrinsic id from rdf_lang+rdf_text");
+                facts += label_fragment;
+                let attr = Attribute::<valueschemas::GenId>::from_name(&predicate);
+                facts.insert(&Trible::new(e, &attr.id(), &label_id.to_value()));
+            }
         }
 
         count += 1;
@@ -315,6 +372,32 @@ mod tests {
         assert_eq!(s, "http://example.org/s");
         assert_eq!(p, "http://example.org/p");
         assert!(matches!(o, NtObject::Uri(ref u) if u == "_:bf55954f96378f65ddb1da9836e2eb87"));
+    }
+
+    #[test]
+    fn parse_lang_tagged_literal() {
+        let line = r#"<http://example.org/s> <http://example.org/p> "hello"@en ."#;
+        let (_, _, o) = parse_line(line).unwrap();
+        match o {
+            NtObject::LangText { lang, text } => {
+                assert_eq!(lang, "en");
+                assert_eq!(text, "hello");
+            }
+            _ => panic!("expected LangText"),
+        }
+    }
+
+    #[test]
+    fn parse_lang_tag_with_region() {
+        let line = r#"<http://example.org/s> <http://example.org/p> "labor"@en-US ."#;
+        let (_, _, o) = parse_line(line).unwrap();
+        match o {
+            NtObject::LangText { lang, text } => {
+                assert_eq!(lang, "en-US");
+                assert_eq!(text, "labor");
+            }
+            _ => panic!("expected LangText"),
+        }
     }
 
     #[test]

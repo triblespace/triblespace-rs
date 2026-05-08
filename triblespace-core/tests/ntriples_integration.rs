@@ -16,7 +16,7 @@ use triblespace_core::prelude::valueschemas::{self, Blake3, Handle};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::Value;
+use triblespace_core::value::{TryToValue, Value};
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
@@ -171,4 +171,67 @@ fn xsd_datatypes_map_to_native_schemas() {
     .next()
     .unwrap();
     assert!((f_val - 2.5).abs() < 1e-9);
+}
+
+#[test]
+fn lang_tagged_literals_reify_into_entities() {
+    use triblespace_core::import::{rdf_lang, rdf_text};
+
+    let mut repo = new_repo();
+    let branch_id = repo.ensure_branch("main", None).unwrap();
+    let mut ws = repo.pull(branch_id).unwrap();
+
+    // Same `(en, "human")` pair appears twice — should dedupe via the
+    // intrinsic-id derivation. `(de, "Mensch")` is a separate entity.
+    let data = br#"
+<http://ex/q5> <http://ex/label> "human"@en .
+<http://ex/q5> <http://ex/label> "Mensch"@de .
+<http://ex/h1> <http://ex/label> "human"@en .
+"#;
+    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..]));
+    assert_eq!(count, 3);
+
+    // `?label` is a GenId pointing at the reified language-tagged entity.
+    let label_attr = Attribute::<valueschemas::GenId>::from_name("http://ex/label");
+
+    // Two distinct subjects, two label entities for them, but the
+    // `(en, "human")` pair is shared, so we have exactly 2 distinct
+    // label-entity ids: one for `(en, "human")`, one for `(de, "Mensch")`.
+    let label_ids: std::collections::HashSet<_> = find!(
+        (l: Id),
+        pattern!(&facts, [{ _?s @ label_attr: ?l }])
+    )
+    .map(|(l,)| l)
+    .collect();
+    assert_eq!(
+        label_ids.len(),
+        2,
+        "(en, human) reuses one label entity across both subjects"
+    );
+
+    // The English label entity carries `rdf_lang = "en"` and one rdf_text trible.
+    let en_value = "en".try_to_value().unwrap();
+    let en_count = find!(
+        (e: Id),
+        pattern!(&facts, [{ ?e @ rdf_lang: en_value }])
+    )
+    .count();
+    assert_eq!(en_count, 1, "one shared English label entity");
+
+    let de_value = "de".try_to_value().unwrap();
+    let de_count = find!(
+        (e: Id),
+        pattern!(&facts, [{ ?e @ rdf_lang: de_value }])
+    )
+    .count();
+    assert_eq!(de_count, 1, "one German label entity");
+
+    // The label entity also carries an `rdf_text` handle.
+    let text_count = find!(
+        (e: Id, h: Value<Handle<Blake3, LongString>>),
+        pattern!(&facts, [{ ?e @ rdf_text: ?h }])
+    )
+    .count();
+    assert_eq!(text_count, 2, "two distinct text handles, one per language");
+
 }
