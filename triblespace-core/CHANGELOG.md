@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] - 2026-05-07
+
+Lock-step bump alongside the team-rooted-gossip release in
+`triblespace-net` / `trible`. No source changes in
+`triblespace-core`. See the workspace
+[`../CHANGELOG.md`](../CHANGELOG.md) for the full release notes.
+
 ## [0.37.0] - 2026-05-06
 
 First per-crate CHANGELOG. Earlier `triblespace-core` releases

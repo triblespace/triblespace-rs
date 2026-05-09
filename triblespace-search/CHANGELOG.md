@@ -4,6 +4,13 @@ All notable changes to `triblespace-search`.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.38.0] - 2026-05-07
+
+Lock-step bump alongside the team-rooted-gossip release in
+`triblespace-net` / `trible`. No source changes in
+`triblespace-search`. See the workspace
+[`../CHANGELOG.md`](../CHANGELOG.md) for the full release notes.
+
 ## [0.37.0] - 2026-05-06
 
 First crates.io release. Aligned with the workspace minor;
