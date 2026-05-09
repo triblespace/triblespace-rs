@@ -3,6 +3,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::Shell;
 use std::io;
+use tracing_subscriber::EnvFilter;
 
 pub const DEFAULT_MAX_PILE_SIZE: usize = 1 << 44; // 16 TiB
 
@@ -47,6 +48,16 @@ enum TribleCli {
 }
 
 fn main() -> Result<()> {
+    // Tracing subscriber for diagnostics. Default `warn` keeps the
+    // CLI quiet; set RUST_LOG (e.g. `RUST_LOG=triblespace_net=info`)
+    // to see the sync handshake and per-op events.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     let args = TribleCli::parse();
     match args {
         TribleCli::Genid => {

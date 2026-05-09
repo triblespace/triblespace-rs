@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- **`tracing-subscriber` initialised at `main()` entry**, gated
+  on the standard `RUST_LOG` env var via `EnvFilter`. Default
+  filter is `warn`, so the CLI is quiet without configuration;
+  `RUST_LOG=triblespace_net=info trible pile net sync …` lights
+  up the auth handshake + per-op events introduced in
+  `triblespace-net` Unreleased. Output goes to stderr so it
+  doesn't interleave with command output on stdout. The
+  `tracing-subscriber` dep was already declared in
+  `Cargo.toml`; this commit wires it through.
+
 ## [0.38.0] - 2026-05-07
 
 ### Removed (breaking)

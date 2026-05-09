@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+- **Tracing instrumentation across the auth handshake and op
+  surface.** `SnapshotHandler::accept` opens an `info`-level
+  `connection` span (`peer`, `alpn`); each `serve_stream` call
+  enters a `debug`-level `stream` span carrying the op name
+  (`AUTH`/`LIST`/`HEAD`/`GET_BLOB`/`CHILDREN`). Auth events fire
+  at `info` (auth ok, granted-branch count, unrestricted flag)
+  or `warn` (auth rejected with the inner `VerifyError` reason,
+  peer-pubkey-parse failure). Per-op events log at `debug` for
+  normal traffic and `warn` on scope-deny so out-of-scope
+  branch / blob requests surface immediately.
+- **Stream span duration = op latency** by construction —
+  subscribers that record span timings (`tracing-subscriber`'s
+  `FmtSpan::CLOSE`, `tracing-flame`, `tracing-opentelemetry`,
+  Tokio Console) get per-op latency observability without
+  further instrumentation.
+- **Client-side `connect_authed` is now a `info`-level span**
+  with `peer` field; emits structured `warn` events on
+  connect failure and auth-handshake failure with the inner
+  error preserved.
+
+### Changed
+- The 12 `eprintln!("[net] …")` ad-hoc log calls in
+  `host.rs` (gossip neighbor up/down, hash-mismatch warnings,
+  fetch errors, the catastrophic bind/connect failures, the
+  stream handler error) are converted to `tracing` events at
+  appropriate levels (`info` for normal lifecycle,
+  `warn` for protocol-level anomalies, `error` for
+  thread-fatal failures). The `[net]` prefix is dropped — the
+  subscriber handles formatting.
+
 ## [0.38.0] - 2026-05-07
 
 ### Changed (breaking)

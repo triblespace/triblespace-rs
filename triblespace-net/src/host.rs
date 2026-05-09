@@ -13,10 +13,22 @@ use std::thread;
 
 use iroh_base::EndpointId;
 use ed25519_dalek::SigningKey;
+use tracing::{debug, debug_span, error, info, info_span, instrument, warn, Instrument};
 
 use crate::channel::{NetCommand, NetEvent};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
+
+fn op_name(op: u8) -> &'static str {
+    match op {
+        OP_AUTH => "AUTH",
+        OP_LIST => "LIST",
+        OP_HEAD => "HEAD",
+        OP_GET_BLOB => "GET_BLOB",
+        OP_CHILDREN => "CHILDREN",
+        _ => "UNKNOWN",
+    }
+}
 
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
 /// `Default` impl — auth is mandatory in protocol v4 so every peer
@@ -318,15 +330,25 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 /// our capability so subsequent ops are authorised. Protocol v4 makes
 /// this mandatory — the server rejects any op until the connection
 /// completes auth.
+#[instrument(level = "info", skip(ep, self_cap), fields(peer = %peer.fmt_short()))]
 async fn connect_authed(
     ep: &iroh::Endpoint,
     peer: EndpointId,
     self_cap: &RawHash,
 ) -> anyhow::Result<iroh::endpoint::Connection> {
+    debug!(alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN), "connecting");
     let conn = ep.connect(peer, PILE_SYNC_ALPN).await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+        .map_err(|e| {
+            warn!(error = %e, "connect failed");
+            anyhow::anyhow!("connect: {e}")
+        })?;
+    debug!(self_cap = %hex::encode(&self_cap[..4]), "connected; sending OP_AUTH");
     op_auth(&conn, self_cap).await
-        .map_err(|e| anyhow::anyhow!("auth: {e}"))?;
+        .map_err(|e| {
+            warn!(error = %e, "auth handshake failed");
+            anyhow::anyhow!("auth: {e}")
+        })?;
+    info!("auth ok");
     Ok(conn)
 }
 
@@ -348,7 +370,7 @@ async fn host_loop(
 
     let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
         Ok(ep) => ep,
-        Err(e) => { eprintln!("[net] bind failed: {e}"); return; }
+        Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
     };
     ep.online().await;
 
@@ -434,16 +456,20 @@ async fn host_loop(
                                     msg.delivered_from.into()
                                 };
                                 tokio::spawn(async move {
-                                    eprintln!("[net] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
+                                    debug!(
+                                        head = %hex::encode(&head[..4]),
+                                        publisher = %hex::encode(&publisher[..4]),
+                                        "gossip head update; fetching"
+                                    );
                                     track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2).await;
                                 });
                             }
                         }
                         iroh_gossip::api::Event::NeighborUp(peer) => {
-                            eprintln!("[net] gossip neighbor up: {}", peer.fmt_short());
+                            info!(peer = %peer.fmt_short(), "gossip neighbor up");
                         }
                         iroh_gossip::api::Event::NeighborDown(peer) => {
-                            eprintln!("[net] gossip neighbor down: {}", peer.fmt_short());
+                            info!(peer = %peer.fmt_short(), "gossip neighbor down");
                         }
                         _ => {}
                     }
@@ -490,12 +516,12 @@ async fn host_loop(
                         // free; explicit track has to ask).
                         let conn = match connect_authed(&ep, peer, &self_cap).await {
                             Ok(c) => c,
-                            Err(e) => { eprintln!("[net] connect: {e}"); return; }
+                            Err(e) => { warn!(error = %e, peer = %peer.fmt_short(), "track: connect failed"); return; }
                         };
                         let head = match op_head(&conn, &branch).await {
                             Ok(Some(h)) => h,
-                            Ok(None) => { eprintln!("[net] no head"); return; }
-                            Err(e) => { eprintln!("[net] head: {e}"); return; }
+                            Ok(None) => { debug!(branch = %hex::encode(&branch[..4]), "track: remote has no head"); return; }
+                            Err(e) => { warn!(error = %e, "track: op_head failed"); return; }
                         };
                         conn.close(0u32.into(), b"ok");
                         // For explicit track, the publisher is the peer
@@ -577,7 +603,7 @@ async fn fetch_blob(
                         if verify(&data) {
                             return Ok(Some(data));
                         }
-                        eprintln!("[net] hash mismatch from DHT provider {}", provider.fmt_short());
+                        warn!(provider = %provider.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from DHT provider");
                     }
                 }
             }
@@ -591,7 +617,7 @@ async fn fetch_blob(
             if verify(&data) {
                 return Ok(Some(data));
             }
-            eprintln!("[net] hash mismatch from hint peer {}", hint_peer.fmt_short());
+            warn!(peer = %hint_peer.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from hint peer");
         }
     }
 
@@ -659,7 +685,7 @@ async fn track_known_head(
     self_cap: &RawHash,
 ) {
     if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap).await {
-        eprintln!("[net] fetch error: {e}");
+        warn!(error = %e, peer = %fetch_peer.fmt_short(), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
     }
@@ -695,45 +721,66 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
         let team_root = self.team_root;
         let revoked = self.revoked.clone();
 
-        // Extract the connecting peer's verified ed25519 identity from
-        // iroh's TLS handshake.
         let peer_endpoint = connection.remote_id();
-        let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(
-            peer_endpoint.as_bytes(),
-        ) {
-            Ok(k) => k,
-            Err(_) => return Ok(()),
-        };
+        let span = info_span!(
+            "connection",
+            peer = %peer_endpoint.fmt_short(),
+            alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN),
+        );
 
-        // Per-connection auth state. Set by the first `OP_AUTH` stream;
-        // read by every subsequent stream to gate access.
-        let auth_state: Arc<tokio::sync::RwLock<
-            Option<triblespace_core::repo::capability::VerifiedCapability>,
-        >> = Arc::new(tokio::sync::RwLock::new(None));
+        async move {
+            info!("connection accepted");
 
-        loop {
-            let (mut send, mut recv) = match connection.accept_bi().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            let snap = snap.clone();
-            let auth_state = auth_state.clone();
-            let revoked = revoked.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_stream(
-                    &snap,
-                    team_root,
-                    peer_pubkey,
-                    auth_state,
-                    revoked,
-                    &mut send,
-                    &mut recv,
-                ).await {
-                    eprintln!("handler error: {e}");
+            // Extract the connecting peer's verified ed25519 identity
+            // from iroh's TLS handshake.
+            let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(
+                peer_endpoint.as_bytes(),
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!(error = %e, "peer pubkey parse failed; closing");
+                    return;
                 }
-                let _ = send.finish();
-            });
+            };
+
+            // Per-connection auth state. Set by the first `OP_AUTH`
+            // stream; read by every subsequent stream to gate access.
+            let auth_state: Arc<tokio::sync::RwLock<
+                Option<triblespace_core::repo::capability::VerifiedCapability>,
+            >> = Arc::new(tokio::sync::RwLock::new(None));
+
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        debug!(error = %e, "accept_bi ended; connection closing");
+                        break;
+                    }
+                };
+                let snap = snap.clone();
+                let auth_state = auth_state.clone();
+                let revoked = revoked.clone();
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = serve_stream(
+                            &snap,
+                            team_root,
+                            peer_pubkey,
+                            auth_state,
+                            revoked,
+                            &mut send,
+                            &mut recv,
+                        ).await {
+                            error!(error = %e, "stream handler error");
+                        }
+                        let _ = send.finish();
+                    }
+                    .in_current_span(),
+                );
+            }
         }
+        .instrument(span)
+        .await;
         Ok(())
     }
 }
@@ -755,9 +802,12 @@ async fn serve_stream(
     use triblespace_core::value::Value;
 
     let op = recv_u8(recv).await?;
+    let span = debug_span!("stream", op = op_name(op));
+    let _enter = span.enter();
 
     if op == OP_AUTH {
         let cap_handle_raw = recv_hash(recv).await?;
+        debug!(cap_handle = %hex::encode(&cap_handle_raw[..4]), "auth: cap handle received");
         let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
             Value::new(cap_handle_raw);
 
@@ -782,10 +832,17 @@ async fn serve_stream(
 
         match result {
             Ok(verified) => {
+                let granted = verified
+                    .granted_branches()
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let unrestricted = verified.granted_branches().is_none();
+                info!(branches = granted, unrestricted = unrestricted, "auth ok");
                 *auth_state.write().await = Some(verified);
                 send_u8(send, AUTH_OK).await?;
             }
-            Err(_) => {
+            Err(e) => {
+                warn!(error = ?e, "auth rejected");
                 send_u8(send, AUTH_REJECTED).await?;
             }
         }
@@ -800,6 +857,7 @@ async fn serve_stream(
         None => {
             // Not authenticated. Close the stream silently — the client
             // should have presented OP_AUTH first.
+            debug!("op without prior OP_AUTH on connection; closing stream");
             return Ok(());
         }
     };
@@ -822,6 +880,8 @@ async fn serve_stream(
             let branches = snap_arc.lock().unwrap().as_ref()
                 .map(|s| s.list_branches().to_vec())
                 .unwrap_or_default();
+            let total = branches.len();
+            let mut visible = 0usize;
             for (id_bytes, head) in &branches {
                 let Some(id) = triblespace_core::id::Id::new(*id_bytes) else {
                     // Skip malformed branch ids (the all-zeros sentinel
@@ -832,10 +892,12 @@ async fn serve_stream(
                 if !verified.grants_read_on(&id) {
                     continue;
                 }
+                visible += 1;
                 send_branch_id(send, id_bytes).await?;
                 send_hash(send, head).await?;
             }
             send_branch_id(send, &NIL_BRANCH_ID).await?;
+            debug!(total = total, visible = visible, "OP_LIST served");
         }
 
         OP_HEAD => {
@@ -849,31 +911,49 @@ async fn serve_stream(
             } else {
                 NIL_HASH
             };
+            if !allowed {
+                warn!(branch = %hex::encode(&id_bytes[..4]), "OP_HEAD denied: branch out of scope");
+            } else {
+                debug!(branch = %hex::encode(&id_bytes[..4]), found = (hash != NIL_HASH), "OP_HEAD served");
+            }
             send_hash(send, &hash).await?;
         }
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
+            let in_scope_flag;
             let data = {
                 let guard = snap_arc.lock().unwrap();
+                let scope_ok = guard.as_ref()
+                    .map(|snap| blob_in_scope(snap.as_ref(), &verified, &hash))
+                    .unwrap_or(false);
+                in_scope_flag = scope_ok;
                 guard.as_ref().and_then(|snap| {
-                    if !blob_in_scope(snap.as_ref(), &verified, &hash) {
-                        return None;
-                    }
+                    if !scope_ok { return None; }
                     snap.get_blob(&hash)
                 })
             };
             match data {
                 Some(data) => {
+                    debug!(hash = %hex::encode(&hash[..4]), bytes = data.len(), "OP_GET_BLOB served");
                     send_u64_be(send, data.len() as u64).await?;
                     send.write_all(&data).await.map_err(|e| anyhow::anyhow!("send: {e}"))?;
                 }
-                None => send_u64_be(send, u64::MAX).await?,
+                None => {
+                    if !in_scope_flag {
+                        warn!(hash = %hex::encode(&hash[..4]), "OP_GET_BLOB denied: out of scope");
+                    } else {
+                        debug!(hash = %hex::encode(&hash[..4]), "OP_GET_BLOB miss: blob not present");
+                    }
+                    send_u64_be(send, u64::MAX).await?;
+                }
             }
         }
 
         OP_CHILDREN => {
             let parent_hash = recv_hash(recv).await?;
+            let mut parent_in_scope = true;
+            let mut total_chunks = 0usize;
             let children: Vec<RawHash> = {
                 let guard = snap_arc.lock().unwrap();
                 match guard.as_ref() {
@@ -897,6 +977,7 @@ async fn serve_stream(
                             }
                         };
                         if !in_scope(&parent_hash) {
+                            parent_in_scope = false;
                             Vec::new()
                         } else {
                             match snap.get_blob(&parent_hash) {
@@ -905,6 +986,7 @@ async fn serve_stream(
                                     let mut result = Vec::new();
                                     for chunk in parent_data.chunks(32) {
                                         if chunk.len() == 32 {
+                                            total_chunks += 1;
                                             let mut candidate = [0u8; 32];
                                             candidate.copy_from_slice(chunk);
                                             if in_scope(&candidate) {
@@ -919,6 +1001,16 @@ async fn serve_stream(
                     }
                 }
             };
+            if !parent_in_scope {
+                warn!(parent = %hex::encode(&parent_hash[..4]), "OP_CHILDREN denied: parent out of scope");
+            } else {
+                debug!(
+                    parent = %hex::encode(&parent_hash[..4]),
+                    candidates = total_chunks,
+                    in_scope = children.len(),
+                    "OP_CHILDREN served"
+                );
+            }
             for hash in &children {
                 send_hash(send, hash).await?;
             }
