@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::fs;
 use anyhow::{Result, anyhow};
+use tracing::info;
 use ed25519_dalek::SigningKey;
 use iroh_base::SecretKey;
 
@@ -37,7 +38,7 @@ pub fn load_or_create_key(
     let hex_str = hex::encode(key.to_bytes());
     fs::write(&key_path, &hex_str)
         .map_err(|e| anyhow!("write key to {}: {e}", key_path.display()))?;
-    eprintln!("generated new node key: {}", key_path.display());
+    info!(path = %key_path.display(), "generated new node key");
     Ok(key)
 }
 

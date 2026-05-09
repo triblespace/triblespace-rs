@@ -7,6 +7,8 @@
 //! The tracking branch has its own local ID. Repository can pull/merge
 //! it like any other branch.
 
+use tracing::debug;
+
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
@@ -232,9 +234,9 @@ where
     let current_ts = read_updated_at(store, &old_meta.raw);
     if let (Some(current), Some(new)) = (current_ts, new_ts) {
         if !is_newer(new, current) {
-            eprintln!(
-                "[tracking] skip stale update for branch {} (incoming ts ≤ current)",
-                hex::encode(&remote_branch_id.raw()[..4])
+            debug!(
+                branch = %hex::encode(&remote_branch_id.raw()[..4]),
+                "tracking: skip stale update (incoming ts ≤ current)"
             );
             return None;
         }

@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `warn` for protocol-level anomalies, `error` for
   thread-fatal failures). The `[net]` prefix is dropped — the
   subscriber handles formatting.
+- The two remaining stray `eprintln!`s in `identity.rs` (the
+  one-time "generated new node key" notice on first startup)
+  and `tracking.rs` (the stale-tracking-update skip
+  diagnostic) are also converted to `tracing` events
+  (`info` and `debug` respectively). `triblespace-net`'s
+  `src/` tree no longer contains any `eprintln!`s — every
+  diagnostic surface now flows through the subscriber.
 
 ## [0.38.0] - 2026-05-07
 
