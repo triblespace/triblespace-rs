@@ -658,7 +658,8 @@ fn parse_decimal(s: &str) -> Option<Ratio<i128>> {
 // missing — RDF data uses all three).
 
 /// Eat `[-]YYYY` from the front of `s`, returning the signed year and
-/// the remainder.
+/// the remainder. (Year-range overflow handled by hifitime's checked
+/// constructor in `epoch_from_gregorian_with_offset`.)
 fn parse_year(mut s: &str) -> Option<(i32, &str)> {
     let neg = if let Some(rest) = s.strip_prefix('-') {
         s = rest;
