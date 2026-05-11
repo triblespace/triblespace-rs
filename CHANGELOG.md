@@ -28,6 +28,15 @@ the attribute's identity now come from a single source of truth.
 - **`ImportAttribute::<S>::from_handle(handle, name)`** updated the
   same way so the RDF/JSON/HTTP importers' attribute ids stay
   consistent with `Attribute::<S>::from_name`'s.
+- **`AttributeUsage::usage_id(attribute_id)`** rewritten the same
+  way. Identity-determining facts are now
+  `metadata::attribute: <attr id>` and (when set)
+  `metadata::source_module: <module-path LongString handle>`. The
+  old `b"triblespace.attribute_usage"` domain-prefix hash is gone;
+  the `USAGE_DOMAIN` constant was removed. Module-path bytes are
+  hashed via the canonical LongString-blob handle so `usage_id` and
+  `describe()`'s emitted `metadata::source_module` fact agree on
+  the handle value byte-for-byte.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"
@@ -50,9 +59,10 @@ the attribute's identity now come from a single source of truth.
   `entity!` so the asymmetry becomes a query distinction (which
   attribute facts describe the URI's role) rather than a hash-
   formula distinction.
-- `AttributeUsage::usage_id` is the remaining bespoke derivation;
-  it'll get the same treatment in a follow-up commit (needs the
-  module-path-handle dance to match `describe()`'s emission).
+- Every dynamic-id-deriving path in core now goes through one
+  mechanism. `blake3::Hasher` is no longer imported anywhere in
+  `attribute.rs` / `import/import_attribute.rs` (the macro handles
+  hashing internally).
 
 ## [0.38.0] - 2026-05-07
 

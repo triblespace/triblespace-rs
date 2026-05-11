@@ -1,7 +1,6 @@
 use core::marker::PhantomData;
 
 use anybytes::View;
-use blake3::Hasher;
 
 use crate::blob::schemas::longstring::LongString;
 use crate::id::{ExclusiveId, Id, RawId};

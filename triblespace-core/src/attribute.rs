@@ -16,7 +16,6 @@ use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ValueSchema;
-use blake3::Hasher;
 use core::marker::PhantomData;
 
 /// Describes a concrete usage of an attribute in source code.
@@ -46,7 +45,6 @@ pub struct AttributeUsageSource {
 impl AttributeUsageSource {}
 
 impl AttributeUsage {
-    const USAGE_DOMAIN: &'static [u8] = b"triblespace.attribute_usage";
     /// Construct a minimal usage entry with a name.
     pub const fn named(name: &'static str) -> Self {
         Self {
@@ -69,17 +67,34 @@ impl AttributeUsage {
     }
 
     fn usage_id(&self, attribute_id: crate::id::Id) -> crate::id::Id {
-        let mut hasher = Hasher::new();
-        hasher.update(Self::USAGE_DOMAIN);
-        hasher.update(attribute_id.as_ref());
-        if let Some(source) = self.source {
-            hasher.update(source.module_path.as_bytes());
-        }
-        let digest = hasher.finalize();
-        let mut raw = [0u8; crate::id::ID_LEN];
-        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
-        raw.copy_from_slice(lower_half);
-        crate::id::Id::new(raw).expect("usage id must be non-nil")
+        // Identity-determining facts: the attribute this usage
+        // describes, and (optionally) which source module the usage
+        // lives in. Module-path bytes are content-addressed via the
+        // same LongString-blob hash describe() emits as
+        // `metadata::source_module`, so usage_id and describe()'s
+        // emitted fact agree on the handle value byte-for-byte.
+        //
+        // describe() then attaches annotation facts (name,
+        // description, the redundant attribute link, tag) under
+        // this id via explicit `&id @ ...` entity!-form, which
+        // doesn't re-derive the id.
+        let fragment = match self.source {
+            Some(src) => {
+                let module_handle = String::from(src.module_path)
+                    .to_blob()
+                    .get_handle::<Blake3>();
+                entity! {
+                    metadata::attribute:     attribute_id,
+                    metadata::source_module: module_handle,
+                }
+            }
+            None => entity! {
+                metadata::attribute: attribute_id,
+            },
+        };
+        fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment")
     }
 
     fn describe<B>(
