@@ -51,7 +51,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert!(uri_count >= 2, "at least frank and dune carry rdf_uri");
 
     // The integer literal lands as I256BE under an Attribute::from_name(predicate).
-    let birthyear = Attribute::<valueschemas::I256BE>::from_name("http://example.org/birthyear");
+    let birthyear = Attribute::<valueschemas::I256BE>::from_iri("http://example.org/birthyear");
     let (year,) = find!(
         (year: i128),
         pattern!(&facts, [{ _?e @ birthyear: ?year }])
@@ -63,7 +63,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // The string literal lands as Handle<LongString>; we don't pull the blob
     // (the test would need a reader), we just verify the trible exists.
     let firstname_attr =
-        Attribute::<Handle<Blake3, LongString>>::from_name("http://example.org/firstname");
+        Attribute::<Handle<Blake3, LongString>>::from_iri("http://example.org/firstname");
     let firstname_count = find!(
         (h: Value<Handle<Blake3, LongString>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
@@ -72,7 +72,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(firstname_count, 1, "one firstname triple");
 
     // The URI-valued triple lands as a GenId pointing frank → dune.
-    let wrote = Attribute::<valueschemas::GenId>::from_name("http://example.org/wrote");
+    let wrote = Attribute::<valueschemas::GenId>::from_iri("http://example.org/wrote");
     let link_count = find!(
         (src: Id, dst: Id),
         pattern!(&facts, [{ ?src @ wrote: ?dst }])
@@ -102,7 +102,7 @@ fn uri_to_id_is_deterministic_across_workspaces() {
     let (facts_b, _) = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
     let frank_attr =
-        Attribute::<Handle<Blake3, LongString>>::from_name("http://example.org/firstname");
+        Attribute::<Handle<Blake3, LongString>>::from_iri("http://example.org/firstname");
     let (frank_a,) = find!(
         (e: Id),
         pattern!(&facts_a, [{ ?e @ frank_attr: _?v }])
@@ -136,7 +136,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 4);
 
-    let i_attr = Attribute::<valueschemas::I256BE>::from_name("http://ex/i");
+    let i_attr = Attribute::<valueschemas::I256BE>::from_iri("http://ex/i");
     let (i_val,) = find!(
         (v: i128),
         pattern!(&facts, [{ _?e @ i_attr: ?v }])
@@ -145,7 +145,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(i_val, 42);
 
-    let u_attr = Attribute::<valueschemas::U256BE>::from_name("http://ex/u");
+    let u_attr = Attribute::<valueschemas::U256BE>::from_iri("http://ex/u");
     let (u_val,) = find!(
         (v: u128),
         pattern!(&facts, [{ _?e @ u_attr: ?v }])
@@ -154,7 +154,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(u_val, 100);
 
-    let b_attr = Attribute::<valueschemas::Boolean>::from_name("http://ex/b");
+    let b_attr = Attribute::<valueschemas::Boolean>::from_iri("http://ex/b");
     let (b_val,) = find!(
         (v: bool),
         pattern!(&facts, [{ _?e @ b_attr: ?v }])
@@ -163,7 +163,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert!(b_val);
 
-    let f_attr = Attribute::<valueschemas::F64>::from_name("http://ex/f");
+    let f_attr = Attribute::<valueschemas::F64>::from_iri("http://ex/f");
     let (f_val,) = find!(
         (v: f64),
         pattern!(&facts, [{ _?e @ f_attr: ?v }])
@@ -196,7 +196,7 @@ fn xsd_temporal_and_binary_types() {
     assert_eq!(count, 8);
 
     // dateTime → NsTAIInterval [t, t]
-    let born = Attribute::<NsTAIInterval>::from_name("http://ex/born");
+    let born = Attribute::<NsTAIInterval>::from_iri("http://ex/born");
     let born_count = find!(
         (v: Value<NsTAIInterval>),
         pattern!(&facts, [{ _?e @ born: ?v }])
@@ -205,7 +205,7 @@ fn xsd_temporal_and_binary_types() {
     assert_eq!(born_count, 1, "dateTime stored as NsTAIInterval");
 
     // date → NsTAIInterval (one day)
-    let lived = Attribute::<NsTAIInterval>::from_name("http://ex/lived");
+    let lived = Attribute::<NsTAIInterval>::from_iri("http://ex/lived");
     assert_eq!(
         find!(
             (v: Value<NsTAIInterval>),
@@ -216,7 +216,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // gYear / gYearMonth → NsTAIInterval
-    let century = Attribute::<NsTAIInterval>::from_name("http://ex/century");
+    let century = Attribute::<NsTAIInterval>::from_iri("http://ex/century");
     assert_eq!(
         find!(
             (v: Value<NsTAIInterval>),
@@ -227,7 +227,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // duration → NsDuration
-    let lifespan = Attribute::<NsDuration>::from_name("http://ex/lifespan");
+    let lifespan = Attribute::<NsDuration>::from_iri("http://ex/lifespan");
     assert_eq!(
         find!(
             (v: Value<NsDuration>),
@@ -238,7 +238,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // hexBinary / base64Binary → Handle<Blake3, RawBytes>
-    let checksum = Attribute::<Handle<Blake3, RawBytes>>::from_name("http://ex/checksum");
+    let checksum = Attribute::<Handle<Blake3, RawBytes>>::from_iri("http://ex/checksum");
     assert_eq!(
         find!(
             (h: Value<Handle<Blake3, RawBytes>>),
@@ -247,7 +247,7 @@ fn xsd_temporal_and_binary_types() {
         .count(),
         1
     );
-    let avatar = Attribute::<Handle<Blake3, RawBytes>>::from_name("http://ex/avatar");
+    let avatar = Attribute::<Handle<Blake3, RawBytes>>::from_iri("http://ex/avatar");
     assert_eq!(
         find!(
             (h: Value<Handle<Blake3, RawBytes>>),
@@ -258,7 +258,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // anyURI → GenId via uri_to_id (same path as `<...>` objects).
-    let homepage = Attribute::<valueschemas::GenId>::from_name("http://ex/homepage");
+    let homepage = Attribute::<valueschemas::GenId>::from_iri("http://ex/homepage");
     assert_eq!(
         find!(
             (id: Id),
@@ -288,7 +288,7 @@ fn lang_tagged_literals_reify_into_entities() {
     assert_eq!(count, 3);
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
-    let label_attr = Attribute::<valueschemas::GenId>::from_name("http://ex/label");
+    let label_attr = Attribute::<valueschemas::GenId>::from_iri("http://ex/label");
 
     // Two distinct subjects, two label entities for them, but the
     // `(en, "human")` pair is shared, so we have exactly 2 distinct
@@ -351,7 +351,7 @@ _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
 
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
-    let age = Attribute::<valueschemas::I256BE>::from_name("http://ex/age");
+    let age = Attribute::<valueschemas::I256BE>::from_iri("http://ex/age");
     let subjects: std::collections::HashSet<_> = find!(
         (e: Id),
         pattern!(&facts, [{ ?e @ age: _?v }])
@@ -382,8 +382,8 @@ _:b1 <http://ex/q> "x" .
     let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 2);
 
-    let p = Attribute::<valueschemas::GenId>::from_name("http://ex/p");
-    let q = Attribute::<Handle<Blake3, LongString>>::from_name("http://ex/q");
+    let p = Attribute::<valueschemas::GenId>::from_iri("http://ex/p");
+    let q = Attribute::<Handle<Blake3, LongString>>::from_iri("http://ex/q");
 
     let (target,) = find!(
         (id: Id),
@@ -444,7 +444,7 @@ fn orphan_bnode_skolemizes_per_import() {
     let (facts_b, _) =
         ingest_ntriples(&mut ws_b, Cursor::new(&data[..])).expect("clean ntriples");
 
-    let p = Attribute::<valueschemas::GenId>::from_name("http://ex/p");
+    let p = Attribute::<valueschemas::GenId>::from_iri("http://ex/p");
     let (id_a,) = find!(
         (id: Id),
         pattern!(&facts_a, [{ _?s @ p: ?id }])

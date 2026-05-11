@@ -4,6 +4,8 @@
 pub mod array;
 /// Raw file bytes blob schema.
 pub mod filebytes;
+/// Internationalized Resource Identifier blob schema.
+pub mod iri;
 /// Arbitrary-length UTF-8 text blob schema.
 pub mod longstring;
 /// Opaque raw bytes blob schema (positive choice, distinct from UnknownBlob).

@@ -392,7 +392,7 @@ where
                 let text = self.parse_string(bytes)?;
                 let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
-                let handle = self
+                let handle: Value<Handle<Blake3, LongString>> = self
                     .store
                     .put(text)
                     .map_err(|err| JsonImportError::EncodeString {

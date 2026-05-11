@@ -213,23 +213,25 @@ impl<S: ValueSchema> Attribute<S> {
         self
     }
 
-    /// Derive an attribute id from a dynamic name and this schema's metadata.
+    /// Derive an attribute id from a dynamic *display name* and this
+    /// schema's metadata.
     ///
-    /// The attribute is modeled as the entity described by two facts —
-    /// `metadata::name: <name as LongString handle>` and
-    /// `metadata::value_schema: <S as ConstId>::ID` — and the id is
-    /// the entity's intrinsic id (sorted, deduped, Blake3 of the
-    /// (attr, value) pairs, lo16 bytes). This is the same canonical
-    /// content-addressing mechanism used everywhere else in the
-    /// system; the `describe()`-emitted metadata facts and the
-    /// attribute's identity come from a single source of truth.
+    /// Hashes from `metadata::name + metadata::value_schema`. Use this
+    /// when the *name* itself is the canonical identifier for this
+    /// origin — e.g. a JSON field name, a column header, a config
+    /// key. The name doubles as display and identity in those
+    /// origins.
     ///
-    /// Note: this derivation changed in the 0.39 cycle. Pre-0.39
-    /// piles that contain attribute ids derived from URIs via
-    /// `Attribute::<S>::from_name(...)` (RDF/JSON imports) must be
-    /// re-ingested to pick up the new ids. Attributes declared with
-    /// explicit hex constants via the `attributes!` macro are
-    /// unaffected.
+    /// For origins where identity is *not* a display name — RDF
+    /// (where the IRI is canonical), WASM (where the export symbol
+    /// is canonical), etc. — use the origin-specific constructor
+    /// instead:
+    ///
+    /// - [`Attribute::from_iri`] — RDF predicates / IRIs.
+    ///
+    /// The idiomatic path remains explicit hex via the `attributes!`
+    /// macro for any attribute whose id we want to pin (so local
+    /// renames don't churn the schema).
     pub fn from_name(name: &str) -> Self {
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
         let fragment = entity! {
@@ -243,6 +245,42 @@ impl<S: ValueSchema> Attribute<S> {
         Self {
             raw,
             handle: Some(field_handle),
+            usage: None,
+            _schema: PhantomData,
+        }
+    }
+
+    /// Derive an attribute id from an IRI and this schema's metadata.
+    ///
+    /// Hashes from `metadata::iri + metadata::value_schema`. The IRI
+    /// is wrapped as a `Handle<Blake3, IRI>` (typed distinctly from
+    /// the `Handle<Blake3, LongString>` `from_name` produces), so
+    /// even if a JSON field name happens to look like an IRI, the
+    /// attribute ids never collide — the (attr_id, value) pair that
+    /// feeds intrinsic-id derivation differs in the attr_id.
+    ///
+    /// Use this from the RDF / JSON-LD / SPARQL importers — anywhere
+    /// the predicate or property *is* an IRI by spec. Debug builds
+    /// validate the IRI predicate at construction; release builds
+    /// trust the caller.
+    pub fn from_iri(iri: &str) -> Self {
+        let iri_handle: crate::value::Value<
+            crate::value::schemas::hash::Handle<Blake3, crate::blob::schemas::iri::IRI>,
+        > = String::from(iri).to_blob().get_handle::<Blake3>();
+        let fragment = entity! {
+            metadata::iri:          iri_handle,
+            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+        };
+        let id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
+        let raw: RawId = id.into();
+        Self {
+            raw,
+            // We don't currently cache the IRI handle on Attribute —
+            // it's a different handle type from `handle: Option<...LongString...>`.
+            // describe() emits the IRI fact explicitly via metadata::iri.
+            handle: None,
             usage: None,
             _schema: PhantomData,
         }

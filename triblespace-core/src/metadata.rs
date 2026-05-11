@@ -3,6 +3,7 @@
 //! This namespace is used to bootstrap the meaning of other namespaces.
 //! It defines meta attributes that are used to describe other attributes.
 
+use crate::blob::schemas::iri::IRI;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::wasmcode::WasmCode;
 use crate::id::Id;
@@ -99,13 +100,29 @@ attributes! {
     /// The value is a `Handle<Blake3, WasmCode>` that points to a sandboxed
     /// formatter module (see `triblespace_core::value_formatter`).
     "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: valueschemas::Handle<hash::Blake3, WasmCode>;
-    /// Long-form name stored as a LongString handle.
+    /// Long-form display name stored as a LongString handle.
     ///
-    /// Names are contextual: multiple usages of the same attribute may carry
-    /// different names depending on the codebase or domain. Use attribute
-    /// usage entities (tagged with KIND_ATTRIBUTE_USAGE) when you need to
-    /// capture multiple names for the same attribute id.
+    /// Names are *display*-oriented and contextual: multiple usages of the
+    /// same attribute may carry different names depending on the codebase
+    /// or domain. Use attribute usage entities (tagged with
+    /// `KIND_ATTRIBUTE_USAGE`) when you need to capture multiple names for
+    /// the same attribute id.
+    ///
+    /// For *identity*-determining strings (an IRI for RDF, an export
+    /// symbol for WASM, …), use a dedicated attribute like
+    /// [`iri`](`self::iri`) instead. The id-derivation paths for dynamic
+    /// attributes hash from those identity-determining attributes, not
+    /// from `name`.
     "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Internationalized Resource Identifier (IRI) for this entity.
+    ///
+    /// The canonical identity-determining string for RDF predicate URIs and
+    /// RDF entity URIs. Distinct from [`name`] (display) so an IRI-derived
+    /// attribute and a same-bytes JSON-field-derived attribute never
+    /// collide: the (attr_id, value) pair that participates in
+    /// entity-intrinsic-id derivation differs in the attr_id, even when the
+    /// raw value bytes are identical.
+    "325F05DB88184B4540AAEEFAE1E9667F" as iri: valueschemas::Handle<hash::Blake3, IRI>;
     /// Link a usage annotation entity to the attribute it describes.
     "F10DE6D8E60E0E86013F1B867173A85C" as attribute: valueschemas::GenId;
     /// Optional provenance string for a usage annotation.

@@ -1048,7 +1048,7 @@ where
             let Some(target_label) = take_bnode(bytes) else {
                 return false;
             };
-            let attr_id = Attribute::<valueschemas::GenId>::from_name(predicate.as_ref()).id();
+            let attr_id = Attribute::<valueschemas::GenId>::from_iri(predicate.as_ref()).id();
             match (iri_subject_anchor, subject_label) {
                 (Some(s_id), None) => {
                     bnodes.push_incoming(IncomingFact {
@@ -1145,7 +1145,7 @@ fn emit_object_iri<Blobs>(
             );
         }
         (None, Some(s_label)) => {
-            let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+            let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
             let obj_id = uri_to_id(ws, obj_uri.as_ref());
             let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri);
             *facts += entity! { crate::import::rdf_uri: obj_h };
@@ -1178,7 +1178,7 @@ where
 {
     match suffix {
         LiteralSuffix::None => {
-            let attr = Attribute::<Handle<Blake3, LongString>>::from_name(predicate);
+            let attr = Attribute::<Handle<Blake3, LongString>>::from_iri(predicate);
             let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
             Some(OutgoingFact::Resolved {
                 attr_id: attr.id(),
@@ -1216,7 +1216,7 @@ where
                 .root()
                 .expect("intrinsic id from rdf_lang+rdf_text");
             *facts += label_fragment;
-            let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+            let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
             let g: Value<GenId> = label_id.to_value();
             Some(OutgoingFact::Resolved {
                 attr_id: attr.id(),
@@ -1235,7 +1235,7 @@ fn emit_uri_object<Blobs>(
 ) where
     Blobs: BlobStore<Blake3>,
 {
-    let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+    let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
     let obj_id = uri_to_id(ws, obj_uri);
     let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri.to_owned());
     *facts += entity! { crate::import::rdf_uri: obj_h };
@@ -1252,7 +1252,7 @@ fn emit_text_literal<Blobs>(
 ) where
     Blobs: BlobStore<Blake3>,
 {
-    let attr = Attribute::<Handle<Blake3, LongString>>::from_name(predicate);
+    let attr = Attribute::<Handle<Blake3, LongString>>::from_iri(predicate);
     let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
     facts.insert(&Trible::new(e, &attr.id(), &handle));
 }
@@ -1272,7 +1272,7 @@ fn emit_typed_literal<Blobs>(
             "integer" | "int" | "long" | "short" | "byte" | "negativeInteger"
             | "nonPositiveInteger" => {
                 if let Ok(val) = text.parse::<i128>() {
-                    let attr = Attribute::<valueschemas::I256BE>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::I256BE>::from_iri(predicate);
                     let v: Value<valueschemas::I256BE> = val.to_value();
                     facts.insert(&Trible::new(e, &attr.id(), &v));
                     return;
@@ -1281,7 +1281,7 @@ fn emit_typed_literal<Blobs>(
             "nonNegativeInteger" | "positiveInteger" | "unsignedInt" | "unsignedLong"
             | "unsignedShort" | "unsignedByte" => {
                 if let Ok(val) = text.parse::<u128>() {
-                    let attr = Attribute::<valueschemas::U256BE>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::U256BE>::from_iri(predicate);
                     let v: Value<valueschemas::U256BE> = val.to_value();
                     facts.insert(&Trible::new(e, &attr.id(), &v));
                     return;
@@ -1289,7 +1289,7 @@ fn emit_typed_literal<Blobs>(
             }
             "decimal" => {
                 if let Some(val) = parse_decimal(text.as_ref()) {
-                    let attr = Attribute::<valueschemas::R256BE>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::R256BE>::from_iri(predicate);
                     let v: Value<valueschemas::R256BE> = val.to_value();
                     facts.insert(&Trible::new(e, &attr.id(), &v));
                     return;
@@ -1297,19 +1297,19 @@ fn emit_typed_literal<Blobs>(
             }
             "float" | "double" => {
                 if let Ok(val) = text.parse::<f64>() {
-                    let attr = Attribute::<valueschemas::F64>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::F64>::from_iri(predicate);
                     facts.insert(&Trible::new(e, &attr.id(), &val.to_value()));
                     return;
                 }
             }
             "boolean" => match text.as_ref() {
                 "true" | "1" => {
-                    let attr = Attribute::<valueschemas::Boolean>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::Boolean>::from_iri(predicate);
                     facts.insert(&Trible::new(e, &attr.id(), &true.to_value()));
                     return;
                 }
                 "false" | "0" => {
-                    let attr = Attribute::<valueschemas::Boolean>::from_name(predicate);
+                    let attr = Attribute::<valueschemas::Boolean>::from_iri(predicate);
                     facts.insert(&Trible::new(e, &attr.id(), &false.to_value()));
                     return;
                 }
@@ -1341,7 +1341,7 @@ fn emit_typed_literal<Blobs>(
             }
             "duration" | "dayTimeDuration" => {
                 if let Some(ns) = parse_xsd_duration(text.as_ref()) {
-                    let attr = Attribute::<NsDuration>::from_name(predicate);
+                    let attr = Attribute::<NsDuration>::from_iri(predicate);
                     let v: Value<NsDuration> = ns.to_value();
                     facts.insert(&Trible::new(e, &attr.id(), &v));
                     return;
@@ -1349,7 +1349,7 @@ fn emit_typed_literal<Blobs>(
             }
             "hexBinary" => {
                 if let Ok(bytes) = hex::decode(text.as_ref()) {
-                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_name(predicate);
+                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_iri(predicate);
                     let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
                     facts.insert(&Trible::new(e, &attr.id(), &handle));
                     return;
@@ -1357,7 +1357,7 @@ fn emit_typed_literal<Blobs>(
             }
             "base64Binary" => {
                 if let Ok(bytes) = BASE64.decode(text.as_ref()) {
-                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_name(predicate);
+                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_iri(predicate);
                     let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
                     facts.insert(&Trible::new(e, &attr.id(), &handle));
                     return;
@@ -1379,7 +1379,7 @@ fn emit_typed_literal<Blobs>(
 
 /// Helper to emit an `[lo, hi]` interval trible.
 fn emit_interval(facts: &mut TribleSet, e: &ExclusiveId, predicate: &str, lo: i128, hi: i128) {
-    let attr = Attribute::<NsTAIInterval>::from_name(predicate);
+    let attr = Attribute::<NsTAIInterval>::from_iri(predicate);
     let mut raw = [0u8; 32];
     raw[0..16].copy_from_slice(&i128_to_ordered_be(lo));
     raw[16..32].copy_from_slice(&i128_to_ordered_be(hi));
@@ -1412,7 +1412,7 @@ fn emit_lang_literal<Blobs>(
         .root()
         .expect("intrinsic id from rdf_lang+rdf_text");
     *facts += label_fragment;
-    let attr = Attribute::<valueschemas::GenId>::from_name(predicate);
+    let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
     facts.insert(&Trible::new(e, &attr.id(), &label_id.to_value()));
 }
 

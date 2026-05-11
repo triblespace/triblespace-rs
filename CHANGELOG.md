@@ -7,13 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.39.0] - 2026-05-11
 
-The canonical-attribute-id release. Dynamic-name attribute id
-derivation now goes through the same mechanism every other entity
-in the system uses (`entity!{...}.root()`) rather than a bespoke
-flat-Blake3. The attribute IS the entity described by its
-`metadata::name` and `metadata::value_schema` facts, and its id is
-that entity's intrinsic id. The metadata `describe()` output and
-the attribute's identity now come from a single source of truth.
+The canonical-attribute-id + origin-typed-identity release. Two
+related cleanups:
+
+1. **Dynamic-name attribute id derivation** now goes through the
+   same `entity!{...}.root()` mechanism every other entity uses,
+   rather than bespoke flat-Blake3 hashing. The metadata
+   `describe()` output and the attribute's identity come from a
+   single source of truth.
+2. **Each origin gets its own identity-determining attribute.** RDF
+   predicates derive from `metadata::iri` (IRI is the canonical
+   identifier); JSON fields and similar display-name-as-identity
+   origins keep `metadata::name`. Collision is avoided structurally
+   — an IRI-derived attribute and a same-bytes JSON-field-derived
+   attribute differ in the (attr_id, value) pair feeding the
+   intrinsic-id hash.
+
+### Added
+- **`blob::schemas::iri::IRI` BlobSchema** for Internationalized
+  Resource Identifiers. Byte layout matches `LongString` but the
+  distinct schema lets handles carry their IRI-ness at the type
+  level, enables boundary validation (`iri::looks_like_iri` —
+  permissive RFC 3987 subset; debug-asserted at `ToBlob`), and makes
+  IRI-derived attribute ids distinct from same-bytes
+  LongString-derived ones. Re-exported as `prelude::blobschemas::IRI`.
+- **`metadata::iri: Handle<Blake3, IRI>`** attribute. The canonical
+  identity-determining attribute for RDF-imported entities.
+  Distinct from `metadata::name` (which stays display-only).
+- **`Attribute::<S>::from_iri(iri)`** constructor. Derives the
+  attribute id via `entity!{ metadata::iri: <handle>,
+  metadata::value_schema: <S>::ID }.root()`. Use this anywhere a
+  predicate URI is the canonical identifier (RDF, JSON-LD, SPARQL).
 
 ### Changed (breaking)
 - **`Attribute::<S>::from_name(name)`** now derives its id via
@@ -21,13 +45,14 @@ the attribute's identity now come from a single source of truth.
   <S>::ID }.root()` — canonical, sorted+deduped+Blake3-hashed (attr,
   value) pairs, lo16 bytes. The old derivation was
   `Blake3(name_handle.raw || S::ID.raw)[lo16]`, which approximated
-  the same semantics but skipped the sort/dedupe step that makes the
-  canonical derivation invariant to fact order. Net effect: every
-  attribute id derived from a name (instead of a hex constant) gets
-  a new value.
-- **`ImportAttribute::<S>::from_handle(handle, name)`** updated the
-  same way so the RDF/JSON/HTTP importers' attribute ids stay
-  consistent with `Attribute::<S>::from_name`'s.
+  the same semantics but skipped the sort/dedupe step. The docs are
+  also re-scoped: `from_name` is now the constructor for *origins
+  where the display name IS the canonical identifier* (JSON fields,
+  column headers, config keys). For RDF use `from_iri` instead.
+- **`ImportAttribute::<S>::from_handle(handle, name)`** updated to
+  use `metadata::name + metadata::value_schema` via `entity!`. This
+  is the JSON-importer path; it stays byte-identical to
+  `Attribute::<S>::from_name` for the same inputs.
 - **`AttributeUsage::usage_id(attribute_id)`** rewritten the same
   way. Identity-determining facts are now
   `metadata::attribute: <attr id>` and (when set)
@@ -37,6 +62,10 @@ the attribute's identity now come from a single source of truth.
   hashed via the canonical LongString-blob handle so `usage_id` and
   `describe()`'s emitted `metadata::source_module` fact agree on
   the handle value byte-for-byte.
+- **`import::ntriples`** now uses `Attribute::from_iri` for all
+  predicate URI imports (was `from_name`). Net effect: RDF-imported
+  attribute ids change to new values that ALSO differ from JSON
+  field name-derived ids on the same byte content.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"
