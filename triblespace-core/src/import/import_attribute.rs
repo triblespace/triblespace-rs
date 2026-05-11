@@ -45,16 +45,24 @@ impl<S: ValueSchema> ImportAttribute<S> {
     }
 
     /// Construct an import attribute from a name handle and the original name bytes.
+    ///
+    /// The id is derived via the canonical entity-intrinsic-id
+    /// mechanism — the attribute IS the entity described by
+    /// `metadata::name: <handle>` and
+    /// `metadata::value_schema: <S>::ID`. This keeps
+    /// `ImportAttribute::from_handle` byte-identical to
+    /// [`crate::attribute::Attribute::from_name`] for the same
+    /// `(name, S)` inputs, which the cross-engine importers and
+    /// test helpers rely on.
     pub fn from_handle(handle: Value<Handle<Blake3, LongString>>, name: View<str>) -> Self {
-        let mut hasher = Hasher::new();
-        hasher.update(&handle.raw);
-        hasher.update(&<S as crate::metadata::ConstId>::ID.raw());
-
-        let digest = hasher.finalize();
-        let mut raw = [0u8; crate::id::ID_LEN];
-        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
-        raw.copy_from_slice(lower_half);
-
+        let fragment = entity! {
+            metadata::name:         handle,
+            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+        };
+        let id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
+        let raw: RawId = id.into();
         Self::from_raw(raw, Some(name))
     }
 

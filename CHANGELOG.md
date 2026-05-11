@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-05-11
+
+The canonical-attribute-id release. Dynamic-name attribute id
+derivation now goes through the same mechanism every other entity
+in the system uses (`entity!{...}.root()`) rather than a bespoke
+flat-Blake3. The attribute IS the entity described by its
+`metadata::name` and `metadata::value_schema` facts, and its id is
+that entity's intrinsic id. The metadata `describe()` output and
+the attribute's identity now come from a single source of truth.
+
+### Changed (breaking)
+- **`Attribute::<S>::from_name(name)`** now derives its id via
+  `entity!{ metadata::name: <name handle>, metadata::value_schema:
+  <S>::ID }.root()` — canonical, sorted+deduped+Blake3-hashed (attr,
+  value) pairs, lo16 bytes. The old derivation was
+  `Blake3(name_handle.raw || S::ID.raw)[lo16]`, which approximated
+  the same semantics but skipped the sort/dedupe step that makes the
+  canonical derivation invariant to fact order. Net effect: every
+  attribute id derived from a name (instead of a hex constant) gets
+  a new value.
+- **`ImportAttribute::<S>::from_handle(handle, name)`** updated the
+  same way so the RDF/JSON/HTTP importers' attribute ids stay
+  consistent with `Attribute::<S>::from_name`'s.
+
+### Migration
+- **Attributes declared with explicit hex via `attributes! { "ID"
+  as name: schema; ... }`** are unaffected. Their ids are stable.
+- **Attributes derived from URIs/field-names** (the RDF and JSON
+  importers' default path; `wd_bench::loader::predicate_id` for
+  cookbook recipes) get new ids. Re-ingest the source data into a
+  fresh pile to pick them up. No automatic migration of existing
+  piles — we caught this design issue before the system has any
+  external users, so the cleanest move is to break and re-ingest.
+
+### Why this matters
+- One canonical content-addressing mechanism for entity ids. The
+  `describe()` metadata that documents an attribute now *is* the
+  attribute's identity — adding a new dimension (cardinality,
+  inverse-of, etc.) to the description automatically participates
+  in the id derivation, with no hand-rolled hash to update.
+- Sets up the eventual "URI position-asymmetry" cleanup: predicate
+  attributes and rdf-position entities will both go through
+  `entity!` so the asymmetry becomes a query distinction (which
+  attribute facts describe the URI's role) rather than a hash-
+  formula distinction.
+- `AttributeUsage::usage_id` is the remaining bespoke derivation;
+  it'll get the same treatment in a follow-up commit (needs the
+  module-path-handle dance to match `describe()`'s emission).
+
 ## [0.38.0] - 2026-05-07
 
 The team-rooted-gossip release. The gossip mesh id is now

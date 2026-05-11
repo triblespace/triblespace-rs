@@ -200,22 +200,31 @@ impl<S: ValueSchema> Attribute<S> {
 
     /// Derive an attribute id from a dynamic name and this schema's metadata.
     ///
-    /// The identifier is computed by hashing the field name handle produced as a
-    /// `Handle<Blake3, crate::blob::schemas::longstring::LongString>` together with the
-    /// schema's [`crate::metadata::ConstId::ID`].
-    /// The resulting 32-byte Blake3 digest uses its rightmost 16 bytes to match the
-    /// `RawId` layout used by [`Attribute::from_id`].
+    /// The attribute is modeled as the entity described by two facts —
+    /// `metadata::name: <name as LongString handle>` and
+    /// `metadata::value_schema: <S as ConstId>::ID` — and the id is
+    /// the entity's intrinsic id (sorted, deduped, Blake3 of the
+    /// (attr, value) pairs, lo16 bytes). This is the same canonical
+    /// content-addressing mechanism used everywhere else in the
+    /// system; the `describe()`-emitted metadata facts and the
+    /// attribute's identity come from a single source of truth.
+    ///
+    /// Note: this derivation changed in the 0.39 cycle. Pre-0.39
+    /// piles that contain attribute ids derived from URIs via
+    /// `Attribute::<S>::from_name(...)` (RDF/JSON imports) must be
+    /// re-ingested to pick up the new ids. Attributes declared with
+    /// explicit hex constants via the `attributes!` macro are
+    /// unaffected.
     pub fn from_name(name: &str) -> Self {
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
-        let mut hasher = Hasher::new();
-        hasher.update(&field_handle.raw);
-        hasher.update(&<S as crate::metadata::ConstId>::ID.raw());
-
-        let digest = hasher.finalize();
-        let mut raw = [0u8; crate::id::ID_LEN];
-        let lower_half = &digest.as_bytes()[digest.as_bytes().len() - crate::id::ID_LEN..];
-        raw.copy_from_slice(lower_half);
-
+        let fragment = entity! {
+            metadata::name:         field_handle,
+            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+        };
+        let id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
+        let raw: RawId = id.into();
         Self {
             raw,
             handle: Some(field_handle),
