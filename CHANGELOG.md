@@ -93,6 +93,27 @@ related cleanups:
   `attribute.rs` / `import/import_attribute.rs` (the macro handles
   hashing internally).
 
+### Path-query: bounded-depth closure estimation
+- **`estimate_from`'s closure-fallback no longer full-materialises**
+  the result set (`triblespace-core/src/query/regularpathconstraint.rs`).
+  When shallow estimation doesn't apply — i.e. the path body
+  contains an unbounded closure that can't be re-shaped through
+  the WCO `build_join` — the previous fallback ran
+  `eval_from(set, body, start).len()`, which paid the full cost
+  of computing the closure just to measure its size. The new
+  `bounded_eval_from` helper caps closure BFS at
+  `RPQ_ESTIMATE_DEPTH = 5` levels, matching Karalis et al.
+  ESWC 2024 §4.3's "default estimation" technique. Bounded depth
+  → bounded estimate cost, sufficient for driving the WCO
+  planner's variable ordering without paying for the materialisation
+  it was meant to inform. Non-closure expressions (Attr,
+  InverseAttr, Concat, Union) don't consume depth — the bound
+  only fires on Plus/Star iteration steps.
+- Shallow estimation (the constant-time per-attribute count from
+  the segmented index) was already in place; this commit just
+  closes the remaining gap where shallow doesn't apply. All 10
+  path proptests pass; 49 broader query proptests pass.
+
 ## [0.38.0] - 2026-05-07
 
 The team-rooted-gossip release. The gossip mesh id is now

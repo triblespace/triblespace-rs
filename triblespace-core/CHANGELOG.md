@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] - 2026-05-11
+
+The canonical-attribute-id + bounded-path-estimation release.
+See the workspace [`../CHANGELOG.md`](../CHANGELOG.md) for the
+full release notes on dynamic-name attribute id derivation,
+the IRI BlobSchema, `metadata::iri`, `Attribute::from_iri`, the
+`MemoryBlobStore::union` structural merge, and the `Workspace`
+`local_blobs → staged` rename.
+
+### Path-query: bounded-depth closure estimation
+- **`estimate_from`'s closure-fallback no longer full-materialises**
+  the result set
+  (`triblespace-core/src/query/regularpathconstraint.rs`). The
+  previous fallback ran `eval_from(set, body, start).len()` —
+  paying the full cost of computing the closure just to measure
+  its size. The new `bounded_eval_from` helper caps closure BFS
+  at `RPQ_ESTIMATE_DEPTH = 5` levels, matching Karalis et al.
+  ESWC 2024 §4.3's "default estimation": bounded depth →
+  bounded estimate cost, sufficient for variable ordering.
+  Non-closure expressions don't consume depth; the bound only
+  fires on Plus/Star iteration steps. Nested closures multiply
+  (`Plus(Plus(q))` runs the inner Plus to depth 5 for each of
+  the outer's 5 steps — `O(depth^k)` for closure-nesting
+  depth `k`), which the doc comment flags. Shallow estimation
+  (the constant-time per-attribute count from the segmented
+  index) was already in place; this commit closes the remaining
+  gap where shallow doesn't apply.
+
 ## [0.38.0] - 2026-05-07
 
 Lock-step bump alongside the team-rooted-gossip release in

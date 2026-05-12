@@ -408,6 +408,84 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
     }
 }
 
+/// Default depth bound for closure-cardinality estimation when shallow
+/// estimation doesn't apply (per Karalis et al. ESWC 2024 §4.3 default
+/// estimation). Five closure iterations is enough to distinguish dense
+/// from sparse expansion for variable-ordering purposes without paying
+/// the cost of full materialisation.
+const RPQ_ESTIMATE_DEPTH: usize = 5;
+
+/// Like `eval_from` but caps closure (Plus/Star) iterations at
+/// `depth` levels. Used for cardinality estimation only — the result
+/// is a lower bound on the true closure reachability, sufficient for
+/// driving the WCO planner's variable ordering. Non-closure
+/// expressions (Attr/InverseAttr/Concat/Union) don't consume depth.
+///
+/// Nested closures multiply: `Plus(Plus(q))` will run the inner Plus
+/// to `depth` steps for each of the outer Plus's `depth` steps, so
+/// total work is `O(depth^k)` for closure-nesting depth `k`. In
+/// practice path expressions rarely nest beyond one closure.
+fn bounded_eval_from(
+    set: &TribleSet,
+    expr: &PathExpr,
+    start: &RawId,
+    depth: usize,
+) -> HashSet<RawId> {
+    match expr {
+        PathExpr::Attr(attr) => eval_attr(set, attr, start),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
+        PathExpr::Concat(lhs, rhs) => {
+            let mut results = HashSet::new();
+            for mid in bounded_eval_from(set, lhs, start, depth) {
+                results.extend(bounded_eval_from(set, rhs, &mid, depth));
+            }
+            results
+        }
+        PathExpr::Union(lhs, rhs) => {
+            let mut results = bounded_eval_from(set, lhs, start, depth);
+            results.extend(bounded_eval_from(set, rhs, start, depth));
+            results
+        }
+        PathExpr::Plus(body) => {
+            let mut results: HashSet<RawId> = HashSet::new();
+            let mut visited: HashSet<RawId> = HashSet::new();
+            let mut frontier: Vec<RawId> = vec![*start];
+            visited.insert(*start);
+            for _ in 0..depth {
+                let mut next: Vec<RawId> = Vec::new();
+                for node in &frontier {
+                    for dest in bounded_eval_from(set, body, node, depth) {
+                        results.insert(dest);
+                        if visited.insert(dest) {
+                            next.push(dest);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+            results
+        }
+        PathExpr::Star(body) => {
+            let mut results = bounded_eval_from(
+                set,
+                &PathExpr::Plus(body.clone()),
+                start,
+                depth,
+            );
+            results.insert(*start);
+            results
+        }
+        PathExpr::Optional(body) => {
+            let mut results = bounded_eval_from(set, body, start, depth);
+            results.insert(*start);
+            results
+        }
+    }
+}
+
 /// Shallow estimate: build the one-step constraint and ask it for the
 /// destination variable's cardinality with the start bound.
 fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
@@ -437,9 +515,17 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         }
         // Concat with a Plus/Star sub-tree can't go through
         // build_join (the per-mid fallback in eval_from is what
-        // makes it work). For an estimate, fall back to actually
-        // computing the result set size.
-        _ if has_unbounded_closure(body) => eval_from(set, body, start).len(),
+        // makes it work). Karalis et al. ESWC 2024 §4.3: when
+        // shallow estimation doesn't apply, evaluate the closure
+        // up to `RPQ_ESTIMATE_DEPTH` and use the partial count as
+        // the estimate — bounded depth → bounded estimate cost,
+        // sufficient for driving variable-ordering decisions.
+        // (The full-materialisation fallback that used to live
+        // here scaled with the actual closure size, defeating the
+        // purpose of having a cheap estimate.)
+        _ if has_unbounded_closure(body) => {
+            bounded_eval_from(set, body, start, RPQ_ESTIMATE_DEPTH).len()
+        }
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
             let mut binding = Binding::default();
