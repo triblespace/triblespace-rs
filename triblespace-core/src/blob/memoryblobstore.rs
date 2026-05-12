@@ -150,6 +150,22 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     // a different type. But this is under the assumption that an attacker is only
     // allowed to write non-handle typed triples, otherwise they might as well
     // introduce blobs directly.
+    /// Structurally merge `other` into this store, consuming `other`.
+    ///
+    /// Both stores share the same `H` hash protocol so handle bytes
+    /// match by content-addressing — duplicate keys collapse via
+    /// PATCH's union semantics (idempotent). Used by callers that
+    /// produced a scratch store (e.g. a `Describe::blobs()` impl
+    /// returning the schema's description blobs) and want to fold
+    /// it into a longer-lived store like a workspace's local blobs.
+    ///
+    /// Faster than per-blob `BlobStorePut::put`: PATCH's `union`
+    /// is a structural merge — cost is bounded by the size of the
+    /// non-overlapping subtrees, not the total blob count.
+    pub fn union(&mut self, other: Self) {
+        self.blobs.union(other.blobs);
+    }
+
     /// Drops any blobs that are not referenced by one of the provided tribles.
     pub fn keep<I>(&mut self, handles: I)
     where
@@ -418,5 +434,40 @@ mod tests {
         // A fresh reader sees both.
         let fresh = store.reader().unwrap();
         assert_eq!(fresh.len(), 2);
+    }
+
+    /// `union` structurally merges two stores; handles round-trip.
+    #[test]
+    fn union_merges_and_preserves_handles() {
+        let mut a = MemoryBlobStore::<Blake3>::new();
+        let h_hello: Value<Handle<Blake3, LongString>> = a
+            .put(Bytes::from_source("hello".to_string()).view().unwrap())
+            .unwrap();
+        let mut b = MemoryBlobStore::<Blake3>::new();
+        let h_world: Value<Handle<Blake3, LongString>> = b
+            .put(Bytes::from_source("world".to_string()).view().unwrap())
+            .unwrap();
+        // Idempotent overlap: putting "hello" in b too — union should
+        // collapse the duplicate, not double-count.
+        let _h_hello_b: Value<Handle<Blake3, LongString>> = b
+            .put(Bytes::from_source("hello".to_string()).view().unwrap())
+            .unwrap();
+
+        a.union(b);
+        assert_eq!(a.reader().unwrap().len(), 2, "duplicates collapse via union");
+
+        use anybytes::View;
+        let recovered_hello: View<str> = a
+            .reader()
+            .unwrap()
+            .get::<View<str>, LongString>(h_hello)
+            .unwrap();
+        assert_eq!(&*recovered_hello, "hello");
+        let recovered_world: View<str> = a
+            .reader()
+            .unwrap()
+            .get::<View<str>, LongString>(h_world)
+            .unwrap();
+        assert_eq!(&*recovered_world, "world");
     }
 }

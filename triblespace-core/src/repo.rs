@@ -2129,6 +2129,22 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         self.local_blobs.put(item).expect("infallible blob put")
     }
 
+    /// Fold a scratch `MemoryBlobStore` into this workspace's local
+    /// blob store via PATCH's structural union.
+    ///
+    /// Faster than iterating and re-`put`ting each blob — `union` is
+    /// O(non-overlapping subtree) on the underlying PATCH. Used by
+    /// producers (e.g. `Describe::blobs()` impls) that build a
+    /// scratch store of content-addressed blobs and want to fold it
+    /// into the workspace's blob state before commit.
+    ///
+    /// Generic over `Blobs` because the local blob store is always
+    /// `MemoryBlobStore<Blake3>` regardless of the fallback backend
+    /// — `Blobs` only governs read-through to the base store.
+    pub fn union_blobs(&mut self, blobs: MemoryBlobStore<Blake3>) {
+        self.local_blobs.union(blobs);
+    }
+
     /// Retrieves a blob from the workspace.
     ///
     /// The method first checks the workspace's local blob store and falls back
