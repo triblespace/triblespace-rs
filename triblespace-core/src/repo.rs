@@ -1086,7 +1086,7 @@ where
         let base_blobs = self.storage.reader().map_err(PullError::BlobReader)?;
         Ok(Workspace {
             base_blobs,
-            local_blobs: MemoryBlobStore::new(),
+            staged: MemoryBlobStore::new(),
             head: head_,
             base_head: head_,
             base_branch_id: branch_id,
@@ -1127,8 +1127,8 @@ where
         &mut self,
         workspace: &mut Workspace<Storage>,
     ) -> Result<Option<Workspace<Storage>>, PushError<Storage>> {
-        // 1. Sync `workspace.local_blobs` to repository's BlobStore.
-        let workspace_reader = workspace.local_blobs.reader().unwrap();
+        // 1. Sync `workspace.staged` to repository's BlobStore.
+        let workspace_reader = workspace.staged.reader().unwrap();
         for handle in workspace_reader.blobs() {
             let handle = handle.expect("infallible blob enumeration");
             let blob: Blob<UnknownBlob> =
@@ -1201,7 +1201,7 @@ where
                 // Clear staged local blobs now that they have been uploaded and
                 // the branch metadata updated. This frees memory and prevents
                 // repeated uploads of the same staged blobs on subsequent pushes.
-                workspace.local_blobs = MemoryBlobStore::new();
+                workspace.staged = MemoryBlobStore::new();
                 Ok(None)
             }
             PushResult::Conflict(conflicting_meta) => {
@@ -1224,7 +1224,7 @@ where
 
                 let conflict_ws = Workspace {
                     base_blobs: self.storage.reader().map_err(PushError::StorageReader)?,
-                    local_blobs: MemoryBlobStore::new(),
+                    staged: MemoryBlobStore::new(),
                     head: head_,
                     base_head: head_,
                     base_branch_id: workspace.base_branch_id,
@@ -1431,8 +1431,12 @@ impl std::ops::Add<&Checkout> for Checkout {
 /// It was formerly known as `Head`. It is sent to worker threads,
 /// modified (via commits, merges, etc.), and then merged back into the Repository.
 pub struct Workspace<Blobs: BlobStore<Blake3>> {
-    /// A local BlobStore that holds any new blobs (commits, trees, deltas) before they are synced.
-    local_blobs: MemoryBlobStore<Blake3>,
+    /// Staged blobs — added to this workspace but not yet pushed to
+    /// the underlying repo. Analogous to git's staging area (the
+    /// index): blobs accumulate here via `put` and friends, then
+    /// `repo.push(&mut ws)` ships everything as one batch to the
+    /// durable backend.
+    pub staged: MemoryBlobStore<Blake3>,
     /// The blob storage base for the workspace.
     base_blobs: Blobs::Reader,
     /// The branch id this workspace is tracking; None for a detached workspace.
@@ -1460,7 +1464,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Workspace")
-            .field("local_blobs", &self.local_blobs)
+            .field("staged", &self.staged)
             .field("base_blobs", &self.base_blobs)
             .field("base_branch_id", &self.base_branch_id)
             .field("base_branch_meta", &self.base_branch_meta)
@@ -1939,7 +1943,7 @@ fn collect_reachable_from_patch_until<Blobs: BlobStore<Blake3>>(
         result.insert(&Entry::new(&commit.raw));
 
         let meta: TribleSet = ws
-            .local_blobs
+            .staged
             .reader()
             .unwrap()
             .get(commit)
@@ -2126,24 +2130,9 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         T: ToBlob<S>,
         Handle<Blake3, S>: ValueSchema,
     {
-        self.local_blobs.put(item).expect("infallible blob put")
+        self.staged.put(item).expect("infallible blob put")
     }
 
-    /// Fold a scratch `MemoryBlobStore` into this workspace's local
-    /// blob store via PATCH's structural union.
-    ///
-    /// Faster than iterating and re-`put`ting each blob — `union` is
-    /// O(non-overlapping subtree) on the underlying PATCH. Used by
-    /// producers (e.g. `Describe::blobs()` impls) that build a
-    /// scratch store of content-addressed blobs and want to fold it
-    /// into the workspace's blob state before commit.
-    ///
-    /// Generic over `Blobs` because the local blob store is always
-    /// `MemoryBlobStore<Blake3>` regardless of the fallback backend
-    /// — `Blobs` only governs read-through to the base store.
-    pub fn union_blobs(&mut self, blobs: MemoryBlobStore<Blake3>) {
-        self.local_blobs.union(blobs);
-    }
 
     /// Retrieves a blob from the workspace.
     ///
@@ -2158,7 +2147,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         T: TryFromBlob<S>,
         Handle<Blake3, S>: ValueSchema,
     {
-        self.local_blobs
+        self.staged
             .reader()
             .unwrap()
             .get(handle)
@@ -2204,13 +2193,13 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
             Some(content_blob.clone()),
             metadata_handle,
         );
-        // 2. Store the content and commit blobs in `self.local_blobs`.
+        // 2. Store the content and commit blobs in `self.staged`.
         let _ = self
-            .local_blobs
+            .staged
             .put(content_blob)
             .expect("failed to put content blob");
         let commit_handle = self
-            .local_blobs
+            .staged
             .put(commit_set)
             .expect("failed to put commit blob");
         // 3. Update `self.head` to point to the new commit.
@@ -2219,8 +2208,8 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
 
     /// Merge another workspace into this one.
     ///
-    /// Always copies the *staged* blobs from `other.local_blobs` into
-    /// `self.local_blobs` (so standalone blobs that aren't referenced by any
+    /// Always copies the *staged* blobs from `other.staged` into
+    /// `self.staged` (so standalone blobs that aren't referenced by any
     /// commit chain still come along — useful when the other workspace was
     /// being used to stage content).
     ///
@@ -2246,11 +2235,11 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         //    standalone blobs (no commit referring to them yet) that the
         //    caller wanted to stash in the workspace independent of any
         //    branch state.
-        let other_local = other.local_blobs.reader().unwrap();
+        let other_local = other.staged.reader().unwrap();
         for r in other_local.blobs() {
             let handle = r.expect("infallible blob enumeration");
             let blob: Blob<UnknownBlob> = other_local.get(handle).expect("infallible blob read");
-            self.local_blobs.put(blob).expect("infallible blob put");
+            self.staged.put(blob).expect("infallible blob put");
         }
 
         // 2. Integrate `other`'s head via the smart merge_commit. If `other`
@@ -2325,7 +2314,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         let parents = self.head.iter().copied().chain(Some(other));
         let merge_commit = commit_metadata(&self.signing_key, parents, None, None, None);
         let commit_handle = self
-            .local_blobs
+            .staged
             .put(merge_commit)
             .expect("failed to put merge commit blob");
         self.head = Some(commit_handle);
@@ -2361,7 +2350,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     where
         I: IntoIterator<Item = CommitHandle>,
     {
-        let local = self.local_blobs.reader().unwrap();
+        let local = self.staged.reader().unwrap();
         let mut result = TribleSet::new();
         for commit in commits {
             let meta: TribleSet = local
@@ -2404,7 +2393,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     where
         I: IntoIterator<Item = CommitHandle>,
     {
-        let local = self.local_blobs.reader().unwrap();
+        let local = self.staged.reader().unwrap();
         let mut result = TribleSet::new();
         for commit in commits {
             let meta: TribleSet = local
@@ -2440,7 +2429,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     where
         I: IntoIterator<Item = CommitHandle>,
     {
-        let local = self.local_blobs.reader().unwrap();
+        let local = self.staged.reader().unwrap();
         let mut data = TribleSet::new();
         let mut metadata_set = TribleSet::new();
         for commit in commits {
@@ -2574,7 +2563,7 @@ fn collect_reachable<Blobs: BlobStore<Blake3>>(
         result.insert(&Entry::new(&commit.raw));
 
         let meta: TribleSet = ws
-            .local_blobs
+            .staged
             .reader()
             .unwrap()
             .get(commit)
