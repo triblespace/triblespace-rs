@@ -9,7 +9,6 @@ use crate::metadata::{self, Describe};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::Value;
 use crate::value::ValueSchema;
