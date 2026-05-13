@@ -48,12 +48,15 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
     where
         B: BlobStore<Blake3>,
     {
-        // Step 1: entity core. The element schema id is the only identity-
-        // determining fact — `Array<u8>` and `Array<f32>` differ in `T::id()`
-        // and so get distinct intrinsic ids. The name / description are
-        // documentation that shouldn't affect identity.
+        // Step 1: entity core via `*:` spread. `T::describe(blobs)?` runs
+        // once: its root becomes the value of `metadata::array_item_schema`,
+        // and its facts are folded into this fragment automatically. The
+        // element schema discriminates `Array<u8>` from `Array<f32>` etc.
+        // Element schemas aren't themselves `BlobSchema`s, so they get
+        // their own attribute (not `metadata::blob_schema`).
         let mut fragment = entity! {
-            metadata::blob_schema: T::id(),
+            metadata::array_item_schema*: T::describe(blobs)?,
+            metadata::tag: metadata::KIND_BLOB_SCHEMA,
         };
         let id = fragment
             .root()
@@ -68,13 +71,7 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
         fragment += entity! { crate::id::ExclusiveId::force_ref(&id) @
             metadata::name: name,
             metadata::description: description,
-            metadata::tag: metadata::KIND_BLOB_SCHEMA,
         };
-
-        // Fold T's schema metadata in as auxiliary facts (TribleSet level,
-        // not Fragment level) so its root doesn't expand this fragment's
-        // exports.
-        fragment += T::describe(blobs)?.into_facts();
         Ok(fragment)
     }
 }

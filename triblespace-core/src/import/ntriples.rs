@@ -932,13 +932,14 @@ where
     let mut facts = TribleSet::new();
     let mut bnodes = BnodeBuffer::new();
     let mut count = 0;
+    let mut attr_cache = NTriplesAttrCache::default();
 
     loop {
         skip_ws_and_comments(&mut bytes);
         if bytes.peek_token().is_none() {
             break;
         }
-        if parse_triple(ws, &mut facts, &mut bnodes, &mut bytes) {
+        if parse_triple(ws, &mut facts, &mut bnodes, &mut bytes, &mut attr_cache) {
             count += 1;
         } else {
             // Malformed triple — skip to next newline so a single bad
@@ -988,11 +989,94 @@ where
 /// Plain triples emit directly into `facts`; triples touching a blank
 /// node go into `bnodes` for deferred resolution. Returns `true` on
 /// success, `false` on malformed input (caller skips to next line).
+/// Per-import cache of predicate-IRI → attribute-id, one slot per value
+/// schema the parser dispatches to. `Attribute::<S>::from_iri(predicate)`
+/// runs `<S as MetaDescribe>::id()` and an `entity!{}.root()` per call —
+/// both nontrivial — so caching by (S, IRI) avoids redoing that work for
+/// every trible sharing a predicate.
+#[derive(Default)]
+struct NTriplesAttrCache {
+    genid: HashMap<String, Id>,
+    longstring: HashMap<String, Id>,
+    rawbytes: HashMap<String, Id>,
+    i256be: HashMap<String, Id>,
+    u256be: HashMap<String, Id>,
+    r256be: HashMap<String, Id>,
+    f64: HashMap<String, Id>,
+    boolean: HashMap<String, Id>,
+    nsduration: HashMap<String, Id>,
+    nstai: HashMap<String, Id>,
+}
+
+impl NTriplesAttrCache {
+    fn genid(&mut self, iri: &str) -> Id {
+        *self
+            .genid
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::GenId>::from_iri(iri).id())
+    }
+    fn longstring(&mut self, iri: &str) -> Id {
+        *self
+            .longstring
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<Handle<Blake3, LongString>>::from_iri(iri).id())
+    }
+    fn rawbytes(&mut self, iri: &str) -> Id {
+        *self
+            .rawbytes
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<Handle<Blake3, RawBytes>>::from_iri(iri).id())
+    }
+    fn i256be(&mut self, iri: &str) -> Id {
+        *self
+            .i256be
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::I256BE>::from_iri(iri).id())
+    }
+    fn u256be(&mut self, iri: &str) -> Id {
+        *self
+            .u256be
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::U256BE>::from_iri(iri).id())
+    }
+    fn r256be(&mut self, iri: &str) -> Id {
+        *self
+            .r256be
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::R256BE>::from_iri(iri).id())
+    }
+    fn f64(&mut self, iri: &str) -> Id {
+        *self
+            .f64
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::F64>::from_iri(iri).id())
+    }
+    fn boolean(&mut self, iri: &str) -> Id {
+        *self
+            .boolean
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<valueschemas::Boolean>::from_iri(iri).id())
+    }
+    fn nsduration(&mut self, iri: &str) -> Id {
+        *self
+            .nsduration
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<NsDuration>::from_iri(iri).id())
+    }
+    fn nstai(&mut self, iri: &str) -> Id {
+        *self
+            .nstai
+            .entry(iri.to_string())
+            .or_insert_with(|| Attribute::<NsTAIInterval>::from_iri(iri).id())
+    }
+}
+
 fn parse_triple<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
     bnodes: &mut BnodeBuffer,
     bytes: &mut Bytes,
+    attr_cache: &mut NTriplesAttrCache,
 ) -> bool
 where
     Blobs: BlobStore<Blake3>,
@@ -1041,6 +1125,7 @@ where
                 subject_label,
                 predicate.as_ref(),
                 obj_uri,
+                attr_cache,
             );
             true
         }
@@ -1048,7 +1133,7 @@ where
             let Some(target_label) = take_bnode(bytes) else {
                 return false;
             };
-            let attr_id = Attribute::<valueschemas::GenId>::from_iri(predicate.as_ref()).id();
+            let attr_id = attr_cache.genid(predicate.as_ref());
             match (iri_subject_anchor, subject_label) {
                 (Some(s_id), None) => {
                     bnodes.push_incoming(IncomingFact {
@@ -1082,11 +1167,17 @@ where
                     let e = ExclusiveId::force_ref(&s_id);
                     match suffix {
                         LiteralSuffix::None => {
-                            emit_text_literal(ws, facts, e, predicate.as_ref(), text)
+                            emit_text_literal(ws, facts, e, predicate.as_ref(), text, attr_cache)
                         }
-                        LiteralSuffix::Datatype(dt) => {
-                            emit_typed_literal(ws, facts, e, predicate.as_ref(), text, dt.as_ref())
-                        }
+                        LiteralSuffix::Datatype(dt) => emit_typed_literal(
+                            ws,
+                            facts,
+                            e,
+                            predicate.as_ref(),
+                            text,
+                            dt.as_ref(),
+                            attr_cache,
+                        ),
                         LiteralSuffix::Language(lang) => emit_lang_literal(
                             ws,
                             facts,
@@ -1094,13 +1185,19 @@ where
                             predicate.as_ref(),
                             lang.as_ref(),
                             text,
+                            attr_cache,
                         ),
                     }
                 }
                 (None, Some(s_label)) => {
-                    if let Some(fact) =
-                        build_resolved_outgoing(ws, facts, predicate.as_ref(), text, suffix)
-                    {
+                    if let Some(fact) = build_resolved_outgoing(
+                        ws,
+                        facts,
+                        predicate.as_ref(),
+                        text,
+                        suffix,
+                        attr_cache,
+                    ) {
                         bnodes.push_outgoing(s_label, fact);
                     }
                 }
@@ -1131,6 +1228,7 @@ fn emit_object_iri<Blobs>(
     subject_label: Option<View<str>>,
     predicate: &str,
     obj_uri: View<str>,
+    attr_cache: &mut NTriplesAttrCache,
 ) where
     Blobs: BlobStore<Blake3>,
 {
@@ -1142,10 +1240,11 @@ fn emit_object_iri<Blobs>(
                 &ExclusiveId::force_ref(&s_id),
                 predicate,
                 obj_uri.as_ref(),
+                attr_cache,
             );
         }
         (None, Some(s_label)) => {
-            let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
+            let attr_id = attr_cache.genid(predicate);
             let obj_id = uri_to_id(ws, obj_uri.as_ref());
             let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri);
             *facts += entity! { crate::import::rdf_uri: obj_h };
@@ -1153,7 +1252,7 @@ fn emit_object_iri<Blobs>(
             bnodes.push_outgoing(
                 s_label,
                 OutgoingFact::Resolved {
-                    attr_id: attr.id(),
+                    attr_id,
                     value_raw: g.raw,
                 },
             );
@@ -1172,16 +1271,17 @@ fn build_resolved_outgoing<Blobs>(
     predicate: &str,
     text: View<str>,
     suffix: LiteralSuffix,
+    attr_cache: &mut NTriplesAttrCache,
 ) -> Option<OutgoingFact>
 where
     Blobs: BlobStore<Blake3>,
 {
     match suffix {
         LiteralSuffix::None => {
-            let attr = Attribute::<Handle<Blake3, LongString>>::from_iri(predicate);
+            let attr_id = attr_cache.longstring(predicate);
             let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
             Some(OutgoingFact::Resolved {
-                attr_id: attr.id(),
+                attr_id,
                 value_raw: handle.raw,
             })
         }
@@ -1192,7 +1292,15 @@ where
             let mut scratch = TribleSet::new();
             let scratch_id = Id::new([0xFF; ID_LEN]).expect("non-nil scratch id");
             let scratch_e = ExclusiveId::force_ref(&scratch_id);
-            emit_typed_literal(ws, &mut scratch, scratch_e, predicate, text, dt.as_ref());
+            emit_typed_literal(
+                ws,
+                &mut scratch,
+                scratch_e,
+                predicate,
+                text,
+                dt.as_ref(),
+                attr_cache,
+            );
             let pair = scratch
                 .iter()
                 .next()
@@ -1216,10 +1324,10 @@ where
                 .root()
                 .expect("intrinsic id from rdf_lang+rdf_text");
             *facts += label_fragment;
-            let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
+            let attr_id = attr_cache.genid(predicate);
             let g: Value<GenId> = label_id.to_value();
             Some(OutgoingFact::Resolved {
-                attr_id: attr.id(),
+                attr_id,
                 value_raw: g.raw,
             })
         }
@@ -1232,15 +1340,16 @@ fn emit_uri_object<Blobs>(
     e: &ExclusiveId,
     predicate: &str,
     obj_uri: &str,
+    attr_cache: &mut NTriplesAttrCache,
 ) where
     Blobs: BlobStore<Blake3>,
 {
-    let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
+    let attr_id = attr_cache.genid(predicate);
     let obj_id = uri_to_id(ws, obj_uri);
     let obj_h: Value<Handle<Blake3, LongString>> = ws.put(obj_uri.to_owned());
     *facts += entity! { crate::import::rdf_uri: obj_h };
     let g: Value<GenId> = obj_id.to_value();
-    facts.insert(&Trible::new(e, &attr.id(), &g));
+    facts.insert(&Trible::new(e, &attr_id, &g));
 }
 
 fn emit_text_literal<Blobs>(
@@ -1249,12 +1358,13 @@ fn emit_text_literal<Blobs>(
     e: &ExclusiveId,
     predicate: &str,
     text: View<str>,
+    attr_cache: &mut NTriplesAttrCache,
 ) where
     Blobs: BlobStore<Blake3>,
 {
-    let attr = Attribute::<Handle<Blake3, LongString>>::from_iri(predicate);
+    let attr_id = attr_cache.longstring(predicate);
     let handle: Value<Handle<Blake3, LongString>> = ws.put(text);
-    facts.insert(&Trible::new(e, &attr.id(), &handle));
+    facts.insert(&Trible::new(e, &attr_id, &handle));
 }
 
 fn emit_typed_literal<Blobs>(
@@ -1264,6 +1374,7 @@ fn emit_typed_literal<Blobs>(
     predicate: &str,
     text: View<str>,
     datatype: &str,
+    attr_cache: &mut NTriplesAttrCache,
 ) where
     Blobs: BlobStore<Blake3>,
 {
@@ -1272,94 +1383,94 @@ fn emit_typed_literal<Blobs>(
             "integer" | "int" | "long" | "short" | "byte" | "negativeInteger"
             | "nonPositiveInteger" => {
                 if let Ok(val) = text.parse::<i128>() {
-                    let attr = Attribute::<valueschemas::I256BE>::from_iri(predicate);
+                    let attr_id = attr_cache.i256be(predicate);
                     let v: Value<valueschemas::I256BE> = val.to_value();
-                    facts.insert(&Trible::new(e, &attr.id(), &v));
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
             }
             "nonNegativeInteger" | "positiveInteger" | "unsignedInt" | "unsignedLong"
             | "unsignedShort" | "unsignedByte" => {
                 if let Ok(val) = text.parse::<u128>() {
-                    let attr = Attribute::<valueschemas::U256BE>::from_iri(predicate);
+                    let attr_id = attr_cache.u256be(predicate);
                     let v: Value<valueschemas::U256BE> = val.to_value();
-                    facts.insert(&Trible::new(e, &attr.id(), &v));
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
             }
             "decimal" => {
                 if let Some(val) = parse_decimal(text.as_ref()) {
-                    let attr = Attribute::<valueschemas::R256BE>::from_iri(predicate);
+                    let attr_id = attr_cache.r256be(predicate);
                     let v: Value<valueschemas::R256BE> = val.to_value();
-                    facts.insert(&Trible::new(e, &attr.id(), &v));
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
             }
             "float" | "double" => {
                 if let Ok(val) = text.parse::<f64>() {
-                    let attr = Attribute::<valueschemas::F64>::from_iri(predicate);
-                    facts.insert(&Trible::new(e, &attr.id(), &val.to_value()));
+                    let attr_id = attr_cache.f64(predicate);
+                    facts.insert(&Trible::new(e, &attr_id, &val.to_value()));
                     return;
                 }
             }
             "boolean" => match text.as_ref() {
                 "true" | "1" => {
-                    let attr = Attribute::<valueschemas::Boolean>::from_iri(predicate);
-                    facts.insert(&Trible::new(e, &attr.id(), &true.to_value()));
+                    let attr_id = attr_cache.boolean(predicate);
+                    facts.insert(&Trible::new(e, &attr_id, &true.to_value()));
                     return;
                 }
                 "false" | "0" => {
-                    let attr = Attribute::<valueschemas::Boolean>::from_iri(predicate);
-                    facts.insert(&Trible::new(e, &attr.id(), &false.to_value()));
+                    let attr_id = attr_cache.boolean(predicate);
+                    facts.insert(&Trible::new(e, &attr_id, &false.to_value()));
                     return;
                 }
                 _ => {}
             },
             "dateTime" => {
                 if let Some(ns) = parse_xsd_datetime(text.as_ref()) {
-                    emit_interval(facts, e, predicate, ns, ns);
+                    emit_interval(facts, e, predicate, ns, ns, attr_cache);
                     return;
                 }
             }
             "date" => {
                 if let Some((lo, hi)) = parse_xsd_date(text.as_ref()) {
-                    emit_interval(facts, e, predicate, lo, hi);
+                    emit_interval(facts, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "gYear" => {
                 if let Some((lo, hi)) = parse_xsd_gyear(text.as_ref()) {
-                    emit_interval(facts, e, predicate, lo, hi);
+                    emit_interval(facts, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "gYearMonth" => {
                 if let Some((lo, hi)) = parse_xsd_gyearmonth(text.as_ref()) {
-                    emit_interval(facts, e, predicate, lo, hi);
+                    emit_interval(facts, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "duration" | "dayTimeDuration" => {
                 if let Some(ns) = parse_xsd_duration(text.as_ref()) {
-                    let attr = Attribute::<NsDuration>::from_iri(predicate);
+                    let attr_id = attr_cache.nsduration(predicate);
                     let v: Value<NsDuration> = ns.to_value();
-                    facts.insert(&Trible::new(e, &attr.id(), &v));
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
             }
             "hexBinary" => {
                 if let Ok(bytes) = hex::decode(text.as_ref()) {
-                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_iri(predicate);
+                    let attr_id = attr_cache.rawbytes(predicate);
                     let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
-                    facts.insert(&Trible::new(e, &attr.id(), &handle));
+                    facts.insert(&Trible::new(e, &attr_id, &handle));
                     return;
                 }
             }
             "base64Binary" => {
                 if let Ok(bytes) = BASE64.decode(text.as_ref()) {
-                    let attr = Attribute::<Handle<Blake3, RawBytes>>::from_iri(predicate);
+                    let attr_id = attr_cache.rawbytes(predicate);
                     let handle: Value<Handle<Blake3, RawBytes>> = ws.put(bytes);
-                    facts.insert(&Trible::new(e, &attr.id(), &handle));
+                    facts.insert(&Trible::new(e, &attr_id, &handle));
                     return;
                 }
             }
@@ -1367,24 +1478,31 @@ fn emit_typed_literal<Blobs>(
                 // Treat the literal as an IRI reference — same path as
                 // bracketed `<...>` objects, so `"http://x"^^xsd:anyURI`
                 // and `<http://x>` collapse to the same entity id.
-                emit_uri_object(ws, facts, e, predicate, text.as_ref());
+                emit_uri_object(ws, facts, e, predicate, text.as_ref(), attr_cache);
                 return;
             }
             _ => {}
         }
     }
     // Unknown / unparseable typed literal: fall back to text storage.
-    emit_text_literal(ws, facts, e, predicate, text);
+    emit_text_literal(ws, facts, e, predicate, text, attr_cache);
 }
 
 /// Helper to emit an `[lo, hi]` interval trible.
-fn emit_interval(facts: &mut TribleSet, e: &ExclusiveId, predicate: &str, lo: i128, hi: i128) {
-    let attr = Attribute::<NsTAIInterval>::from_iri(predicate);
+fn emit_interval(
+    facts: &mut TribleSet,
+    e: &ExclusiveId,
+    predicate: &str,
+    lo: i128,
+    hi: i128,
+    attr_cache: &mut NTriplesAttrCache,
+) {
+    let attr_id = attr_cache.nstai(predicate);
     let mut raw = [0u8; 32];
     raw[0..16].copy_from_slice(&i128_to_ordered_be(lo));
     raw[16..32].copy_from_slice(&i128_to_ordered_be(hi));
     let v: Value<NsTAIInterval> = Value::new(raw);
-    facts.insert(&Trible::new(e, &attr.id(), &v));
+    facts.insert(&Trible::new(e, &attr_id, &v));
 }
 
 fn emit_lang_literal<Blobs>(
@@ -1394,6 +1512,7 @@ fn emit_lang_literal<Blobs>(
     predicate: &str,
     lang: &str,
     text: View<str>,
+    attr_cache: &mut NTriplesAttrCache,
 ) where
     Blobs: BlobStore<Blake3>,
 {
@@ -1412,8 +1531,8 @@ fn emit_lang_literal<Blobs>(
         .root()
         .expect("intrinsic id from rdf_lang+rdf_text");
     *facts += label_fragment;
-    let attr = Attribute::<valueschemas::GenId>::from_iri(predicate);
-    facts.insert(&Trible::new(e, &attr.id(), &label_id.to_value()));
+    let attr_id = attr_cache.genid(predicate);
+    facts.insert(&Trible::new(e, &attr_id, &label_id.to_value()));
 }
 
 /// Convenience wrapper around [`import_bytes`] that opens a file at

@@ -50,13 +50,18 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   Distinct from `metadata::name` (which stays display-only).
 - **`Attribute::<S>::from_iri(iri)`** constructor. Derives the
   attribute id via `entity!{ metadata::iri: <handle>,
-  metadata::value_schema: <S>::ID }.root()`. Use this anywhere a
+  metadata::value_schema: S::id() }.root()`. Use this anywhere a
   predicate URI is the canonical identifier (RDF, JSON-LD, SPARQL).
+- **`metadata::array_item_schema: GenId`** attribute (id
+  `56C43BEE48BE99521886D99BE9026A3B`). `Array<T>` references its
+  element schema through this attribute rather than abusing
+  `metadata::blob_schema` (element schemas are not themselves
+  `BlobSchema`s).
 
 ### Changed (breaking)
 - **`Attribute::<S>::from_name(name)`** now derives its id via
   `entity!{ metadata::name: <name handle>, metadata::value_schema:
-  <S>::ID }.root()` — canonical, sorted+deduped+Blake3-hashed (attr,
+  S::id() }.root()` — canonical, sorted+deduped+Blake3-hashed (attr,
   value) pairs, lo16 bytes. The old derivation was
   `Blake3(name_handle.raw || S::ID.raw)[lo16]`, which approximated
   the same semantics but skipped the sort/dedupe step. The docs are
@@ -96,24 +101,47 @@ The canonical-attribute-id + origin-typed-identity cleanups:
 - **`ValueSchema` and `BlobSchema` super-traits now `+ MetaDescribe`**
   (was `+ ConstId`). Schemas must describe themselves; the id is a
   property of that description, not a separate trait method.
-- **`Handle<H,T>::describe` and `Array<T>::describe` use the
-  entity-core split** — emit a minimal identity-determining fact
-  set first (no `@`, intrinsic root = id), then attach annotations
-  via `&id @ …`. Adding documentation no longer rotates the schema
-  id. Net effect: `Handle<Blake3, LongString>::id()` and similar
+- **`Handle<H,T>::describe`, `Array<T>::describe`, and
+  `Attribute<S>::describe` use the entity-core split with `entity!`'s
+  `*:` spread syntax** — sub-schemas are described *once* and their
+  roots become the values of `metadata::blob_schema` /
+  `metadata::hash_schema` / `metadata::array_item_schema` /
+  `metadata::value_schema`, while their facts fold into the parent
+  fragment automatically. Annotations (name, description, tag) attach
+  via `&id @ …` so reworking documentation doesn't rotate the id.
+  Net effect: `Handle<Blake3, LongString>::id()` and similar
   derived-id schemas have *new* id values vs. 0.38.0's `const_blake3`
   hashes. Re-ingest is required (consistent with the 0.39 attribute-
   id break above).
+- **`Array<T>` uses `metadata::array_item_schema` (not
+  `metadata::blob_schema`)** to reference its element type. Element
+  schemas (`array::F32`, `array::U8`, …) are not themselves
+  `BlobSchema`s — they only carry an `ArrayElement::Native` byte
+  layout — so the dedicated attribute prevents semantically misleading
+  edges. The id derivation is structurally the same shape but
+  attribute-id differs, so existing `Array<T>` ids rotate again.
 - **`const_blake3` workspace crate dropped.** Was a `triblespace-core`
   dep purely for compile-time `Handle`/`Array` id derivation;
-  superseded by the runtime entity-core path. Both the workspace
-  member entry and the path dependency are gone; the `const-blake3/`
-  directory itself is left on disk and can be deleted in a follow-up.
+  superseded by the runtime entity-core path. Workspace member,
+  path dependency, and the `const-blake3/` directory are all gone.
 - **`AttributeUsage::usage_id` private helper removed.** The
   identity-determining core (`metadata::attribute` + optional
   `metadata::source_module`) is now built inline at the top of
   `AttributeUsage::describe` and the annotations attach under its
   derived root. One source of truth for both id and description.
+- **Blanket `impl<T: ConstDescribe> Describe for T` dropped.**
+  Instance `Describe` and type-level `MetaDescribe` are now distinct
+  concepts; calling `Boolean.describe(&mut blobs)` (instance-method
+  form on a unit-struct schema marker) no longer compiles — use
+  `Boolean::describe(&mut blobs)` (associated-fn form) instead. No
+  in-repo callers used the blanket; the change is documented for
+  downstream crates.
+- **`MetaDescribe::id()` is runtime, not const.** Pre-`0.39.0` code
+  could use `T::ID` in `const` contexts. Post-rename `T::id()` is a
+  fn that runs `T::describe(&mut scratch).root()` each call. Most
+  call sites are amortized (attribute construction caches the result
+  in `Attribute::raw`); hot dispatch sites should hoist via
+  `LazyLock<Id>` — see `triblespace-core/src/export/json.rs::render_schema_value`.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"

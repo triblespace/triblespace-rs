@@ -48,7 +48,7 @@ impl<S: ValueSchema> ImportAttribute<S> {
     /// The id is derived via the canonical entity-intrinsic-id
     /// mechanism — the attribute IS the entity described by
     /// `metadata::name: <handle>` and
-    /// `metadata::value_schema: <S>::ID`. This keeps
+    /// `metadata::value_schema: S::id()`. This keeps
     /// `ImportAttribute::from_handle` byte-identical to
     /// [`crate::attribute::Attribute::from_name`] for the same
     /// `(name, S)` inputs, which the cross-engine importers and
@@ -84,16 +84,20 @@ where
     where
         B: BlobStore<Blake3>,
     {
-        let mut tribles = TribleSet::new();
         let id = self.id();
+        let mut fragment = Fragment::rooted(id, TribleSet::new());
 
         if let Some(name) = &self.name {
             let handle = blobs.put(name.clone())?;
-            tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
+            fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::MetaDescribe>::id()) };
+        // Spread S's describe — runs once, S's root becomes the
+        // `metadata::value_schema` value, and S's facts fold in.
+        fragment += entity! { ExclusiveId::force_ref(&id) @
+            metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
+        };
 
-        Ok(Fragment::rooted(id, tribles))
+        Ok(fragment)
     }
 }

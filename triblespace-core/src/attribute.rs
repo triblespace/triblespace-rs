@@ -284,22 +284,24 @@ where
     where
         B: crate::repo::BlobStore<Blake3>,
     {
-        let mut tribles = TribleSet::new();
         let id = self.id();
+        let mut fragment = Fragment::rooted(id, TribleSet::new());
 
         if let Some(handle) = self.handle {
-            tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
+            fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::MetaDescribe>::id()) };
+        // Spread S's describe — runs once, S's root becomes the
+        // `metadata::value_schema` value, and S's facts fold in.
+        fragment += entity! { ExclusiveId::force_ref(&id) @
+            metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
+        };
 
         if let Some(usage) = self.usage {
-            tribles += usage.describe(blobs, id)?;
+            fragment += usage.describe(blobs, id)?;
         }
 
-        tribles += <S as crate::metadata::MetaDescribe>::describe(blobs)?.into_facts();
-
-        Ok(Fragment::rooted(id, tribles))
+        Ok(fragment)
     }
 }
 

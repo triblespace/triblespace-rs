@@ -113,6 +113,10 @@ attributes! {
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
     /// Links a handle to its blob schema identifier.
     "43C134652906547383054B1E31E23DF4" as blob_schema: valueschemas::GenId;
+    /// Links an `Array<T>` schema entity to its element schema's id. Distinct
+    /// from `blob_schema` because element schemas are not themselves
+    /// `BlobSchema`s — they only carry an `ArrayElement::Native` byte-layout.
+    "56C43BEE48BE99521886D99BE9026A3B" as array_item_schema: valueschemas::GenId;
     /// Links a handle to the hash algorithm used for content addressing.
     "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: valueschemas::GenId;
     /// Optional WebAssembly module for formatting values governed by this schema.

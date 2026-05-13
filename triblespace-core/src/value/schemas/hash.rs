@@ -292,13 +292,16 @@ where
     where
         B: BlobStore<Blake3>,
     {
-        // Step 1: entity core — *only* the facts that determine identity.
-        // The hash_schema + blob_schema pair distinguishes one `Handle<H,T>`
-        // monomorphization from another; reword the name or description and
-        // the id stays stable.
+        // Step 1: entity core via `*:` spread. `T::describe(blobs)?` and
+        // `H::describe(blobs)?` each run once: their roots become the
+        // values of `metadata::blob_schema` and `metadata::hash_schema`,
+        // and their facts fold into this fragment automatically. The
+        // hash_schema + blob_schema pair distinguishes one `Handle<H,T>`
+        // monomorphization from another.
         let mut fragment = entity! {
-            metadata::blob_schema: T::id(),
-            metadata::hash_schema: H::id(),
+            metadata::blob_schema*: T::describe(blobs)?,
+            metadata::hash_schema*: H::describe(blobs)?,
+            metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
         let id = fragment
             .root()
@@ -307,14 +310,12 @@ where
         // Step 2: annotate the core with human-facing facts.
         let name = H::NAME;
         let description_handle = blobs.put(format!(
-            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at blob schema {schema_id:X}. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail.",
-            schema_id = T::id()
+            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob schema. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
         ))?;
         let name_handle = blobs.put("handle")?;
         fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::name: name_handle,
             metadata::description: description_handle,
-            metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
@@ -323,12 +324,6 @@ where
                 metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
             };
         }
-
-        // Recursive metadata about the underlying hash and blob schemas —
-        // attached as auxiliary facts (TribleSet level) so their roots
-        // don't expand this fragment's exports.
-        fragment += H::describe(blobs)?.into_facts();
-        fragment += T::describe(blobs)?.into_facts();
 
         Ok(fragment)
     }
