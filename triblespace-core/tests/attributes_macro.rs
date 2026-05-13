@@ -48,8 +48,12 @@ fn attributes_macro_works_in_entity_macro() {
 
 #[test]
 fn attributes_macro_emits_usage_metadata() {
+    // Per-attribute `.describe()` returns identity + schema spread
+    // only. Usage facts (rust identifier, module path, doc comment)
+    // are emitted by the macro-generated top-level `describe()`
+    // function at the attributes!{} declaration site.
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let meta = fixed.describe(&mut blobs).expect("metadata");
+    let meta = describe(&mut blobs).expect("registry metadata");
     let attr_id = fixed.id();
     let usage_count = find!(
         (usage: Id),

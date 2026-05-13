@@ -113,11 +113,17 @@ impl Parse for AttributesInput {
     }
 }
 
-pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<TokenStream2> {
+pub fn attributes_impl(
+    input: TokenStream2,
+    base_path: &TokenStream2,
+    macros_path: &TokenStream2,
+) -> syn::Result<TokenStream2> {
     let AttributesInput { attributes } = syn::parse2(input)?;
 
     let mut out: TokenStream2 = TokenStream2::new();
-    let mut attr_names: Vec<Ident> = Vec::new();
+    // Per-attribute records the top-level `describe()` needs in order
+    // to emit identity + usage facts inline at the declaration site.
+    let mut per_attr: Vec<(Ident, LitStr, Option<LitStr>)> = Vec::new();
     for AttributesDef {
         mut attrs,
         vis,
@@ -130,21 +136,6 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
         attrs = parsed_attrs;
         let ident_name = name.to_string();
         let name_lit = LitStr::new(&ident_name, name.span());
-        let description = description.map(|lit| quote! { Some(#lit) });
-        let description = description.unwrap_or_else(|| quote! { None });
-
-        let usage_expr = quote! {
-            #base_path::attribute::AttributeUsage {
-                name: #name_lit,
-                description: #description,
-                source: Some(#base_path::attribute::AttributeUsageSource {
-                    module_path: module_path!(),
-                    file: file!(),
-                    line: line!(),
-                    column: column!(),
-                }),
-            }
-        };
 
         let vis_ts = match vis {
             Some(v) => quote! { #v },
@@ -172,7 +163,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                 }
             },
             AttributeId::Derived => quote! {
-                #base_path::macros::entity! {
+                #macros_path::entity! {
                     #base_path::metadata::name:         #name_lit.to_blob().get_handle::<#base_path::value::schemas::hash::Blake3>(),
                     #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
                 }
@@ -187,11 +178,60 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                     use #base_path::blob::ToBlob as _;
                     use #base_path::metadata::MetaDescribe as _;
                     #base_path::attribute::Attribute::<#ty>::from(#body_fragment)
-                        .with_usage(#usage_expr)
                 });
         });
-        attr_names.push(name);
+        per_attr.push((name, name_lit, description));
     }
+
+    // Build per-attribute blocks for the top-level `describe()`:
+    //   1. emit identity + schema spread via `Attribute::describe`
+    //   2. inline the usage facts (rust identifier as
+    //      `metadata::name`, module_path as `metadata::source_module`,
+    //      doc-comment as `metadata::description` if present) under a
+    //      usage entity whose id derives from
+    //      (metadata::attribute, metadata::source_module).
+    let per_attr_blocks = per_attr.into_iter().map(|(name, name_lit, description)| {
+        let description_emission = if let Some(desc_lit) = description {
+            quote! {
+                let __desc_h = __blobs.put(#desc_lit)?;
+                __fragment += #macros_path::entity! { &__usage_ref @
+                    #base_path::metadata::description: __desc_h,
+                }.into_facts();
+            }
+        } else {
+            quote! {}
+        };
+
+        quote! {
+            {
+                // Identity + schema spread.
+                __fragment += <#base_path::attribute::Attribute<_> as #base_path::metadata::Describe>::describe(
+                    &*#name,
+                    __blobs,
+                )?
+                .into_facts();
+
+                // Usage facts inlined at the declaration site.
+                let __attr_id = #name.id();
+                let __usage_name_h = __blobs.put(#name_lit)?;
+                let __usage_module_h = __blobs.put(module_path!())?;
+                let __usage_core = #macros_path::entity! {
+                    #base_path::metadata::attribute:     __attr_id,
+                    #base_path::metadata::source_module: __usage_module_h,
+                };
+                let __usage_id = __usage_core
+                    .root()
+                    .expect("entity! without `@` always emits a rooted fragment");
+                let __usage_ref = #base_path::id::ExclusiveId::force_ref(&__usage_id);
+                __fragment += __usage_core.into_facts();
+                __fragment += #macros_path::entity! { &__usage_ref @
+                    #base_path::metadata::name: __usage_name_h,
+                    #base_path::metadata::tag:  #base_path::metadata::KIND_ATTRIBUTE_USAGE,
+                }.into_facts();
+                #description_emission
+            }
+        }
+    });
 
     out.extend(quote! {
         pub fn describe<__B>(__blobs: &mut __B) -> ::core::result::Result<
@@ -201,9 +241,8 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
         where
             __B: #base_path::repo::BlobStore<#base_path::value::schemas::hash::Blake3>,
         {
-            use #base_path::metadata::Describe as _;
             let mut __fragment = #base_path::trible::Fragment::default();
-            #( __fragment += #attr_names.describe(__blobs)?; )*
+            #( #per_attr_blocks )*
             ::core::result::Result::Ok(__fragment)
         }
     });

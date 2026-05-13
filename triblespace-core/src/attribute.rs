@@ -2,12 +2,13 @@
 //!
 //! An [`Attribute<S>`] is a rooted [`Fragment`] plus a phantom value-
 //! schema marker. The fragment's `root()` IS the attribute id; its
-//! facts carry the identity-determining data (e.g.
+//! facts are the identity-determining data (e.g.
 //! `metadata::iri: <handle>` or `metadata::name: <handle>` together
-//! with `metadata::value_schema: <schema id>`). Optional usage
-//! metadata is merged into the same fragment as additional facts (the
-//! usage's own root is not exposed — only the attribute root remains
-//! visible via `Fragment::root()`).
+//! with `metadata::value_schema: <schema id>`). The attribute is the
+//! *abstract shared thing* multiple parties agree on; codebase-local
+//! annotations (the rust identifier, source location, doc comment)
+//! are emitted at the [`attributes!`] call site as usage facts —
+//! there is no [`AttributeUsage`] type, the macro inlines them.
 //!
 //! Construct via [`From<Fragment>`]:
 //!
@@ -24,137 +25,23 @@
 //!     metadata::value_schema: <S as MetaDescribe>::id(),
 //! })
 //!
-//! // Explicit hex id (schemas, pinned attribute namespace):
-//! let id: Id = id_hex!("…");
-//! Attribute::<S>::from(entity! { &ExclusiveId::force_ref(&id) @
-//!     metadata::value_schema: <S as MetaDescribe>::id(),
-//! })
+//! // Explicit hex id (pinned attribute namespace):
+//! Attribute::<S>::from(Fragment::rooted(id, TribleSet::new()))
 //! ```
-//!
-//! Add a contextual usage via the [`Attribute::with_usage`] builder.
 
 use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
-use crate::metadata::{self, Describe};
-use crate::repo::BlobStore;
 use crate::trible::Fragment;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::Blake3;
 use crate::value::ValueSchema;
 use core::marker::PhantomData;
 
-/// Describes a concrete usage of an attribute in source code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AttributeUsage {
-    /// Contextual name for this usage (may differ across codebases).
-    pub name: &'static str,
-    /// Optional human-facing description for this usage.
-    pub description: Option<&'static str>,
-    /// Optional source location to disambiguate multiple usages.
-    pub source: Option<AttributeUsageSource>,
-}
-
-/// Source location metadata for attribute usages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AttributeUsageSource {
-    /// Fully qualified Rust module path (e.g. `"crate::schema::core"`).
-    pub module_path: &'static str,
-    /// Source file path where the attribute is used.
-    pub file: &'static str,
-    /// Line number within the source file.
-    pub line: u32,
-    /// Column number within the source line.
-    pub column: u32,
-}
-
-impl AttributeUsageSource {}
-
-impl AttributeUsage {
-    /// Construct a minimal usage entry with a name.
-    pub const fn named(name: &'static str) -> Self {
-        Self {
-            name,
-            description: None,
-            source: None,
-        }
-    }
-
-    /// Set a human-facing description for this usage.
-    pub const fn description(mut self, description: &'static str) -> Self {
-        self.description = Some(description);
-        self
-    }
-
-    /// Set a source location for this usage.
-    pub const fn source(mut self, source: AttributeUsageSource) -> Self {
-        self.source = Some(source);
-        self
-    }
-
-    /// Build the usage's own fragment — rooted at the usage's intrinsic id,
-    /// with `metadata::attribute: <attr_id>` linking it back to the
-    /// described attribute.
-    pub(crate) fn describe<B>(
-        &self,
-        blobs: &mut B,
-        attribute_id: crate::id::Id,
-    ) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        // Step 1: entity core — the facts that determine this usage's
-        // identity. The attribute it describes, plus (optionally) which
-        // source module the usage lives in. Module-path bytes go through
-        // `blobs.put` here just like in the annotations below; both paths
-        // produce the same `Handle<Blake3, LongString>` handle bytes by
-        // content addressing, so the core's intrinsic id is stable
-        // whether the same usage is computed standalone or as part of a
-        // larger description.
-        let module_handle = if let Some(src) = self.source {
-            Some(blobs.put(src.module_path)?)
-        } else {
-            None
-        };
-        let mut fragment = match module_handle {
-            Some(handle) => entity! {
-                metadata::attribute:     attribute_id,
-                metadata::source_module: handle,
-            },
-            None => entity! {
-                metadata::attribute: attribute_id,
-            },
-        };
-        let usage_id = fragment
-            .root()
-            .expect("entity! without `@` always emits a rooted fragment");
-        let usage_entity = ExclusiveId::force_ref(&usage_id);
-
-        // Step 2: annotate the core with descriptive facts.
-        let name_handle = blobs.put(self.name)?;
-        fragment += entity! { &usage_entity @ metadata::name: name_handle };
-
-        if let Some(description) = self.description {
-            let description_handle = blobs.put(description)?;
-            fragment += entity! { &usage_entity @ metadata::description: description_handle };
-        }
-
-        fragment += entity! { &usage_entity @
-            metadata::attribute: GenId::value_from(attribute_id),
-            metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
-        };
-
-        Ok(fragment)
-    }
-}
-
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
-/// the identity-determining facts, plus optional usage metadata that
-/// `describe()` re-emits on demand using the caller's blob store.
+/// the identity-determining facts, tagged with a phantom value-schema
+/// marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attribute<S: ValueSchema> {
     fragment: Fragment,
-    usage: Option<AttributeUsage>,
     _schema: PhantomData<S>,
 }
 
@@ -195,21 +82,6 @@ impl<S: ValueSchema> Attribute<S> {
     pub fn as_variable(&self, v: crate::query::Variable<S>) -> crate::query::Variable<S> {
         v
     }
-
-    /// Attach a [`AttributeUsage`]. The usage's facts are re-emitted
-    /// by [`Describe::describe`] using the caller's blob store, so
-    /// the destination store ends up with the usage's name /
-    /// description / source-module bytes — without the attribute
-    /// itself ever needing access to a blob store at construction.
-    pub const fn with_usage(mut self, usage: AttributeUsage) -> Self {
-        self.usage = Some(usage);
-        self
-    }
-
-    /// Returns the declared name of the attached usage, if any.
-    pub fn name(&self) -> Option<&str> {
-        self.usage.map(|usage| usage.name)
-    }
 }
 
 /// Wrap a rooted fragment as a typed attribute.
@@ -221,7 +93,7 @@ impl<S: ValueSchema> Attribute<S> {
 /// originating identity attribute.
 ///
 /// Pinning a schema's attribute ids (so local renames don't churn the
-/// schema) is what the `attributes!` macro is for — declare them with
+/// schema) is what the [`attributes!`] macro is for — declare them with
 /// explicit hex literals there.
 impl<S: ValueSchema> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
@@ -230,42 +102,34 @@ impl<S: ValueSchema> From<Fragment> for Attribute<S> {
             .expect("Attribute::from(Fragment) requires a rooted fragment");
         Self {
             fragment,
-            usage: None,
             _schema: PhantomData,
         }
     }
 }
 
-impl<S> Describe for Attribute<S>
+impl<S> crate::metadata::Describe for Attribute<S>
 where
     S: ValueSchema + crate::metadata::MetaDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: BlobStore<Blake3>,
+        B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
     {
         let id = self.id();
-        // Start from the identity-determining fragment — its facts
+        // Start from the identity-determining fragment so its facts
         // (metadata::iri / metadata::name / metadata::value_schema)
-        // are the attribute's metadata, not just the bytes of their
-        // hash.
+        // make it through into the registry, where they can be
+        // looked up.
         let mut fragment = self.fragment.clone();
 
-        // Spread S's describe under the same attribute id so the bare
-        // `metadata::value_schema: S::id()` grows into the full schema
-        // description. Merge as facts so the spread fragment's root
-        // doesn't escape past this attribute.
+        // Spread S's describe under the same attribute id: the bare
+        // `metadata::value_schema: S::id()` in the core grows into
+        // the full schema description. Merge as facts so the
+        // spread's root doesn't escape past this attribute.
         let spread = entity! { ExclusiveId::force_ref(&id) @
-            metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
+            crate::metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
         };
         fragment += spread.into_facts();
-
-        // Re-emit the usage on demand against the caller's blobs, so
-        // they end up with the usage handle bytes. The usage's root
-        // stays internal — we merge facts only.
-        if let Some(usage) = self.usage {
-            fragment += usage.describe(blobs, id)?.into_facts();
-        }
 
         Ok(fragment)
     }
@@ -281,7 +145,7 @@ mod tests {
     use crate::blob::ToBlob;
     use crate::id::Id;
     use crate::macros::{find, pattern};
-    use crate::metadata::MetaDescribe;
+    use crate::metadata::{self, Describe, MetaDescribe};
     use crate::blob::MemoryBlobStore;
     use crate::value::schemas::hash::{Blake3, Handle};
     use crate::value::schemas::shortstring::ShortString;
@@ -363,30 +227,5 @@ mod tests {
         // The describe output's sole root is the attribute id — the
         // schema spread's root doesn't bubble up.
         assert_eq!(meta.root(), Some(attr_id));
-    }
-
-    #[test]
-    fn with_usage_keeps_attribute_root_and_populates_blobs() {
-        let attr = Attribute::<ShortString>::from(entity! {
-            metadata::name:         "answer".to_blob().get_handle::<Blake3>(),
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
-        })
-        .with_usage(AttributeUsage::named("answer"));
-        let attr_id = attr.id();
-
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let meta = attr.describe(&mut blobs).expect("describe");
-        // Sole exposed root is the attribute id — the usage's own
-        // intrinsic root stays internal.
-        assert_eq!(meta.root(), Some(attr_id));
-
-        // Usage facts reach the registry: a usage entity links back
-        // to this attribute via `metadata::attribute`.
-        let usage_count = find!(
-            (u: Id),
-            pattern!(&meta, [{ ?u @ metadata::attribute: attr_id }])
-        )
-        .count();
-        assert!(usage_count > 0, "usage facts present in describe output");
     }
 }

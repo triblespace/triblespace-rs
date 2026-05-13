@@ -3,9 +3,10 @@
 //! The "entity core" mental model (wiki:c14041b4e1996a4101a1e80a8bdaa4c4)
 //! says: identity-determining facts and descriptive annotations are
 //! separate concerns. Derived-id schemas (`Handle<H,T>`, `Array<T>`,
-//! `AttributeUsage`) build a minimal core fragment in `describe()`, take
-//! its intrinsic root as the schema id, and then attach annotations under
-//! `&id @ …` so the id stays stable across documentation changes.
+//! attribute usages emitted by the `attributes!{}` macro) build a
+//! minimal core fragment in `describe()`, take its intrinsic root as
+//! the schema/usage id, and then attach annotations under `&id @ …` so
+//! the id stays stable across documentation changes.
 //!
 //! These tests assert the invariants the model promises:
 //! 1. `T::id()` is deterministic — two independent calls return the same id.

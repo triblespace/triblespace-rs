@@ -16,9 +16,12 @@ fn core_base_path() -> TokenStream2 {
 #[proc_macro]
 pub fn attributes(input: TokenStream) -> TokenStream {
     let base_path = core_base_path();
+    let macros_path = quote!(::triblespace_core::macros);
     let tokens = TokenStream2::from(input);
     expand(triblespace_macros_common::attributes_impl(
-        tokens, &base_path,
+        tokens,
+        &base_path,
+        &macros_path,
     ))
 }
 

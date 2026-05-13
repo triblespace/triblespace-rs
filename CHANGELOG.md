@@ -109,24 +109,38 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   level API, no `entity!{}`) to avoid a bootstrap deadlock —
   foundational attributes like `metadata::value_schema` would
   otherwise reference themselves during their own init.
-- **`Describe for Attribute<S>`** clones the wrapped fragment,
+- **`Describe for Attribute<S>`** clones the wrapped fragment and
   layers the `metadata::value_schema*:` spread (via `.into_facts()`
-  so the spread's root doesn't escape), then re-emits any attached
-  `AttributeUsage` against the caller's blob store. The describe
-  output's sole exposed root is the attribute id — the usage's own
-  intrinsic root stays internal.
+  so the spread's root doesn't escape). The describe output's sole
+  exposed root is the attribute id. Per-attribute `describe()`
+  no longer emits usage facts.
+- **`AttributeUsage` / `AttributeUsageSource` types removed.**
+  An `attributes!{}` declaration site IS an attribute usage; the
+  abstract attribute is the shared thing multiple parties agree
+  on, and the macro emits the codebase-local annotations (rust
+  identifier as `metadata::name`, `module_path!()` as
+  `metadata::source_module`, doc comment as
+  `metadata::description`) inline at the declaration site, in the
+  macro-generated top-level `pub fn describe(blobs)` function.
+  Per-attribute `Attribute<S>` no longer carries usage data, and
+  there is no `with_usage` builder. The usage entity's id and
+  fact structure are byte-identical to the prior
+  `AttributeUsage::describe` output (`(metadata::attribute,
+  metadata::source_module)` → usage id; `metadata::name`,
+  `metadata::tag: KIND_ATTRIBUTE_USAGE`, optional
+  `metadata::description` under the usage id).
+- **`triblespace_macros_common::attributes_impl`** gains a
+  `macros_path` parameter (separate from `base_path`) so the
+  generated code can route `entity!{}` calls through the
+  caller's own re-export — required because for downstream
+  consumers `::triblespace::core::macros::entity!` resolves to
+  the inner `triblespace_core_macros::entity!` (which uses
+  `::triblespace_core` paths the consumer doesn't have in scope),
+  while `::triblespace::macros::entity!` is the umbrella's
+  `::triblespace::core`-path variant.
 - **`ImportAttribute::<S>::from_handle(handle, name)`** still uses
   `metadata::name + metadata::value_schema` via `entity!`. It stays
   byte-identical to the inlined name-derivation pattern above.
-- **`AttributeUsage::usage_id(attribute_id)`** rewritten the same
-  way. Identity-determining facts are now
-  `metadata::attribute: <attr id>` and (when set)
-  `metadata::source_module: <module-path LongString handle>`. The
-  old `b"triblespace.attribute_usage"` domain-prefix hash is gone;
-  the `USAGE_DOMAIN` constant was removed. Module-path bytes are
-  hashed via the canonical LongString-blob handle so `usage_id` and
-  `describe()`'s emitted `metadata::source_module` fact agree on
-  the handle value byte-for-byte.
 - **`import::ntriples`** now derives all predicate URI attributes
   through `metadata::iri` (the `NTriplesAttrCache` builds the
   per-(IRI, S) `Attribute` via the inlined entity-core pattern).
