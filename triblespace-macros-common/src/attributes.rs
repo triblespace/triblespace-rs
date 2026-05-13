@@ -150,35 +150,46 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             Some(v) => quote! { #v },
             None => quote! { pub },
         };
-        match id {
-            AttributeId::Hex(lit) => {
-                out.extend(quote! {
-                    #(#attrs)*
-                    #[allow(non_upper_case_globals)]
-                    #vis_ts const #name: #base_path::attribute::Attribute<#ty> =
-                        #base_path::attribute::Attribute::from_id_with_usage(
-                            #base_path::id::_hex_literal_hex!(#lit),
-                            #usage_expr,
-                        );
+        // Both branches build a rooted fragment whose root IS the
+        // attribute id. The Hex branch constructs the fragment via
+        // the low-level `Fragment::rooted` API rather than `entity!{}`
+        // — bootstrapping attributes like `metadata::value_schema` are
+        // themselves declared via `attributes!{}`, and any reference
+        // to them from inside their own LazyLock init would deadlock.
+        // Derived attributes can use `entity!{}` freely because they
+        // depend on already-initialized Hex attrs.
+        let body_fragment = match id {
+            AttributeId::Hex(lit) => quote! {
+                {
+                    let __id: #base_path::id::Id = #base_path::id::Id::new(
+                        #base_path::id::_hex_literal_hex!(#lit)
+                    )
+                    .expect("attributes!{} hex id must be non-nil");
+                    #base_path::trible::Fragment::rooted(
+                        __id,
+                        #base_path::trible::TribleSet::new(),
+                    )
+                }
+            },
+            AttributeId::Derived => quote! {
+                #base_path::macros::entity! {
+                    #base_path::metadata::name:         #name_lit.to_blob().get_handle::<#base_path::value::schemas::hash::Blake3>(),
+                    #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                }
+            },
+        };
+
+        out.extend(quote! {
+            #(#attrs)*
+            #[allow(non_upper_case_globals)]
+            #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
+                ::std::sync::LazyLock::new(|| {
+                    use #base_path::blob::ToBlob as _;
+                    use #base_path::metadata::MetaDescribe as _;
+                    #base_path::attribute::Attribute::<#ty>::from(#body_fragment)
+                        .with_usage(#usage_expr)
                 });
-            }
-            AttributeId::Derived => {
-                out.extend(quote! {
-                    #(#attrs)*
-                    #[allow(non_upper_case_globals)]
-                    #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
-                        ::std::sync::LazyLock::new(|| {
-                            use #base_path::blob::ToBlob as _;
-                            use #base_path::metadata::MetaDescribe as _;
-                            #base_path::attribute::Attribute::<#ty>::from(#base_path::macros::entity! {
-                                #base_path::metadata::name:         #name_lit.to_blob().get_handle::<#base_path::value::schemas::hash::Blake3>(),
-                                #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
-                            })
-                            .with_usage(#usage_expr)
-                        });
-                });
-            }
-        }
+        });
         attr_names.push(name);
     }
 

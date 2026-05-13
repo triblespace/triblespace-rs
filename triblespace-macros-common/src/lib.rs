@@ -1078,7 +1078,7 @@ pub fn pattern_changes_impl(
                     let af_ident = format_ident!("__af{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
                     attr_decl_tokens.extend(quote! {
-                        let #af_ident = #attr_expr;
+                        let #af_ident = &#attr_expr;
                         let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
                     });
                     attr_const_tokens.extend(quote! {

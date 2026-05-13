@@ -65,11 +65,19 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   `BlobSchema`s).
 
 ### Changed (breaking)
-- **`Attribute::<S>::from_name` and `Attribute::<S>::from_iri`
-  removed.** Both were single-purpose wrappers around the
-  entity-core derivation. Replace each call with explicit
-  `Attribute::<S>::from(entity!{ … })`, naming the identity
-  attribute (`metadata::name` or `metadata::iri`) at the call site:
+- **`Attribute<S>` now stores a rooted `Fragment` (not just a raw
+  id).** The wrapped fragment carries the identity-determining facts
+  (`metadata::iri | metadata::name` + `metadata::value_schema`),
+  which `describe()` re-emits so the metadata registry stays
+  queryable by IRI / name — that round-trip was lost in the prior
+  `raw: RawId`-only shape. `id()` becomes
+  `self.fragment.root().expect("rooted")`.
+- **`Attribute::<S>::from_name`, `from_iri`, `from_id`, and
+  `from_id_with_usage` removed.** The single public construction
+  path is `impl<S: ValueSchema> From<Fragment> for Attribute<S>`.
+  Replace each call with explicit `Attribute::<S>::from(entity!{ … })`,
+  naming the identity attribute (`metadata::name`, `metadata::iri`,
+  or an explicit `@`-prefixed hex id) at the call site:
   ```rust
   // display-name origins (JSON fields, config keys, column headers):
   Attribute::<S>::from(entity! {
@@ -82,11 +90,31 @@ The canonical-attribute-id + origin-typed-identity cleanups:
       metadata::iri:          iri.to_blob().get_handle::<Blake3>(),
       metadata::value_schema: <S as MetaDescribe>::id(),
   })
+
+  // Explicit hex id (schema pinning, bootstrap attrs):
+  let id: Id = id_hex!("…");
+  Attribute::<S>::from(entity! { &ExclusiveId::force_ref(&id) @
+      metadata::value_schema: <S as MetaDescribe>::id(),
+  })
   ```
   The derivation is unchanged — canonical
   sorted+deduped+Blake3-hashed (attr, value) pairs, lo16 bytes — so
   attribute ids for migrated callers stay the same; only the call
   shape changes.
+- **`attributes!{ "hex" as name: schema; … }`** no longer produces
+  `const Attribute<S>` — Fragment isn't const-constructible, so
+  fixed-id attrs become `static LazyLock<Attribute<S>>` like
+  derived ones. Within the LazyLock init, the Hex branch
+  constructs via `Fragment::rooted(id, TribleSet::new())` (low-
+  level API, no `entity!{}`) to avoid a bootstrap deadlock —
+  foundational attributes like `metadata::value_schema` would
+  otherwise reference themselves during their own init.
+- **`Describe for Attribute<S>`** clones the wrapped fragment,
+  layers the `metadata::value_schema*:` spread (via `.into_facts()`
+  so the spread's root doesn't escape), then re-emits any attached
+  `AttributeUsage` against the caller's blob store. The describe
+  output's sole exposed root is the attribute id — the usage's own
+  intrinsic root stays internal.
 - **`ImportAttribute::<S>::from_handle(handle, name)`** still uses
   `metadata::name + metadata::value_schema` via `entity!`. It stays
   byte-identical to the inlined name-derivation pattern above.
