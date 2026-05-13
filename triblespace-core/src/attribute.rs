@@ -223,20 +223,12 @@ impl<S: ValueSchema> Attribute<S> {
     /// renames don't churn the schema).
     pub fn from_name(name: &str) -> Self {
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
-        let fragment = entity! {
+        let mut attr = Self::from(entity! {
             metadata::name:         field_handle,
             metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
-        };
-        let id = fragment
-            .root()
-            .expect("entity! without `@` always emits a rooted fragment");
-        let raw: RawId = id.into();
-        Self {
-            raw,
-            handle: Some(field_handle),
-            usage: None,
-            _schema: PhantomData,
-        }
+        });
+        attr.handle = Some(field_handle);
+        attr
     }
 
     /// Derive an attribute id from an IRI and this schema's metadata.
@@ -256,19 +248,29 @@ impl<S: ValueSchema> Attribute<S> {
         let iri_handle: crate::value::Value<
             crate::value::schemas::hash::Handle<Blake3, crate::blob::schemas::iri::IRI>,
         > = String::from(iri).to_blob().get_handle::<Blake3>();
-        let fragment = entity! {
+        Self::from(entity! {
             metadata::iri:          iri_handle,
             metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
-        };
+        })
+    }
+}
+
+/// Generic constructor: derive an attribute id from a [`Fragment`]'s root.
+///
+/// `from_name` and `from_iri` are thin wrappers around this primitive —
+/// they each build a small `entity!{ metadata::<identity-attr>: <handle>,
+/// metadata::value_schema: S::id() }` fragment and hand it here. Callers
+/// minting attribute ids from custom identity-determining facts (e.g.
+/// `metadata::export_symbol`, `metadata::xpath`, …) can build the right
+/// `entity!` themselves and call `Attribute::<S>::from(frag)`.
+impl<S: ValueSchema> From<Fragment> for Attribute<S> {
+    fn from(fragment: Fragment) -> Self {
         let id = fragment
             .root()
-            .expect("entity! without `@` always emits a rooted fragment");
+            .expect("Attribute::from(Fragment) requires a rooted fragment");
         let raw: RawId = id.into();
         Self {
             raw,
-            // We don't currently cache the IRI handle on Attribute —
-            // it's a different handle type from `handle: Option<...LongString...>`.
-            // describe() emits the IRI fact explicitly via metadata::iri.
             handle: None,
             usage: None,
             _schema: PhantomData,
