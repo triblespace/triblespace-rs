@@ -140,9 +140,18 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   invocation records per `attributes!{}` block — only the outer
   user-facing macro invocation gets recorded by the metadata
   emitter.
-- **`ImportAttribute::<S>::from_handle(handle, name)`** still uses
-  `metadata::name + metadata::value_schema` via `entity!`. It stays
-  byte-identical to the inlined name-derivation pattern above.
+- **`ImportAttribute` removed.** It was a thin wrapper around two
+  separate patterns: (1) "build an attribute from a name handle"
+  (now just `Attribute::<S>::from(entity!{ metadata::name: handle,
+  metadata::value_schema: <S as MetaDescribe>::id() })` in the
+  JSON object importer) and (2) "attach a contextual name fact to
+  an existing attribute id" (the `import::json_tree::build_json_tree_metadata`
+  rename pattern, which is gone — the macro-generated `describe()`
+  already emits a usage entity with `metadata::source_module:
+  "triblespace_core::import::json_tree"`, which disambiguates the
+  module's view of each attribute without needing a separate
+  `json.kind` / `json.string` / … rename. Nothing in the codebase
+  queried those rename strings.)
 - **`import::ntriples`** now derives all predicate URI attributes
   through `metadata::iri` (the `NTriplesAttrCache` builds the
   per-(IRI, S) `Attribute` via the inlined entity-core pattern).

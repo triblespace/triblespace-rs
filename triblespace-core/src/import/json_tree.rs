@@ -14,10 +14,8 @@ use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::ToBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
-use crate::import::ImportAttribute;
 use crate::macros::{entity, id_hex};
 use crate::metadata;
-use crate::metadata::{MetaDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
@@ -90,55 +88,15 @@ pub fn build_json_tree_metadata<B>(blobs: &mut B) -> Result<Fragment, B::PutErro
 where
     B: BlobStore<Blake3>,
 {
-    let mut metadata = Fragment::default();
-    let name = |value: &'static str| {
-        Bytes::from_source(value)
-            .view::<str>()
-            .expect("static JSON attribute names are valid UTF-8")
-    };
-
-    metadata += <GenId as MetaDescribe>::describe(blobs)?;
-    metadata += <Boolean as MetaDescribe>::describe(blobs)?;
-    metadata += <U256BE as MetaDescribe>::describe(blobs)?;
-    metadata += <Handle<Blake3, LongString> as MetaDescribe>::describe(blobs)?;
-
-    metadata +=
-        ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?;
-    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-        string.raw(),
-        Some(name("json.string")),
-    )
-    .describe(blobs)?;
-    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-        number_raw.raw(),
-        Some(name("json.number_raw")),
-    )
-    .describe(blobs)?;
-    metadata += ImportAttribute::<Boolean>::from_raw(boolean.raw(), Some(name("json.boolean")))
-        .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<GenId>::from_raw(field_parent.raw(), Some(name("json.field_parent")))
-            .describe(blobs)?;
-    metadata += ImportAttribute::<Handle<Blake3, LongString>>::from_raw(
-        field_name.raw(),
-        Some(name("json.field_name")),
-    )
-    .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<U256BE>::from_raw(field_index.raw(), Some(name("json.field_index")))
-            .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<GenId>::from_raw(field_value.raw(), Some(name("json.field_value")))
-            .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<GenId>::from_raw(array_parent.raw(), Some(name("json.array_parent")))
-            .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<U256BE>::from_raw(array_index.raw(), Some(name("json.array_index")))
-            .describe(blobs)?;
-    metadata +=
-        ImportAttribute::<GenId>::from_raw(array_value.raw(), Some(name("json.array_value")))
-            .describe(blobs)?;
+    // The macro-generated `describe()` for this module's attributes!{}
+    // block emits each declared attribute's identity, schema spread,
+    // and a usage entity rooted at
+    // (metadata::attribute, metadata::source_module) with the rust
+    // identifier as `metadata::name`. The `source_module` field
+    // disambiguates "this is the JSON tree schema's usage of `kind`"
+    // from any other crate's usage of the same attribute id, so we no
+    // longer need a separate `json.kind` rename.
+    let mut metadata = describe(blobs)?;
 
     metadata += describe_kind(blobs, kind_object, "json.kind.object", "JSON object node.")?;
     metadata += describe_kind(blobs, kind_array, "json.kind.array", "JSON array node.")?;

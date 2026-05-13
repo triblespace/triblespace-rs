@@ -39,10 +39,23 @@ use core::marker::PhantomData;
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
 /// marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Attribute<S: ValueSchema> {
     fragment: Fragment,
     _schema: PhantomData<S>,
+}
+
+impl<S: ValueSchema> Clone for Attribute<S> {
+    // Manual impl: `PhantomData<S>` doesn't require `S: Clone`, but
+    // `#[derive(Clone)]` over a `S: ValueSchema` bound conservatively
+    // adds that constraint. Implementing by hand lets callers clone
+    // `Attribute<Boolean>` etc. without needing `Boolean: Clone`.
+    fn clone(&self) -> Self {
+        Self {
+            fragment: self.fragment.clone(),
+            _schema: PhantomData,
+        }
+    }
 }
 
 impl<S: ValueSchema> Attribute<S> {

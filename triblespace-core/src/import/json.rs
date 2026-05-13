@@ -18,8 +18,8 @@ use winnow::stream::Stream;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::ToBlob;
+use crate::attribute::Attribute;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
-use crate::import::ImportAttribute;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{MetaDescribe, Describe};
@@ -141,10 +141,10 @@ where
     Hasher: HashProtocol,
 {
     store: &'a mut Store,
-    bool_attrs: HashMap<View<str>, ImportAttribute<Boolean>>,
-    num_attrs: HashMap<View<str>, ImportAttribute<F64>>,
-    str_attrs: HashMap<View<str>, ImportAttribute<Handle<Blake3, LongString>>>,
-    genid_attrs: HashMap<View<str>, ImportAttribute<GenId>>,
+    bool_attrs: HashMap<View<str>, Attribute<Boolean>>,
+    num_attrs: HashMap<View<str>, Attribute<F64>>,
+    str_attrs: HashMap<View<str>, Attribute<Handle<Blake3, LongString>>>,
+    genid_attrs: HashMap<View<str>, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     _hasher: PhantomData<Hasher>,
     array_fields: HashSet<View<str>>,
@@ -155,10 +155,10 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
-    fn attr_from_field<S: ValueSchema>(
+    fn attr_from_field<S: ValueSchema + MetaDescribe>(
         &mut self,
         field: &ParsedString,
-    ) -> Result<ImportAttribute<S>, JsonImportError> {
+    ) -> Result<Attribute<S>, JsonImportError> {
         let handle =
             self.store
                 .put(field.clone())
@@ -166,13 +166,16 @@ where
                     field: field.as_ref().to_owned(),
                     source: EncodeError::from_error(err),
                 })?;
-        Ok(ImportAttribute::<S>::from_handle(handle, field.clone()))
+        Ok(Attribute::<S>::from(entity! {
+            metadata::name:         handle,
+            metadata::value_schema: <S as MetaDescribe>::id(),
+        }))
     }
 
     fn bool_attr(
         &mut self,
         field: &ParsedString,
-    ) -> Result<ImportAttribute<Boolean>, JsonImportError> {
+    ) -> Result<Attribute<Boolean>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.bool_attrs.get(&key) {
             return Ok(attr.clone());
@@ -182,7 +185,7 @@ where
         Ok(attr)
     }
 
-    fn num_attr(&mut self, field: &ParsedString) -> Result<ImportAttribute<F64>, JsonImportError> {
+    fn num_attr(&mut self, field: &ParsedString) -> Result<Attribute<F64>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.num_attrs.get(&key) {
             return Ok(attr.clone());
@@ -195,7 +198,7 @@ where
     fn str_attr(
         &mut self,
         field: &ParsedString,
-    ) -> Result<ImportAttribute<Handle<Blake3, LongString>>, JsonImportError> {
+    ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
@@ -208,7 +211,7 @@ where
     fn genid_attr(
         &mut self,
         field: &ParsedString,
-    ) -> Result<ImportAttribute<GenId>, JsonImportError> {
+    ) -> Result<Attribute<GenId>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());

@@ -4,12 +4,9 @@
 //! [`TribleSet`](crate::trible::TribleSet) changes ready to merge into a
 //! repository or workspace.
 
-mod import_attribute;
 pub mod json;
 pub mod json_tree;
 pub mod ntriples;
-
-pub(crate) use import_attribute::ImportAttribute;
 
 use triblespace_core_macros::attributes;
 
