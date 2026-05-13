@@ -167,7 +167,15 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                     #(#attrs)*
                     #[allow(non_upper_case_globals)]
                     #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
-                        ::std::sync::LazyLock::new(|| #base_path::attribute::Attribute::from_name(#name_lit).with_usage(#usage_expr));
+                        ::std::sync::LazyLock::new(|| {
+                            use #base_path::blob::ToBlob as _;
+                            use #base_path::metadata::MetaDescribe as _;
+                            #base_path::attribute::Attribute::<#ty>::from(#base_path::macros::entity! {
+                                #base_path::metadata::name:         #name_lit.to_blob().get_handle::<#base_path::value::schemas::hash::Blake3>(),
+                                #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                            })
+                            .with_usage(#usage_expr)
+                        });
                 });
             }
         }

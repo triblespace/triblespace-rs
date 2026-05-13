@@ -48,10 +48,16 @@ The canonical-attribute-id + origin-typed-identity cleanups:
 - **`metadata::iri: Handle<Blake3, IRI>`** attribute. The canonical
   identity-determining attribute for RDF-imported entities.
   Distinct from `metadata::name` (which stays display-only).
-- **`Attribute::<S>::from_iri(iri)`** constructor. Derives the
-  attribute id via `entity!{ metadata::iri: <handle>,
-  metadata::value_schema: S::id() }.root()`. Use this anywhere a
-  predicate URI is the canonical identifier (RDF, JSON-LD, SPARQL).
+- **`impl<S: ValueSchema> From<Fragment> for Attribute<S>`** — the
+  canonical dynamic-attribute constructor. Hand it an
+  `entity!{ metadata::<identity-attr>: <value>,
+  metadata::value_schema: S::id() }` fragment whose root captures the
+  identity-determining facts, and you get the typed attribute back.
+  This is the *only* dynamic-attribute path: there is no specialized
+  helper privileging any specific identity-attribute, so call sites
+  must spell out which origin the id derives from (`metadata::name`
+  for display-name origins, `metadata::iri` for RDF predicates, or
+  whatever custom origin makes sense).
 - **`metadata::array_item_schema: GenId`** attribute (id
   `56C43BEE48BE99521886D99BE9026A3B`). `Array<T>` references its
   element schema through this attribute rather than abusing
@@ -59,19 +65,31 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   `BlobSchema`s).
 
 ### Changed (breaking)
-- **`Attribute::<S>::from_name(name)`** now derives its id via
-  `entity!{ metadata::name: <name handle>, metadata::value_schema:
-  S::id() }.root()` — canonical, sorted+deduped+Blake3-hashed (attr,
-  value) pairs, lo16 bytes. The old derivation was
-  `Blake3(name_handle.raw || S::ID.raw)[lo16]`, which approximated
-  the same semantics but skipped the sort/dedupe step. The docs are
-  also re-scoped: `from_name` is now the constructor for *origins
-  where the display name IS the canonical identifier* (JSON fields,
-  column headers, config keys). For RDF use `from_iri` instead.
-- **`ImportAttribute::<S>::from_handle(handle, name)`** updated to
-  use `metadata::name + metadata::value_schema` via `entity!`. This
-  is the JSON-importer path; it stays byte-identical to
-  `Attribute::<S>::from_name` for the same inputs.
+- **`Attribute::<S>::from_name` and `Attribute::<S>::from_iri`
+  removed.** Both were single-purpose wrappers around the
+  entity-core derivation. Replace each call with explicit
+  `Attribute::<S>::from(entity!{ … })`, naming the identity
+  attribute (`metadata::name` or `metadata::iri`) at the call site:
+  ```rust
+  // display-name origins (JSON fields, config keys, column headers):
+  Attribute::<S>::from(entity! {
+      metadata::name:         name.to_blob().get_handle::<Blake3>(),
+      metadata::value_schema: <S as MetaDescribe>::id(),
+  })
+
+  // RDF / JSON-LD predicates (IRI as canonical identifier):
+  Attribute::<S>::from(entity! {
+      metadata::iri:          iri.to_blob().get_handle::<Blake3>(),
+      metadata::value_schema: <S as MetaDescribe>::id(),
+  })
+  ```
+  The derivation is unchanged — canonical
+  sorted+deduped+Blake3-hashed (attr, value) pairs, lo16 bytes — so
+  attribute ids for migrated callers stay the same; only the call
+  shape changes.
+- **`ImportAttribute::<S>::from_handle(handle, name)`** still uses
+  `metadata::name + metadata::value_schema` via `entity!`. It stays
+  byte-identical to the inlined name-derivation pattern above.
 - **`AttributeUsage::usage_id(attribute_id)`** rewritten the same
   way. Identity-determining facts are now
   `metadata::attribute: <attr id>` and (when set)
@@ -81,10 +99,12 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   hashed via the canonical LongString-blob handle so `usage_id` and
   `describe()`'s emitted `metadata::source_module` fact agree on
   the handle value byte-for-byte.
-- **`import::ntriples`** now uses `Attribute::from_iri` for all
-  predicate URI imports (was `from_name`). Net effect: RDF-imported
-  attribute ids change to new values that ALSO differ from JSON
-  field name-derived ids on the same byte content.
+- **`import::ntriples`** now derives all predicate URI attributes
+  through `metadata::iri` (the `NTriplesAttrCache` builds the
+  per-(IRI, S) `Attribute` via the inlined entity-core pattern).
+  Net effect: RDF-imported attribute ids change to new values that
+  ALSO differ from JSON field name-derived ids on the same byte
+  content.
 - **`ConstId` trait removed.** Every schema's identity-determining
   hex literal moves from `impl ConstId for X { const ID: Id =
   id_hex!("…"); }` to an inline `let id: Id = id_hex!("…");` inside

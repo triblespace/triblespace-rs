@@ -5,8 +5,6 @@
 //! schema for that attribute. We keep construction simple and const-friendly so
 //! fields can be declared as `pub const F: Field<ShortString> = Field::from(hex!("..."));`.
 
-use crate::blob::schemas::longstring::LongString;
-use crate::blob::ToBlob;
 use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
@@ -122,7 +120,6 @@ impl AttributeUsage {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Attribute<S: ValueSchema> {
     raw: RawId,
-    handle: Option<crate::value::Value<crate::value::schemas::hash::Handle<Blake3, LongString>>>,
     usage: Option<AttributeUsage>,
     _schema: PhantomData<S>,
 }
@@ -131,7 +128,6 @@ impl<S: ValueSchema> Clone for Attribute<S> {
     fn clone(&self) -> Self {
         Self {
             raw: self.raw,
-            handle: self.handle,
             usage: self.usage,
             _schema: PhantomData,
         }
@@ -143,7 +139,6 @@ impl<S: ValueSchema> Attribute<S> {
     pub const fn from_id_with_usage(raw: RawId, usage: AttributeUsage) -> Self {
         Self {
             raw,
-            handle: None,
             usage: Some(usage),
             _schema: PhantomData,
         }
@@ -154,7 +149,6 @@ impl<S: ValueSchema> Attribute<S> {
     pub const fn from_id(raw: RawId) -> Self {
         Self {
             raw,
-            handle: None,
             usage: None,
             _schema: PhantomData,
         }
@@ -202,67 +196,36 @@ impl<S: ValueSchema> Attribute<S> {
         self
     }
 
-    /// Derive an attribute id from a dynamic *display name* and this
-    /// schema's metadata.
-    ///
-    /// Hashes from `metadata::name + metadata::value_schema`. Use this
-    /// when the *name* itself is the canonical identifier for this
-    /// origin — e.g. a JSON field name, a column header, a config
-    /// key. The name doubles as display and identity in those
-    /// origins.
-    ///
-    /// For origins where identity is *not* a display name — RDF
-    /// (where the IRI is canonical), WASM (where the export symbol
-    /// is canonical), etc. — use the origin-specific constructor
-    /// instead:
-    ///
-    /// - [`Attribute::from_iri`] — RDF predicates / IRIs.
-    ///
-    /// The idiomatic path remains explicit hex via the `attributes!`
-    /// macro for any attribute whose id we want to pin (so local
-    /// renames don't churn the schema).
-    pub fn from_name(name: &str) -> Self {
-        let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
-        let mut attr = Self::from(entity! {
-            metadata::name:         field_handle,
-            metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
-        });
-        attr.handle = Some(field_handle);
-        attr
-    }
-
-    /// Derive an attribute id from an IRI and this schema's metadata.
-    ///
-    /// Hashes from `metadata::iri + metadata::value_schema`. The IRI
-    /// is wrapped as a `Handle<Blake3, IRI>` (typed distinctly from
-    /// the `Handle<Blake3, LongString>` `from_name` produces), so
-    /// even if a JSON field name happens to look like an IRI, the
-    /// attribute ids never collide — the (attr_id, value) pair that
-    /// feeds intrinsic-id derivation differs in the attr_id.
-    ///
-    /// Use this from the RDF / JSON-LD / SPARQL importers — anywhere
-    /// the predicate or property *is* an IRI by spec. Debug builds
-    /// validate the IRI predicate at construction; release builds
-    /// trust the caller.
-    pub fn from_iri(iri: &str) -> Self {
-        let iri_handle: crate::value::Value<
-            crate::value::schemas::hash::Handle<Blake3, crate::blob::schemas::iri::IRI>,
-        > = String::from(iri).to_blob().get_handle::<Blake3>();
-        Self::from(entity! {
-            metadata::iri:          iri_handle,
-            metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
-        })
-    }
 }
 
-/// Generic constructor: derive an attribute id from a [`Fragment`]'s root.
+/// Derive an attribute id from a [`Fragment`]'s root.
 ///
-/// `from_name` and `from_iri` are thin wrappers around this primitive —
-/// they each build a small `entity!{ metadata::<identity-attr>: <handle>,
-/// metadata::value_schema: S::id() }` fragment and hand it here. Callers
-/// minting attribute ids from custom identity-determining facts (e.g.
-/// `metadata::export_symbol`, `metadata::xpath`, …) can build the right
-/// `entity!` themselves and call `Attribute::<S>::from(frag)`.
+/// The canonical way to mint a dynamic attribute id: build an
+/// `entity!{ metadata::<identity-attr>: <handle>, metadata::value_schema:
+/// S::id() }` capturing the identity-determining facts, and hand it here.
+///
+/// The fragment's `root()` is the attribute id. Typical builders:
+///
+/// ```ignore
+/// // Display-name origins (JSON fields, config keys, column headers):
+/// let h = String::from(name).to_blob().get_handle::<Blake3>();
+/// Attribute::<S>::from(entity! {
+///     metadata::name:         h,
+///     metadata::value_schema: <S as MetaDescribe>::id(),
+/// })
+///
+/// // RDF / JSON-LD predicates (IRI as canonical identifier):
+/// let h: Value<Handle<Blake3, IRI>> =
+///     String::from(iri).to_blob().get_handle::<Blake3>();
+/// Attribute::<S>::from(entity! {
+///     metadata::iri:          h,
+///     metadata::value_schema: <S as MetaDescribe>::id(),
+/// })
+/// ```
+///
+/// Pinning a schema's attribute ids (so local renames don't churn the
+/// schema) is what the `attributes!` macro is for — declare them with
+/// explicit hex literals there.
 impl<S: ValueSchema> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
         let id = fragment
@@ -271,7 +234,6 @@ impl<S: ValueSchema> From<Fragment> for Attribute<S> {
         let raw: RawId = id.into();
         Self {
             raw,
-            handle: None,
             usage: None,
             _schema: PhantomData,
         }
@@ -288,10 +250,6 @@ where
     {
         let id = self.id();
         let mut fragment = Fragment::rooted(id, TribleSet::new());
-
-        if let Some(handle) = self.handle {
-            fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
-        }
 
         // Spread S's describe — runs once, S's root becomes the
         // `metadata::value_schema` value, and S's facts fold in.
@@ -314,13 +272,23 @@ pub use crate::id::RawId as RawIdAlias;
 mod tests {
     use super::*;
     use crate::blob::schemas::longstring::LongString;
+    use crate::blob::ToBlob;
+    use crate::metadata::MetaDescribe;
     use crate::value::schemas::hash::{Blake3, Handle};
     use crate::value::schemas::shortstring::ShortString;
 
     #[test]
     fn dynamic_field_is_deterministic() {
-        let a1 = Attribute::<ShortString>::from_name("title");
-        let a2 = Attribute::<ShortString>::from_name("title");
+        let h1 = "title".to_blob().get_handle::<Blake3>();
+        let h2 = "title".to_blob().get_handle::<Blake3>();
+        let a1 = Attribute::<ShortString>::from(entity! {
+            metadata::name:         h1,
+            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+        });
+        let a2 = Attribute::<ShortString>::from(entity! {
+            metadata::name:         h2,
+            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+        });
 
         assert_eq!(a1.raw(), a2.raw());
         assert_ne!(a1.raw(), [0; crate::id::ID_LEN]);
@@ -328,16 +296,31 @@ mod tests {
 
     #[test]
     fn dynamic_field_changes_with_name() {
-        let title = Attribute::<ShortString>::from_name("title");
-        let author = Attribute::<ShortString>::from_name("author");
+        let h_title = "title".to_blob().get_handle::<Blake3>();
+        let h_author = "author".to_blob().get_handle::<Blake3>();
+        let title = Attribute::<ShortString>::from(entity! {
+            metadata::name:         h_title,
+            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+        });
+        let author = Attribute::<ShortString>::from(entity! {
+            metadata::name:         h_author,
+            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+        });
 
         assert_ne!(title.raw(), author.raw());
     }
 
     #[test]
     fn dynamic_field_changes_with_schema() {
-        let short = Attribute::<ShortString>::from_name("title");
-        let handle = Attribute::<Handle<Blake3, LongString>>::from_name("title");
+        let h = "title".to_blob().get_handle::<Blake3>();
+        let short = Attribute::<ShortString>::from(entity! {
+            metadata::name:         h,
+            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+        });
+        let handle = Attribute::<Handle<Blake3, LongString>>::from(entity! {
+            metadata::name:         h,
+            metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+        });
 
         assert_ne!(short.raw(), handle.raw());
     }

@@ -686,7 +686,16 @@ mod tests {
     }
 
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {
-        let attr = Attribute::<Handle<Blake3, LongString>>::from_name(expected_attr).id();
+        use crate::blob::ToBlob;
+        use crate::metadata::MetaDescribe;
+        let h: Value<Handle<Blake3, LongString>> = String::from(expected_attr)
+            .to_blob()
+            .get_handle::<Blake3>();
+        let attr = Attribute::<Handle<Blake3, LongString>>::from(crate::macros::entity! {
+            metadata::name:         h,
+            metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+        })
+        .id();
         let trible = facts
             .iter()
             .find(|t| *t.a() == attr)

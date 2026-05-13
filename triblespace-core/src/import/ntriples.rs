@@ -5,8 +5,11 @@
 //! [`crate::import::rdf_uri`] — the same URI always maps to the same
 //! triblespace `Id` across processes, so repeated imports converge.
 //!
-//! Predicate URIs become attribute ids via [`Attribute::from_name`], with
-//! the value schema chosen from the object's XSD datatype:
+//! Predicate URIs become attribute ids by wrapping the IRI handle in
+//! [`entity!`] under [`metadata::iri`] and [`metadata::value_schema`],
+//! then taking the resulting fragment's root via
+//! [`Attribute::<S>::from`]. The value schema is chosen from the
+//! object's XSD datatype:
 //!
 //! - `xsd:integer` / `xsd:long` / `xsd:int` / `xsd:short` / `xsd:byte`
 //!   / `xsd:negativeInteger` / `xsd:nonPositiveInteger` → `I256BE`
@@ -990,10 +993,11 @@ where
 /// node go into `bnodes` for deferred resolution. Returns `true` on
 /// success, `false` on malformed input (caller skips to next line).
 /// Per-import cache of predicate-IRI → attribute-id, one slot per value
-/// schema the parser dispatches to. `Attribute::<S>::from_iri(predicate)`
-/// runs `<S as MetaDescribe>::id()` and an `entity!{}.root()` per call —
-/// both nontrivial — so caching by (S, IRI) avoids redoing that work for
-/// every trible sharing a predicate.
+/// schema the parser dispatches to. Each cache method computes
+/// `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_schema: }).id()`,
+/// which runs `<S as MetaDescribe>::id()` and an `entity!{}.root()` per
+/// call — both nontrivial — so caching by (S, IRI) avoids redoing that
+/// work for every trible sharing a predicate.
 #[derive(Default)]
 struct NTriplesAttrCache {
     genid: HashMap<String, Id>,
@@ -1010,64 +1014,114 @@ struct NTriplesAttrCache {
 
 impl NTriplesAttrCache {
     fn genid(&mut self, iri: &str) -> Id {
-        *self
-            .genid
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::GenId>::from_iri(iri).id())
+        *self.genid.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::GenId>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::GenId as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn longstring(&mut self, iri: &str) -> Id {
-        *self
-            .longstring
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<Handle<Blake3, LongString>>::from_iri(iri).id())
+        *self.longstring.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<Handle<Blake3, LongString>>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <Handle<Blake3, LongString> as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn rawbytes(&mut self, iri: &str) -> Id {
-        *self
-            .rawbytes
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<Handle<Blake3, RawBytes>>::from_iri(iri).id())
+        *self.rawbytes.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<Handle<Blake3, RawBytes>>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <Handle<Blake3, RawBytes> as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn i256be(&mut self, iri: &str) -> Id {
-        *self
-            .i256be
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::I256BE>::from_iri(iri).id())
+        *self.i256be.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::I256BE>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::I256BE as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn u256be(&mut self, iri: &str) -> Id {
-        *self
-            .u256be
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::U256BE>::from_iri(iri).id())
+        *self.u256be.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::U256BE>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::U256BE as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn r256be(&mut self, iri: &str) -> Id {
-        *self
-            .r256be
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::R256BE>::from_iri(iri).id())
+        *self.r256be.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::R256BE>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::R256BE as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn f64(&mut self, iri: &str) -> Id {
-        *self
-            .f64
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::F64>::from_iri(iri).id())
+        *self.f64.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::F64>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::F64 as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn boolean(&mut self, iri: &str) -> Id {
-        *self
-            .boolean
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<valueschemas::Boolean>::from_iri(iri).id())
+        *self.boolean.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<valueschemas::Boolean>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <valueschemas::Boolean as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn nsduration(&mut self, iri: &str) -> Id {
-        *self
-            .nsduration
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<NsDuration>::from_iri(iri).id())
+        *self.nsduration.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<NsDuration>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <NsDuration as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
     fn nstai(&mut self, iri: &str) -> Id {
-        *self
-            .nstai
-            .entry(iri.to_string())
-            .or_insert_with(|| Attribute::<NsTAIInterval>::from_iri(iri).id())
+        *self.nstai.entry(iri.to_string()).or_insert_with(|| {
+            let h: Value<Handle<Blake3, crate::blob::schemas::iri::IRI>> =
+                String::from(iri).to_blob().get_handle::<Blake3>();
+            Attribute::<NsTAIInterval>::from(entity! {
+                crate::metadata::iri:          h,
+                crate::metadata::value_schema: <NsTAIInterval as crate::metadata::MetaDescribe>::id(),
+            })
+            .id()
+        })
     }
 }
 

@@ -50,9 +50,9 @@ impl<S: ValueSchema> ImportAttribute<S> {
     /// `metadata::name: <handle>` and
     /// `metadata::value_schema: S::id()`. This keeps
     /// `ImportAttribute::from_handle` byte-identical to
-    /// [`crate::attribute::Attribute::from_name`] for the same
-    /// `(name, S)` inputs, which the cross-engine importers and
-    /// test helpers rely on.
+    /// `Attribute::<S>::from(entity!{ metadata::name:, metadata::value_schema: })`
+    /// for the same `(name, S)` inputs, which the cross-engine
+    /// importers and test helpers rely on.
     pub fn from_handle(handle: Value<Handle<Blake3, LongString>>, name: View<str>) -> Self {
         let fragment = entity! {
             metadata::name:         handle,

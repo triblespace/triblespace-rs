@@ -1,5 +1,6 @@
+use triblespace_core::blob::ToBlob;
 use triblespace_core::metadata;
-use triblespace_core::metadata::Describe;
+use triblespace_core::metadata::{Describe, MetaDescribe};
 use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
     attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, Value,
@@ -17,10 +18,16 @@ fn attributes_macro_accepts_hex_and_derived_ids() {
     let expected_fixed = Id::from_hex("11111111111111111111111111111111").expect("valid hex id");
     assert_eq!(fixed.id(), expected_fixed);
 
-    let expected_derived = Attribute::<ShortString>::from_name("derived");
+    let expected_derived = Attribute::<ShortString>::from(entity! {
+        metadata::name:         "derived".to_blob().get_handle::<Blake3>(),
+        metadata::value_schema: <ShortString as MetaDescribe>::id(),
+    });
     assert_eq!(derived.id(), expected_derived.id());
 
-    let expected_private = Attribute::<ShortString>::from_name("private");
+    let expected_private = Attribute::<ShortString>::from(entity! {
+        metadata::name:         "private".to_blob().get_handle::<Blake3>(),
+        metadata::value_schema: <ShortString as MetaDescribe>::id(),
+    });
     assert_eq!(private.id(), expected_private.id());
 }
 
