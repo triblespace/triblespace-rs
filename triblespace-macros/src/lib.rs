@@ -316,12 +316,8 @@ pub fn attributes(input: TokenStream) -> TokenStream {
         emit_attribute_definitions(context)
     });
     let base_path: TokenStream2 = quote!(::triblespace::core);
-    // Route entity!{} through the umbrella's own re-export so the
-    // expansion uses ::triblespace::core paths, not ::triblespace_core
-    // (which wouldn't be in scope for downstream consumers).
-    let macros_path: TokenStream2 = quote!(::triblespace::macros);
     let tokens = TokenStream2::from(input);
-    match attributes_impl(tokens, &base_path, &macros_path) {
+    match attributes_impl(tokens, &base_path) {
         Ok(ts) => TokenStream::from(ts),
         Err(e) => e.to_compile_error().into(),
     }

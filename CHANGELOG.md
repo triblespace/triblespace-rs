@@ -129,15 +129,17 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   metadata::source_module)` → usage id; `metadata::name`,
   `metadata::tag: KIND_ATTRIBUTE_USAGE`, optional
   `metadata::description` under the usage id).
-- **`triblespace_macros_common::attributes_impl`** gains a
-  `macros_path` parameter (separate from `base_path`) so the
-  generated code can route `entity!{}` calls through the
-  caller's own re-export — required because for downstream
-  consumers `::triblespace::core::macros::entity!` resolves to
-  the inner `triblespace_core_macros::entity!` (which uses
-  `::triblespace_core` paths the consumer doesn't have in scope),
-  while `::triblespace::macros::entity!` is the umbrella's
-  `::triblespace::core`-path variant.
+- **`attributes_impl` no longer invokes a sibling proc-macro for
+  `entity!{}` expansions**. It calls `entity_impl` (same crate)
+  directly, expanding to a `TokenStream2` with the
+  `attributes_impl` caller's own `base_path`. The two macro shims
+  (`triblespace_core_macros::attributes` →
+  `::triblespace_core` paths; `triblespace_macros::attributes` →
+  `::triblespace::core` paths) keep working as before, but
+  attribute declarations no longer emit *N* inner `emit_metadata`
+  invocation records per `attributes!{}` block — only the outer
+  user-facing macro invocation gets recorded by the metadata
+  emitter.
 - **`ImportAttribute::<S>::from_handle(handle, name)`** still uses
   `metadata::name + metadata::value_schema` via `entity!`. It stays
   byte-identical to the inlined name-derivation pattern above.
