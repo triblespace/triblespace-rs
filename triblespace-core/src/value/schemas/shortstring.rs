@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -42,16 +42,12 @@ pub enum ValidationError {
 /// If the string is exactly 32 bytes, then there is no zero terminator.
 pub struct ShortString;
 
-impl ConstId for ShortString {
-    const ID: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
-}
-
-impl ConstDescribe for ShortString {
+impl MetaDescribe for ShortString {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
         let description = blobs.put(
             "UTF-8 string stored inline in 32 bytes with NUL termination and zero padding. Keeping the bytes inside the value makes the string sortable and queryable without an extra blob lookup.\n\nUse for short labels, enum-like names, and keys that must fit in the value boundary. For longer or variable text, store a LongString blob and reference it with a Handle.\n\nInterior NUL bytes are invalid and the maximum length is 32 bytes. The schema stores raw bytes, so it does not account for grapheme width or display columns.",
         )?;

@@ -3,6 +3,7 @@
 //! This namespace is used to bootstrap the meaning of other namespaces.
 //! It defines meta attributes that are used to describe other attributes.
 
+use crate::blob::MemoryBlobStore;
 use crate::blob::schemas::iri::IRI;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::wasmcode::WasmCode;
@@ -11,61 +12,80 @@ use crate::id_hex;
 use crate::prelude::valueschemas;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::value::schemas::hash;
 use crate::value::schemas::hash::Blake3;
 use core::marker::PhantomData;
 use triblespace_core_macros::attributes;
 
-/// Emits metadata that can be used for documentation or discovery.
+/// Describes a runtime *instance* — emits metadata about a specific value (an
+/// `Attribute<S>` with its id+name+usage, etc.). For describing a Rust *type*
+/// itself (schema metadata for `ShortString`, `Handle<H,T>`, …) use
+/// [`MetaDescribe`].
 pub trait Describe {
-    /// Produces a [`Fragment`] describing this item, storing any long-form
+    /// Produces a [`Fragment`] describing this instance, storing any long-form
     /// content as blobs.
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>;
+
+    /// Returns the id of this instance.
+    ///
+    /// Default: derive from `describe(&mut scratch).root()`, paying a transient
+    /// scratch [`MemoryBlobStore`] allocation. Override when the id is already
+    /// cached on the instance (e.g. `Attribute<S>` caches the raw bytes).
+    fn id(&self) -> Id {
+        let mut scratch = MemoryBlobStore::new();
+        let frag = self
+            .describe(&mut scratch)
+            .expect("MemoryBlobStore put is infallible");
+        frag.root()
+            .expect("describe returns a rooted fragment")
+    }
 }
 
-/// Helper trait for types with a stable compile-time identifier.
-pub trait ConstId {
-    /// The stable 128-bit identifier for this type.
-    const ID: Id;
-}
-
-/// Helper trait for schema types that want to expose metadata without requiring an instance.
-pub trait ConstDescribe: ConstId {
+/// Describes a Rust *type* — emits schema metadata about the type itself
+/// without needing an instance (`ShortString`, `Handle<H,T>`, …). For
+/// describing a runtime value use [`Describe`].
+pub trait MetaDescribe {
     /// Produces a [`Fragment`] describing this schema type.
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: BlobStore<Blake3>,
-    {
-        let _ = blobs;
-        Ok(Fragment::rooted(Self::ID, TribleSet::new()))
+        B: BlobStore<Blake3>;
+
+    /// Returns the id of this type.
+    ///
+    /// Default: derive from `describe(&mut scratch).root()`. Impls choose
+    /// whether the id is *explicit* (an `entity!{ &id_hex @ … }` form inside
+    /// describe) or *derived* (no `@`, intrinsic id from the facts) — either
+    /// way the default reads the root the fragment carries.
+    ///
+    /// Impls **must not** call `Self::id()` from inside their `describe`
+    /// body — that would recurse through this default. Use the literal id
+    /// directly in describe() or rely on no-`@` intrinsic derivation.
+    ///
+    /// No caching: each call re-runs describe + root. If id() becomes a hot
+    /// path, layer a `TypeId`-keyed cache on top from the call site.
+    fn id() -> Id {
+        let mut scratch = MemoryBlobStore::new();
+        let frag = <Self as MetaDescribe>::describe(&mut scratch)
+            .expect("MemoryBlobStore put is infallible");
+        frag.root()
+            .expect("describe returns a rooted fragment")
     }
 }
 
 impl<S> Describe for PhantomData<S>
 where
-    S: ConstDescribe,
+    S: MetaDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        <S as ConstDescribe>::describe(blobs)
+        <S as MetaDescribe>::describe(blobs)
     }
-}
 
-impl<T> Describe for T
-where
-    T: ConstDescribe,
-{
-    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        <T as ConstDescribe>::describe(blobs)
-    }
+    // id() uses the default (describe + root).
 }
 
 // namespace constants

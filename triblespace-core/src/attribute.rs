@@ -66,37 +66,6 @@ impl AttributeUsage {
         self
     }
 
-    fn usage_id(&self, attribute_id: crate::id::Id) -> crate::id::Id {
-        // Identity-determining facts: the attribute this usage
-        // describes, and (optionally) which source module the usage
-        // lives in. Module-path bytes are content-addressed via the
-        // same LongString-blob hash describe() emits as
-        // `metadata::source_module`, so usage_id and describe()'s
-        // emitted fact agree on the handle value byte-for-byte.
-        //
-        // describe() then attaches annotation facts (name,
-        // description, the redundant attribute link, tag) under
-        // this id via explicit `&id @ ...` entity!-form, which
-        // doesn't re-derive the id.
-        let fragment = match self.source {
-            Some(src) => {
-                let module_handle = String::from(src.module_path)
-                    .to_blob()
-                    .get_handle::<Blake3>();
-                entity! {
-                    metadata::attribute:     attribute_id,
-                    metadata::source_module: module_handle,
-                }
-            }
-            None => entity! {
-                metadata::attribute: attribute_id,
-            },
-        };
-        fragment
-            .root()
-            .expect("entity! without `@` always emits a rooted fragment")
-    }
-
     fn describe<B>(
         &self,
         blobs: &mut B,
@@ -105,28 +74,48 @@ impl AttributeUsage {
     where
         B: crate::repo::BlobStore<Blake3>,
     {
-        let mut tribles = TribleSet::new();
-        let usage_id = self.usage_id(attribute_id);
+        // Step 1: entity core — the facts that determine this usage's
+        // identity. The attribute it describes, plus (optionally) which
+        // source module the usage lives in. Module-path bytes go through
+        // `blobs.put` here just like in the annotations below; both paths
+        // produce the same `Handle<Blake3, LongString>` handle bytes by
+        // content addressing, so the core's intrinsic id is stable
+        // whether the same usage is computed standalone or as part of a
+        // larger description.
+        let module_handle = if let Some(src) = self.source {
+            Some(blobs.put(src.module_path)?)
+        } else {
+            None
+        };
+        let mut fragment = match module_handle {
+            Some(handle) => entity! {
+                metadata::attribute:     attribute_id,
+                metadata::source_module: handle,
+            },
+            None => entity! {
+                metadata::attribute: attribute_id,
+            },
+        };
+        let usage_id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
         let usage_entity = ExclusiveId::force_ref(&usage_id);
 
-        tribles += entity! { &usage_entity @ metadata::name: blobs.put(self.name)? };
+        // Step 2: annotate the core with descriptive facts.
+        let name_handle = blobs.put(self.name)?;
+        fragment += entity! { &usage_entity @ metadata::name: name_handle };
 
         if let Some(description) = self.description {
             let description_handle = blobs.put(description)?;
-            tribles += entity! { &usage_entity @ metadata::description: description_handle };
+            fragment += entity! { &usage_entity @ metadata::description: description_handle };
         }
 
-        if let Some(source) = self.source {
-            let module_handle = blobs.put(source.module_path)?;
-            tribles += entity! { &usage_entity @ metadata::source_module: module_handle };
-        }
-
-        tribles += entity! { &usage_entity @
+        fragment += entity! { &usage_entity @
             metadata::attribute: GenId::value_from(attribute_id),
             metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
         };
 
-        Ok(Fragment::rooted(usage_id, tribles))
+        Ok(fragment)
     }
 }
 /// A typed reference to an attribute id together with its value schema.
@@ -236,7 +225,7 @@ impl<S: ValueSchema> Attribute<S> {
         let field_handle = String::from(name).to_blob().get_handle::<Blake3>();
         let fragment = entity! {
             metadata::name:         field_handle,
-            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+            metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
         };
         let id = fragment
             .root()
@@ -269,7 +258,7 @@ impl<S: ValueSchema> Attribute<S> {
         > = String::from(iri).to_blob().get_handle::<Blake3>();
         let fragment = entity! {
             metadata::iri:          iri_handle,
-            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+            metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
         };
         let id = fragment
             .root()
@@ -289,7 +278,7 @@ impl<S: ValueSchema> Attribute<S> {
 
 impl<S> Describe for Attribute<S>
 where
-    S: ValueSchema + crate::metadata::ConstDescribe,
+    S: ValueSchema + crate::metadata::MetaDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
@@ -302,13 +291,13 @@ where
             tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstId>::ID) };
+        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::MetaDescribe>::id()) };
 
         if let Some(usage) = self.usage {
             tribles += usage.describe(blobs, id)?;
         }
 
-        tribles += <S as crate::metadata::ConstDescribe>::describe(blobs)?.into_facts();
+        tribles += <S as crate::metadata::MetaDescribe>::describe(blobs)?.into_facts();
 
         Ok(Fragment::rooted(id, tribles))
     }

@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -27,10 +27,6 @@ pub struct InvalidBoolean;
 /// scanning large collections of flags.
 pub struct Boolean;
 
-impl ConstId for Boolean {
-    const ID: Id = id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5");
-}
-
 impl Boolean {
     fn encode(flag: bool) -> Value<Self> {
         if flag {
@@ -51,12 +47,12 @@ impl Boolean {
     }
 }
 
-impl ConstDescribe for Boolean {
+impl MetaDescribe for Boolean {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("73B414A3E25B0C0F9E4D6B0694DC33C5");
         let description = blobs.put(
             "Boolean stored as all-zero bytes for false and all-0xFF bytes for true. The encoding uses the full 32-byte value, making the two states obvious and cheap to test.\n\nUse for simple flags and binary states. Represent unknown or missing data by omitting the trible rather than inventing a third sentinel value.\n\nMixed patterns are invalid and will fail validation. If you need tri-state or richer states, model it explicitly (for example with ShortString or a dedicated entity).",
         )?;

@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -27,10 +27,6 @@ use num_rational::Ratio;
 /// For a big-endian version, see [R256BE].
 pub struct R256LE;
 
-impl ConstId for R256LE {
-    const ID: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
-}
-
 /// A 256-bit ratio value.
 /// It is stored as two 128-bit signed integers, the numerator and the denominator.
 /// The ratio is always reduced to its canonical form, which mean that the numerator and the denominator
@@ -41,19 +37,15 @@ impl ConstId for R256LE {
 /// For a little-endian version, see [R256LE].
 pub struct R256BE;
 
-impl ConstId for R256BE {
-    const ID: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
-}
-
 /// A type alias for the default (little-endian) variant of the 256-bit ratio schema.
 pub type R256 = R256LE;
 
-impl ConstDescribe for R256LE {
+impl MetaDescribe for R256LE {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
         let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in little-endian, normalized with a positive denominator. This keeps fractions canonical and comparable.\n\nUse for exact rates, proportions, or unit conversions where rounding is unacceptable. Prefer F64 or F256 when approximate floats are fine or when interfacing with floating-point APIs.\n\nDenominator zero is invalid; the schema expects canonicalized fractions. If you need intervals or ranges instead of ratios, use the range schemas.",
         )?;
@@ -78,12 +70,12 @@ impl ConstDescribe for R256LE {
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
-impl ConstDescribe for R256BE {
+impl MetaDescribe for R256BE {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
         let description = blobs.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
         )?;

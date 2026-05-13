@@ -13,7 +13,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::query::TriblePattern;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
@@ -67,16 +67,12 @@ pub struct SuccinctArchiveBlob;
 
 impl BlobSchema for SuccinctArchiveBlob {}
 
-impl ConstId for SuccinctArchiveBlob {
-    const ID: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
-}
-
-impl ConstDescribe for SuccinctArchiveBlob {
+impl MetaDescribe for SuccinctArchiveBlob {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
         let description = blobs.put(
             "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
         )?;

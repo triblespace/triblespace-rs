@@ -23,7 +23,6 @@ use anybytes::View;
 use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace_core::id::Id;
 use triblespace_core::id_hex;
-use triblespace_core::metadata::ConstId;
 use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
@@ -40,8 +39,16 @@ use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 /// conversion.
 pub enum F32LE {}
 
-impl ConstId for F32LE {
-    const ID: Id = id_hex!("816B4751EA8C12644CCB572F36188EBA");
+impl triblespace_core::metadata::MetaDescribe for F32LE {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("816B4751EA8C12644CCB572F36188EBA"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
 }
 
 impl ValueSchema for F32LE {
@@ -98,17 +105,22 @@ impl TryFromValue<'_, F32LE> for f32 {
 /// [h]: triblespace_core::value::schemas::hash::Handle
 pub struct Embedding {}
 
-impl ConstId for Embedding {
-    const ID: Id = id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B");
-}
-
 impl BlobSchema for Embedding {}
 
-// ConstDescribe uses the default impl (an empty metadata
-// fragment keyed on the schema's ConstId) — it just has to
-// exist so `attributes!` can declare attributes whose value
-// type is `Handle<Blake3, Embedding>`.
-impl triblespace_core::metadata::ConstDescribe for Embedding {}
+// MetaDescribe emits an empty metadata fragment keyed on the
+// schema's id — it just has to exist so `attributes!` can
+// declare attributes whose value type is `Handle<Blake3, Embedding>`.
+impl triblespace_core::metadata::MetaDescribe for Embedding {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            triblespace_core::id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
+}
 
 /// Shorthand for the most common embedding-handle value schema:
 /// `Handle<Blake3, Embedding>`. Use in trible attributes, in

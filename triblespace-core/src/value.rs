@@ -6,7 +6,10 @@
 //!
 //! ```
 //! use triblespace_core::value::{Value, ValueSchema, ToValue, TryFromValue};
-//! use triblespace_core::metadata::ConstId;
+//! use triblespace_core::metadata::MetaDescribe;
+//! use triblespace_core::trible::{Fragment, TribleSet};
+//! use triblespace_core::repo::BlobStore;
+//! use triblespace_core::value::schemas::hash::Blake3;
 //! use triblespace_core::id::Id;
 //! use triblespace_core::macros::id_hex;
 //! use std::convert::{TryInto, Infallible};
@@ -16,9 +19,14 @@
 //! // Note that makes our example easier, as we don't have to worry about sign-extension or padding bytes.
 //! pub struct MyNumber;
 //!
-//! // Implement the ValueSchema trait for the schema type.
-//! impl ConstId for MyNumber {
-//!    const ID: Id = id_hex!("345EAC0C5B5D7D034C87777280B88AE2");
+//! // The schema's identity hex lives inline in its describe body — that's
+//! // the only place it appears; callers reach the id via MyNumber::id().
+//! impl MetaDescribe for MyNumber {
+//!    fn describe<B>(_blobs: &mut B) -> Result<Fragment, B::PutError>
+//!    where B: BlobStore<Blake3>,
+//!    {
+//!        Ok(Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new()))
+//!    }
 //! }
 //! impl ValueSchema for MyNumber {
 //!    type ValidationError = ();
@@ -77,7 +85,7 @@
 /// Built-in value schema types and their conversion implementations.
 pub mod schemas;
 
-use crate::metadata::ConstId;
+use crate::metadata::MetaDescribe;
 
 use core::fmt;
 use std::borrow::Borrow;
@@ -310,7 +318,7 @@ impl<T: ValueSchema> Debug for Value<T> {
 ///
 /// See the [value](crate::value) module for more information.
 /// See the [BlobSchema](crate::blob::BlobSchema) trait for the counterpart trait for blobs.
-pub trait ValueSchema: ConstId + Sized + 'static {
+pub trait ValueSchema: MetaDescribe + Sized + 'static {
     /// The error type returned by [`validate`](ValueSchema::validate).
     /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;

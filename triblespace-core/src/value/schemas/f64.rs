@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -19,16 +19,12 @@ use std::fmt;
 /// A value schema for an IEEE-754 double in little-endian byte order.
 pub struct F64;
 
-impl ConstId for F64 {
-    const ID: Id = id_hex!("C80A60F4A6F2FBA5A8DB2531A923EC70");
-}
-
-impl ConstDescribe for F64 {
+impl MetaDescribe for F64 {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("C80A60F4A6F2FBA5A8DB2531A923EC70");
         let description = blobs.put(
             "IEEE-754 double stored in the first 8 bytes (little-endian); remaining bytes are zero. This matches the standard host representation while preserving the 32-byte value width.\n\nUse for typical metrics, measurements, and calculations where floating-point rounding is acceptable. Choose F256 for higher precision or lossless JSON number import, and R256 for exact rational values.\n\nNaN and infinity can be represented; decide whether your application accepts them. If you need deterministic ordering or exact comparisons, prefer integer or rational schemas.",
         )?;

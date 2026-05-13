@@ -5,10 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.39.0] - 2026-05-11
+## [0.39.0] - 2026-05-13
 
-The canonical-attribute-id + origin-typed-identity release. Two
-related cleanups:
+The canonical-attribute-id + origin-typed-identity + metadata-trait
+unification release. Three related cleanups:
+
+3. **`ConstId` + `ConstDescribe` collapsed into `MetaDescribe`** (renamed
+   from interim `TypeDescribe`). The schema id is now `describe(scratch)
+   .root()` — one trait, one method, no separate identity trait. Every
+   schema's identity-determining hex literal lives inline in its
+   `MetaDescribe::describe` body. `const_blake3` (which existed to derive
+   `Handle<H,T>::ID` and `Array<T>::ID` at compile time from `H::ID` /
+   `T::ID`) is no longer needed: those types now derive their ids at
+   runtime via the *entity-core* pattern (no-`@` `entity!` over a
+   minimal identity-determining fact set; the fragment's intrinsic root
+   IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4 ("Entity
+   Core") for the mental model.
+
+The canonical-attribute-id + origin-typed-identity cleanups:
 
 1. **Dynamic-name attribute id derivation** now goes through the
    same `entity!{...}.root()` mechanism every other entity uses,
@@ -66,6 +80,40 @@ related cleanups:
   predicate URI imports (was `from_name`). Net effect: RDF-imported
   attribute ids change to new values that ALSO differ from JSON
   field name-derived ids on the same byte content.
+- **`ConstId` trait removed.** Every schema's identity-determining
+  hex literal moves from `impl ConstId for X { const ID: Id =
+  id_hex!("…"); }` to an inline `let id: Id = id_hex!("…");` inside
+  its `MetaDescribe::describe` body. Callers reach the id via
+  `T::id()` (default = `T::describe(scratch).root()`).
+- **`ConstDescribe` renamed to `MetaDescribe`.** The trait emits
+  facts in the `metadata::*` namespace; the new name signals the
+  intent rather than the call shape. Mechanical rename — same method
+  signature, same default `id()` derivation.
+- **`HashProtocol` super-trait now `+ MetaDescribe`** (was `+
+  ConstDescribe + ConstId`). The id flows through describe like
+  every other schema; the bound stops conflating "I have a stable
+  identifier" with "I implement a digest function".
+- **`ValueSchema` and `BlobSchema` super-traits now `+ MetaDescribe`**
+  (was `+ ConstId`). Schemas must describe themselves; the id is a
+  property of that description, not a separate trait method.
+- **`Handle<H,T>::describe` and `Array<T>::describe` use the
+  entity-core split** — emit a minimal identity-determining fact
+  set first (no `@`, intrinsic root = id), then attach annotations
+  via `&id @ …`. Adding documentation no longer rotates the schema
+  id. Net effect: `Handle<Blake3, LongString>::id()` and similar
+  derived-id schemas have *new* id values vs. 0.38.0's `const_blake3`
+  hashes. Re-ingest is required (consistent with the 0.39 attribute-
+  id break above).
+- **`const_blake3` workspace crate dropped.** Was a `triblespace-core`
+  dep purely for compile-time `Handle`/`Array` id derivation;
+  superseded by the runtime entity-core path. Both the workspace
+  member entry and the path dependency are gone; the `const-blake3/`
+  directory itself is left on disk and can be deleted in a follow-up.
+- **`AttributeUsage::usage_id` private helper removed.** The
+  identity-determining core (`metadata::attribute` + optional
+  `metadata::source_module`) is now built inline at the top of
+  `AttributeUsage::describe` and the annotations attach under its
+  derived root. One source of truth for both id and description.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"

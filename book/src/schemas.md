@@ -74,8 +74,8 @@ impl TryFromValue<'_, ShortString> for Username {
 
 ### Schema identifiers
 
-Every schema declares a unique 128‑bit identifier via the shared
-`ConstId::ID` constant (for example, `<ShortString as ConstId>::ID`).
+Every schema declares a unique 128‑bit identifier, accessible via the
+`MetaDescribe::id` method (for example, `ShortString::id()`).
 Persisting these IDs keeps serialized data self describing so other tooling can
 make sense of the payload without linking against your Rust types. Dynamic
 language bindings (like the Python crate) inspect the stored schema identifier
@@ -113,13 +113,13 @@ The crate provides the following value schemas out of the box:
 
 ```rust
 # use triblespace::prelude::*;
-use triblespace::core::metadata::ConstId;
+use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::schemas::shortstring::ShortString;
 use triblespace::core::value::{ToValue, ValueSchema};
 
 let v: Value<ShortString> = "hi".to_value();
 let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
-let schema_id = <ShortString as ConstId>::ID;
+let schema_id = ShortString::id(); // derived via describe(&mut scratch).root()
 ```
 
 ## Built‑in blob schemas
@@ -138,16 +138,16 @@ The crate also ships with these blob schemas:
 - `UnknownBlob` for data of unknown type.
 
 ```rust
-use triblespace::core::metadata::ConstId;
+use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::{Blob, BlobSchema, ToBlob};
 
 let b: Blob<LongString> = "example".to_blob();
-let schema_id = <LongString as ConstId>::ID;
+let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
 ```
 
 Both value and blob schemas can emit optional discovery metadata. Calling
-`ConstDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
+`MetaDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
 whose facts tag the schema entity with `metadata::KIND_VALUE_SCHEMA` or
 `metadata::KIND_BLOB_SCHEMA` and may attach a `metadata::name` and
 `metadata::description` (LongString handles). Persist the description blobs
@@ -275,7 +275,7 @@ The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
 
 The core crate can optionally ship built-in formatters for its built-in value
 schemas. Enable the `wasm` feature to have
-`ConstDescribe::describe` (which is fallible) attach `metadata::value_formatter` entries for the
+`MetaDescribe::describe` (which is fallible) attach `metadata::value_formatter` entries for the
 standard schemas. This feature requires the `wasm32-unknown-unknown` Rust
 target at build time because the bundled formatters are compiled to WebAssembly
 via the `#[value_formatter]` proc macro.

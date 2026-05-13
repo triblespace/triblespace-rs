@@ -19,7 +19,6 @@ features = ["proptest"]
 
 [workspace]
 members = [
-    "const-blake3",
     "triblespace-core",
     "triblespace-core-macros",
     "triblespace-macros",

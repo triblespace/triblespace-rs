@@ -4,7 +4,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
@@ -30,7 +30,7 @@ use std::marker::PhantomData;
 /// pre-stable and its pinned `digest` dependency conflicts with other
 /// iroh-ecosystem crates. Defining a minimal trait here keeps
 /// triblespace-core dep-independent from the digest crate entirely.
-pub trait HashProtocol: Clone + Send + 'static + ConstDescribe {
+pub trait HashProtocol: Clone + Send + 'static + MetaDescribe {
     /// Short lowercase name used in serialised representations (e.g. `"blake3"`).
     const NAME: &'static str;
 
@@ -60,17 +60,13 @@ pub struct Hash<H> {
     _hasher: PhantomData<fn(H) -> ()>,
 }
 
-impl<H> ConstId for Hash<H>
+impl<H> MetaDescribe for Hash<H>
 where
     H: HashProtocol,
 {
-    const ID: Id = H::ID;
-}
-
-impl<H> ConstDescribe for Hash<H>
-where
-    H: HashProtocol,
-{
+    // Hash<H>'s schema id IS H's schema id — Hash<H> is the value-schema
+    // facet of the same conceptual entity. describe delegates to H so the
+    // fragment's intrinsic root is H's id.
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -166,12 +162,13 @@ where
     }
 }
 
-fn describe_hash<H, B>(blobs: &mut B) -> Result<Fragment, B::PutError>
+fn describe_hash<H, B>(blobs: &mut B, id: Id) -> Result<Fragment, B::PutError>
 where
     H: HashProtocol,
     B: BlobStore<Blake3>,
 {
-    let id = H::ID;
+    // `id` is passed in by the HashProtocol impl so we don't recurse through
+    // `H::id()` (which would call `H::describe` which would call us back).
     let name = H::NAME;
     let description = blobs.put(format!(
         "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
@@ -239,16 +236,12 @@ impl HashProtocol for Blake3 {
     }
 }
 
-impl ConstId for Blake3 {
-    const ID: Id = id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3");
-}
-
-impl ConstDescribe for Blake3 {
+impl MetaDescribe for Blake3 {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        describe_hash::<Self, B>(blobs)
+        describe_hash::<Self, B>(blobs, id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3"))
     }
 }
 
@@ -290,65 +283,63 @@ impl<H: HashProtocol, T: BlobSchema> From<Value<Handle<H, T>>> for Value<Hash<H>
     }
 }
 
-impl<H: HashProtocol, T: BlobSchema> ConstId for Handle<H, T> {
-    const ID: Id = {
-        let mut hasher = const_blake3::Hasher::new();
-        hasher.update(&Hash::<H>::ID.raw());
-        hasher.update(&T::ID.raw());
-        let mut digest = [0u8; 32];
-        hasher.finalize(&mut digest);
-        let mut raw = [0u8; 16];
-        let mut i = 0;
-        while i < raw.len() {
-            raw[i] = digest[16 + i];
-            i += 1;
-        }
-        match Id::new(raw) {
-            Some(id) => id,
-            None => panic!("derived handle schema id must be non-nil"),
-        }
-    };
-}
-
-impl<H, T> ConstDescribe for Handle<H, T>
+impl<H, T> MetaDescribe for Handle<H, T>
 where
     H: HashProtocol,
-    T: BlobSchema + ConstDescribe,
+    T: BlobSchema + MetaDescribe,
 {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        // Step 1: entity core — *only* the facts that determine identity.
+        // The hash_schema + blob_schema pair distinguishes one `Handle<H,T>`
+        // monomorphization from another; reword the name or description and
+        // the id stays stable.
+        let mut fragment = entity! {
+            metadata::blob_schema: T::id(),
+            metadata::hash_schema: H::id(),
+        };
+        let id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
+
+        // Step 2: annotate the core with human-facing facts.
         let name = H::NAME;
-        let schema_id = T::ID;
-        let description = blobs.put(format!(
-            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at blob schema {schema_id:X}. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
+        let description_handle = blobs.put(format!(
+            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at blob schema {schema_id:X}. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail.",
+            schema_id = T::id()
         ))?;
         let name_handle = blobs.put("handle")?;
-        let mut tribles = TribleSet::new();
-        tribles += H::describe(blobs)?;
-        tribles += T::describe(blobs)?;
-
-        tribles += entity! { ExclusiveId::force_ref(&id) @
+        fragment += entity! { ExclusiveId::force_ref(&id) @
             metadata::name: name_handle,
-            metadata::description: description,
-            metadata::blob_schema: schema_id,
-            metadata::hash_schema: H::ID,
+            metadata::description: description_handle,
             metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
         {
-            tribles += entity! { ExclusiveId::force_ref(&id) @
+            fragment += entity! { ExclusiveId::force_ref(&id) @
                 metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
             };
         }
-        Ok(Fragment::rooted(id, tribles))
+
+        // Recursive metadata about the underlying hash and blob schemas —
+        // attached as auxiliary facts (TribleSet level) so their roots
+        // don't expand this fragment's exports.
+        fragment += H::describe(blobs)?.into_facts();
+        fragment += T::describe(blobs)?.into_facts();
+
+        Ok(fragment)
     }
+
+    // id() uses the describe-based default. Handle's describe builds the
+    // core entity first (step 1) and attaches annotations under its root —
+    // the fragment's intrinsic root is the core's id, exactly the schema id
+    // we want.
 }
 
-impl<H: HashProtocol, T: BlobSchema> ValueSchema for Handle<H, T> {
+impl<H: HashProtocol, T: BlobSchema + MetaDescribe> ValueSchema for Handle<H, T> {
     type ValidationError = Infallible;
 }
 

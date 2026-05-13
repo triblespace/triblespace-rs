@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -20,16 +20,12 @@ use std::convert::Infallible;
 #[derive(Debug, Clone, Copy)]
 pub struct LineLocation;
 
-impl ConstId for LineLocation {
-    const ID: Id = id_hex!("DFAED173A908498CB893A076EAD3E578");
-}
-
-impl ConstDescribe for LineLocation {
+impl MetaDescribe for LineLocation {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("DFAED173A908498CB893A076EAD3E578");
         let description = blobs.put(
             "Line/column span encoded as four big-endian u64 values (start_line, start_col, end_line, end_col). This captures explicit source positions rather than byte offsets.\n\nUse for editor diagnostics, source maps, or human-facing spans. If you need byte offsets or length-based ranges, use RangeU128 instead.\n\nColumns are raw counts and do not account for variable-width graphemes. Store any display conventions separately if needed.",
         )?;

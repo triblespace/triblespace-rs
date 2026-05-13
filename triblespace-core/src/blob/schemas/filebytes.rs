@@ -7,7 +7,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -22,16 +22,12 @@ pub struct FileBytes;
 
 impl BlobSchema for FileBytes {}
 
-impl ConstId for FileBytes {
-    const ID: Id = id_hex!("5DE76157AE4FDEA830019916805E80A4");
-}
-
-impl ConstDescribe for FileBytes {
+impl MetaDescribe for FileBytes {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("5DE76157AE4FDEA830019916805E80A4");
         let description = blobs.put(
             "Opaque file bytes captured as a blob. Use when the payload represents a file snapshot (attachments, dataset artifacts, exported archives) and you want to preserve that provenance in the schema rather than treating it as UnknownBlob. The meaning is given by adjacent metadata attributes such as mime type, filename, and dimensions.",
         )?;

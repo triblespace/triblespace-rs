@@ -22,7 +22,7 @@ use anybytes::Bytes;
 use crate::blob::BlobSchema;
 use crate::id::Id;
 use crate::id_hex;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 
 use super::Blob;
 use super::ToBlob;
@@ -37,11 +37,17 @@ use super::TryFromBlob;
 pub struct UnknownBlob;
 impl BlobSchema for UnknownBlob {}
 
-impl ConstId for UnknownBlob {
-    const ID: Id = id_hex!("EAB14005141181B0C10C4B5DD7985F8D");
+impl MetaDescribe for UnknownBlob {
+    fn describe<B>(_blobs: &mut B) -> Result<crate::trible::Fragment, B::PutError>
+    where
+        B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
+    {
+        Ok(crate::trible::Fragment::rooted(
+            id_hex!("EAB14005141181B0C10C4B5DD7985F8D"),
+            crate::trible::TribleSet::new(),
+        ))
+    }
 }
-
-impl ConstDescribe for UnknownBlob {}
 
 impl TryFromBlob<UnknownBlob> for Bytes {
     type Error = std::convert::Infallible;

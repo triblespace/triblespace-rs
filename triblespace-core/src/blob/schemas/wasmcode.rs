@@ -8,7 +8,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -21,16 +21,12 @@ pub struct WasmCode;
 
 impl BlobSchema for WasmCode {}
 
-impl ConstId for WasmCode {
-    const ID: Id = id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52");
-}
-
-impl ConstDescribe for WasmCode {
+impl MetaDescribe for WasmCode {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("DEE50FAD0CFFA4F8FD542DD18D9B7E52");
         let description = blobs.put(
             "WebAssembly bytecode blob for sandboxed helper modules. The modules are expected to be deterministic and import-free, intended for small utilities such as value formatters.\n\nUse when a schema references a formatter via metadata::value_formatter or similar tooling and you want portable, sandboxed code alongside the data. Avoid large or stateful modules; keep the bytecode focused on pure formatting or validation tasks.",
         )?;

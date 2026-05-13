@@ -255,7 +255,7 @@ mod tests {
     use crate::id::Id;
     use crate::macros::pattern;
     use crate::metadata;
-    use crate::metadata::{ConstDescribe, ConstId};
+    use crate::metadata::MetaDescribe;
     use crate::query::find;
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
@@ -302,7 +302,7 @@ mod tests {
         let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
-        let schema_id = crate::value::schemas::shortstring::ShortString::ID;
+        let schema_id = crate::value::schemas::shortstring::ShortString::id();
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
         let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
@@ -373,8 +373,8 @@ mod tests {
         space += ED25519SComponent::describe(&mut store).expect("ed25519 s metadata");
         space += ED25519PublicKey::describe(&mut store).expect("ed25519 pubkey metadata");
         space += UnknownValue::describe(&mut store).expect("unknown metadata");
-        space += <Hash<Blake3> as ConstDescribe>::describe(&mut store).expect("hash metadata");
-        space += <Handle<Blake3, LongString> as ConstDescribe>::describe(&mut store)
+        space += <Hash<Blake3> as MetaDescribe>::describe(&mut store).expect("hash metadata");
+        space += <Handle<Blake3, LongString> as MetaDescribe>::describe(&mut store)
             .expect("handle metadata");
 
         let reader = store.reader().expect("blob reader");
@@ -387,7 +387,7 @@ mod tests {
                 .expect("formatter loaded")
         };
 
-        let boolean = formatter_for(Boolean::ID);
+        let boolean = formatter_for(Boolean::id());
         assert_eq!(
             boolean
                 .format_value_with_limits(&[0u8; 32], limits)
@@ -402,7 +402,7 @@ mod tests {
         );
 
         let id = crate::id::Id::new([1u8; 16]).expect("non-nil id");
-        let genid = formatter_for(GenId::ID);
+        let genid = formatter_for(GenId::id());
         assert_eq!(
             genid
                 .format_value_with_limits(&GenId::value_from(id).raw, limits)
@@ -410,7 +410,7 @@ mod tests {
             "01".repeat(16)
         );
 
-        let shortstring = formatter_for(ShortString::ID);
+        let shortstring = formatter_for(ShortString::id());
         assert_eq!(
             shortstring
                 .format_value_with_limits(&ShortString::value_from("hi").raw, limits)
@@ -418,7 +418,7 @@ mod tests {
             "hi"
         );
 
-        let float64 = formatter_for(F64::ID);
+        let float64 = formatter_for(F64::id());
         assert_eq!(
             float64
                 .format_value_with_limits(&F64::value_from(1.5f64).raw, limits)
@@ -426,14 +426,14 @@ mod tests {
             "1.5"
         );
 
-        let u256le = formatter_for(U256LE::ID);
+        let u256le = formatter_for(U256LE::id());
         assert_eq!(
             u256le
                 .format_value_with_limits(&U256LE::value_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
-        let u256be = formatter_for(U256BE::ID);
+        let u256be = formatter_for(U256BE::id());
         assert_eq!(
             u256be
                 .format_value_with_limits(&U256BE::value_from(42u64).raw, limits)
@@ -441,14 +441,14 @@ mod tests {
             "42"
         );
 
-        let i256le = formatter_for(I256LE::ID);
+        let i256le = formatter_for(I256LE::id());
         assert_eq!(
             i256le
                 .format_value_with_limits(&I256LE::value_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
-        let i256be = formatter_for(I256BE::ID);
+        let i256be = formatter_for(I256BE::id());
         assert_eq!(
             i256be
                 .format_value_with_limits(&I256BE::value_from(-1i8).raw, limits)
@@ -456,14 +456,14 @@ mod tests {
             "-1"
         );
 
-        let r256le = formatter_for(R256LE::ID);
+        let r256le = formatter_for(R256LE::id());
         assert_eq!(
             r256le
                 .format_value_with_limits(&R256LE::value_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
-        let r256be = formatter_for(R256BE::ID);
+        let r256be = formatter_for(R256BE::id());
         assert_eq!(
             r256be
                 .format_value_with_limits(&R256BE::value_from(-3i128).raw, limits)
@@ -471,14 +471,14 @@ mod tests {
             "-3"
         );
 
-        let range_u128 = formatter_for(RangeU128::ID);
+        let range_u128 = formatter_for(RangeU128::id());
         assert_eq!(
             range_u128
                 .format_value_with_limits(&RangeU128::value_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
-        let range_inclusive_u128 = formatter_for(RangeInclusiveU128::ID);
+        let range_inclusive_u128 = formatter_for(RangeInclusiveU128::id());
         assert_eq!(
             range_inclusive_u128
                 .format_value_with_limits(
@@ -489,7 +489,7 @@ mod tests {
             "5..=10"
         );
 
-        let linelocation = formatter_for(LineLocation::ID);
+        let linelocation = formatter_for(LineLocation::id());
         assert_eq!(
             linelocation
                 .format_value_with_limits(
@@ -500,7 +500,7 @@ mod tests {
             "1:2..3:4"
         );
 
-        let f256le = formatter_for(F256LE::ID);
+        let f256le = formatter_for(F256LE::id());
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256le.format_value_with_limits(&raw, limits).unwrap(),
@@ -516,7 +516,7 @@ mod tests {
             "0x1p+2000"
         );
 
-        let f256be = formatter_for(F256BE::ID);
+        let f256be = formatter_for(F256BE::id());
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256be.format_value_with_limits(&raw, limits).unwrap(),
@@ -531,32 +531,32 @@ mod tests {
             "0x1p+2000"
         );
 
-        let ed25519_r = formatter_for(ED25519RComponent::ID);
+        let ed25519_r = formatter_for(ED25519RComponent::id());
         let raw = [0xABu8; 32];
         assert_eq!(
             ed25519_r.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:r:{}", "AB".repeat(32))
         );
 
-        let ed25519_s = formatter_for(ED25519SComponent::ID);
+        let ed25519_s = formatter_for(ED25519SComponent::id());
         assert_eq!(
             ed25519_s.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:s:{}", "AB".repeat(32))
         );
 
-        let ed25519_pk = formatter_for(ED25519PublicKey::ID);
+        let ed25519_pk = formatter_for(ED25519PublicKey::id());
         assert_eq!(
             ed25519_pk.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:pubkey:{}", "AB".repeat(32))
         );
 
-        let unknown = formatter_for(UnknownValue::ID);
+        let unknown = formatter_for(UnknownValue::id());
         assert_eq!(
             unknown.format_value_with_limits(&raw, limits).unwrap(),
             format!("unknown:{}", "AB".repeat(32))
         );
 
-        let hash_formatter = formatter_for(Hash::<Blake3>::ID);
+        let hash_formatter = formatter_for(Hash::<Blake3>::id());
         assert_eq!(
             hash_formatter
                 .format_value_with_limits(&raw, limits)
@@ -564,7 +564,7 @@ mod tests {
             format!("hash:{}", "AB".repeat(32))
         );
 
-        let handle_formatter = formatter_for(Handle::<Blake3, LongString>::ID);
+        let handle_formatter = formatter_for(Handle::<Blake3, LongString>::id());
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter

@@ -49,7 +49,7 @@ pub use crate::id::Id;
 pub use crate::id::IdOwner;
 pub use crate::id::RawId;
 pub use crate::ignore;
-pub use crate::metadata::{ConstDescribe, ConstId, Describe};
+pub use crate::metadata::{Describe, MetaDescribe};
 pub use crate::or;
 pub use crate::query::exists;
 pub use crate::query::find;

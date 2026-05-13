@@ -27,7 +27,6 @@ use std::convert::Infallible;
 
 use triblespace_core::id::Id;
 use triblespace_core::id_hex;
-use triblespace_core::metadata::ConstId;
 use triblespace_core::value::{Value, ValueSchema};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
@@ -37,8 +36,16 @@ use triblespace_core::value::{Value, ValueSchema};
 /// `8868FA39C4CDA947DD4CAA1652C30D06`.
 pub enum WordHash {}
 
-impl ConstId for WordHash {
-    const ID: Id = id_hex!("8868FA39C4CDA947DD4CAA1652C30D06");
+impl triblespace_core::metadata::MetaDescribe for WordHash {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
 }
 
 impl ValueSchema for WordHash {
@@ -52,8 +59,16 @@ impl ValueSchema for WordHash {
 /// `2EC1CAAD948B959D32023EF32D500148`.
 pub enum BigramHash {}
 
-impl ConstId for BigramHash {
-    const ID: Id = id_hex!("2EC1CAAD948B959D32023EF32D500148");
+impl triblespace_core::metadata::MetaDescribe for BigramHash {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("2EC1CAAD948B959D32023EF32D500148"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
 }
 
 impl ValueSchema for BigramHash {
@@ -69,8 +84,16 @@ impl ValueSchema for BigramHash {
 /// `52472B53D201532D7FAA7D89AE80A6ED`.
 pub enum NgramHash {}
 
-impl ConstId for NgramHash {
-    const ID: Id = id_hex!("52472B53D201532D7FAA7D89AE80A6ED");
+impl triblespace_core::metadata::MetaDescribe for NgramHash {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("52472B53D201532D7FAA7D89AE80A6ED"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
 }
 
 impl ValueSchema for NgramHash {

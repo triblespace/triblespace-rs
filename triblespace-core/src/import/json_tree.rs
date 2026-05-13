@@ -17,7 +17,7 @@ use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::import::ImportAttribute;
 use crate::macros::{entity, id_hex};
 use crate::metadata;
-use crate::metadata::{ConstDescribe, Describe};
+use crate::metadata::{MetaDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
@@ -97,10 +97,10 @@ where
             .expect("static JSON attribute names are valid UTF-8")
     };
 
-    metadata += <GenId as ConstDescribe>::describe(blobs)?;
-    metadata += <Boolean as ConstDescribe>::describe(blobs)?;
-    metadata += <U256BE as ConstDescribe>::describe(blobs)?;
-    metadata += <Handle<Blake3, LongString> as ConstDescribe>::describe(blobs)?;
+    metadata += <GenId as MetaDescribe>::describe(blobs)?;
+    metadata += <Boolean as MetaDescribe>::describe(blobs)?;
+    metadata += <U256BE as MetaDescribe>::describe(blobs)?;
+    metadata += <Handle<Blake3, LongString> as MetaDescribe>::describe(blobs)?;
 
     metadata +=
         ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?;

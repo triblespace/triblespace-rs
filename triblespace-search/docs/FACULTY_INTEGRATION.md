@@ -259,16 +259,19 @@ on every call.
 ## Schema-rotation migrations
 
 `triblespace-search` identifies each blob format by a
-`BlobSchema` `ConstId`. A breaking byte-layout change rotates
-that ID. Understanding what that *doesn't* do is important:
+`BlobSchema`'s schema id (the hex literal inlined in its
+`MetaDescribe::describe` body). A breaking byte-layout change
+rotates that ID. Understanding what that *doesn't* do is
+important:
 
-### `ConstId` is metadata, not a runtime type guard
+### The schema id is metadata, not a runtime type guard
 
-`SuccinctBM25Blob::ID` is used by the describe/introspection
-machinery and by derivations like `Handle<H, T>::ID =
-hash(H::ID, T::ID)`. It is **not** checked by
-`try_from_blob` — that dispatches on the Rust type
-parameter. After an ID rotation:
+`SuccinctBM25Blob::id()` is used by the describe/introspection
+machinery and by derived-id schemas like `Handle<H, T>` (whose
+id falls out of `entity!{ blob_schema: T::id(), hash_schema:
+H::id() }.root()`). It is **not** checked by `try_from_blob` —
+that dispatches on the Rust type parameter. After an ID
+rotation:
 
 - `SuccinctBM25Blob` is the same Rust type with the same
   `TryFromBlob` impl.
@@ -293,13 +296,19 @@ our blob schemas — e.g.
 
 ```rust
 struct WikiBm25Handle;
-impl ConstId for WikiBm25Handle { const ID: Id = id_hex!("…"); }
+impl MetaDescribe for WikiBm25Handle {
+    fn describe<B>(_: &mut B) -> Result<Fragment, B::PutError>
+    where B: BlobStore<Blake3>,
+    {
+        Ok(Fragment::rooted(id_hex!("…"), TribleSet::new()))
+    }
+}
 // value type: Handle<Blake3, SuccinctBM25Blob>
 ```
 
-the attribute `ConstId` is your stable contract for
+the attribute's schema id is your stable contract for
 "triples under this attribute hold *this* kind of value."
-When we rotate `SuccinctBM25Blob::ID`, the Rust type the
+When we rotate `SuccinctBM25Blob::id()`, the Rust type the
 attribute's value resolves to has changed underneath, but
 the attribute's own ID hasn't — so old triples are still
 under the same attribute, silently pointing at blobs whose

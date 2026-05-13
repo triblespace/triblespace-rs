@@ -13,10 +13,9 @@ use anybytes::{Bytes, View};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
-use crate::id::Id;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -24,17 +23,19 @@ use crate::value::schemas::hash::Blake3;
 /// Maps a schema element marker to its native Rust type.
 ///
 /// Implement this for zero-sized marker types (e.g. `F32`, `BF16`, `I8`)
-/// that identify an element format. The `ConstId` provides the schema
-/// identity; `Native` provides the actual data type for zerocopy access.
-pub trait ArrayElement: ConstId + 'static {
+/// that identify an element format. `Native` provides the actual data
+/// type for zerocopy access; `MetaDescribe` (super-trait via `BlobSchema`
+/// downstream) provides schema identity.
+pub trait ArrayElement: MetaDescribe + 'static {
     /// The native Rust type for this element.
     type Native: IntoBytes + Immutable + TryFromBytes + KnownLayout + Sync + Send + 'static;
 }
 
 /// A flat array of `T` values in native byte order.
 ///
-/// The blob schema ID is derived at compile time from T's ConstId via
-/// const_blake3, following the same pattern as `Handle<H, S>`.
+/// The blob schema ID is *derived* from describing the schema — including
+/// `T::id()` as `metadata::blob_schema` — so `Array<u8>` and `Array<f32>`
+/// get distinct ids without needing compile-time hashing.
 ///
 /// Shape metadata lives in TribleSpace triples, not in the blob.
 /// Use `View<[T::Native]>` for zero-copy access via `TryFromBlob`.
@@ -42,41 +43,39 @@ pub struct Array<T: ArrayElement>(PhantomData<T>);
 
 impl<T: ArrayElement> BlobSchema for Array<T> {}
 
-impl<T: ArrayElement> ConstId for Array<T> {
-    const ID: Id = {
-        let mut hasher = const_blake3::Hasher::new();
-        hasher.update(b"array:");
-        hasher.update(&T::ID.raw());
-        let mut digest = [0u8; 32];
-        hasher.finalize(&mut digest);
-        let mut raw = [0u8; 16];
-        let mut i = 0;
-        while i < raw.len() {
-            raw[i] = digest[16 + i];
-            i += 1;
-        }
-        match Id::new(raw) {
-            Some(id) => id,
-            None => panic!("derived array schema id must be non-nil"),
-        }
-    };
-}
-
-impl<T: ArrayElement> ConstDescribe for Array<T> {
+impl<T: ArrayElement> MetaDescribe for Array<T> {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
-        Ok(entity! {
-            crate::id::ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("array")?,
-                metadata::description: blobs.put(
-                    "Flat array of typed values in native byte order. \
-                     Shape is stored externally in TribleSpace triples.",
-                )?,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        // Step 1: entity core. The element schema id is the only identity-
+        // determining fact — `Array<u8>` and `Array<f32>` differ in `T::id()`
+        // and so get distinct intrinsic ids. The name / description are
+        // documentation that shouldn't affect identity.
+        let mut fragment = entity! {
+            metadata::blob_schema: T::id(),
+        };
+        let id = fragment
+            .root()
+            .expect("entity! without `@` always emits a rooted fragment");
+
+        // Step 2: annotate the core.
+        let name = blobs.put("array")?;
+        let description = blobs.put(
+            "Flat array of typed values in native byte order. \
+             Shape is stored externally in TribleSpace triples.",
+        )?;
+        fragment += entity! { crate::id::ExclusiveId::force_ref(&id) @
+            metadata::name: name,
+            metadata::description: description,
+            metadata::tag: metadata::KIND_BLOB_SCHEMA,
+        };
+
+        // Fold T's schema metadata in as auxiliary facts (TribleSet level,
+        // not Fragment level) so its root doesn't expand this fragment's
+        // exports.
+        fragment += T::describe(blobs)?.into_facts();
+        Ok(fragment)
     }
 }
 
@@ -100,19 +99,23 @@ impl<T: ArrayElement> TryFromBlob<Array<T>> for Bytes {
 /// Access as `blobschemas::array::F32`, `blobschemas::array::U8`, etc.
 pub mod elements {
     use super::ArrayElement;
-    use crate::id::Id;
-    use crate::metadata::{ConstDescribe, ConstId};
+    use crate::metadata::MetaDescribe;
+    use crate::trible::{Fragment, TribleSet};
+    use crate::value::schemas::hash::Blake3;
 
     macro_rules! impl_array_element {
         ($marker:ident, $native:ty, $id:expr, $doc:expr) => {
             #[doc = $doc]
             pub struct $marker;
 
-            impl ConstId for $marker {
-                const ID: Id = crate::id_hex!($id);
+            impl MetaDescribe for $marker {
+                fn describe<B>(_blobs: &mut B) -> Result<Fragment, B::PutError>
+                where
+                    B: crate::repo::BlobStore<Blake3>,
+                {
+                    Ok(Fragment::rooted(crate::id_hex!($id), TribleSet::new()))
+                }
             }
-
-            impl ConstDescribe for $marker {}
 
             impl ArrayElement for $marker {
                 type Native = $native;

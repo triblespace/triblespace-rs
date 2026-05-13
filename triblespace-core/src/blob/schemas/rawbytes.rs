@@ -7,7 +7,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -28,16 +28,12 @@ pub struct RawBytes;
 
 impl BlobSchema for RawBytes {}
 
-impl ConstId for RawBytes {
-    const ID: Id = id_hex!("4C1BA1EB2FDCC637C2F269A46FCA2398");
-}
-
-impl ConstDescribe for RawBytes {
+impl MetaDescribe for RawBytes {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("4C1BA1EB2FDCC637C2F269A46FCA2398");
         let description = blobs.put(
             "Opaque raw bytes with no further structural interpretation. Used for content where the bytes themselves are the payload (XSD hexBinary / base64Binary literals, inline digests, key material). Distinct from FileBytes (file-provenance) and from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
         )?;

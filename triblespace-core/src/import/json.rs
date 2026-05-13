@@ -22,7 +22,7 @@ use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::import::ImportAttribute;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, Describe};
+use crate::metadata::{MetaDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::{Fragment, Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
@@ -490,10 +490,10 @@ where
     /// encountered so far, suitable for committing alongside the data.
     pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
         let mut meta = Fragment::default();
-        meta += <Boolean as ConstDescribe>::describe(self.store)?;
-        meta += <F64 as ConstDescribe>::describe(self.store)?;
-        meta += <GenId as ConstDescribe>::describe(self.store)?;
-        meta += <Handle<Blake3, LongString> as ConstDescribe>::describe(self.store)?;
+        meta += <Boolean as MetaDescribe>::describe(self.store)?;
+        meta += <F64 as MetaDescribe>::describe(self.store)?;
+        meta += <GenId as MetaDescribe>::describe(self.store)?;
+        meta += <Handle<Blake3, LongString> as MetaDescribe>::describe(self.store)?;
         for (key, attr) in self.bool_attrs.iter() {
             meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {

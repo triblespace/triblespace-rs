@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -29,20 +29,12 @@ pub struct RangeU128;
 #[derive(Debug, Clone, Copy)]
 pub struct RangeInclusiveU128;
 
-impl ConstId for RangeU128 {
-    const ID: Id = id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A");
-}
-
-impl ConstId for RangeInclusiveU128 {
-    const ID: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
-}
-
-impl ConstDescribe for RangeU128 {
+impl MetaDescribe for RangeU128 {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("A4E25E3B92364FA5AB519C6A77D7CB3A");
         let description = blobs.put(
             "Half-open range encoded as two big-endian u128 values (start..end). This mirrors common slice semantics where the end is exclusive.\n\nUse for offsets, byte ranges, and spans where length matters and empty ranges are valid. Use RangeInclusiveU128 when both endpoints should be included.\n\nNo normalization is enforced; callers should ensure start <= end and interpret units consistently.",
         )?;
@@ -69,12 +61,12 @@ impl ValueSchema for RangeU128 {
     type ValidationError = Infallible;
 }
 
-impl ConstDescribe for RangeInclusiveU128 {
+impl MetaDescribe for RangeInclusiveU128 {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("1D0D82CA84424CD0A2F98DB37039E152");
         let description = blobs.put(
             "Inclusive range encoded as two big-endian u128 values (start..=end). This is convenient when both endpoints are meaningful.\n\nUse for closed intervals such as line/column ranges or inclusive numeric bounds. Prefer RangeU128 for half-open intervals and length-based calculations.\n\nCallers should decide how to handle empty or reversed ranges; the schema only defines the byte layout.",
         )?;

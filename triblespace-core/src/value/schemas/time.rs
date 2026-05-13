@@ -3,7 +3,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -30,16 +30,12 @@ use hifitime::prelude::*;
 /// scans on the trie.
 pub struct NsTAIInterval;
 
-impl ConstId for NsTAIInterval {
-    const ID: Id = id_hex!("2170014368272A2B1B18B86B1F1F1CB5");
-}
-
-impl ConstDescribe for NsTAIInterval {
+impl MetaDescribe for NsTAIInterval {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("2170014368272A2B1B18B86B1F1F1CB5");
         let description = blobs.put(
             "Inclusive TAI interval encoded as two offset-big-endian i128 nanosecond bounds. Each i128 is XOR'd with i128::MIN then stored big-endian, so byte-lexicographic order matches numeric order. This enables efficient range scans on ordered indexes.\n\nSemantically identical to the legacy LE encoding — same inclusive bounds, same TAI monotonic time.",
         )?;
@@ -211,16 +207,12 @@ pub struct InvertedIntervalError {
 /// same ns count.
 pub struct NsDuration;
 
-impl ConstId for NsDuration {
-    const ID: Id = id_hex!("951D5249DB193D3B3F208B994B1072C4");
-}
-
-impl ConstDescribe for NsDuration {
+impl MetaDescribe for NsDuration {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("951D5249DB193D3B3F208B994B1072C4");
         let description = blobs.put(
             "Signed nanosecond duration delta encoded as an offset-big-endian i128 in the upper 16 bytes; the lower 16 bytes are reserved (zero today, sub-nanosecond precision in the future). XOR'ing the i128 with i128::MIN before big-endian write makes byte-lexicographic order match numeric order across the full i128 range, so range scans on a sorted trie work natively.",
         )?;

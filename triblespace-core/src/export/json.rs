@@ -6,7 +6,7 @@ use crate::and;
 use crate::blob::schemas::longstring::LongString;
 use crate::id::Id;
 use crate::metadata;
-use crate::metadata::ConstId;
+use crate::metadata::MetaDescribe;
 use crate::prelude::{find, pattern};
 use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;
@@ -175,7 +175,16 @@ fn render_schema_value(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
     out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
-    if schema == Boolean::ID {
+    // Hoisted: id() is not free (re-runs describe per call), so cache the
+    // schema ids this dispatch checks against once per process.
+    use std::sync::LazyLock;
+    static BOOLEAN_ID: LazyLock<Id> = LazyLock::new(Boolean::id);
+    static F64_ID: LazyLock<Id> = LazyLock::new(F64::id);
+    static GENID_ID: LazyLock<Id> = LazyLock::new(GenId::id);
+    static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> =
+        LazyLock::new(Handle::<Blake3, LongString>::id);
+
+    if schema == *BOOLEAN_ID {
         let value = value.transmute::<Boolean>();
         if let Ok(b) = value.try_from_value::<bool>() {
             let _ = out.write_str(if b { "true" } else { "false" });
@@ -184,7 +193,7 @@ fn render_schema_value(
         }
         return Ok(());
     }
-    if schema == F64::ID {
+    if schema == *F64_ID {
         let value = value.transmute::<F64>();
         let number = value.from_value::<f64>();
         if !number.is_finite() {
@@ -200,13 +209,13 @@ fn render_schema_value(
         }
         return Ok(());
     }
-    if schema == GenId::ID {
+    if schema == *GENID_ID {
         if let Ok(child_id) = value.transmute::<GenId>().try_from_value::<Id>() {
             return write_entity(merged, child_id, visited, ctx, out);
         }
         return Ok(());
     }
-    if schema == Handle::<Blake3, LongString>::ID {
+    if schema == *HANDLE_BLAKE3_LONGSTRING_ID {
         let handle = value.transmute::<Handle<Blake3, LongString>>();
         let text = resolve_string(ctx, handle)?;
         write_escaped_str(text.as_ref(), out);

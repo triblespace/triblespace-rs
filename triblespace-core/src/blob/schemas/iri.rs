@@ -7,7 +7,7 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
-use crate::metadata::{ConstDescribe, ConstId};
+use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
@@ -30,16 +30,12 @@ pub struct IRI {}
 
 impl BlobSchema for IRI {}
 
-impl ConstId for IRI {
-    const ID: Id = id_hex!("5AA1EB95B924C388C9057FA94DB7130F");
-}
-
-impl ConstDescribe for IRI {
+impl MetaDescribe for IRI {
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let id = Self::ID;
+        let id: Id = id_hex!("5AA1EB95B924C388C9057FA94DB7130F");
         let description = blobs.put(
             "An Internationalized Resource Identifier (RFC 3987) stored as a blob. \
              Byte layout matches LongString but the distinct schema lets handles \

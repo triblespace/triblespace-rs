@@ -42,7 +42,7 @@ use triblespace_core::blob::schemas::succinctarchive::{
 use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace_core::id::Id;
 use triblespace_core::id_hex;
-use triblespace_core::metadata::{ConstDescribe, ConstId};
+use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::query::Variable;
 use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{RawValue, Value, ValueSchema};
@@ -1258,10 +1258,10 @@ where
 ///
 /// Field order is largest-alignment-first to keep the struct
 /// `repr(C)` padding-free. The crate follows a "no magic, no
-/// version" convention (mirroring
-/// [`triblespace_core::metadata::ConstId`]): any breaking
-/// layout change rotates the [`SuccinctBM25Blob`] schema id
-/// rather than carrying an in-band version field.
+/// version" convention (mirroring triblespace's schema-id
+/// approach): any breaking layout change rotates the
+/// [`SuccinctBM25Blob`] schema id rather than carrying an
+/// in-band version field.
 #[derive(
     Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
 )]
@@ -1729,17 +1729,23 @@ impl std::error::Error for SuccinctLoadError {}
 ///   produced by the shared `ByteArea`).
 pub enum SuccinctBM25Blob {}
 
-impl ConstId for SuccinctBM25Blob {
-    const ID: Id = id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8");
-}
-
 impl BlobSchema for SuccinctBM25Blob {}
 
 // Default `describe` — fragment rooted at `Self::ID` with an
 // empty TribleSet. Lets `attributes!` declare value types like
 // `Handle<Blake3, SuccinctBM25Blob>` without the macro complaining
 // that the schema can't describe itself.
-impl ConstDescribe for SuccinctBM25Blob {}
+impl MetaDescribe for SuccinctBM25Blob {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
+}
 
 impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index<D, T> {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
@@ -1796,13 +1802,19 @@ impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctB
 ///   (suffix-meta, no custom header at all).
 pub enum SuccinctHNSWBlob {}
 
-impl ConstId for SuccinctHNSWBlob {
-    const ID: Id = id_hex!("8DF997D25C15B73EDCEE9E08076F251E");
-}
-
 impl BlobSchema for SuccinctHNSWBlob {}
 
-impl ConstDescribe for SuccinctHNSWBlob {}
+impl MetaDescribe for SuccinctHNSWBlob {
+    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+    where
+        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+    {
+        Ok(triblespace_core::trible::Fragment::rooted(
+            id_hex!("8DF997D25C15B73EDCEE9E08076F251E"),
+            triblespace_core::trible::TribleSet::new(),
+        ))
+    }
+}
 
 impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {

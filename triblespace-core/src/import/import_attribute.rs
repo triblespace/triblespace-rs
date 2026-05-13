@@ -56,7 +56,7 @@ impl<S: ValueSchema> ImportAttribute<S> {
     pub fn from_handle(handle: Value<Handle<Blake3, LongString>>, name: View<str>) -> Self {
         let fragment = entity! {
             metadata::name:         handle,
-            metadata::value_schema: <S as crate::metadata::ConstId>::ID,
+            metadata::value_schema: <S as crate::metadata::MetaDescribe>::id(),
         };
         let id = fragment
             .root()
@@ -92,7 +92,7 @@ where
             tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::name: handle };
         }
 
-        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::ConstId>::ID) };
+        tribles += entity! { ExclusiveId::force_ref(&id) @ metadata::value_schema: GenId::value_from(<S as crate::metadata::MetaDescribe>::id()) };
 
         Ok(Fragment::rooted(id, tribles))
     }
