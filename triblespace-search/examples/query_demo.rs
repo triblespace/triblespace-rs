@@ -8,7 +8,7 @@
 use triblespace_core::id::Id;
 use triblespace_core::macros::find;
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{ToValue, Value};
+use triblespace_core::value::{IntoValue, Value};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
@@ -50,7 +50,7 @@ fn main() {
     // Serialize round-trip — the same bytes end-to-end. With
     // canonical-bytes the index *is* its blob, so the round trip
     // is a refcounted handover (`to_blob` + `try_from_blob`).
-    use triblespace_core::blob::{ToBlob, TryFromBlob};
+    use triblespace_core::blob::{IntoBlob, TryFromBlob};
     let blob = (&idx).to_blob();
     let reloaded: SuccinctBM25Index =
         SuccinctBM25Index::try_from_blob(blob.clone()).expect("valid blob");

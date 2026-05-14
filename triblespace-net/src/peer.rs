@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::{BlobSchema, ToBlob};
+use triblespace_core::blob::{BlobSchema, IntoBlob};
 use triblespace_core::blob::schemas::UnknownBlob;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
@@ -401,7 +401,7 @@ where
     fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Sch>>, Self::PutError>
     where
         Sch: BlobSchema + 'static,
-        T: ToBlob<Sch>,
+        T: IntoBlob<Sch>,
         Handle<Sch>: ValueSchema,
     {
         let handle = self.store.put(item)?;

@@ -12,7 +12,7 @@ use anybytes::view::ViewError;
 use anybytes::{Bytes, View};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use crate::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
+use crate::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -70,8 +70,12 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
 }
 
 /// Store a `Vec<T::Native>` as an `Array<T>` blob (zero-copy via ByteSource).
-impl<T: ArrayElement> ToBlob<Array<T>> for Vec<T::Native> {
-    fn to_blob(self) -> Blob<Array<T>> {
+impl<T: ArrayElement> crate::value::IntoSchema<Array<T>> for Vec<T::Native>
+where
+    crate::value::schemas::hash::Handle<Array<T>>: crate::value::ValueSchema,
+{
+    type Form = Blob<Array<T>>;
+    fn into_schema(self) -> Blob<Array<T>> {
         Blob::new(Bytes::from_source(self))
     }
 }

@@ -12,7 +12,7 @@ use winnow::stream::Stream;
 
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::macros::{entity, id_hex};
 use crate::metadata;
@@ -497,7 +497,7 @@ fn id_from_digest(digest: &[u8]) -> Id {
 mod tests {
     use super::{kind_array_entry, JsonTreeImporter};
     use crate::blob::MemoryBlobStore;
-    use crate::blob::ToBlob;
+    use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::macros::{find, pattern};
     use crate::value::schemas::hash::Blake3;

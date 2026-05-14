@@ -467,7 +467,7 @@ mod tests {
         // Build a fake remote branch metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
         use triblespace_core::repo::branch::branch_unsigned;
-        use triblespace_core::blob::ToBlob;
+        use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::schemas::longstring::LongString;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Value<Handle<LongString>> = store.put(name_blob).unwrap();

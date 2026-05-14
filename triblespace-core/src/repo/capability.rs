@@ -126,7 +126,7 @@ use ed25519_dalek::VerifyingKey;
 use ed25519::signature::Signer;
 
 use crate::blob::Blob;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::blob::schemas::simplearchive::UnarchiveError;
 use crate::id::ExclusiveId;
@@ -135,7 +135,7 @@ use crate::macros::pattern;
 use crate::query::find;
 use crate::trible::TribleSet;
 use crate::value::Value;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::schemas::time::NsTAIInterval;
 
 /// Errors returned by [`build_capability`].
@@ -310,7 +310,7 @@ pub fn build_capability(
 }
 
 /// Convenience: convert a `VerifyingKey` to a `Value<ED25519PublicKey>`.
-/// Inlined to avoid an explicit `ToValue` import at the call sites in
+/// Inlined to avoid an explicit `IntoValue` import at the call sites in
 /// the builder above.
 fn issuer_subject_value(key: VerifyingKey) -> Value<ed::ED25519PublicKey> {
     key.to_value()

@@ -6,7 +6,7 @@
 
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
-use triblespace_core::blob::{Blob, ToBlob};
+use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::id::{genid, Id};
 use triblespace_core::macros::entity;
 use triblespace_core::prelude::BranchStore;

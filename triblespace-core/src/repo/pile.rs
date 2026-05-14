@@ -42,7 +42,7 @@ use zerocopy::TryFromBytes;
 use crate::blob::schemas::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
@@ -877,10 +877,10 @@ impl BlobStorePut for Pile {
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema,
     {
-        let blob = ToBlob::to_blob(item);
+        let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
         let padding = padding_for_blob(blob_size);
         let record_size = BLOB_HEADER_LEN + blob_size + padding;

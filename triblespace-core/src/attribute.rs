@@ -75,31 +75,37 @@ impl<S: ValueSchema> Attribute<S> {
     }
 
     /// Convert a host value into a typed `Value<S>` using the Field's schema.
-    /// This is a small convenience wrapper around the `ToValue` trait and
+    /// This is a small convenience wrapper around the `IntoValue` trait and
     /// simplifies macro expansion: `af.value_from(expr)` preserves the
     /// schema `S` for type inference.
-    pub fn value_from<T: crate::value::ToValue<S>>(&self, v: T) -> crate::value::Value<S> {
-        crate::value::ToValue::to_value(v)
+    pub fn value_from<T: crate::value::IntoValue<S>>(&self, v: T) -> crate::value::Value<S> {
+        crate::value::IntoValue::to_value(v)
     }
 
     /// Macro-side entry point: produce the `(Value<S>, Option<Blob>)`
     /// pair the `entity!{}` codegen folds into a Fragment.
     ///
-    /// Dispatches via [`IntoSchema`] (which produces a `Form` —
-    /// `Value<S>` for inline schemas, `Blob<T>` for handle schemas)
-    /// composed with [`FieldFormFor`] (which expands the form into
-    /// the `(Value, Option<Blob>)` pair). Anchored on `Attribute<S>`
-    /// so the schema parameter `S` is captured for trait resolution.
+    /// Dispatches via [`IntoSchema`], parameterised by the schema's
+    /// [`FieldKind`](crate::value::ValueSchema::FieldKind) — `S`
+    /// itself for inline schemas, the inner `BlobSchema` for
+    /// `Handle<T>`. The resulting `Form` is expanded into the pair
+    /// via [`FieldFormFor`].
     ///
     /// [`IntoSchema`]: crate::value::IntoSchema
     /// [`FieldFormFor`]: crate::value::FieldFormFor
-    pub fn into_field_value<V: crate::value::IntoSchema<S>>(
+    pub fn into_field_value<V>(
         &self,
         v: V,
     ) -> (
         crate::value::Value<S>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
-    ) {
+    )
+    where
+        V: crate::value::IntoSchema<<S as crate::value::ValueSchema>::FieldKind>,
+        <V as crate::value::IntoSchema<
+            <S as crate::value::ValueSchema>::FieldKind,
+        >>::Form: crate::value::FieldFormFor<S>,
+    {
         use crate::value::FieldFormFor;
         v.into_schema().into_field_pair()
     }
@@ -164,7 +170,7 @@ pub use crate::id::RawId as RawIdAlias;
 mod tests {
     use super::*;
     use crate::blob::schemas::longstring::LongString;
-    use crate::blob::ToBlob;
+    use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};

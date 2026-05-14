@@ -221,7 +221,7 @@ fn succinct_bm25_1k_docs_matches_naive() {
     }
 
     // Blob round-trip at this scale — refcounted handover via
-    // `ToBlob` / `TryFromBlob` (`to_bytes` + `try_from_bytes`
+    // `IntoBlob` / `TryFromBlob` (`to_bytes` + `try_from_bytes`
     // retired with the canonical-bytes refactor).
     use triblespace_core::blob::{Blob, TryFromBlob};
     let blob: Blob<triblespace_search::succinct::SuccinctBM25Blob> =

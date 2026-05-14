@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 
 use super::*;
@@ -35,7 +35,7 @@ where
 impl<'a, S: ValueSchema, R, T> Constraint<'a> for SetConstraint<S, R, T>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
     R: Deref<Target = HashSet<T>>,
 {
     fn variables(&self) -> VariableSet {
@@ -53,7 +53,7 @@ where
 
     fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
         if self.variable.index == variable {
-            proposals.extend(self.set.iter().map(|v| ToValue::to_value(v).raw));
+            proposals.extend(self.set.iter().map(|v| IntoValue::to_value(v).raw));
         }
     }
 
@@ -72,7 +72,7 @@ where
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a HashSet<T>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 
@@ -84,7 +84,7 @@ where
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 
@@ -96,7 +96,7 @@ where
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 

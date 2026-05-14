@@ -30,6 +30,7 @@
 //! [`SuccinctGraph`] and the postings sections that *are*
 //! exposed.
 
+use triblespace_core::value::IntoSchema;
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
@@ -39,7 +40,7 @@ use jerky::serialization::Serializable;
 use triblespace_core::blob::schemas::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
-use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -820,7 +821,7 @@ impl SuccinctHNSWIndex {
     /// [`anybytes::ByteArea`], the [`SuccinctHNSWMeta`] header
     /// sits as a typed suffix-section, and the area is frozen
     /// exactly once. The resulting `bytes: Bytes` field is the
-    /// blob — [`ToBlob`] is then an `O(1)` refcounted clone.
+    /// blob — [`IntoBlob`] is then an `O(1)` refcounted clone.
     pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
         let n = idx.doc_count();
         let dim = idx.dim();
@@ -1331,10 +1332,10 @@ pub struct SuccinctBM25Meta {
 /// let hits: Vec<_> = idx.query_term(&fox).collect();
 /// assert_eq!(hits.len(), 2);
 ///
-/// // Persist via ToBlob<SuccinctBM25Blob> — the index *is* its
+/// // Persist via IntoBlob<SuccinctBM25Blob> — the index *is* its
 /// // blob, so this is an O(1) refcounted handover of the
 /// // canonical bytes.
-/// use triblespace_core::blob::ToBlob;
+/// use triblespace_core::blob::IntoBlob;
 /// let blob = (&idx).to_blob();
 /// assert!(blob.bytes.len() > 0);
 /// ```
@@ -1394,7 +1395,7 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// shared [`ByteArea`], the [`SuccinctBM25Meta`] header is
     /// appended as a typed suffix-section, and the area is
     /// frozen exactly once. The resulting `bytes` field is the
-    /// blob — [`ToBlob`] is then an O(1) refcounted clone.
+    /// blob — [`IntoBlob`] is then an O(1) refcounted clone.
     /// Mirrors the `SuccinctArchive` shape (the index *is* its
     /// blob).
     ///
@@ -1712,7 +1713,7 @@ impl std::error::Error for SuccinctLoadError {}
 /// section (keys, doc_lens, terms, postings) lives in one
 /// shared [`anybytes::ByteArea`] and the [`SuccinctBM25Meta`]
 /// header sits at the suffix. The index *is* its blob, so
-/// [`ToBlob`] is an `O(1)` refcounted clone.
+/// [`IntoBlob`] is an `O(1)` refcounted clone.
 ///
 /// Schema id minted fresh via `trible genid`:
 /// `DA527A8FF09A3709B2AC6425CD5AF7A8`. Any breaking layout
@@ -1756,16 +1757,22 @@ impl MetaDescribe for SuccinctBM25Blob {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index<D, T> {
-    fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+impl<D: ValueSchema, T: ValueSchema> IntoSchema<SuccinctBM25Blob> for &SuccinctBM25Index<D, T>
+where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<SuccinctBM25Blob>;
+    fn into_schema(self) -> Blob<SuccinctBM25Blob> {
         // Canonical-bytes pattern: the index *is* its blob, so
         // we just hand over a refcounted clone of the bytes.
         Blob::new(self.bytes.clone())
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
-    fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+impl<D: ValueSchema, T: ValueSchema> IntoSchema<SuccinctBM25Blob> for SuccinctBM25Index<D, T>
+where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<SuccinctBM25Blob>;
+    fn into_schema(self) -> Blob<SuccinctBM25Blob> {
         Blob::new(self.bytes)
     }
 }
@@ -1787,7 +1794,7 @@ impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctB
 /// HNSW blob format — canonical-bytes layout where handles +
 /// graph live in one shared [`anybytes::ByteArea`] and the
 /// [`SuccinctHNSWMeta`] header sits at the suffix. The index
-/// *is* its blob, so [`ToBlob`] is an `O(1)` refcounted clone.
+/// *is* its blob, so [`IntoBlob`] is an `O(1)` refcounted clone.
 /// Embeddings themselves still live as separate blobs in the
 /// pile, referenced by handle.
 ///
@@ -1833,15 +1840,21 @@ impl MetaDescribe for SuccinctHNSWBlob {
     }
 }
 
-impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
-    fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
+impl IntoSchema<SuccinctHNSWBlob> for &SuccinctHNSWIndex
+where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<SuccinctHNSWBlob>;
+    fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
         // Canonical-bytes pattern: refcounted handover.
         Blob::new(self.bytes.clone())
     }
 }
 
-impl ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
-    fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
+impl IntoSchema<SuccinctHNSWBlob> for SuccinctHNSWIndex
+where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<SuccinctHNSWBlob>;
+    fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
         Blob::new(self.bytes)
     }
 }
@@ -2250,7 +2263,7 @@ mod tests {
 
     #[test]
     fn succinct_bm25_blob_schema_round_trip() {
-        use triblespace_core::blob::{ToBlob, TryFromBlob};
+        use triblespace_core::blob::{IntoBlob, TryFromBlob};
         let original = build_succinct_sample();
         let blob: triblespace_core::blob::Blob<SuccinctBM25Blob> = (&original).to_blob();
         let reloaded: SuccinctBM25Index =
@@ -2485,7 +2498,7 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_blob_schema_round_trip() {
-        use triblespace_core::blob::{ToBlob, TryFromBlob};
+        use triblespace_core::blob::{IntoBlob, TryFromBlob};
         let (original, _, _) = build_succinct_hnsw_sample();
         let blob: triblespace_core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
         let reloaded: SuccinctHNSWIndex =

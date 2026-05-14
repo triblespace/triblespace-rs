@@ -9,7 +9,7 @@ use triblespace_core::id::Id;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{Binding, Constraint, Variable, VariableContext};
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{RawValue, ToValue, Value};
+use triblespace_core::value::{RawValue, IntoValue, Value};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;

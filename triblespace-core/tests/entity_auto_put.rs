@@ -1,7 +1,7 @@
 //! `entity!{}` auto-puts `Blob<T>` arguments to handle-typed fields.
 //!
 //! Today `IntoSchema<S>` has two relevant impls: identity for
-//! `Value<S>` (via the blanket from `ToValue<S>`) and put-and-handle
+//! `Value<S>` (via the blanket from `IntoValue<S>`) and put-and-handle
 //! for `Blob<T>` targeting `Handle<H, T>`. The macro calls
 //! `into_field_value` for every field; when the value side carries
 //! `Some(bytes)`, those bytes get absorbed into the entity's
@@ -60,7 +60,7 @@ fn entity_auto_puts_blob_handle_fields() {
 #[test]
 fn entity_still_accepts_precomputed_value() {
     // Passing a precomputed `Value<Handle<LongString>>` still
-    // works via the blanket ToValue→IntoSchema impl. No bytes
+    // works via the blanket IntoValue→IntoSchema impl. No bytes
     // get absorbed (since the caller didn't hand us any), which is
     // the right behaviour — the caller is responsible for making
     // sure the bytes live somewhere else if they want them resolvable.

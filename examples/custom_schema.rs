@@ -2,12 +2,12 @@ use anybytes::Bytes;
 use std::convert::Infallible;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::BlobSchema;
-use triblespace::core::blob::ToBlob;
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::TryFromValue;
-use triblespace::core::value::ToValue;
+use triblespace::core::value::IntoValue;
 use triblespace::core::value::Value;
 use triblespace::core::value::ValueSchema;
 use triblespace::core::value::VALUE_LEN;
@@ -29,7 +29,7 @@ impl ValueSchema for U64LE {
     type ValidationError = Infallible;
 }
 
-impl ToValue<U64LE> for u64 {
+impl IntoValue<U64LE> for u64 {
     fn to_value(self) -> Value<U64LE> {
         let mut raw = [0u8; VALUE_LEN];
         raw[..8].copy_from_slice(&self.to_le_bytes());
@@ -57,7 +57,7 @@ impl MetaDescribe for BytesBlob {
 
 impl BlobSchema for BytesBlob {}
 
-impl ToBlob<BytesBlob> for Bytes {
+impl IntoBlob<BytesBlob> for Bytes {
     fn to_blob(self) -> Blob<BytesBlob> {
         Blob::new(self)
     }

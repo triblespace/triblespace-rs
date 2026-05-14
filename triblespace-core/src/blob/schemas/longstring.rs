@@ -1,6 +1,7 @@
+use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -49,20 +50,29 @@ impl TryFromBlob<LongString> for View<str> {
     }
 }
 
-impl ToBlob<LongString> for View<str> {
-    fn to_blob(self) -> Blob<LongString> {
+impl IntoSchema<LongString> for View<str>
+where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+{
+    type Form = Blob<LongString>;
+    fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.bytes())
     }
 }
 
-impl ToBlob<LongString> for &'static str {
-    fn to_blob(self) -> Blob<LongString> {
+impl IntoSchema<LongString> for &'static str
+where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+{
+    type Form = Blob<LongString>;
+    fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.into())
     }
 }
 
-impl ToBlob<LongString> for String {
-    fn to_blob(self) -> Blob<LongString> {
+impl IntoSchema<LongString> for String
+where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+{
+    type Form = Blob<LongString>;
+    fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.into())
     }
 }
@@ -73,7 +83,7 @@ mod tests {
     use anybytes::View;
 
     use crate::blob::schemas::longstring::LongString;
-    use crate::blob::ToBlob;
+    use crate::blob::IntoBlob;
     use crate::value::schemas::hash::Blake3;
     use crate::value::schemas::hash::Handle;
     use crate::value::Value;

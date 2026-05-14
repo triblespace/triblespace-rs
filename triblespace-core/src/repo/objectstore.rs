@@ -25,7 +25,7 @@ use hex::FromHex;
 use crate::blob::schemas::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
@@ -149,7 +149,7 @@ impl BlobStorePut for ObjectStoreRemote
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema,
     {
         let blob = item.to_blob();

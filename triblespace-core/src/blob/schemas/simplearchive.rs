@@ -1,6 +1,7 @@
+use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -43,8 +44,11 @@ impl MetaDescribe for SimpleArchive {
     }
 }
 
-impl ToBlob<SimpleArchive> for TribleSet {
-    fn to_blob(self) -> Blob<SimpleArchive> {
+impl IntoSchema<SimpleArchive> for TribleSet
+where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::ValueSchema,
+{
+    type Form = Blob<SimpleArchive>;
+    fn into_schema(self) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
         tribles.extend(self.eav.iter_ordered());
         let bytes: Bytes = tribles.into();
@@ -52,8 +56,11 @@ impl ToBlob<SimpleArchive> for TribleSet {
     }
 }
 
-impl ToBlob<SimpleArchive> for &TribleSet {
-    fn to_blob(self) -> Blob<SimpleArchive> {
+impl IntoSchema<SimpleArchive> for &TribleSet
+where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::ValueSchema,
+{
+    type Form = Blob<SimpleArchive>;
+    fn into_schema(self) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
         tribles.extend(self.eav.iter_ordered());
         let bytes: Bytes = tribles.into();

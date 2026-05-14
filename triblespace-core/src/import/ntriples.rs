@@ -82,7 +82,7 @@ use winnow::Parser;
 use crate::attribute::Attribute;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::rawbytes::RawBytes;
-use crate::blob::{Blob, ToBlob};
+use crate::blob::{Blob, IntoBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
 use crate::prelude::valueschemas;
@@ -93,7 +93,7 @@ use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::shortstring::ShortString;
 use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::value::schemas::UnknownValue;
-use crate::value::{RawValue, ToValue, TryToValue, Value};
+use crate::value::{RawValue, IntoValue, TryToValue, Value};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 

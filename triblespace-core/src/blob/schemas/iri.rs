@@ -1,6 +1,7 @@
+use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -23,7 +24,7 @@ use anybytes::View;
 ///
 /// This is the canonical content-addressing schema for RDF
 /// predicate URIs, RDF entity URIs, and any other "globally
-/// identifying string" use case. Construct via [`ToBlob`] impls
+/// identifying string" use case. Construct via [`IntoBlob`] impls
 /// below; see [`parse`] for the validation predicate they use.
 pub struct IRI {}
 
@@ -82,8 +83,11 @@ pub fn looks_like_iri(s: &str) -> bool {
     s.contains(':')
 }
 
-impl ToBlob<IRI> for View<str> {
-    fn to_blob(self) -> Blob<IRI> {
+impl IntoSchema<IRI> for View<str>
+where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+{
+    type Form = Blob<IRI>;
+    fn into_schema(self) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(self.as_ref()),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",
@@ -93,8 +97,11 @@ impl ToBlob<IRI> for View<str> {
     }
 }
 
-impl ToBlob<IRI> for &'static str {
-    fn to_blob(self) -> Blob<IRI> {
+impl IntoSchema<IRI> for &'static str
+where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+{
+    type Form = Blob<IRI>;
+    fn into_schema(self) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(self),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",
@@ -104,8 +111,11 @@ impl ToBlob<IRI> for &'static str {
     }
 }
 
-impl ToBlob<IRI> for String {
-    fn to_blob(self) -> Blob<IRI> {
+impl IntoSchema<IRI> for String
+where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+{
+    type Form = Blob<IRI>;
+    fn into_schema(self) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(&self),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",

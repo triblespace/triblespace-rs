@@ -17,7 +17,7 @@ use winnow::stream::Stream;
 
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::Blob;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::attribute::Attribute;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::macros::entity;
@@ -30,7 +30,7 @@ use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::UnknownValue;
-use crate::value::{RawValue, ToValue, Value, ValueSchema};
+use crate::value::{RawValue, IntoValue, Value, ValueSchema};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
@@ -662,7 +662,7 @@ pub(crate) fn parse_number_common(bytes: &mut Bytes) -> Result<Bytes, JsonImport
 mod tests {
     use super::*;
     use crate::blob::MemoryBlobStore;
-    use crate::blob::ToBlob;
+    use crate::blob::IntoBlob;
     use crate::prelude::Attribute;
     use crate::value::schemas::hash::Blake3;
     use anybytes::View;
@@ -680,7 +680,7 @@ mod tests {
     }
 
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {
-        use crate::blob::ToBlob;
+        use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
         let h: Value<Handle<LongString>> = String::from(expected_attr)
             .to_blob()

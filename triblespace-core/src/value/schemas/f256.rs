@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -53,7 +54,7 @@ impl MetaDescribe for F256LE {
 }
 impl ValueSchema for F256LE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for F256BE {
     fn describe() -> Fragment {
@@ -82,7 +83,7 @@ impl MetaDescribe for F256BE {
 }
 impl ValueSchema for F256BE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 #[cfg(feature = "wasm")]
@@ -275,8 +276,9 @@ impl TryFromValue<'_, F256BE> for f256 {
     }
 }
 
-impl ToValue<F256BE> for f256 {
-    fn to_value(self) -> Value<F256BE> {
+impl IntoSchema<F256BE> for f256 {
+    type Form = Value<F256BE>;
+    fn into_schema(self) -> Value<F256BE> {
         Value::new(self.to_be_bytes())
     }
 }
@@ -288,8 +290,9 @@ impl TryFromValue<'_, F256LE> for f256 {
     }
 }
 
-impl ToValue<F256LE> for f256 {
-    fn to_value(self) -> Value<F256LE> {
+impl IntoSchema<F256LE> for f256 {
+    type Form = Value<F256LE>;
+    fn into_schema(self) -> Value<F256LE> {
         Value::new(self.to_le_bytes())
     }
 }
@@ -341,7 +344,7 @@ impl TryToValue<F256> for &JsonNumber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ToValue, TryToValue};
+    use crate::value::{IntoValue, TryToValue};
     use ::f256::f256;
     use proptest::prelude::*;
 

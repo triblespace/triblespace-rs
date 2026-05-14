@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use crate::blob::schemas::UnknownBlob;
 use crate::blob::BlobSchema;
 use crate::blob::MemoryBlobStore;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::BranchStore;
@@ -31,7 +31,7 @@ impl crate::repo::BlobStorePut for MemoryRepo {
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema,
     {
         self.blobs.put(item)

@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
@@ -9,7 +10,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -79,7 +80,7 @@ mod wasm_formatter {
 }
 impl ValueSchema for GenId {
     type ValidationError = ();
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         if value.raw[0..16] == [0; 16] {
             Ok(value)
@@ -119,8 +120,9 @@ impl TryFromValue<'_, GenId> for RawId {
     }
 }
 
-impl ToValue<GenId> for RawId {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for RawId {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         let mut data = [0; VALUE_LEN];
         data[16..32].copy_from_slice(&self[..]);
         Value::new(data)
@@ -152,16 +154,18 @@ impl TryFromValue<'_, GenId> for Id {
     }
 }
 
-impl ToValue<GenId> for &Id {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for &Id {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         let mut data = [0; VALUE_LEN];
         data[16..32].copy_from_slice(&self[..]);
         Value::new(data)
     }
 }
 
-impl ToValue<GenId> for Id {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for Id {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         (&self).to_value()
     }
 }
@@ -203,14 +207,16 @@ impl<'a> TryFromValue<'a, GenId> for ExclusiveId {
     }
 }
 
-impl ToValue<GenId> for ExclusiveId {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for ExclusiveId {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         self.id.to_value()
     }
 }
 
-impl ToValue<GenId> for &ExclusiveId {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for &ExclusiveId {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         self.id.to_value()
     }
 }
@@ -227,14 +233,16 @@ impl TryFromValue<'_, GenId> for String {
     }
 }
 
-impl ToValue<GenId> for OwnedId<'_> {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for OwnedId<'_> {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         self.id.to_value()
     }
 }
 
-impl ToValue<GenId> for &OwnedId<'_> {
-    fn to_value(self) -> Value<GenId> {
+impl IntoSchema<GenId> for &OwnedId<'_> {
+    type Form = Value<GenId>;
+    fn into_schema(self) -> Value<GenId> {
         self.id.to_value()
     }
 }

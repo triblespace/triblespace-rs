@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -62,7 +63,7 @@ impl MetaDescribe for U256LE {
 }
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for U256BE {
     fn describe() -> Fragment {
@@ -91,7 +92,7 @@ impl MetaDescribe for U256BE {
 }
 impl ValueSchema for U256BE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for I256LE {
     fn describe() -> Fragment {
@@ -120,7 +121,7 @@ impl MetaDescribe for I256LE {
 }
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for I256BE {
     fn describe() -> Fragment {
@@ -149,7 +150,7 @@ impl MetaDescribe for I256BE {
 }
 impl ValueSchema for I256BE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 #[cfg(feature = "wasm")]
@@ -397,8 +398,9 @@ mod wasm_formatter {
     }
 }
 
-impl ToValue<U256BE> for ethnum::U256 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for ethnum::U256 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(self.to_be_bytes())
     }
 }
@@ -410,8 +412,9 @@ impl TryFromValue<'_, U256BE> for ethnum::U256 {
     }
 }
 
-impl ToValue<U256LE> for ethnum::U256 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for ethnum::U256 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(self.to_le_bytes())
     }
 }
@@ -423,8 +426,9 @@ impl TryFromValue<'_, U256LE> for ethnum::U256 {
     }
 }
 
-impl ToValue<I256BE> for ethnum::I256 {
-    fn to_value(self) -> Value<I256BE> {
+impl IntoSchema<I256BE> for ethnum::I256 {
+    type Form = Value<I256BE>;
+    fn into_schema(self) -> Value<I256BE> {
         Value::new(self.to_be_bytes())
     }
 }
@@ -436,8 +440,9 @@ impl TryFromValue<'_, I256BE> for ethnum::I256 {
     }
 }
 
-impl ToValue<I256LE> for ethnum::I256 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for ethnum::I256 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(self.to_le_bytes())
     }
 }
@@ -449,116 +454,135 @@ impl TryFromValue<'_, I256LE> for ethnum::I256 {
     }
 }
 
-impl ToValue<U256LE> for u8 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for u8 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<U256LE> for u16 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for u16 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<U256LE> for u32 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for u32 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<U256LE> for u64 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for u64 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<U256LE> for u128 {
-    fn to_value(self) -> Value<U256LE> {
+impl IntoSchema<U256LE> for u128 {
+    type Form = Value<U256LE>;
+    fn into_schema(self) -> Value<U256LE> {
         Value::new(ethnum::U256::new(self).to_le_bytes())
     }
 }
 
-impl ToValue<U256BE> for u8 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for u8 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<U256BE> for u16 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for u16 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<U256BE> for u32 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for u32 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<U256BE> for u64 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for u64 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<U256BE> for u128 {
-    fn to_value(self) -> Value<U256BE> {
+impl IntoSchema<U256BE> for u128 {
+    type Form = Value<U256BE>;
+    fn into_schema(self) -> Value<U256BE> {
         Value::new(ethnum::U256::new(self).to_be_bytes())
     }
 }
 
-impl ToValue<I256LE> for i8 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for i8 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<I256LE> for i16 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for i16 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<I256LE> for i32 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for i32 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<I256LE> for i64 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for i64 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
-impl ToValue<I256LE> for i128 {
-    fn to_value(self) -> Value<I256LE> {
+impl IntoSchema<I256LE> for i128 {
+    type Form = Value<I256LE>;
+    fn into_schema(self) -> Value<I256LE> {
         Value::new(ethnum::I256::new(self).to_le_bytes())
     }
 }
 
-impl ToValue<I256BE> for i8 {
-    fn to_value(self) -> Value<I256BE> {
+impl IntoSchema<I256BE> for i8 {
+    type Form = Value<I256BE>;
+    fn into_schema(self) -> Value<I256BE> {
         Value::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<I256BE> for i32 {
-    fn to_value(self) -> Value<I256BE> {
+impl IntoSchema<I256BE> for i32 {
+    type Form = Value<I256BE>;
+    fn into_schema(self) -> Value<I256BE> {
         Value::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<I256BE> for i64 {
-    fn to_value(self) -> Value<I256BE> {
+impl IntoSchema<I256BE> for i64 {
+    type Form = Value<I256BE>;
+    fn into_schema(self) -> Value<I256BE> {
         Value::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
-impl ToValue<I256BE> for i128 {
-    fn to_value(self) -> Value<I256BE> {
+impl IntoSchema<I256BE> for i128 {
+    type Form = Value<I256BE>;
+    fn into_schema(self) -> Value<I256BE> {
         Value::new(ethnum::I256::new(self).to_be_bytes())
     }
 }
@@ -587,7 +611,7 @@ impl_try_from_u256!(I256LE, ethnum::I256, i8, i16, i32, i64, i128);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ToValue, TryFromValue};
+    use crate::value::{IntoValue, TryFromValue};
     use proptest::prelude::*;
 
     fn arb_u256() -> impl Strategy<Value = ethnum::U256> {

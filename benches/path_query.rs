@@ -9,7 +9,7 @@ use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
 use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
 use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::ToValue;
+use triblespace::core::value::IntoValue;
 use triblespace::prelude::*;
 
 mod bench_social {

@@ -135,7 +135,7 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
 /// let mut ranked: Vec<(Id, f32)> = matched
 ///     .into_iter()
 ///     .map(|id| {
-///         use triblespace_core::value::ToValue;
+///         use triblespace_core::value::IntoValue;
 ///         let v: triblespace_core::value::Value<
 ///             triblespace_core::value::schemas::genid::GenId,
 ///         > = (&id).to_value();
@@ -723,7 +723,7 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::ToValue;
+    use triblespace_core::value::IntoValue;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()

@@ -183,7 +183,7 @@ pub fn run(
                 format!("squashed {} ({}/{})", name, i + 1, num_chunks)
             };
             let msg_blob: Blob<triblespace_core::blob::schemas::longstring::LongString> =
-                triblespace_core::blob::ToBlob::to_blob(msg_text);
+                triblespace_core::blob::IntoBlob::to_blob(msg_text);
             let msg_handle = dst_pile
                 .put(msg_blob)
                 .map_err(|e| anyhow!("put message: {e:?}"))?;
@@ -218,7 +218,7 @@ pub fn run(
             .map_err(|e| anyhow!("get commit: {e:?}"))?;
 
         let name_handle = dst_pile
-            .put(triblespace_core::blob::ToBlob::<
+            .put(triblespace_core::blob::IntoBlob::<
                 triblespace_core::blob::schemas::longstring::LongString,
             >::to_blob(name.clone()))
             .map_err(|e| anyhow!("put name: {e:?}"))?;

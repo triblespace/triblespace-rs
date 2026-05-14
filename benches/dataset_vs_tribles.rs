@@ -5,7 +5,7 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::fucid;
 use triblespace::core::trible::Trible;
 use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::prelude::{BlobStorePut, IdOwner, ToValue, TribleSet, Value};
+use triblespace::prelude::{BlobStorePut, IdOwner, IntoValue, TribleSet, Value};
 
 struct PreparedData {
     tribles: Vec<Trible>,

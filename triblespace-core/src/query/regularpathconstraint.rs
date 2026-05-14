@@ -17,7 +17,7 @@ use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
 use crate::value::RawValue;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 
 // ── Path expression types ────────────────────────────────────────────────
 

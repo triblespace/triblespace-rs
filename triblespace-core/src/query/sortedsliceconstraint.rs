@@ -1,4 +1,4 @@
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 
 use super::*;
@@ -79,7 +79,7 @@ impl<'a, S: ValueSchema, T> SortedSliceConstraint<'a, S, T> {
 impl<'a, S: ValueSchema, T> Constraint<'a> for SortedSliceConstraint<'a, S, T>
 where
     T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
@@ -95,7 +95,7 @@ where
 
     fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
         if self.variable.index == variable {
-            proposals.extend(self.slice.0.iter().map(|v| ToValue::to_value(v).raw));
+            proposals.extend(self.slice.0.iter().map(|v| IntoValue::to_value(v).raw));
         }
     }
 
@@ -114,7 +114,7 @@ where
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>
 where
     T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     type Constraint = SortedSliceConstraint<'a, S, T>;
 
@@ -138,7 +138,7 @@ where
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a mut [T]
 where
     T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: ToValue<S>,
+    for<'b> &'b T: IntoValue<S>,
 {
     type Constraint = SortedSliceConstraint<'a, S, T>;
 

@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,7 +8,7 @@ use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::RawValue;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -70,7 +71,7 @@ mod wasm_formatter {
 
 impl ValueSchema for LineLocation {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 fn encode_location(lines: (u64, u64, u64, u64)) -> RawValue {
@@ -99,8 +100,9 @@ fn decode_location(raw: &RawValue) -> (u64, u64, u64, u64) {
     )
 }
 
-impl ToValue<LineLocation> for (u64, u64, u64, u64) {
-    fn to_value(self) -> Value<LineLocation> {
+impl IntoSchema<LineLocation> for (u64, u64, u64, u64) {
+    type Form = Value<LineLocation>;
+    fn into_schema(self) -> Value<LineLocation> {
         Value::new(encode_location(self))
     }
 }
@@ -112,8 +114,9 @@ impl TryFromValue<'_, LineLocation> for (u64, u64, u64, u64) {
     }
 }
 
-impl ToValue<LineLocation> for Span {
-    fn to_value(self) -> Value<LineLocation> {
+impl IntoSchema<LineLocation> for Span {
+    type Form = Value<LineLocation>;
+    fn into_schema(self) -> Value<LineLocation> {
         (
             self.start().line() as u64,
             self.start().column() as u64,
@@ -127,7 +130,7 @@ impl ToValue<LineLocation> for Span {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::ToValue;
+    use crate::value::IntoValue;
     use proptest::prelude::*;
 
     proptest! {

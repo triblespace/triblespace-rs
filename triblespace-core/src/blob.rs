@@ -4,7 +4,7 @@
 //! rationale and an extended usage example see the [Blobs
 //! chapter](../book/src/deep-dive/blobs.md) of the Tribles Book.
 
-// Converting Rust types to blobs is infallible in practice, so only `ToBlob`
+// Converting Rust types to blobs is infallible in practice, so only `IntoBlob`
 // and `TryFromBlob` are used throughout the codebase.  `TryToBlob` and
 // `FromBlob` were never required and have been removed for simplicity.
 
@@ -13,6 +13,7 @@ mod memoryblobstore;
 /// Built-in blob schema types and their conversion implementations.
 pub mod schemas;
 
+use crate::value::IntoSchema;
 use crate::metadata::MetaDescribe;
 use crate::value::schemas::hash::Handle;
 use crate::value::Value;
@@ -231,30 +232,49 @@ impl<T: BlobSchema> Debug for Blob<T> {
 /// A trait for defining the abstract schema type of a blob.
 /// This is similar to the [`ValueSchema`] trait in the [`value`](crate::value) module.
 pub trait BlobSchema: MetaDescribe + Sized + 'static {
-    /// Converts a concrete Rust type to a blob with this schema.
-    /// If the conversion fails, this might cause a panic.
-    fn blob_from<T: ToBlob<Self>>(t: T) -> Blob<Self> {
+    /// Converts a concrete Rust type to a blob with this schema via [`IntoBlob`].
+    fn blob_from<T: IntoBlob<Self>>(t: T) -> Blob<Self> {
         t.to_blob()
     }
 }
 
-/// A trait for converting a Rust type to a [Blob] with a specific schema.
-/// This trait is implemented on the concrete Rust type.
+/// Shorthand bound for `IntoSchema<S, Form = Blob<S>>` — "this
+/// source produces a `Blob<S>` for content-addressed storage."
 ///
-/// Conversions are infallible.  Use [`TryFromBlob`] on the target type to
-/// perform the fallible reverse conversion.
+/// `IntoBlob` is a supertrait alias over
+/// [`IntoSchema`](crate::value::IntoSchema): any type that
+/// implements `IntoSchema<S>` with `Form = Blob<S>` automatically
+/// becomes `IntoBlob<S>`, and gains the `to_blob(self) -> Blob<S>`
+/// convenience method.
 ///
-/// See [ToValue](crate::value::ToValue) for the counterpart trait for values.
-pub trait ToBlob<S: BlobSchema> {
-    /// Converts this value into a blob.
-    fn to_blob(self) -> Blob<S>;
+/// The trait parameter is the [`BlobSchema`] directly (not
+/// `Handle<S>`) — this is what makes `impl IntoBlob<MyBlobSchema>
+/// for MyForeignType` legal for downstream crates: the local
+/// `MyBlobSchema` sits at trait position 0, satisfying Rust's
+/// orphan rule.
+pub trait IntoBlob<S: BlobSchema>:
+    crate::value::IntoSchema<S, Form = Blob<S>>
+{
+    /// Convert directly to `Blob<S>`.
+    fn to_blob(self) -> Blob<S>
+    where
+        Self: Sized,
+    {
+        self.into_schema()
+    }
+}
+impl<S, T> IntoBlob<S> for T
+where
+    S: BlobSchema,
+    T: crate::value::IntoSchema<S, Form = Blob<S>>,
+{
 }
 
 /// A trait for converting a [Blob] with a specific schema to a Rust type.
 /// This trait is implemented on the concrete Rust type.
 ///
 /// This might return an error if the conversion is not possible,
-/// This is the counterpart to the [`ToBlob`] trait.
+/// This is the counterpart to the [`IntoBlob`] trait.
 ///
 /// See [TryFromValue](crate::value::TryFromValue) for the counterpart trait for values.
 pub trait TryFromBlob<S: BlobSchema>: Sized {
@@ -272,17 +292,24 @@ impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
     }
 }
 
-impl<S: BlobSchema> ToBlob<S> for Blob<S> {
-    fn to_blob(self) -> Blob<S> {
+/// `Blob<S>` is the identity source for [`IntoSchema<S>`] in the
+/// blob path: it converts to itself with no allocation, and the
+/// cached handle inside lets every downstream step skip rehashing.
+impl<S: BlobSchema> crate::value::IntoSchema<S> for Blob<S>
+where
+    Handle<S>: ValueSchema,
+{
+    type Form = Blob<S>;
+    fn into_schema(self) -> Blob<S> {
         self
     }
 }
 
-/// `Blob<T>` is a [`FieldFormFor<Handle<T>>`] — given a Blob, the
-/// macro can extract the cached handle (value side) and ship the
-/// schema-erased blob to the local store. This is where the "extract
-/// handle / transmute blob" plumbing lives, used by every handle-
-/// schema source via [`IntoSchema`].
+/// `Blob<T>` is the `FieldFormFor<Handle<T>>` expander: it extracts
+/// the cached handle for the value side and ships its schema-erased
+/// bytes for the storage side. This is where the "extract handle /
+/// transmute blob" plumbing lives, used by every handle-schema
+/// source via [`IntoSchema`].
 impl<T> crate::value::FieldFormFor<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
@@ -300,35 +327,14 @@ where
     }
 }
 
-/// Auto-put: a `Blob<T>` passed to a `Handle<T>`-typed `entity!{}`
-/// field is its own form. The macro picks up the cached handle and
-/// ships the blob to the fragment's local store.
-///
-/// Concrete-`Self` rather than a `V: ToBlob<T>` blanket — the
-/// latter coherence-conflicts with the precomputed-handle case
-/// (`Value<Handle<T>>`) because downstream could legitimately impl
-/// `ToBlob<T> for Value<Handle<T>>`. Per-Self also keeps the
-/// extension story symmetric: downstream that wants auto-put for
-/// their native types writes `impl IntoSchema<Handle<MyBlob>> for
-/// MySource`, which the orphan rule permits (`MyBlob` is local).
-impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>> for Blob<T>
+/// Precomputed-handle case: a `Value<Handle<T>>` can be passed as a
+/// `IntoSchema<T>` source (T is the BlobSchema, matching the
+/// `Handle<T>`-attributed field's `FieldKind`). Form is the value
+/// itself; no side-blob — caller asserts the bytes live somewhere
+/// resolvable.
+impl<T: BlobSchema> crate::value::IntoSchema<T> for Value<Handle<T>>
 where
-    T: BlobSchema,
-    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
-{
-    type Form = Blob<T>;
-    fn into_schema(self) -> Blob<T> {
-        self
-    }
-}
-
-/// "I already have the handle" case: a precomputed
-/// `Value<Handle<T>>` is its own field value, no side-blob.
-impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>>
-    for Value<Handle<T>>
-where
-    T: BlobSchema,
-    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
+    Handle<T>: ValueSchema,
 {
     type Form = Value<Handle<T>>;
     fn into_schema(self) -> Value<Handle<T>> {
@@ -337,11 +343,9 @@ where
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>>
-    for &Value<Handle<T>>
+impl<T: BlobSchema> crate::value::IntoSchema<T> for &Value<Handle<T>>
 where
-    T: BlobSchema,
-    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
+    Handle<T>: ValueSchema,
 {
     type Form = Value<Handle<T>>;
     fn into_schema(self) -> Value<Handle<T>> {

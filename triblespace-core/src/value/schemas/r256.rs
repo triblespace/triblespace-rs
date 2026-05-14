@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -66,7 +67,7 @@ impl MetaDescribe for R256LE {
 }
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for R256BE {
     fn describe() -> Fragment {
@@ -142,7 +143,7 @@ mod wasm_formatter {
 }
 impl ValueSchema for R256BE {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 /// An error that can occur when converting a ratio value.
@@ -180,8 +181,9 @@ impl TryFromValue<'_, R256BE> for Ratio<i128> {
     }
 }
 
-impl ToValue<R256BE> for Ratio<i128> {
-    fn to_value(self) -> Value<R256BE> {
+impl IntoSchema<R256BE> for Ratio<i128> {
+    type Form = Value<R256BE>;
+    fn into_schema(self) -> Value<R256BE> {
         let ratio = self.reduced();
 
         let mut bytes = [0; 32];
@@ -192,8 +194,9 @@ impl ToValue<R256BE> for Ratio<i128> {
     }
 }
 
-impl ToValue<R256BE> for i128 {
-    fn to_value(self) -> Value<R256BE> {
+impl IntoSchema<R256BE> for i128 {
+    type Form = Value<R256BE>;
+    fn into_schema(self) -> Value<R256BE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_be_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_be_bytes());
@@ -225,8 +228,9 @@ impl TryFromValue<'_, R256LE> for Ratio<i128> {
     }
 }
 
-impl ToValue<R256LE> for Ratio<i128> {
-    fn to_value(self) -> Value<R256LE> {
+impl IntoSchema<R256LE> for Ratio<i128> {
+    type Form = Value<R256LE>;
+    fn into_schema(self) -> Value<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.numer().to_le_bytes());
         bytes[16..32].copy_from_slice(&self.denom().to_le_bytes());
@@ -235,8 +239,9 @@ impl ToValue<R256LE> for Ratio<i128> {
     }
 }
 
-impl ToValue<R256LE> for i128 {
-    fn to_value(self) -> Value<R256LE> {
+impl IntoSchema<R256LE> for i128 {
+    type Form = Value<R256LE>;
+    fn into_schema(self) -> Value<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_le_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_le_bytes());
@@ -248,7 +253,7 @@ impl ToValue<R256LE> for i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ToValue, TryFromValue};
+    use crate::value::{IntoValue, TryFromValue};
     use num_rational::Ratio;
     use proptest::prelude::*;
 

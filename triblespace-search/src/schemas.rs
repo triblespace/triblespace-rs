@@ -17,15 +17,16 @@
 //! valid LongString-blob handles by construction, so there's
 //! no need for a bespoke "token hash" schema.
 
+use triblespace_core::value::IntoSchema;
 use std::convert::Infallible;
 
 use anybytes::View;
-use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
+use triblespace_core::value::{IntoValue, TryFromValue, Value, ValueSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
 /// triblespace `Value`. Bytes `[0..4]` hold the raw f32 bytes;
@@ -63,19 +64,21 @@ impl MetaDescribe for F32LE {
 
 impl ValueSchema for F32LE {
     type ValidationError = Infallible;
-    type Kind = triblespace_core::value::InlineKind;
+    type FieldKind = Self;
 }
 
-impl ToValue<F32LE> for f32 {
-    fn to_value(self) -> Value<F32LE> {
+impl IntoSchema<F32LE> for f32 {
+    type Form = Value<F32LE>;
+    fn into_schema(self) -> Value<F32LE> {
         let mut raw = [0u8; 32];
         raw[0..4].copy_from_slice(&self.to_le_bytes());
         Value::new(raw)
     }
 }
 
-impl ToValue<F32LE> for &f32 {
-    fn to_value(self) -> Value<F32LE> {
+impl IntoSchema<F32LE> for &f32 {
+    type Form = Value<F32LE>;
+    fn into_schema(self) -> Value<F32LE> {
         (*self).to_value()
     }
 }
@@ -163,14 +166,20 @@ impl TryFromBlob<Embedding> for View<[f32]> {
     }
 }
 
-impl ToBlob<Embedding> for View<[f32]> {
-    fn to_blob(self) -> Blob<Embedding> {
+impl IntoSchema<Embedding> for View<[f32]>
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<Embedding>;
+    fn into_schema(self) -> Blob<Embedding> {
         Blob::new(self.bytes())
     }
 }
 
-impl ToBlob<Embedding> for Vec<f32> {
-    fn to_blob(self) -> Blob<Embedding> {
+impl IntoSchema<Embedding> for Vec<f32>
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<Embedding>;
+    fn into_schema(self) -> Blob<Embedding> {
         // f32 is `IntoBytes` (zerocopy) so this is a straight
         // byte-copy of the `Vec`'s backing storage.
         let mut bytes = Vec::with_capacity(self.len() * 4);
@@ -181,8 +190,11 @@ impl ToBlob<Embedding> for Vec<f32> {
     }
 }
 
-impl ToBlob<Embedding> for &[f32] {
-    fn to_blob(self) -> Blob<Embedding> {
+impl IntoSchema<Embedding> for &[f32]
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+{
+    type Form = Blob<Embedding>;
+    fn into_schema(self) -> Blob<Embedding> {
         let mut bytes = Vec::with_capacity(self.len() * 4);
         for v in self {
             bytes.extend_from_slice(&v.to_le_bytes());

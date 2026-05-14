@@ -1,9 +1,9 @@
-use triblespace_core::blob::ToBlob;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::metadata;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
-    attributes, entity, find, pattern, Attribute, Id, ToValue, Value,
+    attributes, entity, find, pattern, Attribute, Id, IntoValue, Value,
 };
 use triblespace_core::value::schemas::hash::Blake3;
 

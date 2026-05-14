@@ -1,5 +1,5 @@
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::id::Id;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::repo::BlobStore;
@@ -38,7 +38,7 @@ where
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema,
     {
         self.blobs.put(item)

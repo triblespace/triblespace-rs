@@ -1,8 +1,9 @@
+use crate::value::IntoSchema;
 use anybytes::Bytes;
 
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -38,20 +39,29 @@ impl MetaDescribe for WasmCode {
     }
 }
 
-impl ToBlob<WasmCode> for Bytes {
-    fn to_blob(self) -> Blob<WasmCode> {
+impl IntoSchema<WasmCode> for Bytes
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+{
+    type Form = Blob<WasmCode>;
+    fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(self)
     }
 }
 
-impl ToBlob<WasmCode> for Vec<u8> {
-    fn to_blob(self) -> Blob<WasmCode> {
+impl IntoSchema<WasmCode> for Vec<u8>
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+{
+    type Form = Blob<WasmCode>;
+    fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self))
     }
 }
 
-impl ToBlob<WasmCode> for &[u8] {
-    fn to_blob(self) -> Blob<WasmCode> {
+impl IntoSchema<WasmCode> for &[u8]
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+{
+    type Form = Blob<WasmCode>;
+    fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }
 }

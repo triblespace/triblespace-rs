@@ -1,6 +1,7 @@
+use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -47,20 +48,29 @@ impl TryFromBlob<FileBytes> for Bytes {
     }
 }
 
-impl ToBlob<FileBytes> for Bytes {
-    fn to_blob(self) -> Blob<FileBytes> {
+impl IntoSchema<FileBytes> for Bytes
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+{
+    type Form = Blob<FileBytes>;
+    fn into_schema(self) -> Blob<FileBytes> {
         Blob::new(self)
     }
 }
 
-impl ToBlob<FileBytes> for Vec<u8> {
-    fn to_blob(self) -> Blob<FileBytes> {
+impl IntoSchema<FileBytes> for Vec<u8>
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+{
+    type Form = Blob<FileBytes>;
+    fn into_schema(self) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(self))
     }
 }
 
-impl ToBlob<FileBytes> for &[u8] {
-    fn to_blob(self) -> Blob<FileBytes> {
+impl IntoSchema<FileBytes> for &[u8]
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+{
+    type Form = Blob<FileBytes>;
+    fn into_schema(self) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }
 }

@@ -18,7 +18,7 @@ use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, Hash};
 use crate::value::schemas::UnknownValue;
 use crate::value::RawValue;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::Value;
 use anybytes::View;
 use ryu::Buffer;

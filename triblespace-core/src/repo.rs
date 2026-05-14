@@ -170,7 +170,7 @@ use crate::blob::schemas::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::MemoryBlobStore;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::find;
 use crate::id::genid;
@@ -329,7 +329,7 @@ pub trait BlobStorePut {
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema;
 }
 
@@ -1249,7 +1249,7 @@ where
         RollupError<Storage>,
     > {
         use crate::blob::schemas::succinctarchive::{OrderedUniverse, SuccinctArchive};
-        use crate::blob::ToBlob;
+        use crate::blob::IntoBlob;
 
         let mut ws = self.pull(branch_id).map_err(RollupError::Pull)?;
         let head_handle = ws.head().ok_or(RollupError::EmptyBranch)?;
@@ -2114,7 +2114,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
     where
         S: BlobSchema + 'static,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
         Handle<S>: ValueSchema,
     {
         self.staged.put(item).expect("infallible blob put")

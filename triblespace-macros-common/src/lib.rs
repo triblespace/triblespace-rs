@@ -487,7 +487,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 Value::Expr(ref id_expr) => {
                     quote! {
                         let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::value::ToValue::to_value(#id_expr))));
+                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoValue::to_value(#id_expr))));
                     }
                 }
             }
@@ -541,7 +541,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             attr_tokens.extend(quote! {
                                 let #af_ident = &#expr;
                                 let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                                constraints.push(Box::new(#a_ident.is(#base_path::value::ToValue::to_value(#af_ident.id()))));
+                                constraints.push(Box::new(#a_ident.is(#base_path::value::IntoValue::to_value(#af_ident.id()))));
                             });
                             (a_ident, Some(af_ident))
                         }
@@ -1048,7 +1048,7 @@ pub fn pattern_changes_impl(
                 Value::Expr(ref id_expr) => {
                     entity_const_tokens.extend(quote! {
                         let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::value::ToValue::to_value(#id_expr))));
+                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoValue::to_value(#id_expr))));
                     });
                 }
             },
@@ -1103,7 +1103,7 @@ pub fn pattern_changes_impl(
                         let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
                     });
                     attr_const_tokens.extend(quote! {
-                        constraints.push(Box::new(#a_ident.is(#base_path::value::ToValue::to_value(#af_ident.id()))));
+                        constraints.push(Box::new(#a_ident.is(#base_path::value::IntoValue::to_value(#af_ident.id()))));
                     });
                     (a_ident, af_ident)
                 })

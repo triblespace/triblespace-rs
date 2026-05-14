@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{RawValue, ToValue, Value, ValueSchema};
+use triblespace_core::value::{RawValue, IntoValue, Value, ValueSchema};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -112,7 +112,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     ///
     /// Type parameters are usually inferred from downstream
     /// [`insert`][Self::insert] calls (the doc key's
-    /// [`ToValue<D>`] impl pins `D`, the term vector pins `T`).
+    /// [`IntoValue<D>`] impl pins `D`, the term vector pins `T`).
     /// When you need to be explicit — e.g. for an index you'll
     /// populate only after some plumbing — spell the schemas
     /// with a turbofish:
@@ -152,7 +152,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     /// Add a document. `key` is anything that converts to a
     /// `Value<D>` — pass a `Value<GenId>` directly, an
     /// `&Id` for entity-keyed indexes, or any user type that
-    /// implements `ToValue<D>`. `terms` is the caller's
+    /// implements `IntoValue<D>`. `terms` is the caller's
     /// tokenization under schema `T` (see
     /// [`crate::tokens::hash_tokens`] for the usual token-handle
     /// default). Order of terms is irrelevant; duplicates
@@ -165,7 +165,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     /// etc.) without an intermediate `.collect()`.
     pub fn insert<K, I>(&mut self, key: K, terms: I)
     where
-        K: ToValue<D>,
+        K: IntoValue<D>,
         I: IntoIterator<Item = Value<T>>,
     {
         // Value<_> is repr(transparent) around RawValue; strip
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn insert_indexes_by_string_key() {
         use triblespace_core::value::schemas::shortstring::ShortString;
-        use triblespace_core::value::{ToValue, Value};
+        use triblespace_core::value::{IntoValue, Value};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::new();
         let red: Value<ShortString> = "red".to_value();

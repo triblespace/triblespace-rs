@@ -23,7 +23,7 @@ use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::ToValue;
+use triblespace_core::value::IntoValue;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;

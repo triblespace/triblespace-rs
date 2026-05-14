@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,7 +8,7 @@ use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::RawValue;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -56,7 +57,7 @@ impl MetaDescribe for RangeU128 {
 
 impl ValueSchema for RangeU128 {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 impl MetaDescribe for RangeInclusiveU128 {
@@ -116,7 +117,7 @@ mod wasm_formatters {
 
 impl ValueSchema for RangeInclusiveU128 {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 fn encode_pair(range: (u128, u128)) -> RawValue {
@@ -142,8 +143,9 @@ fn decode_range_value<S: ValueSchema>(value: &Value<S>) -> (u128, u128) {
     decode_pair(&value.raw)
 }
 
-impl ToValue<RangeU128> for (u128, u128) {
-    fn to_value(self) -> Value<RangeU128> {
+impl IntoSchema<RangeU128> for (u128, u128) {
+    type Form = Value<RangeU128>;
+    fn into_schema(self) -> Value<RangeU128> {
         encode_range_value(self)
     }
 }
@@ -155,8 +157,9 @@ impl TryFromValue<'_, RangeU128> for (u128, u128) {
     }
 }
 
-impl ToValue<RangeInclusiveU128> for (u128, u128) {
-    fn to_value(self) -> Value<RangeInclusiveU128> {
+impl IntoSchema<RangeInclusiveU128> for (u128, u128) {
+    type Form = Value<RangeInclusiveU128>;
+    fn into_schema(self) -> Value<RangeInclusiveU128> {
         encode_range_value(self)
     }
 }
@@ -206,7 +209,7 @@ impl TryFromValue<'_, RangeInclusiveU128> for RangeInclusive<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ToValue, TryFromValue, TryToValue};
+    use crate::value::{IntoValue, TryFromValue, TryToValue};
     use proptest::prelude::*;
 
     proptest! {

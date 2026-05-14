@@ -2,9 +2,10 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
+use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::id_from_value;
 use crate::id::id_into_value;
@@ -57,7 +58,7 @@ use jerky::serialization::{Metadata, Serializable};
 /// wavelet matrix, enabling rank/select navigation between columns
 /// without materialising six separate indexes.
 ///
-/// Build from a [`TribleSet`] via [`ToBlob`], then query through
+/// Build from a [`TribleSet`] via [`IntoBlob`], then query through
 /// [`SuccinctArchive`] and its [`Constraint`](crate::query::Constraint)
 /// implementation. Suitable for large, read-heavy, mostly-static
 /// datasets where compact storage matters more than incremental updates.
@@ -715,20 +716,24 @@ where
     }
 }
 
-impl<U> ToBlob<SuccinctArchiveBlob> for &SuccinctArchive<U>
+impl<U> IntoSchema<SuccinctArchiveBlob> for &SuccinctArchive<U>
 where
     U: Universe + Serializable,
+    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::ValueSchema,
 {
-    fn to_blob(self) -> Blob<SuccinctArchiveBlob> {
+    type Form = Blob<SuccinctArchiveBlob>;
+    fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes.clone())
     }
 }
 
-impl<U> ToBlob<SuccinctArchiveBlob> for SuccinctArchive<U>
+impl<U> IntoSchema<SuccinctArchiveBlob> for SuccinctArchive<U>
 where
     U: Universe + Serializable,
+    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::ValueSchema,
 {
-    fn to_blob(self) -> Blob<SuccinctArchiveBlob> {
+    type Form = Blob<SuccinctArchiveBlob>;
+    fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes)
     }
 }
@@ -771,12 +776,12 @@ where
 mod tests {
     use std::convert::TryInto;
 
-    use crate::blob::ToBlob;
+    use crate::blob::IntoBlob;
     use crate::id::fucid;
     use crate::prelude::*;
     use crate::query::find;
     use crate::trible::Trible;
-    use crate::value::ToValue;
+    use crate::value::IntoValue;
     use crate::value::TryToValue;
 
     use super::*;

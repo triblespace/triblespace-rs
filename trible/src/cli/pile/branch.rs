@@ -14,7 +14,7 @@ use triblespace::prelude::BlobStorePut;
 use triblespace::prelude::BranchStore;
 use triblespace::prelude::View;
 use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::blob::ToBlob;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::id_hex;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;

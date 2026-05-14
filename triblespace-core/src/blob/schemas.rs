@@ -17,6 +17,7 @@ pub mod succinctarchive;
 /// WebAssembly bytecode blob schema.
 pub mod wasmcode;
 
+use crate::value::IntoSchema;
 use anybytes::Bytes;
 
 use crate::blob::BlobSchema;
@@ -25,7 +26,7 @@ use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
 
 use super::Blob;
-use super::ToBlob;
+use super::IntoBlob;
 use super::TryFromBlob;
 
 /// A blob schema for an unknown blob.
@@ -68,8 +69,11 @@ impl TryFromBlob<UnknownBlob> for Bytes {
     }
 }
 
-impl ToBlob<UnknownBlob> for Bytes {
-    fn to_blob(self) -> Blob<UnknownBlob> {
+impl IntoSchema<UnknownBlob> for Bytes
+where crate::value::schemas::hash::Handle<UnknownBlob>: crate::value::ValueSchema,
+{
+    type Form = Blob<UnknownBlob>;
+    fn into_schema(self) -> Blob<UnknownBlob> {
         Blob::new(self)
     }
 }

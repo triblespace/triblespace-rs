@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```
-//! use triblespace_core::value::{Value, ValueSchema, ToValue, TryFromValue};
+//! use triblespace_core::value::{Value, ValueSchema, IntoValue, TryFromValue};
 //! use triblespace_core::metadata::MetaDescribe;
 //! use triblespace_core::trible::{Fragment, TribleSet};
 //! use triblespace_core::macros::id_hex;
@@ -37,7 +37,7 @@
 //!    }
 //! }
 //!
-//! impl ToValue<MyNumber> for u32 {
+//! impl IntoValue<MyNumber> for u32 {
 //!   fn to_value(self) -> Value<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
 //!      let mut bytes = [0; 32];
@@ -59,7 +59,7 @@
 //!   }
 //! }
 //!
-//! impl ToValue<MyNumber> for u64 {
+//! impl IntoValue<MyNumber> for u64 {
 //!  fn to_value(self) -> Value<MyNumber> {
 //!   let mut bytes = [0; 32];
 //!   bytes[0..8].copy_from_slice(&self.to_le_bytes());
@@ -318,43 +318,30 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;
 
-    /// Discriminator for whether this schema is *inline*
-    /// (32-byte data lives in the trible) or a *handle* (32 bytes are a
-    /// content-addressed reference to a blob in some store).
-    ///
-    /// Used by [`IntoSchema`] to dispatch the `entity!{}` field
-    /// conversion path: inline schemas go through [`ToValue<S>`]
-    /// (just convert), handle schemas go through [`ToBlob<T>`] (convert
-    /// to bytes, hash, store the blob, return the handle). The
-    /// `IntoSchema` blanket impls use this associated type as a
-    /// coherence-clean discriminator so a single source type (e.g.
-    /// `&str`) can have meaningfully different field-level behaviour
-    /// depending on which schema the attribute targets.
-    ///
-    /// Use [`InlineKind`] for ordinary value schemas;
-    /// [`HandleKind<T>`] is reserved for the one schema that's a
-    /// content-addressed reference — [`crate::value::schemas::hash::Handle<T>`].
-    type Kind;
+    /// The trait parameter to dispatch via for `entity!{}` field
+    /// conversion. For *inline* schemas (32-byte data lives in the
+    /// trible), set `FieldKind = Self` — sources convert via
+    /// `IntoSchema<Self> { Form = Value<Self> }`. For
+    /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
+    /// `FieldKind = T` — sources convert via `IntoSchema<T> { Form =
+    /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
+    /// position 0 is what lets downstream impl `IntoSchema<MyBlob>
+    /// for MyType` without bumping into the orphan rule.
+    type FieldKind;
 
     /// Check if the given value conforms to this schema.
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         Ok(value)
     }
 
-    /// Create a new value from a concrete Rust type.
-    /// This is a convenience method that calls the [ToValue] trait.
-    /// This method might panic if the conversion is not possible.
-    ///
-    /// See the [ValueSchema::value_try_from] method for a conversion that returns a result.
-    fn value_from<T: ToValue<Self>>(t: T) -> Value<Self> {
+    /// Create a new value from a concrete Rust type via [`IntoValue`].
+    /// Panics if the underlying conversion panics.
+    fn value_from<T: IntoValue<Self>>(t: T) -> Value<Self> {
         t.to_value()
     }
 
-    /// Create a new value from a concrete Rust type.
-    /// This is a convenience method that calls the [TryToValue] trait.
-    /// This method might return an error if the conversion is not possible.
-    ///
-    /// See the [ValueSchema::value_from] method for a conversion that always succeeds (or panics).
+    /// Create a new value from a concrete Rust type via [`TryToValue`].
+    /// Returns an error if the conversion fails.
     fn value_try_from<T: TryToValue<Self>>(
         t: T,
     ) -> Result<Value<Self>, <T as TryToValue<Self>>::Error> {
@@ -362,133 +349,98 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     }
 }
 
-/// A trait for converting a Rust type to a [Value] with a specific schema type.
-/// This trait is implemented on the concrete Rust type.
+/// Fallible variant of value conversion — `T → Result<Value<S>, Error>`.
 ///
-/// This might cause a panic if the conversion is not possible,
-/// see [TryToValue] for a conversion that returns a result.
-///
-/// This is the counterpart to the [TryFromValue] trait.
-///
-/// See [ToBlob](crate::blob::ToBlob) for the counterpart trait for blobs.
-pub trait ToValue<S: ValueSchema> {
-    /// Convert the Rust type to a [Value] with a specific schema type.
-    /// This might cause a panic if the conversion is not possible.
-    ///
-    /// See the [TryToValue] trait for a conversion that returns a result.
-    fn to_value(self) -> Value<S>;
-}
-
-/// A trait for converting a Rust type to a [Value] with a specific schema type.
-/// This trait is implemented on the concrete Rust type.
-///
-/// This might return an error if the conversion is not possible,
-/// see [ToValue] for cases where the conversion is guaranteed to succeed (or panic).
-///
-/// This is the counterpart to the [TryFromValue] trait.
-///
+/// Kept as a standalone trait (not folded into [`IntoSchema`])
+/// because the error type is part of the per-source/per-target contract.
+/// Used for parses that can fail (e.g. `&str → Hash<Blake3>` via
+/// hex-decoding).
 pub trait TryToValue<S: ValueSchema> {
     /// The error type returned when the conversion fails.
     type Error;
     /// Convert the Rust type to a [Value] with a specific schema type.
-    /// This might return an error if the conversion is not possible.
-    ///
-    /// See the [ToValue] trait for a conversion that always succeeds (or panics).
     fn try_to_value(self) -> Result<Value<S>, Self::Error>;
 }
 
-/// Marker: a [`ValueSchema`] that stores its data **inline** in the
-/// 32-byte trible value slot. The vast majority of schemas are
-/// inline (numerics, booleans, short strings, ids, …). Set
-/// `type Kind = InlineKind;` in your `impl ValueSchema`.
-pub struct InlineKind;
-
-/// Marker: a [`ValueSchema`] that stores a **content-addressed
-/// reference** to a blob of schema `T`. The only in-tree
-/// implementor is [`Handle<T>`](crate::value::schemas::hash::Handle).
-pub struct HandleKind<T: crate::blob::BlobSchema>(core::marker::PhantomData<T>);
-
-/// Convert a value into its **form** for a target [`ValueSchema`] —
-/// either a directly-encoded `Value<S>` (inline path) or a `Blob<T>`
-/// to be deposited and referenced by handle (out-of-band path).
+/// Convert a value into its **form** for a schema target — either a
+/// directly-encoded `Value<S>` (inline path, `S: ValueSchema`) or a
+/// `Blob<S>` for content-addressed storage (handle path, `S: BlobSchema`).
 ///
-/// `IntoSchema<S>` is the single trait every source type implements
-/// to declare how it converts to the schema `S`. Each impl picks
-/// its `Form` associated type — typically `Value<S>` for inline
-/// schemas, `Blob<T>` for `Handle<T>`-targeted blob schemas — and
-/// the macro side automatically expands `Form` into the
-/// `(Value<S>, Option<Blob<UnknownBlob>>)` pair via
-/// [`FieldFormFor`].
+/// `IntoSchema<S>` is the **sole** source-to-schema conversion trait.
+/// `S` is intentionally unbounded so the same trait can target either
+/// a `ValueSchema` (Form = `Value<S>`) or a `BlobSchema`
+/// (Form = `Blob<S>`). The Form's relationship to `S` is captured by
+/// [`FieldFormFor`], which knows how to expand the form into the
+/// `(Value<V>, Option<Blob<UnknownBlob>>)` pair that the `entity!{}`
+/// macro folds into a Fragment.
 ///
-/// Parameterised by a `Kind` phantom that defaults to
-/// `<S as ValueSchema>::Kind`. The inline blanket (`V: ToValue<S>` →
-/// `Form = Value<S>`) lives in this module; handle-side impls are
-/// per-source-type and live next to the source type's other
-/// conversion impls (e.g. `Blob<T>`'s impl is in `blob.rs`).
-pub trait IntoSchema<S: ValueSchema, K = <S as ValueSchema>::Kind> {
-    /// The concrete form this source produces — typically `Value<S>`
-    /// for inline schemas, `Blob<T>` for handle schemas.
-    type Form: FieldFormFor<S>;
-    /// Run the conversion. For inline sources this is just
-    /// `ToValue::to_value`; for blob sources it's
-    /// `ToBlob::to_blob` (which hashes once and caches the handle).
+/// The key property: with `S` at trait position 0, downstream that
+/// defines a local `MyBlobSchema` writes `impl IntoSchema<MyBlobSchema>
+/// for MyType` — the local type sits at trait position 0, which
+/// makes Rust's orphan rule see the impl as legal even when `MyType`
+/// is a foreign type (like `Vec<u8>` or a third-party crate's view).
+/// This is the property the IntoValue/IntoBlob split provided
+/// historically; preserved here by keeping the schema type unbuiried.
+pub trait IntoSchema<S> {
+    /// The concrete form this source produces.
+    type Form;
+    /// Run the conversion.
     fn into_schema(self) -> Self::Form;
 }
 
-/// Expand an [`IntoSchema::Form`] into the `(Value, Option<Blob>)`
+/// Shorthand bound for `IntoSchema<S, Form = Value<S>>` — "this
+/// source produces a directly-encoded `Value<S>`, no side-blob."
+///
+/// `IntoValue` is a supertrait alias over [`IntoSchema`]: any type
+/// that implements `IntoSchema<S>` with `Form = Value<S>`
+/// automatically becomes `IntoValue<S>`, and gains the
+/// `to_value(self) -> Value<S>` convenience method.
+pub trait IntoValue<S: ValueSchema>: IntoSchema<S, Form = Value<S>> {
+    /// Convert directly to `Value<S>`.
+    fn to_value(self) -> Value<S>
+    where
+        Self: Sized,
+    {
+        self.into_schema()
+    }
+}
+impl<S, T> IntoValue<S> for T
+where
+    S: ValueSchema,
+    T: IntoSchema<S, Form = Value<S>>,
+{
+}
+
+/// Expand an [`IntoSchema::Form`] into the `(Value<V>, Option<Blob<UnknownBlob>>)`
 /// pair that the `entity!{}` macro folds into a Fragment.
 ///
-/// Two impls cover everything:
-/// - `Value<S>` is its own value, no side-blob.
+/// `V` is the *attribute's* value schema. Two impls cover everything:
+/// - `Value<V>` is its own value, no side-blob.
 /// - `Blob<T>` targeting `Handle<T>` returns the cached handle plus
 ///   the schema-erased blob for the local store to absorb.
 ///
-/// The split between `IntoSchema` (which produces a `Form`) and
-/// `FieldFormFor` (which expands the form) lets the per-source impls
-/// of `IntoSchema` stay one-line — pure `to_value` / `to_blob` calls
-/// — while the "extract handle / transmute blob" plumbing lives
-/// exactly once, here.
-pub trait FieldFormFor<S: ValueSchema> {
+/// The split between `IntoSchema` (which produces a `Form` keyed on
+/// whatever discriminator the schema uses) and `FieldFormFor` (which
+/// expands the form keyed on the actual value-schema `V`) lets the
+/// per-source impls of `IntoSchema` stay one-line.
+pub trait FieldFormFor<V: ValueSchema> {
     /// Produce the (value, optional-blob) pair the macro absorbs.
     fn into_field_pair(
         self,
     ) -> (
-        Value<S>,
+        Value<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     );
 }
 
-impl<S: ValueSchema> FieldFormFor<S> for Value<S> {
+impl<V: ValueSchema> FieldFormFor<V> for Value<V> {
     fn into_field_pair(
         self,
     ) -> (
-        Value<S>,
+        Value<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
         (self, None)
-    }
-}
-
-/// Inline blanket for [`IntoSchema`]: any `V: ToValue<S>` is a valid
-/// field source for an *inline* value schema (anything whose
-/// `ValueSchema::Kind` is `InlineKind`). The `Form` is the value
-/// itself; no side-blob — the value sits directly in the trible
-/// value slot.
-///
-/// Coherence-clean against handle-side impls because the `Kind`
-/// phantom parameter is `InlineKind` here vs. `HandleKind<T>` on the
-/// handle side. Even though a downstream `MyType` could legitimately
-/// implement both `ToValue<Handle<MyBlob>>` and `ToBlob<MyBlob>`,
-/// the macro call site uses S's actual Kind to pick the correct
-/// blanket — no overlap.
-impl<S, V> IntoSchema<S, InlineKind> for V
-where
-    S: ValueSchema<Kind = InlineKind>,
-    V: ToValue<S>,
-{
-    type Form = Value<S>;
-    fn into_schema(self) -> Value<S> {
-        self.to_value()
     }
 }
 
@@ -511,14 +463,16 @@ pub trait TryFromValue<'a, S: ValueSchema>: Sized {
     fn try_from_value(v: &'a Value<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: ValueSchema> ToValue<S> for Value<S> {
-    fn to_value(self) -> Value<S> {
+impl<S: ValueSchema> IntoSchema<S> for Value<S> {
+    type Form = Value<S>;
+    fn into_schema(self) -> Value<S> {
         self
     }
 }
 
-impl<S: ValueSchema> ToValue<S> for &Value<S> {
-    fn to_value(self) -> Value<S> {
+impl<S: ValueSchema> IntoSchema<S> for &Value<S> {
+    type Form = Value<S>;
+    fn into_schema(self) -> Value<S> {
         *self
     }
 }

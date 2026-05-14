@@ -8,7 +8,7 @@ use std::io::Cursor;
 use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::blob::ToBlob;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;

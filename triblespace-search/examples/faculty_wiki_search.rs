@@ -190,7 +190,7 @@ fn query(
     // trible pattern joins on the shared `?doc` to pick the
     // title up at the same time. Ranking is operational — score
     // each row through `idx.score` after collecting, then sort.
-    use triblespace_core::value::ToValue;
+    use triblespace_core::value::IntoValue;
     let tokens = hash_tokens(text);
     let mut rows: Vec<(Id, f32, String)> = find!(
         (doc: Id, title: String),

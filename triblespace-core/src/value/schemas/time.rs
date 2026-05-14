@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -62,7 +63,7 @@ pub(crate) fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
 
 impl ValueSchema for NsTAIInterval {
     type ValidationError = InvertedIntervalError;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         let lower = i128_from_ordered_be(value.raw[0..16].try_into().unwrap());
@@ -227,7 +228,7 @@ impl MetaDescribe for NsDuration {
 
 impl ValueSchema for NsDuration {
     type ValidationError = ReservedBitsNonZero;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         if value.raw[16..32] != [0u8; 16] {
@@ -255,8 +256,9 @@ impl std::fmt::Display for ReservedBitsNonZero {
     }
 }
 
-impl ToValue<NsDuration> for i128 {
-    fn to_value(self) -> Value<NsDuration> {
+impl IntoSchema<NsDuration> for i128 {
+    type Form = Value<NsDuration>;
+    fn into_schema(self) -> Value<NsDuration> {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&i128_to_ordered_be(self));
         Value::new(raw)
@@ -274,8 +276,9 @@ impl TryFromValue<'_, NsDuration> for i128 {
     }
 }
 
-impl ToValue<NsDuration> for Duration {
-    fn to_value(self) -> Value<NsDuration> {
+impl IntoSchema<NsDuration> for Duration {
+    type Form = Value<NsDuration>;
+    fn into_schema(self) -> Value<NsDuration> {
         self.total_nanoseconds().to_value()
     }
 }

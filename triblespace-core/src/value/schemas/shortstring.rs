@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -89,7 +90,7 @@ mod wasm_formatter {
 
 impl ValueSchema for ShortString {
     type ValidationError = ValidationError;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         let raw = &value.raw;
@@ -155,20 +156,23 @@ impl TryToValue<ShortString> for String {
     }
 }
 
-impl ToValue<ShortString> for &str {
-    fn to_value(self) -> Value<ShortString> {
+impl IntoSchema<ShortString> for &str {
+    type Form = Value<ShortString>;
+    fn into_schema(self) -> Value<ShortString> {
         self.try_to_value().unwrap()
     }
 }
 
-impl ToValue<ShortString> for String {
-    fn to_value(self) -> Value<ShortString> {
+impl IntoSchema<ShortString> for String {
+    type Form = Value<ShortString>;
+    fn into_schema(self) -> Value<ShortString> {
         self.try_to_value().unwrap()
     }
 }
 
-impl ToValue<ShortString> for &String {
-    fn to_value(self) -> Value<ShortString> {
+impl IntoSchema<ShortString> for &String {
+    type Form = Value<ShortString>;
+    fn into_schema(self) -> Value<ShortString> {
         self.to_str().try_to_value().unwrap()
     }
 }

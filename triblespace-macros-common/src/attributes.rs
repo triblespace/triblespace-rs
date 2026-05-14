@@ -176,7 +176,7 @@ pub fn attributes_impl(
             #[allow(non_upper_case_globals)]
             #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
                 ::std::sync::LazyLock::new(|| {
-                    use #base_path::blob::ToBlob as _;
+                    use #base_path::blob::IntoBlob as _;
                     use #base_path::metadata::MetaDescribe as _;
                     #base_path::attribute::Attribute::<#ty>::from(#body_fragment)
                 });

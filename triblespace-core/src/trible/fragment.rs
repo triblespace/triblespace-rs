@@ -1,6 +1,6 @@
 use std::ops::{Add, AddAssign, Deref};
 
-use crate::blob::{BlobSchema, MemoryBlobStore, ToBlob};
+use crate::blob::{BlobSchema, MemoryBlobStore, IntoBlob};
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
@@ -115,7 +115,7 @@ impl Fragment {
     pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
     where
         S: BlobSchema,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
     {
         self.blobs.insert(item.to_blob())
     }

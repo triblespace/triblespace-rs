@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use ed25519::ComponentBytes;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
@@ -12,7 +13,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -53,7 +54,7 @@ impl MetaDescribe for ED25519RComponent {
 }
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for ED25519SComponent {
     fn describe() -> Fragment {
@@ -81,7 +82,7 @@ impl MetaDescribe for ED25519SComponent {
 }
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 impl MetaDescribe for ED25519PublicKey {
     fn describe() -> Fragment {
@@ -109,7 +110,7 @@ impl MetaDescribe for ED25519PublicKey {
 }
 impl ValueSchema for ED25519PublicKey {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 #[cfg(feature = "wasm")]
@@ -172,20 +173,23 @@ impl ED25519SComponent {
     }
 }
 
-impl ToValue<ED25519RComponent> for Signature {
-    fn to_value(self) -> Value<ED25519RComponent> {
+impl IntoSchema<ED25519RComponent> for Signature {
+    type Form = Value<ED25519RComponent>;
+    fn into_schema(self) -> Value<ED25519RComponent> {
         ED25519RComponent::from_signature(self)
     }
 }
 
-impl ToValue<ED25519SComponent> for Signature {
-    fn to_value(self) -> Value<ED25519SComponent> {
+impl IntoSchema<ED25519SComponent> for Signature {
+    type Form = Value<ED25519SComponent>;
+    fn into_schema(self) -> Value<ED25519SComponent> {
         ED25519SComponent::from_signature(self)
     }
 }
 
-impl ToValue<ED25519RComponent> for ComponentBytes {
-    fn to_value(self) -> Value<ED25519RComponent> {
+impl IntoSchema<ED25519RComponent> for ComponentBytes {
+    type Form = Value<ED25519RComponent>;
+    fn into_schema(self) -> Value<ED25519RComponent> {
         Value::new(self)
     }
 }
@@ -197,8 +201,9 @@ impl TryFromValue<'_, ED25519RComponent> for ComponentBytes {
     }
 }
 
-impl ToValue<ED25519SComponent> for ComponentBytes {
-    fn to_value(self) -> Value<ED25519SComponent> {
+impl IntoSchema<ED25519SComponent> for ComponentBytes {
+    type Form = Value<ED25519SComponent>;
+    fn into_schema(self) -> Value<ED25519SComponent> {
         Value::new(self)
     }
 }
@@ -210,8 +215,9 @@ impl TryFromValue<'_, ED25519SComponent> for ComponentBytes {
     }
 }
 
-impl ToValue<ED25519PublicKey> for VerifyingKey {
-    fn to_value(self) -> Value<ED25519PublicKey> {
+impl IntoSchema<ED25519PublicKey> for VerifyingKey {
+    type Form = Value<ED25519PublicKey>;
+    fn into_schema(self) -> Value<ED25519PublicKey> {
         Value::new(self.to_bytes())
     }
 }
@@ -227,7 +233,7 @@ impl TryFromValue<'_, ED25519PublicKey> for VerifyingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{ToValue, TryFromValue};
+    use crate::value::{IntoValue, TryFromValue};
     use ed25519::Signature;
     use ed25519_dalek::SigningKey;
     use proptest::prelude::*;

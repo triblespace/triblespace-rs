@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -62,7 +63,7 @@ mod wasm_formatter {
 
 impl ValueSchema for F64 {
     type ValidationError = Infallible;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 }
 
 impl TryFromValue<'_, F64> for f64 {
@@ -74,8 +75,9 @@ impl TryFromValue<'_, F64> for f64 {
     }
 }
 
-impl ToValue<F64> for f64 {
-    fn to_value(self) -> Value<F64> {
+impl IntoSchema<F64> for f64 {
+    type Form = Value<F64>;
+    fn into_schema(self) -> Value<F64> {
         let mut raw = [0u8; 32];
         raw[..8].copy_from_slice(&self.to_le_bytes());
         Value::new(raw)

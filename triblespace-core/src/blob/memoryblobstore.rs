@@ -1,7 +1,7 @@
 use crate::blob::schemas::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::ToBlob;
+use crate::blob::IntoBlob;
 use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
@@ -319,7 +319,7 @@ impl BlobStorePut for MemoryBlobStore {
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema,
-        T: ToBlob<S>,
+        T: IntoBlob<S>,
     {
         let blob = item.to_blob();
         let handle = blob.get_handle();

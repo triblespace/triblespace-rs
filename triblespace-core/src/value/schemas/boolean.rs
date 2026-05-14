@@ -1,3 +1,4 @@
+use crate::value::IntoSchema;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -6,7 +7,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::ToValue;
+use crate::value::IntoValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -98,7 +99,7 @@ mod wasm_formatter {
 
 impl ValueSchema for Boolean {
     type ValidationError = InvalidBoolean;
-    type Kind = crate::value::InlineKind;
+    type FieldKind = Self;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         Self::decode(&value)?;
@@ -130,14 +131,16 @@ impl TryToValue<Boolean> for &bool {
     }
 }
 
-impl ToValue<Boolean> for bool {
-    fn to_value(self) -> Value<Boolean> {
+impl IntoSchema<Boolean> for bool {
+    type Form = Value<Boolean>;
+    fn into_schema(self) -> Value<Boolean> {
         Boolean::encode(self)
     }
 }
 
-impl ToValue<Boolean> for &bool {
-    fn to_value(self) -> Value<Boolean> {
+impl IntoSchema<Boolean> for &bool {
+    type Form = Value<Boolean>;
+    fn into_schema(self) -> Value<Boolean> {
         Boolean::encode(*self)
     }
 }

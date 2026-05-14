@@ -173,11 +173,11 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
         fresh_builder().build()
     });
 
-    // ToBlob is now O(1) under the canonical-bytes pattern —
+    // IntoBlob is now O(1) under the canonical-bytes pattern —
     // the index *is* its blob, so this is just a refcounted
     // `Bytes::clone`. Peak should be ~zero (the only allocation
     // is the small `Blob` wrapper itself).
-    use triblespace_core::blob::ToBlob;
+    use triblespace_core::blob::IntoBlob;
     let blob = measure("SuccinctBM25Index::to_blob (refcounted clone)", || {
         (&succinct).to_blob()
     });
