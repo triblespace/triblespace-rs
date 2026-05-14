@@ -5,7 +5,6 @@ use triblespace::core::blob::BlobSchema;
 use triblespace::core::blob::ToBlob;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
-use triblespace::core::id::Id;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::TryFromValue;
 use triblespace::core::value::ToValue;
@@ -18,14 +17,11 @@ use triblespace::core::value::VALUE_LEN;
 pub struct U64LE;
 
 impl MetaDescribe for U64LE {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace::core::trible::Fragment, B::PutError>
-    where
-        B: triblespace::core::repo::BlobStore<triblespace::core::value::schemas::hash::Blake3>,
-    {
-        Ok(triblespace::core::trible::Fragment::rooted(
+    fn describe() -> triblespace::core::trible::Fragment {
+        triblespace::core::trible::Fragment::rooted(
             id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"),
             triblespace::core::trible::TribleSet::new(),
-        ))
+        )
     }
 }
 
@@ -51,14 +47,11 @@ impl TryFromValue<'_, U64LE> for u64 {
 pub struct BytesBlob;
 
 impl MetaDescribe for BytesBlob {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace::core::trible::Fragment, B::PutError>
-    where
-        B: triblespace::core::repo::BlobStore<triblespace::core::value::schemas::hash::Blake3>,
-    {
-        Ok(triblespace::core::trible::Fragment::rooted(
+    fn describe() -> triblespace::core::trible::Fragment {
+        triblespace::core::trible::Fragment::rooted(
             id_hex!("B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0B0"),
             triblespace::core::trible::TribleSet::new(),
-        ))
+        )
     }
 }
 

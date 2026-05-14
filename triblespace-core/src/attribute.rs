@@ -30,7 +30,6 @@
 //! ```
 
 use crate::id::RawId;
-use crate::macros::entity;
 use crate::trible::Fragment;
 use crate::value::ValueSchema;
 use core::marker::PhantomData;
@@ -145,9 +144,8 @@ mod tests {
     use crate::blob::schemas::longstring::LongString;
     use crate::blob::ToBlob;
     use crate::id::Id;
-    use crate::macros::{find, pattern};
+    use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
-    use crate::blob::MemoryBlobStore;
     use crate::value::schemas::hash::{Blake3, Handle};
     use crate::value::schemas::shortstring::ShortString;
     use crate::value::Value;
@@ -208,11 +206,10 @@ mod tests {
         let iri_handle: Value<Handle<Blake3, IRI>> = iri.to_blob().get_handle::<Blake3>();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_schema: <ShortString as crate::metadata::MetaDescribe>::id(),
         });
         let attr_id = attr.id();
 
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
         let meta = attr.describe();
 
         // Discovery-by-IRI: the registry must contain

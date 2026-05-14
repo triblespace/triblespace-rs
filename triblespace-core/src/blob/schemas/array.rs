@@ -16,9 +16,7 @@ use crate::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
-use crate::repo::BlobStore;
 use crate::trible::Fragment;
-use crate::value::schemas::hash::Blake3;
 
 /// Maps a schema element marker to its native Rust type.
 ///
@@ -94,7 +92,6 @@ pub mod elements {
     use crate::macros::entity;
     use crate::metadata::{self, MetaDescribe};
     use crate::trible::{Fragment, TribleSet};
-    use crate::value::schemas::hash::Blake3;
 
     macro_rules! impl_array_element {
         ($marker:ident, $native:ty, $id:expr, $doc:expr) => {

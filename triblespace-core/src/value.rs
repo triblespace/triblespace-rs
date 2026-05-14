@@ -8,9 +8,6 @@
 //! use triblespace_core::value::{Value, ValueSchema, ToValue, TryFromValue};
 //! use triblespace_core::metadata::MetaDescribe;
 //! use triblespace_core::trible::{Fragment, TribleSet};
-//! use triblespace_core::repo::BlobStore;
-//! use triblespace_core::value::schemas::hash::Blake3;
-//! use triblespace_core::id::Id;
 //! use triblespace_core::macros::id_hex;
 //! use std::convert::{TryInto, Infallible};
 //!
@@ -22,10 +19,8 @@
 //! // The schema's identity hex lives inline in its describe body — that's
 //! // the only place it appears; callers reach the id via MyNumber::id().
 //! impl MetaDescribe for MyNumber {
-//!    fn describe<B>(_blobs: &mut B) -> Result<Fragment, B::PutError>
-//!    where B: BlobStore<Blake3>,
-//!    {
-//!        Ok(Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new()))
+//!    fn describe() -> Fragment {
+//!        Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new())
 //!    }
 //! }
 //! impl ValueSchema for MyNumber {

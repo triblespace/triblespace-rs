@@ -3,7 +3,7 @@ use triblespace_core::metadata;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
-    attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, Value,
+    attributes, entity, find, pattern, Attribute, Id, ToValue, Value,
 };
 use triblespace_core::value::schemas::hash::Blake3;
 
@@ -52,7 +52,6 @@ fn attributes_macro_emits_usage_metadata() {
     // only. Usage facts (rust identifier, module path, doc comment)
     // are emitted by the macro-generated top-level `describe()`
     // function at the attributes!{} declaration site.
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
     let meta = describe();
     let attr_id = fixed.id();
     let usage_count = find!(

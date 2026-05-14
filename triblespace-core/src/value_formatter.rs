@@ -351,31 +351,31 @@ mod tests {
         use crate::value::Value;
         use crate::value::ValueSchema;
 
-        let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
-        let mut space = TribleSet::new();
-        space += Boolean::describe();
-        space += GenId::describe();
-        space += ShortString::describe();
-        space += F64::describe();
-        space += F256LE::describe();
-        space += F256BE::describe();
-        space += U256LE::describe();
-        space += U256BE::describe();
-        space += I256LE::describe();
-        space += I256BE::describe();
-        space += R256LE::describe();
-        space += R256BE::describe();
-        space += RangeU128::describe();
-        space += RangeInclusiveU128::describe();
-        space += LineLocation::describe();
+        let mut bundle = crate::trible::Fragment::empty();
+        bundle += Boolean::describe();
+        bundle += GenId::describe();
+        bundle += ShortString::describe();
+        bundle += F64::describe();
+        bundle += F256LE::describe();
+        bundle += F256BE::describe();
+        bundle += U256LE::describe();
+        bundle += U256BE::describe();
+        bundle += I256LE::describe();
+        bundle += I256BE::describe();
+        bundle += R256LE::describe();
+        bundle += R256BE::describe();
+        bundle += RangeU128::describe();
+        bundle += RangeInclusiveU128::describe();
+        bundle += LineLocation::describe();
 
-        space += ED25519RComponent::describe();
-        space += ED25519SComponent::describe();
-        space += ED25519PublicKey::describe();
-        space += UnknownValue::describe();
-        space += <Hash<Blake3> as MetaDescribe>::describe();
-        space += <Handle<Blake3, LongString> as MetaDescribe>::describe();
+        bundle += ED25519RComponent::describe();
+        bundle += ED25519SComponent::describe();
+        bundle += ED25519PublicKey::describe();
+        bundle += UnknownValue::describe();
+        bundle += <Hash<Blake3> as MetaDescribe>::describe();
+        bundle += <Handle<Blake3, LongString> as MetaDescribe>::describe();
 
+        let (space, mut store) = bundle.into_facts_and_blobs();
         let reader = store.reader().expect("blob reader");
         let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
             BlobCache::new(reader);

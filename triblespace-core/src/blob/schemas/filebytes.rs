@@ -8,10 +8,8 @@ use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
-use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::schemas::hash::Blake3;
 
 use anybytes::Bytes;
 

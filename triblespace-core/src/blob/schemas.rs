@@ -20,7 +20,6 @@ pub mod wasmcode;
 use anybytes::Bytes;
 
 use crate::blob::BlobSchema;
-use crate::id::Id;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};

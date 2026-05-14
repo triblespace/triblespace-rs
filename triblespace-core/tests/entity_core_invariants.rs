@@ -86,14 +86,12 @@ fn array_describe_root_matches_id() {
 /// `metadata::array_item_schema` edge.
 #[test]
 fn array_describe_carries_element_schema_annotations() {
-    use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
     use triblespace_core::value::schemas::hash::Handle;
     use triblespace_core::value::Value;
 
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
     let frag = <Array<F32> as MetaDescribe>::describe();
 
     let array_id = Array::<F32>::id();
@@ -137,13 +135,11 @@ fn array_describe_carries_element_schema_annotations() {
 /// `array_describe_carries_element_schema_annotations`.
 #[test]
 fn handle_describe_carries_blob_and_hash_schema_annotations() {
-    use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
     use triblespace_core::value::Value;
 
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
     let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe();
 
     let handle_id = Handle::<Blake3, LongString>::id();

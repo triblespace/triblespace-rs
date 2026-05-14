@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.39.0] - 2026-05-13
 
 The canonical-attribute-id + origin-typed-identity + metadata-trait
-unification release. Three related cleanups:
+unification release. Four related cleanups:
 
 1. **Dynamic-name attribute id derivation** now goes through the
    same `entity!{...}.root()` mechanism every other entity uses,
@@ -23,16 +23,27 @@ unification release. Three related cleanups:
    attribute differ in the (attr_id, value) pair feeding the
    intrinsic-id hash.
 3. **`ConstId` + `ConstDescribe` collapsed into `MetaDescribe`** (renamed
-   from interim `TypeDescribe`). The schema id is now `describe(scratch)
-   .root()` — one trait, one method, no separate identity trait. Every
-   schema's identity-determining hex literal lives inline in its
-   `MetaDescribe::describe` body. `const_blake3` (which existed to derive
-   `Handle<H,T>::ID` and `Array<T>::ID` at compile time from `H::ID` /
-   `T::ID`) is no longer needed: those types now derive their ids at
-   runtime via the *entity-core* pattern (no-`@` `entity!` over a
-   minimal identity-determining fact set; the fragment's intrinsic root
-   IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4 ("Entity
-   Core") for the mental model.
+   from interim `TypeDescribe`). The schema id is now
+   `describe().root()` — one trait, one method, no separate identity
+   trait. Every schema's identity-determining hex literal lives inline
+   in its `MetaDescribe::describe` body. `const_blake3` (which existed
+   to derive `Handle<H,T>::ID` and `Array<T>::ID` at compile time from
+   `H::ID` / `T::ID`) is no longer needed: those types now derive their
+   ids at runtime via the *entity-core* pattern (no-`@` `entity!` over
+   a minimal identity-determining fact set; the fragment's intrinsic
+   root IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4
+   ("Entity Core") for the mental model.
+4. **`Fragment` is now self-contained.** It carries an internal
+   `MemoryBlobStore<Blake3>` alongside its exports and facts, so any
+   handle that appears in a fragment's facts has its bytes available
+   without consulting an external blob store. `MetaDescribe::describe`
+   collapses from `fn describe<B>(blobs: &mut B) -> Result<Fragment,
+   B::PutError> where B: BlobStore<Blake3>` to plain `fn describe() ->
+   Fragment` — the bytes live with the fragment that references them,
+   describe is a pure (id, type) → Fragment function with no
+   parameter threading and no error propagation, and `Describe for
+   Attribute<S>` simplifies to `self.fragment.clone()`. See "Fragment
+   self-containment" below for the full breakdown.
 
 ### Added
 - **`blob::schemas::iri::IRI` BlobSchema** for Internationalized
@@ -113,12 +124,12 @@ unification release. Three related cleanups:
   which is the complete identity-determining fact set. Schema-level
   facts (the schema's own name, description, hash protocol info)
   belong to the schema, not the attribute — consumers wanting them
-  call `<S as MetaDescribe>::describe(blobs)?` directly. Drops the
-  `S: MetaDescribe` bound on the impl (no longer needed); the
-  `blobs` parameter becomes unused (no blob puts needed to describe
-  an attribute). Per-attribute `describe()` also doesn't emit
-  usage facts — those live in the macro-generated top-level
-  `describe()` as separate usage entities.
+  call `<S as MetaDescribe>::describe()` directly. Drops the
+  `S: MetaDescribe` bound on the impl (no longer needed); no `blobs`
+  parameter is threaded through (no blob puts needed to describe an
+  attribute, and `describe()` is infallible). Per-attribute
+  `describe()` also doesn't emit usage facts — those live in the
+  macro-generated top-level `describe()` as separate usage entities.
 - **`AttributeUsage` / `AttributeUsageSource` types removed.**
   An `attributes!{}` declaration site IS an attribute usage; the
   abstract attribute is the shared thing multiple parties agree
@@ -126,7 +137,7 @@ unification release. Three related cleanups:
   identifier as `metadata::name`, `module_path!()` as
   `metadata::source_module`, doc comment as
   `metadata::description`) inline at the declaration site, in the
-  macro-generated top-level `pub fn describe(blobs)` function.
+  macro-generated top-level `pub fn describe() -> Fragment` function.
   Per-attribute `Attribute<S>` no longer carries usage data, and
   there is no `with_usage` builder. The usage entity's id and
   fact structure are byte-identical to the prior
@@ -134,8 +145,8 @@ unification release. Three related cleanups:
   metadata::source_module)` → usage id; `metadata::name`,
   `metadata::tag: KIND_ATTRIBUTE_USAGE`, optional
   `metadata::description` under the usage id).
-- **`Fragment::annotated` / `Fragment::try_annotated` added.** These
-  collapse the recurring three-step pattern:
+- **`Fragment::annotated` added.** Collapses the recurring three-step
+  pattern:
   ```rust
   let mut frag = entity! { <core facts> };
   let id = frag.root().expect("rooted");
@@ -148,10 +159,11 @@ unification release. Three related cleanups:
   })
   ```
   The annotation fragment's facts merge in but its root is dropped —
-  `self.root()` still returns the pre-annotation id. `try_annotated`
-  is the fallible variant for closures that need `blobs.put(...)?`
-  or other error propagation while building the annotations. Used
-  by `Describe for Attribute<S>` (schema spread) and by the
+  `self.root()` still returns the pre-annotation id. With `describe()`
+  no longer fallible the previously-paired `try_annotated` variant is
+  gone; closures that need to add blobs to the fragment now do so via
+  the *outer* `Fragment::put` before calling `annotated`. Used by
+  `Describe for Attribute<S>` (schema spread) and by the
   `attributes!{}` macro's per-attribute usage emission, so the
   generated code no longer has the temp-root extraction dance.
 - **`attributes_impl` no longer invokes a sibling proc-macro for
@@ -199,7 +211,7 @@ unification release. Three related cleanups:
   hex literal moves from `impl ConstId for X { const ID: Id =
   id_hex!("…"); }` to an inline `let id: Id = id_hex!("…");` inside
   its `MetaDescribe::describe` body. Callers reach the id via
-  `T::id()` (default = `T::describe(scratch).root()`).
+  `T::id()` (default = `T::describe().root()`).
 - **`ConstDescribe` renamed to `MetaDescribe`.** The trait emits
   facts in the `metadata::*` namespace; the new name signals the
   intent rather than the call shape. Mechanical rename — same method
@@ -236,19 +248,94 @@ unification release. Three related cleanups:
   path dependency, and the `const-blake3/` directory are all gone.
 - **Blanket `impl<T: ConstDescribe> Describe for T` dropped.**
   Instance `Describe` and type-level `MetaDescribe` are now distinct
-  concepts; calling `Boolean.describe(&mut blobs)` (instance-method
-  form on a unit-struct schema marker) no longer compiles — use
-  `Boolean::describe(&mut blobs)` (associated-fn form) instead. No
-  in-repo callers used the blanket; the change is documented for
-  downstream crates.
+  concepts; calling `Boolean.describe()` (instance-method form on a
+  unit-struct schema marker) no longer compiles — use
+  `Boolean::describe()` (associated-fn form) instead. No in-repo
+  callers used the blanket; the change is documented for downstream
+  crates.
 - **`MetaDescribe::id()` is runtime, not const.** Pre-`0.39.0` code
   could use `T::ID` in `const` contexts. Post-rename `T::id()` is a
-  fn that runs `T::describe(&mut scratch).root()` each call.
+  fn that runs `T::describe().root()` each call.
   `Attribute<S>` amortizes per attribute via its stored
   `fragment.root()` lookup (cheap — single PATCH read). Hot
   dispatch sites that call `<S as MetaDescribe>::id()` repeatedly
   should hoist via `LazyLock<Id>` — see
   `triblespace-core/src/export/json.rs::render_schema_value`.
+
+### Fragment self-containment
+- **`Fragment` carries an internal `MemoryBlobStore<Blake3>`**
+  alongside its exports and facts. The shape goes from
+  `{ exports: PATCH<16>, facts: TribleSet }` to
+  `{ exports: PATCH<16>, facts: TribleSet, blobs: MemoryBlobStore<Blake3> }`.
+  Any handle that appears in the fragment's facts has its bytes
+  available *with* the fragment — no external store lookup needed.
+  An empty `MemoryBlobStore` is structurally a single PATCH-root
+  pointer, so fragments without blobs pay essentially zero
+  overhead.
+- **New `Fragment` API:**
+  - `put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>` —
+    insert a blob into the fragment's local store and get the
+    content-addressed handle back. Idempotent.
+  - `blobs() -> &MemoryBlobStore<Blake3>` — read the embedded
+    store.
+  - `into_facts_and_blobs(self) -> (TribleSet, MemoryBlobStore<Blake3>)` —
+    consume the fragment, drop the exports, keep the payload.
+  - `from_facts_and_blobs`, `rooted_with_blobs`, three-tuple
+    `into_parts` for low-level wrap/unwrap.
+  - `Fragment += Fragment` (`AddAssign`) now also unions the
+    embedded blob stores. `TribleSet += Fragment` still drops
+    blobs (facts-only merge); pull blobs out with
+    `into_facts_and_blobs` if you need them downstream.
+- **`Spread::spread` returns `(Iter, TribleSet, MemoryBlobStore<Blake3>)`**
+  instead of `(Iter, TribleSet)`. The `entity!{ field*: spread_source }`
+  syntax now propagates blobs from spread sources into the parent
+  fragment automatically — a spread of a sub-schema's `describe()`
+  fragment carries that schema's documentation blobs forward without
+  any caller-side bookkeeping.
+- **`MetaDescribe::describe` signature collapses from**
+  ```rust
+  fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
+  where B: BlobStore<Blake3>;
+  ```
+  **to**
+  ```rust
+  fn describe() -> Fragment;
+  ```
+  No `<B>` parameter, no `Result`, no `?` threading just to bubble
+  `B::PutError`. Schemas build their fragments via
+  `Fragment::put(item)` on a local
+  `Fragment::rooted(id, TribleSet::new())` and then fold
+  annotations via `Fragment::annotated`. The bytes live with the
+  fragment that references them.
+- **`Describe::describe(&self) -> Fragment`** likewise drops `<B>` /
+  `Result`. The instance form is now a pure (self → Fragment)
+  accessor. `Describe for Attribute<S>` shrinks to a one-liner:
+  `fn describe(&self) -> Fragment { self.fragment.clone() }`.
+- **`MetaDescribe::id()` default** is `Self::describe().root().expect(…)`
+  (no scratch store needed). `Describe::id(&self)` parallels.
+- **`try_annotated` removed.** With describe infallible the
+  fallible annotation variant has nothing to propagate; closures
+  that need to add blobs to the surrounding fragment do so via
+  `Fragment::put` on the *outer* fragment before calling
+  `annotated`. The `annotated` debug-assertion that the closure's
+  returned fragment is rooted at the same id remains.
+- **`MemoryBlobStore<H>` gains `Clone`, `PartialEq`, `Eq`** so
+  Fragment can derive the same traits cleanly.
+- **JSON importers' `metadata()` is infallible.** `JsonObjectImporter::metadata()`
+  and `JsonTreeImporter::metadata()` both return `Fragment` directly.
+  `build_json_tree_metadata` drops its blob-store parameter; it
+  builds a self-contained fragment internally and returns it.
+- **`entity!{}` macro emits a `MemoryBlobStore<Blake3>` accumulator**
+  alongside the `TribleSet`, unions spread-source blobs into it, and
+  wraps the final result via `Fragment::rooted_with_blobs`. Pure
+  `entity!{}` calls with no spreads compile to an empty store
+  (single PATCH pointer) — no overhead vs. the old `Fragment::rooted`
+  shape.
+- **Conceptual win.** `describe()` is now a pure function from a
+  type/instance to a self-contained Fragment. No state mutation,
+  no fallibility, no parameter threading. The "where do the bytes
+  live" question collapses to a single answer: with the Fragment
+  that references them.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"
