@@ -56,6 +56,7 @@ impl MetaDescribe for RangeU128 {
 
 impl ValueSchema for RangeU128 {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 impl MetaDescribe for RangeInclusiveU128 {
@@ -115,6 +116,7 @@ mod wasm_formatters {
 
 impl ValueSchema for RangeInclusiveU128 {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 fn encode_pair(range: (u128, u128)) -> RawValue {

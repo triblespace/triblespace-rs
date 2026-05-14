@@ -53,6 +53,7 @@ impl MetaDescribe for ED25519RComponent {
 }
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for ED25519SComponent {
     fn describe() -> Fragment {
@@ -80,6 +81,7 @@ impl MetaDescribe for ED25519SComponent {
 }
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for ED25519PublicKey {
     fn describe() -> Fragment {
@@ -107,6 +109,7 @@ impl MetaDescribe for ED25519PublicKey {
 }
 impl ValueSchema for ED25519PublicKey {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 #[cfg(feature = "wasm")]

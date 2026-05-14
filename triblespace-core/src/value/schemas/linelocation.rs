@@ -70,6 +70,7 @@ mod wasm_formatter {
 
 impl ValueSchema for LineLocation {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 fn encode_location(lines: (u64, u64, u64, u64)) -> RawValue {

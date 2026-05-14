@@ -60,6 +60,7 @@ impl MetaDescribe for WordHash {
 
 impl ValueSchema for WordHash {
     type ValidationError = Infallible;
+    type Kind = triblespace_core::value::InlineKind;
 }
 
 /// Term schema for [`bigram_tokens`] — Blake3 hash of a pair of
@@ -91,6 +92,7 @@ impl MetaDescribe for BigramHash {
 
 impl ValueSchema for BigramHash {
     type ValidationError = Infallible;
+    type Kind = triblespace_core::value::InlineKind;
 }
 
 /// Term schema for [`ngram_tokens`] — Blake3 hash of a
@@ -124,6 +126,7 @@ impl MetaDescribe for NgramHash {
 
 impl ValueSchema for NgramHash {
     type ValidationError = Infallible;
+    type Kind = triblespace_core::value::InlineKind;
 }
 
 /// Tokenize `text` with a simple whitespace-and-lowercase scheme

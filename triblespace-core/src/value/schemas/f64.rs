@@ -62,6 +62,7 @@ mod wasm_formatter {
 
 impl ValueSchema for F64 {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 impl TryFromValue<'_, F64> for f64 {

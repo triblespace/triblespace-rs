@@ -63,6 +63,7 @@ impl MetaDescribe for F32LE {
 
 impl ValueSchema for F32LE {
     type ValidationError = Infallible;
+    type Kind = triblespace_core::value::InlineKind;
 }
 
 impl ToValue<F32LE> for f32 {

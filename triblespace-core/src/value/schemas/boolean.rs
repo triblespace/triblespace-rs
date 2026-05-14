@@ -98,6 +98,7 @@ mod wasm_formatter {
 
 impl ValueSchema for Boolean {
     type ValidationError = InvalidBoolean;
+    type Kind = crate::value::InlineKind;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         Self::decode(&value)?;

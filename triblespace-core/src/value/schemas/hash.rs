@@ -128,6 +128,7 @@ where
     H: HashProtocol,
 {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 impl<H> Hash<H>
@@ -343,6 +344,7 @@ where
 
 impl<T: BlobSchema + MetaDescribe> ValueSchema for Handle<T> {
     type ValidationError = Infallible;
+    type Kind = crate::value::HandleKind<T>;
 }
 
 impl MetaDescribe for Blake3 {

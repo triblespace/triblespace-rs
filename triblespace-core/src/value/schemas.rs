@@ -84,6 +84,7 @@ mod wasm_formatter {
 
 impl ValueSchema for UnknownValue {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         Ok(value)

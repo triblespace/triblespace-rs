@@ -83,20 +83,25 @@ impl<S: ValueSchema> Attribute<S> {
     }
 
     /// Macro-side entry point: produce the `(Value<S>, Option<Blob>)`
-    /// pair the `entity!{}` codegen folds into a Fragment. The blob
-    /// half (if any) gets absorbed into the fragment's local blob
-    /// store via `MemoryBlobStore::insert`, which reuses the blob's
-    /// cached handle (no rehash). Anchored on `Attribute<S>` so the
-    /// schema parameter `S` is captured for trait resolution on the
-    /// value side.
-    pub fn into_field_value<V: crate::value::IntoFieldValue<S>>(
+    /// pair the `entity!{}` codegen folds into a Fragment.
+    ///
+    /// Dispatches via [`IntoSchema`] (which produces a `Form` —
+    /// `Value<S>` for inline schemas, `Blob<T>` for handle schemas)
+    /// composed with [`FieldFormFor`] (which expands the form into
+    /// the `(Value, Option<Blob>)` pair). Anchored on `Attribute<S>`
+    /// so the schema parameter `S` is captured for trait resolution.
+    ///
+    /// [`IntoSchema`]: crate::value::IntoSchema
+    /// [`FieldFormFor`]: crate::value::FieldFormFor
+    pub fn into_field_value<V: crate::value::IntoSchema<S>>(
         &self,
         v: V,
     ) -> (
         crate::value::Value<S>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        v.into_field_value()
+        use crate::value::FieldFormFor;
+        v.into_schema().into_field_pair()
     }
 
     /// Coerce an existing variable of any schema into a variable typed with

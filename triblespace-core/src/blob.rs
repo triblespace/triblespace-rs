@@ -278,30 +278,74 @@ impl<S: BlobSchema> ToBlob<S> for Blob<S> {
     }
 }
 
-/// A `Blob<T>` passed as a `Handle<T>`-typed field in `entity!{}`
-/// auto-puts itself: the macro absorbs its bytes into the fragment's
-/// local blob store, and the field value is the handle derived from
-/// those same bytes. The blob store is content-addressed, so the
-/// bytes round-trip cleanly even though the schema is erased at the
-/// storage boundary.
-impl<T> crate::value::IntoFieldValue<Handle<T>> for Blob<T>
+/// `Blob<T>` is a [`FieldFormFor<Handle<T>>`] — given a Blob, the
+/// macro can extract the cached handle (value side) and ship the
+/// schema-erased blob to the local store. This is where the "extract
+/// handle / transmute blob" plumbing lives, used by every handle-
+/// schema source via [`IntoSchema`].
+impl<T> crate::value::FieldFormFor<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
     Handle<T>: ValueSchema,
 {
-    fn into_field_value(
+    fn into_field_pair(
         self,
     ) -> (
         Value<Handle<T>>,
         Option<Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        // O(1) — handle was computed eagerly at Blob::new and is
-        // preserved by transmute (hash is over bytes, not schema).
-        // The store gets a self-describing blob with its cached
-        // handle and skips the recompute on insert.
         let handle = self.handle;
         let blob = self.transmute::<crate::blob::schemas::UnknownBlob>();
         (handle, Some(blob))
+    }
+}
+
+/// Auto-put: a `Blob<T>` passed to a `Handle<T>`-typed `entity!{}`
+/// field is its own form. The macro picks up the cached handle and
+/// ships the blob to the fragment's local store.
+///
+/// Concrete-`Self` rather than a `V: ToBlob<T>` blanket — the
+/// latter coherence-conflicts with the precomputed-handle case
+/// (`Value<Handle<T>>`) because downstream could legitimately impl
+/// `ToBlob<T> for Value<Handle<T>>`. Per-Self also keeps the
+/// extension story symmetric: downstream that wants auto-put for
+/// their native types writes `impl IntoSchema<Handle<MyBlob>> for
+/// MySource`, which the orphan rule permits (`MyBlob` is local).
+impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>> for Blob<T>
+where
+    T: BlobSchema,
+    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
+{
+    type Form = Blob<T>;
+    fn into_schema(self) -> Blob<T> {
+        self
+    }
+}
+
+/// "I already have the handle" case: a precomputed
+/// `Value<Handle<T>>` is its own field value, no side-blob.
+impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>>
+    for Value<Handle<T>>
+where
+    T: BlobSchema,
+    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
+{
+    type Form = Value<Handle<T>>;
+    fn into_schema(self) -> Value<Handle<T>> {
+        self
+    }
+}
+
+/// Reference form of the precomputed-handle case.
+impl<T> crate::value::IntoSchema<Handle<T>, crate::value::HandleKind<T>>
+    for &Value<Handle<T>>
+where
+    T: BlobSchema,
+    Handle<T>: ValueSchema<Kind = crate::value::HandleKind<T>>,
+{
+    type Form = Value<Handle<T>>;
+    fn into_schema(self) -> Value<Handle<T>> {
+        *self
     }
 }
 

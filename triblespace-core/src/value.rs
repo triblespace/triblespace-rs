@@ -318,6 +318,24 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;
 
+    /// Discriminator for whether this schema is *inline*
+    /// (32-byte data lives in the trible) or a *handle* (32 bytes are a
+    /// content-addressed reference to a blob in some store).
+    ///
+    /// Used by [`IntoSchema`] to dispatch the `entity!{}` field
+    /// conversion path: inline schemas go through [`ToValue<S>`]
+    /// (just convert), handle schemas go through [`ToBlob<T>`] (convert
+    /// to bytes, hash, store the blob, return the handle). The
+    /// `IntoSchema` blanket impls use this associated type as a
+    /// coherence-clean discriminator so a single source type (e.g.
+    /// `&str`) can have meaningfully different field-level behaviour
+    /// depending on which schema the attribute targets.
+    ///
+    /// Use [`InlineKind`] for ordinary value schemas;
+    /// [`HandleKind<T>`] is reserved for the one schema that's a
+    /// content-addressed reference — [`crate::value::schemas::hash::Handle<T>`].
+    type Kind;
+
     /// Check if the given value conforms to this schema.
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         Ok(value)
@@ -379,37 +397,60 @@ pub trait TryToValue<S: ValueSchema> {
     fn try_to_value(self) -> Result<Value<S>, Self::Error>;
 }
 
-/// Convert a value into the pair an `entity!{}` field expects: the
-/// encoded `Value<S>` goes into the fragment's facts, and any
-/// side-blob the conversion produced (typically a freshly-built
-/// `Blob<UnknownBlob>` for a `Handle`-typed field) gets absorbed
-/// into the fragment's local blob store.
+/// Marker: a [`ValueSchema`] that stores its data **inline** in the
+/// 32-byte trible value slot. The vast majority of schemas are
+/// inline (numerics, booleans, short strings, ids, …). Set
+/// `type Kind = InlineKind;` in your `impl ValueSchema`.
+pub struct InlineKind;
+
+/// Marker: a [`ValueSchema`] that stores a **content-addressed
+/// reference** to a blob of schema `T`. The only in-tree
+/// implementor is [`Handle<T>`](crate::value::schemas::hash::Handle).
+pub struct HandleKind<T: crate::blob::BlobSchema>(core::marker::PhantomData<T>);
+
+/// Convert a value into its **form** for a target [`ValueSchema`] —
+/// either a directly-encoded `Value<S>` (inline path) or a `Blob<T>`
+/// to be deposited and referenced by handle (out-of-band path).
 ///
-/// This is the entry point the `entity!{}` macro uses internally so
-/// that a fragment is *self-contained by construction* — every
-/// handle that appears in the fragment's facts has its bytes
-/// available without consulting an external blob store. The blob
-/// half is **schema-erased** (`Blob<UnknownBlob>`) on purpose: blob
-/// stores key by content hash, so the original `BlobSchema` only
-/// matters on the *value* side (the returned `Value<Handle<T>>`
-/// carries the type). The schema-erased blob also carries its
-/// **cached handle** — the macro hands it straight to
-/// `MemoryBlobStore::insert(blob)` which reuses the cache, so no
-/// double-hash anywhere in the entity-construction pipeline.
+/// `IntoSchema<S>` is the single trait every source type implements
+/// to declare how it converts to the schema `S`. Each impl picks
+/// its `Form` associated type — typically `Value<S>` for inline
+/// schemas, `Blob<T>` for `Handle<T>`-targeted blob schemas — and
+/// the macro side automatically expands `Form` into the
+/// `(Value<S>, Option<Blob<UnknownBlob>>)` pair via
+/// [`FieldFormFor`].
 ///
-/// Why a separate trait from [`ToValue`]? `ToValue<S>` is a pure
-/// (value → Value<S>) conversion with no notion of side payload —
-/// it's the right abstraction at the *value* layer. `IntoFieldValue`
-/// is the *insertion-side* abstraction that knows handles need
-/// their bytes deposited somewhere too. Every `ToValue<S>` impl
-/// composes into `IntoFieldValue<S>` via the blanket below; the only
-/// case that needs explicit handling is `Blob<T>` targeting
-/// `Handle<T>`, where the bytes need to come along.
-pub trait IntoFieldValue<S: ValueSchema> {
-    /// Produce the `(value, optional-blob)` pair for this field.
-    /// The blob (if any) is content-addressed and carries the same
-    /// cached handle that the value side references.
-    fn into_field_value(
+/// Parameterised by a `Kind` phantom that defaults to
+/// `<S as ValueSchema>::Kind`. The inline blanket (`V: ToValue<S>` →
+/// `Form = Value<S>`) lives in this module; handle-side impls are
+/// per-source-type and live next to the source type's other
+/// conversion impls (e.g. `Blob<T>`'s impl is in `blob.rs`).
+pub trait IntoSchema<S: ValueSchema, K = <S as ValueSchema>::Kind> {
+    /// The concrete form this source produces — typically `Value<S>`
+    /// for inline schemas, `Blob<T>` for handle schemas.
+    type Form: FieldFormFor<S>;
+    /// Run the conversion. For inline sources this is just
+    /// `ToValue::to_value`; for blob sources it's
+    /// `ToBlob::to_blob` (which hashes once and caches the handle).
+    fn into_schema(self) -> Self::Form;
+}
+
+/// Expand an [`IntoSchema::Form`] into the `(Value, Option<Blob>)`
+/// pair that the `entity!{}` macro folds into a Fragment.
+///
+/// Two impls cover everything:
+/// - `Value<S>` is its own value, no side-blob.
+/// - `Blob<T>` targeting `Handle<T>` returns the cached handle plus
+///   the schema-erased blob for the local store to absorb.
+///
+/// The split between `IntoSchema` (which produces a `Form`) and
+/// `FieldFormFor` (which expands the form) lets the per-source impls
+/// of `IntoSchema` stay one-line — pure `to_value` / `to_blob` calls
+/// — while the "extract handle / transmute blob" plumbing lives
+/// exactly once, here.
+pub trait FieldFormFor<S: ValueSchema> {
+    /// Produce the (value, optional-blob) pair the macro absorbs.
+    fn into_field_pair(
         self,
     ) -> (
         Value<S>,
@@ -417,22 +458,37 @@ pub trait IntoFieldValue<S: ValueSchema> {
     );
 }
 
-/// Blanket: any `ToValue<S>` is an `IntoFieldValue<S>` with no
-/// side-blob. Covers `Value<S>` itself, `&Value<S>`, native types
-/// (`u32`, `bool`, `&str`, …) that schemas implement `ToValue` for,
-/// and so on.
-impl<S, V> IntoFieldValue<S> for V
-where
-    S: ValueSchema,
-    V: ToValue<S>,
-{
-    fn into_field_value(
+impl<S: ValueSchema> FieldFormFor<S> for Value<S> {
+    fn into_field_pair(
         self,
     ) -> (
         Value<S>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        (self.to_value(), None)
+        (self, None)
+    }
+}
+
+/// Inline blanket for [`IntoSchema`]: any `V: ToValue<S>` is a valid
+/// field source for an *inline* value schema (anything whose
+/// `ValueSchema::Kind` is `InlineKind`). The `Form` is the value
+/// itself; no side-blob — the value sits directly in the trible
+/// value slot.
+///
+/// Coherence-clean against handle-side impls because the `Kind`
+/// phantom parameter is `InlineKind` here vs. `HandleKind<T>` on the
+/// handle side. Even though a downstream `MyType` could legitimately
+/// implement both `ToValue<Handle<MyBlob>>` and `ToBlob<MyBlob>`,
+/// the macro call site uses S's actual Kind to pick the correct
+/// blanket — no overlap.
+impl<S, V> IntoSchema<S, InlineKind> for V
+where
+    S: ValueSchema<Kind = InlineKind>,
+    V: ToValue<S>,
+{
+    type Form = Value<S>;
+    fn into_schema(self) -> Value<S> {
+        self.to_value()
     }
 }
 

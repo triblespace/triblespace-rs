@@ -62,6 +62,7 @@ impl MetaDescribe for U256LE {
 }
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for U256BE {
     fn describe() -> Fragment {
@@ -90,6 +91,7 @@ impl MetaDescribe for U256BE {
 }
 impl ValueSchema for U256BE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for I256LE {
     fn describe() -> Fragment {
@@ -118,6 +120,7 @@ impl MetaDescribe for I256LE {
 }
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for I256BE {
     fn describe() -> Fragment {
@@ -146,6 +149,7 @@ impl MetaDescribe for I256BE {
 }
 impl ValueSchema for I256BE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 #[cfg(feature = "wasm")]

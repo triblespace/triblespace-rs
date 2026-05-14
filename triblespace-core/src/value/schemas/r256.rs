@@ -66,6 +66,7 @@ impl MetaDescribe for R256LE {
 }
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for R256BE {
     fn describe() -> Fragment {
@@ -141,6 +142,7 @@ mod wasm_formatter {
 }
 impl ValueSchema for R256BE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 /// An error that can occur when converting a ratio value.

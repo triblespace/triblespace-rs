@@ -79,6 +79,7 @@ mod wasm_formatter {
 }
 impl ValueSchema for GenId {
     type ValidationError = ();
+    type Kind = crate::value::InlineKind;
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         if value.raw[0..16] == [0; 16] {
             Ok(value)

@@ -89,6 +89,7 @@ mod wasm_formatter {
 
 impl ValueSchema for ShortString {
     type ValidationError = ValidationError;
+    type Kind = crate::value::InlineKind;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         let raw = &value.raw;

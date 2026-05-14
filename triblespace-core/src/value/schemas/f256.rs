@@ -53,6 +53,7 @@ impl MetaDescribe for F256LE {
 }
 impl ValueSchema for F256LE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 impl MetaDescribe for F256BE {
     fn describe() -> Fragment {
@@ -81,6 +82,7 @@ impl MetaDescribe for F256BE {
 }
 impl ValueSchema for F256BE {
     type ValidationError = Infallible;
+    type Kind = crate::value::InlineKind;
 }
 
 #[cfg(feature = "wasm")]
