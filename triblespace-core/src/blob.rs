@@ -236,6 +236,27 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     fn blob_from<T: IntoBlob<Self>>(t: T) -> Blob<Self> {
         t.to_blob()
     }
+
+    /// Expand a `Blob<Self>` into the field-pair shape `entity!{}`
+    /// consumes: the cached handle for the value side, the
+    /// schema-erased blob for the storage side.
+    ///
+    /// Overridable if a schema has unusual storage semantics. The
+    /// inline-path counterpart lives on
+    /// [`ValueSchema::into_field_pair`].
+    fn into_field_pair(
+        blob: Blob<Self>,
+    ) -> (
+        Value<Handle<Self>>,
+        Option<Blob<crate::blob::schemas::UnknownBlob>>,
+    )
+    where
+        Handle<Self>: ValueSchema,
+    {
+        let handle = blob.handle;
+        let unknown = blob.transmute::<crate::blob::schemas::UnknownBlob>();
+        (handle, Some(unknown))
+    }
 }
 
 /// Shorthand bound for `IntoSchema<S, Form = Blob<S>>` — "this
@@ -305,11 +326,11 @@ where
     }
 }
 
-/// `Blob<T>` is the `FieldFormFor<Handle<T>>` expander: it extracts
-/// the cached handle for the value side and ships its schema-erased
-/// bytes for the storage side. This is where the "extract handle /
-/// transmute blob" plumbing lives, used by every handle-schema
-/// source via [`IntoSchema`].
+/// `Blob<T>` is the `FieldFormFor<Handle<T>>` expander: it delegates
+/// to [`BlobSchema::into_field_pair`] for the actual handle/blob
+/// split. The trait is the macro-side dispatch shim; the logic lives
+/// on `BlobSchema` so users (and schemas that need custom storage
+/// semantics) can call or override it directly.
 impl<T> crate::value::FieldFormFor<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
@@ -321,9 +342,7 @@ where
         Value<Handle<T>>,
         Option<Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        let handle = self.handle;
-        let blob = self.transmute::<crate::blob::schemas::UnknownBlob>();
-        (handle, Some(blob))
+        <T as BlobSchema>::into_field_pair(self)
     }
 }
 

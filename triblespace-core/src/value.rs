@@ -347,6 +347,22 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     ) -> Result<Value<Self>, <T as TryToValue<Self>>::Error> {
         t.try_to_value()
     }
+
+    /// Expand an already-encoded `Value<Self>` into the field-pair
+    /// shape `entity!{}` consumes. Inline schemas: `(value, None)`,
+    /// no side-blob.
+    ///
+    /// Overridable if a schema has unusual storage semantics. The
+    /// blob-path counterpart lives on
+    /// [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair).
+    fn into_field_pair(
+        form: Value<Self>,
+    ) -> (
+        Value<Self>,
+        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
+    ) {
+        (form, None)
+    }
 }
 
 /// Fallible variant of value conversion — `T → Result<Value<S>, Error>`.
@@ -415,10 +431,15 @@ where
 /// pair that the `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Value<V>` is its own value, no side-blob.
-/// - `Blob<T>` targeting `Handle<T>` returns the cached handle plus
-///   the schema-erased blob for the local store to absorb.
+/// - `Value<V>` delegates to [`ValueSchema::into_field_pair`] — inline
+///   path, default `(value, None)`.
+/// - `Blob<T>` targeting `Handle<T>` delegates to
+///   [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair) —
+///   handle path, default `(cached_handle, Some(transmuted_blob))`.
 ///
+/// This trait is the **dispatch shim** for the macro layer; the
+/// actual logic lives on the schema traits so users (and overriding
+/// schemas) can call it directly without going through the trait.
 /// The split between `IntoSchema` (which produces a `Form` keyed on
 /// whatever discriminator the schema uses) and `FieldFormFor` (which
 /// expands the form keyed on the actual value-schema `V`) lets the
@@ -440,7 +461,7 @@ impl<V: ValueSchema> FieldFormFor<V> for Value<V> {
         Value<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        (self, None)
+        <V as ValueSchema>::into_field_pair(self)
     }
 }
 
