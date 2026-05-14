@@ -172,6 +172,18 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   module's view of each attribute without needing a separate
   `json.kind` / `json.string` / … rename. Nothing in the codebase
   queried those rename strings.)
+
+  **Tooling-side migration**: any external metadata-browser that
+  previously string-matched `?attr @ metadata::name = "json.kind"`
+  directly on attribute entities will not find that fact in fresh
+  manifests. The new shape is a usage entity:
+  `?usage @ metadata::attribute = <attr_id>,
+            metadata::source_module = <handle of "triblespace_core::import::json_tree">,
+            metadata::name = "kind"`.
+  Old piles still contain the direct-name facts and remain readable;
+  mixed old/new manifests will surface both shapes, so name-discovery
+  tooling should fall back to the usage-entity query if the direct
+  one yields nothing.
 - **`import::ntriples`** now derives all predicate URI attributes
   through `metadata::iri` (the `NTriplesAttrCache` builds the
   per-(IRI, S) `Attribute` via the inlined entity-core pattern).
