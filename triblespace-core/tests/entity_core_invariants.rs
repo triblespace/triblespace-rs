@@ -82,3 +82,54 @@ fn array_describe_root_matches_id() {
     let from_id = Array::<F32>::id();
     assert_eq!(from_describe, from_id);
 }
+
+/// `*:` spread folds the sub-schema's facts into the parent fragment under
+/// the sub-schema's id. With array element schemas now carrying
+/// `metadata::name` / `metadata::description` annotations, querying for
+/// `Array<F32>`'s describe output should surface both Array's own
+/// annotations AND F32's annotations side-by-side, linked through the
+/// `metadata::array_item_schema` edge.
+#[test]
+fn array_describe_carries_element_schema_annotations() {
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::id::Id;
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
+    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::Value;
+
+    let mut blobs = MemoryBlobStore::<Blake3>::new();
+    let frag = <Array<F32> as MetaDescribe>::describe(&mut blobs).expect("describe");
+
+    let array_id = Array::<F32>::id();
+    let f32_id = F32::id();
+
+    // The array's id is linked to the F32 element schema id through
+    // `metadata::array_item_schema`.
+    let item_links: Vec<Id> = find!(
+        (item: Id),
+        pattern!(&frag, [{ array_id @ metadata::array_item_schema: ?item }])
+    )
+    .map(|(item,)| item)
+    .collect();
+    assert_eq!(item_links, vec![f32_id]);
+
+    // F32's name annotation is in the same metadata fragment (folded
+    // in via the `*:` spread).
+    let f32_names: Vec<Value<Handle<Blake3, _>>> = find!(
+        (n: Value<Handle<Blake3, _>>),
+        pattern!(&frag, [{ f32_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .collect();
+    assert_eq!(f32_names.len(), 1, "F32's name annotation reaches the registry");
+
+    // And the Array's own annotation under array_id is also present.
+    let array_names: Vec<Value<Handle<Blake3, _>>> = find!(
+        (n: Value<Handle<Blake3, _>>),
+        pattern!(&frag, [{ array_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .collect();
+    assert_eq!(array_names.len(), 1, "Array's own name annotation reaches the registry");
+}
