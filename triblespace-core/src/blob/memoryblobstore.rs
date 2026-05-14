@@ -110,6 +110,26 @@ impl<H: HashProtocol> MemoryBlobStoreReader<H> {
     }
 }
 
+impl<H: HashProtocol> Clone for MemoryBlobStore<H> {
+    fn clone(&self) -> Self {
+        MemoryBlobStore {
+            blobs: self.blobs.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<H: HashProtocol> PartialEq for MemoryBlobStore<H> {
+    fn eq(&self, other: &Self) -> bool {
+        // PATCH equality is by key set (values aren't part of equality
+        // — see the patch module docs). Good enough for blob-store
+        // equality, since values are content-addressed by key.
+        self.blobs == other.blobs
+    }
+}
+
+impl<H: HashProtocol> Eq for MemoryBlobStore<H> {}
+
 impl<H: HashProtocol> Default for MemoryBlobStore<H> {
     fn default() -> Self {
         Self::new()

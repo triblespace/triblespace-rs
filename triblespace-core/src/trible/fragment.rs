@@ -1,10 +1,13 @@
 use std::ops::{Add, AddAssign, Deref};
 
+use crate::blob::{BlobSchema, MemoryBlobStore, ToBlob};
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
+use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::Value;
 
 use super::Trible;
 use super::TribleSet;
@@ -12,13 +15,23 @@ use super::TribleSet;
 /// A rooted (or multi-root) fragment of a knowledge graph.
 ///
 /// A fragment is a [`TribleSet`] plus a (possibly empty) set of "exported" entity
-/// ids that act as entry points into the contained facts. Exports are not
-/// privileged in the graph model itself; they are simply the ids the producer
-/// wants to hand back to the caller as the fragment's interface.
+/// ids that act as entry points into the contained facts, plus the
+/// [`MemoryBlobStore`] holding any bytes the contained facts reference
+/// by handle. Exports are not privileged in the graph model itself;
+/// they are simply the ids the producer wants to hand back to the
+/// caller as the fragment's interface.
+///
+/// The embedded blob store is what makes a Fragment *self-contained*:
+/// handles in the facts (e.g. `metadata::name: <Value<Handle<Blake3,
+/// LongString>>>`) reference bytes that the fragment carries with
+/// itself. An empty `MemoryBlobStore` is structurally a single
+/// PATCH-root pointer — fragments without blobs pay essentially
+/// zero overhead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fragment {
     exports: PATCH<16>,
     facts: TribleSet,
+    blobs: MemoryBlobStore<Blake3>,
 }
 
 impl Fragment {
@@ -27,15 +40,20 @@ impl Fragment {
         Self::default()
     }
 
-    /// Creates a fragment that exports a single root id.
+    /// Creates a fragment that exports a single root id, with the
+    /// given facts and an empty blob store.
     pub fn rooted(root: Id, facts: TribleSet) -> Self {
         let mut exports = PATCH::<16>::new();
         let raw: RawId = root.into();
         exports.insert(&Entry::new(&raw));
-        Self { exports, facts }
+        Self {
+            exports,
+            facts,
+            blobs: MemoryBlobStore::new(),
+        }
     }
 
-    /// Creates a fragment with the given exported ids.
+    /// Creates a fragment with the given exported ids and an empty blob store.
     ///
     /// Export ids are canonicalized as a set (duplicates are ignored). Empty
     /// exports are allowed.
@@ -51,7 +69,36 @@ impl Fragment {
         Self {
             exports: export_set,
             facts,
+            blobs: MemoryBlobStore::new(),
         }
+    }
+
+    /// Creates a fragment with no exports, holding the given facts and
+    /// blob store. Useful when re-wrapping the tail of a destructured
+    /// fragment (e.g. inside `Spread::spread`) where the exports have
+    /// already been consumed.
+    pub fn from_facts_and_blobs(facts: TribleSet, blobs: MemoryBlobStore<Blake3>) -> Self {
+        Self {
+            exports: PATCH::<16>::new(),
+            facts,
+            blobs,
+        }
+    }
+
+    /// Insert a blob into the fragment's local blob store and return the
+    /// content-addressed handle that references it.
+    ///
+    /// Use this when you want a Fragment to be self-contained — every
+    /// handle in its facts has its bytes available without consulting
+    /// an external blob store. Idempotent under content addressing:
+    /// putting the same bytes twice returns the same handle and
+    /// doesn't grow the store.
+    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>
+    where
+        S: BlobSchema,
+        T: ToBlob<S>,
+    {
+        self.blobs.insert(item.to_blob())
     }
 
     /// Returns the exported ids for this fragment, in deterministic (lexicographic) order.
@@ -79,12 +126,24 @@ impl Fragment {
         &self.facts
     }
 
+    /// Borrow the fragment's local blob store.
+    pub fn blobs(&self) -> &MemoryBlobStore<Blake3> {
+        &self.blobs
+    }
+
     pub fn into_facts(self) -> TribleSet {
         self.facts
     }
 
-    pub fn into_parts(self) -> (PATCH<16>, TribleSet) {
-        (self.exports, self.facts)
+    /// Consume the fragment, yielding its facts and blob store. The
+    /// exports are dropped — most callers want facts/blobs together
+    /// without the rooted-id concern.
+    pub fn into_facts_and_blobs(self) -> (TribleSet, MemoryBlobStore<Blake3>) {
+        (self.facts, self.blobs)
+    }
+
+    pub fn into_parts(self) -> (PATCH<16>, TribleSet, MemoryBlobStore<Blake3>) {
+        (self.exports, self.facts, self.blobs)
     }
 
     /// Merge annotation facts under this fragment's existing root,
@@ -179,10 +238,14 @@ impl AddAssign for Fragment {
     fn add_assign(&mut self, rhs: Self) {
         self.facts += rhs.facts;
         self.exports.union(rhs.exports);
+        self.blobs.union(rhs.blobs);
     }
 }
 
 impl AddAssign<TribleSet> for Fragment {
+    /// Facts-only merge — does not touch exports or blobs. Used by
+    /// `Fragment::annotated` to land annotation facts under self's
+    /// root without exposing the annotation's own exports.
     fn add_assign(&mut self, rhs: TribleSet) {
         self.facts += rhs;
     }
