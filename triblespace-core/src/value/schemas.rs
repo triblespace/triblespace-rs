@@ -47,6 +47,7 @@ pub struct UnknownValue {}
 impl MetaDescribe for UnknownValue {
     fn describe() -> Fragment {
         let id: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
+        #[allow(unused_mut)]
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
         };

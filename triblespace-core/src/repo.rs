@@ -2155,33 +2155,42 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     }
 
     /// Performs a commit in the workspace.
-    /// This method creates a new commit blob (stored in the local blobset)
-    /// and updates the current commit handle.
-    pub fn commit(&mut self, content_: impl Into<TribleSet>, message_: &str) {
-        let content_ = content_.into();
-        self.commit_internal(content_, Some(self.commit_metadata), Some(message_));
+    ///
+    /// Accepts anything that converts into a [`Fragment`] — either a
+    /// raw [`TribleSet`] (auto-promoted to a Fragment with empty blob
+    /// store), or a Fragment built up via `entity!{}` /
+    /// `MetaDescribe::describe()` whose embedded blobs get absorbed
+    /// into `self.staged` alongside the commit-content blob.
+    /// This method creates a new commit blob (stored in the local
+    /// blobset) and updates the current commit handle.
+    pub fn commit(&mut self, content_: impl Into<Fragment>, message_: &str) {
+        self.commit_internal(content_.into(), Some(self.commit_metadata), Some(message_));
     }
 
     /// Like [`commit`](Self::commit) but attaches a one-off metadata handle
     /// instead of the repository default.
     pub fn commit_with_metadata(
         &mut self,
-        content_: impl Into<TribleSet>,
+        content_: impl Into<Fragment>,
         metadata_: MetadataHandle,
         message_: &str,
     ) {
-        let content_ = content_.into();
-        self.commit_internal(content_, Some(metadata_), Some(message_));
+        self.commit_internal(content_.into(), Some(metadata_), Some(message_));
     }
 
     fn commit_internal(
         &mut self,
-        content_: TribleSet,
+        content_: Fragment,
         metadata_handle: Option<MetadataHandle>,
         message_: Option<&str>,
     ) {
+        let (content_facts, content_blobs) = content_.into_facts_and_blobs();
+        // 0. Absorb any blobs the Fragment carried with it into the
+        //    staging area before producing the commit blob, so handles
+        //    inside `content_facts` resolve against `self.staged`.
+        self.staged.union(content_blobs);
         // 1. Create a commit blob from the current head, content, metadata and the commit message.
-        let content_blob = content_.to_blob();
+        let content_blob = content_facts.to_blob();
         // If a message is provided, store it as a LongString blob and pass the handle.
         let message_handle = message_.map(|m| self.put(m.to_string()));
         let parents = self.head.iter().copied();

@@ -304,6 +304,17 @@ impl Add<Fragment> for TribleSet {
     }
 }
 
+/// Lossless promotion: a `TribleSet` becomes a Fragment with no
+/// exported root and an empty blob store. The reverse direction is
+/// intentionally not implemented — going from `Fragment` to
+/// `TribleSet` discards the embedded blob store and exports, so it
+/// has to be explicit (`Fragment::into_facts`).
+impl From<TribleSet> for Fragment {
+    fn from(facts: TribleSet) -> Self {
+        Self::from_facts_and_blobs(facts, MemoryBlobStore::new())
+    }
+}
+
 impl From<Fragment> for TribleSet {
     fn from(value: Fragment) -> Self {
         value.facts
