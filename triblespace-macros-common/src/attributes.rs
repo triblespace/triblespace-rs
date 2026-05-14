@@ -192,10 +192,14 @@ pub fn attributes_impl(
     //      usage entity whose id derives from
     //      (metadata::attribute, metadata::source_module).
     //
-    // The `entity!{}` calls below expand `entity_impl` directly with
-    // our `base_path` — no sibling proc-macro shim is invoked, so
-    // these inner expansions never trip the metadata-emission wrapper
-    // that the outer `attributes!{}` shim already applied.
+    // `entity_impl` (same crate as us) expands the inner `entity!{}`
+    // calls directly with our `base_path` — no sibling proc-macro
+    // shim is invoked, so these inner expansions never trip the
+    // metadata-emission wrapper that the outer `attributes!{}`
+    // shim already applied. The two-step "derive root from core,
+    // then annotate under it" pattern collapses through
+    // `Fragment::try_annotated` so there's no temp root extraction
+    // in the generated code.
     let per_attr_blocks = per_attr.into_iter().map(|(name, name_lit, description)| -> syn::Result<TokenStream2> {
         let usage_core_tokens = crate::entity_impl(
             quote! {
@@ -205,29 +209,39 @@ pub fn attributes_impl(
             base_path,
         )?;
 
-        let usage_annotations_tokens = crate::entity_impl(
-            quote! {
-                &__usage_ref @
-                #base_path::metadata::name: __usage_name_h,
-                #base_path::metadata::tag:  #base_path::metadata::KIND_ATTRIBUTE_USAGE,
-            },
-            base_path,
-        )?;
-
-        let description_emission = if let Some(desc_lit) = description {
-            let desc_tokens = crate::entity_impl(
+        // Annotation closure body for `Fragment::try_annotated`. The
+        // closure receives `__usage_ref: &ExclusiveId` (the derived
+        // usage id) and returns `Result<Fragment, B::PutError>`.
+        // We expand `entity_impl` directly with our `base_path` so
+        // the `entity!{}` inside resolves the same way the outer
+        // `attributes!{}` does. Doc-comments split the body so the
+        // description blob put only happens when the source had one.
+        let annotation_body = if let Some(desc_lit) = description {
+            let annotation_tokens = crate::entity_impl(
                 quote! {
-                    &__usage_ref @
+                    __usage_ref @
+                    #base_path::metadata::name:        __usage_name_h,
+                    #base_path::metadata::tag:         #base_path::metadata::KIND_ATTRIBUTE_USAGE,
                     #base_path::metadata::description: __desc_h,
                 },
                 base_path,
             )?;
             quote! {
                 let __desc_h = __blobs.put(#desc_lit)?;
-                __fragment += (#desc_tokens).into_facts();
+                ::core::result::Result::Ok(#annotation_tokens)
             }
         } else {
-            quote! {}
+            let annotation_tokens = crate::entity_impl(
+                quote! {
+                    __usage_ref @
+                    #base_path::metadata::name: __usage_name_h,
+                    #base_path::metadata::tag:  #base_path::metadata::KIND_ATTRIBUTE_USAGE,
+                },
+                base_path,
+            )?;
+            quote! {
+                ::core::result::Result::Ok(#annotation_tokens)
+            }
         };
 
         Ok(quote! {
@@ -239,18 +253,18 @@ pub fn attributes_impl(
                 )?
                 .into_facts();
 
-                // Usage facts inlined at the declaration site.
+                // Usage entity: core derives its id from
+                // (metadata::attribute, metadata::source_module);
+                // `try_annotated` layers name/tag/description under
+                // that derived id without exposing it.
                 let __attr_id = #name.id();
                 let __usage_name_h = __blobs.put(#name_lit)?;
                 let __usage_module_h = __blobs.put(module_path!())?;
-                let __usage_core = #usage_core_tokens;
-                let __usage_id = __usage_core
-                    .root()
-                    .expect("entity! without `@` always emits a rooted fragment");
-                let __usage_ref = #base_path::id::ExclusiveId::force_ref(&__usage_id);
-                __fragment += __usage_core.into_facts();
-                __fragment += (#usage_annotations_tokens).into_facts();
-                #description_emission
+                let __usage = (#usage_core_tokens)
+                    .try_annotated(|__usage_ref| {
+                        #annotation_body
+                    })?;
+                __fragment += __usage.into_facts();
             }
         })
     }).collect::<syn::Result<Vec<_>>>()?;

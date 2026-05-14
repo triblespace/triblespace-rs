@@ -29,7 +29,6 @@
 //! Attribute::<S>::from(Fragment::rooted(id, TribleSet::new()))
 //! ```
 
-use crate::id::ExclusiveId;
 use crate::id::RawId;
 use crate::macros::entity;
 use crate::trible::Fragment;
@@ -128,23 +127,18 @@ where
     where
         B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
     {
-        let id = self.id();
-        // Start from the identity-determining fragment so its facts
-        // (metadata::iri / metadata::name / metadata::value_schema)
-        // make it through into the registry, where they can be
-        // looked up.
-        let mut fragment = self.fragment.clone();
-
-        // Spread S's describe under the same attribute id: the bare
-        // `metadata::value_schema: S::id()` in the core grows into
-        // the full schema description. Merge as facts so the
-        // spread's root doesn't escape past this attribute.
-        let spread = entity! { ExclusiveId::force_ref(&id) @
-            crate::metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
-        };
-        fragment += spread.into_facts();
-
-        Ok(fragment)
+        // The identity-determining fragment carries facts like
+        // `metadata::iri` / `metadata::name` / `metadata::value_schema`
+        // that the registry queries on. We layer the schema spread
+        // (the bare `value_schema: S::id()` grows into the full schema
+        // description) under the same attribute id via
+        // `try_annotated`, which keeps the attribute root as the
+        // sole exposed root.
+        self.fragment.clone().try_annotated(|id_ref| {
+            Ok(entity! { id_ref @
+                crate::metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
+            })
+        })
     }
 }
 

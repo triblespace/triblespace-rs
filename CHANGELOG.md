@@ -129,6 +129,26 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   metadata::source_module)` → usage id; `metadata::name`,
   `metadata::tag: KIND_ATTRIBUTE_USAGE`, optional
   `metadata::description` under the usage id).
+- **`Fragment::annotated` / `Fragment::try_annotated` added.** These
+  collapse the recurring three-step pattern:
+  ```rust
+  let mut frag = entity! { <core facts> };
+  let id = frag.root().expect("rooted");
+  frag += entity! { &ExclusiveId::force_ref(&id) @ <annotations> }.into_facts();
+  ```
+  into a single chained call:
+  ```rust
+  entity! { <core facts> }.annotated(|id_ref| {
+      entity! { id_ref @ <annotations> }
+  })
+  ```
+  The annotation fragment's facts merge in but its root is dropped —
+  `self.root()` still returns the pre-annotation id. `try_annotated`
+  is the fallible variant for closures that need `blobs.put(...)?`
+  or other error propagation while building the annotations. Used
+  by `Describe for Attribute<S>` (schema spread) and by the
+  `attributes!{}` macro's per-attribute usage emission, so the
+  generated code no longer has the temp-root extraction dance.
 - **`attributes_impl` no longer invokes a sibling proc-macro for
   `entity!{}` expansions**. It calls `entity_impl` (same crate)
   directly, expanding to a `TokenStream2` with the
