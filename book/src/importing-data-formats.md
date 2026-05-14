@@ -28,7 +28,8 @@ deterministic JSON importers and an N-Triples (RDF) importer:
   wrapper) reads the line-oriented N-Triples serialization of an RDF graph
   and emits one trible per statement. URIs become stable entity ids via the
   [`import::rdf_uri`](../src/import/mod.rs) attribute; predicate URIs become
-  attribute ids via `Attribute::from_name`; literal values map into the
+  attribute ids via `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_schema: })`
+  — the IRI is the canonical identifier; literal values map into the
   appropriate native `ValueSchema` based on their XSD datatype.
 
 `JsonObjectImporter` uses a fixed mapping for JSON primitives:
@@ -48,10 +49,13 @@ fresh run (drop the per-field attribute caches and multi-value tracking).
 
 ## Mapping JSON Fields to Attributes
 
-Attributes are derived through `Attribute::from_name`, which hashes the JSON
-field name together with the fixed `ValueSchema` for that primitive. The
-importer caches the resulting `RawId`s per field so the hash only has to be
-computed once per run. Arrays are treated as multi-valued fields: every item is
+Attributes are derived through the entity-core mechanism —
+`Attribute::<S>::from(entity!{ metadata::name: <field handle>,
+metadata::value_schema: <S as MetaDescribe>::id() })` — which hashes the
+sorted+deduped `(attr, value)` pairs to produce a stable attribute id from
+the JSON field name and its fixed `ValueSchema`. The importer caches the
+resulting `Attribute<S>` per field so the hash only has to be computed once
+per run. Arrays are treated as multi-valued fields: every item is
 encoded and stored under the same attribute identifier, producing one trible per
 element.
 
@@ -150,11 +154,16 @@ emitted, so `pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original
 URI for any imported entity.
 
 **Predicate → attribute id.** Predicate URIs become attribute ids through
-`Attribute::from_name`, the same derivation JSON importers use. Because
+the entity-core derivation rooted at `metadata::iri` —
+`Attribute::<S>::from(entity!{ metadata::iri: <iri handle>,
+metadata::value_schema: <S as MetaDescribe>::id() })`. Because
 attribute ids are hashed together with the chosen `ValueSchema`, the same
 predicate used for two different literal types produces two different
 attribute ids — which is what you want: `:birthyear "1920"^^xsd:integer`
-and `:birthyear "1920"` (untyped string) shouldn't collide.
+and `:birthyear "1920"` (untyped string) shouldn't collide. (JSON field
+names use the same shape but with `metadata::name` instead of
+`metadata::iri`, so the resulting ids are also distinct from
+same-spelled IRIs.)
 
 **Literal → native value.** XSD datatypes map into the appropriate
 triblespace value schemas:
@@ -178,9 +187,17 @@ schema:
 
 ```rust,ignore
 use triblespace::core::attribute::Attribute;
-use triblespace::prelude::valueschemas::I256BE;
+use triblespace::core::blob::schemas::iri::IRI;
+use triblespace::core::blob::ToBlob;
+use triblespace::core::macros::entity;
+use triblespace::core::metadata::{self, MetaDescribe};
+use triblespace::prelude::valueschemas::{Blake3, Handle, I256BE};
+use triblespace::prelude::Value;
 
-let birthyear = Attribute::<I256BE>::from_name("http://example.org/birthyear");
+let birthyear = Attribute::<I256BE>::from(entity! {
+    metadata::iri:          "http://example.org/birthyear".to_blob().get_handle::<Blake3>(),
+    metadata::value_schema: <I256BE as MetaDescribe>::id(),
+});
 for (entity, year) in find!(
     (entity: Id, year: i128),
     pattern!(&facts, [{ ?entity @ birthyear: ?year }])
@@ -217,8 +234,10 @@ workload on datasets with significant repetition.
 ## Extending the Importers
 
 To support a new external format, implement a module in the `import` namespace
-that follows the same pattern: decode the source data, derive attributes with
-`Attribute::from_name`, encode values using the appropriate `ValueSchema`, and
-hand the results to `Trible::new`. If the format supplies stable identifiers,
-mix them into the hashing step or salt so downstream systems can keep imports
-idempotent.
+that follows the same pattern: decode the source data, derive attributes via
+`Attribute::<S>::from(entity!{ metadata::<origin>: <handle>, metadata::value_schema: <S as MetaDescribe>::id() })`
+(use `metadata::iri` for URI-identified predicates, `metadata::name` for
+display-name origins like JSON fields), encode values using the appropriate
+`ValueSchema`, and hand the results to `Trible::new`. If the format supplies
+stable identifiers, mix them into the hashing step or salt so downstream
+systems can keep imports idempotent.

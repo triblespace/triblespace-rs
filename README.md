@@ -75,7 +75,9 @@ mod literature {
 
 // The examples pin explicit ids for shared schemas. For quick prototypes you
 // can omit the hex literal and `attributes!` will derive a deterministic id
-// from the attribute name and schema (via Attribute::from_name).
+// from the attribute name and schema via the entity-core mechanism —
+// `Attribute::<S>::from(entity!{ metadata::name: <name handle>,
+// metadata::value_schema: <S as MetaDescribe>::id() })`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory

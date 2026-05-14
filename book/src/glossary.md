@@ -13,8 +13,8 @@ remains independently typed even when many are combined to describe the same
 entity, preserving its individual semantics. Provide an explicit 128-bit id in
 the macro when you need a canonical column shared across crates or languages;
 omit the literal to derive a deterministic id from the attribute name and value
-schema (the macro calls `Attribute::from_name` for you), which is handy for
-short-lived or internal attributes.
+schema (the macro wraps the name + schema id in an `entity!{}` fragment and
+takes the root for you), which is handy for short-lived or internal attributes.
 
 ### Blob
 An immutable chunk of binary data addressed by the hash of its contents. Blobs

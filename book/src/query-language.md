@@ -534,8 +534,9 @@ let results: Vec<_> = find!((s: Value<_>, e: Value<_>),
 
 You can omit the hex literal in `attributes!` when you only need local or
 short‑lived attributes—the macro then derives a deterministic id from the name
-and schema just like `Attribute::from_name`. Stick with explicit ids when the
-attributes form part of a shared protocol.
+and schema via the entity-core mechanism (equivalent to
+`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_schema: <S as MetaDescribe>::id() })`).
+Stick with explicit ids when the attributes form part of a shared protocol.
 
 The middle section uses a familiar regex syntax to describe allowed edge
 sequences.  Editors with Rust macro expansion support provide highlighting and
