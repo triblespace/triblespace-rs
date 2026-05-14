@@ -713,9 +713,8 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let set_init = quote! {
         let mut set = #base_path::trible::TribleSet::new();
-        let mut __blobs: #base_path::blob::MemoryBlobStore<
-            #base_path::value::schemas::hash::Blake3,
-        > = #base_path::blob::MemoryBlobStore::new();
+        let mut __blobs: #base_path::blob::MemoryBlobStore =
+            #base_path::blob::MemoryBlobStore::new();
     };
     let attr_count = attributes.len();
     let has_dynamic_pairs = attributes
@@ -906,8 +905,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                 __hasher.update(&__v[..]);
                 __last = Some((*__a, *__v));
             }
-            let __digest = __hasher.finalize();
-            let __digest_bytes = __digest.as_bytes();
+            let __digest_bytes = __hasher.finalize();
             let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
             __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
             let __id = #base_path::id::Id::new(__raw).unwrap();
@@ -931,8 +929,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                 __hasher.update(&__v[..]);
                 __last = Some((*__a, *__v));
             }
-            let __digest = __hasher.finalize();
-            let __digest_bytes = __digest.as_bytes();
+            let __digest_bytes = __hasher.finalize();
             let mut __raw: #base_path::id::RawId = [0u8; #base_path::id::ID_LEN];
             __raw.copy_from_slice(&__digest_bytes[__digest_bytes.len() - #base_path::id::ID_LEN..]);
             let __id = #base_path::id::Id::new(__raw).unwrap();

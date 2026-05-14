@@ -23,7 +23,7 @@ fn list_branches_outputs_branch_id() {
     std::fs::File::create(&path).unwrap();
 
     {
-        let pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let pile: Pile = Pile::open(&path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
         repo.create_branch("main", None).expect("create branch");
         repo.into_storage().close().unwrap();
@@ -44,7 +44,7 @@ fn delete_branch_removes_branch_id_from_list() {
     std::fs::File::create(&path).unwrap();
 
     let branch_id = {
-        let pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let pile: Pile = Pile::open(&path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let pile = repo.into_storage();
@@ -71,7 +71,7 @@ fn delete_branch_removes_branch_id_from_list() {
         .success()
         .stdout(predicate::str::is_empty());
 
-    let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+    let mut pile: Pile = Pile::open(&path).unwrap();
     pile.refresh().unwrap();
     assert_eq!(pile.head(branch_id).unwrap(), None);
     pile.close().unwrap();
@@ -87,7 +87,7 @@ fn branch_stats_reports_fast_and_full_counts() {
     std::fs::File::create(&path).unwrap();
 
     let branch_id = {
-        let pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let pile: Pile = Pile::open(&path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
@@ -152,7 +152,7 @@ fn create_initializes_empty_pile() {
         .success()
         .stdout(predicate::str::is_empty());
 
-    let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+    let mut pile: Pile = Pile::open(&path).unwrap();
     // Explicitly refresh after open to populate in-memory indices.
     pile.refresh().unwrap();
     let mut iter = pile.branches().unwrap();
@@ -204,7 +204,7 @@ fn put_ingests_file() {
         .success()
         .stdout(predicate::str::is_match(pattern).unwrap());
 
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     let reader = pile.reader().unwrap();
     assert!(reader.blobs().next().is_some());
     drop(reader);
@@ -402,7 +402,7 @@ fn inspect_outputs_tribles() {
     let blob = dataset.to_blob();
 
     let handle_str = {
-        let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let mut pile: Pile = Pile::open(&pile_path).unwrap();
         let handle = pile.put(blob).unwrap();
         pile.close().unwrap();
 

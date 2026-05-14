@@ -18,7 +18,7 @@ use anybytes::View;
 ///
 /// Use for text that does not fit in the 32-byte [`ShortString`](crate::value::schemas::shortstring::ShortString)
 /// value boundary — documents, prompts, JSON payloads, logs, etc.
-/// Reference it from tribles via a [`Handle<Blake3, LongString>`](crate::value::schemas::hash::Handle).
+/// Reference it from tribles via a [`Handle<LongString>`](crate::value::schemas::hash::Handle).
 pub struct LongString {}
 
 impl BlobSchema for LongString {}
@@ -81,8 +81,8 @@ mod tests {
     #[test]
     fn string_handle() {
         let s: View<str> = Bytes::from(String::from("hello world!")).view().unwrap();
-        let h: Value<Handle<Blake3, LongString>> = s.clone().to_blob().get_handle();
-        let h2: Value<Handle<Blake3, LongString>> = s.clone().to_blob().get_handle();
+        let h: Value<Handle<LongString>> = s.clone().to_blob().get_handle();
+        let h2: Value<Handle<LongString>> = s.clone().to_blob().get_handle();
 
         assert!(h == h2);
     }

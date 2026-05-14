@@ -142,10 +142,10 @@ mod tests {
     fn iri_handle_is_deterministic() {
         let s: View<str> = Bytes::from(String::from("http://example.org/x")).view().unwrap();
         let h: crate::value::Value<
-            crate::value::schemas::hash::Handle<Blake3, IRI>,
+            crate::value::schemas::hash::Handle<IRI>,
         > = s.clone().to_blob().get_handle();
         let h2: crate::value::Value<
-            crate::value::schemas::hash::Handle<Blake3, IRI>,
+            crate::value::schemas::hash::Handle<IRI>,
         > = s.clone().to_blob().get_handle();
         assert_eq!(h, h2);
     }

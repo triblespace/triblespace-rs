@@ -40,7 +40,7 @@ mod search_attrs {
     use super::*;
 
     attributes! {
-        "03712511F65DCC9B1C45FE04184F1B44" as pub book_embedding: Handle<Blake3, Embedding>;
+        "03712511F65DCC9B1C45FE04184F1B44" as pub book_embedding: Handle<Embedding>;
     }
 }
 
@@ -60,17 +60,17 @@ fn main() {
     // Put each book's embedding into the blob store up front so
     // we can reference them by handle from both the TribleSet
     // and the HNSW index — one source of truth for the vectors.
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let vectors: Vec<(Id, Vec<f32>)> = vec![
         (book_a, vec![0.9, 0.1, 0.05, 0.02]),
         (book_b, vec![0.0, 0.0, 1.0, 0.0]),
         (book_c, vec![0.85, 0.15, 0.1, 0.0]),
         (book_d, vec![-1.0, 0.0, 0.0, 0.0]),
     ];
-    let mut handles: std::collections::HashMap<Id, Value<Handle<Blake3, Embedding>>> =
+    let mut handles: std::collections::HashMap<Id, Value<Handle<Embedding>>> =
         std::collections::HashMap::new();
     for (bid, v) in &vectors {
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         handles.insert(*bid, h);
     }
 
@@ -115,7 +115,7 @@ fn main() {
     // same address space as the corpus. Content-addressing makes
     // repeats free.
     let query_handle =
-        put_embedding::<_, Blake3>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let reader = store.reader().unwrap();
     let view = idx.attach(&reader);
     println!(

@@ -16,7 +16,7 @@ use triblespace_core_macros::attributes;
 
 /// Describes a runtime *instance* — emits metadata about a specific value (an
 /// `Attribute<S>` with its id+name+usage, etc.). For describing a Rust *type*
-/// itself (schema metadata for `ShortString`, `Handle<H,T>`, …) use
+/// itself (schema metadata for `ShortString`, `Handle<T>`, …) use
 /// [`MetaDescribe`].
 ///
 /// `describe` returns a [`Fragment`] that's self-contained — its
@@ -40,7 +40,7 @@ pub trait Describe {
 }
 
 /// Describes a Rust *type* — emits schema metadata about the type itself
-/// without needing an instance (`ShortString`, `Handle<H,T>`, …). For
+/// without needing an instance (`ShortString`, `Handle<T>`, …). For
 /// describing a runtime value use [`Describe`].
 ///
 /// Same self-contained Fragment contract as [`Describe`]: the
@@ -100,7 +100,7 @@ attributes! {
     /// This attribute is general-purpose: it can describe any entity. Schema
     /// metadata uses it for documenting value/blob schemas, but it is equally
     /// valid for domain entities.
-    "AE94660A55D2EE3C428D2BB299E02EC3" as description: valueschemas::Handle<hash::Blake3, LongString>;
+    "AE94660A55D2EE3C428D2BB299E02EC3" as description: valueschemas::Handle<LongString>;
     /// Links an attribute or handle to its value schema identifier.
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
     /// Links a handle to its blob schema identifier.
@@ -113,9 +113,9 @@ attributes! {
     "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: valueschemas::GenId;
     /// Optional WebAssembly module for formatting values governed by this schema.
     ///
-    /// The value is a `Handle<Blake3, WasmCode>` that points to a sandboxed
+    /// The value is a `Handle<WasmCode>` that points to a sandboxed
     /// formatter module (see `triblespace_core::value_formatter`).
-    "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: valueschemas::Handle<hash::Blake3, WasmCode>;
+    "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: valueschemas::Handle<WasmCode>;
     /// Long-form display name stored as a LongString handle.
     ///
     /// Names are *display*-oriented and contextual: multiple usages of the
@@ -129,7 +129,7 @@ attributes! {
     /// [`iri`](`self::iri`) instead. The id-derivation paths for dynamic
     /// attributes hash from those identity-determining attributes, not
     /// from `name`.
-    "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<hash::Blake3, LongString>;
+    "7FB28C0B48E1924687857310EE230414" as name: valueschemas::Handle<LongString>;
     /// Internationalized Resource Identifier (IRI) for this entity.
     ///
     /// The canonical identity-determining string for RDF predicate URIs and
@@ -138,13 +138,13 @@ attributes! {
     /// collide: the (attr_id, value) pair that participates in
     /// entity-intrinsic-id derivation differs in the attr_id, even when the
     /// raw value bytes are identical.
-    "325F05DB88184B4540AAEEFAE1E9667F" as iri: valueschemas::Handle<hash::Blake3, IRI>;
+    "325F05DB88184B4540AAEEFAE1E9667F" as iri: valueschemas::Handle<IRI>;
     /// Link a usage annotation entity to the attribute it describes.
     "F10DE6D8E60E0E86013F1B867173A85C" as attribute: valueschemas::GenId;
     /// Optional provenance string for a usage annotation.
-    "A56350FD00EC220B4567FE15A5CD68B8" as source: valueschemas::Handle<hash::Blake3, LongString>;
+    "A56350FD00EC220B4567FE15A5CD68B8" as source: valueschemas::Handle<LongString>;
     /// Optional module path for the usage annotation (from `module_path!()`).
-    "BCB94C7439215641A3E9760CE3F4F432" as source_module: valueschemas::Handle<hash::Blake3, LongString>;
+    "BCB94C7439215641A3E9760CE3F4F432" as source_module: valueschemas::Handle<LongString>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
     /// Preferred JSON representation hint (e.g. `"string"`, `"number"`, `"bool"`, `"object"`).
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: valueschemas::ShortString;

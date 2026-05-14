@@ -24,7 +24,7 @@ fn ancestors_respects_bounded_commit_dags() {
     let signing_key = SigningKey::from_bytes(&secret);
 
     let mut storage = MemoryRepo::default();
-    let mut commit_handles = ArrayVec::<Value<Handle<Blake3, SimpleArchive>>, MAX_COMMITS>::new();
+    let mut commit_handles = ArrayVec::<Value<Handle<SimpleArchive>>, MAX_COMMITS>::new();
 
     for index in dag.indices() {
         let parents = dag.parents(index);
@@ -74,7 +74,7 @@ fn ancestors_respects_bounded_commit_dags() {
 
         let mut observed = [false; MAX_COMMITS];
         for raw in patch.iter() {
-            let candidate = Value::<Handle<Blake3, SimpleArchive>>::new(*raw);
+            let candidate = Value::<Handle<SimpleArchive>>::new(*raw);
             let mut matched = false;
             for (pos, existing) in commit_handles.iter().enumerate() {
                 if *existing == candidate {

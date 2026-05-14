@@ -7,7 +7,6 @@ use crate::repo::BlobStorePut;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
@@ -30,27 +29,25 @@ impl<B, R> HybridStore<B, R> {
     }
 }
 
-impl<H, B, R> BlobStorePut<H> for HybridStore<B, R>
+impl<B, R> BlobStorePut for HybridStore<B, R>
 where
-    H: HashProtocol,
-    B: BlobStorePut<H>,
+    B: BlobStorePut,
 {
     type PutError = B::PutError;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         self.blobs.put(item)
     }
 }
 
-impl<H, B, R> BlobStore<H> for HybridStore<B, R>
+impl<B, R> BlobStore for HybridStore<B, R>
 where
-    H: HashProtocol,
-    B: BlobStore<H>,
+    B: BlobStore,
 {
     type Reader = B::Reader;
     type ReaderError = B::ReaderError;
@@ -60,10 +57,9 @@ where
     }
 }
 
-impl<H, B, R> BranchStore<H> for HybridStore<B, R>
+impl<B, R> BranchStore for HybridStore<B, R>
 where
-    H: HashProtocol,
-    R: BranchStore<H>,
+    R: BranchStore,
 {
     type BranchesError = R::BranchesError;
     type HeadError = R::HeadError;
@@ -79,16 +75,16 @@ where
         self.branches.branches()
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<H, SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
         self.branches.head(id)
     }
 
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Option<Value<Handle<H, SimpleArchive>>>,
-    ) -> Result<PushResult<H>, Self::UpdateError> {
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
         self.branches.update(id, old, new)
     }
 }

@@ -26,23 +26,23 @@ fn publish_remote_meta(
     name: &str,
     commit_content: &str,
 ) -> [u8; 32] {
-    let name_handle: Value<Handle<Blake3, LongString>> =
+    let name_handle: Value<Handle<LongString>> =
         store.put(name.to_string()).unwrap();
 
     // Fabricate a "commit" blob — contents don't matter for this test,
     // we just need a valid SimpleArchive the tracking machinery can
     // resolve as the branch's head.
     let eid = genid();
-    let content_handle: Value<Handle<Blake3, LongString>> =
+    let content_handle: Value<Handle<LongString>> =
         store.put(commit_content.to_string()).unwrap();
     let mut commit_set = TribleSet::new();
     commit_set += entity! { &eid @ triblespace_core::metadata::name: content_handle };
     let commit_blob: Blob<SimpleArchive> = commit_set.to_blob();
-    let _commit_handle: Value<Handle<Blake3, SimpleArchive>> =
+    let _commit_handle: Value<Handle<SimpleArchive>> =
         store.put(commit_blob.clone()).unwrap();
 
     let meta_set = branch_unsigned(remote_branch_id, name_handle, Some(commit_blob), None);
-    let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).unwrap();
+    let meta_handle: Value<Handle<SimpleArchive>> = store.put(meta_set).unwrap();
     meta_handle.raw
 }
 

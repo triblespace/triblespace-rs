@@ -44,7 +44,7 @@ mod attrs {
     use super::*;
 
     attributes! {
-        "03712511F65DCC9B1C45FE04184F1B44" as pub paper_embedding: Handle<Blake3, Embedding>;
+        "03712511F65DCC9B1C45FE04184F1B44" as pub paper_embedding: Handle<Embedding>;
     }
 }
 
@@ -91,11 +91,11 @@ fn main() {
     // One MemoryBlobStore holds every embedding blob. Put them
     // up front so both the HNSW index and the TribleSet can
     // reference the same handles.
-    let mut store = MemoryBlobStore::<Blake3>::new();
-    let mut handles: std::collections::HashMap<Id, Value<Handle<Blake3, Embedding>>> =
+    let mut store = MemoryBlobStore::new();
+    let mut handles: std::collections::HashMap<Id, Value<Handle<Embedding>>> =
         std::collections::HashMap::new();
     for (pid, _title, vec) in &papers {
-        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, vec.clone()).unwrap();
         handles.insert(*pid, h);
     }
 
@@ -121,7 +121,7 @@ fn main() {
     // Put the query vector into the store too — similarity is a
     // binary relation over embedding handles.
     let query_handle =
-        put_embedding::<_, Blake3>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
     let reader = store.reader().unwrap();
     let hnsw_view = hnsw.attach(&reader);
 

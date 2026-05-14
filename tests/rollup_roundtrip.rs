@@ -23,7 +23,7 @@ use triblespace::prelude::valueschemas::GenId;
 use triblespace::prelude::TribleSet;
 
 attributes! {
-    "8D3F3519C4B19203B4B2D2CF9F67F2A1" as title: Handle<Blake3, LongString>;
+    "8D3F3519C4B19203B4B2D2CF9F67F2A1" as title: Handle<LongString>;
     "1E9C3CE3F3D70FF25CF4D9DFB5A6FE29" as friend: GenId;
 }
 
@@ -38,8 +38,8 @@ fn compute_rollup_round_trips() {
 
     let alice: ExclusiveId = fucid();
     let bob: ExclusiveId = fucid();
-    let alice_title: Value<Handle<Blake3, LongString>> = ws.put("Alice".to_string());
-    let bob_title: Value<Handle<Blake3, LongString>> = ws.put("Bob".to_string());
+    let alice_title: Value<Handle<LongString>> = ws.put("Alice".to_string());
+    let bob_title: Value<Handle<LongString>> = ws.put("Bob".to_string());
     let mut change = TribleSet::new();
     change += entity! { &alice @ title: alice_title, friend: &bob };
     change += entity! { &bob @ title: bob_title };
@@ -63,7 +63,7 @@ fn compute_rollup_is_idempotent_on_unchanged_head() {
     let branch_id = repo.create_branch("main", None).unwrap();
     let mut ws = repo.pull(*branch_id).unwrap();
     let alice: ExclusiveId = fucid();
-    let alice_title: Value<Handle<Blake3, LongString>> = ws.put("Alice".to_string());
+    let alice_title: Value<Handle<LongString>> = ws.put("Alice".to_string());
     let change: TribleSet = entity! { &alice @ title: alice_title }.into();
     ws.commit(change, "initial");
     repo.push(&mut ws).unwrap();
@@ -98,7 +98,7 @@ fn pull_without_rollup_returns_none() {
     let mut ws = repo.pull(*branch_id).unwrap();
 
     let alice: ExclusiveId = fucid();
-    let alice_title: Value<Handle<Blake3, LongString>> = ws.put("Alice".to_string());
+    let alice_title: Value<Handle<LongString>> = ws.put("Alice".to_string());
     let change: TribleSet = entity! { &alice @ title: alice_title }.into();
     ws.commit(change, "initial");
     repo.push(&mut ws).unwrap();

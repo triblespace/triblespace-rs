@@ -33,7 +33,7 @@ fn consolidate_merges_branch_heads() {
     let mut original_heads: Vec<String> = Vec::new();
     let mut branch_ids: Vec<String> = Vec::new();
     {
-        let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let pile: Pile = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
 
         for i in 0..3 {
@@ -51,7 +51,7 @@ fn consolidate_merges_branch_heads() {
             assert!(res.is_none(), "unexpected push conflict");
 
             let head = ws.head().expect("head present");
-            let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+            let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                 Handle::to_hash(head);
             original_heads.push(hh.from_value());
         }
@@ -100,7 +100,7 @@ fn consolidate_merges_branch_heads() {
         .expect("new branch id in output");
 
     // Open the pile and read the resulting branch metadata and commit
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     pile.refresh().unwrap();
     let raw = hex::decode(id_hex).unwrap();
     let raw16: [u8; 16] = raw.as_slice().try_into().unwrap();
@@ -115,10 +115,10 @@ fn consolidate_merges_branch_heads() {
     let repo_parent_attr: triblespace_core::id::Id = id_hex!("317044B612C690000D798CA660ECFD2A");
 
     // extract the commit handle for the branch head
-    let mut head_handle_opt: Option<Value<Handle<Blake3, SimpleArchive>>> = None;
+    let mut head_handle_opt: Option<Value<Handle<SimpleArchive>>> = None;
     for t in meta.iter() {
         if t.a() == &repo_head_attr {
-            head_handle_opt = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+            head_handle_opt = Some(*t.v::<Handle<SimpleArchive>>());
             break;
         }
     }
@@ -131,8 +131,8 @@ fn consolidate_merges_branch_heads() {
     let mut parents: HashSet<String> = HashSet::new();
     for t in commit_meta.iter() {
         if t.a() == &repo_parent_attr {
-            let p = *t.v::<Handle<Blake3, SimpleArchive>>();
-            let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+            let p = *t.v::<Handle<SimpleArchive>>();
+            let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                 Handle::to_hash(p);
             parents.insert(hh.from_value());
         }
@@ -172,7 +172,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
     let beta_head: String;
     let alpha_a_id: String;
     {
-        let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let pile: Pile = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
 
         // Branch A: "alpha", commit, push, tombstone.
@@ -186,7 +186,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "alpha-A commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_a = ws.head().expect("head");
-        let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+        let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
             Handle::to_hash(head_a);
         alpha_heads.push(hh.from_value());
 
@@ -207,7 +207,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "alpha-B commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_b = ws.head().expect("head");
-        let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+        let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
             Handle::to_hash(head_b);
         alpha_heads.push(hh.from_value());
 
@@ -221,7 +221,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "beta commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_c = ws.head().expect("head");
-        let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+        let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
             Handle::to_hash(head_c);
         beta_head = hh.from_value();
 
@@ -230,7 +230,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
 
     // Verify branch A is actually tombstoned.
     {
-        let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let mut pile: Pile = Pile::open(&pile_path).unwrap();
         pile.refresh().unwrap();
         let raw = hex::decode(&alpha_a_id).unwrap();
         let raw16: [u8; 16] = raw.as_slice().try_into().unwrap();
@@ -284,7 +284,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
     );
 
     // Open the pile and verify the resulting branches.
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     pile.refresh().unwrap();
     let reader = pile.reader().unwrap();
 
@@ -302,7 +302,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut branch_name = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Value<Handle<Blake3, blobschemas::LongString>> = *t.v();
+                let h: Value<Handle<blobschemas::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     branch_name = Some(view.as_ref().to_string());
                 }
@@ -323,7 +323,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &repo_head_attr {
-                head_handle = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                head_handle = Some(*t.v::<Handle<SimpleArchive>>());
             }
         }
         if let Some(hh) = head_handle {
@@ -331,8 +331,8 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
                 let mut parents: HashSet<String> = HashSet::new();
                 for t in commit_meta.iter() {
                     if t.a() == &repo_parent_attr {
-                        let p = *t.v::<Handle<Blake3, SimpleArchive>>();
-                        let hash: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+                        let p = *t.v::<Handle<SimpleArchive>>();
+                        let hash: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                             Handle::to_hash(p);
                         parents.insert(hash.from_value());
                     }
@@ -358,11 +358,11 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &repo_head_attr {
-                head_handle = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                head_handle = Some(*t.v::<Handle<SimpleArchive>>());
             }
         }
         if let Some(hh) = head_handle {
-            let hash: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+            let hash: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                 Handle::to_hash(hh);
             if hash.from_value::<String>() == beta_head {
                 found_beta_direct = true;
@@ -396,7 +396,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
 
     let descendant_head: String;
     {
-        let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let pile: Pile = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
 
         // Branch A: "gamma", commit C1.
@@ -429,7 +429,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         ws_b.commit(content2, "gamma-B commit");
         assert!(repo.try_push(&mut ws_b).expect("push").is_none());
         let head_b = ws_b.head().expect("head");
-        let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+        let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
             Handle::to_hash(head_b);
         descendant_head = hh.from_value();
 
@@ -475,7 +475,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
     );
 
     // Verify: the existing active gamma branch still points to the descendant head.
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     pile.refresh().unwrap();
     let reader = pile.reader().unwrap();
 
@@ -491,7 +491,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Value<Handle<Blake3, blobschemas::LongString>> = *t.v();
+                let h: Value<Handle<blobschemas::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "gamma" {
                         is_gamma = true;
@@ -499,12 +499,12 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
                 }
             }
             if t.a() == &repo_head_attr {
-                head_handle = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                head_handle = Some(*t.v::<Handle<SimpleArchive>>());
             }
         }
         if is_gamma {
             if let Some(hh) = head_handle {
-                let hash: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+                let hash: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                     Handle::to_hash(hh);
                 let hex: String = hash.from_value();
                 // The active branch should still point to the descendant head.
@@ -534,7 +534,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
     // Create two active branches named "delta" with independent commits.
     let mut delta_heads: Vec<String> = Vec::new();
     {
-        let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let pile: Pile = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
 
         for i in 0..2 {
@@ -549,7 +549,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
             ws.commit(content, &format!("delta-{i}"));
             assert!(repo.try_push(&mut ws).expect("push").is_none());
             let head = ws.head().expect("head");
-            let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+            let hh: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                 Handle::to_hash(head);
             delta_heads.push(hh.from_value());
         }
@@ -605,7 +605,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
     );
 
     // Verify delta has a merge commit with both heads.
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     pile.refresh().unwrap();
     let reader = pile.reader().unwrap();
 
@@ -622,7 +622,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Value<Handle<Blake3, blobschemas::LongString>> = *t.v();
+                let h: Value<Handle<blobschemas::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "delta" {
                         is_delta = true;
@@ -630,7 +630,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
                 }
             }
             if t.a() == &repo_head_attr {
-                head_handle = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                head_handle = Some(*t.v::<Handle<SimpleArchive>>());
             }
         }
         if is_delta {
@@ -639,8 +639,8 @@ fn consolidate_by_name_merges_active_same_name_branches() {
                     let mut parents: HashSet<String> = HashSet::new();
                     for t in commit_meta.iter() {
                         if t.a() == &repo_parent_attr {
-                            let p = *t.v::<Handle<Blake3, SimpleArchive>>();
-                            let hash: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
+                            let p = *t.v::<Handle<SimpleArchive>>();
+                            let hash: Value<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
                                 Handle::to_hash(p);
                             parents.insert(hash.from_value());
                         }

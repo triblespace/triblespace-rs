@@ -10,7 +10,7 @@ use triblespace::core::value::VALUE_LEN;
 
 #[test]
 fn reachable_keep_and_transfer() {
-    let mut source = MemoryBlobStore::<Blake3>::new();
+    let mut source = MemoryBlobStore::new();
 
     // Insert a child blob that will be referenced by the root.
     let child_blob = Blob::<UnknownBlob>::new(Bytes::from(vec![1u8; VALUE_LEN * 2]));
@@ -44,7 +44,7 @@ fn reachable_keep_and_transfer() {
 
     // Copy only the handles reported by the reachable walker into a fresh store.
     let reader = source.reader().expect("post-keep reader");
-    let mut target = MemoryBlobStore::<Blake3>::new();
+    let mut target = MemoryBlobStore::new();
     let copied = transfer(&reader, &mut target, reachable(&reader, [root_handle]))
         .collect::<Result<Vec<_>, _>>()
         .expect("transfer handles");

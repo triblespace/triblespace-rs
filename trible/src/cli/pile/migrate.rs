@@ -10,8 +10,8 @@ use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
-type NameHandle = Value<Handle<Blake3, blobschemas::LongString>>;
-type BranchMetaHandle = Value<Handle<Blake3, blobschemas::SimpleArchive>>;
+type NameHandle = Value<Handle<blobschemas::LongString>>;
+type BranchMetaHandle = Value<Handle<blobschemas::SimpleArchive>>;
 
 mod legacy_branch_metadata {
     use super::*;
@@ -69,7 +69,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
 }
 
 fn list_migrations(pile_path: &PathBuf) -> Result<()> {
-    let mut pile: Pile<Blake3> = Pile::open(pile_path).context("open pile")?;
+    let mut pile: Pile = Pile::open(pile_path).context("open pile")?;
     let res = (|| -> Result<(), anyhow::Error> {
         pile.refresh().context("refresh pile")?;
         let reader = pile.reader().context("pile reader")?;
@@ -141,7 +141,7 @@ fn migrate_branch_metadata_name(
     dry_run: bool,
     rename_duplicates: bool,
 ) -> Result<()> {
-    let mut pile: Pile<Blake3> = Pile::open(pile_path).context("open pile")?;
+    let mut pile: Pile = Pile::open(pile_path).context("open pile")?;
     pile.restore().context("restore pile")?;
 
     let res = (|| -> Result<(), anyhow::Error> {
@@ -285,7 +285,7 @@ fn legacy_branch_name(meta: &TribleSet) -> Result<Option<String>> {
 }
 
 fn load_branch_name(
-    reader: &impl BlobStoreGet<Blake3>,
+    reader: &impl BlobStoreGet,
     meta: &TribleSet,
 ) -> Result<Option<String>> {
     let mut names = find!(
@@ -322,7 +322,7 @@ fn rewrite_branch_meta(meta: &TribleSet, meta_entity: Id, name_handle: NameHandl
 }
 
 fn rename_duplicate_branch_names(
-    pile: &mut Pile<Blake3>,
+    pile: &mut Pile,
     branches: &[BranchInfo],
     dry_run: bool,
 ) -> Result<usize> {

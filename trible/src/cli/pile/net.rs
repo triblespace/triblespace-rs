@@ -10,7 +10,7 @@ use iroh_base::EndpointId;
 use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::identity::load_or_create_key;
 
-type Pile = triblespace_core::repo::pile::Pile<triblespace_core::value::schemas::hash::Blake3>;
+use triblespace_core::repo::pile::Pile;
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     Pile::open(path).map_err(|e| anyhow!("open pile: {e:?}"))

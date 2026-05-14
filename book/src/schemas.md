@@ -175,7 +175,7 @@ What are you storing?
 │  ├─ Fits in 32 bytes (≤32 UTF-8 bytes)?
 │  │  └─ ShortString
 │  └─ Longer text?
-│     └─ Handle<Blake3, LongString>  (blob)
+│     └─ Handle<LongString>  (blob)
 │
 ├─ A number?
 │  ├─ Integer
@@ -191,14 +191,14 @@ What are you storing?
 │
 ├─ A cryptographic value?
 │  ├─ Content hash? → Hash<Blake3>
-│  ├─ Reference to a blob? → Handle<Blake3, BlobSchema>
+│  ├─ Reference to a blob? → Handle<BlobSchema>
 │  └─ Signature? → ED25519RComponent / ED25519SComponent / ED25519PublicKey
 │
 ├─ A file or binary payload?
-│  └─ Handle<Blake3, FileBytes>  (blob)
+│  └─ Handle<FileBytes>  (blob)
 │
 ├─ A large structured dataset?
-│  └─ Handle<Blake3, SimpleArchive>  (blob, stores a TribleSet)
+│  └─ Handle<SimpleArchive>  (blob, stores a TribleSet)
 │
 └─ Something else?
    ├─ Fits in 32 bytes? → define a custom ValueSchema

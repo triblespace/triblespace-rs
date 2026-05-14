@@ -21,7 +21,7 @@ use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
+use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::iu256::U256BE;
 use crate::value::Value;
 use triblespace_core_macros::attributes;
@@ -36,15 +36,15 @@ attributes! {
     /// Node kind tag (one of the `kind_*` constants).
     "D78B9D5A96029FDBBB327E377418AF51" as pub kind: GenId;
     /// String content stored as a LongString blob.
-    "40BC51924FD5D2058A48D1FA6073F871" as pub string: Handle<Blake3, LongString>;
+    "40BC51924FD5D2058A48D1FA6073F871" as pub string: Handle<LongString>;
     /// Raw decimal number string (preserves precision).
-    "428E02672FFD0D010D95AE641ADE1730" as pub number_raw: Handle<Blake3, LongString>;
+    "428E02672FFD0D010D95AE641ADE1730" as pub number_raw: Handle<LongString>;
     /// Boolean value.
     "6F43FC771207574BF4CC58D3080C313C" as pub boolean: Boolean;
     /// Parent entity of an object field entry.
     "97A4ACD83EC9EA29EE7E487BB058C437" as pub field_parent: GenId;
     /// Field name stored as a LongString blob.
-    "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<Blake3, LongString>;
+    "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<LongString>;
     /// Ordinal position of a field within its parent object.
     "38C7B1CDEA580DE70A520B2C8CBC4F14" as pub field_index: U256BE;
     /// Value entity referenced by an object field entry.
@@ -129,7 +129,7 @@ fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
 #[derive(Clone)]
 struct FieldEntry {
     name: View<str>,
-    name_handle: Value<Handle<Blake3, LongString>>,
+    name_handle: Value<Handle<LongString>>,
     index: u64,
     value: Id,
 }
@@ -144,20 +144,17 @@ struct ArrayEntry {
 ///
 /// This importer encodes JSON values as an explicit node/entry graph (a JSON AST),
 /// using content-addressed ids so identical subtrees deduplicate across imports.
-pub struct JsonTreeImporter<'a, Store, Hasher = Blake3>
+pub struct JsonTreeImporter<'a, Store>
 where
-    Store: BlobStore<Blake3>,
-    Hasher: HashProtocol,
+    Store: BlobStore,
 {
     store: &'a mut Store,
     id_salt: Option<[u8; 32]>,
-    _hasher: PhantomData<Hasher>,
 }
 
-impl<'a, Store, Hasher> JsonTreeImporter<'a, Store, Hasher>
+impl<'a, Store> JsonTreeImporter<'a, Store>
 where
-    Store: BlobStore<Blake3>,
-    Hasher: HashProtocol,
+    Store: BlobStore,
 {
     /// Creates a new lossless importer backed by `store`. Pass an optional
     /// 32-byte salt to namespace the content-addressed entity ids.
@@ -165,7 +162,6 @@ where
         Self {
             store,
             id_salt,
-            _hasher: PhantomData,
         }
     }
 
@@ -438,15 +434,15 @@ where
         self.finish_hash(hasher)
     }
 
-    fn seeded_hasher(&self) -> Hasher {
-        let mut hasher = Hasher::new();
+    fn seeded_hasher(&self) -> Blake3 {
+        let mut hasher = Blake3::new();
         if let Some(salt) = self.id_salt {
             hasher.update(salt.as_ref());
         }
         hasher
     }
 
-    fn finish_hash(&self, hasher: Hasher) -> Id {
+    fn finish_hash(&self, hasher: Blake3) -> Id {
         let digest = hasher.finalize();
         id_from_digest(digest.as_ref())
     }
@@ -482,7 +478,7 @@ where
     }
 }
 
-fn hash_chunk<H: HashProtocol>(hasher: &mut H, bytes: &[u8]) {
+fn hash_chunk(hasher: &mut Blake3, bytes: &[u8]) {
     let len = (bytes.len() as u64).to_be_bytes();
     hasher.update(&len);
     hasher.update(bytes);
@@ -509,15 +505,15 @@ mod tests {
     #[test]
     fn lossless_ids_are_content_based() {
         let input = r#"{ "a": [1, 2] }"#;
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonTreeImporter::<_>::new(&mut blobs, None);
         let root = importer
             .import_blob(input.to_blob())
             .unwrap()
             .root()
             .expect("import_blob returns a rooted fragment");
         drop(importer);
-        let mut other = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut other = JsonTreeImporter::<_>::new(&mut blobs, None);
         let other_root = other
             .import_blob(input.to_blob())
             .unwrap()
@@ -529,8 +525,8 @@ mod tests {
     #[test]
     fn lossless_preserves_array_order() {
         let input = r#"[1, 2]"#;
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonTreeImporter::<_>::new(&mut blobs, None);
         let fragment = importer.import_blob(input.to_blob()).unwrap();
         let root = fragment
             .root()

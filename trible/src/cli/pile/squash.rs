@@ -27,7 +27,7 @@ pub fn run(
     let key = load_signing_key(&signing_key)?;
 
     // Open source pile.
-    let mut src_pile: Pile<Blake3> = Pile::open(&source)?;
+    let mut src_pile: Pile = Pile::open(&source)?;
     src_pile.restore().map_err(|e| anyhow!("restore source: {e:?}"))?;
 
     // Enumerate branches.
@@ -54,7 +54,7 @@ pub fn run(
         std::fs::create_dir_all(parent)?;
     }
     std::fs::File::create(&dest)?;
-    let mut dst_pile: Pile<Blake3> = Pile::open(&dest)?;
+    let mut dst_pile: Pile = Pile::open(&dest)?;
 
     let mut total_blobs = 0usize;
     let mut total_branches = 0usize;
@@ -79,7 +79,7 @@ pub fn run(
             for t in meta.iter() {
                 if *t.a() == name_attr {
                     let handle: Value<
-                        Handle<Blake3, triblespace_core::blob::schemas::longstring::LongString>,
+                        Handle<triblespace_core::blob::schemas::longstring::LongString>,
                     > = Value::new(t.data[32..64].try_into().unwrap());
                     let name_view: View<str> = reader.get(handle).ok()?;
                     return Some(name_view.to_string());
@@ -131,14 +131,14 @@ pub fn run(
         );
 
         // 1. Transfer referenced blobs from source.
-        let mut roots: Vec<Value<Handle<Blake3, UnknownBlob>>> = Vec::new();
+        let mut roots: Vec<Value<Handle<UnknownBlob>>> = Vec::new();
         for trible in &tribles {
             let raw: [u8; 32] = trible[32..64].try_into().unwrap();
-            roots.push(Value::<Handle<Blake3, UnknownBlob>>::new(raw));
+            roots.push(Value::<Handle<UnknownBlob>>::new(raw));
         }
         for trible in metadata.iter() {
             let raw: [u8; 32] = trible.data[32..64].try_into().unwrap();
-            roots.push(Value::<Handle<Blake3, UnknownBlob>>::new(raw));
+            roots.push(Value::<Handle<UnknownBlob>>::new(raw));
         }
 
         let reachable = repo::reachable(&src_reader, roots);
@@ -154,7 +154,7 @@ pub fn run(
         }
 
         // 2. Store metadata blob.
-        let metadata_handle: Value<Handle<Blake3, SimpleArchive>> = dst_pile
+        let metadata_handle: Value<Handle<SimpleArchive>> = dst_pile
             .put(metadata.to_blob())
             .map_err(|e| anyhow!("put metadata: {e:?}"))?;
 
@@ -163,7 +163,7 @@ pub fn run(
         let trible_bytes = anybytes::Bytes::from_source(tribles);
 
         let num_chunks = (num_tribles + CHUNK_TRIBLES - 1) / CHUNK_TRIBLES;
-        let mut prev_commit: Option<Value<Handle<Blake3, SimpleArchive>>> = None;
+        let mut prev_commit: Option<Value<Handle<SimpleArchive>>> = None;
 
         for i in 0..num_chunks {
             let start = i * CHUNK_TRIBLES * TRIBLE_LEN;
@@ -172,7 +172,7 @@ pub fn run(
             let chunk_blob: Blob<SimpleArchive> = Blob::new(chunk_bytes);
 
             // Store the chunk content blob.
-            let _content_handle: Value<Handle<Blake3, SimpleArchive>> = dst_pile
+            let _content_handle: Value<Handle<SimpleArchive>> = dst_pile
                 .put(chunk_blob.clone())
                 .map_err(|e| anyhow!("put chunk: {e:?}"))?;
 

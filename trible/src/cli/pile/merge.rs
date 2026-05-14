@@ -19,7 +19,7 @@ use triblespace_core::value::Value;
 
 use super::signing::load_signing_key;
 
-type CommitHandle = Value<Handle<Blake3, triblespace::prelude::blobschemas::SimpleArchive>>;
+type CommitHandle = Value<Handle<triblespace::prelude::blobschemas::SimpleArchive>>;
 
 #[derive(Debug, Clone)]
 struct BranchInfo {
@@ -43,7 +43,7 @@ fn parse_branch_id_hex(raw: &str) -> Result<Id> {
     Id::new(arr).ok_or_else(|| anyhow::anyhow!("branch id cannot be nil"))
 }
 
-fn read_branch_info(pile: &mut Pile<Blake3>, branch_id: Id) -> Result<BranchInfo> {
+fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
     use triblespace::prelude::blobschemas::SimpleArchive;
 
     let reader = pile
@@ -72,7 +72,7 @@ fn read_branch_info(pile: &mut Pile<Blake3>, branch_id: Id) -> Result<BranchInfo
             if name.is_some() {
                 bail!("branch {branch_id:X} has multiple name values");
             }
-            let handle: Value<Handle<Blake3, LongString>> = *t.v();
+            let handle: Value<Handle<LongString>> = *t.v();
             let view: View<str> = reader
                 .get(handle)
                 .map_err(|e| anyhow::anyhow!("branch name blob: {e:?}"))?;
@@ -81,7 +81,7 @@ fn read_branch_info(pile: &mut Pile<Blake3>, branch_id: Id) -> Result<BranchInfo
             if head.is_some() {
                 bail!("branch {branch_id:X} has multiple heads");
             }
-            head = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+            head = Some(*t.v::<Handle<SimpleArchive>>());
         }
     }
 
@@ -100,7 +100,7 @@ pub fn run(
     signing_key: Option<PathBuf>,
 ) -> Result<()> {
     let key = load_signing_key(&signing_key)?;
-    let pile: Pile<Blake3> = Pile::open(&pile_path)?;
+    let pile: Pile = Pile::open(&pile_path)?;
     let mut repo = Repository::new(pile, key, TribleSet::new())?;
 
     let res = (|| -> Result<(), anyhow::Error> {

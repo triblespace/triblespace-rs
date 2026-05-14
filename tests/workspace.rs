@@ -275,7 +275,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
     use triblespace::core::value::schemas::r256::R256;
     use triblespace::core::value::Value;
 
-    type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+    type CommitHandle = Value<Handle<SimpleArchive>>;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();

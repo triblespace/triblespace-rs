@@ -12,7 +12,7 @@ use url::Url;
 #[test]
 fn objectstore_branch_creates_branch() {
     let url = Url::parse("memory:///repo").unwrap();
-    let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
+    let storage = ObjectStoreRemote::with_url(&url).unwrap();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
 
@@ -22,7 +22,7 @@ fn objectstore_branch_creates_branch() {
 #[test]
 fn objectstore_workspace_commit_updates_head() {
     let url = Url::parse("memory:///repo2").unwrap();
-    let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
+    let storage = ObjectStoreRemote::with_url(&url).unwrap();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
@@ -35,7 +35,7 @@ fn objectstore_workspace_commit_updates_head() {
 #[test]
 fn objectstore_branch_from_and_pull_with_key() {
     let url = Url::parse("memory:///repo3").unwrap();
-    let mut store = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
+    let mut store = ObjectStoreRemote::with_url(&url).unwrap();
     let key = SigningKey::generate(&mut OsRng);
     let commit_set = repo::commit::commit_metadata(&key, [], None, None, None);
     let initial = store.put(commit_set).unwrap();
@@ -56,7 +56,7 @@ fn objectstore_branch_from_and_pull_with_key() {
 #[test]
 fn objectstore_push_and_merge_conflict_resolution() {
     let url = Url::parse("memory:///repo4").unwrap();
-    let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
+    let storage = ObjectStoreRemote::with_url(&url).unwrap();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");

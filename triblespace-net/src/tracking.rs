@@ -26,7 +26,7 @@ use crate::protocol::RawHash;
 
 // Minted attribute IDs for tracking branches.
 attributes! {
-    "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<Blake3, LongString>;
+    "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<LongString>;
     "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" as pub tracking_remote_branch: GenId;
     "C52A223988BB237B0859319661DA23F5" as pub tracking_peer: ED25519PublicKey;
 }
@@ -37,7 +37,7 @@ attributes! {
 /// Tracking branches are local-only state that should not be re-gossipped.
 pub fn is_tracking_branch<S>(store: &mut S, branch_id: Id) -> bool
 where
-    S: BlobStore<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BranchStore,
 {
     let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
     let Ok(reader) = store.reader() else { return false; };
@@ -67,7 +67,7 @@ pub struct TrackingBranchInfo {
 /// auto-merge loops, status displays, etc.
 pub fn list_tracking_branches<S>(store: &mut S) -> Vec<TrackingBranchInfo>
 where
-    S: BlobStore<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BranchStore,
 {
     let mut result = Vec::new();
     let Ok(iter) = store.branches() else { return result; };
@@ -84,7 +84,7 @@ where
         ).next() else { continue; };
 
         let Some(name_handle) = find!(
-            h: Value<Handle<Blake3, LongString>>,
+            h: Value<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ remote_name: ?h }])
         ).next() else { continue; };
 
@@ -106,7 +106,7 @@ pub fn find_tracking_branch<S>(
     remote_branch_id: Id,
 ) -> Option<Id>
 where
-    S: BlobStore<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BranchStore,
 {
     list_tracking_branches(store)
         .into_iter()
@@ -119,15 +119,15 @@ where
 /// The network protocol gossips the branch metadata blob hash as "HEAD",
 /// but `repo::head` in branch metadata points to a commit. This resolves
 /// the indirection so tracking branches store actual commit handles.
-fn resolve_commit_in_branch_meta<S: BlobStore<Blake3>>(
+fn resolve_commit_in_branch_meta<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
-) -> Option<Value<Handle<Blake3, SimpleArchive>>> {
+) -> Option<Value<Handle<SimpleArchive>>> {
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*branch_meta_hash);
+    let meta_handle = Value::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
     find!(
-        h: Value<Handle<Blake3, SimpleArchive>>,
+        h: Value<Handle<SimpleArchive>>,
         pattern!(&meta, [{ _?e @ triblespace_core::repo::head: ?h }])
     ).next()
 }
@@ -135,12 +135,12 @@ fn resolve_commit_in_branch_meta<S: BlobStore<Blake3>>(
 /// Read the `metadata::updated_at` attribute from a branch metadata blob,
 /// if present. Returns `None` if the blob is missing, can't be parsed, or
 /// doesn't carry a timestamp.
-fn read_updated_at<S: BlobStore<Blake3>>(
+fn read_updated_at<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
 ) -> Option<Value<NsTAIInterval>> {
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*branch_meta_hash);
+    let meta_handle = Value::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
     find!(
         ts: Value<NsTAIInterval>,
@@ -174,7 +174,7 @@ pub fn create_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<Id>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     // Resolve the gossiped branch metadata hash to the actual commit.
     let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash)?;
@@ -188,7 +188,7 @@ where
     let tracking_id: Id = *genid();
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<Blake3, LongString>> =
+    let name_handle: Value<Handle<LongString>> =
         store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
@@ -202,7 +202,7 @@ where
         triblespace_core::metadata::updated_at?: remote_updated_at,
     }
     .into();
-    let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
+    let meta_handle: Value<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
 
     match store.update(tracking_id, None, Some(meta_handle)).ok()? {
         PushResult::Success() => Some(tracking_id),
@@ -221,7 +221,7 @@ pub fn update_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<()>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     let old_meta = store.head(tracking_branch_id).ok()??;
 
@@ -245,7 +245,7 @@ where
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<Blake3, LongString>> =
+    let name_handle: Value<Handle<LongString>> =
         store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
@@ -262,7 +262,7 @@ where
     }
     .into();
 
-    let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
+    let meta_handle: Value<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
 
     match store.update(tracking_branch_id, Some(old_meta), Some(meta_handle)).ok()? {
         PushResult::Success() => Some(()),
@@ -279,7 +279,7 @@ pub fn ensure_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<Id>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     if let Some(tracking_id) = find_tracking_branch(store, remote_branch_id) {
         update_tracking_branch(store, tracking_id, remote_branch_id, remote_head_hash, remote_name_str, publisher);
@@ -297,7 +297,7 @@ pub enum MergeOutcome {
     /// Local branch was already up-to-date with the tracking branch.
     UpToDate,
     /// Local branch advanced to `new_head` (fast-forward or merge commit).
-    Merged { new_head: Value<Handle<Blake3, SimpleArchive>> },
+    Merged { new_head: Value<Handle<SimpleArchive>> },
 }
 
 /// Merge a tracking branch into its same-named local branch.
@@ -317,7 +317,7 @@ pub fn merge_tracking_into_local<S>(
     local_name: &str,
 ) -> anyhow::Result<MergeOutcome>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     let local_id = repo
         .ensure_branch(local_name, None)
@@ -470,7 +470,7 @@ mod tests {
         use triblespace_core::blob::ToBlob;
         use triblespace_core::blob::schemas::longstring::LongString;
         let name_blob = "remote-branch".to_string().to_blob();
-        let name_handle: Value<Handle<Blake3, LongString>> = store.put(name_blob).unwrap();
+        let name_handle: Value<Handle<LongString>> = store.put(name_blob).unwrap();
         let remote_branch_id = genid();
         // Create a dummy commit blob and set it as the remote head.
         let commit_meta: TribleSet = TribleSet::new();
@@ -505,8 +505,8 @@ mod tests {
         let reader = store2.reader().unwrap();
         let track_meta_handle = store2.head(tracking_id).unwrap().unwrap();
         let track_meta: TribleSet = reader.get(track_meta_handle).unwrap();
-        let track_head: Value<Handle<Blake3, SimpleArchive>> = find!(
-            h: Value<Handle<Blake3, SimpleArchive>>,
+        let track_head: Value<Handle<SimpleArchive>> = find!(
+            h: Value<Handle<SimpleArchive>>,
             pattern!(&track_meta, [{ _?e @ triblespace_core::repo::head: ?h }])
         ).next().expect("tracking branch should have a head");
         assert_eq!(track_head, commit_handle,

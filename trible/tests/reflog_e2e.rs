@@ -17,7 +17,7 @@ fn reflog_lists_branch_updates_and_tombstones() {
 
     // Create a few branch update records by directly updating the pile's branch store.
     {
-        let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let mut pile: Pile = Pile::open(&pile_path).unwrap();
         pile.restore().unwrap();
 
         let mut a = TribleSet::new();

@@ -526,7 +526,7 @@ TribleSpace taste:
 - **Doc keys removed.** `HNSWBuilder`, `HNSWIndex`, `FlatBuilder`,
   `FlatIndex`, `SuccinctHNSWIndex` (and their `Attached*`
   wrappers) no longer carry a `D` generic or a separate doc-key
-  table. Each node **is** a `Handle<Blake3, Embedding>` — the
+  table. Each node **is** a `Handle<Embedding>` — the
   caller's mapping from doc → embedding lives as a trible they
   own, not as a shadow datamodel inside the index.
 - **New insert signature:** `HNSWBuilder::insert(handle, vec)` /
@@ -536,8 +536,7 @@ TribleSpace taste:
   `SimilarToVectorHNSW`, `SimilarToVectorHNSWScored`) are
   replaced by a single [`Similar<'_, I>`][s] constraint
   produced by the `similar(a, b, score_floor)` method on each
-  attached view. Both `a` and `b` are `Variable<Handle<Blake3,
-  Embedding>>`; at least one must be bound at query time. The
+  attached view. Both `a` and `b` are `Variable<Handle<  Embedding>>`; at least one must be bound at query time. The
   relation is symmetric (cosine is symmetric), approximate
   through HNSW.
 - **Score is fixed, not a variable.** `score_floor: f32` is a
@@ -564,7 +563,7 @@ TribleSpace taste:
   handles-only blob layout — no keys section, header shrinks
   from 144 B to 128 B.
 - **Embedding implements `ConstDescribe`** so callers can
-  declare `Handle<Blake3, Embedding>` attributes via the
+  declare `Handle<Embedding>` attributes via the
   `attributes!` macro (see the updated `compose_hnsw_and_pattern`
   / `hybrid_search` examples).
 

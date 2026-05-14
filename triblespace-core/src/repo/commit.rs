@@ -55,10 +55,10 @@ impl From<SignatureError> for ValidationError {
 /// converge in zero extra rounds.
 pub fn commit_metadata(
     signing_key: &SigningKey,
-    parents: impl IntoIterator<Item = Value<Handle<Blake3, SimpleArchive>>>,
-    msg: Option<Value<Handle<Blake3, LongString>>>,
+    parents: impl IntoIterator<Item = Value<Handle<SimpleArchive>>>,
+    msg: Option<Value<Handle<LongString>>>,
     content: Option<Blob<SimpleArchive>>,
-    metadata: Option<Value<Handle<Blake3, SimpleArchive>>>,
+    metadata: Option<Value<Handle<SimpleArchive>>>,
 ) -> TribleSet {
     // Authored commits carry a timestamp and a signature. Merge commits
     // (content = None) carry neither, so they stay content-deterministic.

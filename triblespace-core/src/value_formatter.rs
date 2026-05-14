@@ -264,9 +264,9 @@ mod tests {
     use crate::value::schemas::hash::Handle;
     use crate::value::Value;
 
-    fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Value<Handle<Blake3, WasmCode>>> {
+    fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Value<Handle<WasmCode>>> {
         for (schema_id, handle) in find!(
-            (schema_id: Id, handle: Value<Handle<Blake3, WasmCode>>),
+            (schema_id: Id, handle: Value<Handle<WasmCode>>),
             pattern!(space, [{ ?schema_id @ metadata::value_formatter: ?handle }])
         ) {
             if schema_id == schema {
@@ -298,7 +298,7 @@ mod tests {
         )
         .expect("wat parses");
 
-        let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
+        let mut store: crate::blob::MemoryBlobStore = crate::blob::MemoryBlobStore::new();
         let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
@@ -308,7 +308,7 @@ mod tests {
             metadata::value_formatter: handle,
         };
 
-        let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> =
             BlobCache::new(reader);
         let formatter = formatter_cache
             .get(formatter_handle(&space, schema_id).expect("formatter handle"))
@@ -373,11 +373,11 @@ mod tests {
         bundle += ED25519PublicKey::describe();
         bundle += UnknownValue::describe();
         bundle += <Hash<Blake3> as MetaDescribe>::describe();
-        bundle += <Handle<Blake3, LongString> as MetaDescribe>::describe();
+        bundle += <Handle<LongString> as MetaDescribe>::describe();
 
         let (space, mut store) = bundle.into_facts_and_blobs();
         let reader = store.reader().expect("blob reader");
-        let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> =
             BlobCache::new(reader);
         let limits = WasmLimits::default();
         let formatter_for = |schema| {
@@ -555,7 +555,7 @@ mod tests {
             format!("unknown:{}", "AB".repeat(32))
         );
 
-        let hash_formatter = formatter_for(Hash::<Blake3>::id());
+        let hash_formatter = formatter_for(<Hash<Blake3> as MetaDescribe>::id());
         assert_eq!(
             hash_formatter
                 .format_value_with_limits(&raw, limits)
@@ -563,8 +563,8 @@ mod tests {
             format!("hash:{}", "AB".repeat(32))
         );
 
-        let handle_formatter = formatter_for(Handle::<Blake3, LongString>::id());
-        let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
+        let handle_formatter = formatter_for(Handle::<LongString>::id());
+        let raw = Value::<Handle<LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter
                 .format_value_with_limits(&raw, limits)

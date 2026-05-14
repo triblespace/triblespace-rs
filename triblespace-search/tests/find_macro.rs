@@ -196,13 +196,13 @@ fn find_hnsw_similar_on_succinct() {
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut b = HNSWBuilder::new(4).with_seed(23);
     let mut handles = Vec::new();
     for i in 1..=16u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         b.insert(h, v).unwrap();
         handles.push(h);
     }
@@ -212,8 +212,8 @@ fn find_hnsw_similar_on_succinct() {
     let probe = handles[0];
     let floor = 0.4f32;
 
-    let rows: Vec<(Value<Handle<Blake3, Embedding>>,)> = find!(
-        (neighbour: Value<Handle<Blake3, Embedding>>),
+    let rows: Vec<(Value<Handle<Embedding>>,)> = find!(
+        (neighbour: Value<Handle<Embedding>>),
         succinct_view.similar_to(probe, neighbour, floor)
     )
     .collect();

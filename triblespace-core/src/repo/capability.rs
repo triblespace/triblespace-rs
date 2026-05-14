@@ -69,7 +69,7 @@ triblespace_core_macros::attributes! {
     /// Handle of the parent cap blob in the chain. Absent on the
     /// founder's cap (the chain terminator), which is signed directly
     /// by the team root.
-    "E825B3A8D387B4DAE1720B0EDCBFAA9E" as pub cap_parent: Handle<Blake3, SimpleArchive>;
+    "E825B3A8D387B4DAE1720B0EDCBFAA9E" as pub cap_parent: Handle<SimpleArchive>;
     /// Entity id within the cap blob holding the parent's signature
     /// inline (the "targeted merge" optimisation — see module docs).
     /// The sub-entity carries `signed_by`, `signature_r`, `signature_s`
@@ -90,7 +90,7 @@ triblespace_core_macros::attributes! {
     /// `cap_blob.bytes`), not over the handle. SimpleArchive is already
     /// canonical, so the bytes the signer signs are exactly what the
     /// hasher hashes.
-    "230E175A083E29155C860B38BD44F2F3" as pub sig_signs: Handle<Blake3, SimpleArchive>;
+    "230E175A083E29155C860B38BD44F2F3" as pub sig_signs: Handle<SimpleArchive>;
     // Note: sig_signer + sig_value (r/s) reuse the existing
     // `repo::signed_by`, `repo::signature_r`, `repo::signature_s`
     // attributes — same convention as commit signatures, plus
@@ -252,7 +252,7 @@ pub fn build_capability(
     cap_set += scope_facts;
 
     if let Some((parent_cap_blob, parent_sig_blob)) = parent {
-        let parent_cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let parent_cap_handle: Value<Handle<SimpleArchive>> =
             parent_cap_blob.get_handle();
 
         // Decode the parent signature blob into its tribles, then locate
@@ -266,7 +266,7 @@ pub fn build_capability(
         // sig_signs (its own sig entity). We project that id out; the
         // signed handle is unused here.
         let mut sig_id_iter = find!(
-            (sig: crate::id::Id, _signed: Value<Handle<Blake3, SimpleArchive>>),
+            (sig: crate::id::Id, _signed: Value<Handle<SimpleArchive>>),
             pattern!(&parent_sig_set, [{ ?sig @ sig_signs: ?_signed }])
         )
         .map(|(sig, _)| sig);
@@ -292,7 +292,7 @@ pub fn build_capability(
 
     // Sign the cap blob's canonical bytes.
     let signature: Signature = issuer.sign(&cap_blob.bytes);
-    let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+    let cap_handle: Value<Handle<SimpleArchive>> =
         (&cap_blob).get_handle();
 
     // Build the sig blob: handle pointer to the cap, signer pubkey,
@@ -466,7 +466,7 @@ pub fn build_revocation(
 
     let signature: Signature = revoker.sign(&rev_blob.bytes);
     let revoker_pubkey = revoker.verifying_key();
-    let rev_handle: Value<Handle<Blake3, SimpleArchive>> =
+    let rev_handle: Value<Handle<SimpleArchive>> =
         (&rev_blob).get_handle();
 
     let sig_fragment = entity! {
@@ -638,7 +638,7 @@ where
     let blob_map: std::collections::HashMap<[u8; 32], Blob<SimpleArchive>> = blobs
         .into_iter()
         .map(|b| {
-            let h: Value<Handle<Blake3, SimpleArchive>> = (&b).get_handle();
+            let h: Value<Handle<SimpleArchive>> = (&b).get_handle();
             (h.raw, b)
         })
         .collect();
@@ -652,7 +652,7 @@ where
             continue;
         };
         let mut sig_iter = find!(
-            (sig: crate::id::Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            (sig: crate::id::Id, h: Value<Handle<SimpleArchive>>),
             pattern!(&sig_set, [{ ?sig @ sig_signs: ?h }])
         );
         // Exactly one sig_signs triple — anything else is non-sig-shaped
@@ -883,7 +883,7 @@ fn verify_sig_blob(
     sig_set: &TribleSet,
     cap_blob: &Blob<SimpleArchive>,
 ) -> Result<VerifyingKey, VerifyError> {
-    let cap_handle: Value<Handle<Blake3, SimpleArchive>> = cap_blob.get_handle();
+    let cap_handle: Value<Handle<SimpleArchive>> = cap_blob.get_handle();
     let mut iter = find!(
         (sig: crate::id::Id, signer: VerifyingKey, r, s),
         pattern!(sig_set, [{
@@ -932,8 +932,8 @@ fn extract_cap_fields(
 
     // Optional: cap_parent + cap_embedded_parent_sig. Both present or
     // both absent.
-    let parent_handle: Option<Value<Handle<Blake3, SimpleArchive>>> = find!(
-        (h: Value<Handle<Blake3, SimpleArchive>>),
+    let parent_handle: Option<Value<Handle<SimpleArchive>>> = find!(
+        (h: Value<Handle<SimpleArchive>>),
         pattern!(cap_set, [{ cap_id @ cap_parent: ?h }])
     )
     .next()
@@ -965,7 +965,7 @@ struct CapFields {
     issuer: VerifyingKey,
     scope_root: crate::id::Id,
     expiry: Value<NsTAIInterval>,
-    parent_handle: Option<Value<Handle<Blake3, SimpleArchive>>>,
+    parent_handle: Option<Value<Handle<SimpleArchive>>>,
     embedded_sig: Option<crate::id::Id>,
 }
 
@@ -1037,13 +1037,13 @@ struct CapFields {
 /// .unwrap();
 ///
 /// // The peer presents the *sig* blob's handle on connection.
-/// let leaf_sig_handle: Value<Handle<Blake3, SimpleArchive>> =
+/// let leaf_sig_handle: Value<Handle<SimpleArchive>> =
 ///     (&sig_blob).get_handle();
 ///
 /// // The verifier needs both blobs available via the fetch closure.
 /// // Real callers wire this through their pile / blob store.
 /// let mut blobs: HashMap<[u8; 32], Blob<SimpleArchive>> = HashMap::new();
-/// let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+/// let cap_handle: Value<Handle<SimpleArchive>> =
 ///     (&cap_blob).get_handle();
 /// blobs.insert(cap_handle.raw, cap_blob);
 /// blobs.insert(leaf_sig_handle.raw, sig_blob);
@@ -1065,13 +1065,13 @@ struct CapFields {
 /// ```
 pub fn verify_chain<F>(
     team_root: VerifyingKey,
-    leaf_sig_handle: Value<Handle<Blake3, SimpleArchive>>,
+    leaf_sig_handle: Value<Handle<SimpleArchive>>,
     expected_subject: VerifyingKey,
     revoked: &HashSet<VerifyingKey>,
     mut fetch_blob: F,
 ) -> Result<VerifiedCapability, VerifyError>
 where
-    F: FnMut(Value<Handle<Blake3, SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+    F: FnMut(Value<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
     let now: Epoch = hifitime::Epoch::now().expect("system time");
 
@@ -1092,7 +1092,7 @@ where
 
     // The leaf sig blob points at the leaf cap blob via sig_signs.
     let mut leaf_cap_handle_iter = find!(
-        (sig: crate::id::Id, h: Value<Handle<Blake3, SimpleArchive>>),
+        (sig: crate::id::Id, h: Value<Handle<SimpleArchive>>),
         pattern!(&leaf_sig_set, [{
             ?sig @ sig_signs: ?h,
         }])
@@ -1287,7 +1287,7 @@ mod tests {
                 .expect("valid sig blob");
         let mut sig_iter = find!(
             (sig: Id,
-             handle: Value<Handle<Blake3, SimpleArchive>>,
+             handle: Value<Handle<SimpleArchive>>,
              pubkey: VerifyingKey,
              r,
              s),
@@ -1304,7 +1304,7 @@ mod tests {
         assert!(sig_iter.next().is_none(), "exactly one sig entity");
 
         // sig_signs must point at the cap blob.
-        let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let cap_handle: Value<Handle<SimpleArchive>> =
             (&cap_blob).get_handle();
         assert_eq!(signed_handle, cap_handle);
 
@@ -1323,7 +1323,7 @@ mod tests {
             <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(cap_blob)
                 .expect("valid cap blob");
         let parents: usize = find!(
-            (e: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            (e: Id, h: Value<Handle<SimpleArchive>>),
             pattern!(&cap_set, [{ ?e @ cap_parent: ?h }])
         )
         .count();
@@ -1340,14 +1340,14 @@ mod tests {
     /// Helper: build an in-memory blob store keyed by handle for the
     /// verifier's `fetch_blob` callback.
     fn store_for(blobs: &[&Blob<SimpleArchive>])
-        -> impl FnMut(Value<Handle<Blake3, SimpleArchive>>) -> Option<Blob<SimpleArchive>>
+        -> impl FnMut(Value<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>
     {
         let mut map = std::collections::HashMap::new();
         for blob in blobs {
-            let handle: Value<Handle<Blake3, SimpleArchive>> = (*blob).get_handle();
+            let handle: Value<Handle<SimpleArchive>> = (*blob).get_handle();
             map.insert(handle.raw, (*blob).clone());
         }
-        move |h: Value<Handle<Blake3, SimpleArchive>>| map.get(&h.raw).cloned()
+        move |h: Value<Handle<SimpleArchive>>| map.get(&h.raw).cloned()
     }
 
     /// Verify a length-1 chain (root signs founder directly). Should
@@ -1368,7 +1368,7 @@ mod tests {
         )
         .expect("root cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1414,7 +1414,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1454,7 +1454,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1488,7 +1488,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1521,7 +1521,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let mut revoked = HashSet::new();
         revoked.insert(founder.verifying_key());
@@ -1568,7 +1568,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let mut revoked = HashSet::new();
         // Revoke the founder's pubkey. The leaf cap's issuer is the
@@ -1724,7 +1724,7 @@ mod tests {
             [(rev_blob, rev_sig_blob)],
         );
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let result = verify_chain(
             team_root.verifying_key(),
@@ -1852,7 +1852,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1910,10 +1910,10 @@ mod tests {
             <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(member_cap)
                 .expect("valid cap blob");
 
-        let founder_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let founder_handle: Value<Handle<SimpleArchive>> =
             (&founder_cap).get_handle();
         let mut parents = find!(
-            (e: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            (e: Id, h: Value<Handle<SimpleArchive>>),
             pattern!(&member_cap_set, [{ ?e @ cap_parent: ?h }])
         );
         let (cap_entity_id, parent_handle_v) =
@@ -1974,7 +1974,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let verified = verify_chain(
@@ -2008,7 +2008,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let verified = verify_chain(
             team_root.verifying_key(),
@@ -2043,7 +2043,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let leaf_handle: Value<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let verified = verify_chain(
             team_root.verifying_key(),

@@ -13,7 +13,7 @@ use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::{BlobStore, TribleSet};
 
-type Reader = <MemoryBlobStore<Blake3> as BlobStore<Blake3>>::Reader;
+type Reader = <MemoryBlobStore as BlobStore<Blake3>>::Reader;
 
 struct Fixture {
     name: &'static str,
@@ -26,7 +26,7 @@ struct PreparedFixture {
     merged: TribleSet,
     root: Id,
     reader: Reader,
-    _blobs: MemoryBlobStore<Blake3>,
+    _blobs: MemoryBlobStore,
     data_tribles: usize,
     json_bytes: usize,
 }
@@ -55,7 +55,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
     load_fixtures()
         .into_iter()
         .filter_map(|fixture| {
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut blobs = MemoryBlobStore::new();
             let (merged, root, data_tribles) = {
                 let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                 let fragment = importer
@@ -231,7 +231,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
             prepared,
             |b, prepared| {
                 b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::new();
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                         let fragment = importer
@@ -269,7 +269,7 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
             |b, prepared| {
                 let payload = prepared.payload.clone().into_bytes();
                 b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::new();
                     let (merged, root) = {
                         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                         let fragment = importer

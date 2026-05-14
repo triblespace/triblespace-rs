@@ -164,7 +164,7 @@ pub fn attributes_impl(
             },
             AttributeId::Derived => {
                 let entity_input = quote! {
-                    #base_path::metadata::name:         #name_lit.to_blob().get_handle::<#base_path::value::schemas::hash::Blake3>(),
+                    #base_path::metadata::name:         #name_lit.to_blob().get_handle(),
                     #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
                 };
                 crate::entity_impl(entity_input, base_path)?

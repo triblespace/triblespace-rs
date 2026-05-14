@@ -164,7 +164,7 @@ constraints are generic over it — same constraint types, same
 
 ### Binary relation: `similar(a, b, score_floor)`
 
-Two variables (`a, b: Variable<Handle<Blake3, Embedding>>`) and
+Two variables (`a, b: Variable<Handle<Embedding>>`) and
 one fixed cosine threshold. Produced by the `similar` method on
 any attached view:
 
@@ -288,7 +288,7 @@ The constraint borrows from a specific index value (naive or
 reloaded from a blob). Typical flow:
 
 ```rust
-let handle: Value<Handle<Blake3, SuccinctBM25Blob>> =
+let handle: Value<Handle<SuccinctBM25Blob>> =
     load_current_index_handle(&kb)?;
 let reader = pile.reader()?;
 let idx: SuccinctBM25Index =

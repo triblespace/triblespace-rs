@@ -59,12 +59,12 @@ impl std::error::Error for ExportError {}
 pub fn export_to_json(
     merged: &TribleSet,
     root: Id,
-    store: &impl BlobStoreGet<Blake3>,
+    store: &impl BlobStoreGet,
     out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
     let mut multi_flags = HashSet::new();
     find!(
-        (name_handle: Value<Handle<Blake3, LongString>>),
+        (name_handle: Value<Handle<LongString>>),
         temp!((field), pattern!(merged, [
             { ?field @ metadata::name: ?name_handle },
             { ?field @ metadata::tag: metadata::KIND_MULTI }
@@ -89,7 +89,7 @@ fn write_entity(
     merged: &TribleSet,
     entity: Id,
     visited: &mut HashSet<Id>,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
     out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
     if !visited.insert(entity) {
@@ -103,12 +103,12 @@ fn write_entity(
 
     let mut field_values: Vec<(
         RawValue,
-        Value<Handle<Blake3, LongString>>,
+        Value<Handle<LongString>>,
         Id,
         Value<UnknownValue>,
     )> = Vec::new();
     find!(
-        (name_handle: Value<Handle<Blake3, LongString>>, schema_value: Value<GenId>, value: Value<UnknownValue>),
+        (name_handle: Value<Handle<LongString>>, schema_value: Value<GenId>, value: Value<UnknownValue>),
         temp!((e, attr), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, value),
@@ -172,7 +172,7 @@ fn render_schema_value(
     schema: Id,
     value: Value<UnknownValue>,
     visited: &mut HashSet<Id>,
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
     out: &mut impl FmtWrite,
 ) -> Result<(), ExportError> {
     // Hoisted: id() is not free (re-runs describe per call), so cache the
@@ -182,7 +182,7 @@ fn render_schema_value(
     static F64_ID: LazyLock<Id> = LazyLock::new(F64::id);
     static GENID_ID: LazyLock<Id> = LazyLock::new(GenId::id);
     static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> =
-        LazyLock::new(Handle::<Blake3, LongString>::id);
+        LazyLock::new(Handle::<LongString>::id);
 
     if schema == *BOOLEAN_ID {
         let value = value.transmute::<Boolean>();
@@ -216,7 +216,7 @@ fn render_schema_value(
         return Ok(());
     }
     if schema == *HANDLE_BLAKE3_LONGSTRING_ID {
-        let handle = value.transmute::<Handle<Blake3, LongString>>();
+        let handle = value.transmute::<Handle<LongString>>();
         let text = resolve_string(ctx, handle)?;
         write_escaped_str(text.as_ref(), out);
         return Ok(());
@@ -279,7 +279,7 @@ fn write_escaped_str(text: &str, out: &mut impl FmtWrite) {
     let _ = out.write_char('"');
 }
 
-struct ExportCtx<'a, Store: BlobStoreGet<Blake3>> {
+struct ExportCtx<'a, Store: BlobStoreGet> {
     store: &'a Store,
     name_cache: HashMap<RawValue, String>,
     string_cache: HashMap<RawValue, View<str>>,
@@ -287,8 +287,8 @@ struct ExportCtx<'a, Store: BlobStoreGet<Blake3>> {
 }
 
 fn resolve_name(
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-    handle: Value<Handle<Blake3, LongString>>,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
+    handle: Value<Handle<LongString>>,
 ) -> Result<String, ExportError> {
     if let Some(cached) = ctx.name_cache.get(&handle.raw) {
         return Ok(cached.clone());
@@ -308,8 +308,8 @@ fn resolve_name(
 }
 
 fn resolve_string(
-    ctx: &mut ExportCtx<'_, impl BlobStoreGet<Blake3>>,
-    handle: Value<Handle<Blake3, LongString>>,
+    ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
+    handle: Value<Handle<LongString>>,
 ) -> Result<View<str>, ExportError> {
     if let Some(cached) = ctx.string_cache.get(&handle.raw) {
         return Ok(cached.clone());

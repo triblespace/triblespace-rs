@@ -21,41 +21,41 @@ use crate::value::ValueSchema;
 #[derive(Debug, Default)]
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
-    pub blobs: MemoryBlobStore<Blake3>,
+    pub blobs: MemoryBlobStore,
     /// Map from branch id to the handle of its current head commit.
-    pub branches: HashMap<Id, Value<Handle<Blake3, SimpleArchive>>>,
+    pub branches: HashMap<Id, Value<Handle<SimpleArchive>>>,
 }
 
-impl crate::repo::BlobStorePut<Blake3> for MemoryRepo {
-    type PutError = <MemoryBlobStore<Blake3> as crate::repo::BlobStorePut<Blake3>>::PutError;
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<Blake3, S>>, Self::PutError>
+impl crate::repo::BlobStorePut for MemoryRepo {
+    type PutError = <MemoryBlobStore as crate::repo::BlobStorePut>::PutError;
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<Blake3, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         self.blobs.put(item)
     }
 }
 
-impl crate::repo::BlobStore<Blake3> for MemoryRepo {
-    type Reader = <MemoryBlobStore<Blake3> as crate::repo::BlobStore<Blake3>>::Reader;
-    type ReaderError = <MemoryBlobStore<Blake3> as crate::repo::BlobStore<Blake3>>::ReaderError;
+impl crate::repo::BlobStore for MemoryRepo {
+    type Reader = <MemoryBlobStore as crate::repo::BlobStore>::Reader;
+    type ReaderError = <MemoryBlobStore as crate::repo::BlobStore>::ReaderError;
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.blobs.reader()
     }
 }
 
-impl crate::repo::BlobStoreKeep<Blake3> for MemoryRepo {
+impl crate::repo::BlobStoreKeep for MemoryRepo {
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<Blake3, UnknownBlob>>>,
+        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
     {
         self.blobs.keep(handles);
     }
 }
 
-impl BranchStore<Blake3> for MemoryRepo {
+impl BranchStore for MemoryRepo {
     type BranchesError = Infallible;
     type HeadError = Infallible;
     type UpdateError = Infallible;
@@ -75,16 +75,16 @@ impl BranchStore<Blake3> for MemoryRepo {
     fn head(
         &mut self,
         id: Id,
-    ) -> Result<Option<Value<Handle<Blake3, SimpleArchive>>>, Self::HeadError> {
+    ) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
         Ok(self.branches.get(&id).cloned())
     }
 
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<Blake3, SimpleArchive>>>,
-        new: Option<Value<Handle<Blake3, SimpleArchive>>>,
-    ) -> Result<PushResult<Blake3>, Self::UpdateError> {
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
         let current = self.branches.get(&id);
         if current != old.as_ref() {
             return Ok(PushResult::Conflict(current.cloned()));

@@ -5,7 +5,7 @@
 //! for `Blob<T>` targeting `Handle<H, T>`. The macro calls
 //! `into_field_value` for every field; when the value side carries
 //! `Some(bytes)`, those bytes get absorbed into the entity's
-//! `MemoryBlobStore<Blake3>`. The resulting Fragment is then
+//! `MemoryBlobStore`. The resulting Fragment is then
 //! self-contained — every handle in its facts resolves against its
 //! own blob store.
 
@@ -19,8 +19,7 @@ use triblespace_core::value::schemas::hash::{Blake3, Handle};
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000020" as pub note: valueschemas::Handle<
-            valueschemas::Blake3, blobschemas::LongString>;
+        "DD00000000000000DD00000000000020" as pub note: valueschemas::Handle<blobschemas::LongString>;
     }
 }
 
@@ -29,19 +28,19 @@ fn entity_auto_puts_blob_handle_fields() {
     let e = rngid();
     // Build a Blob (typed as LongString) without ever touching a blob
     // store. Pass it directly into `entity!{}` as the value for a
-    // Handle<Blake3, LongString>-typed field. The macro must:
+    // Handle<LongString>-typed field. The macro must:
     //   1. Run IntoFieldValue → get back (handle, Some(bytes)).
     //   2. Insert the bytes into the fragment's local blob store.
     //   3. Use the handle as the field value.
     let blob: Blob<LongString> = "hi from a Blob<LongString>".to_blob();
-    let expected_handle = blob.clone().get_handle::<Blake3>();
+    let expected_handle = blob.clone().get_handle();
 
     let frag = entity! { &e @ ns::note: blob };
 
     // The handle in the facts must match what the macro computed.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Value<Handle<Blake3, LongString>> = find!(
-        (h: triblespace_core::value::Value<Handle<Blake3, LongString>>),
+    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Value<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -60,7 +59,7 @@ fn entity_auto_puts_blob_handle_fields() {
 
 #[test]
 fn entity_still_accepts_precomputed_value() {
-    // Passing a precomputed `Value<Handle<Blake3, LongString>>` still
+    // Passing a precomputed `Value<Handle<LongString>>` still
     // works via the blanket ToValue→IntoFieldValue impl. No bytes
     // get absorbed (since the caller didn't hand us any), which is
     // the right behaviour — the caller is responsible for making
@@ -68,13 +67,13 @@ fn entity_still_accepts_precomputed_value() {
     let e = rngid();
     let precomputed = "already put elsewhere"
         .to_blob()
-        .get_handle::<Blake3>();
+        .get_handle();
     let frag = entity! { &e @ ns::note: precomputed };
 
     // Handle is in the facts.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Value<Handle<Blake3, LongString>> = find!(
-        (h: triblespace_core::value::Value<Handle<Blake3, LongString>>),
+    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Value<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)

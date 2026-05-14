@@ -19,13 +19,13 @@ fn attributes_macro_accepts_hex_and_derived_ids() {
     assert_eq!(fixed.id(), expected_fixed);
 
     let expected_derived = Attribute::<ShortString>::from(entity! {
-        metadata::name:         "derived".to_blob().get_handle::<Blake3>(),
+        metadata::name:         "derived".to_blob().get_handle(),
         metadata::value_schema: <ShortString as MetaDescribe>::id(),
     });
     assert_eq!(derived.id(), expected_derived.id());
 
     let expected_private = Attribute::<ShortString>::from(entity! {
-        metadata::name:         "private".to_blob().get_handle::<Blake3>(),
+        metadata::name:         "private".to_blob().get_handle(),
         metadata::value_schema: <ShortString as MetaDescribe>::id(),
     });
     assert_eq!(private.id(), expected_private.id());

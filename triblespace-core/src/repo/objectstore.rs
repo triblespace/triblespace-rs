@@ -31,7 +31,6 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -50,14 +49,12 @@ const BLOB_INFIX: &str = "blobs";
 ///
 /// All data is stored in an external service (e.g. S3, local filesystem) via
 /// the `object_store` crate.
-pub struct ObjectStoreRemote<H> {
+pub struct ObjectStoreRemote {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    rt: Arc<Runtime>,
-    _hasher: PhantomData<H>,
-}
+    rt: Arc<Runtime>,}
 
-impl<H> fmt::Debug for ObjectStoreRemote<H> {
+impl fmt::Debug for ObjectStoreRemote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObjectStoreRemote")
             .field("prefix", &self.prefix)
@@ -65,7 +62,7 @@ impl<H> fmt::Debug for ObjectStoreRemote<H> {
     }
 }
 
-impl<H> fmt::Debug for ObjectStoreReader<H> {
+impl fmt::Debug for ObjectStoreReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObjectStoreReader")
             .field("prefix", &self.prefix)
@@ -75,12 +72,10 @@ impl<H> fmt::Debug for ObjectStoreReader<H> {
 
 /// Read-only handle into an [`ObjectStoreRemote`] that can be cloned and shared.
 #[derive(Clone)]
-pub struct ObjectStoreReader<H> {
+pub struct ObjectStoreReader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    rt: Arc<Runtime>,
-    _hasher: PhantomData<H>,
-}
+    rt: Arc<Runtime>,}
 
 /// Iterator that bridges an async [`Stream`] into blocking iteration via a bounded channel.
 pub struct BlockingIter<T> {
@@ -121,17 +116,17 @@ impl<T> Iterator for BlockingIter<T> {
     }
 }
 
-impl<H> PartialEq for ObjectStoreReader<H> {
+impl PartialEq for ObjectStoreReader {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.store, &other.store) && self.prefix == other.prefix
     }
 }
 
-impl<H> Eq for ObjectStoreReader<H> {}
+impl Eq for ObjectStoreReader {}
 
-impl<H> ObjectStoreRemote<H> {
+impl ObjectStoreRemote {
     /// Creates a repository pointing at the object store described by `url`.
-    pub fn with_url(url: &Url) -> Result<ObjectStoreRemote<H>, object_store::Error> {
+    pub fn with_url(url: &Url) -> Result<ObjectStoreRemote, object_store::Error> {
         let (store, path) = parse_url(url)?;
         Ok(ObjectStoreRemote {
             store: Arc::from(store),
@@ -142,23 +137,20 @@ impl<H> ObjectStoreRemote<H> {
                     .worker_threads(2)
                     .build()
                     .expect("build runtime"),
-            ),
-            _hasher: PhantomData,
-        })
+            ),        })
     }
 }
 
-impl<H> BlobStorePut<H> for ObjectStoreRemote<H>
-where
-    H: HashProtocol,
+impl BlobStorePut for ObjectStoreRemote
 {
+
     type PutError = object_store::Error;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         let blob = item.to_blob();
         let handle = blob.get_handle();
@@ -176,27 +168,23 @@ where
     }
 }
 
-impl<H> BlobStore<H> for ObjectStoreRemote<H>
-where
-    H: HashProtocol,
+impl BlobStore for ObjectStoreRemote
 {
-    type Reader = ObjectStoreReader<H>;
+
+    type Reader = ObjectStoreReader;
     type ReaderError = Infallible;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         Ok(ObjectStoreReader {
             store: self.store.clone(),
             prefix: self.prefix.clone(),
-            rt: self.rt.clone(),
-            _hasher: PhantomData,
-        })
+            rt: self.rt.clone(),        })
     }
 }
 
-impl<H> BranchStore<H> for ObjectStoreRemote<H>
-where
-    H: HashProtocol,
+impl BranchStore for ObjectStoreRemote
 {
+
     type BranchesError = ListBranchesErr;
     type HeadError = PullBranchErr;
     type UpdateError = PushBranchErr;
@@ -232,7 +220,7 @@ where
         ))
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<H, SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
         let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
         let result = self.rt.block_on(async { self.store.get(&path).await });
         match result {
@@ -252,9 +240,9 @@ where
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Option<Value<Handle<H, SimpleArchive>>>,
-    ) -> Result<PushResult<H>, Self::UpdateError> {
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
         let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
         // We encode "deleted branch" as an empty object. This lets us preserve
         // CAS semantics for delete via conditional PUT (PutMode::Update), since
@@ -268,7 +256,7 @@ where
         };
 
         let parse_branch = |bytes: &bytes::Bytes| -> Result<
-            Option<Value<Handle<H, SimpleArchive>>>,
+            Option<Value<Handle<SimpleArchive>>>,
             TryFromSliceError,
         > {
             if bytes.is_empty() {
@@ -369,7 +357,7 @@ where
     }
 }
 
-impl<H> crate::repo::StorageClose for ObjectStoreRemote<H> {
+impl crate::repo::StorageClose for ObjectStoreRemote {
     type Error = Infallible;
 
     fn close(self) -> Result<(), Self::Error> {
@@ -378,18 +366,17 @@ impl<H> crate::repo::StorageClose for ObjectStoreRemote<H> {
     }
 }
 
-impl<H> ObjectStoreReader<H> {
+impl ObjectStoreReader {
     fn blob_path(&self, handle_hex: String) -> Path {
         self.prefix.child(BLOB_INFIX).child(handle_hex)
     }
 }
 
-impl<H> BlobStoreList<H> for ObjectStoreReader<H>
-where
-    H: HashProtocol,
+impl BlobStoreList for ObjectStoreReader
 {
+
     type Err = ListBlobsErr;
-    type Iter<'a> = BlockingIter<Result<Value<Handle<H, UnknownBlob>>, Self::Err>>;
+    type Iter<'a> = BlockingIter<Result<Value<Handle<UnknownBlob>>, Self::Err>>;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         let prefix = self.prefix.child(BLOB_INFIX);
@@ -441,20 +428,19 @@ impl<E: Error> From<object_store::Error> for GetBlobErr<E> {
     }
 }
 
-impl<H> BlobStoreGet<H> for ObjectStoreReader<H>
-where
-    H: HashProtocol,
+impl BlobStoreGet for ObjectStoreReader
 {
+
     type GetError<E: Error + Send + Sync + 'static> = GetBlobErr<E>;
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         let path = self.blob_path(hex::encode(handle.raw));
         let object = self.rt.block_on(async { self.store.get(&path).await })?;
@@ -487,7 +473,7 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
-impl<H: HashProtocol> super::BlobChildren<H> for ObjectStoreReader<H> {}
+impl super::BlobChildren for ObjectStoreReader {}
 
 /// Error returned when listing branches from the object store.
 #[derive(Debug)]
@@ -578,19 +564,18 @@ impl From<TryFromSliceError> for PushBranchErr {
     }
 }
 
-impl<H> crate::repo::BlobStoreMeta<H> for ObjectStoreReader<H>
-where
-    H: HashProtocol,
+impl crate::repo::BlobStoreMeta for ObjectStoreReader
 {
+
     type MetaError = object_store::Error;
 
     fn metadata<S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);
@@ -609,16 +594,15 @@ where
     }
 }
 
-impl<H> crate::repo::BlobStoreForget<H> for ObjectStoreRemote<H>
-where
-    H: HashProtocol,
+impl crate::repo::BlobStoreForget for ObjectStoreRemote
 {
+
     type ForgetError = object_store::Error;
 
-    fn forget<S>(&mut self, handle: Value<Handle<H, S>>) -> Result<(), Self::ForgetError>
+    fn forget<S>(&mut self, handle: Value<Handle<S>>) -> Result<(), Self::ForgetError>
     where
         S: BlobSchema + 'static,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);

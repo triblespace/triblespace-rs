@@ -19,7 +19,7 @@ fn metadata_detects_corrupted_blob() {
     let path = dir.path().join("pile.pile");
 
     std::fs::File::create(&path).unwrap();
-    let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+    let mut pile: Pile = Pile::open(&path).unwrap();
     let data = b"hello metadata".to_vec();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
     let handle = pile.put(blob).unwrap();
@@ -44,7 +44,7 @@ fn metadata_detects_corrupted_blob() {
         file.write_all(&[new_byte]).unwrap();
     }
 
-    let mut reopened: Pile<Blake3> = Pile::open(&path).unwrap();
+    let mut reopened: Pile = Pile::open(&path).unwrap();
     reopened.restore().unwrap();
     let reader = reopened.reader().unwrap();
     assert!(reader.metadata(handle).unwrap().is_none());

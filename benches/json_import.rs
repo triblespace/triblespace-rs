@@ -53,7 +53,7 @@ fn json_import_benchmark(c: &mut Criterion) {
             &blob,
             |b, blob| {
                 b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::new();
                     let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
                     let fragment = importer.import_blob(blob.clone()).expect("import JSON");
                     std::hint::black_box(fragment.facts().len());
@@ -65,7 +65,7 @@ fn json_import_benchmark(c: &mut Criterion) {
             &blob,
             |b, blob| {
                 b.iter(|| {
-                    let mut blobs = MemoryBlobStore::<Blake3>::new();
+                    let mut blobs = MemoryBlobStore::new();
                     let mut importer = JsonTreeImporter::<_, Blake3>::new(&mut blobs, None);
                     let fragment = importer.import_blob(blob.clone()).expect("import JSON");
                     std::hint::black_box(fragment.facts().len());

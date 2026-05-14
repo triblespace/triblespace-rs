@@ -34,7 +34,7 @@ deterministic JSON importers and an N-Triples (RDF) importer:
 
 `JsonObjectImporter` uses a fixed mapping for JSON primitives:
 
-- strings → `Handle<Blake3, LongString>`
+- strings → `Handle<LongString>`
 - numbers → `F64`
 - booleans → `Boolean`
 
@@ -89,7 +89,7 @@ When exporting back to JSON, pass a blob reader (e.g., from a `Workspace` or
 is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:
-`ShortString` → JSON string, `Handle<Blake3, LongString>` → JSON string (via
+`ShortString` → JSON string, `Handle<LongString>` → JSON string (via
 blob lookup), `Boolean` → JSON bool, `F64` → JSON number, `GenId` → inlined
 object (unless already visited). Attributes that use other schemas are ignored
 so JSON roundtrips stay predictable even when the dataset mixes in
@@ -108,7 +108,7 @@ lossless JSON AST representation. Each JSON value becomes a node tagged with a
 kind (`json_tree::kind_*`). Objects and arrays emit explicit entry entities
 that store field names and indices (`json_tree::field_*` and
 `json_tree::array_*`), preserving ordering and allowing repeated keys.
-Numbers are stored as raw decimal strings via `Handle<Blake3, LongString>` so
+Numbers are stored as raw decimal strings via `Handle<LongString>` so
 precision is not lost. Array and field indices are stored as `U256BE` to keep
 ordering exact even for large collections.
 
@@ -175,9 +175,9 @@ triblespace value schemas:
 | `xsd:decimal` | `R256BE` (exact rational) |
 | `xsd:float`, `xsd:double` | `F64` |
 | `xsd:boolean` | `Boolean` |
-| `xsd:string`, untyped, language-tagged | `Handle<Blake3, LongString>` |
+| `xsd:string`, untyped, language-tagged | `Handle<LongString>` |
 
-Unrecognized datatypes fall back to `Handle<Blake3, LongString>` so no
+Unrecognized datatypes fall back to `Handle<LongString>` so no
 data is lost — the lexical form ships through verbatim. Numeric parse
 failures fall back to the string path too.
 
@@ -195,7 +195,7 @@ use triblespace::prelude::valueschemas::{Blake3, Handle, I256BE};
 use triblespace::prelude::Value;
 
 let birthyear = Attribute::<I256BE>::from(entity! {
-    metadata::iri:          "http://example.org/birthyear".to_blob().get_handle::<Blake3>(),
+    metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
     metadata::value_schema: <I256BE as MetaDescribe>::id(),
 });
 for (entity, year) in find!(

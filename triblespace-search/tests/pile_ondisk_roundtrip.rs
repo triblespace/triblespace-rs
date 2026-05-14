@@ -43,7 +43,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     let original = b.build();
 
     let handle = {
-        let mut pile = Pile::<triblespace_core::value::schemas::hash::Blake3>::open(&pile_path)
+        let mut pile = Pile::open(&pile_path)
             .expect("open pile");
         pile.refresh().expect("refresh empty pile");
         let h = pile
@@ -54,7 +54,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     };
 
     // Reopen — exercises the actual on-disk load path.
-    let mut pile = Pile::<triblespace_core::value::schemas::hash::Blake3>::open(&pile_path)
+    let mut pile = Pile::open(&pile_path)
         .expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
@@ -88,7 +88,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
     std::fs::File::create(&pile_path).expect("create pile file");
 
     let (original, probe, handle) = {
-        let mut pile = Pile::<Blake3>::open(&pile_path).expect("open pile");
+        let mut pile = Pile::open(&pile_path).expect("open pile");
         pile.refresh().expect("refresh empty pile");
 
         let mut b = HNSWBuilder::new(4).with_seed(19);
@@ -96,7 +96,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
         for i in 1..=12u8 {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-            let h = put_embedding::<_, Blake3>(&mut pile, v.clone()).unwrap();
+            let h = put_embedding::<_>(&mut pile, v.clone()).unwrap();
             b.insert(h, v).unwrap();
             handles.push(h);
         }
@@ -109,7 +109,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
         (original, handles[0], handle)
     };
 
-    let mut pile = Pile::<Blake3>::open(&pile_path).expect("reopen pile");
+    let mut pile = Pile::open(&pile_path).expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
@@ -126,14 +126,14 @@ fn succinct_hnsw_survives_pile_round_trip() {
     // just the leaf walk.
     let original_view = original.attach(&reader);
     let reloaded_view = reloaded.attach(&reader);
-    let a: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+    let a: HashSet<Value<Handle<Embedding>>> = find!(
+        (n: Value<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
     .collect();
-    let r: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+    let r: HashSet<Value<Handle<Embedding>>> = find!(
+        (n: Value<Handle<Embedding>>),
         reloaded_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)

@@ -22,8 +22,7 @@ use super::TribleSet;
 /// caller as the fragment's interface.
 ///
 /// The embedded blob store is what makes a Fragment *self-contained*:
-/// handles in the facts (e.g. `metadata::name: <Value<Handle<Blake3,
-/// LongString>>>`) reference bytes that the fragment carries with
+/// handles in the facts (e.g. `metadata::name: <Value<Handle</// LongString>>>`) reference bytes that the fragment carries with
 /// itself. An empty `MemoryBlobStore` is structurally a single
 /// PATCH-root pointer — fragments without blobs pay essentially
 /// zero overhead.
@@ -31,7 +30,7 @@ use super::TribleSet;
 pub struct Fragment {
     exports: PATCH<16>,
     facts: TribleSet,
-    blobs: MemoryBlobStore<Blake3>,
+    blobs: MemoryBlobStore,
 }
 
 impl Fragment {
@@ -77,7 +76,7 @@ impl Fragment {
     /// blob store. Useful when re-wrapping the tail of a destructured
     /// fragment (e.g. inside `Spread::spread`) where the exports have
     /// already been consumed.
-    pub fn from_facts_and_blobs(facts: TribleSet, blobs: MemoryBlobStore<Blake3>) -> Self {
+    pub fn from_facts_and_blobs(facts: TribleSet, blobs: MemoryBlobStore) -> Self {
         Self {
             exports: PATCH::<16>::new(),
             facts,
@@ -93,7 +92,7 @@ impl Fragment {
     pub fn rooted_with_blobs(
         root: Id,
         facts: TribleSet,
-        blobs: MemoryBlobStore<Blake3>,
+        blobs: MemoryBlobStore,
     ) -> Self {
         let mut exports = PATCH::<16>::new();
         let raw: RawId = root.into();
@@ -113,7 +112,7 @@ impl Fragment {
     /// an external blob store. Idempotent under content addressing:
     /// putting the same bytes twice returns the same handle and
     /// doesn't grow the store.
-    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>
+    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
     where
         S: BlobSchema,
         T: ToBlob<S>,
@@ -147,7 +146,7 @@ impl Fragment {
     }
 
     /// Borrow the fragment's local blob store.
-    pub fn blobs(&self) -> &MemoryBlobStore<Blake3> {
+    pub fn blobs(&self) -> &MemoryBlobStore {
         &self.blobs
     }
 
@@ -158,11 +157,11 @@ impl Fragment {
     /// Consume the fragment, yielding its facts and blob store. The
     /// exports are dropped — most callers want facts/blobs together
     /// without the rooted-id concern.
-    pub fn into_facts_and_blobs(self) -> (TribleSet, MemoryBlobStore<Blake3>) {
+    pub fn into_facts_and_blobs(self) -> (TribleSet, MemoryBlobStore) {
         (self.facts, self.blobs)
     }
 
-    pub fn into_parts(self) -> (PATCH<16>, TribleSet, MemoryBlobStore<Blake3>) {
+    pub fn into_parts(self) -> (PATCH<16>, TribleSet, MemoryBlobStore) {
         (self.exports, self.facts, self.blobs)
     }
 

@@ -56,7 +56,7 @@ mod wiki {
         "F27792C7AF218F1BAE047650DF560B95"
             as pub title: valueschemas::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
-            as pub body: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+            as pub body: valueschemas::Handle<blobschemas::LongString>;
         // `index` rotated 2026-05-05 alongside the
         // `SuccinctBM25Blob` schema id rotation
         // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
@@ -69,7 +69,7 @@ mod wiki {
         // `docs/FACULTY_INTEGRATION.md` § "What the caller has to
         // rotate" for the migration recipe.
         "EBDECCC621ABA8DA8C81D48A9B19347C"
-            as pub index: valueschemas::Handle<valueschemas::Blake3, SuccinctBM25Blob>;
+            as pub index: valueschemas::Handle<SuccinctBM25Blob>;
     }
 
     // Single stable id every faculty reader agrees on as the
@@ -89,7 +89,7 @@ fn fragment_id(byte: u8) -> Id {
 /// wiki fragments". A real faculty wouldn't have this; it would
 /// inherit whatever the caller committed.
 fn seed(
-    pile: &mut Pile<Blake3>,
+    pile: &mut Pile,
 ) -> Result<TribleSet, Box<dyn Error>> {
     let docs = [
         (
@@ -133,11 +133,11 @@ fn seed(
 /// hash-tokenize, build a SuccinctBM25Index, put it, overwrite
 /// the anchor trible with the new handle.
 fn refresh(
-    pile: &mut Pile<Blake3>,
+    pile: &mut Pile,
     kb: &mut TribleSet,
-) -> Result<Value<Handle<Blake3, SuccinctBM25Blob>>, Box<dyn Error>> {
-    let body_handles: Vec<(Id, Value<Handle<Blake3, blobschemas::LongString>>)> = find!(
-        (id: Id, body: Value<Handle<Blake3, blobschemas::LongString>>),
+) -> Result<Value<Handle<SuccinctBM25Blob>>, Box<dyn Error>> {
+    let body_handles: Vec<(Id, Value<Handle<blobschemas::LongString>>)> = find!(
+        (id: Id, body: Value<Handle<blobschemas::LongString>>),
         pattern!(&*kb, [{ ?id @ wiki::body: ?body }])
     )
     .collect();
@@ -163,7 +163,7 @@ fn refresh(
 }
 
 fn query(
-    pile: &mut Pile<Blake3>,
+    pile: &mut Pile,
     kb: &TribleSet,
     text: &str,
     top_k: usize,
@@ -172,8 +172,8 @@ fn query(
 
     // Resolve the anchor → handle.
     let anchor = wiki::INDEX_ANCHOR;
-    let handles: Vec<(Value<Handle<Blake3, SuccinctBM25Blob>>,)> = find!(
-        (h: Value<Handle<Blake3, SuccinctBM25Blob>>),
+    let handles: Vec<(Value<Handle<SuccinctBM25Blob>>,)> = find!(
+        (h: Value<Handle<SuccinctBM25Blob>>),
         pattern!(kb, [{ &anchor @ wiki::index: ?h }])
     )
     .collect();
@@ -211,12 +211,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let pile_path = dir.path().join("wiki.pile");
     std::fs::File::create(&pile_path)?;
 
-    let mut pile = Pile::<Blake3>::open(&pile_path)?;
+    let mut pile = Pile::open(&pile_path)?;
     pile.refresh()?;
 
     let mut kb = seed(&mut pile)?;
     let n_seeded = find!(
-        (id: Id, h: Value<Handle<Blake3, blobschemas::LongString>>),
+        (id: Id, h: Value<Handle<blobschemas::LongString>>),
         pattern!(&kb, [{ ?id @ wiki::body: ?h }])
     )
     .count();

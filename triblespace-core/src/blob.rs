@@ -15,7 +15,6 @@ pub mod schemas;
 
 use crate::metadata::MetaDescribe;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
@@ -78,16 +77,12 @@ impl<S: BlobSchema> Blob<S> {
         unsafe { std::mem::transmute(self) }
     }
 
-    // Note: Do we want to cache the handle somewhere so that we don't have to compute the hash every time?
-    // We could use WeakBytes for this, but it would require one hash-map per HashProtocol.
-
-    /// Hashes the blob with the given hash protocol and returns the hash as a handle.
-    pub fn get_handle<H>(&self) -> Value<Handle<H, S>>
+    /// Hashes the blob's bytes with Blake3 and returns the typed handle.
+    pub fn get_handle(&self) -> Value<Handle<S>>
     where
-        H: HashProtocol,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
-        let digest = H::digest(&self.bytes);
+        let digest = crate::value::schemas::hash::Blake3::digest(&self.bytes);
         Value::new(digest)
     }
 
@@ -180,20 +175,19 @@ impl<S: BlobSchema> ToBlob<S> for Blob<S> {
     }
 }
 
-/// A `Blob<T>` passed as a `Handle<H, T>`-typed field in `entity!{}`
+/// A `Blob<T>` passed as a `Handle<T>`-typed field in `entity!{}`
 /// auto-puts itself: the macro absorbs its bytes into the fragment's
 /// local blob store, and the field value is the handle derived from
 /// those same bytes. The blob store is content-addressed, so the
 /// bytes round-trip cleanly even though the schema is erased at the
 /// storage boundary.
-impl<H, T> crate::value::IntoFieldValue<Handle<H, T>> for Blob<T>
+impl<T> crate::value::IntoFieldValue<Handle<T>> for Blob<T>
 where
-    H: HashProtocol,
     T: BlobSchema,
-    Handle<H, T>: ValueSchema,
+    Handle<T>: ValueSchema,
 {
-    fn into_field_value(self) -> (Value<Handle<H, T>>, Option<Bytes>) {
-        let handle = self.get_handle::<H>();
+    fn into_field_value(self) -> (Value<Handle<T>>, Option<Bytes>) {
+        let handle = self.get_handle();
         (handle, Some(self.bytes))
     }
 }

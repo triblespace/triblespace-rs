@@ -12,8 +12,8 @@ proptest! {
         value in "[a-z]{1,20}",
     ) {
         let json = format!(r#"{{"{key}": "{value}"}}"#);
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut store, None);
+        let mut store: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer = JsonObjectImporter::<_>::new(&mut store, None);
         let frag = importer.import_str(&json).expect("valid JSON");
 
         // Should produce at least one trible (the key-value pair)
@@ -33,11 +33,11 @@ proptest! {
 
         // Import twice with same salt — should get same entity id
         let mut store1 = MemoryBlobStore::default();
-        let mut importer1 = JsonObjectImporter::<_, Blake3>::new(&mut store1, None);
+        let mut importer1 = JsonObjectImporter::<_>::new(&mut store1, None);
         let frag1 = importer1.import_str(&json).unwrap();
 
         let mut store2 = MemoryBlobStore::default();
-        let mut importer2 = JsonObjectImporter::<_, Blake3>::new(&mut store2, None);
+        let mut importer2 = JsonObjectImporter::<_>::new(&mut store2, None);
         let frag2 = importer2.import_str(&json).unwrap();
 
         prop_assert_eq!(frag1.root(), frag2.root(),
@@ -54,12 +54,12 @@ proptest! {
         let salt_a = [1u8; 32];
         let salt_b = [2u8; 32];
 
-        let mut store1: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer1 = JsonObjectImporter::<_, Blake3>::new(&mut store1, Some(salt_a));
+        let mut store1: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer1 = JsonObjectImporter::<_>::new(&mut store1, Some(salt_a));
         let frag1 = importer1.import_str(&json).unwrap();
 
-        let mut store2: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer2 = JsonObjectImporter::<_, Blake3>::new(&mut store2, Some(salt_b));
+        let mut store2: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer2 = JsonObjectImporter::<_>::new(&mut store2, Some(salt_b));
         let frag2 = importer2.import_str(&json).unwrap();
 
         prop_assert_ne!(frag1.root(), frag2.root(),
@@ -75,8 +75,8 @@ proptest! {
             .collect();
         let json = format!("[{}]", objects.join(","));
 
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut store, None);
+        let mut store: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer = JsonObjectImporter::<_>::new(&mut store, None);
         let frag = importer.import_str(&json).expect("valid JSON array");
 
         // Array of N objects should produce up to N exports (identical
@@ -95,8 +95,8 @@ proptest! {
     ) {
         let json = format!(r#"{{"{outer_key}": {{"{inner_key}": "{inner_val}"}}}}"#);
 
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut store, None);
+        let mut store: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer = JsonObjectImporter::<_>::new(&mut store, None);
         let frag = importer.import_str(&json).expect("valid nested JSON");
 
         // Should have tribles for both outer and inner entities
@@ -109,8 +109,8 @@ proptest! {
     #[test]
     fn json_primitive_root_rejected(s in "[a-z]{1,20}") {
         let json = format!(r#""{s}""#);
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut store, None);
+        let mut store: MemoryBlobStore = MemoryBlobStore::default();
+        let mut importer = JsonObjectImporter::<_>::new(&mut store, None);
         let result = importer.import_str(&json);
         prop_assert!(result.is_err(), "primitive root should be rejected");
     }

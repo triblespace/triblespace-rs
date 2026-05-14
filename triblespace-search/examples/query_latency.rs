@@ -179,14 +179,14 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut builder = HNSWBuilder::new(dim).with_seed(13);
-    let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_docs);
+    let mut handles: Vec<Value<Handle<Embedding>>> = Vec::with_capacity(n_docs);
     for _ in 0..n_docs {
         let v: Vec<f32> = (0..dim)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         builder.insert(h, v).unwrap();
         handles.push(h);
     }
@@ -198,7 +198,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     // handle rather than a raw vector is the new API; callers
     // would typically put their query vector into the store,
     // then probe from the resulting handle.
-    let probes: Vec<Value<Handle<Blake3, Embedding>>> = (0..100)
+    let probes: Vec<Value<Handle<Embedding>>> = (0..100)
         .map(|i| handles[(i * 37 + 1) % handles.len()])
         .collect();
 
@@ -209,7 +209,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         let _ = succinct_view.candidates_above(*p, 0.5);
     }
 
-    let time = |tag: &str, f: &dyn Fn(&Value<Handle<Blake3, Embedding>>)| {
+    let time = |tag: &str, f: &dyn Fn(&Value<Handle<Embedding>>)| {
         let reps = 5;
         let mut samples: Vec<u128> = Vec::with_capacity(probes.len() * reps);
         for _ in 0..reps {

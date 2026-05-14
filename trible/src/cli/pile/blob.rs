@@ -59,13 +59,13 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::value::schemas::hash::Handle;
             use triblespace_core::value::schemas::hash::Hash;
 
-            let mut pile: Pile<Blake3> = Pile::open(&path)?;
+            let mut pile: Pile = Pile::open(&path)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let reader = pile
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
                 for handle in reader.blobs() {
-                    let handle: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+                    let handle: triblespace_core::value::Value<Handle<UnknownBlob>> =
                         handle?;
                     let hash: triblespace_core::value::Value<Hash<Blake3>> =
                         Handle::to_hash(handle);
@@ -97,7 +97,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::value::schemas::hash::Handle;
             use triblespace_core::value::schemas::hash::Hash;
 
-            let mut pile: Pile<Blake3> = Pile::open(&pile)?;
+            let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let file_handle = File::open(&file)?;
                 let bytes = unsafe { Bytes::map_file(&file_handle)? };
@@ -125,10 +125,10 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Handle;
 
-            let mut pile: Pile<Blake3> = Pile::open(&pile)?;
+            let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+                let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()
@@ -157,10 +157,10 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Handle;
 
-            let mut pile: Pile<Blake3> = Pile::open(&pile)?;
+            let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+                let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()

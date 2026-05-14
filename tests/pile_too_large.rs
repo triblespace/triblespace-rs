@@ -13,7 +13,7 @@ fn open_near_usize_max_errors() {
         return;
     }
     drop(file);
-    match Pile::<Blake3>::open(&path) {
+    match Pile::open(&path) {
         Err(ReadError::FileTooLarge { .. }) => {}
         Err(e) => panic!("unexpected error: {e:?}"),
         Ok(_) => panic!("expected error opening overly large pile"),

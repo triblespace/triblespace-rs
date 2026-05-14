@@ -12,7 +12,7 @@
 //!   on the index — same pattern as [`Similar`] for HNSW.
 //! * [`Similar`] — a binary relation
 //!   `similar(a, b, score_floor)` over two
-//!   `Variable<Handle<Blake3, Embedding>>` variables, produced
+//!   `Variable<Handle<Embedding>>` variables, produced
 //!   by the `similar()` method on
 //!   [`crate::hnsw::AttachedHNSWIndex`] /
 //!   [`crate::hnsw::AttachedFlatIndex`] /
@@ -389,16 +389,16 @@ pub trait SimilaritySearch {
     /// put into the pile for this one call).
     fn neighbours_above(
         &self,
-        from: Value<Handle<Blake3, Embedding>>,
+        from: Value<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Blake3, Embedding>>>;
+    ) -> Vec<Value<Handle<Embedding>>>;
 
     /// Exact cosine similarity between the two handles, or
     /// [`None`] if either blob can't be fetched / parsed.
     fn cosine_between(
         &self,
-        a: Value<Handle<Blake3, Embedding>>,
-        b: Value<Handle<Blake3, Embedding>>,
+        a: Value<Handle<Embedding>>,
+        b: Value<Handle<Embedding>>,
     ) -> Option<f32>;
 }
 
@@ -440,7 +440,7 @@ pub trait SimilaritySearch {
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
-/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut store = MemoryBlobStore::new();
 /// let mut b = HNSWBuilder::new(3).with_seed(42);
 /// let mut handles = Vec::new();
 /// for v in [
@@ -448,7 +448,7 @@ pub trait SimilaritySearch {
 ///     vec![0.9, 0.1, 0.0],
 ///     vec![0.0, 1.0, 0.0],
 /// ] {
-///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
 ///     b.insert(h, v).unwrap();
 ///     handles.push(h);
 /// }
@@ -478,8 +478,8 @@ pub trait SimilaritySearch {
 /// `temp!` + `anchor.is(...)` ceremony.
 pub struct Similar<'a, I: SimilaritySearch + ?Sized> {
     index: &'a I,
-    a: Variable<Handle<Blake3, Embedding>>,
-    b: Variable<Handle<Blake3, Embedding>>,
+    a: Variable<Handle<Embedding>>,
+    b: Variable<Handle<Embedding>>,
     score_floor: f32,
 }
 
@@ -488,8 +488,8 @@ impl<'a, I: SimilaritySearch + ?Sized> Similar<'a, I> {
     /// method on an attached index rather than directly.
     pub fn new(
         index: &'a I,
-        a: Variable<Handle<Blake3, Embedding>>,
-        b: Variable<Handle<Blake3, Embedding>>,
+        a: Variable<Handle<Embedding>>,
+        b: Variable<Handle<Embedding>>,
         score_floor: f32,
     ) -> Self {
         Self {
@@ -630,7 +630,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
-/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut store = MemoryBlobStore::new();
 /// let mut b = HNSWBuilder::new(3).with_seed(42);
 /// let mut handles = Vec::new();
 /// for v in [
@@ -638,7 +638,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 ///     vec![0.9, 0.1, 0.0],
 ///     vec![0.0, 1.0, 0.0],
 /// ] {
-///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
 ///     b.insert(h, v).unwrap();
 ///     handles.push(h);
 /// }
@@ -659,7 +659,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// assert!(!got.contains(&handles[2])); // below floor
 /// ```
 pub struct SimilarTo {
-    var: Variable<Handle<Blake3, Embedding>>,
+    var: Variable<Handle<Embedding>>,
     /// Eagerly-computed above-threshold handle set from the one
     /// walk at construction.
     candidates: Vec<RawValue>,
@@ -670,7 +670,7 @@ impl SimilarTo {
     /// through the `similar_to` method on an attached index
     /// rather than directly.
     pub fn from_candidates(
-        var: Variable<Handle<Blake3, Embedding>>,
+        var: Variable<Handle<Embedding>>,
         candidates: Vec<RawValue>,
     ) -> Self {
         Self { var, candidates }
@@ -1017,21 +1017,21 @@ mod tests {
     fn sample_sim() -> (
         crate::hnsw::FlatIndex,
         crate::hnsw::HNSWIndex,
-        MemoryBlobStore<Blake3>,
-        [Value<Handle<Blake3, Embedding>>; 3],
+        MemoryBlobStore,
+        [Value<Handle<Embedding>>; 3],
     ) {
         use crate::hnsw::{FlatBuilder, HNSWBuilder};
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let vecs = [
             vec![1.0f32, 0.0, 0.0],
             vec![0.0, 1.0, 0.0],
             vec![0.9, 0.1, 0.0],
         ];
-        let mut handles: [Value<Handle<Blake3, Embedding>>; 3] =
+        let mut handles: [Value<Handle<Embedding>>; 3] =
             [Value::new([0u8; 32]); 3];
         for (i, v) in vecs.iter().enumerate() {
             handles[i] =
-                crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+                crate::schemas::put_embedding::<_>(&mut store, v.clone()).unwrap();
         }
         let mut flat = FlatBuilder::new(3);
         for h in handles.iter() {
@@ -1051,8 +1051,8 @@ mod tests {
         let view = flat.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 
         let mut binding = Binding::default();
@@ -1073,8 +1073,8 @@ mod tests {
         let view = flat.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 
         let mut binding = Binding::default();
@@ -1094,8 +1094,8 @@ mod tests {
         let view = flat.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 
         let mut good = Binding::default();
@@ -1116,8 +1116,8 @@ mod tests {
         let view = hnsw.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 
         let mut binding = Binding::default();
@@ -1138,8 +1138,8 @@ mod tests {
         let view = flat.attach(&reader);
 
         let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let unrelated: Variable<GenId> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 

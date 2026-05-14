@@ -19,8 +19,8 @@ fn commit_harness() {
     let signing_key = SigningKey::from_bytes(&secret);
 
     // Create two dummy parent handles
-    let parent1 = TribleSet::new().to_blob().get_handle::<Blake3>();
-    let parent2 = TribleSet::new().to_blob().get_handle::<Blake3>();
+    let parent1 = TribleSet::new().to_blob().get_handle();
+    let parent2 = TribleSet::new().to_blob().get_handle();
 
     // Create minimal commit content
     let content = TribleSet::new().to_blob();

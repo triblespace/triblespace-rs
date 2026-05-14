@@ -63,7 +63,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Prefer the repo-managed blob listing. Do not fall back to raw
             // listing automatically — bare files were a bug, not a feature.
-            let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             let reader = remote
                 .reader()
                 .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
@@ -72,7 +72,9 @@ pub fn run(cmd: Command) -> Result<()> {
                 match item_res {
                     Ok(handle_val) => {
                         let hash: triblespace_core::value::Value<
-                            triblespace_core::value::schemas::hash::Hash<Blake3>,
+                            triblespace_core::value::schemas::hash::Hash<
+                                triblespace_core::value::schemas::hash::Blake3,
+                            >,
                         > = Handle::to_hash(handle_val);
                         let string: String = hash.from_value();
                         println!("{}", string);
@@ -91,7 +93,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::value::schemas::hash::Hash;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             let file_handle = File::open(&file)?;
             let bytes = unsafe { Bytes::map_file(&file_handle)? };
             let handle = remote.put::<FileBytes, _>(bytes)?;
@@ -111,9 +113,9 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::BlobStoreGet;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+            let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
                 hash_val.into();
             let reader = remote
                 .reader()
@@ -130,9 +132,9 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::Blob;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+            let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
                 hash_val.into();
             let handle_str: String = hash_val.clone().from_value();
             let reader = remote
@@ -171,10 +173,10 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Forget { url, handle } => {
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             let (_store, _path) = parse_url(&url)?;
             let hash_val = parse_blob_handle(&handle)?;
-            let handle_val: triblespace_core::value::Value<Handle<Blake3, UnknownBlob>> =
+            let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
                 hash_val.into();
             let blob_handle = handle_val;
             // forget is idempotent

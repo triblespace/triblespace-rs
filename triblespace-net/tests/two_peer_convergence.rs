@@ -104,7 +104,7 @@ fn sync_round(
     merge_tracking_into_local(local, tracking_id, branch_name).expect("merge")
 }
 
-fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Value<Handle<Blake3, SimpleArchive>> {
+fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Value<Handle<SimpleArchive>> {
     let id = lookup_id(repo, name);
     let ws = repo.pull(id).unwrap();
     ws.head().expect("branch has head")

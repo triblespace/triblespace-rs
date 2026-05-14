@@ -327,7 +327,7 @@ proptest! {
         use anybytes::View;
 
         let text = String::from_utf8_lossy(&content).to_string();
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::default();
+        let mut store: MemoryBlobStore = MemoryBlobStore::default();
         let handle = store.put::<LongString, _>(text.clone()).expect("put");
 
         let reader = store.reader().expect("reader");

@@ -19,7 +19,7 @@ attributes! {
     /// from an external vocabulary where the entity's identity is a URI —
     /// the same URI always deterministically maps to the same triblespace
     /// Id by round-tripping through an `rdf_uri` fragment.
-    "AA68DE115445A63D62A63FF3284D030C" as pub rdf_uri: Handle<Blake3, LongString>;
+    "AA68DE115445A63D62A63FF3284D030C" as pub rdf_uri: Handle<LongString>;
 
     /// BCP-47 language tag for a reified language-tagged literal entity.
     ///
@@ -32,5 +32,5 @@ attributes! {
 
     /// Lexical form of a reified language-tagged literal entity. See
     /// [`rdf_lang`] for the full encoding rationale.
-    "02923632852C6AF8CD0D2596ACC343D2" as pub rdf_text: Handle<Blake3, LongString>;
+    "02923632852C6AF8CD0D2596ACC343D2" as pub rdf_text: Handle<LongString>;
 }

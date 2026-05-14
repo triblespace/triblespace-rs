@@ -17,7 +17,7 @@ fn branch_set_creates_and_updates_with_cas() {
     let branch_id = id_hex!("22222222222222222222222222222222");
 
     let (h1, h2) = {
-        let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let mut pile: Pile = Pile::open(&pile_path).unwrap();
         pile.restore().unwrap();
 
         let mut a = TribleSet::new();
@@ -86,7 +86,7 @@ fn branch_set_creates_and_updates_with_cas() {
         .failure();
 
     // Verify the head is set to h2.
-    let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+    let mut pile: Pile = Pile::open(&pile_path).unwrap();
     pile.restore().unwrap();
     assert_eq!(pile.head(branch_id).unwrap(), Some(h2));
     pile.close().unwrap();
@@ -101,7 +101,7 @@ fn branch_list_all_deleted_lists_deleted_branches() {
     let branch_id = id_hex!("33333333333333333333333333333333");
 
     {
-        let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
+        let mut pile: Pile = Pile::open(&pile_path).unwrap();
         pile.restore().unwrap();
 
         let mut a = TribleSet::new();

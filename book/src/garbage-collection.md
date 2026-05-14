@@ -82,7 +82,7 @@ use triblespace::core::blob::memoryblobstore::MemoryBlobStore;
 use triblespace::core::repo::{self, BlobStoreKeep, BlobStoreList, BranchStore};
 use triblespace::core::value::schemas::hash::Blake3;
 
-let mut store = MemoryBlobStore::<Blake3>::default();
+let mut store = MemoryBlobStore::default();
 // ... populate the store or import data ...
 
 let mut branch_store = /* your BranchStore implementation */;
@@ -100,7 +100,7 @@ for branch_id in branch_store.branches()? {
 store.keep(repo::reachable(&reader, roots.clone()));
 
 // Optionally copy the same reachable blobs into another store.
-let mut scratch = MemoryBlobStore::<Blake3>::default();
+let mut scratch = MemoryBlobStore::default();
 let visited = repo::reachable(&reader, roots.clone()).count();
 let mapping: Vec<_> = repo::transfer(
     &reader,

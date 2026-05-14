@@ -197,7 +197,7 @@ fn branch_push_pull_transfers_branch() {
     let url = format!("file://{}", remote_dir.display());
 
     let branch_id = {
-        let pile: Pile<Blake3> = Pile::open(&local).unwrap();
+        let pile: Pile = Pile::open(&local).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
 
         let branch_id = repo.create_branch("main", None).unwrap();

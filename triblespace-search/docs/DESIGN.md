@@ -27,7 +27,7 @@ the same invariants:
      scores via `idx.score(&doc, &terms)` for ranking.
      `hnsw.similar(?a, ?b, score_floor: f32)` — symmetric
      binary relation: `a` and `b` are
-     `Variable<Handle<Blake3, Embedding>>`, `score_floor` is a
+     `Variable<Handle<Embedding>>`, `score_floor` is a
      fixed cosine threshold. At least one of `a` / `b` must be
      bound for the engine to walk.
    Callers combine with `and!` / `or!` / filters in the normal
@@ -208,7 +208,7 @@ is the identity — no in-blob magic or version.
   graph_offsets_meta      32 B   ; CompactVectorMetaOnDisk
   (section_offset, section_len) × 3 = 48 B
 
-[handles             ] n_nodes × 32 B          ; Value<Handle<Blake3, Embedding>>
+[handles             ] n_nodes × 32 B          ; Value<Handle<Embedding>>
                                                ; — the node IS the handle;
                                                ; no separate doc-key table.
 [graph_bytes         ] variable                ; two CompactVectors in one
@@ -257,7 +257,7 @@ the bit-packed graph; see
 ### Handle-keyed storage (shipped for both FlatIndex and HNSW)
 
 Both `FlatIndex` and `SuccinctHNSWIndex` store a flat table of
-`Value<Handle<Blake3, Embedding>>` (32 B per handle). There is
+`Value<Handle<Embedding>>` (32 B per handle). There is
 no separate "doc key" table — the node IS the handle. Callers
 who want a book-id → embedding-handle mapping keep it as a
 trible attribute they own (`book_embedding` in the examples),
@@ -333,7 +333,7 @@ BM25 binds `doc` only — `matches(doc, &terms, score_floor)` is
 a single-variable filter; ranking happens in Rust via
 `idx.score(&doc, terms)` after `.collect()`. HNSW similarity
 is a binary `similar(a, b, score_floor)` relation over
-`Value<Handle<Blake3, Embedding>>` variables (see
+`Value<Handle<Embedding>>` variables (see
 `docs/QUERY_ENGINE_INTEGRATION.md`). Ordering is operational —
 callers collect the iterator and slice.
 
@@ -480,7 +480,7 @@ that references them. The HNSW blob only carries the handles
 table and the graph:
 
 - `handles`: 100 k × 32 B = **3.2 MiB** (one
-  `Value<Handle<Blake3, Embedding>>` per node, the sole
+  `Value<Handle<Embedding>>` per node, the sole
   per-node table)
 - graph `neighbours`: ~1 M directed edges (average `M`
   neighbours per node plus layer-0 fill-in with `M0 = 32`),

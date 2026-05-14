@@ -74,7 +74,7 @@ blobs.
 #### Manager-owned repository and workspace DI
 
 At runtime, prefer to give a long-lived manager (session, exporter, service)
-ownership of a `Repository<Pile<Blake3>>`. Downstream code can depend on that
+ownership of a `Repository<Pile>`. Downstream code can depend on that
 manager in one of two shapes:
 
 1. Accept a `&mut Repository<_>` and open/pull the workspace you need inside
@@ -180,7 +180,7 @@ unofficial schema. Treat any adapter as an opt-in shim that exists purely at
 integration boundaries where consumers refuse to speak tribles primitives.
 
 ```rust,ignore
-fn handle_plan_update(ws: &mut Workspace<Pile<Blake3>>, plan_id: Id) -> io::Result<()> {
+fn handle_plan_update(ws: &mut Workspace<Pile>, plan_id: Id) -> io::Result<()> {
     // ad-hoc find! calls to read the fields we need
     let checkout = ws.checkout()?;
 
@@ -207,7 +207,7 @@ struct PlanSummary<'a> {
     title: &'a str,
 }
 
-fn load_plan_summary<'a>(ws: &'a mut Workspace<Pile<Blake3>>, plan_id: Id) -> io::Result<Option<PlanSummary<'a>>> {
+fn load_plan_summary<'a>(ws: &'a mut Workspace<Pile>, plan_id: Id) -> io::Result<Option<PlanSummary<'a>>> {
     let content = ws.checkout()?;
     Ok(find!(
         (title: ShortString),
@@ -234,7 +234,7 @@ typed View API which returns a borrowed &str without copying when possible.
 ```rust,ignore
 let view = ws
     .get::<View<str>, LongString>(handle)
-    .map_err(|e| ...)?; // `handle` is a Value<Handle<Blake3, LongString>>
+    .map_err(|e| ...)?; // `handle` is a Value<Handle<LongString>>
 let s: &str = view.as_ref(); // zero-copy view tied to the workspace lifetime
 // If you need an owned String: let owned = view.to_string();
 ```

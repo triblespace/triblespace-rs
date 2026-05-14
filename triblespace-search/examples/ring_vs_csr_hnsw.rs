@@ -58,14 +58,14 @@ fn build_hnsw(
     seed: u64,
 ) -> (
     triblespace_search::testing::HNSWIndex,
-    MemoryBlobStore<Blake3>,
+    MemoryBlobStore,
 ) {
     let mut rng = Rng(seed);
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut b = HNSWBuilder::new(dim).with_seed(seed);
     for _ in 0..n {
         let vec: Vec<f32> = (0..dim).map(|_| rng.f32_pm1()).collect();
-        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, vec.clone()).unwrap();
         b.insert(h, vec).unwrap();
     }
     (b.build_naive(), store)
@@ -285,7 +285,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
     println!("\n── n = {n}   dim = {dim}   k = {k}   ef = {ef} ──");
 
     let (naive, mut store) = build_hnsw(n, dim, seed);
-    let handles: Vec<Value<Handle<Blake3, Embedding>>> = naive.handles().to_vec();
+    let handles: Vec<Value<Handle<Embedding>>> = naive.handles().to_vec();
     let entry = naive.entry_point().expect("non-empty");
     let max_level = naive.max_level();
     // Sanity: a realistic HNSW index at 10k-100k sits on

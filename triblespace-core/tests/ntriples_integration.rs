@@ -46,7 +46,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // the two distinct subject URIs (frank, dune) each appear in the facts,
     // and the URI-valued object (dune) is also tagged with its rdf_uri.
     let uri_count = find!(
-        (entity: Id, uri: Value<Handle<Blake3, LongString>>),
+        (entity: Id, uri: Value<Handle<LongString>>),
         pattern!(&facts, [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -54,7 +54,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // The integer literal lands as I256BE under an IRI-rooted attribute.
     let birthyear = Attribute::<valueschemas::I256BE>::from(entity! {
-        metadata::iri:          "http://example.org/birthyear".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
     });
     let (year,) = find!(
@@ -67,12 +67,12 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // The string literal lands as Handle<LongString>; we don't pull the blob
     // (the test would need a reader), we just verify the trible exists.
-    let firstname_attr = Attribute::<Handle<Blake3, LongString>>::from(entity! {
-        metadata::iri:          "http://example.org/firstname".to_blob().get_handle::<Blake3>(),
-        metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
+        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
+        metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
     });
     let firstname_count = find!(
-        (h: Value<Handle<Blake3, LongString>>),
+        (h: Value<Handle<LongString>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
     )
     .count();
@@ -80,7 +80,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // The URI-valued triple lands as a GenId pointing frank → dune.
     let wrote = Attribute::<valueschemas::GenId>::from(entity! {
-        metadata::iri:          "http://example.org/wrote".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://example.org/wrote".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
     });
     let link_count = find!(
@@ -111,9 +111,9 @@ fn uri_to_id_is_deterministic_across_workspaces() {
     let (facts_a, _) = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     let (facts_b, _) = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
-    let frank_attr = Attribute::<Handle<Blake3, LongString>>::from(entity! {
-        metadata::iri:          "http://example.org/firstname".to_blob().get_handle::<Blake3>(),
-        metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+    let frank_attr = Attribute::<Handle<LongString>>::from(entity! {
+        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
+        metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
     });
     let (frank_a,) = find!(
         (e: Id),
@@ -149,7 +149,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     assert_eq!(count, 4);
 
     let i_attr = Attribute::<valueschemas::I256BE>::from(entity! {
-        metadata::iri:          "http://ex/i".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/i".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
     });
     let (i_val,) = find!(
@@ -161,7 +161,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     assert_eq!(i_val, 42);
 
     let u_attr = Attribute::<valueschemas::U256BE>::from(entity! {
-        metadata::iri:          "http://ex/u".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/u".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::U256BE as MetaDescribe>::id(),
     });
     let (u_val,) = find!(
@@ -173,7 +173,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     assert_eq!(u_val, 100);
 
     let b_attr = Attribute::<valueschemas::Boolean>::from(entity! {
-        metadata::iri:          "http://ex/b".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/b".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::Boolean as MetaDescribe>::id(),
     });
     let (b_val,) = find!(
@@ -185,7 +185,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     assert!(b_val);
 
     let f_attr = Attribute::<valueschemas::F64>::from(entity! {
-        metadata::iri:          "http://ex/f".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/f".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::F64 as MetaDescribe>::id(),
     });
     let (f_val,) = find!(
@@ -221,7 +221,7 @@ fn xsd_temporal_and_binary_types() {
 
     // dateTime → NsTAIInterval [t, t]
     let born = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/born".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/born".to_blob().get_handle(),
         metadata::value_schema: <NsTAIInterval as MetaDescribe>::id(),
     });
     let born_count = find!(
@@ -233,7 +233,7 @@ fn xsd_temporal_and_binary_types() {
 
     // date → NsTAIInterval (one day)
     let lived = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/lived".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/lived".to_blob().get_handle(),
         metadata::value_schema: <NsTAIInterval as MetaDescribe>::id(),
     });
     assert_eq!(
@@ -247,7 +247,7 @@ fn xsd_temporal_and_binary_types() {
 
     // gYear / gYearMonth → NsTAIInterval
     let century = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/century".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/century".to_blob().get_handle(),
         metadata::value_schema: <NsTAIInterval as MetaDescribe>::id(),
     });
     assert_eq!(
@@ -261,7 +261,7 @@ fn xsd_temporal_and_binary_types() {
 
     // duration → NsDuration
     let lifespan = Attribute::<NsDuration>::from(entity! {
-        metadata::iri:          "http://ex/lifespan".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/lifespan".to_blob().get_handle(),
         metadata::value_schema: <NsDuration as MetaDescribe>::id(),
     });
     assert_eq!(
@@ -273,26 +273,26 @@ fn xsd_temporal_and_binary_types() {
         1
     );
 
-    // hexBinary / base64Binary → Handle<Blake3, RawBytes>
-    let checksum = Attribute::<Handle<Blake3, RawBytes>>::from(entity! {
-        metadata::iri:          "http://ex/checksum".to_blob().get_handle::<Blake3>(),
-        metadata::value_schema: <Handle<Blake3, RawBytes> as MetaDescribe>::id(),
+    // hexBinary / base64Binary → Handle<RawBytes>
+    let checksum = Attribute::<Handle<RawBytes>>::from(entity! {
+        metadata::iri:          "http://ex/checksum".to_blob().get_handle(),
+        metadata::value_schema: <Handle<RawBytes> as MetaDescribe>::id(),
     });
     assert_eq!(
         find!(
-            (h: Value<Handle<Blake3, RawBytes>>),
+            (h: Value<Handle<RawBytes>>),
             pattern!(&facts, [{ _?e @ checksum: ?h }])
         )
         .count(),
         1
     );
-    let avatar = Attribute::<Handle<Blake3, RawBytes>>::from(entity! {
-        metadata::iri:          "http://ex/avatar".to_blob().get_handle::<Blake3>(),
-        metadata::value_schema: <Handle<Blake3, RawBytes> as MetaDescribe>::id(),
+    let avatar = Attribute::<Handle<RawBytes>>::from(entity! {
+        metadata::iri:          "http://ex/avatar".to_blob().get_handle(),
+        metadata::value_schema: <Handle<RawBytes> as MetaDescribe>::id(),
     });
     assert_eq!(
         find!(
-            (h: Value<Handle<Blake3, RawBytes>>),
+            (h: Value<Handle<RawBytes>>),
             pattern!(&facts, [{ _?e @ avatar: ?h }])
         )
         .count(),
@@ -301,7 +301,7 @@ fn xsd_temporal_and_binary_types() {
 
     // anyURI → GenId via uri_to_id (same path as `<...>` objects).
     let homepage = Attribute::<valueschemas::GenId>::from(entity! {
-        metadata::iri:          "http://ex/homepage".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/homepage".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
     });
     assert_eq!(
@@ -334,7 +334,7 @@ fn lang_tagged_literals_reify_into_entities() {
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
     let label_attr = Attribute::<valueschemas::GenId>::from(entity! {
-        metadata::iri:          "http://ex/label".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/label".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
     });
 
@@ -372,7 +372,7 @@ fn lang_tagged_literals_reify_into_entities() {
 
     // The label entity also carries an `rdf_text` handle.
     let text_count = find!(
-        (e: Id, h: Value<Handle<Blake3, LongString>>),
+        (e: Id, h: Value<Handle<LongString>>),
         pattern!(&facts, [{ ?e @ rdf_text: ?h }])
     )
     .count();
@@ -400,7 +400,7 @@ _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
     let age = Attribute::<valueschemas::I256BE>::from(entity! {
-        metadata::iri:          "http://ex/age".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/age".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
     });
     let subjects: std::collections::HashSet<_> = find!(
@@ -434,12 +434,12 @@ _:b1 <http://ex/q> "x" .
     assert_eq!(count, 2);
 
     let p = Attribute::<valueschemas::GenId>::from(entity! {
-        metadata::iri:          "http://ex/p".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/p".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
     });
-    let q = Attribute::<Handle<Blake3, LongString>>::from(entity! {
-        metadata::iri:          "http://ex/q".to_blob().get_handle::<Blake3>(),
-        metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+    let q = Attribute::<Handle<LongString>>::from(entity! {
+        metadata::iri:          "http://ex/q".to_blob().get_handle(),
+        metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
     });
 
     let (target,) = find!(
@@ -451,7 +451,7 @@ _:b1 <http://ex/q> "x" .
 
     // The same id appears as the subject of the bnode's outgoing fact.
     let outgoing_count = find!(
-        (h: Value<Handle<Blake3, LongString>>),
+        (h: Value<Handle<LongString>>),
         pattern!(&facts, [{ target @ q: ?h }])
     )
     .count();
@@ -502,7 +502,7 @@ fn orphan_bnode_skolemizes_per_import() {
         ingest_ntriples(&mut ws_b, Cursor::new(&data[..])).expect("clean ntriples");
 
     let p = Attribute::<valueschemas::GenId>::from(entity! {
-        metadata::iri:          "http://ex/p".to_blob().get_handle::<Blake3>(),
+        metadata::iri:          "http://ex/p".to_blob().get_handle(),
         metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
     });
     let (id_a,) = find!(

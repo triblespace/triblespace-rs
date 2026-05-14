@@ -39,13 +39,13 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
     let original = b.build();
 
     // Put → handle.
-    let mut store = MemoryBlobStore::<triblespace_core::value::schemas::hash::Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let handle = store
         .put::<SuccinctBM25Blob, _>(&original)
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader = <MemoryBlobStore<_> as triblespace_core::repo::BlobStore<_>>::reader(&mut store)
+    let reader = <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store)
         .expect("reader");
     let reloaded: SuccinctBM25Index = reader
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
@@ -80,13 +80,13 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     use triblespace_search::schemas::put_embedding;
 
     // Build a small HNSW index.
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut b = HNSWBuilder::new(4).with_seed(9);
     let mut handles = Vec::new();
     for i in 1..=12u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         b.insert(h, v).unwrap();
         handles.push(h);
     }
@@ -99,7 +99,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view, then attach the reader for queries.
-    let reader = <MemoryBlobStore<_> as triblespace_core::repo::BlobStore<_>>::reader(&mut store)
+    let reader = <MemoryBlobStore as triblespace_core::repo::BlobStore>::reader(&mut store)
         .expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
@@ -117,14 +117,14 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     let probe = handles[0];
     let original_view = original.attach(&reader);
     let reloaded_view = reloaded.attach(&reader);
-    let a: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+    let a: HashSet<Value<Handle<Embedding>>> = find!(
+        (n: Value<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
     .collect();
-    let r: HashSet<Value<Handle<Blake3, Embedding>>> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+    let r: HashSet<Value<Handle<Embedding>>> = find!(
+        (n: Value<Handle<Embedding>>),
         reloaded_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
@@ -153,11 +153,11 @@ fn hnsw_indexes_share_embedding_blobs() {
     // seed, neighbour lists), but the stored handles must be
     // identical — content-addressing is deterministic on
     // normalized bytes.
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
 
     let mut a_b = HNSWBuilder::new(4).with_seed(1);
     for v in &vecs {
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         a_b.insert(h, v.clone()).unwrap();
     }
     // `build_naive()` so the test can inspect `handles()[i]`
@@ -167,7 +167,7 @@ fn hnsw_indexes_share_embedding_blobs() {
 
     let mut b_b = HNSWBuilder::new(4).with_seed(99); // different seed!
     for v in &vecs {
-        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
         b_b.insert(h, v.clone()).unwrap();
     }
     let idx_b = b_b.build_naive();
@@ -201,13 +201,13 @@ fn hnsw_indexes_share_embedding_blobs() {
     let view_a = idx_a.attach(&reader);
     let view_b = idx_b.attach(&reader);
     let hits_a: Vec<_> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+        (n: Value<Handle<Embedding>>),
         view_a.similar_to(probe, n, 0.99)
     )
     .map(|(h,)| h)
     .collect();
     let hits_b: Vec<_> = find!(
-        (n: Value<Handle<Blake3, Embedding>>),
+        (n: Value<Handle<Embedding>>),
         view_b.similar_to(probe, n, 0.99)
     )
     .map(|(h,)| h)

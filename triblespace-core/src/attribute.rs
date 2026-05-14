@@ -15,13 +15,13 @@
 //! ```ignore
 //! // Display-name origin (JSON fields, config keys, column headers):
 //! Attribute::<S>::from(entity! {
-//!     metadata::name:         name.to_blob().get_handle::<Blake3>(),
+//!     metadata::name:         name.to_blob().get_handle(),
 //!     metadata::value_schema: <S as MetaDescribe>::id(),
 //! })
 //!
 //! // RDF / JSON-LD predicate (IRI as canonical identifier):
 //! Attribute::<S>::from(entity! {
-//!     metadata::iri:          iri.to_blob().get_handle::<Blake3>(),
+//!     metadata::iri:          iri.to_blob().get_handle(),
 //!     metadata::value_schema: <S as MetaDescribe>::id(),
 //! })
 //!
@@ -165,8 +165,8 @@ mod tests {
 
     #[test]
     fn dynamic_field_is_deterministic() {
-        let h1 = "title".to_blob().get_handle::<Blake3>();
-        let h2 = "title".to_blob().get_handle::<Blake3>();
+        let h1 = "title".to_blob().get_handle();
+        let h2 = "title".to_blob().get_handle();
         let a1 = Attribute::<ShortString>::from(entity! {
             metadata::name:         h1,
             metadata::value_schema: <ShortString as MetaDescribe>::id(),
@@ -182,8 +182,8 @@ mod tests {
 
     #[test]
     fn dynamic_field_changes_with_name() {
-        let h_title = "title".to_blob().get_handle::<Blake3>();
-        let h_author = "author".to_blob().get_handle::<Blake3>();
+        let h_title = "title".to_blob().get_handle();
+        let h_author = "author".to_blob().get_handle();
         let title = Attribute::<ShortString>::from(entity! {
             metadata::name:         h_title,
             metadata::value_schema: <ShortString as MetaDescribe>::id(),
@@ -198,14 +198,14 @@ mod tests {
 
     #[test]
     fn dynamic_field_changes_with_schema() {
-        let h = "title".to_blob().get_handle::<Blake3>();
+        let h = "title".to_blob().get_handle();
         let short = Attribute::<ShortString>::from(entity! {
             metadata::name:         h,
             metadata::value_schema: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<Blake3, LongString>>::from(entity! {
+        let handle = Attribute::<Handle<LongString>>::from(entity! {
             metadata::name:         h,
-            metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+            metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
         });
 
         assert_ne!(short.raw(), handle.raw());
@@ -216,7 +216,7 @@ mod tests {
         use crate::blob::schemas::iri::IRI;
 
         let iri = "http://example.org/foo";
-        let iri_handle: Value<Handle<Blake3, IRI>> = iri.to_blob().get_handle::<Blake3>();
+        let iri_handle: Value<Handle<IRI>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
             metadata::value_schema: <ShortString as crate::metadata::MetaDescribe>::id(),

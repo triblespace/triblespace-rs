@@ -6,32 +6,29 @@ use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
 use crate::repo::BlobStoreGet;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
 const DEFAULT_BLOB_CACHE_CAPACITY: usize = 256;
 
 /// Lazy cache for blob conversions keyed by blob handle.
-pub struct BlobCache<B, H, S, T>
+pub struct BlobCache<B, S, T>
 where
-    B: BlobStoreGet<H>,
-    H: HashProtocol,
+    B: BlobStoreGet,
     S: BlobSchema + 'static,
     T: TryFromBlob<S>,
-    Handle<H, S>: ValueSchema,
+    Handle<S>: ValueSchema,
 {
     blobs: B,
-    by_handle: Cache<Value<Handle<H, S>>, Arc<T>>,
+    by_handle: Cache<Value<Handle<S>>, Arc<T>>,
 }
 
-impl<B, H, S, T> BlobCache<B, H, S, T>
+impl<B, S, T> BlobCache<B, S, T>
 where
-    B: BlobStoreGet<H>,
-    H: HashProtocol,
+    B: BlobStoreGet,
     S: BlobSchema + 'static,
     T: TryFromBlob<S>,
-    Handle<H, S>: ValueSchema,
+    Handle<S>: ValueSchema,
 {
     /// Creates a new cache backed by `blobs` with the default capacity.
     pub fn new(blobs: B) -> Self {
@@ -47,7 +44,7 @@ where
     }
 
     /// Returns the cached value for `handle`, fetching and converting it on a cache miss.
-    pub fn get(&self, handle: Value<Handle<H, S>>) -> Result<Arc<T>, B::GetError<T::Error>> {
+    pub fn get(&self, handle: Value<Handle<S>>) -> Result<Arc<T>, B::GetError<T::Error>> {
         let blobs = &self.blobs;
         self.by_handle.get_or_insert_with(&handle, || {
             let value = blobs.get::<T, S>(handle)?;

@@ -21,8 +21,7 @@ use triblespace_core::value::schemas::hash::{Blake3, Handle};
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000010" as pub note: valueschemas::Handle<
-            valueschemas::Blake3, blobschemas::LongString>;
+        "DD00000000000000DD00000000000010" as pub note: valueschemas::Handle<blobschemas::LongString>;
     }
 }
 
@@ -90,7 +89,7 @@ fn commit_tribleset_auto_promotes() {
     let e = rngid();
     // Put the blob via the workspace's staged store the old way,
     // pass a bare TribleSet to commit.
-    let h: triblespace_core::value::Value<Handle<Blake3, LongString>> =
+    let h: triblespace_core::value::Value<Handle<LongString>> =
         ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
     ws.commit(data, "tribleset commit");

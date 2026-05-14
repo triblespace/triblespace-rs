@@ -28,7 +28,7 @@ use crate::trible::{Fragment, Trible, TribleSet};
 use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
+use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::UnknownValue;
 use crate::value::{RawValue, ToValue, Value, ValueSchema};
 
@@ -135,25 +135,22 @@ type ParsedString = View<str>;
 ///
 /// Use [`crate::import::json_tree::JsonTreeImporter`] when you need a lossless
 /// representation of arbitrary JSON values (including primitive roots).
-pub struct JsonObjectImporter<'a, Store, Hasher = Blake3>
+pub struct JsonObjectImporter<'a, Store>
 where
-    Store: BlobStore<Blake3>,
-    Hasher: HashProtocol,
+    Store: BlobStore,
 {
     store: &'a mut Store,
     bool_attrs: HashMap<View<str>, Attribute<Boolean>>,
     num_attrs: HashMap<View<str>, Attribute<F64>>,
-    str_attrs: HashMap<View<str>, Attribute<Handle<Blake3, LongString>>>,
+    str_attrs: HashMap<View<str>, Attribute<Handle<LongString>>>,
     genid_attrs: HashMap<View<str>, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
-    _hasher: PhantomData<Hasher>,
     array_fields: HashSet<View<str>>,
 }
 
-impl<'a, Store, Hasher> JsonObjectImporter<'a, Store, Hasher>
+impl<'a, Store> JsonObjectImporter<'a, Store>
 where
-    Store: BlobStore<Blake3>,
-    Hasher: HashProtocol,
+    Store: BlobStore,
 {
     fn attr_from_field<S: ValueSchema + MetaDescribe>(
         &mut self,
@@ -198,12 +195,12 @@ where
     fn str_attr(
         &mut self,
         field: &ParsedString,
-    ) -> Result<Attribute<Handle<Blake3, LongString>>, JsonImportError> {
+    ) -> Result<Attribute<Handle<LongString>>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.str_attrs.get(&key) {
             return Ok(attr.clone());
         }
-        let attr = self.attr_from_field::<Handle<Blake3, LongString>>(field)?;
+        let attr = self.attr_from_field::<Handle<LongString>>(field)?;
         self.str_attrs.insert(key, attr.clone());
         Ok(attr)
     }
@@ -230,9 +227,7 @@ where
             num_attrs: HashMap::new(),
             str_attrs: HashMap::new(),
             genid_attrs: HashMap::new(),
-            id_salt,
-            _hasher: PhantomData,
-            array_fields: HashSet::new(),
+            id_salt,            array_fields: HashSet::new(),
         }
     }
 
@@ -395,7 +390,7 @@ where
                 let text = self.parse_string(bytes)?;
                 let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
-                let handle: Value<Handle<Blake3, LongString>> = self
+                let handle: Value<Handle<LongString>> = self
                     .store
                     .put(text)
                     .map_err(|err| JsonImportError::EncodeString {
@@ -444,7 +439,7 @@ where
         sorted
             .sort_by(|(a_attr, a_val), (b_attr, b_val)| a_attr.cmp(b_attr).then(a_val.cmp(b_val)));
 
-        let mut hasher = Hasher::new();
+        let mut hasher = Blake3::new();
         if let Some(salt) = self.id_salt {
             hasher.update(salt.as_ref());
         }
@@ -496,7 +491,7 @@ where
         meta += <Boolean as MetaDescribe>::describe();
         meta += <F64 as MetaDescribe>::describe();
         meta += <GenId as MetaDescribe>::describe();
-        meta += <Handle<Blake3, LongString> as MetaDescribe>::describe();
+        meta += <Handle<LongString> as MetaDescribe>::describe();
         for (key, attr) in self.bool_attrs.iter() {
             meta += attr.describe();
             if self.array_fields.contains(key) {
@@ -675,8 +670,8 @@ mod tests {
     #[test]
     fn deterministic_imports_simple_object() {
         let input = r#"{ "title": "Dune", "pages": 412 }"#;
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
         let fragment = importer.import_blob(input.to_blob()).unwrap();
         let roots = fragment.exports().collect::<Vec<_>>();
         assert_eq!(roots.len(), 1);
@@ -687,27 +682,27 @@ mod tests {
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {
         use crate::blob::ToBlob;
         use crate::metadata::MetaDescribe;
-        let h: Value<Handle<Blake3, LongString>> = String::from(expected_attr)
+        let h: Value<Handle<LongString>> = String::from(expected_attr)
             .to_blob()
-            .get_handle::<Blake3>();
-        let attr = Attribute::<Handle<Blake3, LongString>>::from(crate::macros::entity! {
+            .get_handle();
+        let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
             metadata::name:         h,
-            metadata::value_schema: <Handle<Blake3, LongString> as MetaDescribe>::id(),
+            metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
         })
         .id();
         let trible = facts
             .iter()
             .find(|t| *t.a() == attr)
             .expect("missing string trible");
-        trible.v::<Handle<Blake3, LongString>>().raw
+        trible.v::<Handle<LongString>>().raw
     }
 
-    fn read_text(blobs: &mut MemoryBlobStore<Blake3>, handle_raw: RawValue) -> String {
+    fn read_text(blobs: &mut MemoryBlobStore, handle_raw: RawValue) -> String {
         let entries: Vec<_> = blobs.reader().unwrap().into_iter().collect();
         let (_, blob) = entries
             .iter()
             .find(|(h, _)| {
-                let h: Value<Handle<Blake3, LongString>> = (*h).transmute();
+                let h: Value<Handle<LongString>> = (*h).transmute();
                 h.raw == handle_raw
             })
             .expect("handle not found in blob store");
@@ -723,8 +718,8 @@ mod tests {
     #[test]
     fn parses_escaped_string() {
         let input = r#"{ "text": "hello\nworld" }"#;
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
         let fragment = importer.import_blob(input.to_blob()).unwrap();
         let handle = extract_handle_raw(fragment.facts(), "text");
         drop(importer);
@@ -735,8 +730,8 @@ mod tests {
     #[test]
     fn parses_unicode_escape() {
         let input = r#"{ "text": "smile: \u263A" }"#;
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
         let fragment = importer.import_blob(input.to_blob()).unwrap();
         let handle = extract_handle_raw(fragment.facts(), "text");
         drop(importer);

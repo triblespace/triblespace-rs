@@ -47,10 +47,10 @@ use rand::rngs::OsRng;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 
 // Build a BlobStore and fill it with some data.
-let mut memory_store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
+let mut memory_store: MemoryBlobStore = MemoryBlobStore::new();
 
 let book_author_id = fucid();
-let quote_a: Value<Handle<Blake3, LongString>> = memory_store
+let quote_a: Value<Handle<LongString>> = memory_store
     .put("Deep in the human unconscious is a pervasive need for a logical universe that makes sense. But the real universe is always one step beyond logic.")
     .unwrap();
 let quote_b = memory_store
@@ -66,7 +66,7 @@ let set = entity!{
 
 // Serialize the TribleSet and store it as another blob. The resulting
 // handle points to the archived bytes and keeps track of its schema.
-let archived_set_handle: Value<Handle<Blake3, SimpleArchive>> = memory_store.put(&set).unwrap();
+let archived_set_handle: Value<Handle<SimpleArchive>> = memory_store.put(&set).unwrap();
 
 let mut csprng = OsRng;
 let commit_author_key: SigningKey = SigningKey::generate(&mut csprng);

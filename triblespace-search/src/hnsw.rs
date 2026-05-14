@@ -19,10 +19,10 @@
 //! # use triblespace_core::value::schemas::hash::Blake3;
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace_search::schemas::put_embedding;
-//! let mut store = MemoryBlobStore::<Blake3>::new();
-//! let h1 = put_embedding::<_, Blake3>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-//! let h2 = put_embedding::<_, Blake3>(&mut store, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
-//! let h3 = put_embedding::<_, Blake3>(&mut store, vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+//! let mut store = MemoryBlobStore::new();
+//! let h1 = put_embedding::<_>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+//! let h2 = put_embedding::<_>(&mut store, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+//! let h3 = put_embedding::<_>(&mut store, vec![0.9, 0.1, 0.0, 0.0]).unwrap();
 //!
 //! let mut b = FlatBuilder::new(4);
 //! b.insert(h1);
@@ -105,7 +105,7 @@ pub struct HNSWBuilder {
     /// any caller-supplied doc key — the mapping from a caller's
     /// document to an embedding is a trible the caller owns, not
     /// something the index duplicates.
-    handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    handles: Vec<Value<Handle<Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -201,7 +201,7 @@ impl HNSWBuilder {
     /// [`put_embedding`]: crate::schemas::put_embedding
     pub fn insert(
         &mut self,
-        handle: Value<Handle<Blake3, Embedding>>,
+        handle: Value<Handle<Embedding>>,
         mut vec: Vec<f32>,
     ) -> Result<(), DimMismatch> {
         if vec.len() != self.dim {
@@ -446,7 +446,7 @@ pub struct HNSWIndex {
     /// index doesn't know or care about any caller-level doc
     /// identity. The caller's doc-to-embedding mapping lives
     /// as tribles in the pile.
-    handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    handles: Vec<Value<Handle<Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -501,7 +501,7 @@ impl HNSWIndex {
     /// The stored embedding-handle table. `handles()[i]` is the
     /// content-addressed pointer to the embedding blob for node
     /// `i`.
-    pub fn handles(&self) -> &[Value<Handle<Blake3, Embedding>>] {
+    pub fn handles(&self) -> &[Value<Handle<Embedding>>] {
         &self.handles
     }
 
@@ -513,14 +513,14 @@ impl HNSWIndex {
 
     /// Attach a blob store to this index, returning a queryable
     /// view. The view owns a [`BlobCache`][c] over the store,
-    /// keyed on `Handle<Blake3, Embedding>`, so repeat visits
+    /// keyed on `Handle<Embedding>`, so repeat visits
     /// to the same node during graph walks deserialize each
     /// embedding at most once per view lifetime.
     ///
     /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedHNSWIndex<'a, B>
     where
-        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet + Clone,
     {
         AttachedHNSWIndex {
             index: self,
@@ -564,16 +564,16 @@ impl HNSWIndex {
 #[doc(hidden)]
 pub struct AttachedHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     index: &'a HNSWIndex,
-    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Embedding, anybytes::View<[f32]>>,
     ef_search: usize,
 }
 
 impl<'a, B> AttachedHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     /// The inner index (back-reference for metadata queries).
     pub fn index(&self) -> &HNSWIndex {
@@ -590,7 +590,7 @@ where
 
     /// Build a symmetric similarity constraint over two handle
     /// variables, gated by a fixed cosine `score_floor`. Both
-    /// variables bind to `Handle<Blake3, Embedding>` values —
+    /// variables bind to `Handle<Embedding>` values —
     /// callers typically get `a` from a trible pattern
     /// (e.g. "embedding attached to this doc") and leave `b`
     /// free for the engine to enumerate via the HNSW walk. See
@@ -868,7 +868,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[doc(hidden)]
 pub struct FlatBuilder {
     dim: usize,
-    handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    handles: Vec<Value<Handle<Embedding>>>,
 }
 
 impl FlatBuilder {
@@ -892,7 +892,7 @@ impl FlatBuilder {
     ///
     /// Use [`crate::schemas::put_embedding`] to put + normalize
     /// + get a handle in one step.
-    pub fn insert(&mut self, handle: Value<Handle<Blake3, Embedding>>) {
+    pub fn insert(&mut self, handle: Value<Handle<Embedding>>) {
         self.handles.push(handle);
     }
 
@@ -938,7 +938,7 @@ impl FlatBuilder {
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
-    handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    handles: Vec<Value<Handle<Embedding>>>,
 }
 
 impl FlatIndex {
@@ -954,7 +954,7 @@ impl FlatIndex {
 
     /// The stored embedding-handle table. `handles()[i]` is the
     /// content-addressed pointer to the embedding blob.
-    pub fn handles(&self) -> &[Value<Handle<Blake3, Embedding>>] {
+    pub fn handles(&self) -> &[Value<Handle<Embedding>>] {
         &self.handles
     }
 
@@ -962,14 +962,14 @@ impl FlatIndex {
     /// view.
     ///
     /// The view wraps `store` in an internal
-    /// [`BlobCache`][c] keyed on `Handle<Blake3, Embedding>`.
+    /// [`BlobCache`][c] keyed on `Handle<Embedding>`.
     /// `B: Clone` so the cache can own the store; typical
     /// readers are cheap-clone.
     ///
     /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedFlatIndex<'a, B>
     where
-        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet + Clone,
     {
         AttachedFlatIndex {
             index: self,
@@ -989,15 +989,15 @@ impl FlatIndex {
 #[doc(hidden)]
 pub struct AttachedFlatIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     index: &'a FlatIndex,
-    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Embedding, anybytes::View<[f32]>>,
 }
 
 impl<'a, B> AttachedFlatIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     /// The inner index.
     pub fn index(&self) -> &FlatIndex {
@@ -1085,20 +1085,20 @@ impl FlatIndex {
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     fn neighbours_above(
         &self,
-        from: Value<Handle<Blake3, Embedding>>,
+        from: Value<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Blake3, Embedding>>> {
+    ) -> Vec<Value<Handle<Embedding>>> {
         self.candidates_above(from, score_floor).unwrap_or_default()
     }
 
     fn cosine_between(
         &self,
-        a: Value<Handle<Blake3, Embedding>>,
-        b: Value<Handle<Blake3, Embedding>>,
+        a: Value<Handle<Embedding>>,
+        b: Value<Handle<Embedding>>,
     ) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
@@ -1113,20 +1113,20 @@ where
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedFlatIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     fn neighbours_above(
         &self,
-        from: Value<Handle<Blake3, Embedding>>,
+        from: Value<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Blake3, Embedding>>> {
+    ) -> Vec<Value<Handle<Embedding>>> {
         self.candidates_above(from, score_floor).unwrap_or_default()
     }
 
     fn cosine_between(
         &self,
-        a: Value<Handle<Blake3, Embedding>>,
-        b: Value<Handle<Blake3, Embedding>>,
+        a: Value<Handle<Embedding>>,
+        b: Value<Handle<Embedding>>,
     ) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
@@ -1150,10 +1150,10 @@ mod tests {
     /// Put `vec` into `store` as a normalized [`Embedding`] blob
     /// and return the handle.
     fn put_emb(
-        store: &mut MemoryBlobStore<Blake3>,
+        store: &mut MemoryBlobStore,
         vec: Vec<f32>,
-    ) -> Value<Handle<Blake3, Embedding>> {
-        crate::schemas::put_embedding::<_, Blake3>(store, vec).unwrap()
+    ) -> Value<Handle<Embedding>> {
+        crate::schemas::put_embedding::<_>(store, vec).unwrap()
     }
 
     /// Build a [`FlatIndex`] from raw vectors. Returns the index,
@@ -1164,10 +1164,10 @@ mod tests {
         vecs: &[Vec<f32>],
     ) -> (
         FlatIndex,
-        MemoryBlobStore<Blake3>,
-        Vec<Value<Handle<Blake3, Embedding>>>,
+        MemoryBlobStore,
+        Vec<Value<Handle<Embedding>>>,
     ) {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = FlatBuilder::new(dim);
         let mut handles = Vec::with_capacity(vecs.len());
         for v in vecs {
@@ -1181,8 +1181,8 @@ mod tests {
     /// Stable reader from an existing store — the writer must
     /// live for the reader to remain valid.
     fn reader_of(
-        store: &mut MemoryBlobStore<Blake3>,
-    ) -> <MemoryBlobStore<Blake3> as BlobStore<Blake3>>::Reader {
+        store: &mut MemoryBlobStore,
+    ) -> <MemoryBlobStore as BlobStore>::Reader {
         store.reader().unwrap()
     }
 
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn flat_empty_index_has_no_candidates() {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let idx = FlatBuilder::new(4).build();
         let probe = put_emb(&mut store, vec![1.0, 0.0, 0.0, 0.0]);
         let reader = store.reader().unwrap();
@@ -1246,8 +1246,8 @@ mod tests {
 
     fn sample_flat() -> (
         FlatIndex,
-        MemoryBlobStore<Blake3>,
-        Vec<Value<Handle<Blake3, Embedding>>>,
+        MemoryBlobStore,
+        Vec<Value<Handle<Embedding>>>,
     ) {
         build_flat(
             3,
@@ -1275,10 +1275,10 @@ mod tests {
         vecs: &[Vec<f32>],
     ) -> (
         crate::succinct::SuccinctHNSWIndex,
-        MemoryBlobStore<Blake3>,
-        Vec<Value<Handle<Blake3, Embedding>>>,
+        MemoryBlobStore,
+        Vec<Value<Handle<Embedding>>>,
     ) {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(dim).with_seed(seed);
         let mut handles = Vec::with_capacity(vecs.len());
         for v in vecs {
@@ -1291,7 +1291,7 @@ mod tests {
 
     #[test]
     fn hnsw_empty_index_has_no_candidates() {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let idx = HNSWBuilder::new(4).build();
         assert_eq!(idx.doc_count(), 0);
         let probe = put_emb(&mut store, vec![1.0, 0.0, 0.0, 0.0]);
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn hnsw_dim_mismatch_rejected_at_insert() {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(3);
         let h = put_emb(&mut store, vec![1.0, 0.0]);
         let err = b.insert(h, vec![1.0, 0.0]).unwrap_err();
@@ -1419,10 +1419,10 @@ mod tests {
 
     fn sample_hnsw() -> (
         HNSWIndex,
-        MemoryBlobStore<Blake3>,
-        Vec<Value<Handle<Blake3, Embedding>>>,
+        MemoryBlobStore,
+        Vec<Value<Handle<Embedding>>>,
     ) {
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(3).with_seed(42);
         let vecs = [
             vec![1.0f32, 0.0, 0.0],
@@ -1451,7 +1451,7 @@ mod tests {
             vec![0.0, 0.0, 1.0],
             vec![0.2, 0.3, 0.5],
         ];
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(3).with_seed(19);
         for v in &vecs {
             let h = put_emb(&mut store, v.clone());

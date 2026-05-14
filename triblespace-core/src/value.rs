@@ -401,7 +401,7 @@ pub trait TryToValue<S: ValueSchema> {
 /// their bytes deposited somewhere too. Every `ToValue<S>` impl
 /// composes into `IntoFieldValue<S>` via the blanket below; the only
 /// case that needs explicit handling is `Blob<T>` targeting
-/// `Handle<H, T>`, where the bytes need to come along.
+/// `Handle<T>`, where the bytes need to come along.
 pub trait IntoFieldValue<S: ValueSchema> {
     /// Produce the `(value, optional-bytes)` pair for this field.
     /// The bytes (if any) are content-addressed under the same hash

@@ -125,13 +125,13 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     struct ExportFixture {
         merged: TribleSet,
         roots: Vec<Id>,
-        reader: <MemoryBlobStore<Blake3> as BlobStore<Blake3>>::Reader,
+        reader: <MemoryBlobStore as BlobStore<Blake3>>::Reader,
         payload_len: usize,
-        _blobs: MemoryBlobStore<Blake3>,
+        _blobs: MemoryBlobStore,
     }
 
     let export_fixture = {
-        let mut blobs = MemoryBlobStore::<Blake3>::new();
+        let mut blobs = MemoryBlobStore::new();
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
         let fragment = importer
             .import_blob(import_blob.clone())
@@ -154,7 +154,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     group.bench_function(BenchmarkId::new("parse", FIXTURE_NAME), |b| {
         let blob = import_blob.clone();
         b.iter(|| {
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut blobs = MemoryBlobStore::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())
@@ -167,7 +167,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     group.bench_function(BenchmarkId::new("parse_simplearchive", FIXTURE_NAME), |b| {
         let blob = import_blob.clone();
         b.iter(|| {
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut blobs = MemoryBlobStore::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())
@@ -180,7 +180,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     group.bench_function(BenchmarkId::new("json_roundtrip", FIXTURE_NAME), |b| {
         let blob = import_blob.clone();
         b.iter(|| {
-            let mut blobs = MemoryBlobStore::<Blake3>::new();
+            let mut blobs = MemoryBlobStore::new();
             let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())

@@ -141,7 +141,7 @@ pub trait StorageClose {
 // Convenience impl for repositories whose storage supports explicit close.
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore<Blake3> + BranchStore<Blake3> + StorageClose,
+    Storage: BlobStore + BranchStore + StorageClose,
 {
     /// Close the repository's underlying storage if it supports explicit
     /// close operations.
@@ -182,7 +182,6 @@ use crate::prelude::valueschemas::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use crate::value::VALUE_LEN;
@@ -198,17 +197,17 @@ use crate::value::schemas::shortstring::ShortString;
 
 attributes! {
     /// The actual data of the commit.
-    "4DD4DDD05CC31734B03ABB4E43188B1F" as pub content: Handle<Blake3, SimpleArchive>;
+    "4DD4DDD05CC31734B03ABB4E43188B1F" as pub content: Handle<SimpleArchive>;
     /// Metadata describing the commit content.
-    "88B59BD497540AC5AECDB7518E737C87" as pub metadata: Handle<Blake3, SimpleArchive>;
+    "88B59BD497540AC5AECDB7518E737C87" as pub metadata: Handle<SimpleArchive>;
     /// A commit that this commit is based on.
-    "317044B612C690000D798CA660ECFD2A" as pub parent: Handle<Blake3, SimpleArchive>;
+    "317044B612C690000D798CA660ECFD2A" as pub parent: Handle<SimpleArchive>;
     /// A (potentially long) message describing the commit.
-    "B59D147839100B6ED4B165DF76EDF3BB" as pub message: Handle<Blake3, LongString>;
+    "B59D147839100B6ED4B165DF76EDF3BB" as pub message: Handle<LongString>;
     /// A short message describing the commit.
     "12290C0BE0E9207E324F24DDE0D89300" as pub short_message: ShortString;
     /// The hash of the first commit in the commit chain of the branch.
-    "272FBC56108F336C4D2E17289468C35F" as pub head: Handle<Blake3, SimpleArchive>;
+    "272FBC56108F336C4D2E17289468C35F" as pub head: Handle<SimpleArchive>;
     /// An id used to track the branch.
     "8694CC73AF96A5E1C7635C677D1B928A" as pub branch: GenId;
     /// The author of the signature identified by their ed25519 public key.
@@ -225,13 +224,13 @@ attributes! {
     /// Absent on branches that haven't had a rollup built yet. Soft state:
     /// the rollup is redundant with (and must agree with) whatever
     /// `ws.checkout(..)` would return for the same HEAD.
-    "D7D14C6737AA27A51E1E08D380D13EF9" as pub rollup: Handle<Blake3, SuccinctArchiveBlob>;
+    "D7D14C6737AA27A51E1E08D380D13EF9" as pub rollup: Handle<SuccinctArchiveBlob>;
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
-pub trait BlobStoreList<H: HashProtocol> {
+pub trait BlobStoreList {
     /// Iterator over blob handles in the store.
-    type Iter<'a>: Iterator<Item = Result<Value<Handle<H, UnknownBlob>>, Self::Err>>
+    type Iter<'a>: Iterator<Item = Result<Value<Handle<UnknownBlob>>, Self::Err>>
     where
         Self: 'a;
     /// Error type for listing operations.
@@ -268,7 +267,7 @@ pub struct BlobMetadata {
 }
 
 /// Trait exposing metadata lookup for blobs available in a repository reader.
-pub trait BlobStoreMeta<H: HashProtocol> {
+pub trait BlobStoreMeta {
     /// Error type returned by metadata calls.
     type MetaError: std::error::Error + Send + Sync + 'static;
 
@@ -276,30 +275,30 @@ pub trait BlobStoreMeta<H: HashProtocol> {
     /// the blob is not present.
     fn metadata<S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<Option<BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<H, S>: ValueSchema;
+        Handle<S>: ValueSchema;
 }
 
 /// Trait exposing a monotonic "forget" operation.
 ///
 /// Forget is idempotent and monotonic: it removes materialization from a
 /// particular repository but does not semantically delete derived facts.
-pub trait BlobStoreForget<H: HashProtocol> {
+pub trait BlobStoreForget {
     /// Error type for forget operations.
     type ForgetError: std::error::Error + Send + Sync + 'static;
 
     /// Removes the materialized blob identified by `handle` from this store.
-    fn forget<S>(&mut self, handle: Value<Handle<H, S>>) -> Result<(), Self::ForgetError>
+    fn forget<S>(&mut self, handle: Value<Handle<S>>) -> Result<(), Self::ForgetError>
     where
         S: BlobSchema + 'static,
-        Handle<H, S>: ValueSchema;
+        Handle<S>: ValueSchema;
 }
 
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
-pub trait BlobStoreGet<H: HashProtocol> {
+pub trait BlobStoreGet {
     /// Error type for get operations, parameterised by the deserialization error.
     type GetError<E: std::error::Error + Send + Sync + 'static>: Error + Send + Sync + 'static;
 
@@ -313,34 +312,34 @@ pub trait BlobStoreGet<H: HashProtocol> {
     /// The error type is specified by the `Err` associated type.
     fn get<T, S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<H, S>: ValueSchema;
+        Handle<S>: ValueSchema;
 }
 
 /// The `PutBlob` trait is used to store blobs in a repository.
-pub trait BlobStorePut<H: HashProtocol> {
+pub trait BlobStorePut {
     /// Error type for put operations.
     type PutError: Error + Debug + Send + Sync + 'static;
 
     /// Serialises `item` as a blob, stores it, and returns its handle.
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<H, S>: ValueSchema;
+        Handle<S>: ValueSchema;
 }
 
 /// Combined read/write blob storage.
 ///
 /// Extends [`BlobStorePut`] with the ability to create a shareable
 /// [`Reader`](BlobStore::Reader) snapshot for concurrent reads.
-pub trait BlobStore<H: HashProtocol>: BlobStorePut<H> {
+pub trait BlobStore: BlobStorePut {
     /// A clonable reader handle for concurrent blob lookups.
-    type Reader: BlobStoreGet<H> + BlobStoreList<H> + Clone + Send + PartialEq + Eq + 'static;
+    type Reader: BlobStoreGet + BlobStoreList + Clone + Send + PartialEq + Eq + 'static;
     /// Error type for creating a reader.
     type ReaderError: Error + Debug + Send + Sync + 'static;
     /// Creates a shareable reader snapshot of the current store state.
@@ -348,11 +347,11 @@ pub trait BlobStore<H: HashProtocol>: BlobStorePut<H> {
 }
 
 /// Trait for blob stores that can retain a supplied set of handles.
-pub trait BlobStoreKeep<H: HashProtocol> {
+pub trait BlobStoreKeep {
     /// Retain only the blobs identified by `handles`.
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>;
+        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>;
 }
 
 /// Trait for stores that can enumerate a blob's child references.
@@ -364,12 +363,12 @@ pub trait BlobStoreKeep<H: HashProtocol> {
 /// 32-byte chunk with [`BlobStoreGet::get`]. Backends with batch
 /// capabilities (e.g. a network store with a SYNC protocol) can
 /// override this for efficiency.
-pub trait BlobChildren<H: HashProtocol>: BlobStoreGet<H> {
+pub trait BlobChildren: BlobStoreGet {
     /// Return handles of blobs referenced by `handle` that exist in this store.
     fn children(
         &self,
-        handle: Value<Handle<H, UnknownBlob>>,
-    ) -> Vec<Value<Handle<H, UnknownBlob>>> {
+        handle: Value<Handle<UnknownBlob>>,
+    ) -> Vec<Value<Handle<UnknownBlob>>> {
         let Ok(blob) = self.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
             return Vec::new();
         };
@@ -379,7 +378,7 @@ pub trait BlobChildren<H: HashProtocol>: BlobStoreGet<H> {
         while offset + VALUE_LEN <= bytes.len() {
             let mut raw = [0u8; VALUE_LEN];
             raw.copy_from_slice(&bytes[offset..offset + VALUE_LEN]);
-            let candidate = Value::<Handle<H, UnknownBlob>>::new(raw);
+            let candidate = Value::<Handle<UnknownBlob>>::new(raw);
             if self.get::<anybytes::Bytes, UnknownBlob>(candidate).is_ok() {
                 result.push(candidate);
             }
@@ -395,15 +394,12 @@ pub trait BlobChildren<H: HashProtocol>: BlobStoreGet<H> {
 
 /// Outcome of a compare-and-swap branch update.
 #[derive(Debug)]
-pub enum PushResult<H>
-where
-    H: HashProtocol,
-{
+pub enum PushResult {
     /// The CAS succeeded — the branch now points to the new commit.
     Success(),
     /// The CAS failed — the branch had advanced. Contains the current
     /// head, or `None` if the branch was deleted concurrently.
-    Conflict(Option<Value<Handle<H, SimpleArchive>>>),
+    Conflict(Option<Value<Handle<SimpleArchive>>>),
 }
 
 /// Storage backend for branch metadata (branch-id → commit-handle mapping).
@@ -412,7 +408,7 @@ where
 /// content-addressed and orderless, while branch stores track a single
 /// mutable pointer per branch. The update operation uses compare-and-swap
 /// semantics so multiple writers can coordinate without locks.
-pub trait BranchStore<H: HashProtocol> {
+pub trait BranchStore {
     /// Error type for listing branches.
     type BranchesError: Error + Debug + Send + Sync + 'static;
     /// Error type for head lookups.
@@ -444,7 +440,7 @@ pub trait BranchStore<H: HashProtocol> {
     /// # Returns
     /// * A future that resolves to the handle of the branch.
     /// * The handle is a unique identifier for the branch, and is used to retrieve it from the repository.
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<H, SimpleArchive>>>, Self::HeadError>;
+    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError>;
 
     /// Puts a branch on the repository, creating or updating it.
     ///
@@ -459,9 +455,9 @@ pub trait BranchStore<H: HashProtocol> {
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Option<Value<Handle<H, SimpleArchive>>>,
-    ) -> Result<PushResult<H>, Self::UpdateError>;
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError>;
 }
 
 /// Error returned by [`transfer`] when copying blobs between stores.
@@ -497,29 +493,27 @@ where
 }
 
 /// Copies the specified blob handles from `source` into `target`.
-pub fn transfer<'a, BS, BT, HS, HT, Handles>(
+pub fn transfer<'a, BS, BT, Handles>(
     source: &'a BS,
     target: &'a mut BT,
     handles: Handles,
 ) -> impl Iterator<
     Item = Result<
         (
-            Value<Handle<HS, UnknownBlob>>,
-            Value<Handle<HT, UnknownBlob>>,
+            Value<Handle<UnknownBlob>>,
+            Value<Handle<UnknownBlob>>,
         ),
         TransferError<
             Infallible,
-            <BS as BlobStoreGet<HS>>::GetError<Infallible>,
-            <BT as BlobStorePut<HT>>::PutError,
+            <BS as BlobStoreGet>::GetError<Infallible>,
+            <BT as BlobStorePut>::PutError,
         >,
     >,
 > + 'a
 where
-    BS: BlobStoreGet<HS> + 'a,
-    BT: BlobStorePut<HT> + 'a,
-    HS: 'static + HashProtocol,
-    HT: 'static + HashProtocol,
-    Handles: IntoIterator<Item = Value<Handle<HS, UnknownBlob>>> + 'a,
+    BS: BlobStoreGet + 'a,
+    BT: BlobStorePut + 'a,
+    Handles: IntoIterator<Item = Value<Handle<UnknownBlob>>> + 'a,
     Handles::IntoIter: 'a,
 {
     handles.into_iter().map(move |source_handle| {
@@ -536,22 +530,20 @@ where
 ///
 /// Uses [`BlobChildren`] to enumerate references at each level,
 /// so backends with batch capabilities get efficient traversal.
-pub struct ReachableHandles<'a, BS, H>
+pub struct ReachableHandles<'a, BS>
 where
-    BS: BlobChildren<H>,
-    H: 'static + HashProtocol,
+    BS: BlobChildren,
 {
     source: &'a BS,
-    queue: VecDeque<Value<Handle<H, UnknownBlob>>>,
+    queue: VecDeque<Value<Handle<UnknownBlob>>>,
     visited: HashSet<[u8; VALUE_LEN]>,
 }
 
-impl<'a, BS, H> ReachableHandles<'a, BS, H>
+impl<'a, BS> ReachableHandles<'a, BS>
 where
-    BS: BlobChildren<H>,
-    H: 'static + HashProtocol,
+    BS: BlobChildren,
 {
-    fn new(source: &'a BS, roots: impl IntoIterator<Item = Value<Handle<H, UnknownBlob>>>) -> Self {
+    fn new(source: &'a BS, roots: impl IntoIterator<Item = Value<Handle<UnknownBlob>>>) -> Self {
         let mut queue = VecDeque::new();
         for handle in roots {
             queue.push_back(handle);
@@ -565,12 +557,11 @@ where
     }
 }
 
-impl<'a, BS, H> Iterator for ReachableHandles<'a, BS, H>
+impl<'a, BS> Iterator for ReachableHandles<'a, BS>
 where
-    BS: BlobChildren<H>,
-    H: 'static + HashProtocol,
+    BS: BlobChildren,
 {
-    type Item = Value<Handle<H, UnknownBlob>>;
+    type Item = Value<Handle<UnknownBlob>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(handle) = self.queue.pop_front() {
@@ -599,13 +590,12 @@ where
 ///
 /// Uses [`BlobChildren`] for reference enumeration, so network-backed
 /// stores can provide optimized batch implementations.
-pub fn reachable<'a, BS, H>(
+pub fn reachable<'a, BS>(
     source: &'a BS,
-    roots: impl IntoIterator<Item = Value<Handle<H, UnknownBlob>>>,
-) -> ReachableHandles<'a, BS, H>
+    roots: impl IntoIterator<Item = Value<Handle<UnknownBlob>>>,
+) -> ReachableHandles<'a, BS>
 where
-    BS: BlobChildren<H>,
-    H: 'static + HashProtocol,
+    BS: BlobChildren,
 {
     ReachableHandles::new(source, roots)
 }
@@ -613,19 +603,16 @@ where
 /// Iterate over every 32-byte candidate in the value column of a [`TribleSet`].
 ///
 /// This is a conservative conversion used when scanning metadata for potential
-/// blob handles. Each 32-byte chunk is treated as a `Handle<H, UnknownBlob>`.
+/// blob handles. Each 32-byte chunk is treated as a `Handle<UnknownBlob>`.
 /// Callers can feed the resulting iterator into [`BlobStoreKeep::keep`] or other
 /// helpers that accept collections of handles.
-pub fn potential_handles<'a, H>(
+pub fn potential_handles<'a>(
     set: &'a TribleSet,
-) -> impl Iterator<Item = Value<Handle<H, UnknownBlob>>> + 'a
-where
-    H: HashProtocol,
-{
+) -> impl Iterator<Item = Value<Handle<UnknownBlob>>> + 'a {
     set.vae.iter().map(|raw| {
         let mut value = [0u8; VALUE_LEN];
         value.copy_from_slice(&raw[0..VALUE_LEN]);
-        Value::<Handle<H, UnknownBlob>>::new(value)
+        Value::<Handle<UnknownBlob>>::new(value)
     })
 }
 
@@ -669,7 +656,7 @@ pub enum MergeError {
 /// Error returned by [`Repository::push`] and [`Repository::try_push`].
 /// Error type for [`Repository::compute_rollup`].
 #[derive(Debug)]
-pub enum RollupError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
+pub enum RollupError<Storage: BranchStore + BlobStore> {
     /// The branch was not found in the underlying storage.
     UnknownBranch,
     /// The branch is empty — no HEAD to roll up.
@@ -682,25 +669,25 @@ pub enum RollupError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
     Push(PushError<Storage>),
     /// Could not pull the branch to obtain a workspace.
     Pull(PullError<Storage::HeadError,
-                    <Storage as BlobStore<Blake3>>::ReaderError,
-                    <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>),
+                    <Storage as BlobStore>::ReaderError,
+                    <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>>),
     /// Could not check out the branch state to build the archive.
     Checkout(WorkspaceCheckoutError<
-        <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>),
+        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>>),
 }
 
 #[derive(Debug)]
-pub enum PushError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
+pub enum PushError<Storage: BranchStore + BlobStore> {
     /// An error occurred while enumerating the branch storage branches.
     StorageBranches(Storage::BranchesError),
     /// An error occurred while creating a blob reader.
-    StorageReader(<Storage as BlobStore<Blake3>>::ReaderError),
+    StorageReader(<Storage as BlobStore>::ReaderError),
     /// An error occurred while reading metadata blobs.
     StorageGet(
-        <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     ),
     /// An error occurred while transferring blobs to the repository.
-    StoragePut(<Storage as BlobStorePut<Blake3>>::PutError),
+    StoragePut(<Storage as BlobStorePut>::PutError),
     /// An error occurred while updating the branch storage.
     BranchUpdate(Storage::UpdateError),
     /// Malformed branch metadata.
@@ -715,7 +702,7 @@ pub enum PushError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
 // `.map_err(|e| PushError::MergeError(e))?`.
 impl<Storage> From<MergeError> for PushError<Storage>
 where
-    Storage: BranchStore<Blake3> + BlobStore<Blake3>,
+    Storage: BranchStore + BlobStore,
 {
     fn from(e: MergeError) -> Self {
         PushError::MergeError(e)
@@ -732,16 +719,16 @@ where
 #[derive(Debug)]
 pub enum BranchError<Storage>
 where
-    Storage: BranchStore<Blake3> + BlobStore<Blake3>,
+    Storage: BranchStore + BlobStore,
 {
     /// An error occurred while creating a blob reader.
-    StorageReader(<Storage as BlobStore<Blake3>>::ReaderError),
+    StorageReader(<Storage as BlobStore>::ReaderError),
     /// An error occurred while reading metadata blobs.
     StorageGet(
-        <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     ),
     /// An error occurred while storing blobs.
-    StoragePut(<Storage as BlobStorePut<Blake3>>::PutError),
+    StoragePut(<Storage as BlobStorePut>::PutError),
     /// An error occurred while retrieving branch heads.
     BranchHead(Storage::HeadError),
     /// An error occurred while updating the branch storage.
@@ -756,17 +743,17 @@ where
 #[derive(Debug)]
 pub enum LookupError<Storage>
 where
-    Storage: BranchStore<Blake3> + BlobStore<Blake3>,
+    Storage: BranchStore + BlobStore,
 {
     /// Failed to enumerate branches.
     StorageBranches(Storage::BranchesError),
     /// Failed to read a branch head.
     BranchHead(Storage::HeadError),
     /// Failed to create a blob reader.
-    StorageReader(<Storage as BlobStore<Blake3>>::ReaderError),
+    StorageReader(<Storage as BlobStore>::ReaderError),
     /// Failed to read a metadata blob.
     StorageGet(
-        <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     ),
     /// Multiple branches were found with the given name.
     NameConflict(Vec<Id>),
@@ -778,7 +765,7 @@ where
 #[derive(Debug)]
 pub enum EnsureBranchError<Storage>
 where
-    Storage: BranchStore<Blake3> + BlobStore<Blake3>,
+    Storage: BranchStore + BlobStore,
 {
     /// Failed to look up the branch.
     Lookup(LookupError<Storage>),
@@ -792,7 +779,7 @@ where
 /// The [`Repository`] type exposes convenience methods for creating branches,
 /// committing data and pushing changes while delegating actual storage to the
 /// given [`BlobStore`] and [`BranchStore`] implementations.
-pub struct Repository<Storage: BlobStore<Blake3> + BranchStore<Blake3>> {
+pub struct Repository<Storage: BlobStore + BranchStore> {
     storage: Storage,
     signing_key: SigningKey,
     commit_metadata: MetadataHandle,
@@ -836,7 +823,7 @@ where
 
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore<Blake3> + BranchStore<Blake3>,
+    Storage: BlobStore + BranchStore,
 {
     /// Creates a new repository with the given storage, signing key, and commit metadata.
     ///
@@ -846,7 +833,7 @@ where
         mut storage: Storage,
         signing_key: SigningKey,
         commit_metadata: TribleSet,
-    ) -> Result<Self, <Storage as BlobStorePut<Blake3>>::PutError> {
+    ) -> Result<Self, <Storage as BlobStorePut>::PutError> {
         let commit_metadata = storage.put(commit_metadata)?;
         Ok(Self {
             storage,
@@ -914,7 +901,7 @@ where
     ) -> Result<ExclusiveId, BranchError<Storage>> {
         let branch_id = genid();
         let name_blob = branch_name.to_owned().to_blob();
-        let name_handle = name_blob.get_handle::<Blake3>();
+        let name_handle = name_blob.get_handle();
         self.storage
             .put(name_blob)
             .map_err(|e| BranchError::StoragePut(e))?;
@@ -981,7 +968,7 @@ where
             let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
             let Ok((name_handle,)) = find!(
-                (n: Value<Handle<Blake3, LongString>>),
+                (n: Value<Handle<LongString>>),
                 pattern!(&meta_set, [{ crate::metadata::name: ?n }])
             )
             .exactly_one() else {
@@ -1040,7 +1027,7 @@ where
         PullError<
             Storage::HeadError,
             Storage::ReaderError,
-            <Storage::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+            <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
         >,
     > {
         self.pull_with_key(branch_id, self.signing_key.clone())
@@ -1056,7 +1043,7 @@ where
         PullError<
             Storage::HeadError,
             Storage::ReaderError,
-            <Storage::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+            <Storage::Reader as BlobStoreGet>::GetError<UnarchiveError>,
         >,
     > {
         // 1. Get the branch metadata head from the branch store.
@@ -1151,7 +1138,7 @@ where
             .map_err(PushError::StorageGet)?;
 
         let Ok((branch_name,)) = find!(
-            (name: Value<Handle<Blake3, LongString>>),
+            (name: Value<Handle<LongString>>),
             pattern!(base_branch_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
@@ -1258,7 +1245,7 @@ where
         &mut self,
         branch_id: Id,
     ) -> Result<
-        Value<Handle<Blake3, crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
+        Value<Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
         RollupError<Storage>,
     > {
         use crate::blob::schemas::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -1277,7 +1264,7 @@ where
         // staging needed; the CAS below references it by handle.
         let archive_blob = (&archive).to_blob();
         let handle: Value<
-            Handle<Blake3, crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>,
+            Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>,
         > = self
             .storage
             .put(archive_blob)
@@ -1293,7 +1280,7 @@ where
             .get(ws.base_branch_meta)
             .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
         let (branch_name,) = find!(
-            (name: Value<Handle<Blake3, LongString>>),
+            (name: Value<Handle<LongString>>),
             pattern!(&base_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one()
@@ -1329,11 +1316,11 @@ where
 }
 
 /// A handle to a commit blob in the repository.
-pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
-type MetadataHandle = Value<Handle<Blake3, SimpleArchive>>;
+pub type CommitHandle = Value<Handle<SimpleArchive>>;
+type MetadataHandle = Value<Handle<SimpleArchive>>;
 /// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
 pub type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
-type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
+type BranchMetaHandle = Value<Handle<SimpleArchive>>;
 
 /// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
 /// with the set of commits that produced it. Pass the commit set as the start
@@ -1430,13 +1417,13 @@ impl std::ops::Add<&Checkout> for Checkout {
 /// The Workspace represents the mutable working area or "staging" state.
 /// It was formerly known as `Head`. It is sent to worker threads,
 /// modified (via commits, merges, etc.), and then merged back into the Repository.
-pub struct Workspace<Blobs: BlobStore<Blake3>> {
+pub struct Workspace<Blobs: BlobStore> {
     /// Staged blobs — added to this workspace but not yet pushed to
     /// the underlying repo. Analogous to git's staging area (the
     /// index): blobs accumulate here via `put` and friends, then
     /// `repo.push(&mut ws)` ships everything as one batch to the
     /// durable backend.
-    pub staged: MemoryBlobStore<Blake3>,
+    pub staged: MemoryBlobStore,
     /// The blob storage base for the workspace.
     base_blobs: Blobs::Reader,
     /// The branch id this workspace is tracking; None for a detached workspace.
@@ -1459,7 +1446,7 @@ pub struct Workspace<Blobs: BlobStore<Blake3>> {
 
 impl<Blobs> fmt::Debug for Workspace<Blobs>
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
     Blobs::Reader: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1476,13 +1463,13 @@ where
 }
 
 /// Helper trait for [`Workspace::checkout`] specifying commit handles or ranges.
-pub trait CommitSelector<Blobs: BlobStore<Blake3>> {
+pub trait CommitSelector<Blobs: BlobStore> {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >;
 }
 
@@ -1580,14 +1567,14 @@ pub fn filter<S, F>(selector: S, filter: F) -> Filter<S, F> {
 
 impl<Blobs> CommitSelector<Blobs> for CommitHandle
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         _ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut patch = CommitSet::new();
         patch.insert(&Entry::new(&self.raw));
@@ -1597,14 +1584,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for CommitSet
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         _ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         Ok(self)
     }
@@ -1612,14 +1599,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for Vec<CommitHandle>
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         _ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut patch = CommitSet::new();
         for handle in self {
@@ -1631,14 +1618,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for &[CommitHandle]
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         _ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut patch = CommitSet::new();
         for handle in self {
@@ -1650,14 +1637,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for Option<CommitHandle>
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         _ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut patch = CommitSet::new();
         if let Some(handle) = self {
@@ -1670,14 +1657,14 @@ where
 impl<S, Blobs> CommitSelector<Blobs> for Ancestors<S>
 where
     S: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let seeds = self.0.select(ws)?;
         collect_reachable_from_patch(ws, seeds)
@@ -1686,7 +1673,7 @@ where
 
 impl<Blobs, S> CommitSelector<Blobs> for NthAncestors<S>
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
     S: CommitSelector<Blobs>,
 {
     fn select(
@@ -1694,7 +1681,7 @@ where
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut frontier = self.0.select(ws)?;
         let mut remaining = self.1;
@@ -1721,14 +1708,14 @@ where
 impl<S, Blobs> CommitSelector<Blobs> for Parents<S>
 where
     S: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let seeds = self.0.select(ws)?;
         let mut result = CommitSet::new();
@@ -1747,14 +1734,14 @@ impl<A, B, Blobs> CommitSelector<Blobs> for SymmetricDiff<A, B>
 where
     A: CommitSelector<Blobs>,
     B: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let seeds_a = self.0.select(ws)?;
         let seeds_b = self.1.select(ws)?;
@@ -1771,14 +1758,14 @@ impl<A, B, Blobs> CommitSelector<Blobs> for Union<A, B>
 where
     A: CommitSelector<Blobs>,
     B: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let mut left = self.left.select(ws)?;
         let right = self.right.select(ws)?;
@@ -1791,14 +1778,14 @@ impl<A, B, Blobs> CommitSelector<Blobs> for Intersect<A, B>
 where
     A: CommitSelector<Blobs>,
     B: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let left = self.left.select(ws)?;
         let right = self.right.select(ws)?;
@@ -1810,14 +1797,14 @@ impl<A, B, Blobs> CommitSelector<Blobs> for Difference<A, B>
 where
     A: CommitSelector<Blobs>,
     B: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let left = self.left.select(ws)?;
         let right = self.right.select(ws)?;
@@ -1827,7 +1814,7 @@ where
 
 impl<S, F, Blobs> CommitSelector<Blobs> for Filter<S, F>
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
     S: CommitSelector<Blobs>,
     F: for<'x, 'y> Fn(&'x TribleSet, &'y TribleSet) -> bool,
 {
@@ -1836,7 +1823,7 @@ where
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let patch = self.selector.select(ws)?;
         let mut result = CommitSet::new();
@@ -1875,14 +1862,14 @@ pub fn history_of(entity: Id) -> HistoryOf {
 
 impl<Blobs> CommitSelector<Blobs> for HistoryOf
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let Some(head_) = ws.head else {
             return Ok(CommitSet::new());
@@ -1903,12 +1890,12 @@ where
 // walks from `end` until it hits `start`—while continuing to support selectors
 // such as `Ancestors(...)` at either boundary.
 
-fn collect_reachable_from_patch<Blobs: BlobStore<Blake3>>(
+fn collect_reachable_from_patch<Blobs: BlobStore>(
     ws: &mut Workspace<Blobs>,
     patch: CommitSet,
 ) -> Result<
     CommitSet,
-    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
 > {
     let mut result = CommitSet::new();
     for raw in patch.iter() {
@@ -1919,13 +1906,13 @@ fn collect_reachable_from_patch<Blobs: BlobStore<Blake3>>(
     Ok(result)
 }
 
-fn collect_reachable_from_patch_until<Blobs: BlobStore<Blake3>>(
+fn collect_reachable_from_patch_until<Blobs: BlobStore>(
     ws: &mut Workspace<Blobs>,
     seeds: CommitSet,
     stop: &CommitSet,
 ) -> Result<
     CommitSet,
-    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
 > {
     let mut visited = HashSet::new();
     let mut stack: Vec<CommitHandle> = seeds.iter().map(|raw| Value::new(*raw)).collect();
@@ -1961,14 +1948,14 @@ fn collect_reachable_from_patch_until<Blobs: BlobStore<Blake3>>(
 impl<T, Blobs> CommitSelector<Blobs> for std::ops::Range<T>
 where
     T: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let end_patch = self.end.select(ws)?;
         let start_patch = self.start.select(ws)?;
@@ -1980,14 +1967,14 @@ where
 impl<T, Blobs> CommitSelector<Blobs> for std::ops::RangeFrom<T>
 where
     T: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let Some(head_) = ws.head else {
             return Ok(CommitSet::new());
@@ -2004,14 +1991,14 @@ where
 impl<T, Blobs> CommitSelector<Blobs> for std::ops::RangeTo<T>
 where
     T: CommitSelector<Blobs>,
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let end_patch = self.end.select(ws)?;
         collect_reachable_from_patch(ws, end_patch)
@@ -2020,14 +2007,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for std::ops::RangeFull
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let Some(head_) = ws.head else {
             return Ok(CommitSet::new());
@@ -2038,14 +2025,14 @@ where
 
 impl<Blobs> CommitSelector<Blobs> for TimeRange
 where
-    Blobs: BlobStore<Blake3>,
+    Blobs: BlobStore,
 {
     fn select(
         self,
         ws: &mut Workspace<Blobs>,
     ) -> Result<
         CommitSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     > {
         let Some(head_) = ws.head else {
             return Ok(CommitSet::new());
@@ -2068,7 +2055,7 @@ where
     }
 }
 
-impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
+impl<Blobs: BlobStore> Workspace<Blobs> {
     /// Returns the branch id associated with this workspace.
     pub fn branch_id(&self) -> Id {
         self.base_branch_id
@@ -2108,13 +2095,13 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     pub fn rollup(
         &mut self,
     ) -> Result<
-        Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
-        <Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+        Option<Value<Handle<SuccinctArchiveBlob>>>,
+        <Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     > {
         let base_meta: TribleSet = self.base_blobs.get(self.base_branch_meta)?;
         Ok(
             find!(
-                (r: Value<Handle<Blake3, SuccinctArchiveBlob>>),
+                (r: Value<Handle<SuccinctArchiveBlob>>),
                 pattern!(&base_meta, [{ rollup: ?r }])
             )
             .next()
@@ -2124,11 +2111,11 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
 
     /// Adds a blob to the workspace's local blob store.
     /// Mirrors [`BlobStorePut::put`](crate::repo::BlobStorePut) for ease of use.
-    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>
+    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<Blake3, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         self.staged.put(item).expect("infallible blob put")
     }
@@ -2140,12 +2127,12 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// to the base blob store if the blob is not found locally.
     pub fn get<T, S>(
         &mut self,
-        handle: Value<Handle<Blake3, S>>,
-    ) -> Result<T, <Blobs::Reader as BlobStoreGet<Blake3>>::GetError<<T as TryFromBlob<S>>::Error>>
+        handle: Value<Handle<S>>,
+    ) -> Result<T, <Blobs::Reader as BlobStoreGet>::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<Blake3, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         self.staged
             .reader()
@@ -2280,7 +2267,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// `transfer`) for the optimization to kick in.
     pub fn merge_commit(
         &mut self,
-        other: Value<Handle<Blake3, SimpleArchive>>,
+        other: Value<Handle<SimpleArchive>>,
     ) -> Result<CommitHandle, MergeError> {
         // Trivial cases first.
         let local_head = match self.head {
@@ -2354,7 +2341,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         commits: I,
     ) -> Result<
         TribleSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         I: IntoIterator<Item = CommitHandle>,
@@ -2397,7 +2384,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         commits: I,
     ) -> Result<
         TribleSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         I: IntoIterator<Item = CommitHandle>,
@@ -2433,7 +2420,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         commits: I,
     ) -> Result<
         (TribleSet, TribleSet),
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         I: IntoIterator<Item = CommitHandle>,
@@ -2488,7 +2475,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         spec: R,
     ) -> Result<
         Checkout,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         R: CommitSelector<Blobs>,
@@ -2505,7 +2492,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         spec: R,
     ) -> Result<
         TribleSet,
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         R: CommitSelector<Blobs>,
@@ -2522,7 +2509,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         spec: R,
     ) -> Result<
         (TribleSet, TribleSet),
-        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
     >
     where
         R: CommitSelector<Blobs>,
@@ -2554,12 +2541,12 @@ impl<E: Error + fmt::Debug> fmt::Display for WorkspaceCheckoutError<E> {
 
 impl<E: Error + fmt::Debug> Error for WorkspaceCheckoutError<E> {}
 
-fn collect_reachable<Blobs: BlobStore<Blake3>>(
+fn collect_reachable<Blobs: BlobStore>(
     ws: &mut Workspace<Blobs>,
     from: CommitHandle,
 ) -> Result<
     CommitSet,
-    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
 > {
     let mut visited = HashSet::new();
     let mut stack = vec![from];

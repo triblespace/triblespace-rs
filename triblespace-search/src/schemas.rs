@@ -13,7 +13,7 @@
 //! live next to their index types.
 //!
 //! The built-in tokenizers in [`crate::tokens`] return
-//! `Value<Handle<Blake3, LongString>>` — the hash bytes are
+//! `Value<Handle<LongString>>` — the hash bytes are
 //! valid LongString-blob handles by construction, so there's
 //! no need for a bespoke "token hash" schema.
 
@@ -91,7 +91,7 @@ impl TryFromValue<'_, F32LE> for f32 {
 /// An arbitrary-length `[f32]` (little-endian) stored as a blob.
 ///
 /// HNSW indexes reference embeddings by
-/// [`Handle<Blake3, Embedding>`][h] so two indexes that embed
+/// [`Handle<Embedding>`][h] so two indexes that embed
 /// the same entity share one on-disk blob. A blob is just the
 /// raw f32 LE bytes, length = `dim × 4`. The dim isn't
 /// recorded in the blob header — the HNSW index that owns the
@@ -138,7 +138,7 @@ impl MetaDescribe for Embedding {
 }
 
 /// Shorthand for the most common embedding-handle value schema:
-/// `Handle<Blake3, Embedding>`. Use in trible attributes, in
+/// `Handle<Embedding>`. Use in trible attributes, in
 /// similarity constraint variables, wherever you'd otherwise
 /// spell the full type.
 ///
@@ -149,11 +149,7 @@ impl MetaDescribe for Embedding {
 /// fn keep(_h: Value<EmbHandle>) {}
 /// # keep(Value::new([0u8; 32]));
 /// ```
-pub type EmbHandle =
-    triblespace_core::value::schemas::hash::Handle<
-        triblespace_core::value::schemas::hash::Blake3,
-        Embedding,
-    >;
+pub type EmbHandle = triblespace_core::value::schemas::hash::Handle<Embedding>;
 
 /// Decode a blob back into a zero-copy `View<[f32]>`. Fails
 /// iff the blob's byte length isn't a multiple of 4 (malformed)
@@ -215,14 +211,13 @@ pub fn l2_normalize(vec: &mut [f32]) {
 /// cosine-similarity index — two callers with the same raw
 /// input produce the same handle, so the pile's dedup layer
 /// stores the blob once even across distinct indexes.
-pub fn put_embedding<B, H>(
+pub fn put_embedding<B>(
     store: &mut B,
     mut vec: Vec<f32>,
-) -> Result<triblespace_core::value::Value<triblespace_core::value::schemas::hash::Handle<H, Embedding>>, B::PutError>
+) -> Result<triblespace_core::value::Value<triblespace_core::value::schemas::hash::Handle<Embedding>>, B::PutError>
 where
-    H: triblespace_core::value::schemas::hash::HashProtocol,
-    B: triblespace_core::repo::BlobStorePut<H>,
-    triblespace_core::value::schemas::hash::Handle<H, Embedding>:
+    B: triblespace_core::repo::BlobStorePut,
+    triblespace_core::value::schemas::hash::Handle<Embedding>:
         triblespace_core::value::ValueSchema,
 {
     l2_normalize(&mut vec);
@@ -294,9 +289,9 @@ mod tests {
         use triblespace_core::repo::{BlobStore, BlobStoreGet};
         use triblespace_core::value::schemas::hash::Blake3;
 
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let vec = vec![1.0_f32, 0.0, 0.0];
-        let handle = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let handle = put_embedding::<_>(&mut store, vec.clone()).unwrap();
         let reader = store.reader().unwrap();
         let view: View<[f32]> = reader.get::<View<[f32]>, Embedding>(handle).unwrap();
         // After normalize, [1,0,0] stays [1,0,0].
@@ -311,9 +306,9 @@ mod tests {
         let v2: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v3: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
 
-        let h1: Value<Handle<Blake3, Embedding>> = v1.to_blob().get_handle();
-        let h2: Value<Handle<Blake3, Embedding>> = v2.to_blob().get_handle();
-        let h3: Value<Handle<Blake3, Embedding>> = v3.to_blob().get_handle();
+        let h1: Value<Handle<Embedding>> = v1.to_blob().get_handle();
+        let h2: Value<Handle<Embedding>> = v2.to_blob().get_handle();
+        let h3: Value<Handle<Embedding>> = v3.to_blob().get_handle();
 
         assert_eq!(h1, h2, "identical vectors must dedup by handle");
         assert_ne!(h1, h3, "different vectors must have different handles");

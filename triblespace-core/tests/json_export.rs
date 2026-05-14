@@ -20,8 +20,8 @@ fn exports_json_with_cardinality_hints() {
         "available": true
     });
 
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+    let mut blobs = MemoryBlobStore::new();
+    let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
     let fragment = importer.import_blob(blob).expect("import payload");
@@ -78,8 +78,8 @@ fn exports_openai_like_conversation() {
         }
     });
 
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+    let mut blobs = MemoryBlobStore::new();
+    let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
     let json = serde_json::to_string(&payload).expect("serialize payload");
     let blob: Blob<LongString> = Blob::new(Bytes::from(json.into_bytes()));
     let fragment = importer.import_blob(blob).expect("import payload");

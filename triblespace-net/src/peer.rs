@@ -70,7 +70,7 @@ pub use crate::host::PeerConfig;
 /// use triblespace_net::peer::{Peer, PeerConfig};
 ///
 /// let key = SigningKey::generate(&mut OsRng);
-/// let pile: Pile<Blake3> = Pile::open(Path::new("./team.pile")).unwrap();
+/// let pile: Pile = Pile::open(Path::new("./team.pile")).unwrap();
 /// let peer = Peer::new(pile, key.clone(), PeerConfig {
 ///     peers: vec![],                       // bootstrap nodes
 ///     gossip: true,                        // false = serve/pull-only
@@ -85,7 +85,7 @@ pub use crate::host::PeerConfig;
 /// ```
 pub struct Peer<S>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     store: S,
     sender: NetSender,
@@ -104,7 +104,7 @@ where
 
 impl<S> Peer<S>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread internally.
     ///
@@ -222,12 +222,12 @@ where
     pub fn fetch<T, Sch>(
         &mut self,
         peer: EndpointId,
-        handle: Value<Handle<Blake3, Sch>>,
+        handle: Value<Handle<Sch>>,
     ) -> anyhow::Result<Option<T>>
     where
         Sch: BlobSchema + 'static,
         T: triblespace_core::blob::TryFromBlob<Sch>,
-        Handle<Blake3, Sch>: ValueSchema,
+        Handle<Sch>: ValueSchema,
     {
         let Some(bytes) = self.sender.fetch(peer, handle.raw)? else {
             return Ok(None);
@@ -392,17 +392,17 @@ where
 // network thread, updating the diff baselines so refresh doesn't
 // double-announce.
 
-impl<S> BlobStorePut<Blake3> for Peer<S>
+impl<S> BlobStorePut for Peer<S>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     type PutError = S::PutError;
 
-    fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Blake3, Sch>>, Self::PutError>
+    fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Sch>>, Self::PutError>
     where
         Sch: BlobSchema + 'static,
         T: ToBlob<Sch>,
-        Handle<Blake3, Sch>: ValueSchema,
+        Handle<Sch>: ValueSchema,
     {
         let handle = self.store.put(item)?;
         self.sender.announce(handle.raw);
@@ -412,9 +412,9 @@ where
     }
 }
 
-impl<S> BlobStore<Blake3> for Peer<S>
+impl<S> BlobStore for Peer<S>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     type Reader = S::Reader;
     type ReaderError = S::ReaderError;
@@ -425,9 +425,9 @@ where
     }
 }
 
-impl<S> BranchStore<Blake3> for Peer<S>
+impl<S> BranchStore for Peer<S>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     type BranchesError = S::BranchesError;
     type HeadError = S::HeadError;
@@ -442,7 +442,7 @@ where
     fn head(
         &mut self,
         id: Id,
-    ) -> Result<Option<Value<Handle<Blake3, SimpleArchive>>>, Self::HeadError> {
+    ) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
         self.refresh();
         self.store.head(id)
     }
@@ -450,9 +450,9 @@ where
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<Blake3, SimpleArchive>>>,
-        new: Option<Value<Handle<Blake3, SimpleArchive>>>,
-    ) -> Result<PushResult<Blake3>, Self::UpdateError> {
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
         let result = self.store.update(id, old, new.clone())?;
         if let PushResult::Success() = &result {
             if let Some(head) = new {
@@ -492,7 +492,7 @@ pub fn resolve_branch_name<S>(
     name: &str,
 ) -> anyhow::Result<Option<(Id, RawHash)>>
 where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+    S: BlobStore + BlobStorePut + BranchStore,
 {
     use triblespace_core::blob::schemas::longstring::LongString;
     use triblespace_core::macros::{find, pattern};
@@ -500,13 +500,13 @@ where
 
     let branches = peer.list_remote_branches(remote)?;
     for (id, head) in branches {
-        let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(head);
+        let meta_handle = Value::<Handle<SimpleArchive>>::new(head);
         let Some(meta) = peer.fetch::<TribleSet, _>(remote, meta_handle)? else {
             continue;
         };
 
-        let name_handles: Vec<Value<Handle<Blake3, LongString>>> = find!(
-            h: Value<Handle<Blake3, LongString>>,
+        let name_handles: Vec<Value<Handle<LongString>>> = find!(
+            h: Value<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
         )
         .collect();
@@ -526,23 +526,23 @@ where
 /// Read the branch name from a branch metadata blob. Tries `metadata::name`
 /// first (normal branches) and falls back to `remote_name` (tracking
 /// branches mirrored from a remote peer).
-fn read_remote_name<S: BlobStore<Blake3>>(store: &mut S, head_hash: &RawHash) -> Option<String> {
+fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<String> {
     use triblespace_core::blob::schemas::longstring::LongString;
     use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::macros::{find, pattern};
 
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*head_hash);
+    let meta_handle = Value::<Handle<SimpleArchive>>::new(*head_hash);
     let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
 
-    let name_handle: Value<Handle<Blake3, LongString>> = find!(
-        h: Value<Handle<Blake3, LongString>>,
+    let name_handle: Value<Handle<LongString>> = find!(
+        h: Value<Handle<LongString>>,
         pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
     )
     .next()
     .or_else(|| {
         find!(
-            h: Value<Handle<Blake3, LongString>>,
+            h: Value<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ crate::tracking::remote_name: ?h }])
         )
         .next()

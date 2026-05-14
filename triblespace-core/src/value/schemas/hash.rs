@@ -19,42 +19,97 @@ use hex::FromHex;
 use hex::FromHexError;
 use std::marker::PhantomData;
 
-/// A trait for 32-byte content-addressed hash functions.
+/// A 32-byte content-addressed hash function.
 ///
-/// Implementors expose the minimal streaming API the rest of triblespace
-/// relies on (`new` / `update` / `finalize`) plus a one-shot `digest`
-/// helper. The previous version of this trait extended the `digest`
-/// crate's [`Digest`](https://docs.rs/digest) trait via blake3's
-/// `traits-preview` feature, but `traits-preview` is explicitly
-/// pre-stable and its pinned `digest` dependency conflicts with other
-/// iroh-ecosystem crates. Defining a minimal trait here keeps
-/// triblespace-core dep-independent from the digest crate entirely.
-pub trait HashProtocol: Clone + Send + 'static + MetaDescribe {
+/// triblespace's *storage* layer (handles, blob stores, piles) is
+/// fixed to [`Blake3`] — that's the content-addressing hash that
+/// produces every [`Handle<T>`]. This trait stays generic so
+/// [`Hash<H>`] can carry digests produced by *other* hash functions
+/// (e.g. an external system's SHA-256 fingerprints) alongside
+/// Blake3 in the same store, distinguished by their schema type at
+/// the value layer. Only the storage-side parameter went away; the
+/// value-side distinction between digest families is still useful.
+pub trait HashProtocol: Sized + 'static + MetaDescribe {
     /// Short lowercase name used in serialised representations (e.g. `"blake3"`).
     const NAME: &'static str;
-
-    /// Create a fresh hasher ready to accept input.
-    fn new() -> Self;
-
-    /// Feed `bytes` into the streaming state.
-    fn update(&mut self, bytes: &[u8]);
-
-    /// Return the 32-byte digest of the bytes fed so far. Takes
-    /// `&self` (not `self`) so method-resolution on `blake3::Hasher`
-    /// still prefers blake3's inherent `finalize` returning a
-    /// `blake3::Hash` — that matters for call sites (including the
-    /// `entity!` macro expansion) that want the native API.
-    fn finalize(&self) -> RawValue;
 
     /// One-shot convenience: hash `bytes` and return the digest.
     fn digest(bytes: &[u8]) -> RawValue;
 }
 
-/// A value schema for a hash.
-/// A hash is a fixed-size 256bit digest of a byte sequence.
+/// Blake3 hash protocol — the canonical content-addressing hash
+/// for triblespace blob storage. The [`MemoryBlobStore`], [`Pile`],
+/// and [`Handle`] types are all implicitly Blake3-backed.
 ///
-/// See the [crate::id] module documentation for a discussion on the length
-/// of the digest and its role as an intrinsic identifier.
+/// Implements [`HashProtocol`] so [`Hash<Blake3>`] is also a valid
+/// "blake3 digest" value schema, parallel to hypothetical
+/// `Hash<Sha256>` etc. for foreign-hash fingerprints.
+pub struct Blake3 {
+    hasher: blake3::Hasher,
+}
+
+impl Clone for Blake3 {
+    fn clone(&self) -> Self {
+        Self {
+            hasher: self.hasher.clone(),
+        }
+    }
+}
+
+impl Default for Blake3 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Blake3 {
+    /// Short lowercase name used in serialised representations.
+    pub const NAME: &'static str = <Self as HashProtocol>::NAME;
+
+    /// Create a fresh hasher ready to accept input.
+    pub fn new() -> Self {
+        Self {
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    /// Feed `bytes` into the streaming state.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    /// Return the 32-byte digest of the bytes fed so far.
+    pub fn finalize(&self) -> RawValue {
+        *self.hasher.finalize().as_bytes()
+    }
+
+    /// One-shot convenience: hash `bytes` with Blake3 and return
+    /// the 32-byte digest. Mirrors [`HashProtocol::digest`] as an
+    /// inherent method so call sites don't need to import the trait.
+    pub fn digest(bytes: &[u8]) -> RawValue {
+        <Self as HashProtocol>::digest(bytes)
+    }
+}
+
+impl HashProtocol for Blake3 {
+    const NAME: &'static str = "blake3";
+
+    fn digest(bytes: &[u8]) -> RawValue {
+        *blake3::hash(bytes).as_bytes()
+    }
+}
+
+/// A value schema for a 32-byte hash digest.
+///
+/// `H` selects the hash function — `Hash<Blake3>` for blake3-produced
+/// digests, hypothetical `Hash<Sha256>` for foreign 256-bit
+/// fingerprints carried alongside. This stays parametric so a store
+/// can hold both kinds of digests with type-level distinction; only
+/// the storage-side wiring ([`Handle`], [`MemoryBlobStore`], piles)
+/// is fixed to Blake3.
+///
+/// See the [crate::id] module documentation for a discussion on the
+/// length of the digest and its role as an intrinsic identifier.
 pub struct Hash<H> {
     _hasher: PhantomData<fn(H) -> ()>,
 }
@@ -63,9 +118,6 @@ impl<H> MetaDescribe for Hash<H>
 where
     H: HashProtocol,
 {
-    // Hash<H>'s schema id IS H's schema id — Hash<H> is the value-schema
-    // facet of the same conceptual entity. describe delegates to H so the
-    // fragment's intrinsic root is H's id.
     fn describe() -> Fragment {
         H::describe()
     }
@@ -99,14 +151,11 @@ where
     }
 }
 
-impl<H> TryFromValue<'_, Hash<H>> for String
-where
-    H: HashProtocol,
-{
+impl<H: HashProtocol> TryFromValue<'_, Hash<H>> for String {
     type Error = std::convert::Infallible;
     fn try_from_value(v: &Value<Hash<H>>) -> Result<Self, std::convert::Infallible> {
         let mut out = String::new();
-        out.push_str(<H as HashProtocol>::NAME);
+        out.push_str(H::NAME);
         out.push(':');
         out.push_str(&hex::encode(v.raw));
         Ok(out)
@@ -130,14 +179,11 @@ impl From<FromHexError> for HashError {
     }
 }
 
-impl<H> TryToValue<Hash<H>> for &str
-where
-    H: HashProtocol,
-{
+impl<H: HashProtocol> TryToValue<Hash<H>> for &str {
     type Error = HashError;
 
     fn try_to_value(self) -> Result<Value<Hash<H>>, Self::Error> {
-        let protocol = <H as HashProtocol>::NAME;
+        let protocol = H::NAME;
         if !(self.starts_with(protocol) && &self[protocol.len()..=protocol.len()] == ":") {
             return Err(HashError::BadProtocol);
         }
@@ -147,10 +193,7 @@ where
     }
 }
 
-impl<H> TryToValue<Hash<H>> for String
-where
-    H: HashProtocol,
-{
+impl<H: HashProtocol> TryToValue<Hash<H>> for String {
     type Error = HashError;
 
     fn try_to_value(self) -> Result<Value<Hash<H>>, Self::Error> {
@@ -158,12 +201,7 @@ where
     }
 }
 
-fn describe_hash<H>(id: Id) -> Fragment
-where
-    H: HashProtocol,
-{
-    // `id` is passed in by the HashProtocol impl so we don't recurse through
-    // `H::id()` (which would call `H::describe` which would call us back).
+fn describe_hash<H: HashProtocol>(id: Id) -> Fragment {
     let name = H::NAME;
     let mut tribles = Fragment::rooted(id, TribleSet::new());
     let description = tribles.put(format!(
@@ -205,36 +243,6 @@ mod wasm_formatter {
     }
 }
 
-/// Blake3 hasher, usable as a [`HashProtocol`]. This is the default
-/// hash function for content-addressed blob storage.
-pub use blake3::Hasher as Blake3;
-
-impl HashProtocol for Blake3 {
-    const NAME: &'static str = "blake3";
-
-    fn new() -> Self {
-        blake3::Hasher::new()
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        blake3::Hasher::update(self, bytes);
-    }
-
-    fn finalize(&self) -> RawValue {
-        *blake3::Hasher::finalize(self).as_bytes()
-    }
-
-    fn digest(bytes: &[u8]) -> RawValue {
-        *blake3::hash(bytes).as_bytes()
-    }
-}
-
-impl MetaDescribe for Blake3 {
-    fn describe() -> Fragment {
-        describe_hash::<Self>(id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3"))
-    }
-}
-
 /// This is a value schema for a handle.
 /// A handle to a blob is comprised of a hash of a blob and type level information about the blobs schema.
 ///
@@ -244,54 +252,52 @@ impl MetaDescribe for Blake3 {
 /// The handle is generated when a blob is inserted into a BlobSet, and the handle
 /// can be used to retrieve the blob from the BlobSet later.
 #[repr(transparent)]
-pub struct Handle<H: HashProtocol, T: BlobSchema> {
-    digest: Hash<H>,
+pub struct Handle<T: BlobSchema> {
+    digest: Hash<Blake3>,
     _type: PhantomData<T>,
 }
 
-impl<H: HashProtocol, T: BlobSchema> Handle<H, T> {
-    /// Wraps a hash value as a typed handle.
-    pub fn from_hash(hash: Value<Hash<H>>) -> Value<Self> {
+impl<T: BlobSchema> Handle<T> {
+    /// Wraps a Blake3 hash value as a typed handle.
+    pub fn from_hash(hash: Value<Hash<Blake3>>) -> Value<Self> {
         hash.transmute()
     }
 
-    /// Extracts the underlying hash, discarding the blob schema type.
-    pub fn to_hash(handle: Value<Self>) -> Value<Hash<H>> {
+    /// Extracts the underlying Blake3 hash, discarding the blob schema type.
+    pub fn to_hash(handle: Value<Self>) -> Value<Hash<Blake3>> {
         handle.transmute()
     }
 }
 
-impl<H: HashProtocol, T: BlobSchema> From<Value<Hash<H>>> for Value<Handle<H, T>> {
-    fn from(value: Value<Hash<H>>) -> Self {
+impl<T: BlobSchema> From<Value<Hash<Blake3>>> for Value<Handle<T>> {
+    fn from(value: Value<Hash<Blake3>>) -> Self {
         value.transmute()
     }
 }
 
-impl<H: HashProtocol, T: BlobSchema> From<Value<Handle<H, T>>> for Value<Hash<H>> {
-    fn from(value: Value<Handle<H, T>>) -> Self {
+impl<T: BlobSchema> From<Value<Handle<T>>> for Value<Hash<Blake3>> {
+    fn from(value: Value<Handle<T>>) -> Self {
         value.transmute()
     }
 }
 
-impl<H, T> MetaDescribe for Handle<H, T>
+impl<T> MetaDescribe for Handle<T>
 where
-    H: HashProtocol,
     T: BlobSchema + MetaDescribe,
 {
     fn describe() -> Fragment {
-        // Entity core via `*:` spread. `T::describe()` and
-        // `H::describe()` each run once: their roots become the
-        // values of `metadata::blob_schema` and `metadata::hash_schema`,
-        // and their facts + blobs fold in automatically. The
-        // hash_schema + blob_schema pair distinguishes one
-        // `Handle<H,T>` monomorphization from another; `annotated`
+        // Entity core via `*:` spread. `T::describe()` runs once: its
+        // root becomes the value of `metadata::blob_schema` and its
+        // facts + blobs fold in automatically. With the hash protocol
+        // fixed to Blake3, only the blob schema parameter distinguishes
+        // one `Handle<T>` monomorphization from another; `annotated`
         // layers the human-facing annotations under the derived root.
         let mut core = entity! {
             metadata::blob_schema*: T::describe(),
-            metadata::hash_schema*: H::describe(),
+            metadata::hash_schema*: Blake3::describe(),
             metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
-        let name = H::NAME;
+        let name = Blake3::NAME;
         let description_handle = core.put(format!(
             "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob schema. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
         ));
@@ -313,25 +319,25 @@ where
             annotations
         })
     }
-
-    // id() uses the describe-based default. Handle's describe builds the
-    // core entity first and attaches annotations under its root via
-    // `annotated` — the fragment's intrinsic root is the core's id,
-    // exactly the schema id we want.
 }
 
-impl<H: HashProtocol, T: BlobSchema + MetaDescribe> ValueSchema for Handle<H, T> {
+impl<T: BlobSchema + MetaDescribe> ValueSchema for Handle<T> {
     type ValidationError = Infallible;
+}
+
+impl MetaDescribe for Blake3 {
+    fn describe() -> Fragment {
+        describe_hash::<Self>(id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Blake3;
     use crate::prelude::*;
     use crate::value::schemas::hash::HashError;
     use rand;
 
-    use super::Hash;
+    use super::{Blake3, Hash};
 
     #[test]
     fn value_roundtrip() {

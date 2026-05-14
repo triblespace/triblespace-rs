@@ -26,7 +26,7 @@ use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 use triblespace_core::value::Value;
 
-type PileBlake3 = Pile<Blake3>;
+type PileBlake3 = Pile;
 
 #[derive(Parser)]
 pub enum Command {
@@ -221,7 +221,7 @@ fn parse_secret_hex(s: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&raw))
 }
 
-fn parse_handle_hex(s: &str) -> Result<Value<Handle<Blake3, SimpleArchive>>> {
+fn parse_handle_hex(s: &str) -> Result<Value<Handle<SimpleArchive>>> {
     let bytes = hex::decode(s).map_err(|e| anyhow!("decode handle hex: {e}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
@@ -262,7 +262,7 @@ fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
 
 fn fetch_cap_blob_pair(
     pile: &mut PileBlake3,
-    sig_handle: Value<Handle<Blake3, SimpleArchive>>,
+    sig_handle: Value<Handle<SimpleArchive>>,
 ) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>)> {
     use triblespace_core::blob::TryFromBlob;
     use triblespace_core::repo::BlobStore;
@@ -281,8 +281,8 @@ fn fetch_cap_blob_pair(
 
     use triblespace_core::macros::pattern;
     use triblespace_core::query::find;
-    let cap_handle: Value<Handle<Blake3, SimpleArchive>> = find!(
-        (sig: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+    let cap_handle: Value<Handle<SimpleArchive>> = find!(
+        (sig: Id, h: Value<Handle<SimpleArchive>>),
         pattern!(&sig_set, [{ ?sig @ capability::sig_signs: ?h }])
     )
     .map(|(_, h)| h)
@@ -337,8 +337,8 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     )
     .map_err(|e| anyhow!("build founder cap: {e:?}"))?;
 
-    let cap_handle: Value<Handle<Blake3, SimpleArchive>> = (&cap_blob).get_handle();
-    let sig_handle: Value<Handle<Blake3, SimpleArchive>> = (&sig_blob).get_handle();
+    let cap_handle: Value<Handle<SimpleArchive>> = (&cap_blob).get_handle();
+    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
@@ -414,7 +414,7 @@ fn run_invite(
         issuer_cap_sig_handle,
         issuer_pubkey,
         &revoked,
-        |h: Value<Handle<Blake3, SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+        |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             use triblespace_core::repo::BlobStoreGet;
             snap_reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(h)
@@ -457,7 +457,7 @@ fn run_invite(
     )
     .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
 
-    let sig_handle: Value<Handle<Blake3, SimpleArchive>> = (&sig_blob).get_handle();
+    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
@@ -486,7 +486,7 @@ fn run_revoke(
 
     let (rev_blob, sig_blob) = capability::build_revocation(&team_root, target);
 
-    let sig_handle: Value<Handle<Blake3, SimpleArchive>> = (&sig_blob).get_handle();
+    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
     store_blob(&mut pile, rev_blob)?;
     store_blob(&mut pile, sig_blob)?;
 
@@ -558,7 +558,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(h) => h,
             Err(_) => continue,
         };
-        let typed_handle: Value<Handle<Blake3, SimpleArchive>> =
+        let typed_handle: Value<Handle<SimpleArchive>> =
             Value::new(handle.raw);
         let blob: Blob<SimpleArchive> = match reader
             .get::<Blob<SimpleArchive>, SimpleArchive>(typed_handle)
@@ -760,7 +760,7 @@ fn run_show(
     let mut leaf_iter = find!(
         (
             sig: Id,
-            signed: Value<Handle<Blake3, SimpleArchive>>,
+            signed: Value<Handle<SimpleArchive>>,
             signer: VerifyingKey
         ),
         pattern!(&leaf_sig_set, [{
@@ -864,7 +864,7 @@ fn run_show(
         let parent_pair = find!(
             (
                 e: Id,
-                parent_cap: Value<Handle<Blake3, SimpleArchive>>,
+                parent_cap: Value<Handle<SimpleArchive>>,
                 parent_sig_id: Id,
             ),
             pattern!(&cap_set, [{
@@ -938,13 +938,13 @@ fn run_show(
                 let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
                     .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
                 let raw_iter = find!(
-                    (sig: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+                    (sig: Id, h: Value<Handle<SimpleArchive>>),
                     pattern!(&leaf_sig_set, [{
                         ?sig @ capability::sig_signs: ?h
                     }])
                 );
                 let mut iter = raw_iter.map(|(_sig, h)| (h,));
-                let cap_h: Value<Handle<Blake3, SimpleArchive>> = match iter.next() {
+                let cap_h: Value<Handle<SimpleArchive>> = match iter.next() {
                     Some((h,)) => h,
                     None => return Err(anyhow!("leaf sig blob malformed")),
                 };
@@ -968,7 +968,7 @@ fn run_show(
 
         // Build the fetch_blob closure verify_chain expects, backed
         // by the same pile reader the structural walk used.
-        let fetch = |h: Value<Handle<Blake3, SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+        let fetch = |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             use triblespace_core::repo::BlobStoreGet;
             reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(h)

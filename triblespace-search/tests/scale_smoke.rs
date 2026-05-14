@@ -122,7 +122,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xFACE_FEED);
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut flat_b = FlatBuilder::new(DIM);
     let mut hnsw_b = HNSWBuilder::new(DIM).with_seed(7);
     let mut handles = Vec::with_capacity(N_DOCS);
@@ -130,7 +130,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, vec.clone()).unwrap();
         flat_b.insert(h);
         hnsw_b.insert(h, vec).unwrap();
         handles.push(h);
@@ -256,14 +256,14 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xBADF00D);
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut builder = HNSWBuilder::new(DIM).with_seed(11);
     let mut handles = Vec::new();
     for _ in 0..1_000 {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let h = put_embedding::<_>(&mut store, vec.clone()).unwrap();
         builder.insert(h, vec).unwrap();
         handles.push(h);
     }
@@ -431,7 +431,7 @@ fn flat_1k_vectors_threshold_finds_self() {
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0x1234_5678);
-    let mut store = MemoryBlobStore::<Blake3>::new();
+    let mut store = MemoryBlobStore::new();
     let mut builder = FlatBuilder::new(DIM);
     // One target vector we know the answer for — all ones in the
     // first half, zero in the second — plus 999 random neighbours.
@@ -439,13 +439,13 @@ fn flat_1k_vectors_threshold_finds_self() {
     for v in target_vec.iter_mut().take(DIM / 2) {
         *v = 1.0;
     }
-    let h_target = put_embedding::<_, Blake3>(&mut store, target_vec).unwrap();
+    let h_target = put_embedding::<_>(&mut store, target_vec).unwrap();
     builder.insert(h_target);
     for _ in 0..(N_DOCS - 1) {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let h = put_embedding::<_, Blake3>(&mut store, vec).unwrap();
+        let h = put_embedding::<_>(&mut store, vec).unwrap();
         builder.insert(h);
     }
     let idx = builder.build();

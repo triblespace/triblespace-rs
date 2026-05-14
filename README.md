@@ -51,7 +51,7 @@ mod literature {
         "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
 
         /// A quote from a work.
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<Blake3, LongString>;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<LongString>;
 
         /// The author of a work.
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
@@ -69,7 +69,7 @@ mod literature {
         "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
 
         /// A throwaway prototype field; omit the id to derive it from the name and schema.
-        pub prototype_note: Handle<Blake3, LongString>;
+        pub prototype_note: Handle<LongString>;
     }
 }
 

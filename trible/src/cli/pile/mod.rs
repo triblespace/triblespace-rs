@@ -110,7 +110,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             // state.
             fs::File::create(&path)?;
 
-            let pile: Pile<Blake3> = Pile::open(&path)?;
+            let pile: Pile = Pile::open(&path)?;
             // Explicit close makes the empty pile durable and avoids Drop warnings.
             pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             Ok(())

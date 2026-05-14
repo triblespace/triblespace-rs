@@ -24,8 +24,6 @@ pub use crate::value::schemas::hash::Blake3;
 pub use crate::value::schemas::hash::Handle;
 /// Re-export of [`struct@Hash`].
 pub use crate::value::schemas::hash::Hash;
-/// Re-export of [`HashProtocol`].
-pub use crate::value::schemas::hash::HashProtocol;
 /// Re-export of [`I256`].
 pub use crate::value::schemas::iu256::I256;
 /// Re-export of [`I256BE`].

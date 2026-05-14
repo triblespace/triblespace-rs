@@ -70,7 +70,7 @@ fn bench_inserts(c: &mut Criterion) {
             |b, data| {
                 b.iter(|| {
                     let mut set = TribleSet::new();
-                    let mut store = MemoryBlobStore::<Blake3>::new();
+                    let mut store = MemoryBlobStore::new();
                     for (trible, text) in data.tribles.iter().zip(&data.blobs) {
                         let handle: Value<_> = store.put(text.clone()).expect("blob store insert");
                         // force allows using the raw ids from the sampled trible

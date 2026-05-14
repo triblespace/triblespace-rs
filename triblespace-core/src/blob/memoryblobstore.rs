@@ -9,7 +9,6 @@ use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
 use crate::value::schemas::hash::Handle;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::VALUE_LEN;
 
@@ -18,7 +17,6 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::{self};
 use std::iter::FromIterator;
-use std::marker::PhantomData;
 
 use super::TryFromBlob;
 
@@ -33,12 +31,11 @@ use super::TryFromBlob;
 /// PATCH, readers each hold a pinned Arc-clone.
 ///
 /// [`reader`]: BlobStore::reader
-pub struct MemoryBlobStore<H: HashProtocol> {
+pub struct MemoryBlobStore {
     blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
-    _marker: PhantomData<H>,
 }
 
-impl<H: HashProtocol> Debug for MemoryBlobStore<H> {
+impl Debug for MemoryBlobStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MemoryBlobStore")
     }
@@ -55,37 +52,29 @@ impl<H: HashProtocol> Debug for MemoryBlobStore<H> {
 /// `pattern!` / `and!` / `or!`.
 ///
 /// [`reader`]: BlobStore::reader
-pub struct MemoryBlobStoreReader<H: HashProtocol> {
+pub struct MemoryBlobStoreReader {
     blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
-    _marker: PhantomData<H>,
 }
 
-impl<H: HashProtocol> Clone for MemoryBlobStoreReader<H> {
+impl Clone for MemoryBlobStoreReader {
     fn clone(&self) -> Self {
         MemoryBlobStoreReader {
             blobs: self.blobs.clone(),
-            _marker: PhantomData,
         }
     }
 }
 
-impl<H: HashProtocol> PartialEq for MemoryBlobStoreReader<H> {
+impl PartialEq for MemoryBlobStoreReader {
     fn eq(&self, other: &Self) -> bool {
-        // PATCH equality is by key set (values aren't part of equality
-        // — see the patch module docs). Good enough for our blob-store
-        // sense of equality, since values are content-addressed by key.
         self.blobs == other.blobs
     }
 }
 
-impl<H: HashProtocol> Eq for MemoryBlobStoreReader<H> {}
+impl Eq for MemoryBlobStoreReader {}
 
-impl<H: HashProtocol> MemoryBlobStoreReader<H> {
+impl MemoryBlobStoreReader {
     fn new(blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>) -> Self {
-        MemoryBlobStoreReader {
-            blobs,
-            _marker: PhantomData,
-        }
+        MemoryBlobStoreReader { blobs }
     }
 
     /// Number of blobs in this snapshot.
@@ -93,55 +82,50 @@ impl<H: HashProtocol> MemoryBlobStoreReader<H> {
         self.blobs.len() as usize
     }
 
+    /// True iff the snapshot is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Iterator over `(handle, blob)` pairs in this snapshot.
     /// Iteration order is unspecified.
-    pub fn iter(&self) -> MemoryBlobStoreIter<H> {
-        // Two clones: one drives iteration (yields keys), the
-        // other retains the values for lookup. Both are O(1)
-        // PATCH clones; the iterator owns its data so it can
-        // outlive a borrowing reference to the reader.
+    pub fn iter(&self) -> MemoryBlobStoreIter {
         let for_iter = self.blobs.clone();
         let lookup = for_iter.clone();
         MemoryBlobStoreIter {
             keys: for_iter.into_iter(),
             lookup,
-            _marker: PhantomData,
         }
     }
 }
 
-impl<H: HashProtocol> Clone for MemoryBlobStore<H> {
+impl Clone for MemoryBlobStore {
     fn clone(&self) -> Self {
         MemoryBlobStore {
             blobs: self.blobs.clone(),
-            _marker: PhantomData,
         }
     }
 }
 
-impl<H: HashProtocol> PartialEq for MemoryBlobStore<H> {
+impl PartialEq for MemoryBlobStore {
     fn eq(&self, other: &Self) -> bool {
-        // PATCH equality is by key set (values aren't part of equality
-        // — see the patch module docs). Good enough for blob-store
-        // equality, since values are content-addressed by key.
         self.blobs == other.blobs
     }
 }
 
-impl<H: HashProtocol> Eq for MemoryBlobStore<H> {}
+impl Eq for MemoryBlobStore {}
 
-impl<H: HashProtocol> Default for MemoryBlobStore<H> {
+impl Default for MemoryBlobStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<H: HashProtocol> MemoryBlobStore<H> {
+impl MemoryBlobStore {
     /// Creates a new [`MemoryBlobStore`] with no blobs.
-    pub fn new() -> MemoryBlobStore<H> {
+    pub fn new() -> MemoryBlobStore {
         MemoryBlobStore {
             blobs: PATCH::new(),
-            _marker: PhantomData,
         }
     }
 
@@ -151,12 +135,12 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     /// present, which matches blob-store semantics (handles are
     /// content-addressed, so a duplicate-key insert is also a duplicate-value
     /// insert).
-    pub fn insert<S>(&mut self, blob: Blob<S>) -> Value<Handle<H, S>>
+    pub fn insert<S>(&mut self, blob: Blob<S>) -> Value<Handle<S>>
     where
         S: BlobSchema,
     {
-        let handle: Value<Handle<H, S>> = blob.get_handle();
-        let unknown_handle: Value<Handle<H, UnknownBlob>> = handle.transmute();
+        let handle: Value<Handle<S>> = blob.get_handle();
+        let unknown_handle: Value<Handle<UnknownBlob>> = handle.transmute();
         let blob: Blob<UnknownBlob> = blob.transmute();
         let entry = Entry::with_value(&unknown_handle.raw, blob);
         self.blobs.insert(&entry);
@@ -179,37 +163,19 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     /// Used by the `entity!{}` macro to absorb the bytes returned
     /// from [`IntoFieldValue::into_field_value`](crate::value::IntoFieldValue)
     /// — the schema is already captured on the value side (the
-    /// returned `Value<Handle<H, T>>` carries the type), so the
-    /// storage path only cares about the bytes. The corresponding
-    /// `BlobStoreGet<H>::get::<T, …>(handle)` reads them back under
-    /// the original type by content hash.
+    /// returned `Value<Handle<T>>` carries the type), so the
+    /// storage path only cares about the bytes.
     pub fn insert_bytes(&mut self, bytes: anybytes::Bytes) {
         let blob: Blob<UnknownBlob> = Blob::new(bytes);
-        // Reuse the typed `insert` so handle computation and PATCH
-        // bookkeeping live in one place. The returned handle is
-        // discarded; the caller already owns a typed handle from
-        // `IntoFieldValue::into_field_value` whose bytes are identical.
         let _ = self.insert(blob);
     }
 
-    // Note that keep is conservative and keeps every blob for which there exists
-    // a corresponding trible value, irrespective of that tribles attribute type.
-    // This could theoretically allow an attacker to DOS blob garbage collection
-    // by introducting values that look like existing hashes, but are actually of
-    // a different type. But this is under the assumption that an attacker is only
-    // allowed to write non-handle typed triples, otherwise they might as well
-    // introduce blobs directly.
     /// Structurally merge `other` into this store, consuming `other`.
     ///
-    /// Both stores share the same `H` hash protocol so handle bytes
-    /// match by content-addressing — duplicate keys collapse via
-    /// PATCH's union semantics (idempotent). Used by callers that
-    /// produced a scratch store (e.g. a `Describe::blobs()` impl
-    /// returning the schema's description blobs) and want to fold
-    /// it into a longer-lived store like a workspace's local blobs.
-    ///
-    /// Faster than per-blob `BlobStorePut::put`: PATCH's `union`
-    /// is a structural merge — cost is bounded by the size of the
+    /// Handle bytes match by content-addressing — duplicate keys
+    /// collapse via PATCH's union semantics (idempotent). Faster
+    /// than per-blob `BlobStorePut::put`: PATCH's `union` is a
+    /// structural merge — cost is bounded by the size of the
     /// non-overlapping subtrees, not the total blob count.
     pub fn union(&mut self, other: Self) {
         self.blobs.union(other.blobs);
@@ -218,11 +184,8 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     /// Drops any blobs that are not referenced by one of the provided tribles.
     pub fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>,
+        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
     {
-        // PATCH has no `retain`, so build a fresh PATCH containing only
-        // the surviving entries. Keep is rare (consolidation / explicit
-        // GC); the O(n) rebuild cost is fine.
         let mut surviving = PATCH::new();
         for handle in handles {
             if let Some(blob) = self.blobs.get(&handle.raw) {
@@ -234,20 +197,17 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     }
 }
 
-impl<H: HashProtocol> BlobStoreKeep<H> for MemoryBlobStore<H> {
+impl BlobStoreKeep for MemoryBlobStore {
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>,
+        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
     {
         MemoryBlobStore::keep(self, handles);
     }
 }
 
-impl<H> FromIterator<(Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBlobStore<H>
-where
-    H: HashProtocol,
-{
-    fn from_iter<I: IntoIterator<Item = (Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>)>>(
+impl FromIterator<(Value<Handle<UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBlobStore {
+    fn from_iter<I: IntoIterator<Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>)>>(
         iter: I,
     ) -> Self {
         let mut store = MemoryBlobStore::new();
@@ -259,12 +219,9 @@ where
     }
 }
 
-impl<H> IntoIterator for MemoryBlobStoreReader<H>
-where
-    H: HashProtocol,
-{
-    type Item = (Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>);
-    type IntoIter = MemoryBlobStoreIter<H>;
+impl IntoIterator for MemoryBlobStoreReader {
+    type Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>);
+    type IntoIter = MemoryBlobStoreIter;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
@@ -273,7 +230,6 @@ where
 #[derive(Debug)]
 pub enum MemoryStoreGetError<E: Error> {
     /// This error occurs when a blob is requested that does not exist in the store.
-    /// It is used to indicate that the requested blob could not be found.
     NotFound(),
     /// This error occurs when a blob is requested that exists, but cannot be converted to the requested type.
     ConversionFailed(E),
@@ -294,33 +250,23 @@ impl<E: Error> Error for MemoryStoreGetError<E> {}
 ///
 /// Yields `(Handle, Blob)` pairs. Owned snapshot via PATCH
 /// clones — does not borrow from the source reader.
-pub struct MemoryBlobStoreIter<H>
-where
-    H: HashProtocol,
-{
+pub struct MemoryBlobStoreIter {
     keys: crate::patch::PATCHIntoIterator<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
     lookup: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
-    _marker: PhantomData<H>,
 }
 
-impl<H> Debug for MemoryBlobStoreIter<H>
-where
-    H: HashProtocol,
-{
+impl Debug for MemoryBlobStoreIter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemoryBlobStoreIter").finish()
     }
 }
 
-impl<H> Iterator for MemoryBlobStoreIter<H>
-where
-    H: HashProtocol,
-{
-    type Item = (Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>);
+impl Iterator for MemoryBlobStoreIter {
+    type Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.keys.next()?;
-        let handle: Value<Handle<H, UnknownBlob>> = Value::new(key);
+        let handle: Value<Handle<UnknownBlob>> = Value::new(key);
         let blob = self
             .lookup
             .get(&key)
@@ -331,18 +277,12 @@ where
 }
 
 /// Adapter over [`MemoryBlobStoreIter`] that yields only blob handles.
-pub struct MemoryBlobStoreListIter<H>
-where
-    H: HashProtocol,
-{
-    inner: MemoryBlobStoreIter<H>,
+pub struct MemoryBlobStoreListIter {
+    inner: MemoryBlobStoreIter,
 }
 
-impl<H> Iterator for MemoryBlobStoreListIter<H>
-where
-    H: HashProtocol,
-{
-    type Item = Result<Value<Handle<H, UnknownBlob>>, Infallible>;
+impl Iterator for MemoryBlobStoreListIter {
+    type Item = Result<Value<Handle<UnknownBlob>>, Infallible>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (handle, _) = self.inner.next()?;
@@ -350,11 +290,8 @@ where
     }
 }
 
-impl<H> BlobStoreList<H> for MemoryBlobStoreReader<H>
-where
-    H: HashProtocol,
-{
-    type Iter<'a> = MemoryBlobStoreListIter<H>;
+impl BlobStoreList for MemoryBlobStoreReader {
+    type Iter<'a> = MemoryBlobStoreListIter;
     type Err = Infallible;
 
     fn blobs(&self) -> Self::Iter<'static> {
@@ -362,21 +299,18 @@ where
     }
 }
 
-impl<H> BlobStoreGet<H> for MemoryBlobStoreReader<H>
-where
-    H: HashProtocol,
-{
+impl BlobStoreGet for MemoryBlobStoreReader {
     type GetError<E: Error + Send + Sync + 'static> = MemoryStoreGetError<E>;
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema,
         T: TryFromBlob<S>,
     {
-        let handle: Value<Handle<H, UnknownBlob>> = handle.transmute();
+        let handle: Value<Handle<UnknownBlob>> = handle.transmute();
         let Some(blob) = self.blobs.get(&handle.raw) else {
             return Err(MemoryStoreGetError::NotFound());
         };
@@ -388,15 +322,12 @@ where
     }
 }
 
-impl<H: HashProtocol> crate::repo::BlobChildren<H> for MemoryBlobStoreReader<H> {}
+impl crate::repo::BlobChildren for MemoryBlobStoreReader {}
 
-impl<H> BlobStorePut<H> for MemoryBlobStore<H>
-where
-    H: HashProtocol,
-{
+impl BlobStorePut for MemoryBlobStore {
     type PutError = Infallible;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema,
         T: ToBlob<S>,
@@ -408,13 +339,11 @@ where
     }
 }
 
-impl<H: HashProtocol> BlobStore<H> for MemoryBlobStore<H> {
-    type Reader = MemoryBlobStoreReader<H>;
+impl BlobStore for MemoryBlobStore {
+    type Reader = MemoryBlobStoreReader;
     type ReaderError = Infallible;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        // O(1) PATCH clone — structural sharing means readers
-        // are independent snapshots without copying the data.
         Ok(MemoryBlobStoreReader::new(self.blobs.clone()))
     }
 }
@@ -430,11 +359,10 @@ mod tests {
     use fake::Fake;
 
     use blobschemas::LongString;
-    use valueschemas::Blake3;
     use valueschemas::Handle;
 
     attributes! {
-        "5AD0FAFB1FECBC197A385EC20166899E" as description: Handle<Blake3, LongString>;
+        "5AD0FAFB1FECBC197A385EC20166899E" as description: Handle<LongString>;
     }
 
     #[test]
@@ -449,7 +377,7 @@ mod tests {
                description: blobs.put(Bytes::from_source(Name(EN).fake::<String>()).view().unwrap()).unwrap()
             };
         }
-        blobs.keep(potential_handles::<Blake3>(&kb));
+        blobs.keep(potential_handles(&kb));
     }
 
     /// `MemoryBlobStoreReader` must be `Send + Sync` so it composes
@@ -457,21 +385,20 @@ mod tests {
     #[test]
     fn reader_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<MemoryBlobStoreReader<Blake3>>();
+        assert_send_sync::<MemoryBlobStoreReader>();
     }
 
     /// `reader()` returns an independent snapshot — writes after
     /// the reader is produced are not visible to that reader.
-    /// Same shape as `PileReader`.
     #[test]
     fn reader_is_a_pinned_snapshot() {
-        let mut store = MemoryBlobStore::<Blake3>::new();
-        let blob_a: Value<Handle<Blake3, LongString>> =
+        let mut store = MemoryBlobStore::new();
+        let blob_a: Value<Handle<LongString>> =
             store.put(Bytes::from_source("hello".to_string()).view().unwrap()).unwrap();
         let snapshot = store.reader().unwrap();
         assert_eq!(snapshot.len(), 1);
 
-        let _blob_b: Value<Handle<Blake3, LongString>> =
+        let _blob_b: Value<Handle<LongString>> =
             store.put(Bytes::from_source("world".to_string()).view().unwrap()).unwrap();
         // The snapshot still has only the original blob.
         assert_eq!(snapshot.len(), 1);
@@ -488,17 +415,17 @@ mod tests {
     /// `union` structurally merges two stores; handles round-trip.
     #[test]
     fn union_merges_and_preserves_handles() {
-        let mut a = MemoryBlobStore::<Blake3>::new();
-        let h_hello: Value<Handle<Blake3, LongString>> = a
+        let mut a = MemoryBlobStore::new();
+        let h_hello: Value<Handle<LongString>> = a
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
-        let mut b = MemoryBlobStore::<Blake3>::new();
-        let h_world: Value<Handle<Blake3, LongString>> = b
+        let mut b = MemoryBlobStore::new();
+        let h_world: Value<Handle<LongString>> = b
             .put(Bytes::from_source("world".to_string()).view().unwrap())
             .unwrap();
         // Idempotent overlap: putting "hello" in b too — union should
         // collapse the duplicate, not double-count.
-        let _h_hello_b: Value<Handle<Blake3, LongString>> = b
+        let _h_hello_b: Value<Handle<LongString>> = b
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
 

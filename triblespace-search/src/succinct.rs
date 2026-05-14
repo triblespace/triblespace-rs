@@ -729,7 +729,7 @@ const _: () = assert!(
 /// descent + ef-search, threshold-gated similarity), but the
 /// graph lives in a [`SuccinctGraph`] (bit-packed CSR over
 /// (layer, node) → neighbours) and nodes are
-/// `Value<Handle<Blake3, Embedding>>` rows in a
+/// `Value<Handle<Embedding>>` rows in a
 /// [`View<[[u8; 32]]>`] section of the canonical bytes.
 /// Embeddings live in the pile's blob store, content-addressed
 /// — queries resolve handles through the attached reader at
@@ -753,7 +753,7 @@ const _: () = assert!(
 /// use triblespace_search::schemas::{put_embedding, Embedding};
 /// use triblespace_search::succinct::SuccinctHNSWIndex;
 ///
-/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut store = MemoryBlobStore::new();
 /// let mut b = HNSWBuilder::new(4).with_seed(1);
 /// let mut handles = Vec::new();
 /// for v in [
@@ -761,7 +761,7 @@ const _: () = assert!(
 ///     vec![0.0, 1.0, 0.0, 0.0],
 ///     vec![0.9, 0.1, 0.0, 0.0],
 /// ] {
-///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     let h = put_embedding::<_>(&mut store, v.clone()).unwrap();
 ///     b.insert(h, v).unwrap();
 ///     handles.push(h);
 /// }
@@ -770,7 +770,7 @@ const _: () = assert!(
 /// let reader = store.reader().unwrap();
 /// let view = idx.attach(&reader);
 /// let hits: Vec<_> = find!(
-///     (n: Value<Handle<Blake3, Embedding>>),
+///     (n: Value<Handle<Embedding>>),
 ///     view.similar_to(handles[0], n, 0.8)
 /// )
 /// .map(|(h,)| h)
@@ -946,7 +946,7 @@ impl SuccinctHNSWIndex {
     /// ```
     ///
     /// The view wraps `store` in an internal
-    /// [`BlobCache`][c] keyed on `Handle<Blake3, Embedding>`,
+    /// [`BlobCache`][c] keyed on `Handle<Embedding>`,
     /// so the HNSW walk's repeat visits to the same node
     /// deserialize each embedding at most once per view.
     /// `B: Clone` so the cache can own the store; typical
@@ -955,7 +955,7 @@ impl SuccinctHNSWIndex {
     /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
-        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet + Clone,
     {
         AttachedSuccinctHNSWIndex {
             index: self,
@@ -982,16 +982,16 @@ impl SuccinctHNSWIndex {
 /// [c]: triblespace_core::blob::BlobCache
 pub struct AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     index: &'a SuccinctHNSWIndex,
-    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Embedding, anybytes::View<[f32]>>,
     ef_search: usize,
 }
 
 impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     /// Back-reference to the inner index.
     pub fn index(&self) -> &SuccinctHNSWIndex {
@@ -1221,7 +1221,7 @@ where
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace_core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet,
 {
     fn neighbours_above(
         &self,
@@ -1734,7 +1734,7 @@ impl BlobSchema for SuccinctBM25Blob {}
 
 // Default `describe` — fragment rooted at `Self::ID` with an
 // empty TribleSet. Lets `attributes!` declare value types like
-// `Handle<Blake3, SuccinctBM25Blob>` without the macro complaining
+// `Handle<SuccinctBM25Blob>` without the macro complaining
 // that the schema can't describe itself.
 impl MetaDescribe for SuccinctBM25Blob {
     fn describe() -> Fragment {
@@ -2331,13 +2331,13 @@ mod tests {
 
         // Small deterministic corpus of 4-D vectors. with_seed
         // locks the level sampling so the graph is reproducible.
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(4).with_seed(42);
         let mut handles = Vec::new();
         for i in 1..=16u8 {
             let f = i as f32;
             let vec = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-            let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+            let h = crate::schemas::put_embedding::<_>(&mut store, vec.clone()).unwrap();
             b.insert(h, vec).unwrap();
             handles.push(h);
         }
@@ -2366,13 +2366,10 @@ mod tests {
 
     fn build_succinct_hnsw_sample() -> (
         SuccinctHNSWIndex,
-        triblespace_core::blob::MemoryBlobStore<
-            triblespace_core::value::schemas::hash::Blake3,
-        >,
+        triblespace_core::blob::MemoryBlobStore,
         Vec<
             triblespace_core::value::Value<
                 triblespace_core::value::schemas::hash::Handle<
-                    triblespace_core::value::schemas::hash::Blake3,
                     crate::schemas::Embedding,
                 >,
             >,
@@ -2381,13 +2378,13 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::value::schemas::hash::Blake3;
-        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(4).with_seed(17);
         let mut handles = Vec::new();
         for i in 1..=20u8 {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.7).sin(), (f * 0.3).cos()];
-            let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+            let h = crate::schemas::put_embedding::<_>(&mut store, v.clone()).unwrap();
             b.insert(h, v).unwrap();
             handles.push(h);
         }
@@ -2436,8 +2433,8 @@ mod tests {
         let reloaded: SuccinctHNSWIndex =
             SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
-        let probe = crate::schemas::put_embedding::<_, Blake3>(
+        let mut store: MemoryBlobStore = MemoryBlobStore::new();
+        let probe = crate::schemas::put_embedding::<_>(
             &mut store,
             vec![1.0, 0.0, 0.0],
         )
@@ -2512,8 +2509,8 @@ mod tests {
         use triblespace_core::value::schemas::hash::Blake3;
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
-        let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
-        let probe = crate::schemas::put_embedding::<_, Blake3>(
+        let mut store: MemoryBlobStore = MemoryBlobStore::new();
+        let probe = crate::schemas::put_embedding::<_>(
             &mut store,
             vec![1.0, 0.0, 0.0],
         )

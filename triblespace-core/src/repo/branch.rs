@@ -51,13 +51,13 @@ fn now_updated_at() -> Value<NsTAIInterval> {
 pub fn branch_metadata(
     signing_key: &SigningKey,
     branch_id: Id,
-    name: Value<Handle<Blake3, LongString>>,
+    name: Value<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
+    rollup: Option<Value<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let (head_handle, signed_by, signature) = match commit_head.as_ref() {
         Some(blob) => (
-            Some(blob.get_handle::<Blake3>()),
+            Some(blob.get_handle()),
             Some(signing_key.verifying_key()),
             Some(signing_key.sign(&blob.bytes)),
         ),
@@ -84,13 +84,13 @@ pub fn branch_metadata(
 /// therefore be created without access to a private key.
 pub fn branch_unsigned(
     branch_id: Id,
-    name: Value<Handle<Blake3, LongString>>,
+    name: Value<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
+    rollup: Option<Value<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let head_handle = commit_head
         .as_ref()
-        .map(|blob| blob.get_handle::<Blake3>());
+        .map(|blob| blob.get_handle());
     let updated_at = now_updated_at();
 
     let fragment = entity! {

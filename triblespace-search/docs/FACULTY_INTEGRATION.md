@@ -48,8 +48,8 @@ use triblespace_search::tokens::hash_tokens;
 
 // Assume a `wiki` namespace is already in the pile, providing:
 //   wiki::title:   ShortString                   (fragment title)
-//   wiki::body:    Handle<Blake3, LongString>    (typst body)
-//   wiki::index:   Handle<Blake3, SuccinctBM25Blob>  (current-index handle)
+//   wiki::body:    Handle<LongString>    (typst body)
+//   wiki::index:   Handle<SuccinctBM25Blob>  (current-index handle)
 mod wiki { /* ... */ }
 
 #[derive(Parser)]
@@ -303,7 +303,7 @@ impl MetaDescribe for WikiBm25Handle {
         Ok(Fragment::rooted(id_hex!("…"), TribleSet::new()))
     }
 }
-// value type: Handle<Blake3, SuccinctBM25Blob>
+// value type: Handle<SuccinctBM25Blob>
 ```
 
 the attribute's schema id is your stable contract for

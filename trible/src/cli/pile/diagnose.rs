@@ -45,7 +45,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace_core::value::schemas::hash::{Blake3, Handle, Hash};
     use triblespace_core::value::Value;
 
-    match Pile::<Blake3>::open(pile_path) {
+    match Pile::open(pile_path) {
         Ok(mut pile) => {
             let res = (|| -> Result<(), anyhow::Error> {
                 let mut any_error = false;
@@ -97,14 +97,14 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                     id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
 
                 fn verify_chain(
-                    reader: &triblespace_core::repo::pile::PileReader<Blake3>,
-                    start: Value<Handle<Blake3, SimpleArchive>>,
+                    reader: &triblespace_core::repo::pile::PileReader,
+                    start: Value<Handle<SimpleArchive>>,
                     repo_parent_attr: triblespace_core::id::Id,
                     repo_content_attr: triblespace_core::id::Id,
                 ) -> (usize, Option<String>) {
                     use std::collections::BTreeSet;
                     let mut visited: BTreeSet<String> = BTreeSet::new();
-                    let mut stack: Vec<Value<Handle<Blake3, SimpleArchive>>> = vec![start];
+                    let mut stack: Vec<Value<Handle<SimpleArchive>>> = vec![start];
                     let mut count = 0usize;
                     while let Some(h) = stack.pop() {
                         let hh: Value<Hash<Blake3>> = Handle::to_hash(h);
@@ -133,13 +133,13 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 )
                             }
                         };
-                        let mut content_handle: Option<Value<Handle<Blake3, SimpleArchive>>> = None;
-                        let mut parents: Vec<Value<Handle<Blake3, SimpleArchive>>> = Vec::new();
+                        let mut content_handle: Option<Value<Handle<SimpleArchive>>> = None;
+                        let mut parents: Vec<Value<Handle<SimpleArchive>>> = Vec::new();
                         for t in meta.iter() {
                             if t.a() == &repo_content_attr {
-                                content_handle = Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                                content_handle = Some(*t.v::<Handle<SimpleArchive>>());
                             } else if t.a() == &repo_parent_attr {
-                                parents.push(*t.v::<Handle<Blake3, SimpleArchive>>());
+                                parents.push(*t.v::<Handle<SimpleArchive>>());
                             }
                         }
                         // Some commits (for example merge-only commits) intentionally do not carry
@@ -183,7 +183,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                         Some(meta_handle) => {
                             let meta_present = reader.metadata(meta_handle)?.is_some();
                             let mut name_val: Option<String> = None;
-                            let mut head_val: Option<Value<Handle<Blake3, SimpleArchive>>> = None;
+                            let mut head_val: Option<Value<Handle<SimpleArchive>>> = None;
                             let mut meta_err: Option<String> = None;
                             let name_attr = triblespace_core::metadata::name.id();
                             if meta_present {
@@ -191,7 +191,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                     Ok(meta) => {
                                         for t in meta.iter() {
                                             if t.a() == &name_attr {
-                                                let h: Value<Handle<Blake3, LongString>> = *t.v();
+                                                let h: Value<Handle<LongString>> = *t.v();
                                                 if let Ok(view) =
                                                     reader.get::<triblespace::prelude::View<str>, _>(h)
                                                 {
@@ -199,7 +199,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                                 }
                                             } else if t.a() == &repo_head_attr {
                                                 head_val =
-                                                    Some(*t.v::<Handle<Blake3, SimpleArchive>>());
+                                                    Some(*t.v::<Handle<SimpleArchive>>());
                                             }
                                         }
                                     }

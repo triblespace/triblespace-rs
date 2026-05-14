@@ -53,7 +53,6 @@ use crate::prelude::blobschemas::SimpleArchive;
 use crate::prelude::valueschemas::Handle;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Hash;
-use crate::value::schemas::hash::HashProtocol;
 use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -113,7 +112,7 @@ struct BranchHeader {
 }
 
 impl BranchHeader {
-    fn new<H: HashProtocol>(branch_id: Id, hash: Value<Handle<H, SimpleArchive>>) -> Self {
+    fn new(branch_id: Id, hash: Value<Handle<SimpleArchive>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BRANCH,
             branch_id: *branch_id,
@@ -151,7 +150,7 @@ struct BlobHeader {
 }
 
 impl BlobHeader {
-    fn new<H: HashProtocol>(timestamp: u64, length: u64, hash: Value<Hash<H>>) -> Self {
+    fn new(timestamp: u64, length: u64, hash: Value<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB,
             timestamp,
@@ -162,9 +161,9 @@ impl BlobHeader {
 }
 
 #[derive(Debug)]
-enum Applied<H: HashProtocol> {
-    Blob { hash: Value<Hash<H>> },
-    Branch { id: Id, hash: Value<Hash<H>> },
+enum Applied {
+    Blob { hash: Value<Hash<Blake3>> },
+    Branch { id: Id, hash: Value<Hash<Blake3>> },
     BranchTombstone { id: Id },
 }
 
@@ -177,11 +176,11 @@ enum Applied<H: HashProtocol> {
 /// [`Pile::refresh`] aborts immediately if the underlying file shrinks below
 /// data that has already been applied, preventing undefined behavior from
 /// dangling [`Bytes`] handles.
-pub struct Pile<H: HashProtocol = Blake3> {
+pub struct Pile {
     file: File,
     mmap: Arc<MmapRaw>,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
-    branches: PATCH<16, IdentitySchema, Value<Handle<H, SimpleArchive>>>,
+    branches: PATCH<16, IdentitySchema, Value<Handle<SimpleArchive>>>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -198,64 +197,58 @@ fn padding_for_blob(blob_size: usize) -> usize {
 ///
 /// Multiple `PileReader` instances can coexist and provide concurrent access to
 /// the same underlying pile data.
-pub struct PileReader<H: HashProtocol> {
+pub struct PileReader {
     mmap: Arc<MmapRaw>,
-    blobs: PATCH<32, IdentitySchema, IndexEntry>,
-    _marker: std::marker::PhantomData<H>,
-}
+    blobs: PATCH<32, IdentitySchema, IndexEntry>,}
 
-impl<H: HashProtocol> PartialEq for PileReader<H> {
+impl PartialEq for PileReader {
     fn eq(&self, other: &Self) -> bool {
         self.blobs == other.blobs
     }
 }
 
-impl<H: HashProtocol> Eq for PileReader<H> {}
+impl Eq for PileReader {}
 
-impl<H: HashProtocol> PileReader<H> {
+impl PileReader {
     fn new(mmap: Arc<MmapRaw>, blobs: PATCH<32, IdentitySchema, IndexEntry>) -> Self {
         Self {
             mmap,
-            blobs,
-            _marker: std::marker::PhantomData,
-        }
+            blobs,        }
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
     ///
     /// This creates an owned snapshot of the current keys/indices so the
     /// returned iterator does not borrow from the underlying PATCH.
-    pub fn iter(&self) -> PileBlobStoreIter<H> {
+    pub fn iter(&self) -> PileBlobStoreIter {
         // Clone the PATCH (cheap copy-on-write) and create two clones: one
         // consumed by the iterator and one retained for lookups of index
         // entries while iterating.
         let for_iter = self.blobs.clone();
         let lookup = for_iter.clone();
         let inner = for_iter.into_iter();
-        PileBlobStoreIter::<H> {
+        PileBlobStoreIter {
             mmap: self.mmap.clone(),
             inner,
-            lookup,
-            _marker: std::marker::PhantomData,
-        }
+            lookup,        }
     }
 
     // metadata moved into BlobStoreMeta impl below
 }
 
-impl<H: HashProtocol> BlobStoreGet<H> for PileReader<H> {
+impl BlobStoreGet for PileReader {
     type GetError<E: Error + Send + Sync + 'static> = GetBlobError<E>;
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
-        let hash: &Value<Hash<H>> = handle.as_transmute();
+        let hash: &Value<Hash<Blake3>> = handle.as_transmute();
         let Some(entry) = self.blobs.get(&hash.raw) else {
             return Err(GetBlobError::BlobNotFound);
         };
@@ -269,7 +262,7 @@ impl<H: HashProtocol> BlobStoreGet<H> for PileReader<H> {
             Bytes::from_raw_parts(slice, self.mmap.clone())
         };
         let state = state.get_or_init(|| {
-            let computed_hash = Hash::<H>::digest(&bytes);
+            let computed_hash = Hash::<Blake3>::digest(&bytes);
             if computed_hash == *hash {
                 ValidationState::Validated
             } else {
@@ -289,10 +282,10 @@ impl<H: HashProtocol> BlobStoreGet<H> for PileReader<H> {
     }
 }
 
-impl<H: HashProtocol> super::BlobChildren<H> for PileReader<H> {}
+impl super::BlobChildren for PileReader {}
 
-impl<H: HashProtocol> BlobStore<H> for Pile<H> {
-    type Reader = PileReader<H>;
+impl BlobStore for Pile {
+    type Reader = PileReader;
     type ReaderError = ReadError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
@@ -475,7 +468,7 @@ impl std::fmt::Display for FlushError {
 
 impl std::error::Error for FlushError {}
 
-impl<H: HashProtocol> Pile<H> {
+impl Pile {
     /// Opens an existing pile file. Returns an error if the file does not
     /// exist — create the file first with [`std::fs::File::create`] or
     /// equivalent if you need a fresh pile.
@@ -503,7 +496,7 @@ impl<H: HashProtocol> Pile<H> {
             file,
             mmap,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
-            branches: PATCH::<16, IdentitySchema, Value<Handle<H, SimpleArchive>>>::new(),
+            branches: PATCH::<16, IdentitySchema, Value<Handle<SimpleArchive>>>::new(),
             applied_length: 0,
         })
     }
@@ -531,7 +524,7 @@ impl<H: HashProtocol> Pile<H> {
     /// Aborts if the pile file is observed to shrink below the portion already
     /// applied, which would otherwise leave existing `Bytes` handles dangling
     /// and lead to undefined behavior.
-    fn apply_next(&mut self) -> Result<Option<Applied<H>>, ReadError> {
+    fn apply_next(&mut self) -> Result<Option<Applied>, ReadError> {
         let file_len = self.file.metadata()?.len() as usize;
         if file_len < self.applied_length {
             // Truncation below `applied_length` invalidates previously issued
@@ -584,7 +577,7 @@ impl<H: HashProtocol> Pile<H> {
                 bytes.take_prefix(pad).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
-                let hash: Value<Hash<H>> = Value::new(header.hash);
+                let hash: Value<Hash<Blake3>> = Value::new(header.hash);
                 let ts = header.timestamp;
                 let entry =
                     Entry::with_value(&hash.raw, IndexEntry::new(data_offset, header.length, ts));
@@ -606,7 +599,7 @@ impl<H: HashProtocol> Pile<H> {
                                 .unwrap();
                                 Bytes::from_raw_parts(slice, self.mmap.clone())
                             };
-                            let computed = Hash::<H>::digest(&bytes);
+                            let computed = Hash::<Blake3>::digest(&bytes);
                             if computed == hash {
                                 ValidationState::Validated
                             } else {
@@ -633,8 +626,8 @@ impl<H: HashProtocol> Pile<H> {
                 })?;
                 // Interpret the stored raw value as a hash and transmute into a
                 // handle value for storage. Use Entry to insert/replace into the PATCH.
-                let hash: Value<Hash<H>> = Value::new(header.hash);
-                let handle_val: Value<Handle<H, SimpleArchive>> = hash.into();
+                let hash: Value<Hash<Blake3>> = Value::new(header.hash);
+                let handle_val: Value<Handle<SimpleArchive>> = hash.into();
                 let entry = Entry::with_value(&header.branch_id, handle_val);
                 // Replace existing mapping (if any) with the new head.
                 self.branches.replace(&entry);
@@ -720,7 +713,7 @@ impl<H: HashProtocol> Pile<H> {
     }
 }
 
-impl<H: HashProtocol> Drop for Pile<H> {
+impl Drop for Pile {
     fn drop(&mut self) {
         eprintln!("warning: Pile dropped without calling close(); data may not be persisted");
     }
@@ -728,7 +721,7 @@ impl<H: HashProtocol> Drop for Pile<H> {
 
 // Implement the repository storage close trait so callers can call
 // `repo.close()` when the repository was created with a `Pile` storage.
-impl<H: HashProtocol> crate::repo::StorageClose for Pile<H> {
+impl crate::repo::StorageClose for Pile {
     type Error = FlushError;
 
     fn close(self) -> Result<(), Self::Error> {
@@ -749,21 +742,19 @@ use super::PushResult;
 /// Owned iterator over all blobs currently stored in the pile. This collects
 /// a snapshot of keys/indices at iterator creation so the iterator does not
 /// borrow the underlying [`PATCH`] and can live independently of the [`Pile`].
-pub struct PileBlobStoreIter<H: HashProtocol> {
+pub struct PileBlobStoreIter {
     mmap: Arc<MmapRaw>,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
     /// Owned clone of the PATCH used for lookups of IndexEntry by key.
-    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,
-    _marker: std::marker::PhantomData<H>,
-}
+    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,}
 
-impl<H: HashProtocol> Iterator for PileBlobStoreIter<H> {
+impl Iterator for PileBlobStoreIter {
     type Item =
-        Result<(Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
+        Result<(Value<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?; // [u8;32]
-        let hash = Value::<Hash<H>>::new(key);
+        let hash = Value::<Hash<Blake3>>::new(key);
         // Look up the index entry inside the owned PATCH clone held by the
         // `lookup` field. The clone is cheap and allows us to resolve index
         // entries without borrowing the live PATCH.
@@ -778,7 +769,7 @@ impl<H: HashProtocol> Iterator for PileBlobStoreIter<H> {
                 Bytes::from_raw_parts(slice, self.mmap.clone())
             };
             let state = state.get_or_init(|| {
-                let computed_hash = Hash::<H>::digest(&bytes);
+                let computed_hash = Hash::<Blake3>::digest(&bytes);
                 if computed_hash == hash {
                     ValidationState::Validated
                 } else {
@@ -788,7 +779,7 @@ impl<H: HashProtocol> Iterator for PileBlobStoreIter<H> {
             match state {
                 ValidationState::Validated => {
                     let blob: Blob<UnknownBlob> = Blob::new(bytes.clone());
-                    let handle: Value<Handle<H, UnknownBlob>> = hash.into();
+                    let handle: Value<Handle<UnknownBlob>> = hash.into();
                     Some(Ok((handle, blob)))
                 }
                 ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes.clone()))),
@@ -803,25 +794,23 @@ impl<H: HashProtocol> Iterator for PileBlobStoreIter<H> {
 
 /// Adapter that yields only the blob handles. The iterator owns the handle
 /// list and does not borrow the backing [`PATCH`].
-pub struct PileBlobStoreListIter<H: HashProtocol> {
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
-    _marker: std::marker::PhantomData<H>,
-}
+pub struct PileBlobStoreListIter {
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,}
 
-impl<H: HashProtocol> Iterator for PileBlobStoreListIter<H> {
-    type Item = Result<Value<Handle<H, UnknownBlob>>, GetBlobError<Infallible>>;
+impl Iterator for PileBlobStoreListIter {
+    type Item = Result<Value<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?;
-        let hash = Value::<Hash<H>>::new(key);
-        let handle: Value<Handle<H, UnknownBlob>> = hash.into();
+        let hash = Value::<Hash<Blake3>>::new(key);
+        let handle: Value<Handle<UnknownBlob>> = hash.into();
         Some(Ok(handle))
     }
 }
 
-impl<H: HashProtocol> BlobStoreList<H> for PileReader<H> {
+impl BlobStoreList for PileReader {
     type Err = GetBlobError<Infallible>;
-    type Iter<'a> = PileBlobStoreListIter<H>;
+    type Iter<'a> = PileBlobStoreListIter;
 
     fn blobs(&self) -> Self::Iter<'_> {
         // Clone the PATCH and create an owned iterator over its keys so we do
@@ -829,10 +818,8 @@ impl<H: HashProtocol> BlobStoreList<H> for PileReader<H> {
         // being cheap (PATCH clone is copy-on-write).
         let cloned = self.blobs.clone();
         let inner = cloned.into_iter();
-        PileBlobStoreListIter::<H> {
-            inner,
-            _marker: std::marker::PhantomData,
-        }
+        PileBlobStoreListIter {
+            inner,        }
     }
 
     /// Cheap PATCH-level set difference between this reader's blob index
@@ -841,21 +828,19 @@ impl<H: HashProtocol> BlobStoreList<H> for PileReader<H> {
     /// the two snapshots without having to enumerate either side.
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         let diff = self.blobs.difference(&old.blobs);
-        PileBlobStoreListIter::<H> {
-            inner: diff.into_iter(),
-            _marker: std::marker::PhantomData,
-        }
+        PileBlobStoreListIter {
+            inner: diff.into_iter(),        }
     }
 }
 
 /// Iterator over branch ids stored in the pile's PATCH, using the PATCH's
 /// built-in key iterator to avoid allocating a full Vec of ids.
-pub struct PileBranchStoreIter<H: HashProtocol> {
+pub struct PileBranchStoreIter {
     inner:
-        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Value<Handle<H, SimpleArchive>>>,
+        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Value<Handle<SimpleArchive>>>,
 }
 
-impl<H: HashProtocol> Iterator for PileBranchStoreIter<H> {
+impl Iterator for PileBranchStoreIter {
     type Item = Result<Id, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -869,7 +854,7 @@ impl<H: HashProtocol> Iterator for PileBranchStoreIter<H> {
     }
 }
 
-impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
+impl BlobStorePut for Pile {
     type PutError = InsertError;
 
     /// Inserts a blob into the pile and returns its handle.
@@ -883,11 +868,11 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
     /// so a multi-`write` record is still crash-safe. Multiple writers
     /// are safe only on filesystems guaranteeing atomic `write`/`vwrite`
     /// appends; other filesystems may corrupt the pile.
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         let blob = ToBlob::to_blob(item);
         let blob_size = blob.bytes.len();
@@ -906,8 +891,8 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
         let res = (|| {
             self.refresh_locked().map_err(InsertError::from)?;
 
-            let handle: Value<Handle<H, S>> = blob.get_handle();
-            let hash: Value<Hash<H>> = handle.into();
+            let handle: Value<Handle<S>> = blob.get_handle();
+            let hash: Value<Hash<Blake3>> = handle.into();
 
             if let Some(IndexEntry {
                 state, offset, len, ..
@@ -921,7 +906,7 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
                                 .unwrap();
                         Bytes::from_raw_parts(slice, self.mmap.clone())
                     };
-                    let computed = Hash::<H>::digest(&bytes);
+                    let computed = Hash::<Blake3>::digest(&bytes);
                     if computed == hash {
                         ValidationState::Validated
                     } else {
@@ -986,17 +971,16 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
     }
 }
 
-impl<H> BranchStore<H> for Pile<H>
-where
-    H: HashProtocol,
+impl BranchStore for Pile
 {
+
     type BranchesError = ReadError;
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
     type HeadError = ReadError;
     type UpdateError = UpdateBranchError;
 
-    type ListIter<'a> = PileBranchStoreIter<H>;
+    type ListIter<'a> = PileBranchStoreIter;
 
     fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
         // Ensure newly appended records are applied before enumerating
@@ -1010,7 +994,7 @@ where
         Ok(PileBranchStoreIter { inner })
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<H, SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
         // Ensure newly appended records are applied before returning the head.
         // This keeps callers up-to-date with any external writers that appended
         // to the pile file.
@@ -1034,9 +1018,9 @@ where
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<H, SimpleArchive>>>,
-        new: Option<Value<Handle<H, SimpleArchive>>>,
-    ) -> Result<super::PushResult<H>, Self::UpdateError> {
+        old: Option<Value<Handle<SimpleArchive>>>,
+        new: Option<Value<Handle<SimpleArchive>>>,
+    ) -> Result<super::PushResult, Self::UpdateError> {
         self.file.lock()?;
         let res = (|| {
             self.refresh_locked().map_err(UpdateBranchError::from)?;
@@ -1093,19 +1077,19 @@ where
     }
 }
 
-impl<H: HashProtocol> crate::repo::BlobStoreMeta<H> for PileReader<H> {
+impl crate::repo::BlobStoreMeta for PileReader {
     type MetaError = std::convert::Infallible;
 
     fn metadata<S>(
         &self,
-        handle: Value<Handle<H, S>>,
+        handle: Value<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<H, S>: ValueSchema,
+        Handle<S>: ValueSchema,
     {
         // re-use existing implementation logic
-        let hash: &Value<Hash<H>> = handle.as_transmute();
+        let hash: &Value<Hash<Blake3>> = handle.as_transmute();
         let entry = match self.blobs.get(&hash.raw) {
             Some(e) => e,
             None => return Ok(None),
@@ -1123,7 +1107,7 @@ impl<H: HashProtocol> crate::repo::BlobStoreMeta<H> for PileReader<H> {
             Bytes::from_raw_parts(slice, self.mmap.clone())
         };
         let state = state.get_or_init(|| {
-            let computed_hash = Hash::<H>::digest(&bytes);
+            let computed_hash = Hash::<Blake3>::digest(&bytes);
             if computed_hash == *hash {
                 ValidationState::Validated
             } else {
@@ -1181,7 +1165,7 @@ mod tests {
 
         pile.close().unwrap();
 
-        let mut reopened: Pile<Blake3> = Pile::open(&tmp_pile).unwrap();
+        let mut reopened: Pile = Pile::open(&tmp_pile).unwrap();
         reopened.restore().unwrap();
         reopened.close().unwrap();
     }
@@ -1203,7 +1187,7 @@ mod tests {
         let len = file.metadata().unwrap().len();
         file.set_len(len - 10).unwrap();
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
@@ -1229,7 +1213,7 @@ mod tests {
             .set_len(file_len - 10)
             .unwrap();
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         match pile.refresh() {
             Err(ReadError::CorruptPile { valid_length }) => assert_eq!(valid_length, 0),
             other => panic!("unexpected result: {other:?}"),
@@ -1258,7 +1242,7 @@ mod tests {
             .write_all(&[0u8; 16])
             .unwrap();
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
@@ -1284,7 +1268,7 @@ mod tests {
             .set_len(file_len + 8)
             .unwrap();
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         match pile.refresh() {
             Err(ReadError::CorruptPile { valid_length }) => {
                 assert_eq!(valid_length as u64, file_len)
@@ -1319,7 +1303,7 @@ mod tests {
         file.flush().unwrap();
         drop(file);
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         match pile.refresh() {
             Err(ReadError::CorruptPile { valid_length }) => assert_eq!(valid_length, 0),
             other => panic!("unexpected result: {other:?}"),
@@ -1352,7 +1336,7 @@ mod tests {
         file.flush().unwrap();
         drop(file);
 
-        let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
+        let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
@@ -1419,7 +1403,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
 
         // Stage three baseline blobs and snapshot the reader.
-        let mut baseline_handles: HashSet<Value<Handle<Blake3, UnknownBlob>>> = HashSet::new();
+        let mut baseline_handles: HashSet<Value<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![1u8; 3], vec![2u8; 4], vec![3u8; 5]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
             let handle = pile.put(blob).unwrap();
@@ -1428,7 +1412,7 @@ mod tests {
         let baseline = pile.reader().unwrap();
 
         // Stage two more blobs after taking the baseline snapshot.
-        let mut new_handles: HashSet<Value<Handle<Blake3, UnknownBlob>>> = HashSet::new();
+        let mut new_handles: HashSet<Value<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![4u8; 6], vec![5u8; 7]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
             let handle = pile.put(blob).unwrap();
@@ -1437,7 +1421,7 @@ mod tests {
 
         // Diff the current reader against the baseline.
         let current = pile.reader().unwrap();
-        let diffed: HashSet<Value<Handle<Blake3, UnknownBlob>>> = current
+        let diffed: HashSet<Value<Handle<UnknownBlob>>> = current
             .blobs_diff(&baseline)
             .map(|r| r.expect("infallible diff iter"))
             .collect();
@@ -1511,7 +1495,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
 
         let branch_id = Id::new([1; 16]).unwrap();
-        let head = Value::<Handle<Blake3, SimpleArchive>>::new([2; 32]);
+        let head = Value::<Handle<SimpleArchive>>::new([2; 32]);
         pile.update(branch_id, None, Some(head)).unwrap();
 
         let data = vec![3u8; 8];

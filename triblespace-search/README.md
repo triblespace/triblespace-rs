@@ -15,7 +15,7 @@ Two blob types, loaded zero-copy via [anybytes] and [jerky]:
   `A96890DE5F85A4F2285C365549B21BC2`) — approximate cosine
   similarity over caller-supplied embedding handles. Graph
   stored as per-(layer, node) CSR in two jerky `CompactVector`s.
-  Nodes are `Handle<Blake3, Embedding>` values; the caller's
+  Nodes are `Handle<Embedding>` values; the caller's
   doc-to-embedding mapping is a trible they own, not a shadow
   datamodel inside the index.
 
@@ -66,8 +66,7 @@ remaining open items are perf/encoding refinements, not architecture.
   mapping lives in their tribles, not here.
 * **Binary-relation similarity constraint** `similar(a, b,
   score_floor)` produced by the `similar()` method on any
-  attached view. `a` and `b` are `Variable<Handle<Blake3,
-  Embedding>>`; `score_floor` is a fixed cosine threshold.
+  attached view. `a` and `b` are `Variable<Handle<  Embedding>>`; `score_floor` is a fixed cosine threshold.
   Callers who need the exact score fetch both embeddings and
   compute cosine directly — no u16 quantization.
 * **Shared constraint trait** `SimilaritySearch` (HNSW, Flat,

@@ -29,12 +29,12 @@ pub mod schema {
     attributes! {
         "3E062AA7E3554C8F2DB94883CE639BFE" as pub session: GenId;
         "146E5AA2F7CB3D8B654BC7742A13CAB3" as pub parent: GenId;
-        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<Blake3, LongString>;
+        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<LongString>;
         "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: ShortString;
         "E11A84A30CC112650DC860B66B8BD8A9" as pub begin_ns: U256BE;
         "2786FA563372FB6EF469EC7710719A49" as pub end_ns: U256BE;
         "7593602383D0B0D21BBE382A67E5BD9F" as pub duration_ns: U256BE;
-        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<Blake3, LongString>;
+        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<LongString>;
     }
 
     #[allow(non_upper_case_globals)]
@@ -84,12 +84,12 @@ fn is_valid_short(value: &str) -> bool {
 }
 
 struct ThreadTelemetry {
-    workspace: Workspace<Pile<Blake3>>,
+    workspace: Workspace<Pile>,
     last_flush: Instant,
 }
 
 struct TelemetryInner {
-    repo: Mutex<Option<Repository<Pile<Blake3>>>>,
+    repo: Mutex<Option<Repository<Pile>>>,
     workspaces: ThreadLocal<Arc<Mutex<ThreadTelemetry>>>,
     registry: Mutex<Vec<Arc<Mutex<ThreadTelemetry>>>>,
     session: Id,
@@ -331,7 +331,7 @@ impl Telemetry {
         if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).ok()?;
         }
-        let mut pile = Pile::<Blake3>::open(&pile_path).ok()?;
+        let mut pile = Pile::open(&pile_path).ok()?;
         if pile.restore().is_err() {
             let _ = pile.close();
             return None;
@@ -440,7 +440,7 @@ impl Drop for Telemetry {
 }
 
 fn span_begin(
-    ws: &mut Workspace<Pile<Blake3>>,
+    ws: &mut Workspace<Pile>,
     session: Id,
     span_id: Id,
     parent: Option<Id>,
@@ -467,7 +467,7 @@ fn span_begin(
     ws.commit(tribles, "telemetry span");
 }
 
-fn span_end(ws: &mut Workspace<Pile<Blake3>>, span_id: Id, at_ns: u64, duration_ns: u64) {
+fn span_end(ws: &mut Workspace<Pile>, span_id: Id, at_ns: u64, duration_ns: u64) {
     let span_entity = ExclusiveId::force_ref(&span_id);
     let mut tribles = TribleSet::new();
     tribles += entity! { span_entity @

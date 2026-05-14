@@ -16,7 +16,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
 
     let dir = tempdir()?;
     let url = Url::parse(&format!("file://{}", dir.path().display()))?;
-    let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+    let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
 
     let contents = b"hello world".to_vec();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from(contents.clone()));
