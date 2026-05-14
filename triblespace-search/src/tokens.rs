@@ -25,12 +25,10 @@
 
 use std::convert::Infallible;
 
-use triblespace_core::id::Id;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{Value, ValueSchema};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both

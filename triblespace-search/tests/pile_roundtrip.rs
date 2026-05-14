@@ -14,7 +14,7 @@ use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Value;
 
 use triblespace_search::bm25::BM25Builder;

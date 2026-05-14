@@ -13,7 +13,7 @@ use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Value;
 
 use triblespace_search::bm25::BM25Builder;

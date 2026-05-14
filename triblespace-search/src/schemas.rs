@@ -21,12 +21,10 @@ use std::convert::Infallible;
 
 use anybytes::View;
 use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
-use triblespace_core::id::Id;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte

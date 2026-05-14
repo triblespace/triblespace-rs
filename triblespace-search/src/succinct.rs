@@ -40,13 +40,12 @@ use triblespace_core::blob::schemas::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
 use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
-use triblespace_core::id::Id;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{RawValue, Value, ValueSchema};
 
 use crate::schemas::{EmbHandle, Embedding};
