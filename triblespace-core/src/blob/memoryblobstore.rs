@@ -129,19 +129,21 @@ impl MemoryBlobStore {
         }
     }
 
-    /// Inserts `blob` into the store and returns the newly computed handle.
+    /// Inserts `blob` into the store and returns its handle.
     ///
-    /// Idempotent: PATCH's `insert` is a no-op when the key is already
-    /// present, which matches blob-store semantics (handles are
-    /// content-addressed, so a duplicate-key insert is also a duplicate-value
-    /// insert).
+    /// O(1) over the handle computation — the handle was hashed once
+    /// at `Blob::new` and cached in the blob; this method reuses it.
+    /// Idempotent at the PATCH level: re-inserting the same handle is
+    /// a no-op, which matches the content-addressed semantics
+    /// (same handle ⇒ same bytes).
     pub fn insert<S>(&mut self, blob: Blob<S>) -> Value<Handle<S>>
     where
         S: BlobSchema,
+        Handle<S>: crate::value::ValueSchema,
     {
         let handle: Value<Handle<S>> = blob.get_handle();
         let unknown_handle: Value<Handle<UnknownBlob>> = handle.transmute();
-        let blob: Blob<UnknownBlob> = blob.transmute();
+        let blob: Blob<UnknownBlob> = blob.transmute::<UnknownBlob>();
         let entry = Entry::with_value(&unknown_handle.raw, blob);
         self.blobs.insert(&entry);
         handle

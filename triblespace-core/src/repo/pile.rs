@@ -271,7 +271,9 @@ impl BlobStoreGet for PileReader {
         });
         match state {
             ValidationState::Validated => {
-                let blob: Blob<S> = Blob::new(bytes.clone());
+                // The handle is what we just validated against — reuse
+                // it to skip Blake3 recomputation in Blob::new.
+                let blob: Blob<S> = Blob::with_handle(bytes.clone(), handle);
                 match blob.try_from_blob() {
                     Ok(value) => Ok(value),
                     Err(e) => Err(GetBlobError::ConversionError(e)),
@@ -778,8 +780,12 @@ impl Iterator for PileBlobStoreIter {
             });
             match state {
                 ValidationState::Validated => {
-                    let blob: Blob<UnknownBlob> = Blob::new(bytes.clone());
                     let handle: Value<Handle<UnknownBlob>> = hash.into();
+                    // We just validated against `hash`; pre-seed the
+                    // cached handle so downstream `get_handle` /
+                    // `insert` skip the Blake3 recompute.
+                    let blob: Blob<UnknownBlob> =
+                        Blob::with_handle(bytes.clone(), handle);
                     Some(Ok((handle, blob)))
                 }
                 ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes.clone()))),

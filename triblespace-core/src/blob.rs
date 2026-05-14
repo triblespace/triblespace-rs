@@ -33,35 +33,98 @@ pub use memoryblobstore::MemoryBlobStore;
 /// Re-export of `anybytes::Bytes` for blob payloads.
 pub use anybytes::Bytes;
 
-/// A blob is a immutable sequence of bytes that can be used to represent any kind of data.
-/// It is the fundamental building block of data storage and transmission.
-/// The [`BlobSchema`] type parameter is used to define the abstract schema type of a blob.
-/// This is similar to the [`Value`] type and the [`ValueSchema`] trait in the [`value`](crate::value) module.
-#[repr(transparent)]
+/// A blob is an immutable sequence of bytes plus its eagerly-cached
+/// Blake3 content-addressed handle.
+///
+/// The handle is computed once at construction (`Blob::new` / `Blob::transmute`)
+/// and cached in the struct, so subsequent calls to `get_handle()` and
+/// `MemoryBlobStore::insert(blob)` are O(1) — no recompute. Schemas
+/// are still distinguished at the type level via the phantom marker,
+/// and `transmute` carries the cached handle across schema casts (the
+/// hash is over bytes, not over schema, so the handle bytes don't
+/// change).
+///
+/// The layout was previously `#[repr(transparent)]` around `Bytes` for
+/// the same-size guarantee. We've deliberately given that up: the
+/// double-hash that came with computing the handle at every insert
+/// site was a real cost the cache eliminates, and the only call that
+/// relied on transparency (`as_transmute`'s `mem::transmute`) still
+/// works because `Blob<S>` and `Blob<T>` have identical layouts for
+/// any `S`/`T: BlobSchema` (the phantoms are zero-sized and the
+/// handle is `[u8; 32] + PhantomData`).
 pub struct Blob<S: BlobSchema> {
     /// The raw byte content of this blob.
     pub bytes: Bytes,
+    /// Cached content-addressed handle. Computed eagerly at
+    /// construction time; reused on every `get_handle` call and on
+    /// `MemoryBlobStore::insert`.
+    handle: Value<Handle<S>>,
     _schema: PhantomData<S>,
 }
 
-impl<S: BlobSchema> Blob<S> {
+impl<S> Blob<S>
+where
+    S: BlobSchema,
+    Handle<S>: ValueSchema,
+{
     /// Creates a new blob from a sequence of bytes.
-    /// The bytes are stored in the blob as-is.
+    ///
+    /// **Hashes eagerly**: this call runs Blake3 over `bytes` once and
+    /// caches the resulting handle. Subsequent `get_handle` /
+    /// `MemoryBlobStore::insert` calls reuse the cached value at O(1).
+    /// For most use cases this is what callers want — `Blob::new`
+    /// almost always precedes an `insert` or a `get_handle`. If you
+    /// have a blob path that's *never* hashed and the eager cost
+    /// matters, reach for the raw `Bytes` instead.
     pub fn new(bytes: Bytes) -> Self {
+        let digest = crate::value::schemas::hash::Blake3::digest(&bytes);
         Self {
             bytes,
+            handle: Value::new(digest),
+            _schema: PhantomData,
+        }
+    }
+
+    /// Constructs a blob from bytes *and* a precomputed handle,
+    /// skipping the hash step.
+    ///
+    /// Used by blob-store readers (`MemoryBlobStoreReader::get` and
+    /// friends) and pile-format decoders that already know the
+    /// handle the blob is stored under — they read the bytes out of
+    /// their backing storage already keyed by hash, so recomputing
+    /// it would be pure overhead.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts that `handle == Blake3(bytes)`. The cache
+    /// is trusted on read paths; if these diverge,
+    /// `MemoryBlobStore::insert(blob)` will store the bytes under
+    /// `handle` (not the true Blake3 hash), and subsequent lookups
+    /// will silently miss or return wrong data. Always pair this
+    /// with a hash you got from a trusted source (the same store
+    /// you're reading from, the pile header, a verified network
+    /// fetch). For callers without that guarantee, use
+    /// [`Blob::new`] which hashes from bytes.
+    pub fn with_handle(bytes: Bytes, handle: Value<Handle<S>>) -> Self {
+        Self {
+            bytes,
+            handle,
             _schema: PhantomData,
         }
     }
 
     /// Reinterprets the contained bytes as a blob of a different schema.
     ///
-    /// This is a zero-copy transformation that simply changes the compile-time
-    /// schema marker. It does **not** validate that the data actually conforms
-    /// to the new schema.
-    pub fn transmute<T: BlobSchema>(self) -> Blob<T> {
+    /// This is a zero-copy transformation: bytes pass through and the
+    /// cached handle is recast at the phantom level. It does **not**
+    /// validate that the data actually conforms to the new schema.
+    pub fn transmute<T: BlobSchema>(self) -> Blob<T>
+    where
+        Handle<T>: ValueSchema,
+    {
         Blob {
             bytes: self.bytes,
+            handle: self.handle.transmute(),
             _schema: PhantomData,
         }
     }
@@ -77,13 +140,9 @@ impl<S: BlobSchema> Blob<S> {
         unsafe { std::mem::transmute(self) }
     }
 
-    /// Hashes the blob's bytes with Blake3 and returns the typed handle.
-    pub fn get_handle(&self) -> Value<Handle<S>>
-    where
-        Handle<S>: ValueSchema,
-    {
-        let digest = crate::value::schemas::hash::Blake3::digest(&self.bytes);
-        Value::new(digest)
+    /// Returns the cached Blake3 handle. O(1) — no rehash.
+    pub fn get_handle(&self) -> Value<Handle<S>> {
+        self.handle
     }
 
     /// Tries to convert the blob to a concrete Rust type.
@@ -96,10 +155,15 @@ impl<S: BlobSchema> Blob<S> {
     }
 }
 
-impl<T: BlobSchema> Clone for Blob<T> {
+impl<T> Clone for Blob<T>
+where
+    T: BlobSchema,
+    Handle<T>: ValueSchema,
+{
     fn clone(&self) -> Self {
         Self {
             bytes: self.bytes.clone(),
+            handle: self.handle,
             _schema: PhantomData,
         }
     }
@@ -187,7 +251,53 @@ where
     Handle<T>: ValueSchema,
 {
     fn into_field_value(self) -> (Value<Handle<T>>, Option<Bytes>) {
-        let handle = self.get_handle();
-        (handle, Some(self.bytes))
+        // O(1) — handle was computed eagerly at Blob::new.
+        (self.handle, Some(self.bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::schemas::UnknownBlob;
+    use crate::value::schemas::hash::Blake3;
+
+    #[test]
+    fn new_computes_and_caches_handle() {
+        let b: Blob<UnknownBlob> = Blob::new(Bytes::from(b"hello".to_vec()));
+        let h1 = b.get_handle();
+        let h2 = b.get_handle();
+        // Same handle on repeat — cache is stable.
+        assert_eq!(h1, h2);
+        // And matches a fresh independent Blake3 of the bytes.
+        let independent = Value::new(Blake3::digest(b"hello"));
+        let h_typed: Value<Handle<UnknownBlob>> = independent;
+        assert_eq!(h1, h_typed);
+    }
+
+    #[test]
+    fn with_handle_trusts_the_provided_handle() {
+        // Construct a blob with a *deliberately bogus* handle. The
+        // cache returns it verbatim — proving we don't recompute from
+        // bytes. This is the optimization read paths exploit (they
+        // already know the handle, no point re-hashing).
+        let bogus: Value<Handle<UnknownBlob>> = Value::new([0xAA; 32]);
+        let b: Blob<UnknownBlob> = Blob::with_handle(
+            Bytes::from(b"any bytes".to_vec()),
+            bogus,
+        );
+        assert_eq!(b.get_handle(), bogus);
+    }
+
+    #[test]
+    fn transmute_carries_cached_handle() {
+        let b: Blob<UnknownBlob> = Blob::new(Bytes::from(b"shared".to_vec()));
+        let h_before: Value<Handle<UnknownBlob>> = b.get_handle();
+        // Schema cast — handle bytes stay identical, only the phantom
+        // changes.
+        let b2: Blob<crate::blob::schemas::longstring::LongString> =
+            b.transmute::<crate::blob::schemas::longstring::LongString>();
+        let h_after = b2.get_handle();
+        assert_eq!(h_before.raw, h_after.raw);
     }
 }
