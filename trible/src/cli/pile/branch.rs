@@ -21,12 +21,12 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle, Hash};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use super::signing::load_signing_key;
 use triblespace_core::repo::BlobStoreMeta;
 
-type BranchNameHandle = Value<Handle<LongString>>;
+type BranchNameHandle = Inline<Handle<LongString>>;
 
 // These markers are part of the stable on-disk pile format (see
 // triblespace-rs/book/src/pile-format.md). Copy them exactly; do not invent.
@@ -307,7 +307,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             Ok(meta) => {
                                 let name_attr = triblespace_core::metadata::name.id();
                                 let mut name_handle: Option<BranchNameHandle> = None;
-                                let mut head_handle: Option<Value<Handle<SimpleArchive>>> =
+                                let mut head_handle: Option<Inline<Handle<SimpleArchive>>> =
                                     None;
                                 for t in meta.iter() {
                                     if t.a() == &name_attr {
@@ -317,7 +317,7 @@ pub fn run(cmd: Command) -> Result<()> {
                                             break;
                                         }
                                     } else if t.a() == &head_attr {
-                                        let h: Value<Handle<SimpleArchive>> = *t.v();
+                                        let h: Inline<Handle<SimpleArchive>> = *t.v();
                                         if head_handle.replace(h).is_some() {
                                             head_handle = None;
                                         }
@@ -402,7 +402,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::trible::TribleSet;
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Hash;
-            use triblespace_core::value::Value;
+            use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -417,12 +417,12 @@ pub fn run(cmd: Command) -> Result<()> {
                 let meta_present = reader.metadata(meta_handle)?.is_some();
                 let (name_val, head_val, head_err): (
                     Option<String>,
-                    Option<Value<Handle<SimpleArchive>>>,
+                    Option<Inline<Handle<SimpleArchive>>>,
                     Option<String>,
                 ) = if meta_present {
                     match reader.get::<TribleSet, SimpleArchive>(meta_handle) {
                         Ok(meta) => {
-                            let mut head_val: Option<Value<Handle<SimpleArchive>>> = None;
+                            let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
                             let repo_head_attr = triblespace_core::repo::head.id();
                             for t in meta.iter() {
                                 if t.a() == &repo_head_attr {
@@ -440,8 +440,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 };
 
                 let id_hex = format!("{branch_id:X}");
-                let meta_hash: Value<Hash<Blake3>> = Handle::to_hash(meta_handle);
-                let meta_hex: String = meta_hash.from_value();
+                let meta_hash: Inline<Hash<Blake3>> = Handle::to_hash(meta_handle);
+                let meta_hex: String = meta_hash.from_inline();
 
                 println!("Id:        {id_hex}");
                 if let Some(nstr) = name_val.clone() {
@@ -456,8 +456,8 @@ pub fn run(cmd: Command) -> Result<()> {
                         .unwrap_or_default()
                 );
                 if let Some(h) = head_val {
-                    let head_hash: Value<Hash<Blake3>> = Handle::to_hash(h);
-                    let head_hex: String = head_hash.from_value();
+                    let head_hash: Inline<Hash<Blake3>> = Handle::to_hash(h);
+                    let head_hex: String = head_hash.from_inline();
                     let present = reader.metadata(h)?.is_some();
                     println!(
                         "Head:      {head_hex} [{}]",
@@ -504,14 +504,14 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::valueschemas::Handle;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::value::schemas::hash::Blake3;
-            use triblespace_core::value::Value;
+            use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let branch_id = parse_branch_id_hex(&branch)?;
-                let new_meta: Value<Handle<SimpleArchive>> = parse_blake3_handle(&meta)?;
+                let new_meta: Inline<Handle<SimpleArchive>> = parse_blake3_handle(&meta)?;
 
-                let expected_old: Option<Value<Handle<SimpleArchive>>> = match expected {
+                let expected_old: Option<Inline<Handle<SimpleArchive>>> = match expected {
                     Some(s) => parse_blake3_handle_opt(&s)?,
                     None => pile.head(branch_id)?,
                 };
@@ -622,7 +622,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Handle;
-            use triblespace_core::value::Value;
+            use triblespace_core::value::Inline;
 
             let bid = parse_branch_id_hex(&branch)?;
 
@@ -643,8 +643,8 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 // Prepare a mapping from source handle raw -> destination handle for later lookup.
                 use std::collections::HashMap;
-                use triblespace_core::value::VALUE_LEN;
-                let mut mapping: HashMap<[u8; VALUE_LEN], Value<Handle<_>>> =
+                use triblespace_core::value::INLINE_LEN;
+                let mut mapping: HashMap<[u8; INLINE_LEN], Inline<Handle<_>>> =
                     HashMap::new();
 
                 let src_reader = src
@@ -723,7 +723,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::trible::TribleSet;
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Hash;
-            use triblespace_core::value::Value;
+            use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -744,7 +744,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     .head(branch_id)?
                     .ok_or_else(|| anyhow::anyhow!("branch not found"))?;
 
-                let mut head_opt: Option<Value<Handle<SimpleArchive>>> = None;
+                let mut head_opt: Option<Inline<Handle<SimpleArchive>>> = None;
                 if reader.metadata(meta_handle)?.is_some() {
                     if let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) {
                         let repo_head_attr = triblespace_core::repo::head.id();
@@ -761,7 +761,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 // Traverse commit graph, union content tribles
                 let mut visited: BTreeSet<String> = BTreeSet::new();
-                let mut stack: Vec<Value<Handle<SimpleArchive>>> = vec![head];
+                let mut stack: Vec<Inline<Handle<SimpleArchive>>> = vec![head];
                 let mut commit_count: usize = 0;
                 let mut total_triples_accum: usize = 0;
                 let mut content_blob_count: usize = 0;
@@ -770,8 +770,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 let mut unioned = TribleSet::new();
 
                 while let Some(h) = stack.pop() {
-                    let hh: Value<Hash<Blake3>> = Handle::to_hash(h);
-                    let hex: String = hh.from_value();
+                    let hh: Inline<Hash<Blake3>> = Handle::to_hash(h);
+                    let hex: String = hh.from_inline();
                     if !visited.insert(hex.clone()) {
                         continue;
                     }
@@ -786,8 +786,8 @@ pub fn run(cmd: Command) -> Result<()> {
                         Err(_) => continue,
                     };
 
-                    let mut parents: Vec<Value<Handle<SimpleArchive>>> = Vec::new();
-                    let mut content_handles: Vec<Value<Handle<SimpleArchive>>> = Vec::new();
+                    let mut parents: Vec<Inline<Handle<SimpleArchive>>> = Vec::new();
+                    let mut content_handles: Vec<Inline<Handle<SimpleArchive>>> = Vec::new();
                     for t in meta.iter() {
                         if t.a() == &repo_content_attr {
                             let c = *t.v::<Handle<SimpleArchive>>();
@@ -866,7 +866,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo::Repository;
             use triblespace_core::value::schemas::hash::Blake3;
             use triblespace_core::value::schemas::hash::Handle;
-            use triblespace_core::value::Value;
+            use triblespace_core::value::Inline;
 
             struct CopyStats {
                 visited: usize,
@@ -888,7 +888,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             let mut repo = Repository::new(dst_pile, key, TribleSet::new())?;
             let result = (|| -> Result<CopyStats, anyhow::Error> {
-                let src_head: Value<Handle<SimpleArchive>> = src
+                let src_head: Inline<Handle<SimpleArchive>> = src
                     .head(src_bid)?
                     .ok_or_else(|| anyhow::anyhow!("source branch head not found"))?;
 
@@ -999,7 +999,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     );
 
                     // --- Phase 2: Name resolution & grouping ---
-                    let mut groups: BTreeMap<String, Vec<(Id, Option<Value<Handle<SimpleArchive>>>)>> = BTreeMap::new();
+                    let mut groups: BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>> = BTreeMap::new();
 
                     for (bid, state) in &states {
                         let meta_handle = match state.kind {
@@ -1079,7 +1079,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
 
                     // Iterate active branches, resolve names, group.
-                    let mut groups: std::collections::BTreeMap<String, Vec<(Id, Option<Value<Handle<SimpleArchive>>>)>> = std::collections::BTreeMap::new();
+                    let mut groups: std::collections::BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>> = std::collections::BTreeMap::new();
 
                     let branch_ids: Vec<Id> = repo.storage_mut().branches()?
                         .collect::<Result<Vec<_>, _>>()?;
@@ -1164,7 +1164,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     let repo_head_attr = triblespace_core::repo::head.id();
 
                     // Collect all branch ids and their current heads.
-                    let mut candidates: Vec<(Id, Option<Value<Handle<SimpleArchive>>>)> =
+                    let mut candidates: Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)> =
                         Vec::new();
                     for bid in branch_ids {
                         let meta_handle = repo
@@ -1172,7 +1172,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             .head(bid)?
                             .ok_or_else(|| anyhow::anyhow!("branch not found: {bid:X}"))?;
 
-                        let mut head_val: Option<Value<Handle<SimpleArchive>>> = None;
+                        let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
                         if reader.metadata(meta_handle)?.is_some() {
                             if let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) {
                                 for t in meta.iter() {
@@ -1191,8 +1191,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     for (bid, head) in &candidates {
                         let id_hex = format!("{bid:X}");
                         if let Some(h) = head {
-                            let hh: Value<Hash<Blake3>> = Handle::to_hash(*h);
-                            let hex: String = hh.from_value();
+                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(*h);
+                            let hex: String = hh.from_inline();
                             println!("- {id_hex} -> commit {hex}");
                         } else {
                             println!("- {id_hex} -> <no head>");
@@ -1210,7 +1210,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     }
 
                     // Collect parent commit handles (skip branches without a head).
-                    let parents: Vec<Value<Handle<SimpleArchive>>> =
+                    let parents: Vec<Inline<Handle<SimpleArchive>>> =
                         candidates.iter().filter_map(|(_, h)| *h).collect();
                     if parents.is_empty() {
                         anyhow::bail!("no branch heads available to attach");
@@ -1290,7 +1290,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("branch has no commit head"))?;
 
                 // BFS from commit head, newest first.
-                let mut queue: std::collections::VecDeque<Value<Handle<SimpleArchive>>> =
+                let mut queue: std::collections::VecDeque<Inline<Handle<SimpleArchive>>> =
                     std::collections::VecDeque::new();
                 let mut visited: HashSet<[u8; 32]> = HashSet::new();
                 queue.push_back(commit_head);
@@ -1307,8 +1307,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     let commit_set: TribleSet = match reader.get(current) {
                         Ok(c) => c,
                         Err(_) => {
-                            let hash: Value<Hash<Blake3>> = Handle::to_hash(current);
-                            let hex: String = hash.from_value();
+                            let hash: Inline<Hash<Blake3>> = Handle::to_hash(current);
+                            let hex: String = hash.from_inline();
                             println!("{hex}  <missing blob>");
                             printed += 1;
                             continue;
@@ -1316,8 +1316,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     };
 
                     let info = read_commit_fields(&commit_set);
-                    let hash: Value<Hash<Blake3>> = Handle::to_hash(current);
-                    let hex: String = hash.from_value();
+                    let hash: Inline<Hash<Blake3>> = Handle::to_hash(current);
+                    let hex: String = hash.from_inline();
 
                     let msg = if let Some(sm) = &info.short_message {
                         sm.clone()
@@ -1348,7 +1348,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
                     let ts_str = if let Some(ts_val) = info.timestamp {
                         use triblespace_core::value::schemas::time::Lower;
-                        let lower: Lower = ts_val.try_from_value().unwrap_or(Lower(0));
+                        let lower: Lower = ts_val.try_from_inline().unwrap_or(Lower(0));
                         let epoch = hifitime::Epoch::from_tai_duration(
                             hifitime::Duration::from_total_nanoseconds(lower.0));
                         hifitime::efmt::Formatter::new(
@@ -1372,8 +1372,8 @@ pub fn run(cmd: Command) -> Result<()> {
                         println!("Date:   {ts_str}");
                         if !info.parents.is_empty() {
                             let parent_strs: Vec<String> = info.parents.iter().map(|p| {
-                                let ph: Value<Hash<Blake3>> = Handle::to_hash(*p);
-                                let phex: String = ph.from_value();
+                                let ph: Inline<Hash<Blake3>> = Handle::to_hash(*p);
+                                let phex: String = ph.from_inline();
                                 phex[..16].to_string()
                             }).collect();
                             let label = if info.parents.len() > 1 { "Merge: " } else { "Parent:" };
@@ -1399,7 +1399,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Show { pile, commit } => {
             use triblespace_core::repo::pile::Pile;
 
-            let commit_handle: Value<Handle<SimpleArchive>> =
+            let commit_handle: Inline<Handle<SimpleArchive>> =
                 parse_blake3_handle(&commit)?;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -1414,8 +1414,8 @@ pub fn run(cmd: Command) -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("read commit blob: {e:?}"))?;
 
                 let info = read_commit_fields(&commit_set);
-                let hash: Value<Hash<Blake3>> = Handle::to_hash(commit_handle);
-                let hex: String = hash.from_value();
+                let hash: Inline<Hash<Blake3>> = Handle::to_hash(commit_handle);
+                let hex: String = hash.from_inline();
                 println!("Commit: {hex}");
 
                 // Message
@@ -1440,8 +1440,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 } else {
                     println!("Parents:");
                     for p in &info.parents {
-                        let ph: Value<Hash<Blake3>> = Handle::to_hash(*p);
-                        let phex: String = ph.from_value();
+                        let ph: Inline<Hash<Blake3>> = Handle::to_hash(*p);
+                        let phex: String = ph.from_inline();
                         let present = reader.metadata(*p)?.is_some();
                         println!(
                             "  {phex} [{}]",
@@ -1452,8 +1452,8 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 // Content
                 if let Some(ch) = info.content {
-                    let ch_hash: Value<Hash<Blake3>> = Handle::to_hash(ch);
-                    let ch_hex: String = ch_hash.from_value();
+                    let ch_hash: Inline<Hash<Blake3>> = Handle::to_hash(ch);
+                    let ch_hex: String = ch_hash.from_inline();
                     let present = reader.metadata(ch)?.is_some();
                     print!("Content: {ch_hex} [{}]", if present { "present" } else { "missing" });
                     if present {
@@ -1480,8 +1480,8 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 // Metadata
                 if let Some(mh) = info.metadata {
-                    let mh_hash: Value<Hash<Blake3>> = Handle::to_hash(mh);
-                    let mh_hex: String = mh_hash.from_value();
+                    let mh_hash: Inline<Hash<Blake3>> = Handle::to_hash(mh);
+                    let mh_hex: String = mh_hash.from_inline();
                     let present = reader.metadata(mh)?.is_some();
                     println!(
                         "Metadata: {mh_hex} [{}]",
@@ -1535,7 +1535,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 let mut tallies: HashMap<Id, AttrTally> = HashMap::new();
                 let mut attr_names: HashMap<Id, String> = HashMap::new();
                 let mut visited: HashSet<[u8; 32]> = HashSet::new();
-                let mut stack: Vec<Value<Handle<SimpleArchive>>> = vec![commit_head];
+                let mut stack: Vec<Inline<Handle<SimpleArchive>>> = vec![commit_head];
                 let mut commit_count = 0usize;
 
                 let tag_attr = triblespace_core::metadata::tag.id();
@@ -1577,10 +1577,10 @@ pub fn run(cmd: Command) -> Result<()> {
                             let mut usage_entities: HashSet<Id> = HashSet::new();
                             for t in meta_set.iter() {
                                 if t.a() == &tag_attr {
-                                    let v: Value<triblespace::prelude::valueschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::valueschemas::GenId> =
                                         *t.v();
                                     if let Ok(gid) =
-                                        v.try_from_value::<triblespace_core::id::Id>()
+                                        v.try_from_inline::<triblespace_core::id::Id>()
                                     {
                                         if gid == kind_id {
                                             usage_entities.insert(*t.e());
@@ -1595,15 +1595,15 @@ pub fn run(cmd: Command) -> Result<()> {
                                     continue;
                                 }
                                 if t.a() == &attr_attr {
-                                    let v: Value<triblespace::prelude::valueschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::valueschemas::GenId> =
                                         *t.v();
                                     if let Ok(described_id) =
-                                        v.try_from_value::<triblespace_core::id::Id>()
+                                        v.try_from_inline::<triblespace_core::id::Id>()
                                     {
                                         // Now find the name for this entity.
                                         for t2 in meta_set.iter() {
                                             if t2.e() == t.e() && t2.a() == &name_attr {
-                                                let nh: Value<
+                                                let nh: Inline<
                                                     Handle<LongString>,
                                                 > = *t2.v();
                                                 if let Ok(view) =
@@ -1689,8 +1689,8 @@ pub fn run(cmd: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("read branch meta: {e:?}"))?;
 
                     // Extract current commit head from metadata.
-                    let head_handle: Option<Value<Handle<SimpleArchive>>> =
-                        find!((h: Value<_>), pattern!(&meta, [{ triblespace_core::repo::head: ?h }]))
+                    let head_handle: Option<Inline<Handle<SimpleArchive>>> =
+                        find!((h: Inline<_>), pattern!(&meta, [{ triblespace_core::repo::head: ?h }]))
                             .next()
                             .map(|(h,)| h);
 
@@ -1764,7 +1764,7 @@ struct RawBranchRecord {
     branch_id: Id,
     kind: RecordKind,
     /// Branch metadata handle (only when kind == Set).
-    meta_handle: Option<Value<Handle<SimpleArchive>>>,
+    meta_handle: Option<Inline<Handle<SimpleArchive>>>,
 }
 
 /// Collapsed final state per branch from a raw pile scan.
@@ -1772,9 +1772,9 @@ struct RawBranchRecord {
 struct BranchState {
     kind: RecordKind,
     /// Current metadata handle (only when kind == Set).
-    meta: Option<Value<Handle<SimpleArchive>>>,
+    meta: Option<Inline<Handle<SimpleArchive>>>,
     /// Most recent Set metadata handle (kept even after tombstone).
-    last_set: Option<Value<Handle<SimpleArchive>>>,
+    last_set: Option<Inline<Handle<SimpleArchive>>>,
 }
 
 /// Scan the raw pile file for all branch update/tombstone records.
@@ -1807,7 +1807,7 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
             let raw_id: [u8; 16] = buf[16..32].try_into().unwrap();
             let Some(id) = Id::new(raw_id) else { break };
             let raw_handle: [u8; 32] = buf[32..64].try_into().unwrap();
-            let meta: Value<Handle<SimpleArchive>> = Value::new(raw_handle);
+            let meta: Inline<Handle<SimpleArchive>> = Inline::new(raw_handle);
             records.push(RawBranchRecord {
                 offset,
                 branch_id: id,
@@ -1867,12 +1867,12 @@ fn collapse_branch_states(records: &[RawBranchRecord]) -> HashMap<Id, BranchStat
 /// Parsed commit fields from a commit TribleSet.
 #[derive(Clone, Debug)]
 struct CommitInfo {
-    parents: Vec<Value<Handle<SimpleArchive>>>,
-    content: Option<Value<Handle<SimpleArchive>>>,
-    metadata: Option<Value<Handle<SimpleArchive>>>,
-    message: Option<Value<Handle<LongString>>>,
+    parents: Vec<Inline<Handle<SimpleArchive>>>,
+    content: Option<Inline<Handle<SimpleArchive>>>,
+    metadata: Option<Inline<Handle<SimpleArchive>>>,
+    message: Option<Inline<Handle<LongString>>>,
     short_message: Option<String>,
-    timestamp: Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+    timestamp: Option<Inline<triblespace_core::value::schemas::time::NsTAIInterval>>,
     signed_by: Option<[u8; 32]>,
 }
 
@@ -1913,12 +1913,12 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
         } else if a == message_attr {
             info.message = Some(*t.v::<Handle<LongString>>());
         } else if a == short_message_attr {
-            let v: Value<ShortString> = *t.v();
-            info.short_message = v.try_from_value().ok();
+            let v: Inline<ShortString> = *t.v();
+            info.short_message = v.try_from_inline().ok();
         } else if a == created_at_attr {
             info.timestamp = Some(*t.v::<NsTAIInterval>());
         } else if a == signed_by_attr {
-            let v: Value<ed::ED25519PublicKey> = *t.v();
+            let v: Inline<ed::ED25519PublicKey> = *t.v();
             info.signed_by = Some(v.raw);
         }
     }
@@ -1936,18 +1936,18 @@ fn blob_padding(len: u64) -> u64 {
     }
 }
 
-fn extract_repo_head(meta: &TribleSet) -> Option<Value<Handle<SimpleArchive>>> {
+fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> {
     use triblespace::prelude::blobschemas::SimpleArchive;
     use triblespace::prelude::valueschemas::Handle;
     use triblespace_core::repo;
     use triblespace_core::value::schemas::hash::Blake3;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let head_attr = repo::head.id();
-    let mut head_handle: Option<Value<Handle<SimpleArchive>>> = None;
+    let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
     for t in meta.iter() {
         if t.a() == &head_attr {
-            let h: Value<Handle<SimpleArchive>> = *t.v();
+            let h: Inline<Handle<SimpleArchive>> = *t.v();
             if head_handle.replace(h).is_some() {
                 // Multiple heads -> ambiguous.
                 return None;
@@ -1966,7 +1966,7 @@ fn parse_branch_id_hex(s: &str) -> Result<Id> {
     Id::new(raw).ok_or_else(|| anyhow::anyhow!("branch id cannot be nil"))
 }
 
-fn parse_blake3_handle(s: &str) -> Result<Value<Handle<SimpleArchive>>> {
+fn parse_blake3_handle(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
     let s = s.trim();
     let hex = match s.split_once(':') {
         Some((proto, rest)) => {
@@ -1984,10 +1984,10 @@ fn parse_blake3_handle(s: &str) -> Result<Value<Handle<SimpleArchive>>> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow::anyhow!("handle must be 32 bytes (64 hex chars)"))?;
-    Ok(Value::new(raw))
+    Ok(Inline::new(raw))
 }
 
-fn parse_blake3_handle_opt(s: &str) -> Result<Option<Value<Handle<SimpleArchive>>>> {
+fn parse_blake3_handle_opt(s: &str) -> Result<Option<Inline<Handle<SimpleArchive>>>> {
     let s = s.trim();
     if s == "-" || s.eq_ignore_ascii_case("none") {
         return Ok(None);
@@ -2002,7 +2002,7 @@ fn parse_blake3_handle_opt(s: &str) -> Result<Option<Value<Handle<SimpleArchive>
 ///
 /// `statuses` maps branch IDs to display labels (e.g. "active"/"deleted").
 fn consolidate_groups(
-    groups: &std::collections::BTreeMap<String, Vec<(Id, Option<Value<Handle<SimpleArchive>>>)>>,
+    groups: &std::collections::BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>>,
     statuses: &HashMap<Id, &str>,
     reader: &triblespace_core::repo::pile::PileReader,
     repo: &mut Repository<Pile>,
@@ -2016,7 +2016,7 @@ fn consolidate_groups(
     let mut created_count: usize = 0;
 
     for (name, members) in groups {
-        let heads: Vec<Value<Handle<SimpleArchive>>> =
+        let heads: Vec<Inline<Handle<SimpleArchive>>> =
             members.iter().filter_map(|(_, h)| *h).collect();
 
         if heads.is_empty() {
@@ -2037,8 +2037,8 @@ fn consolidate_groups(
         for (bid, head) in members {
             let status = statuses.get(bid).copied().unwrap_or("?");
             if let Some(h) = head {
-                let hh: Value<Hash<Blake3>> = Handle::to_hash(*h);
-                let hex: String = hh.from_value();
+                let hh: Inline<Hash<Blake3>> = Handle::to_hash(*h);
+                let hex: String = hh.from_inline();
                 println!("  - {bid:X} [{status}] head={}", &hex[..23]);
             } else {
                 println!("  - {bid:X} [{status}] <no head>");
@@ -2046,7 +2046,7 @@ fn consolidate_groups(
         }
 
         // Deduplicate heads (same commit on multiple branch IDs).
-        let unique_heads: Vec<Value<Handle<SimpleArchive>>> = {
+        let unique_heads: Vec<Inline<Handle<SimpleArchive>>> = {
             let mut seen: HashSet<[u8; 32]> = HashSet::new();
             heads.iter().copied().filter(|h| seen.insert(h.raw)).collect()
         };
@@ -2063,8 +2063,8 @@ fn consolidate_groups(
                     match is_ancestor_of(unique_heads[i], unique_heads[j], reader, &parent_attr) {
                         Ok(true) => {
                             subsumed.insert(unique_heads[i].raw);
-                            let hh: Value<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
-                            let hex: String = hh.from_value();
+                            let hh: Inline<Hash<Blake3>> = Handle::to_hash(unique_heads[i]);
+                            let hex: String = hh.from_inline();
                             println!("  ({}... subsumed)", &hex[..23]);
                             break;
                         }
@@ -2077,7 +2077,7 @@ fn consolidate_groups(
             }
         }
 
-        let non_subsumed: Vec<Value<Handle<SimpleArchive>>> = unique_heads
+        let non_subsumed: Vec<Inline<Handle<SimpleArchive>>> = unique_heads
             .iter()
             .copied()
             .filter(|h| !subsumed.contains(&h.raw))
@@ -2156,7 +2156,7 @@ fn consolidate_groups(
 /// Tombstone all branches in `members` except `keeper`. Returns the number tombstoned.
 fn tombstone_branches(
     repo: &mut Repository<Pile>,
-    members: &[(Id, Option<Value<Handle<SimpleArchive>>>)],
+    members: &[(Id, Option<Inline<Handle<SimpleArchive>>>)],
     keeper: Option<Id>,
 ) -> Result<usize> {
     let mut count = 0;
@@ -2174,15 +2174,15 @@ fn tombstone_branches(
 }
 
 fn is_ancestor_of(
-    ancestor: Value<Handle<SimpleArchive>>,
-    descendant: Value<Handle<SimpleArchive>>,
+    ancestor: Inline<Handle<SimpleArchive>>,
+    descendant: Inline<Handle<SimpleArchive>>,
     reader: &impl BlobStoreGet,
     parent_attr: &Id,
 ) -> Result<bool> {
     use std::collections::HashSet;
 
     let mut visited: HashSet<[u8; 32]> = HashSet::new();
-    let mut stack: Vec<Value<Handle<SimpleArchive>>> = vec![descendant];
+    let mut stack: Vec<Inline<Handle<SimpleArchive>>> = vec![descendant];
 
     while let Some(current) = stack.pop() {
         if current.raw == ancestor.raw {

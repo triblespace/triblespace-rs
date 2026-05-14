@@ -87,7 +87,7 @@
   respects `MAX_RETRIES`, `table_insert` hands growth entries back to
   `Branch::modify_child`, and `table_grow` preserves every occupant.
 - Extend `proofs/value_harness.rs` with schema-aware helpers ensuring
-  `TryFromValue` conversions reject truncated buffers.
+  `TryFromInline` conversions reject truncated buffers.
 - Expand `proofs/commit_harness.rs` with bounded commit DAG generators that
   assert append-only pile semantics.
 
@@ -105,7 +105,7 @@ The existing collection of schemas covers the basics like strings, large
 integers and archives.  The following ideas could broaden what can be stored
 without custom extensions:
 
-### Value schemas
+### Inline schemas
 - `Uuid` for RFC&nbsp;4122 identifiers.
 - `Ipv4Addr` and `Ipv6Addr` to store network addresses.  IPv6 could dedicate
   spare bits to a port or service code.

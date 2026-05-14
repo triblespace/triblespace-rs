@@ -96,9 +96,9 @@ proptest! {
         std::fs::File::create(&path).unwrap();
         let mut piles: Vec<Pile> =
             (0..scenario.actors).map(|_| Pile::open(&path).unwrap()).collect();
-        let mut expected: HashMap<Value<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
-        let mut handles: Vec<Value<Handle<UnknownBlob>>> = Vec::new();
-        let mut branches: HashMap<Id, Value<Handle<SimpleArchive>>> = HashMap::new();
+        let mut expected: HashMap<Inline<Handle<UnknownBlob>>, Vec<u8>> = HashMap::new();
+        let mut handles: Vec<Inline<Handle<UnknownBlob>>> = Vec::new();
+        let mut branches: HashMap<Id, Inline<Handle<SimpleArchive>>> = HashMap::new();
 
         for op in scenario.ops {
             match op {

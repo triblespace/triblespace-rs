@@ -59,7 +59,7 @@ let c: BM25Filter<D> = idx.matches(doc, &terms, score_floor);
 ```
 
 One variable (`doc: Variable<D>`), one slice of typed terms
-`&[Value<T>]`, and one `score_floor: f32` parameter. Binds
+`&[Inline<T>]`, and one `score_floor: f32` parameter. Binds
 `doc` to documents whose summed BM25 score across every term
 in `terms` is at least `score_floor`. The engine can propose
 matching docs, or confirm a bound doc against the filter set.
@@ -72,7 +72,7 @@ posting list, sum scores into a `HashMap<doc, f32>`, drop docs
 below the floor, keep the doc keys. Triblespace has no
 "arithmetic sum of bound variables" primitive, so this
 pre-materialisation is the cleanest path; the resulting
-constraint is small (`Vec<RawValue>`, one entry per matching
+constraint is small (`Vec<RawInline>`, one entry per matching
 doc) and the engine path needs no further lookups.
 
 Typical calls (the `_text` forms tokenise the query string
@@ -99,7 +99,7 @@ let docs: Vec<(Id,)> = find!(
 
 // For other tokeniser flavours (bigrams, n-grams, code tokens) or
 // when reusing the same token slice across many `score` calls,
-// the explicit form takes a pre-tokenised `&[Value<T>]`:
+// the explicit form takes a pre-tokenised `&[Inline<T>]`:
 let tokens = hash_tokens("graph search algorithms");
 let docs: Vec<(Id,)> = find!(
     (book: Id),
@@ -108,14 +108,14 @@ let docs: Vec<(Id,)> = find!(
 .collect();
 ```
 
-The schema-typed term values (`Value<WordHash>`,
-`Value<BigramHash>`, etc.) keep the compiler enforcing that the
+The schema-typed term values (`Inline<WordHash>`,
+`Inline<BigramHash>`, etc.) keep the compiler enforcing that the
 right tokenizer's output reaches the right index.
 
 ### `score(&doc, &terms) -> f32`
 
 ```rust
-let s = idx.score(&doc.to_value(), &tokens);
+let s = idx.score(&doc.to_inline(), &tokens);
 ```
 
 Recompute helper for ranking. Returns the summed BM25 score for
@@ -131,7 +131,7 @@ let mut ranked: Vec<(Id, f32)> = find!(
     (doc: Id),
     idx.matches(doc, &tokens, 0.0)
 )
-.map(|(d,)| (d, idx.score(&d.to_value(), &tokens)))
+.map(|(d,)| (d, idx.score(&d.to_inline(), &tokens)))
 .collect();
 ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 ```
@@ -288,7 +288,7 @@ The constraint borrows from a specific index value (naive or
 reloaded from a blob). Typical flow:
 
 ```rust
-let handle: Value<Handle<SuccinctBM25Blob>> =
+let handle: Inline<Handle<SuccinctBM25Blob>> =
     load_current_index_handle(&kb)?;
 let reader = pile.reader()?;
 let idx: SuccinctBM25Index =

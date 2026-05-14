@@ -56,7 +56,7 @@ unification release. Four related cleanups:
 - **`metadata::iri: Handle<Blake3, IRI>`** attribute. The canonical
   identity-determining attribute for RDF-imported entities.
   Distinct from `metadata::name` (which stays display-only).
-- **`impl<S: ValueSchema> From<Fragment> for Attribute<S>`** — the
+- **`impl<S: InlineSchema> From<Fragment> for Attribute<S>`** — the
   canonical dynamic-attribute constructor. Hand it an
   `entity!{ metadata::<identity-attr>: <value>,
   metadata::value_schema: S::id() }` fragment whose root captures the
@@ -82,7 +82,7 @@ unification release. Four related cleanups:
   `self.fragment.root().expect("rooted")`.
 - **`Attribute::<S>::from_name`, `from_iri`, `from_id`, and
   `from_id_with_usage` removed.** The single public construction
-  path is `impl<S: ValueSchema> From<Fragment> for Attribute<S>`.
+  path is `impl<S: InlineSchema> From<Fragment> for Attribute<S>`.
   Replace each call with explicit `Attribute::<S>::from(entity!{ … })`,
   naming the identity attribute (`metadata::name`, `metadata::iri`,
   or an explicit `@`-prefixed hex id) at the call site:
@@ -220,7 +220,7 @@ unification release. Four related cleanups:
   ConstDescribe + ConstId`). The id flows through describe like
   every other schema; the bound stops conflating "I have a stable
   identifier" with "I implement a digest function".
-- **`ValueSchema` and `BlobSchema` super-traits now `+ MetaDescribe`**
+- **`InlineSchema` and `BlobSchema` super-traits now `+ MetaDescribe`**
   (was `+ ConstId`). Schemas must describe themselves; the id is a
   property of that description, not a separate trait method.
 - **`Handle<H,T>::describe`, `Array<T>::describe`, and
@@ -273,7 +273,7 @@ unification release. Four related cleanups:
   pointer, so fragments without blobs pay essentially zero
   overhead.
 - **New `Fragment` API:**
-  - `put<S, T>(&mut self, item: T) -> Value<Handle<Blake3, S>>` —
+  - `put<S, T>(&mut self, item: T) -> Inline<Handle<Blake3, S>>` —
     insert a blob into the fragment's local store and get the
     content-addressed handle back. Idempotent.
   - `blobs() -> &MemoryBlobStore<Blake3>` — read the embedded
@@ -461,9 +461,9 @@ range-query primitive in core.
   Building block for SPB-style outer projections (Q3/Q4
   `?cw ?pred ?value`) and general-purpose schema-erased
   iteration over an entity's triples. The value variable
-  must be typed `Variable<UnknownValue>` (compile-time
+  must be typed `Variable<UnknownInline>` (compile-time
   enforced); decoding to a concrete schema is an explicit
-  `try_from_value::<S>()` step at the use site.
+  `try_from_inline::<S>()` step at the use site.
 - **`PathOp::Optional` (`(p)?`) primitive** in the path-query
   language. Zero-or-one application of a sub-path; recognised
   inline so the zero-step branch reuses the bound start node.
@@ -669,12 +669,12 @@ surface-level details. Highlights:
 
 ## [0.20.0] - 2026-03-14
 ### Changed
-- **Breaking:** Removed the `FromValue` trait. `TryFromValue` is now the sole
-  value conversion trait. `Value::from_value()` is constrained to
-  `TryFromValue<Error = Infallible>`.
+- **Breaking:** Removed the `FromInline` trait. `TryFromInline` is now the sole
+  value conversion trait. `Inline::from_inline()` is constrained to
+  `TryFromInline<Error = Infallible>`.
 - **Breaking:** `find!` now uses filter semantics: when a variable's
-  `TryFromValue` conversion fails the row is silently skipped instead of
-  panicking. For types with `Error = Infallible` (e.g. `f64`, `Value<_>`) no
+  `TryFromInline` conversion fails the row is silently skipped instead of
+  panicking. For types with `Error = Infallible` (e.g. `f64`, `Inline<_>`) no
   rows can ever be accidentally filtered.
 - **Breaking:** `find!` variable declarations support a `?` suffix
   (`name: Type?`) that yields `Result<T, E>` without filtering, matching
@@ -686,7 +686,7 @@ surface-level details. Highlights:
 - `find!` is now implemented as a hybrid `macro_rules!` + proc macro
   (`__find_impl!`), replacing the previous three-arm `macro_rules!` definition.
 - `HashSet`/`HashMap` constraint bounds relaxed from requiring
-  `TryFromValue<Error = Infallible>` to accepting any `TryFromValue`; values
+  `TryFromInline<Error = Infallible>` to accepting any `TryFromInline`; values
   that fail to convert are rejected during `confirm()`.
 
 ## [0.16.0] - 2026-02-15
@@ -811,7 +811,7 @@ surface-level details. Highlights:
   `json_tree`.
 
 ### Fixed
-- Added the missing `Value` import in the lossless JSON importer.
+- Added the missing `Inline` import in the lossless JSON importer.
 
 ## [0.8.0] - 2026-01-22
 ### Added
@@ -844,7 +844,7 @@ surface-level details. Highlights:
   schema identifier, eliminating the former `metadata_id` accessors.
 - `Metadata::describe` and `ConstMetadata::describe` are now fallible so blob
   write errors can be propagated instead of silently ignored.
-- `ValueSchema` inherits its identifier and default description behavior from
+- `InlineSchema` inherits its identifier and default description behavior from
   `ConstMetadata`, removing duplicate `id`, `metadata_id`, and `describe`
   methods from the schema trait itself.
 - Hash protocol metadata now emits the protocol name alongside the identifier
@@ -900,8 +900,8 @@ surface-level details. Highlights:
 - `metadata::Metadata` trait for emitting self-describing `TribleSet` and
   `MemoryBlobStore` pairs, enabling attributes and schemas to publish
   documentation metadata recursively.
-- `TryToValue` implementations that convert `serde_json::Number` directly into
-  the `F256` schema so JSON import code can call `.to_value()` instead of
+- `TryToInline` implementations that convert `serde_json::Number` directly into
+  the `F256` schema so JSON import code can call `.to_inline()` instead of
   hand-packing high-precision floats.
 - Criterion benchmark covering deterministic JSON import performance using the
   serde-rs/json-benchmark fixtures.
@@ -968,7 +968,7 @@ surface-level details. Highlights:
   testing plans in the book.
 - Expanded the roadmap with an explicit invariant catalogue, spelling out the
   PATCH/ByteTable invariants exercised by `Branch::modify_child`, clarifying the
-  value-schema guarantees around `TryFromValue`, and synchronised follow-up
+  value-schema guarantees around `TryFromInline`, and synchronised follow-up
   tasks in `INVENTORY.md`.
   PATCH/ByteTable invariants exercised by `Branch::modify_child`, and synchronised
   follow-up tasks in `INVENTORY.md`.
@@ -998,7 +998,7 @@ surface-level details. Highlights:
 - Simplified attribute naming by replacing the internal `AttributeName` enum
   with an optional `Cow<'static, str>`, keeping const-friendly static ids while
   storing dynamic field names directly.
-- Replaced the `ValueSchema::VALUE_SCHEMA_ID` and `BlobSchema::BLOB_SCHEMA_ID`
+- Replaced the `InlineSchema::VALUE_SCHEMA_ID` and `BlobSchema::BLOB_SCHEMA_ID`
   associated constants with `ConstMetadata::id()` across value and blob schemas,
   preserving existing identifiers and deriving composite `Handle` schema IDs
   deterministically from their hash protocol and blob schema components.
@@ -1006,7 +1006,7 @@ surface-level details. Highlights:
   the unified metadata API alongside value and blob schemas.
 - Documented why schema identifiers remain regular functions until `blake3`
   exposes a const-friendly hashing API for composite handle schemas.
-- Removed the `ValueSchema::BLOB_SCHEMA_ID` associated constant and stopped
+- Removed the `InlineSchema::BLOB_SCHEMA_ID` associated constant and stopped
   emitting attribute metadata that relied on blob schema coupling.
 - Glossary chapter in the book for quick reference to core terminology.
 - Expanded the Identifiers chapter with a `local_ids` + `IdOwner` workflow
@@ -1053,7 +1053,7 @@ surface-level details. Highlights:
   fixed-width tribles from blob payloads, and guide readers through the rest of
   the book.
 - Dedicated "Portability & Common Formats" chapter in the book capturing value
-  schemas, identifiers, and conversion guidance, referenced from the `Value`
+  schemas, identifiers, and conversion guidance, referenced from the `Inline`
   crate docs, and closing out the documentation backlog request to move this
   material out of the API reference.
 - Chapter exploring the TribleSpace type algebra linking `attributes!`,
@@ -1324,7 +1324,7 @@ surface-level details. Highlights:
   table.
 - Trimmed the Portability & Common Formats chapter by removing the "Why this
   chapter lives in the book" subsection after documenting the move from the
-  `Value` module docs.
+  `Inline` module docs.
 - Documented the `path!`, `attributes!`, and `pattern_changes!` procedural
   macros in the `tribles-macros` crate overview.
 - `attributes!` procedural macro now resolves the caller's crate path so
@@ -1357,7 +1357,7 @@ surface-level details. Highlights:
 - Clarified the commit selector traversal description to avoid implying a
   specific order, fixed the `ancestors(A)..B` exclusion example, and tightened
   the debugging guidance wording.
-- Clarified that `find!` retrieves `ExclusiveId` bindings via `TryFromValue` and
+- Clarified that `find!` retrieves `ExclusiveId` bindings via `TryFromInline` and
   that restricting queries with `local_ids` keeps the conversion safe.
 - Getting started guide now demonstrates defining custom attributes alongside
   the quick-start example, hides doc-test-only cleanup, and exercises the
@@ -1378,7 +1378,7 @@ surface-level details. Highlights:
   - Updated `SuccinctArchive` to use `BitVectorDataMeta` for prefix bit vectors.
 
 ### Fixed
-- Reinstated the `ValueSchema` documentation that notes hash handles still carry
+- Reinstated the `InlineSchema` documentation that notes hash handles still carry
   their referenced blob schema type parameter.
 - Updated deterministic JSON importer metadata tests to align with attribute
   metadata now emitting only value schema descriptors.
@@ -1413,7 +1413,7 @@ surface-level details. Highlights:
   empty archives because the builder handles zero-length iterators.
 - Verified the wavelet-matrix builder path against empty archives via
   `./scripts/preflight.sh` after the jerky upgrade.
-- `OrderedUniverse` now stores values as `View<[RawValue]>` for zero-copy access.
+- `OrderedUniverse` now stores values as `View<[RawInline]>` for zero-copy access.
 - Simplified `OrderedUniverse::with_sorted_dedup` to always collect incoming
   values before writing them into the reserved section, avoiding reliance on
   unstable iterator detection.
@@ -1429,7 +1429,7 @@ surface-level details. Highlights:
 - README walkthrough and regression test keep the namespace name `literature` to match the shared example module.
 - `with_sorted_dedup` now accepts iterators so compressed universes can build domains without materializing values.
 - `SuccinctArchiveMeta` now accepts the domain's serialized metadata type,
-  removing its hardcoded `SectionHandle<RawValue>` dependency.
+  removing its hardcoded `SectionHandle<RawInline>` dependency.
 - Architecture chapter now explains the system layers, copy-on-write behaviour,
   and how repositories coordinate blob and branch stores.
 - `SuccinctArchiveMeta` bounds metadata types with jerky's `Metadata` marker
@@ -1567,7 +1567,7 @@ surface-level details. Highlights:
 - `Leaf` stores the associated value and `PATCH`/`Head`/`Branch` now carry a
   value type parameter so keys can map to arbitrary payloads.
 - Moved the value type parameter to the end of generic parameter lists for a
-  more ergonomic `PATCH<KEY_LEN, Order, Value>` API.
+  more ergonomic `PATCH<KEY_LEN, Order, Inline>` API.
 - Documented that hashing and equality ignore leaf values and added a
   regression test verifying patches with identical keys but different values
   compare equal.
@@ -1813,9 +1813,9 @@ surface-level details. Highlights:
   `kani::any()` or bounded constructors for nondeterministic inputs.
 - Fixed Kani playback build errors by using `dst_len` to access `child_table`
   length without implicit autorefs.
-- Introduced `ValueSchema::validate` to verify raw value bit patterns.
+- Introduced `InlineSchema::validate` to verify raw value bit patterns.
 - Query and value harnesses use this to avoid invalid `ShortString` data during playback.
-- `ValueSchema::validate` now returns a `Result` and `Value::is_valid` provides
+- `InlineSchema::validate` now returns a `Result` and `Inline::is_valid` provides
   a convenient boolean check.
 - Corrected the workspace example to merge conflicts into the returned workspace
   and push that result.

@@ -41,8 +41,8 @@ use crate::prelude::valueschemas::GenId;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
-use crate::value::RawValue;
-use crate::value::VALUE_LEN;
+use crate::value::RawInline;
+use crate::value::INLINE_LEN;
 
 thread_local!(static OWNED_IDS: IdOwner = IdOwner::new());
 
@@ -52,17 +52,17 @@ pub const ID_LEN: usize = 16;
 /// Represents a 16 byte abstract identifier.
 pub type RawId = [u8; ID_LEN];
 
-/// Converts a 16 byte [RawId] reference into an 32 byte [RawValue].
-pub(crate) fn id_into_value(id: &RawId) -> RawValue {
-    let mut data = [0; VALUE_LEN];
+/// Converts a 16 byte [RawId] reference into an 32 byte [RawInline].
+pub(crate) fn id_into_value(id: &RawId) -> RawInline {
+    let mut data = [0; INLINE_LEN];
     data[16..32].copy_from_slice(id);
     data
 }
 
-/// Converts a 32 byte [RawValue] reference into an 16 byte [RawId].
+/// Converts a 32 byte [RawInline] reference into an 16 byte [RawId].
 /// Returns `None` if the value is not in the canonical ID format,
 /// i.e. the first 16 bytes are all zero.
-pub(crate) fn id_from_value(id: &RawValue) -> Option<RawId> {
+pub(crate) fn id_from_value(id: &RawInline) -> Option<RawId> {
     if id[0..16] != [0; 16] {
         return None;
     }
@@ -186,7 +186,7 @@ impl From<Id> for RawId {
     }
 }
 
-impl From<Id> for RawValue {
+impl From<Id> for RawInline {
     fn from(id: Id) -> Self {
         let raw: RawId = id.into();
         id_into_value(&raw)
@@ -496,7 +496,7 @@ impl IdOwner {
     ///
     /// let mut owner = IdOwner::new();
     /// let owned_id = owner.defer_insert(fucid());
-    /// let trible = Trible::new(&owned_id, &id_hex!("7830D7B3C2DCD44EB3FA68C93D06B973"), &ShortString::value_from("Hello, World!"));
+    /// let trible = Trible::new(&owned_id, &id_hex!("7830D7B3C2DCD44EB3FA68C93D06B973"), &ShortString::inline_from("Hello, World!"));
     /// ```
     pub fn defer_insert(&self, id: ExclusiveId) -> OwnedId<'_> {
         OwnedId {
@@ -742,7 +742,7 @@ mod tests {
         wrapper.set_estimate(name.index, 1);
 
         let q: Query<_, _, _> = Query::new(wrapper, |binding| {
-            Some(name.extract(binding).try_from_value::<String>().unwrap())
+            Some(name.extract(binding).try_from_inline::<String>().unwrap())
         });
         let r: Vec<_> = q.collect();
         assert_eq!(r, vec!["Isaac", "Jules"]);

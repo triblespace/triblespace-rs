@@ -1,4 +1,4 @@
-//! Value and blob schemas minted for triblespace-search.
+//! Inline and blob schemas minted for triblespace-search.
 //!
 //! - [`F32LE`] (value schema): packs an f32 into a 32-byte
 //!   triblespace value, used by score-as-bound-variable
@@ -13,7 +13,7 @@
 //! live next to their index types.
 //!
 //! The built-in tokenizers in [`crate::tokens`] return
-//! `Value<Handle<LongString>>` — the hash bytes are
+//! `Inline<Handle<LongString>>` — the hash bytes are
 //! valid LongString-blob handles by construction, so there's
 //! no need for a bespoke "token hash" schema.
 
@@ -26,10 +26,10 @@ use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{IntoValue, TryFromValue, Value, ValueSchema};
+use triblespace_core::value::{IntoInline, TryFromInline, Inline, InlineSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
-/// triblespace `Value`. Bytes `[0..4]` hold the raw f32 bytes;
+/// triblespace `Inline`. Bytes `[0..4]` hold the raw f32 bytes;
 /// bytes `[4..32]` are zero-padded.
 ///
 /// Schema id was minted via `trible genid` and is fixed:
@@ -38,7 +38,7 @@ use triblespace_core::value::{IntoValue, TryFromValue, Value, ValueSchema};
 /// Every bit pattern decodes to some f32 (including NaN +
 /// signed zero), so validation is infallible. Callers that want
 /// stricter invariants (non-NaN, within a specific range)
-/// should wrap `Value<F32LE>` with their own newtype + checked
+/// should wrap `Inline<F32LE>` with their own newtype + checked
 /// conversion.
 pub enum F32LE {}
 
@@ -50,7 +50,7 @@ impl MetaDescribe for F32LE {
         );
         let name = fragment.put("F32LE");
         let description = fragment.put(
-            "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Value, with the rest zero-padded.",
+            "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Inline, with the rest zero-padded.",
         );
         fragment.annotated(|id_ref| {
             entity! { id_ref @
@@ -62,31 +62,31 @@ impl MetaDescribe for F32LE {
     }
 }
 
-impl ValueSchema for F32LE {
+impl InlineSchema for F32LE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
 
 impl IntoSchema<F32LE> for f32 {
-    type Form = Value<F32LE>;
-    fn into_schema(self) -> Value<F32LE> {
+    type Form = Inline<F32LE>;
+    fn into_schema(self) -> Inline<F32LE> {
         let mut raw = [0u8; 32];
         raw[0..4].copy_from_slice(&self.to_le_bytes());
-        Value::new(raw)
+        Inline::new(raw)
     }
 }
 
 impl IntoSchema<F32LE> for &f32 {
-    type Form = Value<F32LE>;
-    fn into_schema(self) -> Value<F32LE> {
-        (*self).to_value()
+    type Form = Inline<F32LE>;
+    fn into_schema(self) -> Inline<F32LE> {
+        (*self).to_inline()
     }
 }
 
-impl TryFromValue<'_, F32LE> for f32 {
+impl TryFromInline<'_, F32LE> for f32 {
     type Error = Infallible;
 
-    fn try_from_value(value: &Value<F32LE>) -> Result<Self, Self::Error> {
+    fn try_from_inline(value: &Inline<F32LE>) -> Result<Self, Self::Error> {
         Ok(f32::from_le_bytes(value.raw[0..4].try_into().unwrap()))
     }
 }
@@ -147,11 +147,11 @@ impl MetaDescribe for Embedding {
 /// spell the full type.
 ///
 /// ```
-/// use triblespace_core::value::Value;
+/// use triblespace_core::value::Inline;
 /// use triblespace_search::schemas::EmbHandle;
 ///
-/// fn keep(_h: Value<EmbHandle>) {}
-/// # keep(Value::new([0u8; 32]));
+/// fn keep(_h: Inline<EmbHandle>) {}
+/// # keep(Inline::new([0u8; 32]));
 /// ```
 pub type EmbHandle = triblespace_core::value::schemas::hash::Handle<Embedding>;
 
@@ -167,7 +167,7 @@ impl TryFromBlob<Embedding> for View<[f32]> {
 }
 
 impl IntoSchema<Embedding> for View<[f32]>
-where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Form = Blob<Embedding>;
     fn into_schema(self) -> Blob<Embedding> {
@@ -176,7 +176,7 @@ where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_cor
 }
 
 impl IntoSchema<Embedding> for Vec<f32>
-where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Form = Blob<Embedding>;
     fn into_schema(self) -> Blob<Embedding> {
@@ -191,7 +191,7 @@ where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_cor
 }
 
 impl IntoSchema<Embedding> for &[f32]
-where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::ValueSchema,
+where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Form = Blob<Embedding>;
     fn into_schema(self) -> Blob<Embedding> {
@@ -227,11 +227,11 @@ pub fn l2_normalize(vec: &mut [f32]) {
 pub fn put_embedding<B>(
     store: &mut B,
     mut vec: Vec<f32>,
-) -> Result<triblespace_core::value::Value<triblespace_core::value::schemas::hash::Handle<Embedding>>, B::PutError>
+) -> Result<triblespace_core::value::Inline<triblespace_core::value::schemas::hash::Handle<Embedding>>, B::PutError>
 where
     B: triblespace_core::repo::BlobStorePut,
     triblespace_core::value::schemas::hash::Handle<Embedding>:
-        triblespace_core::value::ValueSchema,
+        triblespace_core::value::InlineSchema,
 {
     l2_normalize(&mut vec);
     store.put::<Embedding, _>(vec)
@@ -244,32 +244,32 @@ mod tests {
     #[test]
     fn round_trip_positive() {
         let original: f32 = 0.123;
-        let v: Value<F32LE> = original.to_value();
-        let back: f32 = f32::try_from_value(&v).unwrap();
+        let v: Inline<F32LE> = original.to_inline();
+        let back: f32 = f32::try_from_inline(&v).unwrap();
         assert_eq!(original, back);
     }
 
     #[test]
     fn round_trip_negative() {
         let original: f32 = -42.75;
-        let v: Value<F32LE> = original.to_value();
-        let back: f32 = f32::try_from_value(&v).unwrap();
+        let v: Inline<F32LE> = original.to_inline();
+        let back: f32 = f32::try_from_inline(&v).unwrap();
         assert_eq!(original, back);
     }
 
     #[test]
     fn round_trip_zero() {
         let original: f32 = 0.0;
-        let v: Value<F32LE> = original.to_value();
-        let back: f32 = f32::try_from_value(&v).unwrap();
+        let v: Inline<F32LE> = original.to_inline();
+        let back: f32 = f32::try_from_inline(&v).unwrap();
         assert_eq!(original.to_bits(), back.to_bits());
     }
 
     #[test]
     fn round_trip_nan() {
         let original: f32 = f32::NAN;
-        let v: Value<F32LE> = original.to_value();
-        let back: f32 = f32::try_from_value(&v).unwrap();
+        let v: Inline<F32LE> = original.to_inline();
+        let back: f32 = f32::try_from_inline(&v).unwrap();
         assert!(back.is_nan());
     }
 
@@ -277,14 +277,14 @@ mod tests {
     fn padding_is_zero() {
         // Arbitrary finite non-zero value; clippy flags 3.14 as
         // an approximation of `std::f32::consts::PI`.
-        let v: Value<F32LE> = 2.5f32.to_value();
+        let v: Inline<F32LE> = 2.5f32.to_inline();
         assert_eq!(&v.raw[4..32], &[0u8; 28]);
     }
 
     #[test]
     fn deterministic_same_input_same_value() {
-        let a: Value<F32LE> = 1.5f32.to_value();
-        let b: Value<F32LE> = 1.5f32.to_value();
+        let a: Inline<F32LE> = 1.5f32.to_inline();
+        let b: Inline<F32LE> = 1.5f32.to_inline();
         assert_eq!(a.raw, b.raw);
     }
 
@@ -319,9 +319,9 @@ mod tests {
         let v2: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v3: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
 
-        let h1: Value<Handle<Embedding>> = v1.to_blob().get_handle();
-        let h2: Value<Handle<Embedding>> = v2.to_blob().get_handle();
-        let h3: Value<Handle<Embedding>> = v3.to_blob().get_handle();
+        let h1: Inline<Handle<Embedding>> = v1.to_blob().get_handle();
+        let h2: Inline<Handle<Embedding>> = v2.to_blob().get_handle();
+        let h3: Inline<Handle<Embedding>> = v3.to_blob().get_handle();
 
         assert_eq!(h1, h2, "identical vectors must dedup by handle");
         assert_ne!(h1, h3, "different vectors must have different handles");

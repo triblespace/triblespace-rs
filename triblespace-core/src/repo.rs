@@ -182,9 +182,9 @@ use crate::prelude::valueschemas::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Handle;
-use crate::value::Value;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::Inline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 use ed25519_dalek::SigningKey;
 
 use crate::blob::schemas::longstring::LongString;
@@ -230,7 +230,7 @@ attributes! {
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList {
     /// Iterator over blob handles in the store.
-    type Iter<'a>: Iterator<Item = Result<Value<Handle<UnknownBlob>>, Self::Err>>
+    type Iter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::Err>>
     where
         Self: 'a;
     /// Error type for listing operations.
@@ -275,11 +275,11 @@ pub trait BlobStoreMeta {
     /// the blob is not present.
     fn metadata<S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<Option<BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<S>: ValueSchema;
+        Handle<S>: InlineSchema;
 }
 
 /// Trait exposing a monotonic "forget" operation.
@@ -291,10 +291,10 @@ pub trait BlobStoreForget {
     type ForgetError: std::error::Error + Send + Sync + 'static;
 
     /// Removes the materialized blob identified by `handle` from this store.
-    fn forget<S>(&mut self, handle: Value<Handle<S>>) -> Result<(), Self::ForgetError>
+    fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
     where
         S: BlobSchema + 'static,
-        Handle<S>: ValueSchema;
+        Handle<S>: InlineSchema;
 }
 
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
@@ -312,12 +312,12 @@ pub trait BlobStoreGet {
     /// The error type is specified by the `Err` associated type.
     fn get<T, S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: ValueSchema;
+        Handle<S>: InlineSchema;
 }
 
 /// The `PutBlob` trait is used to store blobs in a repository.
@@ -326,11 +326,11 @@ pub trait BlobStorePut {
     type PutError: Error + Debug + Send + Sync + 'static;
 
     /// Serialises `item` as a blob, stores it, and returns its handle.
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema;
+        Handle<S>: InlineSchema;
 }
 
 /// Combined read/write blob storage.
@@ -351,7 +351,7 @@ pub trait BlobStoreKeep {
     /// Retain only the blobs identified by `handles`.
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>;
+        I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>;
 }
 
 /// Trait for stores that can enumerate a blob's child references.
@@ -367,22 +367,22 @@ pub trait BlobChildren: BlobStoreGet {
     /// Return handles of blobs referenced by `handle` that exist in this store.
     fn children(
         &self,
-        handle: Value<Handle<UnknownBlob>>,
-    ) -> Vec<Value<Handle<UnknownBlob>>> {
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Vec<Inline<Handle<UnknownBlob>>> {
         let Ok(blob) = self.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
             return Vec::new();
         };
         let bytes = blob.bytes.as_ref();
         let mut result = Vec::new();
         let mut offset = 0usize;
-        while offset + VALUE_LEN <= bytes.len() {
-            let mut raw = [0u8; VALUE_LEN];
-            raw.copy_from_slice(&bytes[offset..offset + VALUE_LEN]);
-            let candidate = Value::<Handle<UnknownBlob>>::new(raw);
+        while offset + INLINE_LEN <= bytes.len() {
+            let mut raw = [0u8; INLINE_LEN];
+            raw.copy_from_slice(&bytes[offset..offset + INLINE_LEN]);
+            let candidate = Inline::<Handle<UnknownBlob>>::new(raw);
             if self.get::<anybytes::Bytes, UnknownBlob>(candidate).is_ok() {
                 result.push(candidate);
             }
-            offset += VALUE_LEN;
+            offset += INLINE_LEN;
         }
         result
     }
@@ -399,7 +399,7 @@ pub enum PushResult {
     Success(),
     /// The CAS failed — the branch had advanced. Contains the current
     /// head, or `None` if the branch was deleted concurrently.
-    Conflict(Option<Value<Handle<SimpleArchive>>>),
+    Conflict(Option<Inline<Handle<SimpleArchive>>>),
 }
 
 /// Storage backend for branch metadata (branch-id → commit-handle mapping).
@@ -440,13 +440,13 @@ pub trait BranchStore {
     /// # Returns
     /// * A future that resolves to the handle of the branch.
     /// * The handle is a unique identifier for the branch, and is used to retrieve it from the repository.
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError>;
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>;
 
     /// Puts a branch on the repository, creating or updating it.
     ///
     /// # Parameters
     /// * `old` - Expected current value of the branch (None if creating new)
-    /// * `new` - Value to update the branch to (None deletes the branch)
+    /// * `new` - Inline to update the branch to (None deletes the branch)
     ///
     /// # Returns
     /// * `Success` - Push completed successfully
@@ -455,8 +455,8 @@ pub trait BranchStore {
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError>;
 }
 
@@ -500,8 +500,8 @@ pub fn transfer<'a, BS, BT, Handles>(
 ) -> impl Iterator<
     Item = Result<
         (
-            Value<Handle<UnknownBlob>>,
-            Value<Handle<UnknownBlob>>,
+            Inline<Handle<UnknownBlob>>,
+            Inline<Handle<UnknownBlob>>,
         ),
         TransferError<
             Infallible,
@@ -513,7 +513,7 @@ pub fn transfer<'a, BS, BT, Handles>(
 where
     BS: BlobStoreGet + 'a,
     BT: BlobStorePut + 'a,
-    Handles: IntoIterator<Item = Value<Handle<UnknownBlob>>> + 'a,
+    Handles: IntoIterator<Item = Inline<Handle<UnknownBlob>>> + 'a,
     Handles::IntoIter: 'a,
 {
     handles.into_iter().map(move |source_handle| {
@@ -535,15 +535,15 @@ where
     BS: BlobChildren,
 {
     source: &'a BS,
-    queue: VecDeque<Value<Handle<UnknownBlob>>>,
-    visited: HashSet<[u8; VALUE_LEN]>,
+    queue: VecDeque<Inline<Handle<UnknownBlob>>>,
+    visited: HashSet<[u8; INLINE_LEN]>,
 }
 
 impl<'a, BS> ReachableHandles<'a, BS>
 where
     BS: BlobChildren,
 {
-    fn new(source: &'a BS, roots: impl IntoIterator<Item = Value<Handle<UnknownBlob>>>) -> Self {
+    fn new(source: &'a BS, roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>) -> Self {
         let mut queue = VecDeque::new();
         for handle in roots {
             queue.push_back(handle);
@@ -561,7 +561,7 @@ impl<'a, BS> Iterator for ReachableHandles<'a, BS>
 where
     BS: BlobChildren,
 {
-    type Item = Value<Handle<UnknownBlob>>;
+    type Item = Inline<Handle<UnknownBlob>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(handle) = self.queue.pop_front() {
@@ -592,7 +592,7 @@ where
 /// stores can provide optimized batch implementations.
 pub fn reachable<'a, BS>(
     source: &'a BS,
-    roots: impl IntoIterator<Item = Value<Handle<UnknownBlob>>>,
+    roots: impl IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
 ) -> ReachableHandles<'a, BS>
 where
     BS: BlobChildren,
@@ -608,11 +608,11 @@ where
 /// helpers that accept collections of handles.
 pub fn potential_handles<'a>(
     set: &'a TribleSet,
-) -> impl Iterator<Item = Value<Handle<UnknownBlob>>> + 'a {
+) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + 'a {
     set.vae.iter().map(|raw| {
-        let mut value = [0u8; VALUE_LEN];
-        value.copy_from_slice(&raw[0..VALUE_LEN]);
-        Value::<Handle<UnknownBlob>>::new(value)
+        let mut value = [0u8; INLINE_LEN];
+        value.copy_from_slice(&raw[0..INLINE_LEN]);
+        Inline::<Handle<UnknownBlob>>::new(value)
     })
 }
 
@@ -968,7 +968,7 @@ where
             let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
             let Ok((name_handle,)) = find!(
-                (n: Value<Handle<LongString>>),
+                (n: Inline<Handle<LongString>>),
                 pattern!(&meta_set, [{ crate::metadata::name: ?n }])
             )
             .exactly_one() else {
@@ -1060,7 +1060,7 @@ where
         };
 
         let head_ = match find!(
-            (head_: Value<_>),
+            (head_: Inline<_>),
             pattern!(&base_branch_meta, [{ head: ?head_ }])
         )
         .at_most_one()
@@ -1138,7 +1138,7 @@ where
             .map_err(PushError::StorageGet)?;
 
         let Ok((branch_name,)) = find!(
-            (name: Value<Handle<LongString>>),
+            (name: Inline<Handle<LongString>>),
             pattern!(base_branch_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
@@ -1199,7 +1199,7 @@ where
                     .get(conflicting_meta)
                     .map_err(PushError::StorageGet)?;
 
-                let head_ = match find!((head_: Value<_>),
+                let head_ = match find!((head_: Inline<_>),
                     pattern!(&branch_meta, [{ head: ?head_ }])
                 )
                 .at_most_one()
@@ -1245,7 +1245,7 @@ where
         &mut self,
         branch_id: Id,
     ) -> Result<
-        Value<Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
+        Inline<Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
         RollupError<Storage>,
     > {
         use crate::blob::schemas::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -1263,7 +1263,7 @@ where
         // Upload the archive blob directly to storage — no workspace-local
         // staging needed; the CAS below references it by handle.
         let archive_blob = (&archive).to_blob();
-        let handle: Value<
+        let handle: Inline<
             Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>,
         > = self
             .storage
@@ -1280,7 +1280,7 @@ where
             .get(ws.base_branch_meta)
             .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
         let (branch_name,) = find!(
-            (name: Value<Handle<LongString>>),
+            (name: Inline<Handle<LongString>>),
             pattern!(&base_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one()
@@ -1316,11 +1316,11 @@ where
 }
 
 /// A handle to a commit blob in the repository.
-pub type CommitHandle = Value<Handle<SimpleArchive>>;
-type MetadataHandle = Value<Handle<SimpleArchive>>;
+pub type CommitHandle = Inline<Handle<SimpleArchive>>;
+type MetadataHandle = Inline<Handle<SimpleArchive>>;
 /// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
-pub type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
-type BranchMetaHandle = Value<Handle<SimpleArchive>>;
+pub type CommitSet = PATCH<INLINE_LEN, IdentitySchema, ()>;
+type BranchMetaHandle = Inline<Handle<SimpleArchive>>;
 
 /// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
 /// with the set of commits that produced it. Pass the commit set as the start
@@ -1688,12 +1688,12 @@ where
 
         while remaining > 0 && !frontier.is_empty() {
             // Collect current frontier keys before mutating.
-            let keys: Vec<[u8; VALUE_LEN]> = frontier.iter().copied().collect();
+            let keys: Vec<[u8; INLINE_LEN]> = frontier.iter().copied().collect();
             let mut next_frontier = CommitSet::new();
             for raw in keys {
                 let handle = CommitHandle::new(raw);
                 let meta: TribleSet = ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
-                for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
+                for (p,) in find!((p: Inline<_>), pattern!(&meta, [{ parent: ?p }])) {
                     next_frontier.insert(&Entry::new(&p.raw));
                 }
             }
@@ -1720,9 +1720,9 @@ where
         let seeds = self.0.select(ws)?;
         let mut result = CommitSet::new();
         for raw in seeds.iter() {
-            let handle = Value::new(*raw);
+            let handle = Inline::new(*raw);
             let meta: TribleSet = ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
-            for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
+            for (p,) in find!((p: Inline<_>), pattern!(&meta, [{ parent: ?p }])) {
                 result.insert(&Entry::new(&p.raw));
             }
         }
@@ -1829,11 +1829,11 @@ where
         let mut result = CommitSet::new();
         let filter = self.filter;
         for raw in patch.iter() {
-            let handle = Value::new(*raw);
+            let handle = Inline::new(*raw);
             let meta: TribleSet = ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
 
             let Ok((content_handle,)) = find!(
-                (c: Value<_>),
+                (c: Inline<_>),
                 pattern!(&meta, [{ content: ?c }])
             )
             .exactly_one() else {
@@ -1899,7 +1899,7 @@ fn collect_reachable_from_patch<Blobs: BlobStore>(
 > {
     let mut result = CommitSet::new();
     for raw in patch.iter() {
-        let handle = Value::new(*raw);
+        let handle = Inline::new(*raw);
         let reach = collect_reachable(ws, handle)?;
         result.union(reach);
     }
@@ -1915,7 +1915,7 @@ fn collect_reachable_from_patch_until<Blobs: BlobStore>(
     WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
 > {
     let mut visited = HashSet::new();
-    let mut stack: Vec<CommitHandle> = seeds.iter().map(|raw| Value::new(*raw)).collect();
+    let mut stack: Vec<CommitHandle> = seeds.iter().map(|raw| Inline::new(*raw)).collect();
     let mut result = CommitSet::new();
 
     while let Some(commit) = stack.pop() {
@@ -1937,7 +1937,7 @@ fn collect_reachable_from_patch_until<Blobs: BlobStore>(
             .or_else(|_| ws.base_blobs.get(commit))
             .map_err(WorkspaceCheckoutError::Storage)?;
 
-        for (p,) in find!((p: Value<_>,), pattern!(&meta, [{ parent: ?p }])) {
+        for (p,) in find!((p: Inline<_>,), pattern!(&meta, [{ parent: ?p }])) {
             stack.push(p);
         }
     }
@@ -2095,13 +2095,13 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     pub fn rollup(
         &mut self,
     ) -> Result<
-        Option<Value<Handle<SuccinctArchiveBlob>>>,
+        Option<Inline<Handle<SuccinctArchiveBlob>>>,
         <Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     > {
         let base_meta: TribleSet = self.base_blobs.get(self.base_branch_meta)?;
         Ok(
             find!(
-                (r: Value<Handle<SuccinctArchiveBlob>>),
+                (r: Inline<Handle<SuccinctArchiveBlob>>),
                 pattern!(&base_meta, [{ rollup: ?r }])
             )
             .next()
@@ -2111,11 +2111,11 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
 
     /// Adds a blob to the workspace's local blob store.
     /// Mirrors [`BlobStorePut::put`](crate::repo::BlobStorePut) for ease of use.
-    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
+    pub fn put<S, T>(&mut self, item: T) -> Inline<Handle<S>>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         self.staged.put(item).expect("infallible blob put")
     }
@@ -2127,12 +2127,12 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// to the base blob store if the blob is not found locally.
     pub fn get<T, S>(
         &mut self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<T, <Blobs::Reader as BlobStoreGet>::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         self.staged
             .reader()
@@ -2267,7 +2267,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// `transfer`) for the optimization to kick in.
     pub fn merge_commit(
         &mut self,
-        other: Value<Handle<SimpleArchive>>,
+        other: Inline<Handle<SimpleArchive>>,
     ) -> Result<CommitHandle, MergeError> {
         // Trivial cases first.
         let local_head = match self.head {
@@ -2359,7 +2359,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             // callers can request ancestor ranges without failing when a
             // merge commit is encountered.
             let content_opt =
-                match find!((c: Value<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
@@ -2398,7 +2398,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                 .map_err(WorkspaceCheckoutError::Storage)?;
 
             let metadata_opt =
-                match find!((c: Value<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
@@ -2435,7 +2435,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                 .map_err(WorkspaceCheckoutError::Storage)?;
 
             let content_opt =
-                match find!((c: Value<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ content: ?c }])).at_most_one() {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
@@ -2450,7 +2450,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             }
 
             let metadata_opt =
-                match find!((c: Value<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
@@ -2481,7 +2481,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         R: CommitSelector<Blobs>,
     {
         let commits = spec.select(self)?;
-        let facts = self.checkout_commits(commits.iter().map(|raw| Value::new(*raw)))?;
+        let facts = self.checkout_commits(commits.iter().map(|raw| Inline::new(*raw)))?;
         Ok(Checkout { facts, commits })
     }
 
@@ -2498,7 +2498,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         R: CommitSelector<Blobs>,
     {
         let patch = spec.select(self)?;
-        let commits = patch.iter().map(|raw| Value::new(*raw));
+        let commits = patch.iter().map(|raw| Inline::new(*raw));
         self.checkout_commits_metadata(commits)
     }
 
@@ -2515,7 +2515,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         R: CommitSelector<Blobs>,
     {
         let patch = spec.select(self)?;
-        let commits = patch.iter().map(|raw| Value::new(*raw));
+        let commits = patch.iter().map(|raw| Inline::new(*raw));
         self.checkout_commits_with_metadata(commits)
     }
 }
@@ -2566,7 +2566,7 @@ fn collect_reachable<Blobs: BlobStore>(
             .or_else(|_| ws.base_blobs.get(commit))
             .map_err(WorkspaceCheckoutError::Storage)?;
 
-        for (p,) in find!((p: Value<_>,), pattern!(&meta, [{ parent: ?p }])) {
+        for (p,) in find!((p: Inline<_>,), pattern!(&meta, [{ parent: ?p }])) {
             stack.push(p);
         }
     }

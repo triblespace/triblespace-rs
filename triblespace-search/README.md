@@ -7,7 +7,7 @@ Two blob types, loaded zero-copy via [anybytes] and [jerky]:
 
 - **`SuccinctBM25Index`** (SB25 blob, schema id
   `68C03764D04D05DF65E49589FBBA1441`) — lexical / associative
-  retrieval. Terms are 32-byte triblespace `Value`s, so the
+  retrieval. Terms are 32-byte triblespace `Inline`s, so the
   index handles text search, entity co-occurrence, and tag
   weighting with the same schema. Postings bit-packed via jerky
   `CompactVector`.
@@ -93,8 +93,8 @@ remaining open items are perf/encoding refinements, not architecture.
   both single-word and phrase queries — `bigram_tokens("quick
   brown")` hashes only the ordered pair, so a doc matches iff
   the two words appear adjacently.
-* **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
-  into 32-byte `Value<F32LE>`s. Used by the scored BM25
+* **`schemas::F32LE`**: `InlineSchema` for packing `f32` scores
+  into 32-byte `Inline<F32LE>`s. Used by the scored BM25
   constraint.
 * Eight runnable examples:
   - `query_demo` — text search, multi-term ranking via

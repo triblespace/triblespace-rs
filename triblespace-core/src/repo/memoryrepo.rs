@@ -12,7 +12,7 @@ use crate::repo::PushResult;
 use crate::value::schemas::hash::Blake3;
 
 use crate::value::schemas::hash::Handle;
-use crate::value::ValueSchema;
+use crate::value::InlineSchema;
 
 /// Simple in-memory implementation of [`BlobStore`] and [`BranchStore`].
 ///
@@ -23,16 +23,16 @@ pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
     /// Map from branch id to the handle of its current head commit.
-    pub branches: HashMap<Id, Value<Handle<SimpleArchive>>>,
+    pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
 }
 
 impl crate::repo::BlobStorePut for MemoryRepo {
     type PutError = <MemoryBlobStore as crate::repo::BlobStorePut>::PutError;
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         self.blobs.put(item)
     }
@@ -49,7 +49,7 @@ impl crate::repo::BlobStore for MemoryRepo {
 impl crate::repo::BlobStoreKeep for MemoryRepo {
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
+        I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
         self.blobs.keep(handles);
     }
@@ -75,15 +75,15 @@ impl BranchStore for MemoryRepo {
     fn head(
         &mut self,
         id: Id,
-    ) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
+    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         Ok(self.branches.get(&id).cloned())
     }
 
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         let current = self.branches.get(&id);
         if current != old.as_ref() {

@@ -118,12 +118,12 @@ fn main() {
 
     // ─ Bonus: filter through the engine, score precisely after ─
     println!("\nscored variant: title 'fox' with BM25 scores:");
-    use triblespace_core::value::IntoValue;
+    use triblespace_core::value::IntoInline;
     let mut scored: Vec<(Id, f32)> = find!(
         (book: Id),
         idx.matches(book, &fox, 0.0)
     )
-    .map(|(b,)| (b, idx.score(&b.to_value(), &fox)))
+    .map(|(b,)| (b, idx.score(&b.to_inline(), &fox)))
     .collect();
     scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (b, s) in &scored {

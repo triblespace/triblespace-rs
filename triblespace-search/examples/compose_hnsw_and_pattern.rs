@@ -25,7 +25,7 @@ use triblespace_core::query::temp;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::macros::attributes;
 
@@ -67,7 +67,7 @@ fn main() {
         (book_c, vec![0.85, 0.15, 0.1, 0.0]),
         (book_d, vec![-1.0, 0.0, 0.0, 0.0]),
     ];
-    let mut handles: std::collections::HashMap<Id, Value<Handle<Embedding>>> =
+    let mut handles: std::collections::HashMap<Id, Inline<Handle<Embedding>>> =
         std::collections::HashMap::new();
     for (bid, v) in &vectors {
         let h = put_embedding::<_>(&mut store, v.clone()).unwrap();

@@ -134,8 +134,8 @@ use crate::macros::entity;
 use crate::macros::pattern;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::value::Value;
-use crate::value::IntoValue;
+use crate::value::Inline;
+use crate::value::IntoInline;
 use crate::value::schemas::time::NsTAIInterval;
 
 /// Errors returned by [`build_capability`].
@@ -189,7 +189,7 @@ pub enum BuildError {
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToValue;
+/// use triblespace_core::value::TryToInline;
 /// use triblespace_core::repo::capability::{build_capability, PERM_READ};
 /// use rand::rngs::OsRng;
 ///
@@ -206,7 +206,7 @@ pub enum BuildError {
 ///
 /// let now = hifitime::Epoch::now().unwrap();
 /// let expiry = (now, now + hifitime::Duration::from_seconds(24.0 * 3600.0))
-///     .try_to_value()
+///     .try_to_inline()
 ///     .unwrap();
 ///
 /// let (cap_blob, sig_blob) = build_capability(
@@ -230,7 +230,7 @@ pub fn build_capability(
     parent: Option<(Blob<SimpleArchive>, Blob<SimpleArchive>)>,
     scope_root: crate::id::Id,
     scope_facts: TribleSet,
-    expiry: Value<NsTAIInterval>,
+    expiry: Inline<NsTAIInterval>,
 ) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>), BuildError> {
     let issuer_pubkey: VerifyingKey = issuer.verifying_key();
 
@@ -252,7 +252,7 @@ pub fn build_capability(
     cap_set += scope_facts;
 
     if let Some((parent_cap_blob, parent_sig_blob)) = parent {
-        let parent_cap_handle: Value<Handle<SimpleArchive>> =
+        let parent_cap_handle: Inline<Handle<SimpleArchive>> =
             parent_cap_blob.get_handle();
 
         // Decode the parent signature blob into its tribles, then locate
@@ -266,7 +266,7 @@ pub fn build_capability(
         // sig_signs (its own sig entity). We project that id out; the
         // signed handle is unused here.
         let mut sig_id_iter = find!(
-            (sig: crate::id::Id, _signed: Value<Handle<SimpleArchive>>),
+            (sig: crate::id::Id, _signed: Inline<Handle<SimpleArchive>>),
             pattern!(&parent_sig_set, [{ ?sig @ sig_signs: ?_signed }])
         )
         .map(|(sig, _)| sig);
@@ -292,7 +292,7 @@ pub fn build_capability(
 
     // Sign the cap blob's canonical bytes.
     let signature: Signature = issuer.sign(&cap_blob.bytes);
-    let cap_handle: Value<Handle<SimpleArchive>> =
+    let cap_handle: Inline<Handle<SimpleArchive>> =
         (&cap_blob).get_handle();
 
     // Build the sig blob: handle pointer to the cap, signer pubkey,
@@ -309,11 +309,11 @@ pub fn build_capability(
     Ok((cap_blob, sig_blob))
 }
 
-/// Convenience: convert a `VerifyingKey` to a `Value<ED25519PublicKey>`.
-/// Inlined to avoid an explicit `IntoValue` import at the call sites in
+/// Convenience: convert a `VerifyingKey` to a `Inline<ED25519PublicKey>`.
+/// Inlined to avoid an explicit `IntoInline` import at the call sites in
 /// the builder above.
-fn issuer_subject_value(key: VerifyingKey) -> Value<ed::ED25519PublicKey> {
-    key.to_value()
+fn issuer_subject_value(key: VerifyingKey) -> Inline<ed::ED25519PublicKey> {
+    key.to_inline()
 }
 
 // ── Scope subsumption ────────────────────────────────────────────────
@@ -455,18 +455,18 @@ pub fn build_revocation(
     target: VerifyingKey,
 ) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
     let now = hifitime::Epoch::now().expect("system time");
-    let timestamp: Value<NsTAIInterval> =
-        (now, now).try_to_value().expect("point interval");
+    let timestamp: Inline<NsTAIInterval> =
+        (now, now).try_to_inline().expect("point interval");
 
     let rev_fragment = entity! {
-        rev_target: target.to_value(),
+        rev_target: target.to_inline(),
         crate::metadata::created_at: timestamp,
     };
     let rev_blob: Blob<SimpleArchive> = TribleSet::from(rev_fragment).to_blob();
 
     let signature: Signature = revoker.sign(&rev_blob.bytes);
     let revoker_pubkey = revoker.verifying_key();
-    let rev_handle: Value<Handle<SimpleArchive>> =
+    let rev_handle: Inline<Handle<SimpleArchive>> =
         (&rev_blob).get_handle();
 
     let sig_fragment = entity! {
@@ -577,7 +577,7 @@ where
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToValue;
+/// use triblespace_core::value::TryToInline;
 /// use triblespace_core::repo::capability::{
 ///     build_capability, build_revocation, build_revocation_set,
 ///     extract_revocation_pairs, PERM_READ,
@@ -602,7 +602,7 @@ where
 /// .into();
 /// let now = hifitime::Epoch::now().unwrap();
 /// let expiry = (now, now + hifitime::Duration::from_seconds(3600.0))
-///     .try_to_value()
+///     .try_to_inline()
 ///     .unwrap();
 /// let (cap_blob, cap_sig_blob) = build_capability(
 ///     &team_root,
@@ -638,7 +638,7 @@ where
     let blob_map: std::collections::HashMap<[u8; 32], Blob<SimpleArchive>> = blobs
         .into_iter()
         .map(|b| {
-            let h: Value<Handle<SimpleArchive>> = (&b).get_handle();
+            let h: Inline<Handle<SimpleArchive>> = (&b).get_handle();
             (h.raw, b)
         })
         .collect();
@@ -652,7 +652,7 @@ where
             continue;
         };
         let mut sig_iter = find!(
-            (sig: crate::id::Id, h: Value<Handle<SimpleArchive>>),
+            (sig: crate::id::Id, h: Inline<Handle<SimpleArchive>>),
             pattern!(&sig_set, [{ ?sig @ sig_signs: ?h }])
         );
         // Exactly one sig_signs triple — anything else is non-sig-shaped
@@ -694,8 +694,8 @@ where
 
 use ed25519_dalek::Verifier;
 use std::collections::HashSet;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
 use hifitime::Epoch;
 
 /// Errors returned by [`verify_chain`].
@@ -883,7 +883,7 @@ fn verify_sig_blob(
     sig_set: &TribleSet,
     cap_blob: &Blob<SimpleArchive>,
 ) -> Result<VerifyingKey, VerifyError> {
-    let cap_handle: Value<Handle<SimpleArchive>> = cap_blob.get_handle();
+    let cap_handle: Inline<Handle<SimpleArchive>> = cap_blob.get_handle();
     let mut iter = find!(
         (sig: crate::id::Id, signer: VerifyingKey, r, s),
         pattern!(sig_set, [{
@@ -916,7 +916,7 @@ fn extract_cap_fields(
          subject: VerifyingKey,
          issuer: VerifyingKey,
          scope_root: crate::id::Id,
-         expiry: Value<NsTAIInterval>),
+         expiry: Inline<NsTAIInterval>),
         pattern!(cap_set, [{
             ?cap @
             cap_subject: ?subject,
@@ -932,8 +932,8 @@ fn extract_cap_fields(
 
     // Optional: cap_parent + cap_embedded_parent_sig. Both present or
     // both absent.
-    let parent_handle: Option<Value<Handle<SimpleArchive>>> = find!(
-        (h: Value<Handle<SimpleArchive>>),
+    let parent_handle: Option<Inline<Handle<SimpleArchive>>> = find!(
+        (h: Inline<Handle<SimpleArchive>>),
         pattern!(cap_set, [{ cap_id @ cap_parent: ?h }])
     )
     .next()
@@ -964,8 +964,8 @@ struct CapFields {
     subject: VerifyingKey,
     issuer: VerifyingKey,
     scope_root: crate::id::Id,
-    expiry: Value<NsTAIInterval>,
-    parent_handle: Option<Value<Handle<SimpleArchive>>>,
+    expiry: Inline<NsTAIInterval>,
+    parent_handle: Option<Inline<Handle<SimpleArchive>>>,
     embedded_sig: Option<crate::id::Id>,
 }
 
@@ -996,8 +996,8 @@ struct CapFields {
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToValue;
-/// use triblespace_core::value::Value;
+/// use triblespace_core::value::TryToInline;
+/// use triblespace_core::value::Inline;
 /// use triblespace_core::value::schemas::hash::{Blake3, Handle};
 /// use triblespace_core::repo::capability::{
 ///     build_capability, verify_chain, PERM_READ,
@@ -1022,7 +1022,7 @@ struct CapFields {
 /// // 24-hour expiry interval, anchored at "now".
 /// let now = hifitime::Epoch::now().unwrap();
 /// let expiry = (now, now + hifitime::Duration::from_seconds(24.0 * 3600.0))
-///     .try_to_value()
+///     .try_to_inline()
 ///     .unwrap();
 ///
 /// // Length-1 chain: team root signs the member's cap directly.
@@ -1037,13 +1037,13 @@ struct CapFields {
 /// .unwrap();
 ///
 /// // The peer presents the *sig* blob's handle on connection.
-/// let leaf_sig_handle: Value<Handle<SimpleArchive>> =
+/// let leaf_sig_handle: Inline<Handle<SimpleArchive>> =
 ///     (&sig_blob).get_handle();
 ///
 /// // The verifier needs both blobs available via the fetch closure.
 /// // Real callers wire this through their pile / blob store.
 /// let mut blobs: HashMap<[u8; 32], Blob<SimpleArchive>> = HashMap::new();
-/// let cap_handle: Value<Handle<SimpleArchive>> =
+/// let cap_handle: Inline<Handle<SimpleArchive>> =
 ///     (&cap_blob).get_handle();
 /// blobs.insert(cap_handle.raw, cap_blob);
 /// blobs.insert(leaf_sig_handle.raw, sig_blob);
@@ -1065,20 +1065,20 @@ struct CapFields {
 /// ```
 pub fn verify_chain<F>(
     team_root: VerifyingKey,
-    leaf_sig_handle: Value<Handle<SimpleArchive>>,
+    leaf_sig_handle: Inline<Handle<SimpleArchive>>,
     expected_subject: VerifyingKey,
     revoked: &HashSet<VerifyingKey>,
     mut fetch_blob: F,
 ) -> Result<VerifiedCapability, VerifyError>
 where
-    F: FnMut(Value<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+    F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
     let now: Epoch = hifitime::Epoch::now().expect("system time");
 
     // Helper: a cap is valid until the *upper bound* of its expiry
     // interval. We compare that upper bound against `now`.
-    let is_expired = |expiry: &Value<NsTAIInterval>| -> bool {
-        match <(Epoch, Epoch)>::try_from_value(expiry) {
+    let is_expired = |expiry: &Inline<NsTAIInterval>| -> bool {
+        match <(Epoch, Epoch)>::try_from_inline(expiry) {
             Ok((_lower, upper)) => upper < now,
             // A malformed/inverted interval is treated as expired so
             // adversarial caps can't fall through.
@@ -1092,7 +1092,7 @@ where
 
     // The leaf sig blob points at the leaf cap blob via sig_signs.
     let mut leaf_cap_handle_iter = find!(
-        (sig: crate::id::Id, h: Value<Handle<SimpleArchive>>),
+        (sig: crate::id::Id, h: Inline<Handle<SimpleArchive>>),
         pattern!(&leaf_sig_set, [{
             ?sig @ sig_signs: ?h,
         }])
@@ -1217,15 +1217,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::TryToValue;
+    use crate::value::TryToInline;
     use ed25519_dalek::Verifier;
     use hifitime::Epoch;
     use rand::rngs::OsRng;
 
-    fn now_plus_24h() -> Value<NsTAIInterval> {
+    fn now_plus_24h() -> Inline<NsTAIInterval> {
         let now = Epoch::now().expect("system time");
         let later = now + hifitime::Duration::from_seconds(24.0 * 3600.0);
-        (now, later).try_to_value().expect("valid interval")
+        (now, later).try_to_inline().expect("valid interval")
     }
 
     fn signing_key() -> SigningKey {
@@ -1287,7 +1287,7 @@ mod tests {
                 .expect("valid sig blob");
         let mut sig_iter = find!(
             (sig: Id,
-             handle: Value<Handle<SimpleArchive>>,
+             handle: Inline<Handle<SimpleArchive>>,
              pubkey: VerifyingKey,
              r,
              s),
@@ -1304,7 +1304,7 @@ mod tests {
         assert!(sig_iter.next().is_none(), "exactly one sig entity");
 
         // sig_signs must point at the cap blob.
-        let cap_handle: Value<Handle<SimpleArchive>> =
+        let cap_handle: Inline<Handle<SimpleArchive>> =
             (&cap_blob).get_handle();
         assert_eq!(signed_handle, cap_handle);
 
@@ -1323,7 +1323,7 @@ mod tests {
             <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(cap_blob)
                 .expect("valid cap blob");
         let parents: usize = find!(
-            (e: Id, h: Value<Handle<SimpleArchive>>),
+            (e: Id, h: Inline<Handle<SimpleArchive>>),
             pattern!(&cap_set, [{ ?e @ cap_parent: ?h }])
         )
         .count();
@@ -1340,14 +1340,14 @@ mod tests {
     /// Helper: build an in-memory blob store keyed by handle for the
     /// verifier's `fetch_blob` callback.
     fn store_for(blobs: &[&Blob<SimpleArchive>])
-        -> impl FnMut(Value<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>
+        -> impl FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>
     {
         let mut map = std::collections::HashMap::new();
         for blob in blobs {
-            let handle: Value<Handle<SimpleArchive>> = (*blob).get_handle();
+            let handle: Inline<Handle<SimpleArchive>> = (*blob).get_handle();
             map.insert(handle.raw, (*blob).clone());
         }
-        move |h: Value<Handle<SimpleArchive>>| map.get(&h.raw).cloned()
+        move |h: Inline<Handle<SimpleArchive>>| map.get(&h.raw).cloned()
     }
 
     /// Verify a length-1 chain (root signs founder directly). Should
@@ -1368,7 +1368,7 @@ mod tests {
         )
         .expect("root cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1414,7 +1414,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1454,7 +1454,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1488,7 +1488,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1521,7 +1521,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let mut revoked = HashSet::new();
         revoked.insert(founder.verifying_key());
@@ -1568,7 +1568,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let mut revoked = HashSet::new();
         // Revoke the founder's pubkey. The leaf cap's issuer is the
@@ -1724,7 +1724,7 @@ mod tests {
             [(rev_blob, rev_sig_blob)],
         );
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let result = verify_chain(
             team_root.verifying_key(),
@@ -1852,7 +1852,7 @@ mod tests {
         )
         .expect("member cap builds");
 
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&member_sig).get_handle();
         let revoked = HashSet::new();
         let result = verify_chain(
@@ -1910,10 +1910,10 @@ mod tests {
             <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(member_cap)
                 .expect("valid cap blob");
 
-        let founder_handle: Value<Handle<SimpleArchive>> =
+        let founder_handle: Inline<Handle<SimpleArchive>> =
             (&founder_cap).get_handle();
         let mut parents = find!(
-            (e: Id, h: Value<Handle<SimpleArchive>>),
+            (e: Id, h: Inline<Handle<SimpleArchive>>),
             pattern!(&member_cap_set, [{ ?e @ cap_parent: ?h }])
         );
         let (cap_entity_id, parent_handle_v) =
@@ -1974,7 +1974,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let revoked = HashSet::new();
         let verified = verify_chain(
@@ -2008,7 +2008,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let verified = verify_chain(
             team_root.verifying_key(),
@@ -2043,7 +2043,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let leaf_handle: Value<Handle<SimpleArchive>> =
+        let leaf_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
         let verified = verify_chain(
             team_root.verifying_key(),

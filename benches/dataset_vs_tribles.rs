@@ -5,7 +5,7 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::fucid;
 use triblespace::core::trible::Trible;
 use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::prelude::{BlobStorePut, IdOwner, IntoValue, TribleSet, Value};
+use triblespace::prelude::{BlobStorePut, IdOwner, IntoInline, TribleSet, Inline};
 
 struct PreparedData {
     tribles: Vec<Trible>,
@@ -33,7 +33,7 @@ fn prepare(size: usize) -> PreparedData {
         let e = owner.defer_insert(fucid());
         let a = owner.defer_insert(fucid());
         let v = fucid();
-        tribles.push(Trible::new(&e, &a, &v.to_value()));
+        tribles.push(Trible::new(&e, &a, &v.to_inline()));
         blobs.push(format!("blob_payload_{i}"));
     }
 
@@ -72,7 +72,7 @@ fn bench_inserts(c: &mut Criterion) {
                     let mut set = TribleSet::new();
                     let mut store = MemoryBlobStore::new();
                     for (trible, text) in data.tribles.iter().zip(&data.blobs) {
-                        let handle: Value<_> = store.put(text.clone()).expect("blob store insert");
+                        let handle: Inline<_> = store.put(text.clone()).expect("blob store insert");
                         // force allows using the raw ids from the sampled trible
                         let blob_trible = Trible::force(trible.e(), trible.a(), &handle);
                         set.insert(&blob_trible);

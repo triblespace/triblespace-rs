@@ -53,9 +53,9 @@ use crate::prelude::blobschemas::SimpleArchive;
 use crate::prelude::valueschemas::Handle;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Hash;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -108,11 +108,11 @@ impl IndexEntry {
 struct BranchHeader {
     magic_marker: RawId,
     branch_id: RawId,
-    hash: RawValue,
+    hash: RawInline,
 }
 
 impl BranchHeader {
-    fn new(branch_id: Id, hash: Value<Handle<SimpleArchive>>) -> Self {
+    fn new(branch_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BRANCH,
             branch_id: *branch_id,
@@ -127,7 +127,7 @@ struct BranchTombstoneHeader {
     magic_marker: RawId,
     branch_id: RawId,
     /// Reserved bytes to preserve 64 byte record alignment.
-    reserved: RawValue,
+    reserved: RawInline,
 }
 
 impl BranchTombstoneHeader {
@@ -146,11 +146,11 @@ struct BlobHeader {
     magic_marker: RawId,
     timestamp: u64,
     length: u64,
-    hash: RawValue,
+    hash: RawInline,
 }
 
 impl BlobHeader {
-    fn new(timestamp: u64, length: u64, hash: Value<Hash<Blake3>>) -> Self {
+    fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB,
             timestamp,
@@ -162,8 +162,8 @@ impl BlobHeader {
 
 #[derive(Debug)]
 enum Applied {
-    Blob { hash: Value<Hash<Blake3>> },
-    Branch { id: Id, hash: Value<Hash<Blake3>> },
+    Blob { hash: Inline<Hash<Blake3>> },
+    Branch { id: Id, hash: Inline<Hash<Blake3>> },
     BranchTombstone { id: Id },
 }
 
@@ -180,7 +180,7 @@ pub struct Pile {
     file: File,
     mmap: Arc<MmapRaw>,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
-    branches: PATCH<16, IdentitySchema, Value<Handle<SimpleArchive>>>,
+    branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -241,14 +241,14 @@ impl BlobStoreGet for PileReader {
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
-        let hash: &Value<Hash<Blake3>> = handle.as_transmute();
+        let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
         let Some(entry) = self.blobs.get(&hash.raw) else {
             return Err(GetBlobError::BlobNotFound);
         };
@@ -498,7 +498,7 @@ impl Pile {
             file,
             mmap,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
-            branches: PATCH::<16, IdentitySchema, Value<Handle<SimpleArchive>>>::new(),
+            branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             applied_length: 0,
         })
     }
@@ -579,7 +579,7 @@ impl Pile {
                 bytes.take_prefix(pad).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
-                let hash: Value<Hash<Blake3>> = Value::new(header.hash);
+                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
                 let ts = header.timestamp;
                 let entry =
                     Entry::with_value(&hash.raw, IndexEntry::new(data_offset, header.length, ts));
@@ -628,8 +628,8 @@ impl Pile {
                 })?;
                 // Interpret the stored raw value as a hash and transmute into a
                 // handle value for storage. Use Entry to insert/replace into the PATCH.
-                let hash: Value<Hash<Blake3>> = Value::new(header.hash);
-                let handle_val: Value<Handle<SimpleArchive>> = hash.into();
+                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
+                let handle_val: Inline<Handle<SimpleArchive>> = hash.into();
                 let entry = Entry::with_value(&header.branch_id, handle_val);
                 // Replace existing mapping (if any) with the new head.
                 self.branches.replace(&entry);
@@ -752,11 +752,11 @@ pub struct PileBlobStoreIter {
 
 impl Iterator for PileBlobStoreIter {
     type Item =
-        Result<(Value<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
+        Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?; // [u8;32]
-        let hash = Value::<Hash<Blake3>>::new(key);
+        let hash = Inline::<Hash<Blake3>>::new(key);
         // Look up the index entry inside the owned PATCH clone held by the
         // `lookup` field. The clone is cheap and allows us to resolve index
         // entries without borrowing the live PATCH.
@@ -780,7 +780,7 @@ impl Iterator for PileBlobStoreIter {
             });
             match state {
                 ValidationState::Validated => {
-                    let handle: Value<Handle<UnknownBlob>> = hash.into();
+                    let handle: Inline<Handle<UnknownBlob>> = hash.into();
                     // We just validated against `hash`; pre-seed the
                     // cached handle so downstream `get_handle` /
                     // `insert` skip the Blake3 recompute.
@@ -804,12 +804,12 @@ pub struct PileBlobStoreListIter {
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,}
 
 impl Iterator for PileBlobStoreListIter {
-    type Item = Result<Value<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
+    type Item = Result<Inline<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?;
-        let hash = Value::<Hash<Blake3>>::new(key);
-        let handle: Value<Handle<UnknownBlob>> = hash.into();
+        let hash = Inline::<Hash<Blake3>>::new(key);
+        let handle: Inline<Handle<UnknownBlob>> = hash.into();
         Some(Ok(handle))
     }
 }
@@ -843,7 +843,7 @@ impl BlobStoreList for PileReader {
 /// built-in key iterator to avoid allocating a full Vec of ids.
 pub struct PileBranchStoreIter {
     inner:
-        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Value<Handle<SimpleArchive>>>,
+        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
 }
 
 impl Iterator for PileBranchStoreIter {
@@ -874,11 +874,11 @@ impl BlobStorePut for Pile {
     /// so a multi-`write` record is still crash-safe. Multiple writers
     /// are safe only on filesystems guaranteeing atomic `write`/`vwrite`
     /// appends; other filesystems may corrupt the pile.
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
@@ -897,8 +897,8 @@ impl BlobStorePut for Pile {
         let res = (|| {
             self.refresh_locked().map_err(InsertError::from)?;
 
-            let handle: Value<Handle<S>> = blob.get_handle();
-            let hash: Value<Hash<Blake3>> = handle.into();
+            let handle: Inline<Handle<S>> = blob.get_handle();
+            let hash: Inline<Hash<Blake3>> = handle.into();
 
             if let Some(IndexEntry {
                 state, offset, len, ..
@@ -1000,7 +1000,7 @@ impl BranchStore for Pile
         Ok(PileBranchStoreIter { inner })
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         // Ensure newly appended records are applied before returning the head.
         // This keeps callers up-to-date with any external writers that appended
         // to the pile file.
@@ -1024,8 +1024,8 @@ impl BranchStore for Pile
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<super::PushResult, Self::UpdateError> {
         self.file.lock()?;
         let res = (|| {
@@ -1088,14 +1088,14 @@ impl crate::repo::BlobStoreMeta for PileReader {
 
     fn metadata<S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         // re-use existing implementation logic
-        let hash: &Value<Hash<Blake3>> = handle.as_transmute();
+        let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
         let entry = match self.blobs.get(&hash.raw) {
             Some(e) => e,
             None => return Ok(None),
@@ -1409,7 +1409,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
 
         // Stage three baseline blobs and snapshot the reader.
-        let mut baseline_handles: HashSet<Value<Handle<UnknownBlob>>> = HashSet::new();
+        let mut baseline_handles: HashSet<Inline<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![1u8; 3], vec![2u8; 4], vec![3u8; 5]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
             let handle = pile.put(blob).unwrap();
@@ -1418,7 +1418,7 @@ mod tests {
         let baseline = pile.reader().unwrap();
 
         // Stage two more blobs after taking the baseline snapshot.
-        let mut new_handles: HashSet<Value<Handle<UnknownBlob>>> = HashSet::new();
+        let mut new_handles: HashSet<Inline<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![4u8; 6], vec![5u8; 7]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
             let handle = pile.put(blob).unwrap();
@@ -1427,7 +1427,7 @@ mod tests {
 
         // Diff the current reader against the baseline.
         let current = pile.reader().unwrap();
-        let diffed: HashSet<Value<Handle<UnknownBlob>>> = current
+        let diffed: HashSet<Inline<Handle<UnknownBlob>>> = current
             .blobs_diff(&baseline)
             .map(|r| r.expect("infallible diff iter"))
             .collect();
@@ -1501,7 +1501,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
 
         let branch_id = Id::new([1; 16]).unwrap();
-        let head = Value::<Handle<SimpleArchive>>::new([2; 32]);
+        let head = Inline::<Handle<SimpleArchive>>::new([2; 32]);
         pile.update(branch_id, None, Some(head)).unwrap();
 
         let data = vec![3u8; 8];
@@ -1883,7 +1883,7 @@ mod tests {
 
         let mut reader = pile.reader().unwrap();
         let _full_patch = reader.blobs.clone();
-        let hash1: Value<Hash<Blake3>> = handle1.into();
+        let hash1: Inline<Hash<Blake3>> = handle1.into();
         reader.blobs.remove(&hash1.raw);
 
         let mut iter = reader.iter();

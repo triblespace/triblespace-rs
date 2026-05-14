@@ -46,14 +46,14 @@ fn pattern_local_variables_enforce_equality() {
     kb += entity! { &different @ names::first: "Alice", names::last: "Smith" };
 
     let results: Vec<_> = find!(
-        (person: Value<_>),
+        (person: Inline<_>),
         pattern!(&kb, [
             { ?person @ names::first: _?name, names::last: _?name }
         ])
     )
     .collect();
 
-    assert_eq!(results, vec![(same.to_value(),)]);
+    assert_eq!(results, vec![(same.to_inline(),)]);
 }
 
 #[test]
@@ -67,14 +67,14 @@ fn pattern_changes_local_variables_track_deltas() {
     let delta = updated.difference(&base);
 
     let results: Vec<_> = find!(
-        (person: Value<_>),
+        (person: Inline<_>),
         pattern_changes!(&updated, &delta, [
             { ?person @ names::first: _?name, names::last: _?name }
         ])
     )
     .collect();
 
-    assert_eq!(results, vec![(same.to_value(),)]);
+    assert_eq!(results, vec![(same.to_inline(),)]);
 }
 
 #[test]
@@ -96,13 +96,13 @@ fn pattern_local_vars_require_no_external_binding() {
         social::best_friend: &alice
     };
 
-    let results: Vec<_> = find!((person: Value<_>), pattern!(&set, [
+    let results: Vec<_> = find!((person: Inline<_>), pattern!(&set, [
         { ?person @ social::friend: _?buddy },
         { ?person @ social::best_friend: _?buddy }
     ]))
     .collect();
 
-    assert_eq!(results, vec![(alice.to_value(),)]);
+    assert_eq!(results, vec![(alice.to_inline(),)]);
 }
 
 #[test]
@@ -127,13 +127,13 @@ fn pattern_changes_local_vars_are_scoped_to_invocation() {
 
     let delta = updated.difference(&base);
 
-    let results: Vec<_> = find!((person: Value<_>), pattern_changes!(&updated, &delta, [
+    let results: Vec<_> = find!((person: Inline<_>), pattern_changes!(&updated, &delta, [
         { ?person @ social::friend: _?buddy },
         { ?person @ social::best_friend: _?buddy }
     ]))
     .collect();
 
-    assert_eq!(results, vec![(alice.to_value(),)]);
+    assert_eq!(results, vec![(alice.to_inline(),)]);
 }
 
 #[test]
@@ -154,10 +154,10 @@ fn pattern_local_vars_infer_value_schema_from_usage() {
         library::subtitle: "Second Edition"
     };
 
-    let results: Vec<_> = find!((book: Value<_>), pattern!(&set, [
+    let results: Vec<_> = find!((book: Inline<_>), pattern!(&set, [
         { ?book @ library::title: _?label, library::subtitle: _?label }
     ]))
     .collect();
 
-    assert_eq!(results, vec![(highlighted.to_value(),)]);
+    assert_eq!(results, vec![(highlighted.to_inline(),)]);
 }

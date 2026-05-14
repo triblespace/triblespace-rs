@@ -35,13 +35,13 @@ proptest! {
         let dst = rngid();
         let set: TribleSet = entity! { &src @ test_ns::link: &dst }.into();
 
-        let results: Vec<Value<_>> = find!(
-            target: Value<_>,
+        let results: Vec<Inline<_>> = find!(
+            target: Inline<_>,
             pattern!(&set, [{ test_ns::link: ?target }])
         ).collect();
 
         prop_assert_eq!(results.len(), 1);
-        prop_assert_eq!(results[0], (&dst).to_value());
+        prop_assert_eq!(results[0], (&dst).to_inline());
     }
 
     #[test]
@@ -62,12 +62,12 @@ proptest! {
         prop_assert_eq!(&names[0], &name);
 
         // Query link
-        let links: Vec<Value<_>> = find!(
-            target: Value<_>,
+        let links: Vec<Inline<_>> = find!(
+            target: Inline<_>,
             pattern!(&set, [{ test_ns::link: ?target }])
         ).collect();
         prop_assert_eq!(links.len(), 1);
-        prop_assert_eq!(links[0], (&other).to_value());
+        prop_assert_eq!(links[0], (&other).to_inline());
     }
 
     #[test]
@@ -223,8 +223,8 @@ proptest! {
         }
 
         // ?e in both entity and value positions (projected variable)
-        let results: Vec<(Value<_>, String)> = find!(
-            (e: Value<_>, name: String),
+        let results: Vec<(Inline<_>, String)> = find!(
+            (e: Inline<_>, name: String),
             pattern!(&set, [
                 { ?e @ test_ns::name: ?name, test_ns::link: ?e }
             ])
@@ -232,7 +232,7 @@ proptest! {
 
         prop_assert_eq!(results.len(), 1,
             "expected 1 self-linker, got {:?}", results);
-        let expected_id = (&self_linker_id.unwrap()).to_value();
+        let expected_id = (&self_linker_id.unwrap()).to_inline();
         prop_assert_eq!(results[0].0, expected_id);
     }
 

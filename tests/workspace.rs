@@ -47,7 +47,7 @@ fn workspace_checkout_unions_commits() {
 
     let e1 = ufoid();
     let a1 = ufoid();
-    let v1: Value<R256> = 1i128.to_value();
+    let v1: Inline<R256> = 1i128.to_inline();
     let t1 = Trible::new(&e1, &a1, &v1);
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
@@ -57,7 +57,7 @@ fn workspace_checkout_unions_commits() {
 
     let e2 = ufoid();
     let a2 = ufoid();
-    let v2: Value<R256> = 2i128.to_value();
+    let v2: Inline<R256> = 2i128.to_inline();
     let t2 = Trible::new(&e2, &a2, &v2);
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
@@ -84,7 +84,7 @@ fn workspace_checkout_single_commit() {
 
     let e = ufoid();
     let a = ufoid();
-    let v: Value<R256> = 42i128.to_value();
+    let v: Inline<R256> = 42i128.to_inline();
     let t = Trible::new(&e, &a, &v);
     let mut s = TribleSet::new();
     s.insert(&t);
@@ -111,7 +111,7 @@ fn workspace_checkout_vec_commits() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -136,7 +136,7 @@ fn workspace_checkout_metadata_returns_repo_metadata() {
 
     let meta_e = ufoid();
     let meta_a = ufoid();
-    let meta_v: Value<R256> = 1i128.to_value();
+    let meta_v: Inline<R256> = 1i128.to_inline();
     let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
     let mut meta = TribleSet::new();
     meta.insert(&meta_t);
@@ -164,7 +164,7 @@ fn workspace_checkout_with_metadata_returns_both() {
 
     let meta_e = ufoid();
     let meta_a = ufoid();
-    let meta_v: Value<R256> = 7i128.to_value();
+    let meta_v: Inline<R256> = 7i128.to_inline();
     let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
     let mut meta = TribleSet::new();
     meta.insert(&meta_t);
@@ -176,7 +176,7 @@ fn workspace_checkout_with_metadata_returns_both() {
 
     let data_e = ufoid();
     let data_a = ufoid();
-    let data_v: Value<R256> = 42i128.to_value();
+    let data_v: Inline<R256> = 42i128.to_inline();
     let data_t = Trible::new(&data_e, &data_a, &data_v);
     let mut data = TribleSet::new();
     data.insert(&data_t);
@@ -198,7 +198,7 @@ fn workspace_commit_uses_repo_metadata() {
 
     let meta_e = ufoid();
     let meta_a = ufoid();
-    let meta_v: Value<R256> = 99i128.to_value();
+    let meta_v: Inline<R256> = 99i128.to_inline();
     let meta_t = Trible::new(&meta_e, &meta_a, &meta_v);
     let mut meta = TribleSet::new();
     meta.insert(&meta_t);
@@ -210,7 +210,7 @@ fn workspace_commit_uses_repo_metadata() {
 
     let data_e = ufoid();
     let data_a = ufoid();
-    let data_v: Value<R256> = 1i128.to_value();
+    let data_v: Inline<R256> = 1i128.to_inline();
     let data_t = Trible::new(&data_e, &data_a, &data_v);
     let mut data = TribleSet::new();
     data.insert(&data_t);
@@ -240,7 +240,7 @@ fn workspace_checkout_range_variants() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -273,9 +273,9 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
     use triblespace::core::repo::commit::commit_metadata;
     use triblespace::core::value::schemas::hash::{Blake3, Handle};
     use triblespace::core::value::schemas::r256::R256;
-    use triblespace::core::value::Value;
+    use triblespace::core::value::Inline;
 
-    type CommitHandle = Value<Handle<SimpleArchive>>;
+    type CommitHandle = Inline<Handle<SimpleArchive>>;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -286,7 +286,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
     let root_e = ufoid();
     let root_a = ufoid();
-    let root_v: Value<R256> = 0i128.to_value();
+    let root_v: Inline<R256> = 0i128.to_inline();
     let root_t = Trible::new(&root_e, &root_a, &root_v);
     let mut root_set = TribleSet::new();
     root_set.insert(&root_t);
@@ -305,7 +305,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
     let child_a_e = ufoid();
     let child_a_a = ufoid();
-    let child_a_v: Value<R256> = 1i128.to_value();
+    let child_a_v: Inline<R256> = 1i128.to_inline();
     let child_a_t = Trible::new(&child_a_e, &child_a_a, &child_a_v);
     let mut child_a_set = TribleSet::new();
     child_a_set.insert(&child_a_t);
@@ -319,7 +319,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
     let child_b_e = ufoid();
     let child_b_a = ufoid();
-    let child_b_v: Value<R256> = 2i128.to_value();
+    let child_b_v: Inline<R256> = 2i128.to_inline();
     let child_b_t = Trible::new(&child_b_e, &child_b_a, &child_b_v);
     let mut child_b_set = TribleSet::new();
     child_b_set.insert(&child_b_t);
@@ -353,7 +353,7 @@ fn workspace_checkout_symmetric_diff() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -383,7 +383,7 @@ fn workspace_checkout_set_operation_selectors() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -425,7 +425,7 @@ fn workspace_get_local_and_base() {
 
     let e = ufoid();
     let a = ufoid();
-    let v: Value<R256> = 123i128.to_value();
+    let v: Inline<R256> = 123i128.to_inline();
     let t = Trible::new(&e, &a, &v);
     let mut set = TribleSet::new();
     set.insert(&t);
@@ -457,7 +457,7 @@ fn workspace_checkout_head_collects_history() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -488,7 +488,7 @@ fn workspace_nth_ancestor_selector() {
     for i in 0..3i128 {
         let e = ufoid();
         let a = ufoid();
-        let v: Value<R256> = i.to_value();
+        let v: Inline<R256> = i.to_inline();
         let t = Trible::new(&e, &a, &v);
         let mut s = TribleSet::new();
         s.insert(&t);
@@ -521,7 +521,7 @@ fn workspace_parents_selector() {
     let mut ws_main = repo.pull(*main_branch_id).expect("pull branch state");
     let e0 = ufoid();
     let a0 = ufoid();
-    let v0: Value<R256> = 0i128.to_value();
+    let v0: Inline<R256> = 0i128.to_inline();
     let t0 = Trible::new(&e0, &a0, &v0);
     let mut s0 = TribleSet::new();
     s0.insert(&t0);
@@ -534,7 +534,7 @@ fn workspace_parents_selector() {
     // Divergent commits on both workspaces.
     let e1 = ufoid();
     let a1 = ufoid();
-    let v1: Value<R256> = 1i128.to_value();
+    let v1: Inline<R256> = 1i128.to_inline();
     let t1 = Trible::new(&e1, &a1, &v1);
     let mut s1 = TribleSet::new();
     s1.insert(&t1);
@@ -542,7 +542,7 @@ fn workspace_parents_selector() {
 
     let e2 = ufoid();
     let a2 = ufoid();
-    let v2: Value<R256> = 2i128.to_value();
+    let v2: Inline<R256> = 2i128.to_inline();
     let t2 = Trible::new(&e2, &a2, &v2);
     let mut s2 = TribleSet::new();
     s2.insert(&t2);
@@ -574,8 +574,8 @@ fn workspace_history_of_entity() {
     let entity = ufoid();
     let a1 = ufoid();
     let a2 = ufoid();
-    let v1: Value<R256> = 1i128.to_value();
-    let v2: Value<R256> = 2i128.to_value();
+    let v1: Inline<R256> = 1i128.to_inline();
+    let v2: Inline<R256> = 2i128.to_inline();
 
     let mut s1 = TribleSet::new();
     s1.insert(&Trible::new(&entity, &a1, &v1));

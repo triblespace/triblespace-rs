@@ -98,8 +98,8 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     let ranked = idx.query_multi(&q);
     // Needle doc should be the top hit since both rare tokens
     // land only there.
-    // Keys are 32-byte RawValue now; compare against the
-    // Value<GenId> form of needle_id.
+    // Keys are 32-byte RawInline now; compare against the
+    // Inline<GenId> form of needle_id.
     let mut needle_key = [0u8; 32];
     needle_key[16..32].copy_from_slice(AsRef::<[u8; 16]>::as_ref(&needle_id));
     assert_eq!(ranked[0].0.raw, needle_key);
@@ -388,8 +388,8 @@ fn bm25_quantization_preserves_top10() {
             continue;
         }
 
-        let mut raw_scores: Vec<(triblespace_core::value::RawValue, f32)> = Vec::new();
-        let mut q_scores: Vec<(triblespace_core::value::RawValue, f32)> = Vec::new();
+        let mut raw_scores: Vec<(triblespace_core::value::RawInline, f32)> = Vec::new();
+        let mut q_scores: Vec<(triblespace_core::value::RawInline, f32)> = Vec::new();
         for term in &terms {
             for (d, s) in idx.query_term(term) {
                 let d_raw = d.raw;

@@ -15,14 +15,14 @@ fn bare_single_variable_returns_value() {
     let e = fucid();
     set += entity! { &e @ ns::name: "alice" };
 
-    let names: Vec<Value<_>> = find!(
-        v: Value<valueschemas::ShortString>,
+    let names: Vec<Inline<_>> = find!(
+        v: Inline<valueschemas::ShortString>,
         pattern!(&set, [{ e.id @ ns::name: ?v }])
     )
     .collect();
 
     assert_eq!(names.len(), 1);
-    let name: &str = names[0].try_from_value().unwrap();
+    let name: &str = names[0].try_from_inline().unwrap();
     assert_eq!(name, "alice");
 }
 

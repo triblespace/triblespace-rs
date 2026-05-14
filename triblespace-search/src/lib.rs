@@ -5,7 +5,7 @@
 //! with bit-packed bodies via [`jerky`]:
 //! - [`succinct::SuccinctBM25Index`] (schema
 //!   [`succinct::SuccinctBM25Blob`]) — term → doc retrieval
-//!   where terms are 32-byte triblespace `Value`s (text tokens,
+//!   where terms are 32-byte triblespace `Inline`s (text tokens,
 //!   entity ids, tags, anything).
 //! - [`succinct::SuccinctHNSWIndex`] (schema
 //!   [`succinct::SuccinctHNSWBlob`]) — approximate

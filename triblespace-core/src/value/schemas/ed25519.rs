@@ -13,10 +13,10 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 
 /// A value schema for the R component of an Ed25519 signature.
@@ -52,7 +52,7 @@ impl MetaDescribe for ED25519RComponent {
         tribles
     }
 }
-impl ValueSchema for ED25519RComponent {
+impl InlineSchema for ED25519RComponent {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -80,7 +80,7 @@ impl MetaDescribe for ED25519SComponent {
         tribles
     }
 }
-impl ValueSchema for ED25519SComponent {
+impl InlineSchema for ED25519SComponent {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -108,7 +108,7 @@ impl MetaDescribe for ED25519PublicKey {
         tribles
     }
 }
-impl ValueSchema for ED25519PublicKey {
+impl InlineSchema for ED25519PublicKey {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -161,71 +161,71 @@ mod wasm_formatter {
 
 impl ED25519RComponent {
     /// Extracts the R component from a full Ed25519 signature.
-    pub fn from_signature(s: Signature) -> Value<ED25519RComponent> {
-        Value::new(*s.r_bytes())
+    pub fn from_signature(s: Signature) -> Inline<ED25519RComponent> {
+        Inline::new(*s.r_bytes())
     }
 }
 
 impl ED25519SComponent {
     /// Extracts the S component from a full Ed25519 signature.
-    pub fn from_signature(s: Signature) -> Value<ED25519SComponent> {
-        Value::new(*s.s_bytes())
+    pub fn from_signature(s: Signature) -> Inline<ED25519SComponent> {
+        Inline::new(*s.s_bytes())
     }
 }
 
 impl IntoSchema<ED25519RComponent> for Signature {
-    type Form = Value<ED25519RComponent>;
-    fn into_schema(self) -> Value<ED25519RComponent> {
+    type Form = Inline<ED25519RComponent>;
+    fn into_schema(self) -> Inline<ED25519RComponent> {
         ED25519RComponent::from_signature(self)
     }
 }
 
 impl IntoSchema<ED25519SComponent> for Signature {
-    type Form = Value<ED25519SComponent>;
-    fn into_schema(self) -> Value<ED25519SComponent> {
+    type Form = Inline<ED25519SComponent>;
+    fn into_schema(self) -> Inline<ED25519SComponent> {
         ED25519SComponent::from_signature(self)
     }
 }
 
 impl IntoSchema<ED25519RComponent> for ComponentBytes {
-    type Form = Value<ED25519RComponent>;
-    fn into_schema(self) -> Value<ED25519RComponent> {
-        Value::new(self)
+    type Form = Inline<ED25519RComponent>;
+    fn into_schema(self) -> Inline<ED25519RComponent> {
+        Inline::new(self)
     }
 }
 
-impl TryFromValue<'_, ED25519RComponent> for ComponentBytes {
+impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
     type Error = Infallible;
-    fn try_from_value(v: &Value<ED25519RComponent>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<ED25519RComponent>) -> Result<Self, Infallible> {
         Ok(v.raw)
     }
 }
 
 impl IntoSchema<ED25519SComponent> for ComponentBytes {
-    type Form = Value<ED25519SComponent>;
-    fn into_schema(self) -> Value<ED25519SComponent> {
-        Value::new(self)
+    type Form = Inline<ED25519SComponent>;
+    fn into_schema(self) -> Inline<ED25519SComponent> {
+        Inline::new(self)
     }
 }
 
-impl TryFromValue<'_, ED25519SComponent> for ComponentBytes {
+impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
     type Error = Infallible;
-    fn try_from_value(v: &Value<ED25519SComponent>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<ED25519SComponent>) -> Result<Self, Infallible> {
         Ok(v.raw)
     }
 }
 
 impl IntoSchema<ED25519PublicKey> for VerifyingKey {
-    type Form = Value<ED25519PublicKey>;
-    fn into_schema(self) -> Value<ED25519PublicKey> {
-        Value::new(self.to_bytes())
+    type Form = Inline<ED25519PublicKey>;
+    fn into_schema(self) -> Inline<ED25519PublicKey> {
+        Inline::new(self.to_bytes())
     }
 }
 
-impl TryFromValue<'_, ED25519PublicKey> for VerifyingKey {
+impl TryFromInline<'_, ED25519PublicKey> for VerifyingKey {
     type Error = SignatureError;
 
-    fn try_from_value(v: &Value<ED25519PublicKey>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<ED25519PublicKey>) -> Result<Self, Self::Error> {
         VerifyingKey::from_bytes(&v.raw)
     }
 }
@@ -233,7 +233,7 @@ impl TryFromValue<'_, ED25519PublicKey> for VerifyingKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoValue, TryFromValue};
+    use crate::value::{IntoInline, TryFromInline};
     use ed25519::Signature;
     use ed25519_dalek::SigningKey;
     use proptest::prelude::*;
@@ -241,42 +241,42 @@ mod tests {
     proptest! {
         #[test]
         fn r_component_bytes_roundtrip(input in prop::array::uniform32(any::<u8>())) {
-            let value: Value<ED25519RComponent> = input.to_value();
-            let output: ComponentBytes = value.from_value();
+            let value: Inline<ED25519RComponent> = input.to_inline();
+            let output: ComponentBytes = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn s_component_bytes_roundtrip(input in prop::array::uniform32(any::<u8>())) {
-            let value: Value<ED25519SComponent> = input.to_value();
-            let output: ComponentBytes = value.from_value();
+            let value: Inline<ED25519SComponent> = input.to_inline();
+            let output: ComponentBytes = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn r_component_validates(input in prop::array::uniform32(any::<u8>())) {
-            let value: Value<ED25519RComponent> = input.to_value();
+            let value: Inline<ED25519RComponent> = input.to_inline();
             prop_assert!(ED25519RComponent::validate(value).is_ok());
         }
 
         #[test]
         fn s_component_validates(input in prop::array::uniform32(any::<u8>())) {
-            let value: Value<ED25519SComponent> = input.to_value();
+            let value: Inline<ED25519SComponent> = input.to_inline();
             prop_assert!(ED25519SComponent::validate(value).is_ok());
         }
 
         #[test]
         fn pubkey_validates(seed in prop::array::uniform32(any::<u8>())) {
             let key = SigningKey::from_bytes(&seed).verifying_key();
-            let value: Value<ED25519PublicKey> = key.to_value();
+            let value: Inline<ED25519PublicKey> = key.to_inline();
             prop_assert!(ED25519PublicKey::validate(value).is_ok());
         }
 
         #[test]
         fn verifying_key_roundtrip(seed in prop::array::uniform32(any::<u8>())) {
             let key = SigningKey::from_bytes(&seed).verifying_key();
-            let value: Value<ED25519PublicKey> = key.to_value();
-            let recovered = VerifyingKey::try_from_value(&value).expect("valid key");
+            let value: Inline<ED25519PublicKey> = key.to_inline();
+            let recovered = VerifyingKey::try_from_inline(&value).expect("valid key");
             prop_assert_eq!(key, recovered);
         }
 
@@ -285,8 +285,8 @@ mod tests {
             use ed25519_dalek::Signer;
             let signing_key = SigningKey::from_bytes(&seed);
             let sig = Signature::from_bytes(&signing_key.sign(&msg).to_bytes());
-            let value: Value<ED25519RComponent> = sig.to_value();
-            let bytes: ComponentBytes = value.from_value();
+            let value: Inline<ED25519RComponent> = sig.to_inline();
+            let bytes: ComponentBytes = value.from_inline();
             prop_assert_eq!(&bytes, sig.r_bytes());
         }
 
@@ -295,8 +295,8 @@ mod tests {
             use ed25519_dalek::Signer;
             let signing_key = SigningKey::from_bytes(&seed);
             let sig = Signature::from_bytes(&signing_key.sign(&msg).to_bytes());
-            let value: Value<ED25519SComponent> = sig.to_value();
-            let bytes: ComponentBytes = value.from_value();
+            let value: Inline<ED25519SComponent> = sig.to_inline();
+            let bytes: ComponentBytes = value.from_inline();
             prop_assert_eq!(&bytes, sig.s_bytes());
         }
 
@@ -305,10 +305,10 @@ mod tests {
             use ed25519_dalek::Signer;
             let signing_key = SigningKey::from_bytes(&seed);
             let sig = Signature::from_bytes(&signing_key.sign(&msg).to_bytes());
-            let r_val: Value<ED25519RComponent> = sig.to_value();
-            let s_val: Value<ED25519SComponent> = sig.to_value();
-            let r_bytes: ComponentBytes = r_val.from_value();
-            let s_bytes: ComponentBytes = s_val.from_value();
+            let r_val: Inline<ED25519RComponent> = sig.to_inline();
+            let s_val: Inline<ED25519SComponent> = sig.to_inline();
+            let r_bytes: ComponentBytes = r_val.from_inline();
+            let s_bytes: ComponentBytes = s_val.from_inline();
             let mut combined = [0u8; 64];
             combined[..32].copy_from_slice(&r_bytes);
             combined[32..].copy_from_slice(&s_bytes);
@@ -322,7 +322,7 @@ mod tests {
     fn verifying_key_invalid_bytes() {
         let mut raw = [0u8; 32];
         raw[0] = 2;
-        let value: Value<ED25519PublicKey> = Value::new(raw);
-        assert!(VerifyingKey::try_from_value(&value).is_err());
+        let value: Inline<ED25519PublicKey> = Inline::new(raw);
+        assert!(VerifyingKey::try_from_inline(&value).is_err());
     }
 }

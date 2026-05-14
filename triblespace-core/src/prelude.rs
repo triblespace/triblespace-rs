@@ -55,7 +55,7 @@ pub use crate::query::exists;
 pub use crate::query::find;
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
-pub use crate::query::rangeconstraint::{value_range, ValueRange};
+pub use crate::query::rangeconstraint::{value_range, InlineRange};
 pub use crate::query::sortedsliceconstraint::SortedSlice;
 pub use crate::query::temp;
 pub use crate::query::unionconstraint::UnionConstraint;
@@ -89,12 +89,12 @@ pub use crate::trible::Spread;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
 pub use crate::trible::TribleSetFingerprint;
-pub use crate::value::schemas::UnknownValue;
-pub use crate::value::IntoValue;
-pub use crate::value::TryFromValue;
-pub use crate::value::TryToValue;
-pub use crate::value::Value;
-pub use crate::value::ValueSchema;
+pub use crate::value::schemas::UnknownInline;
+pub use crate::value::IntoInline;
+pub use crate::value::TryFromInline;
+pub use crate::value::TryToInline;
+pub use crate::value::Inline;
+pub use crate::value::InlineSchema;
 pub use anybytes::View;
 // Re-export the pattern/entity procedural macros into the prelude so they can
 // be imported with `use triblespace::prelude::*;` and called as `pattern!(...)`.

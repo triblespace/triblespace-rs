@@ -9,8 +9,8 @@ use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
 use crate::value::schemas::hash::Handle;
-use crate::value::Value;
-use crate::value::VALUE_LEN;
+use crate::value::Inline;
+use crate::value::INLINE_LEN;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -32,7 +32,7 @@ use super::TryFromBlob;
 ///
 /// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStore {
-    blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
 }
 
 impl Debug for MemoryBlobStore {
@@ -53,7 +53,7 @@ impl Debug for MemoryBlobStore {
 ///
 /// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStoreReader {
-    blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
 }
 
 impl Clone for MemoryBlobStoreReader {
@@ -73,7 +73,7 @@ impl PartialEq for MemoryBlobStoreReader {
 impl Eq for MemoryBlobStoreReader {}
 
 impl MemoryBlobStoreReader {
-    fn new(blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>) -> Self {
+    fn new(blobs: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>) -> Self {
         MemoryBlobStoreReader { blobs }
     }
 
@@ -136,13 +136,13 @@ impl MemoryBlobStore {
     /// Idempotent at the PATCH level: re-inserting the same handle is
     /// a no-op, which matches the content-addressed semantics
     /// (same handle ⇒ same bytes).
-    pub fn insert<S>(&mut self, blob: Blob<S>) -> Value<Handle<S>>
+    pub fn insert<S>(&mut self, blob: Blob<S>) -> Inline<Handle<S>>
     where
         S: BlobSchema,
-        Handle<S>: crate::value::ValueSchema,
+        Handle<S>: crate::value::InlineSchema,
     {
-        let handle: Value<Handle<S>> = blob.get_handle();
-        let unknown_handle: Value<Handle<UnknownBlob>> = handle.transmute();
+        let handle: Inline<Handle<S>> = blob.get_handle();
+        let unknown_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
         let blob: Blob<UnknownBlob> = blob.transmute::<UnknownBlob>();
         let entry = Entry::with_value(&unknown_handle.raw, blob);
         self.blobs.insert(&entry);
@@ -173,7 +173,7 @@ impl MemoryBlobStore {
     /// Drops any blobs that are not referenced by one of the provided tribles.
     pub fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
+        I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
         let mut surviving = PATCH::new();
         for handle in handles {
@@ -189,14 +189,14 @@ impl MemoryBlobStore {
 impl BlobStoreKeep for MemoryBlobStore {
     fn keep<I>(&mut self, handles: I)
     where
-        I: IntoIterator<Item = Value<Handle<UnknownBlob>>>,
+        I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
         MemoryBlobStore::keep(self, handles);
     }
 }
 
-impl FromIterator<(Value<Handle<UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBlobStore {
-    fn from_iter<I: IntoIterator<Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>)>>(
+impl FromIterator<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBlobStore {
+    fn from_iter<I: IntoIterator<Item = (Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>)>>(
         iter: I,
     ) -> Self {
         let mut store = MemoryBlobStore::new();
@@ -209,7 +209,7 @@ impl FromIterator<(Value<Handle<UnknownBlob>>, Blob<UnknownBlob>)> for MemoryBlo
 }
 
 impl IntoIterator for MemoryBlobStoreReader {
-    type Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>);
+    type Item = (Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>);
     type IntoIter = MemoryBlobStoreIter;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -240,8 +240,8 @@ impl<E: Error> Error for MemoryStoreGetError<E> {}
 /// Yields `(Handle, Blob)` pairs. Owned snapshot via PATCH
 /// clones — does not borrow from the source reader.
 pub struct MemoryBlobStoreIter {
-    keys: crate::patch::PATCHIntoIterator<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
-    lookup: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    keys: crate::patch::PATCHIntoIterator<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    lookup: PATCH<INLINE_LEN, IdentitySchema, Blob<UnknownBlob>>,
 }
 
 impl Debug for MemoryBlobStoreIter {
@@ -251,11 +251,11 @@ impl Debug for MemoryBlobStoreIter {
 }
 
 impl Iterator for MemoryBlobStoreIter {
-    type Item = (Value<Handle<UnknownBlob>>, Blob<UnknownBlob>);
+    type Item = (Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>);
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.keys.next()?;
-        let handle: Value<Handle<UnknownBlob>> = Value::new(key);
+        let handle: Inline<Handle<UnknownBlob>> = Inline::new(key);
         let blob = self
             .lookup
             .get(&key)
@@ -271,7 +271,7 @@ pub struct MemoryBlobStoreListIter {
 }
 
 impl Iterator for MemoryBlobStoreListIter {
-    type Item = Result<Value<Handle<UnknownBlob>>, Infallible>;
+    type Item = Result<Inline<Handle<UnknownBlob>>, Infallible>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (handle, _) = self.inner.next()?;
@@ -293,13 +293,13 @@ impl BlobStoreGet for MemoryBlobStoreReader {
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema,
         T: TryFromBlob<S>,
     {
-        let handle: Value<Handle<UnknownBlob>> = handle.transmute();
+        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
         let Some(blob) = self.blobs.get(&handle.raw) else {
             return Err(MemoryStoreGetError::NotFound());
         };
@@ -316,7 +316,7 @@ impl crate::repo::BlobChildren for MemoryBlobStoreReader {}
 impl BlobStorePut for MemoryBlobStore {
     type PutError = Infallible;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema,
         T: IntoBlob<S>,
@@ -382,12 +382,12 @@ mod tests {
     #[test]
     fn reader_is_a_pinned_snapshot() {
         let mut store = MemoryBlobStore::new();
-        let blob_a: Value<Handle<LongString>> =
+        let blob_a: Inline<Handle<LongString>> =
             store.put(Bytes::from_source("hello".to_string()).view().unwrap()).unwrap();
         let snapshot = store.reader().unwrap();
         assert_eq!(snapshot.len(), 1);
 
-        let _blob_b: Value<Handle<LongString>> =
+        let _blob_b: Inline<Handle<LongString>> =
             store.put(Bytes::from_source("world".to_string()).view().unwrap()).unwrap();
         // The snapshot still has only the original blob.
         assert_eq!(snapshot.len(), 1);
@@ -405,16 +405,16 @@ mod tests {
     #[test]
     fn union_merges_and_preserves_handles() {
         let mut a = MemoryBlobStore::new();
-        let h_hello: Value<Handle<LongString>> = a
+        let h_hello: Inline<Handle<LongString>> = a
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
         let mut b = MemoryBlobStore::new();
-        let h_world: Value<Handle<LongString>> = b
+        let h_world: Inline<Handle<LongString>> = b
             .put(Bytes::from_source("world".to_string()).view().unwrap())
             .unwrap();
         // Idempotent overlap: putting "hello" in b too — union should
         // collapse the duplicate, not double-count.
-        let _h_hello_b: Value<Handle<LongString>> = b
+        let _h_hello_b: Inline<Handle<LongString>> = b
             .put(Bytes::from_source("hello".to_string()).view().unwrap())
             .unwrap();
 

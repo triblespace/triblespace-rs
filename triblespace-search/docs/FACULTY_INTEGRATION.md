@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `BM25Builder<GenId, WordHash>` — entity-id doc
             // keys, Blake3-hashed text tokens. Pass `&id` and the
             // `ToValue<GenId>` impl handles the conversion;
-            // `hash_tokens` returns `Vec<Value<WordHash>>` so
+            // `hash_tokens` returns `Vec<Inline<WordHash>>` so
             // terms are typed end-to-end.
             let mut builder = BM25Builder::new();
             for (id, body) in find!(
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pattern!(&kb, [{ ?doc @ wiki::title: ?title }])
                 )
             )
-            .map(|(d, t)| (d, idx.score_text(&d.to_value(), &text), t))
+            .map(|(d, t)| (d, idx.score_text(&d.to_inline(), &text), t))
             .collect();
             rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             for (id, score, title) in rows.into_iter().take(10) {
@@ -191,7 +191,7 @@ let docs: Vec<(Id,)> = find!(
 For other tokenisers (`bigram_tokens`, `ngram_tokens`,
 `code_tokens`) or for hand-built term slices, the explicit form
 `idx.matches(doc, &terms, 0.0)` accepts any
-`&[Value<T>]` matching the index's term schema.
+`&[Inline<T>]` matching the index's term schema.
 
 This is the "find docs with `typst` in the body AND tagged X"
 query, running through a single engine pass. The engine picks
@@ -207,8 +207,8 @@ versions with a concrete KB.
 
 Score is **never** a bound query variable. The constraint
 filters on a fixed `score_floor` parameter; callers recompute
-exact scores afterwards via `idx.score(&doc.to_value(), terms)`
-(or `idx.score_text(&doc.to_value(), text)` on a `WordHash`-keyed
+exact scores afterwards via `idx.score(&doc.to_inline(), terms)`
+(or `idx.score_text(&doc.to_inline(), text)` on a `WordHash`-keyed
 index, which tokenises internally). Same pattern as HNSW's
 `similar`/recompute-cosine split:
 
@@ -218,7 +218,7 @@ let mut ranked: Vec<(Id, f32)> = find!(
     (doc: Id),
     idx.matches_text(doc, "typst links", 0.0)
 )
-.map(|(d,)| (d, idx.score_text(&d.to_value(), "typst links")))
+.map(|(d,)| (d, idx.score_text(&d.to_inline(), "typst links")))
 .collect();
 ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 ```

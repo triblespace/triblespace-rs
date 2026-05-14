@@ -20,10 +20,10 @@ use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
-use crate::value::schemas::UnknownValue;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::schemas::UnknownInline;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use succinctarchiveconstraint::*;
 
 /// Re-export all universe types and traits.
@@ -103,7 +103,7 @@ pub struct SuccinctArchiveMeta<D: Metadata> {
     pub e_a: BitVectorDataMeta,
     /// Attribute-axis prefix bit vector metadata.
     pub a_a: BitVectorDataMeta,
-    /// Value-axis prefix bit vector metadata.
+    /// Inline-axis prefix bit vector metadata.
     pub v_a: BitVectorDataMeta,
     /// First-occurrence markers for (entity, attribute) pairs.
     pub changed_e_a: BitVectorDataMeta,
@@ -191,7 +191,7 @@ pub struct SuccinctArchive<U> {
     pub e_a: BitVector<Rank9SelIndex>,
     /// Attribute-axis prefix bit vector.
     pub a_a: BitVector<Rank9SelIndex>,
-    /// Value-axis prefix bit vector.
+    /// Inline-axis prefix bit vector.
     pub v_a: BitVector<Rank9SelIndex>,
 
     /// Bit vector marking the first occurrence of each `(entity, attribute)` pair
@@ -243,18 +243,18 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// find!(ts: Value<NsTAIInterval>,
+    /// find!(ts: Inline<NsTAIInterval>,
     ///     and!(
     ///         pattern!(&archive, [{ ?id @ attr: ?ts }]),
     ///         archive.value_in_range(ts, min_ts, max_ts),
     ///     )
     /// )
     /// ```
-    pub fn value_in_range<V: ValueSchema>(
+    pub fn value_in_range<V: InlineSchema>(
         &self,
         variable: crate::query::Variable<V>,
-        min: Value<V>,
-        max: Value<V>,
+        min: Inline<V>,
+        max: Inline<V>,
     ) -> succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint<'_, U> {
         succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint::new(
             variable, min, max, self,
@@ -277,7 +277,7 @@ where
 
             let e: Id = Id::new(id_from_value(&e).unwrap()).unwrap();
             let a: Id = Id::new(id_from_value(&a).unwrap()).unwrap();
-            let v: Value<UnknownValue> = Value::new(v);
+            let v: Inline<UnknownInline> = Inline::new(v);
 
             Trible::force(&e, &a, &v)
         })
@@ -325,7 +325,7 @@ where
     pub fn enumerate_domain<'a>(
         &'a self,
         prefix: &'a BitVector<Rank9SelIndex>,
-    ) -> impl Iterator<Item = RawValue> + 'a {
+    ) -> impl Iterator<Item = RawInline> + 'a {
         let zero_count = prefix.num_bits() - (self.domain.len() + 1);
         let mut z = 0usize;
         std::iter::from_fn(move || {
@@ -351,7 +351,7 @@ where
         &'a self,
         prefix: &'a BitVector<Rank9SelIndex>,
         code_range: std::ops::Range<usize>,
-    ) -> impl Iterator<Item = RawValue> + 'a {
+    ) -> impl Iterator<Item = RawInline> + 'a {
         let zero_count_total = prefix.num_bits() - (self.domain.len() + 1);
         let end_code = code_range.end;
         // Seek to the first 0-bit (first trible) at or after `code_range.start`'s
@@ -650,7 +650,7 @@ where
     where
         U: 'a;
 
-    fn pattern<'a, V: ValueSchema>(
+    fn pattern<'a, V: InlineSchema>(
         &'a self,
         e: crate::query::Variable<GenId>,
         a: crate::query::Variable<GenId>,
@@ -719,7 +719,7 @@ where
 impl<U> IntoSchema<SuccinctArchiveBlob> for &SuccinctArchive<U>
 where
     U: Universe + Serializable,
-    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::ValueSchema,
+    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
     type Form = Blob<SuccinctArchiveBlob>;
     fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
@@ -730,7 +730,7 @@ where
 impl<U> IntoSchema<SuccinctArchiveBlob> for SuccinctArchive<U>
 where
     U: Universe + Serializable,
-    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::ValueSchema,
+    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
     type Form = Blob<SuccinctArchiveBlob>;
     fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
@@ -781,8 +781,8 @@ mod tests {
     use crate::prelude::*;
     use crate::query::find;
     use crate::trible::Trible;
-    use crate::value::IntoValue;
-    use crate::value::TryToValue;
+    use crate::value::IntoInline;
+    use crate::value::TryToInline;
 
     use super::*;
     use anybytes::area::ByteArea;
@@ -829,7 +829,7 @@ mod tests {
 
         #[test]
         fn ordered_universe(values in prop::collection::vec(prop::collection::vec(0u8..255, 32), 1..128)) {
-            let mut values: Vec<RawValue> = values.into_iter().map(|v| v.try_into().unwrap()).collect();
+            let mut values: Vec<RawInline> = values.into_iter().map(|v| v.try_into().unwrap()).collect();
             values.sort();
             let mut area = ByteArea::new().unwrap();
             let mut sections = area.sections();
@@ -850,7 +850,7 @@ mod tests {
 
         #[test]
         fn compressed_universe(values in prop::collection::vec(prop::collection::vec(0u8..255, 32), 1..128)) {
-            let mut values: Vec<RawValue> = values.into_iter().map(|v| v.try_into().unwrap()).collect();
+            let mut values: Vec<RawInline> = values.into_iter().map(|v| v.try_into().unwrap()).collect();
             values.sort();
             let mut area = ByteArea::new().unwrap();
             let mut sections = area.sections();
@@ -905,7 +905,7 @@ mod tests {
         )
         .collect();
         assert_eq!(
-            vec![((&juliet).to_value(), "Juliet".try_to_value().unwrap(),)],
+            vec![((&juliet).to_inline(), "Juliet".try_to_inline().unwrap(),)],
             r
         );
     }

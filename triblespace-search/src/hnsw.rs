@@ -43,7 +43,7 @@
 
 use triblespace_core::query::Variable;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use crate::schemas::{EmbHandle, Embedding};
 
@@ -105,7 +105,7 @@ pub struct HNSWBuilder {
     /// any caller-supplied doc key — the mapping from a caller's
     /// document to an embedding is a trible the caller owns, not
     /// something the index duplicates.
-    handles: Vec<Value<Handle<Embedding>>>,
+    handles: Vec<Inline<Handle<Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -201,7 +201,7 @@ impl HNSWBuilder {
     /// [`put_embedding`]: crate::schemas::put_embedding
     pub fn insert(
         &mut self,
-        handle: Value<Handle<Embedding>>,
+        handle: Inline<Handle<Embedding>>,
         mut vec: Vec<f32>,
     ) -> Result<(), DimMismatch> {
         if vec.len() != self.dim {
@@ -446,7 +446,7 @@ pub struct HNSWIndex {
     /// index doesn't know or care about any caller-level doc
     /// identity. The caller's doc-to-embedding mapping lives
     /// as tribles in the pile.
-    handles: Vec<Value<Handle<Embedding>>>,
+    handles: Vec<Inline<Handle<Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -501,7 +501,7 @@ impl HNSWIndex {
     /// The stored embedding-handle table. `handles()[i]` is the
     /// content-addressed pointer to the embedding blob for node
     /// `i`.
-    pub fn handles(&self) -> &[Value<Handle<Embedding>>] {
+    pub fn handles(&self) -> &[Inline<Handle<Embedding>>] {
         &self.handles
     }
 
@@ -617,7 +617,7 @@ where
     /// iterate the cached list.
     pub fn similar_to(
         &self,
-        probe: Value<EmbHandle>,
+        probe: Inline<EmbHandle>,
         var: Variable<EmbHandle>,
         score_floor: f32,
     ) -> crate::constraint::SimilarTo {
@@ -645,9 +645,9 @@ where
     #[doc(hidden)]
     pub fn candidates_above(
         &self,
-        from_handle: Value<EmbHandle>,
+        from_handle: Inline<EmbHandle>,
         score_floor: f32,
-    ) -> Result<Vec<Value<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<Inline<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
         let Some(entry) = self.index.entry_point else {
             return Ok(Vec::new());
         };
@@ -868,7 +868,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 #[doc(hidden)]
 pub struct FlatBuilder {
     dim: usize,
-    handles: Vec<Value<Handle<Embedding>>>,
+    handles: Vec<Inline<Handle<Embedding>>>,
 }
 
 impl FlatBuilder {
@@ -892,7 +892,7 @@ impl FlatBuilder {
     ///
     /// Use [`crate::schemas::put_embedding`] to put + normalize
     /// + get a handle in one step.
-    pub fn insert(&mut self, handle: Value<Handle<Embedding>>) {
+    pub fn insert(&mut self, handle: Inline<Handle<Embedding>>) {
         self.handles.push(handle);
     }
 
@@ -938,7 +938,7 @@ impl FlatBuilder {
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
-    handles: Vec<Value<Handle<Embedding>>>,
+    handles: Vec<Inline<Handle<Embedding>>>,
 }
 
 impl FlatIndex {
@@ -954,7 +954,7 @@ impl FlatIndex {
 
     /// The stored embedding-handle table. `handles()[i]` is the
     /// content-addressed pointer to the embedding blob.
-    pub fn handles(&self) -> &[Value<Handle<Embedding>>] {
+    pub fn handles(&self) -> &[Inline<Handle<Embedding>>] {
         &self.handles
     }
 
@@ -1028,7 +1028,7 @@ where
     /// [a]: crate::hnsw::AttachedHNSWIndex::similar_to
     pub fn similar_to(
         &self,
-        probe: Value<EmbHandle>,
+        probe: Inline<EmbHandle>,
         var: Variable<EmbHandle>,
         score_floor: f32,
     ) -> crate::constraint::SimilarTo {
@@ -1051,9 +1051,9 @@ where
     #[doc(hidden)]
     pub fn candidates_above(
         &self,
-        from_handle: Value<EmbHandle>,
+        from_handle: Inline<EmbHandle>,
         score_floor: f32,
-    ) -> Result<Vec<Value<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<Inline<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
         let from = self.cache.get(from_handle)?;
         let query = from.as_ref().as_ref();
         if query.len() != self.index.dim {
@@ -1089,16 +1089,16 @@ where
 {
     fn neighbours_above(
         &self,
-        from: Value<Handle<Embedding>>,
+        from: Inline<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Embedding>>> {
+    ) -> Vec<Inline<Handle<Embedding>>> {
         self.candidates_above(from, score_floor).unwrap_or_default()
     }
 
     fn cosine_between(
         &self,
-        a: Value<Handle<Embedding>>,
-        b: Value<Handle<Embedding>>,
+        a: Inline<Handle<Embedding>>,
+        b: Inline<Handle<Embedding>>,
     ) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
@@ -1117,16 +1117,16 @@ where
 {
     fn neighbours_above(
         &self,
-        from: Value<Handle<Embedding>>,
+        from: Inline<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Embedding>>> {
+    ) -> Vec<Inline<Handle<Embedding>>> {
         self.candidates_above(from, score_floor).unwrap_or_default()
     }
 
     fn cosine_between(
         &self,
-        a: Value<Handle<Embedding>>,
-        b: Value<Handle<Embedding>>,
+        a: Inline<Handle<Embedding>>,
+        b: Inline<Handle<Embedding>>,
     ) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
@@ -1152,7 +1152,7 @@ mod tests {
     fn put_emb(
         store: &mut MemoryBlobStore,
         vec: Vec<f32>,
-    ) -> Value<Handle<Embedding>> {
+    ) -> Inline<Handle<Embedding>> {
         crate::schemas::put_embedding::<_>(store, vec).unwrap()
     }
 
@@ -1165,7 +1165,7 @@ mod tests {
     ) -> (
         FlatIndex,
         MemoryBlobStore,
-        Vec<Value<Handle<Embedding>>>,
+        Vec<Inline<Handle<Embedding>>>,
     ) {
         let mut store = MemoryBlobStore::new();
         let mut b = FlatBuilder::new(dim);
@@ -1247,7 +1247,7 @@ mod tests {
     fn sample_flat() -> (
         FlatIndex,
         MemoryBlobStore,
-        Vec<Value<Handle<Embedding>>>,
+        Vec<Inline<Handle<Embedding>>>,
     ) {
         build_flat(
             3,
@@ -1276,7 +1276,7 @@ mod tests {
     ) -> (
         crate::succinct::SuccinctHNSWIndex,
         MemoryBlobStore,
-        Vec<Value<Handle<Embedding>>>,
+        Vec<Inline<Handle<Embedding>>>,
     ) {
         let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(dim).with_seed(seed);
@@ -1420,7 +1420,7 @@ mod tests {
     fn sample_hnsw() -> (
         HNSWIndex,
         MemoryBlobStore,
-        Vec<Value<Handle<Embedding>>>,
+        Vec<Inline<Handle<Embedding>>>,
     ) {
         let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(3).with_seed(42);

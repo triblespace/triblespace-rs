@@ -244,7 +244,7 @@ impl Parse for AttributeDefinitions {
 
 fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
     use triblespace_core::metadata;
-    use triblespace_core::prelude::ValueSchema;
+    use triblespace_core::prelude::InlineSchema;
     use triblespace_core::value::schemas::genid::GenId;
 
     let Ok(parsed) =
@@ -269,7 +269,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
         let name_handle = context.workspace().put(definition.name.to_string());
         let mut set = ::triblespace_core::macros::entity! {
             &entity @
-            metadata::attribute: GenId::value_from(attr_id),
+            metadata::attribute: GenId::inline_from(attr_id),
             metadata::name: name_handle,
             metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
             attribute::invocation: invocation_hex.as_str()
@@ -339,7 +339,7 @@ pub fn attributes(input: TokenStream) -> TokenStream {
 ///
 /// ```rust,ignore
 /// find!(
-///     (src: Value<_>, dst: Value<_>),
+///     (src: Inline<_>, dst: Inline<_>),
 ///     path!(kb.clone(), src (social::follows | social::likes)+ dst)
 /// )
 /// ```
@@ -370,7 +370,7 @@ pub fn path(input: TokenStream) -> TokenStream {
 ///
 /// ```rust,ignore
 /// find!(
-///     (person: Value<_>, friend: Value<_>),
+///     (person: Inline<_>, friend: Inline<_>),
 ///     pattern!(&kb, [
 ///         { ?person @ social::friend: ?friend },
 ///         { ?friend @ social::name: "Bob" }
@@ -403,7 +403,7 @@ pub fn pattern(input: TokenStream) -> TokenStream {
 ///
 /// ```rust,ignore
 /// for (work,) in find!(
-///     (work: Value<_>),
+///     (work: Inline<_>),
 ///     pattern_changes!(&full, &delta, [
 ///         { ?work @ literature::author: &shakespeare }
 ///     ])
@@ -462,7 +462,7 @@ pub fn entity(input: TokenStream) -> TokenStream {
 ///
 /// ```rust,ignore
 /// let names: Vec<_> = find!(
-///     (name: Value<_>),
+///     (name: Inline<_>),
 ///     pattern!(&kb, [{ ?person @ social::name: ?name }])
 /// ).collect();
 /// ```

@@ -16,8 +16,8 @@ pub mod schemas;
 use crate::value::IntoSchema;
 use crate::metadata::MetaDescribe;
 use crate::value::schemas::hash::Handle;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -39,7 +39,7 @@ pub use anybytes::Bytes;
 ///
 /// `Blob<S>` is the **heavy form** of a content-addressed payload —
 /// it carries the bytes plus the cached
-/// [`Value<Handle<S>>`][Handle] that names them. The handle is the
+/// [`Inline<Handle<S>>`][Handle] that names them. The handle is the
 /// **lightweight form**: a 32-byte reference you can store in
 /// tribles, send across the network, or hand around freely without
 /// dragging the bytes along. `Blob` ↔ `Handle<S>` is the same
@@ -58,7 +58,7 @@ pub use anybytes::Bytes;
 ///   handle across schema casts — the Blake3 hash is over bytes, not
 ///   over schema, so the digest survives the phantom change.
 ///
-/// `Blob<S>: AsRef<Value<Handle<S>>>` so `&blob` deref-coerces to the
+/// `Blob<S>: AsRef<Inline<Handle<S>>>` so `&blob` deref-coerces to the
 /// lightweight reference for free.
 ///
 /// The previous shape (`#[repr(transparent)]` around `Bytes`) was
@@ -74,14 +74,14 @@ pub struct Blob<S: BlobSchema> {
     /// Cached content-addressed handle. Computed eagerly at
     /// construction time; reused on every `get_handle` call and on
     /// `MemoryBlobStore::insert`.
-    handle: Value<Handle<S>>,
+    handle: Inline<Handle<S>>,
     _schema: PhantomData<S>,
 }
 
 impl<S> Blob<S>
 where
     S: BlobSchema,
-    Handle<S>: ValueSchema,
+    Handle<S>: InlineSchema,
 {
     /// Creates a new blob from a sequence of bytes.
     ///
@@ -96,7 +96,7 @@ where
         let digest = crate::value::schemas::hash::Blake3::digest(&bytes);
         Self {
             bytes,
-            handle: Value::new(digest),
+            handle: Inline::new(digest),
             _schema: PhantomData,
         }
     }
@@ -121,7 +121,7 @@ where
     /// you're reading from, the pile header, a verified network
     /// fetch). For callers without that guarantee, use
     /// [`Blob::new`] which hashes from bytes.
-    pub fn with_handle(bytes: Bytes, handle: Value<Handle<S>>) -> Self {
+    pub fn with_handle(bytes: Bytes, handle: Inline<Handle<S>>) -> Self {
         Self {
             bytes,
             handle,
@@ -136,7 +136,7 @@ where
     /// validate that the data actually conforms to the new schema.
     pub fn transmute<T: BlobSchema>(self) -> Blob<T>
     where
-        Handle<T>: ValueSchema,
+        Handle<T>: InlineSchema,
     {
         Blob {
             bytes: self.bytes,
@@ -162,7 +162,7 @@ where
     /// 32 bytes you can store in a trible, share over the network, or
     /// pass around freely. The blob is the *heavy* form (bytes you
     /// can decode). Both share the same Blake3 identity.
-    pub fn get_handle(&self) -> Value<Handle<S>> {
+    pub fn get_handle(&self) -> Inline<Handle<S>> {
         self.handle
     }
 
@@ -179,7 +179,7 @@ where
 impl<T> Clone for Blob<T>
 where
     T: BlobSchema,
-    Handle<T>: ValueSchema,
+    Handle<T>: InlineSchema,
 {
     fn clone(&self) -> Self {
         Self {
@@ -190,21 +190,21 @@ where
     }
 }
 
-/// `Blob<S>` borrows as the `Value<Handle<S>>` that references it.
+/// `Blob<S>` borrows as the `Inline<Handle<S>>` that references it.
 ///
 /// Models the heavy/lightweight duality at the type system level:
 /// a `Blob<S>` IS a content-addressed value, and its `Handle<S>` is
 /// the 32-byte reference form. Coercing a `&Blob<S>` to a
-/// `&Value<Handle<S>>` is free — the handle is stored as a field —
+/// `&Inline<Handle<S>>` is free — the handle is stored as a field —
 /// so code that wants to pass the lightweight reference around
 /// (e.g. inserting into a trible, sending over the network) can
 /// just `blob.as_ref()` instead of `&blob.get_handle()`.
-impl<S> AsRef<Value<Handle<S>>> for Blob<S>
+impl<S> AsRef<Inline<Handle<S>>> for Blob<S>
 where
     S: BlobSchema,
-    Handle<S>: ValueSchema,
+    Handle<S>: InlineSchema,
 {
-    fn as_ref(&self) -> &Value<Handle<S>> {
+    fn as_ref(&self) -> &Inline<Handle<S>> {
         &self.handle
     }
 }
@@ -230,7 +230,7 @@ impl<T: BlobSchema> Debug for Blob<T> {
 }
 
 /// A trait for defining the abstract schema type of a blob.
-/// This is similar to the [`ValueSchema`] trait in the [`value`](crate::value) module.
+/// This is similar to the [`InlineSchema`] trait in the [`value`](crate::value) module.
 pub trait BlobSchema: MetaDescribe + Sized + 'static {
     /// Converts a concrete Rust type to a blob with this schema via [`IntoBlob`].
     fn blob_from<T: IntoBlob<Self>>(t: T) -> Blob<Self> {
@@ -243,15 +243,15 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
-    /// [`ValueSchema::into_field_pair`].
+    /// [`InlineSchema::into_field_pair`].
     fn into_field_pair(
         blob: Blob<Self>,
     ) -> (
-        Value<Handle<Self>>,
+        Inline<Handle<Self>>,
         Option<Blob<crate::blob::schemas::UnknownBlob>>,
     )
     where
-        Handle<Self>: ValueSchema,
+        Handle<Self>: InlineSchema,
     {
         let handle = blob.handle;
         let unknown = blob.transmute::<crate::blob::schemas::UnknownBlob>();
@@ -297,7 +297,7 @@ where
 /// This might return an error if the conversion is not possible,
 /// This is the counterpart to the [`IntoBlob`] trait.
 ///
-/// See [TryFromValue](crate::value::TryFromValue) for the counterpart trait for values.
+/// See [TryFromInline](crate::value::TryFromInline) for the counterpart trait for values.
 pub trait TryFromBlob<S: BlobSchema>: Sized {
     /// The error type returned when the conversion fails.
     type Error: Error + Send + Sync + 'static;
@@ -318,7 +318,7 @@ impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
 /// cached handle inside lets every downstream step skip rehashing.
 impl<S: BlobSchema> crate::value::IntoSchema<S> for Blob<S>
 where
-    Handle<S>: ValueSchema,
+    Handle<S>: InlineSchema,
 {
     type Form = Blob<S>;
     fn into_schema(self) -> Blob<S> {
@@ -334,40 +334,40 @@ where
 impl<T> crate::value::FieldFormFor<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
-    Handle<T>: ValueSchema,
+    Handle<T>: InlineSchema,
 {
     fn into_field_pair(
         self,
     ) -> (
-        Value<Handle<T>>,
+        Inline<Handle<T>>,
         Option<Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
         <T as BlobSchema>::into_field_pair(self)
     }
 }
 
-/// Precomputed-handle case: a `Value<Handle<T>>` can be passed as a
+/// Precomputed-handle case: a `Inline<Handle<T>>` can be passed as a
 /// `IntoSchema<T>` source (T is the BlobSchema, matching the
 /// `Handle<T>`-attributed field's `FieldKind`). Form is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
-impl<T: BlobSchema> crate::value::IntoSchema<T> for Value<Handle<T>>
+impl<T: BlobSchema> crate::value::IntoSchema<T> for Inline<Handle<T>>
 where
-    Handle<T>: ValueSchema,
+    Handle<T>: InlineSchema,
 {
-    type Form = Value<Handle<T>>;
-    fn into_schema(self) -> Value<Handle<T>> {
+    type Form = Inline<Handle<T>>;
+    fn into_schema(self) -> Inline<Handle<T>> {
         self
     }
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T: BlobSchema> crate::value::IntoSchema<T> for &Value<Handle<T>>
+impl<T: BlobSchema> crate::value::IntoSchema<T> for &Inline<Handle<T>>
 where
-    Handle<T>: ValueSchema,
+    Handle<T>: InlineSchema,
 {
-    type Form = Value<Handle<T>>;
-    fn into_schema(self) -> Value<Handle<T>> {
+    type Form = Inline<Handle<T>>;
+    fn into_schema(self) -> Inline<Handle<T>> {
         *self
     }
 }
@@ -386,8 +386,8 @@ mod tests {
         // Same handle on repeat — cache is stable.
         assert_eq!(h1, h2);
         // And matches a fresh independent Blake3 of the bytes.
-        let independent = Value::new(Blake3::digest(b"hello"));
-        let h_typed: Value<Handle<UnknownBlob>> = independent;
+        let independent = Inline::new(Blake3::digest(b"hello"));
+        let h_typed: Inline<Handle<UnknownBlob>> = independent;
         assert_eq!(h1, h_typed);
     }
 
@@ -397,7 +397,7 @@ mod tests {
         // cache returns it verbatim — proving we don't recompute from
         // bytes. This is the optimization read paths exploit (they
         // already know the handle, no point re-hashing).
-        let bogus: Value<Handle<UnknownBlob>> = Value::new([0xAA; 32]);
+        let bogus: Inline<Handle<UnknownBlob>> = Inline::new([0xAA; 32]);
         let b: Blob<UnknownBlob> = Blob::with_handle(
             Bytes::from(b"any bytes".to_vec()),
             bogus,
@@ -408,8 +408,8 @@ mod tests {
     #[test]
     fn as_ref_borrows_the_lightweight_handle() {
         let b: Blob<UnknownBlob> = Blob::new(Bytes::from(b"borrow me".to_vec()));
-        let h_owned: Value<Handle<UnknownBlob>> = b.get_handle();
-        let h_borrowed: &Value<Handle<UnknownBlob>> = b.as_ref();
+        let h_owned: Inline<Handle<UnknownBlob>> = b.get_handle();
+        let h_borrowed: &Inline<Handle<UnknownBlob>> = b.as_ref();
         // Same value, no allocation, no rehash.
         assert_eq!(h_owned, *h_borrowed);
     }
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn transmute_carries_cached_handle() {
         let b: Blob<UnknownBlob> = Blob::new(Bytes::from(b"shared".to_vec()));
-        let h_before: Value<Handle<UnknownBlob>> = b.get_handle();
+        let h_before: Inline<Handle<UnknownBlob>> = b.get_handle();
         // Schema cast — handle bytes stay identical, only the phantom
         // changes.
         let b2: Blob<crate::blob::schemas::longstring::LongString> =

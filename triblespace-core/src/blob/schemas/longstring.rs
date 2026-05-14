@@ -51,7 +51,7 @@ impl TryFromBlob<LongString> for View<str> {
 }
 
 impl IntoSchema<LongString> for View<str>
-where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Form = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
@@ -60,7 +60,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema
 }
 
 impl IntoSchema<LongString> for &'static str
-where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Form = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
@@ -69,7 +69,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema
 }
 
 impl IntoSchema<LongString> for String
-where crate::value::schemas::hash::Handle<LongString>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Form = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
@@ -86,13 +86,13 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::value::schemas::hash::Blake3;
     use crate::value::schemas::hash::Handle;
-    use crate::value::Value;
+    use crate::value::Inline;
 
     #[test]
     fn string_handle() {
         let s: View<str> = Bytes::from(String::from("hello world!")).view().unwrap();
-        let h: Value<Handle<LongString>> = s.clone().to_blob().get_handle();
-        let h2: Value<Handle<LongString>> = s.clone().to_blob().get_handle();
+        let h: Inline<Handle<LongString>> = s.clone().to_blob().get_handle();
+        let h2: Inline<Handle<LongString>> = s.clone().to_blob().get_handle();
 
         assert!(h == h2);
     }

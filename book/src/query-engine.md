@@ -62,7 +62,7 @@ constraint types can participate without custom planner hooks.
 
 You might notice that trible.space does not define a global ontology or schema
 beyond associating attributes with a
-[`ValueSchema`](triblespace::core::value::ValueSchema) or
+[`InlineSchema`](triblespace::core::value::InlineSchema) or
 [`BlobSchema`](triblespace::core::prelude::BlobSchema). This is deliberate. The semantic web
 taught us that per-value typing, while desirable, was awkward in RDF: literal
 datatypes are optional, custom types need globally scoped IRIs and there is no
@@ -134,10 +134,10 @@ fn main() {
         literature::title: "Dune",
     };
 
-    let mut allowed = HashSet::<Value<ShortString>>::new();
-    allowed.insert("Frank".to_value());
+    let mut allowed = HashSet::<Inline<ShortString>>::new();
+    allowed.insert("Frank".to_inline());
 
-    let results: Vec<_> = find!((title: Value<_>, firstname: Value<_>),
+    let results: Vec<_> = find!((title: Inline<_>, firstname: Inline<_>),
         and!(
             allowed.has(firstname),
             pattern!(&kb, [{
@@ -153,7 +153,7 @@ fn main() {
     .collect();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0, "Dune".to_value());
+    assert_eq!(results[0].0, "Dune".to_inline());
 }
 ```
 

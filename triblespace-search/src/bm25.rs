@@ -1,6 +1,6 @@
 //! BM25-style lexical / associative retrieval.
 //!
-//! Terms are 32-byte triblespace `Value`s (as [`RawValue`], the
+//! Terms are 32-byte triblespace `Inline`s (as [`RawInline`], the
 //! schema-erased byte array). Callers supply term values however
 //! they want — [`crate::tokens::hash_tokens`] is one opt-in
 //! helper that Blake3-hashes whitespace-separated tokens, but the
@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{RawValue, IntoValue, Value, ValueSchema};
+use triblespace_core::value::{RawInline, IntoInline, Inline, InlineSchema};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -61,8 +61,8 @@ const DEFAULT_B: f32 = 0.75;
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
 ///
-/// Generic over `D` (the doc-key [`ValueSchema`]) and `T` (the
-/// term [`ValueSchema`]). Typical shapes:
+/// Generic over `D` (the doc-key [`InlineSchema`]) and `T` (the
+/// term [`InlineSchema`]). Typical shapes:
 ///
 /// - `BM25Builder<GenId, WordHash>` — classic text search
 ///   keyed by entity id; terms come from
@@ -78,19 +78,19 @@ const DEFAULT_B: f32 = 0.75;
 ///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
-pub struct BM25Builder<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::WordHash> {
-    pub(crate) docs: Vec<(RawValue, Vec<RawValue>)>,
+pub struct BM25Builder<D: InlineSchema = GenId, T: InlineSchema = crate::tokens::WordHash> {
+    pub(crate) docs: Vec<(RawInline, Vec<RawInline>)>,
     pub(crate) k1: f32,
     pub(crate) b: f32,
     pub(crate) _phantom: PhantomData<(D, T)>,
 }
 
 // Manual `Clone` impl (not derive) so the bound stays on
-// `D: ValueSchema, T: ValueSchema` rather than the auto-derive's
+// `D: InlineSchema, T: InlineSchema` rather than the auto-derive's
 // `D: Clone, T: Clone` — `PhantomData<(D, T)>` is `Clone`
 // regardless of `D` / `T`, and the rest of the fields are
 // already `Clone`.
-impl<D: ValueSchema, T: ValueSchema> Clone for BM25Builder<D, T> {
+impl<D: InlineSchema, T: InlineSchema> Clone for BM25Builder<D, T> {
     fn clone(&self) -> Self {
         Self {
             docs: self.docs.clone(),
@@ -101,18 +101,18 @@ impl<D: ValueSchema, T: ValueSchema> Clone for BM25Builder<D, T> {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> Default for BM25Builder<D, T> {
+impl<D: InlineSchema, T: InlineSchema> Default for BM25Builder<D, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
+impl<D: InlineSchema, T: InlineSchema> BM25Builder<D, T> {
     /// Create an empty builder with the standard BM25 tuning.
     ///
     /// Type parameters are usually inferred from downstream
     /// [`insert`][Self::insert] calls (the doc key's
-    /// [`IntoValue<D>`] impl pins `D`, the term vector pins `T`).
+    /// [`IntoInline<D>`] impl pins `D`, the term vector pins `T`).
     /// When you need to be explicit — e.g. for an index you'll
     /// populate only after some plumbing — spell the schemas
     /// with a turbofish:
@@ -150,28 +150,28 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     }
 
     /// Add a document. `key` is anything that converts to a
-    /// `Value<D>` — pass a `Value<GenId>` directly, an
+    /// `Inline<D>` — pass a `Inline<GenId>` directly, an
     /// `&Id` for entity-keyed indexes, or any user type that
-    /// implements `IntoValue<D>`. `terms` is the caller's
+    /// implements `IntoInline<D>`. `terms` is the caller's
     /// tokenization under schema `T` (see
     /// [`crate::tokens::hash_tokens`] for the usual token-handle
     /// default). Order of terms is irrelevant; duplicates
     /// contribute to term frequency.
     ///
-    /// Accepts any `IntoIterator<Item = Value<T>>`, so a
-    /// `Vec<Value<T>>` from `hash_tokens(...)` works directly,
+    /// Accepts any `IntoIterator<Item = Inline<T>>`, so a
+    /// `Vec<Inline<T>>` from `hash_tokens(...)` works directly,
     /// and so does an iterator chain
     /// (`tokens.iter().filter(...).copied()`, `(0..n).map(...)`,
     /// etc.) without an intermediate `.collect()`.
     pub fn insert<K, I>(&mut self, key: K, terms: I)
     where
-        K: IntoValue<D>,
-        I: IntoIterator<Item = Value<T>>,
+        K: IntoInline<D>,
+        I: IntoIterator<Item = Inline<T>>,
     {
-        // Value<_> is repr(transparent) around RawValue; strip
+        // Inline<_> is repr(transparent) around RawInline; strip
         // the phantom at the boundary, store raw bytes.
-        let key_val: Value<D> = key.to_value();
-        let term_rows: Vec<RawValue> = terms.into_iter().map(|v| v.raw).collect();
+        let key_val: Inline<D> = key.to_inline();
+        let term_rows: Vec<RawInline> = terms.into_iter().map(|v| v.raw).collect();
         self.docs.push((key_val.raw, term_rows));
     }
 
@@ -211,12 +211,12 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
             doc_lens.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_docs as f32
         };
 
-        let keys: Vec<RawValue> = docs.iter().map(|(key, _)| *key).collect();
+        let keys: Vec<RawInline> = docs.iter().map(|(key, _)| *key).collect();
 
         let term_to_tfs = if threads <= 1 || n_docs < 2 {
             // Single-threaded tf accumulation — cheap for small
             // corpora; also what we get when threads == 1.
-            let mut m: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+            let mut m: HashMap<RawInline, HashMap<u32, u32>> = HashMap::new();
             for (doc_idx, (_, terms)) in docs.into_iter().enumerate() {
                 accumulate_tfs(&mut m, doc_idx as u32, terms);
             }
@@ -233,7 +233,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
             // consume. We keep the start doc_idx of each chunk
             // to preserve global indexing.
             let mut starts = Vec::with_capacity(threads);
-            let mut chunks: Vec<Vec<(RawValue, Vec<RawValue>)>> = Vec::with_capacity(threads);
+            let mut chunks: Vec<Vec<(RawInline, Vec<RawInline>)>> = Vec::with_capacity(threads);
             let mut docs_iter = docs.into_iter();
             let mut idx = 0usize;
             for t in 0..threads {
@@ -245,12 +245,12 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
             }
 
             // Scoped threads so references to `chunks` stay alive.
-            let locals: Vec<HashMap<RawValue, HashMap<u32, u32>>> = std::thread::scope(|s| {
+            let locals: Vec<HashMap<RawInline, HashMap<u32, u32>>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(threads);
                 for (shard_start, chunk) in starts.iter().zip(chunks) {
                     let start = *shard_start as u32;
                     handles.push(s.spawn(move || {
-                        let mut m: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+                        let mut m: HashMap<RawInline, HashMap<u32, u32>> = HashMap::new();
                         for (i, (_, terms)) in chunk.into_iter().enumerate() {
                             accumulate_tfs(&mut m, start + i as u32, terms);
                         }
@@ -265,7 +265,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
             // submaps have disjoint keys — `extend` without
             // collision checks is sound and avoids the per-entry
             // hash lookup that `or_insert` costs.
-            let mut merged: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+            let mut merged: HashMap<RawInline, HashMap<u32, u32>> = HashMap::new();
             for local in locals {
                 for (term, tfs) in local {
                     merged.entry(term).or_default().extend(tfs);
@@ -276,7 +276,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
 
         // Sort terms ascending so the term table supports binary
         // search (matches the succinct layout).
-        let mut terms: Vec<RawValue> = term_to_tfs.keys().copied().collect();
+        let mut terms: Vec<RawInline> = term_to_tfs.keys().copied().collect();
         terms.sort_unstable();
 
         // Per-term postings with pre-baked BM25 scores. IDF follows
@@ -329,9 +329,9 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
 
 /// Accumulate token-frequency counts for one doc into `m`.
 fn accumulate_tfs(
-    m: &mut HashMap<RawValue, HashMap<u32, u32>>,
+    m: &mut HashMap<RawInline, HashMap<u32, u32>>,
     doc_idx: u32,
-    terms: Vec<RawValue>,
+    terms: Vec<RawInline>,
 ) {
     for term in terms {
         let entry = m.entry(term).or_default().entry(doc_idx).or_insert(0);
@@ -349,13 +349,13 @@ fn accumulate_tfs(
 /// saturating term frequency (`k1`) and length-normalized doc
 /// length (`b`).
 #[doc(hidden)]
-pub struct BM25Index<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::WordHash> {
-    /// Per-doc 32-byte keys. Stored raw; `Value<D>` at the API
+pub struct BM25Index<D: InlineSchema = GenId, T: InlineSchema = crate::tokens::WordHash> {
+    /// Per-doc 32-byte keys. Stored raw; `Inline<D>` at the API
     /// boundary.
-    keys: Vec<RawValue>,
+    keys: Vec<RawInline>,
     doc_lens: Vec<u32>,
     avg_doc_len: f32,
-    terms: Vec<RawValue>,
+    terms: Vec<RawInline>,
     offsets: Vec<u32>,
     postings: Vec<(u32, f32)>,
     k1: f32,
@@ -363,7 +363,7 @@ pub struct BM25Index<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::Wor
     _phantom: PhantomData<(D, T)>,
 }
 
-impl<D: ValueSchema, T: ValueSchema> std::fmt::Debug for BM25Index<D, T> {
+impl<D: InlineSchema, T: InlineSchema> std::fmt::Debug for BM25Index<D, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BM25Index")
             .field("n_docs", &self.keys.len())
@@ -375,7 +375,7 @@ impl<D: ValueSchema, T: ValueSchema> std::fmt::Debug for BM25Index<D, T> {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> Clone for BM25Index<D, T> {
+impl<D: InlineSchema, T: InlineSchema> Clone for BM25Index<D, T> {
     fn clone(&self) -> Self {
         Self {
             keys: self.keys.clone(),
@@ -391,7 +391,7 @@ impl<D: ValueSchema, T: ValueSchema> Clone for BM25Index<D, T> {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
+impl<D: InlineSchema, T: InlineSchema> BM25Index<D, T> {
     /// Number of documents in the index.
     pub fn doc_count(&self) -> usize {
         self.keys.len()
@@ -409,12 +409,12 @@ impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
 
     /// Look up a term's posting list.
     ///
-    /// Returns `(Value<D>, f32)` pairs in posting-list order.
+    /// Returns `(Inline<D>, f32)` pairs in posting-list order.
     /// Empty iterator if the term is absent.
     pub fn query_term<'a>(
         &'a self,
-        term: &Value<T>,
-    ) -> impl Iterator<Item = (Value<D>, f32)> + 'a {
+        term: &Inline<T>,
+    ) -> impl Iterator<Item = (Inline<D>, f32)> + 'a {
         let lo = self.terms.binary_search(&term.raw).ok();
         let range = match lo {
             Some(i) => self.offsets[i] as usize..self.offsets[i + 1] as usize,
@@ -422,29 +422,29 @@ impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
         };
         self.postings[range]
             .iter()
-            .map(|&(doc_idx, score)| (Value::<D>::new(self.keys[doc_idx as usize]), score))
+            .map(|&(doc_idx, score)| (Inline::<D>::new(self.keys[doc_idx as usize]), score))
     }
 
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words).
     ///
-    /// Returned `(Value<D>, f32)` pairs are sorted descending by
+    /// Returned `(Inline<D>, f32)` pairs are sorted descending by
     /// score. No top-k truncation — caller slices what they need.
-    pub fn query_multi(&self, terms: &[Value<T>]) -> Vec<(Value<D>, f32)> {
-        let mut acc: HashMap<RawValue, f32> = HashMap::new();
+    pub fn query_multi(&self, terms: &[Inline<T>]) -> Vec<(Inline<D>, f32)> {
+        let mut acc: HashMap<RawInline, f32> = HashMap::new();
         for term in terms {
             for (doc, score) in self.query_term(term) {
                 *acc.entry(doc.raw).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Value<D>, f32)> =
-            acc.into_iter().map(|(raw, s)| (Value::<D>::new(raw), s)).collect();
+        let mut out: Vec<(Inline<D>, f32)> =
+            acc.into_iter().map(|(raw, s)| (Inline::<D>::new(raw), s)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
 
     /// Number of documents containing this term.
-    pub fn doc_frequency(&self, term: &Value<T>) -> usize {
+    pub fn doc_frequency(&self, term: &Inline<T>) -> usize {
         self.terms
             .binary_search(&term.raw)
             .ok()
@@ -469,17 +469,17 @@ impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
     }
 
     /// Doc-key table: `keys()[i]` is the external 32-byte
-    /// `RawValue` for internal index `i`. Exposed so succinct
+    /// `RawInline` for internal index `i`. Exposed so succinct
     /// re-encoders can snapshot the table without roundtripping
     /// through query_term.
-    pub fn keys(&self) -> &[RawValue] {
+    pub fn keys(&self) -> &[RawInline] {
         &self.keys
     }
 
     /// Sorted 32-byte term table. Used by succinct re-encoders
     /// and anyone implementing a custom query plan over this
     /// index's internals.
-    pub fn terms_slice(&self) -> &[RawValue] {
+    pub fn terms_slice(&self) -> &[RawInline] {
         &self.terms
     }
 
@@ -517,7 +517,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> PartialEq for BM25Index<D, T> {
+impl<D: InlineSchema, T: InlineSchema> PartialEq for BM25Index<D, T> {
     /// Bit-exact equality, including on `f32` fields — used by
     /// parallel-build tests that assert byte-identical output
     /// across thread counts. Score computation is deterministic
@@ -543,7 +543,7 @@ impl<D: ValueSchema, T: ValueSchema> PartialEq for BM25Index<D, T> {
     }
 }
 
-impl<D: ValueSchema, T: ValueSchema> Eq for BM25Index<D, T> {}
+impl<D: InlineSchema, T: InlineSchema> Eq for BM25Index<D, T> {}
 
 
 #[cfg(test)]
@@ -558,12 +558,12 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
-    /// Test helper: the 32-byte `Value<GenId>` representation of
+    /// Test helper: the 32-byte `Inline<GenId>` representation of
     /// the Id used by `id(byte)`. Matches what `BM25Builder::insert`
     /// stores internally, so `query_term` results can be
     /// compared against it.
-    fn id_key(byte: u8) -> RawValue {
-        id(byte).to_value().raw
+    fn id_key(byte: u8) -> RawInline {
+        id(byte).to_inline().raw
     }
 
     #[test]
@@ -571,21 +571,21 @@ mod tests {
         let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
-        let term: Value<crate::tokens::WordHash> = Value::new([0u8; 32]);
+        let term: Inline<crate::tokens::WordHash> = Inline::new([0u8; 32]);
         assert!(idx.query_term(&term).next().is_none());
     }
 
     #[test]
     fn insert_indexes_by_string_key() {
         use triblespace_core::value::schemas::shortstring::ShortString;
-        use triblespace_core::value::{IntoValue, Value};
+        use triblespace_core::value::{IntoInline, Inline};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::new();
-        let red: Value<ShortString> = "red".to_value();
-        let blue: Value<ShortString> = "blue".to_value();
+        let red: Inline<ShortString> = "red".to_inline();
+        let blue: Inline<ShortString> = "blue".to_inline();
         // Two docs keyed by string value rather than entity id.
         // The doc body is the token stream; the *key* is a
-        // `Value<ShortString>`, so a later query can find "docs
+        // `Inline<ShortString>`, so a later query can find "docs
         // whose key/field value is 'red'".
         b.insert(red, hash_tokens("a tomato is red"));
         b.insert(blue, hash_tokens("the ocean is blue"));
@@ -597,10 +597,10 @@ mod tests {
         let blue_hits: Vec<_> = idx.query_term(&hash_tokens("blue")[0]).collect();
         assert_eq!(red_hits.len(), 1);
         assert_eq!(blue_hits.len(), 1);
-        // Keys come back as `Value<ShortString>` since that's the
+        // Keys come back as `Inline<ShortString>` since that's the
         // doc schema; compare against the expected key.
-        let red_raw: Value<ShortString> = "red".to_value();
-        let blue_raw: Value<ShortString> = "blue".to_value();
+        let red_raw: Inline<ShortString> = "red".to_inline();
+        let blue_raw: Inline<ShortString> = "blue".to_inline();
         assert_eq!(red_hits[0].0, red_raw);
         assert_eq!(blue_hits[0].0, blue_raw);
     }
@@ -667,7 +667,7 @@ mod tests {
         let idx = b.build();
 
         let foo = hash_tokens("foo");
-        let scores: HashMap<RawValue, f32> = idx
+        let scores: HashMap<RawInline, f32> = idx
             .query_term(&foo[0])
             .map(|(v, s)| (v.raw, s))
             .collect();

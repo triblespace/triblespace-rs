@@ -1,7 +1,7 @@
 //! `entity!{}` auto-puts `Blob<T>` arguments to handle-typed fields.
 //!
 //! Today `IntoSchema<S>` has two relevant impls: identity for
-//! `Value<S>` (via the blanket from `IntoValue<S>`) and put-and-handle
+//! `Inline<S>` (via the blanket from `IntoInline<S>`) and put-and-handle
 //! for `Blob<T>` targeting `Handle<H, T>`. The macro calls
 //! `into_field_value` for every field; when the value side carries
 //! `Some(bytes)`, those bytes get absorbed into the entity's
@@ -39,8 +39,8 @@ fn entity_auto_puts_blob_handle_fields() {
 
     // The handle in the facts must match what the macro computed.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Value<Handle<LongString>>),
+    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -59,8 +59,8 @@ fn entity_auto_puts_blob_handle_fields() {
 
 #[test]
 fn entity_still_accepts_precomputed_value() {
-    // Passing a precomputed `Value<Handle<LongString>>` still
-    // works via the blanket IntoValue→IntoSchema impl. No bytes
+    // Passing a precomputed `Inline<Handle<LongString>>` still
+    // works via the blanket IntoInline→IntoSchema impl. No bytes
     // get absorbed (since the caller didn't hand us any), which is
     // the right behaviour — the caller is responsible for making
     // sure the bytes live somewhere else if they want them resolvable.
@@ -72,8 +72,8 @@ fn entity_still_accepts_precomputed_value() {
 
     // Handle is in the facts.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Value<Handle<LongString>>),
+    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -96,8 +96,8 @@ fn entity_still_accepts_precomputed_value() {
 #[test]
 fn entity_pipeline_does_not_rehash() {
     let e = rngid();
-    let bogus_handle: triblespace_core::value::Value<Handle<LongString>> =
-        triblespace_core::value::Value::new([0xAA; 32]);
+    let bogus_handle: triblespace_core::value::Inline<Handle<LongString>> =
+        triblespace_core::value::Inline::new([0xAA; 32]);
     let blob: Blob<LongString> = Blob::with_handle(
         anybytes::Bytes::from(b"contents whose true hash we'll never see".to_vec()),
         bogus_handle,
@@ -106,8 +106,8 @@ fn entity_pipeline_does_not_rehash() {
     let frag = entity! { &e @ ns::note: blob };
 
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Value<Handle<LongString>>),
+    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)

@@ -39,7 +39,7 @@ validation to the reader:
 
 ## Looking up blob metadata
 
-`PileReader::metadata` accepts the same `Value<Handle<_, _>>` that other blob
+`PileReader::metadata` accepts the same `Inline<Handle<_, _>>` that other blob
 store APIs use. The reader consults its in-memory index and, on the first
 request for a handle, lazily hashes the payload to confirm the bytes match the
 handle. Subsequent metadata lookups for the same handle reuse that cached

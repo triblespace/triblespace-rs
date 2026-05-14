@@ -29,8 +29,8 @@ use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::schemas::UnknownValue;
-use crate::value::{RawValue, IntoValue, Value, ValueSchema};
+use crate::value::schemas::UnknownInline;
+use crate::value::{RawInline, IntoInline, Inline, InlineSchema};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
@@ -152,7 +152,7 @@ impl<'a, Store> JsonObjectImporter<'a, Store>
 where
     Store: BlobStore,
 {
-    fn attr_from_field<S: ValueSchema + MetaDescribe>(
+    fn attr_from_field<S: InlineSchema + MetaDescribe>(
         &mut self,
         field: &ParsedString,
     ) -> Result<Attribute<S>, JsonImportError> {
@@ -292,7 +292,7 @@ where
     ) -> Result<(ExclusiveId, TribleSet), JsonImportError> {
         self.consume_byte(bytes, b'{')?;
         self.skip_ws(bytes);
-        let mut pairs: Vec<(RawId, RawValue)> = Vec::new();
+        let mut pairs: Vec<(RawId, RawInline)> = Vec::new();
         let mut staged = TribleSet::new();
 
         if bytes.peek_token() == Some(b'}') {
@@ -322,7 +322,7 @@ where
         let entity = self.derive_id(&pairs)?;
         for (attr_raw, value_raw) in pairs {
             let attr_id = Id::new(attr_raw).ok_or(JsonImportError::PrimitiveRoot)?;
-            let value = Value::<UnknownValue>::new(value_raw);
+            let value = Inline::<UnknownInline>::new(value_raw);
             staged.insert(&Trible::new(&entity, &attr_id, &value));
         }
 
@@ -333,7 +333,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         field: &ParsedString,
-        pairs: &mut Vec<(RawId, RawValue)>,
+        pairs: &mut Vec<(RawId, RawInline)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
         self.consume_byte(bytes, b'[')?;
@@ -366,7 +366,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         field: &ParsedString,
-        pairs: &mut Vec<(RawId, RawValue)>,
+        pairs: &mut Vec<(RawId, RawInline)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
         match bytes.peek_token() {
@@ -377,20 +377,20 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), true.to_value().raw));
+                pairs.push((attr.raw(), true.to_inline().raw));
                 Ok(())
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), false.to_value().raw));
+                pairs.push((attr.raw(), false.to_inline().raw));
                 Ok(())
             }
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
                 let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
-                let handle: Value<Handle<LongString>> = self
+                let handle: Inline<Handle<LongString>> = self
                     .store
                     .put(text)
                     .map_err(|err| JsonImportError::EncodeString {
@@ -404,7 +404,7 @@ where
                 let (child, child_staged) = self.parse_object(bytes)?;
                 *staged += child_staged;
                 let attr = self.genid_attr(field)?;
-                let value = GenId::value_from(&child);
+                let value = GenId::inline_from(&child);
                 pairs.push((attr.raw(), value.raw));
                 Ok(())
             }
@@ -427,14 +427,14 @@ where
                     });
                 }
                 let attr = self.num_attr(field)?;
-                let encoded: Value<F64> = number.to_value();
+                let encoded: Inline<F64> = number.to_inline();
                 pairs.push((attr.raw(), encoded.raw));
                 Ok(())
             }
         }
     }
 
-    fn derive_id(&self, pairs: &[(RawId, RawValue)]) -> Result<ExclusiveId, JsonImportError> {
+    fn derive_id(&self, pairs: &[(RawId, RawInline)]) -> Result<ExclusiveId, JsonImportError> {
         let mut sorted = pairs.to_vec();
         sorted
             .sort_by(|(a_attr, a_val), (b_attr, b_val)| a_attr.cmp(b_attr).then(a_val.cmp(b_val)));
@@ -679,10 +679,10 @@ mod tests {
         assert!(!importer.metadata().facts().is_empty());
     }
 
-    fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {
+    fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawInline {
         use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
-        let h: Value<Handle<LongString>> = String::from(expected_attr)
+        let h: Inline<Handle<LongString>> = String::from(expected_attr)
             .to_blob()
             .get_handle();
         let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
@@ -697,12 +697,12 @@ mod tests {
         trible.v::<Handle<LongString>>().raw
     }
 
-    fn read_text(blobs: &mut MemoryBlobStore, handle_raw: RawValue) -> String {
+    fn read_text(blobs: &mut MemoryBlobStore, handle_raw: RawInline) -> String {
         let entries: Vec<_> = blobs.reader().unwrap().into_iter().collect();
         let (_, blob) = entries
             .iter()
             .find(|(h, _)| {
-                let h: Value<Handle<LongString>> = (*h).transmute();
+                let h: Inline<Handle<LongString>> = (*h).transmute();
                 h.raw == handle_raw
             })
             .expect("handle not found in blob store");

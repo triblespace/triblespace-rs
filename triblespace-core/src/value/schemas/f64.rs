@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use serde_json::Number as JsonNumber;
 use std::convert::Infallible;
 use std::fmt;
@@ -61,14 +61,14 @@ mod wasm_formatter {
     }
 }
 
-impl ValueSchema for F64 {
+impl InlineSchema for F64 {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
 
-impl TryFromValue<'_, F64> for f64 {
+impl TryFromInline<'_, F64> for f64 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<F64>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<F64>) -> Result<Self, Infallible> {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&v.raw[..8]);
         Ok(f64::from_le_bytes(bytes))
@@ -76,11 +76,11 @@ impl TryFromValue<'_, F64> for f64 {
 }
 
 impl IntoSchema<F64> for f64 {
-    type Form = Value<F64>;
-    fn into_schema(self) -> Value<F64> {
+    type Form = Inline<F64>;
+    fn into_schema(self) -> Inline<F64> {
         let mut raw = [0u8; 32];
         raw[..8].copy_from_slice(&self.to_le_bytes());
-        Value::new(raw)
+        Inline::new(raw)
     }
 }
 
@@ -103,20 +103,20 @@ impl fmt::Display for JsonNumberToF64Error {
 
 impl std::error::Error for JsonNumberToF64Error {}
 
-impl TryToValue<F64> for JsonNumber {
+impl TryToInline<F64> for JsonNumber {
     type Error = JsonNumberToF64Error;
 
-    fn try_to_value(self) -> Result<Value<F64>, Self::Error> {
-        (&self).try_to_value()
+    fn try_to_inline(self) -> Result<Inline<F64>, Self::Error> {
+        (&self).try_to_inline()
     }
 }
 
-impl TryToValue<F64> for &JsonNumber {
+impl TryToInline<F64> for &JsonNumber {
     type Error = JsonNumberToF64Error;
 
-    fn try_to_value(self) -> Result<Value<F64>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<F64>, Self::Error> {
         if let Some(value) = self.as_f64().filter(|v| v.is_finite()) {
-            return Ok(value.to_value());
+            return Ok(value.to_inline());
         }
         Err(JsonNumberToF64Error::Unrepresentable)
     }

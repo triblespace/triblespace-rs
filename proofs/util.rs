@@ -3,8 +3,8 @@
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::patch::Entry;
 use crate::trible::Trible;
-use crate::value::schemas::UnknownValue;
-use crate::value::{Value, VALUE_LEN};
+use crate::value::schemas::UnknownInline;
+use crate::value::{Inline, INLINE_LEN};
 use kani::BoundedArbitrary;
 
 /// Ensures the generated identifier is never nil by rejecting the sentinel.
@@ -31,13 +31,13 @@ pub fn bounded_exclusive_id() -> ExclusiveId {
 
 /// Produce a value with a reduced search space for harnesses that only care
 /// about byte-level behaviour.
-pub fn bounded_unknown_value() -> Value<UnknownValue> {
-    let raw: [u8; VALUE_LEN] = kani::any();
+pub fn bounded_unknown_value() -> Inline<UnknownInline> {
+    let raw: [u8; INLINE_LEN] = kani::any();
     // Restrict the value to the lower nibble of each byte to keep the state
     // space manageable for symbolic execution while still covering a wide
     // range of patterns.
     let raw = raw.map(|byte| byte & 0x0F);
-    Value::new(raw)
+    Inline::new(raw)
 }
 
 /// Construct a single [`Trible`] using bounded identifiers and value bytes.

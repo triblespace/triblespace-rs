@@ -1,23 +1,23 @@
 //! Opt-in helpers for turning strings into the 32-byte
-//! triblespace `Value`s that `bm25::BM25Index` uses as term ids.
+//! triblespace `Inline`s that `bm25::BM25Index` uses as term ids.
 //!
 //! Nothing in `bm25::` or `hnsw::` depends on this module —
 //! callers who have their own tokenizer (language-specific
 //! stemming, typst/code-aware splitting, phrase handling) can
-//! feed `Value`s directly and skip these helpers entirely.
+//! feed `Inline`s directly and skip these helpers entirely.
 //!
 //! # Per-tokenizer schemas
 //!
-//! Each tokenizer produces a distinct [`ValueSchema`], so the
+//! Each tokenizer produces a distinct [`InlineSchema`], so the
 //! compiler keeps their outputs from mixing at the type level
 //! (the old string-prefix approach was a statistical safeguard
 //! only — user text containing literal `"3:foo"` could collide
 //! with `ngram_tokens("foo", 3)`):
 //!
-//! - [`hash_tokens`] + [`code_tokens`] → [`Value<WordHash>`]
+//! - [`hash_tokens`] + [`code_tokens`] → [`Inline<WordHash>`]
 //!   (same output space — both lowercase + Blake3).
-//! - [`bigram_tokens`] → [`Value<BigramHash>`].
-//! - [`ngram_tokens`] → [`Value<NgramHash>`].
+//! - [`bigram_tokens`] → [`Inline<BigramHash>`].
+//! - [`ngram_tokens`] → [`Inline<NgramHash>`].
 //!
 //! An index that needs multiple tokenizer flavors becomes
 //! multiple indexes, one per schema, joined via `and!` / `or!`
@@ -29,7 +29,7 @@ use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{Value, ValueSchema};
+use triblespace_core::value::{Inline, InlineSchema};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
 /// produce Blake3 hashes of a lowercased word / code segment.
@@ -58,7 +58,7 @@ impl MetaDescribe for WordHash {
     }
 }
 
-impl ValueSchema for WordHash {
+impl InlineSchema for WordHash {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -90,7 +90,7 @@ impl MetaDescribe for BigramHash {
     }
 }
 
-impl ValueSchema for BigramHash {
+impl InlineSchema for BigramHash {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -124,7 +124,7 @@ impl MetaDescribe for NgramHash {
     }
 }
 
-impl ValueSchema for NgramHash {
+impl InlineSchema for NgramHash {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -144,7 +144,7 @@ impl ValueSchema for NgramHash {
 /// same 32-byte value across processes and crate versions. That
 /// matters because a `bm25::SuccinctBM25Index` stores these
 /// hashes directly; callers who want language-aware tokenization
-/// should write their own `&str -> Vec<RawValue>` function and
+/// should write their own `&str -> Vec<RawInline>` function and
 /// skip this helper.
 ///
 /// # Example
@@ -157,9 +157,9 @@ impl ValueSchema for NgramHash {
 /// assert_eq!(vs[0], vs[2]);
 /// assert_ne!(vs[0], vs[1]);
 /// ```
-pub fn hash_tokens(text: &str) -> Vec<Value<WordHash>> {
+pub fn hash_tokens(text: &str) -> Vec<Inline<WordHash>> {
     normalize_words(text)
-        .map(|w| Value::<WordHash>::new(*blake3::hash(w.as_bytes()).as_bytes()))
+        .map(|w| Inline::<WordHash>::new(*blake3::hash(w.as_bytes()).as_bytes()))
         .collect()
 }
 
@@ -225,7 +225,7 @@ fn normalize_words(text: &str) -> impl Iterator<Item = String> + '_ {
 /// let qry = bigram_tokens("quick brown");
 /// assert!(doc.contains(&qry[0]));
 /// ```
-pub fn bigram_tokens(text: &str) -> Vec<Value<BigramHash>> {
+pub fn bigram_tokens(text: &str) -> Vec<Inline<BigramHash>> {
     // Same normalization pipeline as `hash_tokens`, but we pair
     // adjacent words before hashing rather than hashing each on
     // its own.
@@ -243,7 +243,7 @@ pub fn bigram_tokens(text: &str) -> Vec<Value<BigramHash>> {
         buf.push_str(&pair[0]);
         buf.push('\u{0}');
         buf.push_str(&pair[1]);
-        out.push(Value::<BigramHash>::new(*blake3::hash(buf.as_bytes()).as_bytes()));
+        out.push(Inline::<BigramHash>::new(*blake3::hash(buf.as_bytes()).as_bytes()));
     }
     out
 }
@@ -278,7 +278,7 @@ pub fn bigram_tokens(text: &str) -> Vec<Value<BigramHash>> {
 /// uppercase with the new lowercase run, producing `HTM` + `Lv`
 /// in that case. Prefer explicit separators (`_`, case changes,
 /// or digits) when the intent matters.
-pub fn code_tokens(text: &str) -> Vec<Value<WordHash>> {
+pub fn code_tokens(text: &str) -> Vec<Inline<WordHash>> {
     let mut segments: Vec<String> = Vec::new();
     let mut cur = String::new();
 
@@ -361,7 +361,7 @@ pub fn code_tokens(text: &str) -> Vec<Value<WordHash>> {
             if lower.is_empty() {
                 None
             } else {
-                Some(Value::<WordHash>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
+                Some(Inline::<WordHash>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
             }
         })
         .collect()
@@ -403,7 +403,7 @@ pub fn code_tokens(text: &str) -> Vec<Value<WordHash>> {
 /// // "fox" and "foxes" share the "fox" trigram.
 /// assert!(ngram_tokens("foxes", 3).contains(&ngram_tokens("fox", 3)[0]));
 /// ```
-pub fn ngram_tokens(text: &str, n: usize) -> Vec<Value<NgramHash>> {
+pub fn ngram_tokens(text: &str, n: usize) -> Vec<Inline<NgramHash>> {
     if n == 0 {
         return Vec::new();
     }
@@ -438,7 +438,7 @@ pub fn ngram_tokens(text: &str, n: usize) -> Vec<Value<NgramHash>> {
             for &c in window {
                 gram.push(c);
             }
-            out.push(Value::<NgramHash>::new(*blake3::hash(gram.as_bytes()).as_bytes()));
+            out.push(Inline::<NgramHash>::new(*blake3::hash(gram.as_bytes()).as_bytes()));
         }
     }
     out
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn bigram_tokens_separated_from_hash_by_schema() {
         // Single-word `hash_tokens` output is
-        // `Value<WordHash>`; bigram output is `Value<BigramHash>`
+        // `Inline<WordHash>`; bigram output is `Inline<BigramHash>`
         // — different types. The compiler enforces the
         // separation; they can't accidentally share an index or
         // be swapped in a query. Byte-level collision is
@@ -630,7 +630,7 @@ mod tests {
         let t = code_tokens("parse_http_response");
         let expected = ["parse", "http", "response"]
             .iter()
-            .map(|s| Value::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
+            .map(|s| Inline::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -640,7 +640,7 @@ mod tests {
         let t = code_tokens("parseResponseBody");
         let expected = ["parse", "response", "body"]
             .iter()
-            .map(|s| Value::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
+            .map(|s| Inline::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -652,7 +652,7 @@ mod tests {
         let t = code_tokens("HTMLParser");
         let expected = ["html", "parser"]
             .iter()
-            .map(|s| Value::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
+            .map(|s| Inline::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -662,7 +662,7 @@ mod tests {
         let t = code_tokens("parseV2Request");
         let expected = ["parse", "v", "2", "request"]
             .iter()
-            .map(|s| Value::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
+            .map(|s| Inline::<WordHash>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }

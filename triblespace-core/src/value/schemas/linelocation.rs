@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawValue;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use proc_macro::Span;
 use std::convert::Infallible;
 
@@ -69,12 +69,12 @@ mod wasm_formatter {
     }
 }
 
-impl ValueSchema for LineLocation {
+impl InlineSchema for LineLocation {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
 
-fn encode_location(lines: (u64, u64, u64, u64)) -> RawValue {
+fn encode_location(lines: (u64, u64, u64, u64)) -> RawInline {
     let mut raw = [0u8; 32];
     raw[..8].copy_from_slice(&lines.0.to_be_bytes());
     raw[8..16].copy_from_slice(&lines.1.to_be_bytes());
@@ -83,7 +83,7 @@ fn encode_location(lines: (u64, u64, u64, u64)) -> RawValue {
     raw
 }
 
-fn decode_location(raw: &RawValue) -> (u64, u64, u64, u64) {
+fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
     let mut first = [0u8; 8];
     let mut second = [0u8; 8];
     let mut third = [0u8; 8];
@@ -101,50 +101,50 @@ fn decode_location(raw: &RawValue) -> (u64, u64, u64, u64) {
 }
 
 impl IntoSchema<LineLocation> for (u64, u64, u64, u64) {
-    type Form = Value<LineLocation>;
-    fn into_schema(self) -> Value<LineLocation> {
-        Value::new(encode_location(self))
+    type Form = Inline<LineLocation>;
+    fn into_schema(self) -> Inline<LineLocation> {
+        Inline::new(encode_location(self))
     }
 }
 
-impl TryFromValue<'_, LineLocation> for (u64, u64, u64, u64) {
+impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
     type Error = Infallible;
-    fn try_from_value(v: &Value<LineLocation>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<LineLocation>) -> Result<Self, Infallible> {
         Ok(decode_location(&v.raw))
     }
 }
 
 impl IntoSchema<LineLocation> for Span {
-    type Form = Value<LineLocation>;
-    fn into_schema(self) -> Value<LineLocation> {
+    type Form = Inline<LineLocation>;
+    fn into_schema(self) -> Inline<LineLocation> {
         (
             self.start().line() as u64,
             self.start().column() as u64,
             self.end().line() as u64,
             self.end().column() as u64,
         )
-            .to_value()
+            .to_inline()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::IntoValue;
+    use crate::value::IntoInline;
     use proptest::prelude::*;
 
     proptest! {
         #[test]
         fn tuple_roundtrip(a: u64, b: u64, c: u64, d: u64) {
             let input = (a, b, c, d);
-            let value: Value<LineLocation> = input.to_value();
-            let output: (u64, u64, u64, u64) = value.from_value();
+            let value: Inline<LineLocation> = input.to_inline();
+            let output: (u64, u64, u64, u64) = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn validates(a: u64, b: u64, c: u64, d: u64) {
-            let value: Value<LineLocation> = (a, b, c, d).to_value();
+            let value: Inline<LineLocation> = (a, b, c, d).to_inline();
             prop_assert!(LineLocation::validate(value).is_ok());
         }
     }

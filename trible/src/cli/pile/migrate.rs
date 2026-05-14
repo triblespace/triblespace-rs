@@ -10,8 +10,8 @@ use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
-type NameHandle = Value<Handle<blobschemas::LongString>>;
-type BranchMetaHandle = Value<Handle<blobschemas::SimpleArchive>>;
+type NameHandle = Inline<Handle<blobschemas::LongString>>;
+type BranchMetaHandle = Inline<Handle<blobschemas::SimpleArchive>>;
 
 mod legacy_branch_metadata {
     use super::*;

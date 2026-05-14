@@ -31,7 +31,7 @@ use std::collections::HashSet;
 use triblespace_core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
 use triblespace_core::value::schemas::genid::GenId;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::{RawValue, Value};
+use triblespace_core::value::{RawInline, Inline};
 
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
@@ -44,38 +44,38 @@ use crate::schemas::Embedding;
 /// engine layer.
 pub trait BM25Queryable {
     /// Iterate `(key, score)` for the posting list of `term`.
-    /// Keys are 32-byte triblespace `RawValue`s — the caller's
-    /// `Variable<S>` decodes them through whatever `ValueSchema`
+    /// Keys are 32-byte triblespace `RawInline`s — the caller's
+    /// `Variable<S>` decodes them through whatever `InlineSchema`
     /// is appropriate. Empty iterator if the term is absent.
     fn query_term_boxed<'a>(
         &'a self,
-        term: &RawValue,
-    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a>;
+        term: &RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a>;
 }
 
-impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
     BM25Queryable for BM25Index<D, T>
 {
     fn query_term_boxed<'a>(
         &'a self,
-        term: &RawValue,
-    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        // Wrap the raw bytes in `Value<T>` at the trait boundary
-        // — the typed API inside the index expects `&Value<T>`.
-        let term_val = Value::<T>::new(*term);
+        term: &RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a> {
+        // Wrap the raw bytes in `Inline<T>` at the trait boundary
+        // — the typed API inside the index expects `&Inline<T>`.
+        let term_val = Inline::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
     BM25Queryable for crate::succinct::SuccinctBM25Index<D, T>
 {
     fn query_term_boxed<'a>(
         &'a self,
-        term: &RawValue,
-    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        let term_val = Value::<T>::new(*term);
+        term: &RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a> {
+        let term_val = Inline::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 }
@@ -135,10 +135,10 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
 /// let mut ranked: Vec<(Id, f32)> = matched
 ///     .into_iter()
 ///     .map(|id| {
-///         use triblespace_core::value::IntoValue;
-///         let v: triblespace_core::value::Value<
+///         use triblespace_core::value::IntoInline;
+///         let v: triblespace_core::value::Inline<
 ///             triblespace_core::value::schemas::genid::GenId,
-///         > = (&id).to_value();
+///         > = (&id).to_inline();
 ///         (id, idx.score(&v, &terms))
 ///     })
 ///     .collect();
@@ -147,29 +147,29 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
 /// ```
 pub struct BM25Filter<S = GenId>
 where
-    S: triblespace_core::value::ValueSchema,
+    S: triblespace_core::value::InlineSchema,
 {
     doc: Variable<S>,
     /// Pre-filtered set of doc keys whose summed score
     /// across the query terms is `>= score_floor`. Score is
     /// dropped after the filter — re-derived on demand.
-    entries: Vec<RawValue>,
+    entries: Vec<RawInline>,
 }
 
 impl<S> BM25Filter<S>
 where
-    S: triblespace_core::value::ValueSchema,
+    S: triblespace_core::value::InlineSchema,
 {
     /// Build a filter from a pre-computed doc list. Use the
     /// `matches` method on [`BM25Index`] or `SuccinctBM25Index`
     /// rather than constructing directly.
     ///
-    /// Accepts any `IntoIterator<Item = RawValue>` so callers
-    /// can pass a `Vec<RawValue>` or a streaming iterator
+    /// Accepts any `IntoIterator<Item = RawInline>` so callers
+    /// can pass a `Vec<RawInline>` or a streaming iterator
     /// without forcing a collect.
     pub fn from_entries<I>(doc: Variable<S>, entries: I) -> Self
     where
-        I: IntoIterator<Item = RawValue>,
+        I: IntoIterator<Item = RawInline>,
     {
         Self {
             doc,
@@ -185,10 +185,10 @@ where
 /// identical filtering behaviour.
 fn aggregate_above<I: BM25Queryable + ?Sized>(
     index: &I,
-    terms: &[RawValue],
+    terms: &[RawInline],
     score_floor: f32,
-) -> Vec<RawValue> {
-    let mut acc: std::collections::HashMap<RawValue, f32> =
+) -> Vec<RawInline> {
+    let mut acc: std::collections::HashMap<RawInline, f32> =
         std::collections::HashMap::new();
     for term in terms {
         for (doc, score) in index.query_term_boxed(term) {
@@ -200,7 +200,7 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
         .collect()
 }
 
-impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
     BM25Index<D, T>
 {
     /// Multi-term BM25 filter constraint. Binds `doc` to
@@ -215,10 +215,10 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
     pub fn matches(
         &self,
         doc: Variable<D>,
-        terms: &[Value<T>],
+        terms: &[Inline<T>],
         score_floor: f32,
     ) -> BM25Filter<D> {
-        let raw_terms: Vec<RawValue> = terms.iter().map(|t| t.raw).collect();
+        let raw_terms: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
         BM25Filter::from_entries(doc, aggregate_above(self, &raw_terms, score_floor))
     }
 
@@ -227,7 +227,7 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
     /// Lossless on the naive index; on the succinct index the
     /// score reflects the stored u16 quantisation but at f32
     /// precision (no engine-side equality bookkeeping).
-    pub fn score(&self, doc: &Value<D>, terms: &[Value<T>]) -> f32 {
+    pub fn score(&self, doc: &Inline<D>, terms: &[Inline<T>]) -> f32 {
         let mut sum = 0.0;
         for term in terms {
             for (d, s) in self.query_term(term) {
@@ -250,7 +250,7 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
 /// then delegate. Available only on indexes whose term schema is
 /// [`crate::tokens::WordHash`] — pair them up with
 /// `BM25Builder::<D, WordHash>::new()` builders.
-impl<D: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema>
     BM25Index<D, crate::tokens::WordHash>
 {
     /// Same as [`Self::matches`], but takes a query string and
@@ -268,13 +268,13 @@ impl<D: triblespace_core::value::ValueSchema>
     /// tokenises it with [`crate::tokens::hash_tokens`] internally.
     /// Use after `find!` collects to recompute precise per-result
     /// scores for ranking.
-    pub fn score_text(&self, doc: &Value<D>, text: &str) -> f32 {
+    pub fn score_text(&self, doc: &Inline<D>, text: &str) -> f32 {
         self.score(doc, &crate::tokens::hash_tokens(text))
     }
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
     crate::succinct::SuccinctBM25Index<D, T>
 {
     /// Succinct-side sibling of [`BM25Index::matches`]. Same
@@ -283,15 +283,15 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
     pub fn matches(
         &self,
         doc: Variable<D>,
-        terms: &[Value<T>],
+        terms: &[Inline<T>],
         score_floor: f32,
     ) -> BM25Filter<D> {
-        let raw_terms: Vec<RawValue> = terms.iter().map(|t| t.raw).collect();
+        let raw_terms: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
         BM25Filter::from_entries(doc, aggregate_above(self, &raw_terms, score_floor))
     }
 
     /// Succinct-side sibling of [`BM25Index::score`].
-    pub fn score(&self, doc: &Value<D>, terms: &[Value<T>]) -> f32 {
+    pub fn score(&self, doc: &Inline<D>, terms: &[Inline<T>]) -> f32 {
         let mut sum = 0.0;
         for term in terms {
             for (d, s) in self.query_term(term) {
@@ -308,7 +308,7 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
 /// Word-hash convenience for the succinct path — same shape as the
 /// naive-index sugar, picks up the u16-quantised scoring transparently.
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::ValueSchema>
+impl<D: triblespace_core::value::InlineSchema>
     crate::succinct::SuccinctBM25Index<D, crate::tokens::WordHash>
 {
     /// Succinct-side sibling of [`BM25Index::matches_text`].
@@ -322,14 +322,14 @@ impl<D: triblespace_core::value::ValueSchema>
     }
 
     /// Succinct-side sibling of [`BM25Index::score_text`].
-    pub fn score_text(&self, doc: &Value<D>, text: &str) -> f32 {
+    pub fn score_text(&self, doc: &Inline<D>, text: &str) -> f32 {
         self.score(doc, &crate::tokens::hash_tokens(text))
     }
 }
 
 impl<'a, S> Constraint<'a> for BM25Filter<S>
 where
-    S: triblespace_core::value::ValueSchema + 'a,
+    S: triblespace_core::value::InlineSchema + 'a,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
@@ -343,18 +343,18 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.doc.index {
             return;
         }
         proposals.extend_from_slice(&self.entries);
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.doc.index {
             return;
         }
-        let valid: HashSet<RawValue> = self.entries.iter().copied().collect();
+        let valid: HashSet<RawInline> = self.entries.iter().copied().collect();
         proposals.retain(|raw| valid.contains(raw));
     }
 
@@ -389,16 +389,16 @@ pub trait SimilaritySearch {
     /// put into the pile for this one call).
     fn neighbours_above(
         &self,
-        from: Value<Handle<Embedding>>,
+        from: Inline<Handle<Embedding>>,
         score_floor: f32,
-    ) -> Vec<Value<Handle<Embedding>>>;
+    ) -> Vec<Inline<Handle<Embedding>>>;
 
     /// Exact cosine similarity between the two handles, or
     /// [`None`] if either blob can't be fetched / parsed.
     fn cosine_between(
         &self,
-        a: Value<Handle<Embedding>>,
-        b: Value<Handle<Embedding>>,
+        a: Inline<Handle<Embedding>>,
+        b: Inline<Handle<Embedding>>,
     ) -> Option<f32>;
 }
 
@@ -436,7 +436,7 @@ pub trait SimilaritySearch {
 /// use triblespace_core::query::temp;
 /// use triblespace_core::repo::BlobStore;
 /// use triblespace_core::value::schemas::hash::Blake3;
-/// use triblespace_core::value::Value;
+/// use triblespace_core::value::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
@@ -457,8 +457,8 @@ pub trait SimilaritySearch {
 /// let view = idx.attach(&reader);
 ///
 /// let probe = handles[0];
-/// let rows: Vec<(Value<EmbHandle>,)> = find!(
-///     (neighbour: Value<EmbHandle>),
+/// let rows: Vec<(Inline<EmbHandle>,)> = find!(
+///     (neighbour: Inline<EmbHandle>),
 ///     temp!(
 ///         (anchor),
 ///         and!(anchor.is(probe), view.similar(anchor, neighbour, 0.8))
@@ -520,7 +520,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
             // walk and report an exact cardinality.
             Some(from) => Some(
                 self.index
-                    .neighbours_above(Value::new(from), self.score_floor)
+                    .neighbours_above(Inline::new(from), self.score_floor)
                     .len(),
             ),
             // Other side unbound: the engine is still ordering
@@ -531,7 +531,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         }
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -547,13 +547,13 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         };
         for h in self
             .index
-            .neighbours_above(Value::new(from), self.score_floor)
+            .neighbours_above(Inline::new(from), self.score_floor)
         {
             proposals.push(h.raw);
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -569,9 +569,9 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
             // side is bound.
             return;
         };
-        let allowed: HashSet<RawValue> = self
+        let allowed: HashSet<RawInline> = self
             .index
-            .neighbours_above(Value::new(from), self.score_floor)
+            .neighbours_above(Inline::new(from), self.score_floor)
             .into_iter()
             .map(|h| h.raw)
             .collect();
@@ -584,7 +584,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
                 // Both bound: compute cosine directly. No engine
                 // reason to prefer the walk here — exact beats
                 // approximate once we've paid the two blob fetches.
-                match self.index.cosine_between(Value::new(*a), Value::new(*b)) {
+                match self.index.cosine_between(Inline::new(*a), Inline::new(*b)) {
                     Some(sim) => sim >= self.score_floor,
                     None => false,
                 }
@@ -626,7 +626,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// use triblespace_core::find;
 /// use triblespace_core::repo::BlobStore;
 /// use triblespace_core::value::schemas::hash::Blake3;
-/// use triblespace_core::value::Value;
+/// use triblespace_core::value::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
@@ -647,8 +647,8 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// let view = idx.attach(&reader);
 ///
 /// // No temp!, no `.is()` — the probe is pinned on the call.
-/// let rows: Vec<(Value<EmbHandle>,)> = find!(
-///     (neighbour: Value<EmbHandle>),
+/// let rows: Vec<(Inline<EmbHandle>,)> = find!(
+///     (neighbour: Inline<EmbHandle>),
 ///     view.similar_to(handles[0], neighbour, 0.8)
 /// )
 /// .collect();
@@ -662,7 +662,7 @@ pub struct SimilarTo {
     var: Variable<Handle<Embedding>>,
     /// Eagerly-computed above-threshold handle set from the one
     /// walk at construction.
-    candidates: Vec<RawValue>,
+    candidates: Vec<RawInline>,
 }
 
 impl SimilarTo {
@@ -671,7 +671,7 @@ impl SimilarTo {
     /// rather than directly.
     pub fn from_candidates(
         var: Variable<Handle<Embedding>>,
-        candidates: Vec<RawValue>,
+        candidates: Vec<RawInline>,
     ) -> Self {
         Self { var, candidates }
     }
@@ -690,7 +690,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.var.index {
             return;
         }
@@ -699,11 +699,11 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.var.index {
             return;
         }
-        let allowed: HashSet<RawValue> = self.candidates.iter().copied().collect();
+        let allowed: HashSet<RawInline> = self.candidates.iter().copied().collect();
         proposals.retain(|raw| allowed.contains(raw));
     }
 
@@ -723,20 +723,20 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::IntoValue;
+    use triblespace_core::value::IntoInline;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
 
-    /// `GenId`-schema RawValue → `Id` test helper.
-    fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
-        Value::<GenId>::new(*raw).try_from_value::<Id>().ok()
+    /// `GenId`-schema RawInline → `Id` test helper.
+    fn raw_value_to_id(raw: &RawInline) -> Option<Id> {
+        Inline::<GenId>::new(*raw).try_from_inline::<Id>().ok()
     }
 
-    /// `Id` → `GenId`-schema RawValue test helper.
-    fn id_to_raw_value(id: Id) -> RawValue {
-        id.to_value().raw
+    /// `Id` → `GenId`-schema RawInline test helper.
+    fn id_to_raw_value(id: Id) -> RawInline {
+        id.to_inline().raw
     }
 
     fn sample_index() -> BM25Index {
@@ -792,7 +792,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let binding = Binding::default();
-        let mut props: Vec<RawValue> = Vec::new();
+        let mut props: Vec<RawInline> = Vec::new();
         c.propose(doc.index, &binding, &mut props);
         assert_eq!(props.len(), 2);
 
@@ -813,7 +813,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let binding = Binding::default();
-        let mut props: Vec<RawValue> = vec![
+        let mut props: Vec<RawInline> = vec![
             id_to_raw_value(id(1)),
             id_to_raw_value(id(2)),
             id_to_raw_value(id(3)),
@@ -904,8 +904,8 @@ mod tests {
     #[test]
     fn score_text_matches_explicit_tokens() {
         let idx = sample_index();
-        let s_explicit = idx.score(&id(1).to_value(), &hash_tokens("quick fox"));
-        let s_sugar = idx.score_text(&id(1).to_value(), "quick fox");
+        let s_explicit = idx.score(&id(1).to_inline(), &hash_tokens("quick fox"));
+        let s_sugar = idx.score_text(&id(1).to_inline(), "quick fox");
         assert_eq!(s_explicit, s_sugar);
     }
 
@@ -922,8 +922,8 @@ mod tests {
         let terms = hash_tokens("fox quick brown jumps");
         // Compute per-doc summed scores so we can pick a floor
         // that excludes doc 2 but keeps doc 1.
-        let s1 = idx.score(&id(1).to_value(), &terms);
-        let s2 = idx.score(&id(2).to_value(), &terms);
+        let s1 = idx.score(&id(1).to_inline(), &terms);
+        let s2 = idx.score(&id(2).to_inline(), &terms);
         assert!(s1 > s2, "fixture: full-match should beat partial");
 
         // Floor below s2 → both. Floor between s2 and s1 → only doc 1.
@@ -955,10 +955,10 @@ mod tests {
         let terms = hash_tokens("quick fox");
 
         for byte in [1u8, 3] {
-            let doc_value: Value<GenId> = id(byte).to_value();
+            let doc_value: Inline<GenId> = id(byte).to_inline();
             let helper_score = idx.score(&doc_value, &terms);
 
-            let target = id(byte).to_value().raw;
+            let target = id(byte).to_inline().raw;
             let mut expected = 0.0_f32;
             for t in &terms {
                 for (d, s) in idx.query_term(t) {
@@ -976,7 +976,7 @@ mod tests {
         }
 
         // Doc with no matching terms scores 0.0.
-        let doc2_value: Value<GenId> = id(2).to_value();
+        let doc2_value: Inline<GenId> = id(2).to_inline();
         assert_eq!(idx.score(&doc2_value, &terms), 0.0);
     }
 
@@ -985,7 +985,7 @@ mod tests {
         let idx = sample_index();
         let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let terms: Vec<triblespace_core::value::Value<crate::tokens::WordHash>> = Vec::new();
+        let terms: Vec<triblespace_core::value::Inline<crate::tokens::WordHash>> = Vec::new();
         let c = idx.matches(doc, &terms, 0.0);
 
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
@@ -1018,7 +1018,7 @@ mod tests {
         crate::hnsw::FlatIndex,
         crate::hnsw::HNSWIndex,
         MemoryBlobStore,
-        [Value<Handle<Embedding>>; 3],
+        [Inline<Handle<Embedding>>; 3],
     ) {
         use crate::hnsw::{FlatBuilder, HNSWBuilder};
         let mut store = MemoryBlobStore::new();
@@ -1027,8 +1027,8 @@ mod tests {
             vec![0.0, 1.0, 0.0],
             vec![0.9, 0.1, 0.0],
         ];
-        let mut handles: [Value<Handle<Embedding>>; 3] =
-            [Value::new([0u8; 32]); 3];
+        let mut handles: [Inline<Handle<Embedding>>; 3] =
+            [Inline::new([0u8; 32]); 3];
         for (i, v) in vecs.iter().enumerate() {
             handles[i] =
                 crate::schemas::put_embedding::<_>(&mut store, v.clone()).unwrap();
@@ -1060,7 +1060,7 @@ mod tests {
 
         let mut props = Vec::new();
         c.propose(b.index, &binding, &mut props);
-        let got: HashSet<RawValue> = props.iter().copied().collect();
+        let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
         assert!(!got.contains(&handles[1].raw));
@@ -1082,7 +1082,7 @@ mod tests {
 
         let mut props = Vec::new();
         c.propose(a.index, &binding, &mut props);
-        let got: HashSet<RawValue> = props.iter().copied().collect();
+        let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
     }
@@ -1125,7 +1125,7 @@ mod tests {
 
         let mut props = Vec::new();
         c.propose(b.index, &binding, &mut props);
-        let got: HashSet<RawValue> = props.iter().copied().collect();
+        let got: HashSet<RawInline> = props.iter().copied().collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
         assert!(!got.contains(&handles[1].raw));

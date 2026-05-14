@@ -23,7 +23,7 @@ use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::iu256::U256BE;
-use crate::value::Value;
+use crate::value::Inline;
 use triblespace_core_macros::attributes;
 
 use crate::import::json::{
@@ -47,13 +47,13 @@ attributes! {
     "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<LongString>;
     /// Ordinal position of a field within its parent object.
     "38C7B1CDEA580DE70A520B2C8CBC4F14" as pub field_index: U256BE;
-    /// Value entity referenced by an object field entry.
+    /// Inline entity referenced by an object field entry.
     "6E6CA175F925B6AA0844D357B409F15A" as pub field_value: GenId;
     /// Parent entity of an array entry.
     "B49E6499D0A2CF5DD9A1E72D9D047747" as pub array_parent: GenId;
     /// Zero-based index of an array element.
     "D5DA41A093BD0DE490925126D1150B57" as pub array_index: U256BE;
-    /// Value entity referenced by an array entry.
+    /// Inline entity referenced by an array entry.
     "33535F41827B476B1EC0CACECE9BEED0" as pub array_value: GenId;
 }
 
@@ -129,7 +129,7 @@ fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
 #[derive(Clone)]
 struct FieldEntry {
     name: View<str>,
-    name_handle: Value<Handle<LongString>>,
+    name_handle: Inline<Handle<LongString>>,
     index: u64,
     value: Id,
 }

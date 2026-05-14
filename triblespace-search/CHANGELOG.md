@@ -332,7 +332,7 @@ Observed numbers at 50 k docs / 20 k vocab / 96 tokens-per-doc
 | `SuccinctBM25Index::to_bytes`             |  20.1 MiB  |
 
 Honest takeaway: the build-side streaming win is *masked* at this
-scale — `term_to_tfs: HashMap<RawValue, HashMap<u32, u32>>`
+scale — `term_to_tfs: HashMap<RawInline, HashMap<u32, u32>>`
 dominates at ~150 MiB, dwarfing the
 `Vec<Vec<(u32, f32)>>` intermediate the streaming refactor
 removed (~24 MiB at 50 k, ~144 MiB at 100 k+ where the
@@ -361,7 +361,7 @@ Specifically:
   9.6 MB `Vec<u8>` round-trip at 300 k terms).
 - `SuccinctHNSWIndex::to_bytes`: handles section streams from
   the existing view directly into the output buffer (drops
-  three redundant copies — `Vec<RawValue>` build input, a
+  three redundant copies — `Vec<RawInline>` build input, a
   fresh `FixedBytesTable<32>::build` ByteArea, and a
   `.as_ref().to_vec()` flat copy — collectively ~10 MB at
   100 k nodes).
@@ -409,7 +409,7 @@ idx.bm25_query(doc, score, &terms)          // 2 vars, summed score
 
 // After:
 idx.matches(doc, &terms, score_floor)       // 1 var, score is a filter
-idx.score(&doc.to_value(), &terms) -> f32   // recompute precisely after
+idx.score(&doc.to_inline(), &terms) -> f32   // recompute precisely after
 ```
 
 `score_floor = 0.0` recovers `docs_containing` semantics — BM25 is
@@ -430,8 +430,8 @@ What this kills:
 - `HashSet<u32>` score bit-pattern dedup (Cartesian-blowup
   avoidance) — not needed when score isn't a variable.
 - `query_term_ids` / `query_multi_ids` GenId-specific shortcuts —
-  callers do `Id::try_from_value(v).unwrap()` once after the typed
-  `query_term` if they want `Id` instead of `Value<GenId>`.
+  callers do `Id::try_from_inline(v).unwrap()` once after the typed
+  `query_term` if they want `Id` instead of `Inline<GenId>`.
 
 The constraint module's surface is now one structural shape on each
 side: `BM25Filter` for BM25, `Similar` (+ `similar_to` sugar) for
@@ -448,7 +448,7 @@ re-shaped around the new pattern.
 `BM25Builder::new` was a sibling only on `<GenId, WordHash>`
 that called `typed()` internally. In practice, both `D` and `T`
 are almost always inferred from downstream `insert` calls
-(`&Id → ToValue<GenId>` pins `D`, `hash_tokens → Vec<Value<WordHash>>`
+(`&Id → ToValue<GenId>` pins `D`, `hash_tokens → Vec<Inline<WordHash>>`
 pins `T`), so the specific-shape `new` was just sugar for the
 common case.
 
@@ -643,19 +643,19 @@ TribleSpace taste:
   schema `T`. Default struct types are `<GenId, WordHash>` —
   `BM25Builder::new()` works bare when the type parameters are
   inferrable from later `insert` calls (`&Id → ToValue<GenId>` /
-  `hash_tokens → Vec<Value<WordHash>>`). For other shapes,
+  `hash_tokens → Vec<Inline<WordHash>>`). For other shapes,
   spell the schemas with a turbofish:
   `BM25Builder::<ShortString, WordHash>::new()` for a title-keyed
   index or `BM25Builder::<GenId, GenId>::new()` for
   entity-citation search.
 - `insert` accepts anything that `ToValue<D>`-converts — pass a
-  typed `Value<D>` directly, or `&id` for the common GenId case.
+  typed `Inline<D>` directly, or `&id` for the common GenId case.
   `insert_id` / `insert_value` don't exist; the single `insert`
   covers both.
 - Per-tokenizer term schemas: `hash_tokens` →
-  `Vec<Value<WordHash>>`, `bigram_tokens` →
-  `Vec<Value<BigramHash>>`, `ngram_tokens` →
-  `Vec<Value<NgramHash>>`. The compiler refuses to cross-feed
+  `Vec<Inline<WordHash>>`, `bigram_tokens` →
+  `Vec<Inline<BigramHash>>`, `ngram_tokens` →
+  `Vec<Inline<NgramHash>>`. The compiler refuses to cross-feed
   flavours into the wrong index — see
   `examples/phrase_search.rs` for the two-index pattern when a
   caller needs multiple tokenizer flavours.
@@ -702,7 +702,7 @@ schema of their own.
 
 ### Schemas
 
-- `schemas::F32LE` — 32-byte `ValueSchema` for `f32` scores,
+- `schemas::F32LE` — 32-byte `InlineSchema` for `f32` scores,
   used by the scored BM25 + similarity constraints.
 
 ### Examples (runnable)

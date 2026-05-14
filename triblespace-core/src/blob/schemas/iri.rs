@@ -84,7 +84,7 @@ pub fn looks_like_iri(s: &str) -> bool {
 }
 
 impl IntoSchema<IRI> for View<str>
-where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Form = Blob<IRI>;
     fn into_schema(self) -> Blob<IRI> {
@@ -98,7 +98,7 @@ where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<IRI> for &'static str
-where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Form = Blob<IRI>;
     fn into_schema(self) -> Blob<IRI> {
@@ -112,7 +112,7 @@ where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<IRI> for String
-where crate::value::schemas::hash::Handle<IRI>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Form = Blob<IRI>;
     fn into_schema(self) -> Blob<IRI> {
@@ -151,10 +151,10 @@ mod tests {
     #[test]
     fn iri_handle_is_deterministic() {
         let s: View<str> = Bytes::from(String::from("http://example.org/x")).view().unwrap();
-        let h: crate::value::Value<
+        let h: crate::value::Inline<
             crate::value::schemas::hash::Handle<IRI>,
         > = s.clone().to_blob().get_handle();
-        let h2: crate::value::Value<
+        let h2: crate::value::Inline<
             crate::value::schemas::hash::Handle<IRI>,
         > = s.clone().to_blob().get_handle();
         assert_eq!(h, h2);

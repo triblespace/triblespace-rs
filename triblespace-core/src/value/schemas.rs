@@ -1,4 +1,4 @@
-//! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Value]s.
+//! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Inline]s.
 
 /// Boolean value schema (all-zero / all-one encoding).
 pub mod boolean;
@@ -32,8 +32,8 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 
 /// A value schema for an unknown value.
@@ -42,9 +42,9 @@ use std::convert::Infallible;
 /// Instead, use a specific value schema.
 ///
 /// Any bit pattern can be a valid value of this schema.
-pub struct UnknownValue {}
+pub struct UnknownInline {}
 
-impl MetaDescribe for UnknownValue {
+impl MetaDescribe for UnknownInline {
     fn describe() -> Fragment {
         let id: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
         #[allow(unused_mut)]
@@ -82,11 +82,11 @@ mod wasm_formatter {
     }
 }
 
-impl ValueSchema for UnknownValue {
+impl InlineSchema for UnknownInline {
     type ValidationError = Infallible;
     type FieldKind = Self;
 
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         Ok(value)
     }
 }

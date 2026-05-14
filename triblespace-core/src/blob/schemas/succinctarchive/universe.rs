@@ -1,4 +1,4 @@
-use crate::value::RawValue;
+use crate::value::RawInline;
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -20,12 +20,12 @@ pub trait Universe: Serializable {
     /// Builds a universe from a sorted, deduplicated iterator of raw values.
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
-        I: Iterator<Item = RawValue>;
+        I: Iterator<Item = RawInline>;
 
     /// Builds a universe from an arbitrary iterator, sorting and deduplicating internally.
     fn with<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
-        I: Iterator<Item = RawValue>,
+        I: Iterator<Item = RawInline>,
     {
         let mut values: Vec<_> = iter.collect();
         values.sort_unstable();
@@ -39,9 +39,9 @@ pub trait Universe: Serializable {
     /// if `i < j` and both are valid codes, then `access(i) <= access(j)`
     /// in byte-lexicographic order. This is what makes [`Self::search`]
     /// and [`Self::search_range`] log-time over the universe size.
-    fn access(&self, pos: usize) -> RawValue;
+    fn access(&self, pos: usize) -> RawInline;
     /// Returns the integer code for `v`, or `None` if absent.
-    fn search(&self, v: &RawValue) -> Option<usize>;
+    fn search(&self, v: &RawInline) -> Option<usize>;
     /// Returns the number of distinct values in the universe.
     fn len(&self) -> usize;
     /// Returns `true` if the universe contains no values.
@@ -57,7 +57,7 @@ pub trait Universe: Serializable {
     /// monotonicity promise on [`Self::access`]. Implementations with a
     /// flat sorted slice should override to skip the virtual-call
     /// overhead.
-    fn search_lower(&self, v: &RawValue) -> usize {
+    fn search_lower(&self, v: &RawInline) -> usize {
         let mut lo = 0usize;
         let mut hi = self.len();
         while lo < hi {
@@ -80,7 +80,7 @@ pub trait Universe: Serializable {
     /// monotonicity promise on [`Self::access`]. Implementations with a
     /// flat sorted slice should override to skip the virtual-call
     /// overhead.
-    fn search_upper(&self, v: &RawValue) -> usize {
+    fn search_upper(&self, v: &RawInline) -> usize {
         let mut lo = 0usize;
         let mut hi = self.len();
         while lo < hi {
@@ -101,7 +101,7 @@ pub trait Universe: Serializable {
     /// Composes [`Self::search_lower`] and [`Self::search_upper`];
     /// override only if a fused implementation can beat two independent
     /// binary searches.
-    fn search_range(&self, min: &RawValue, max: &RawValue) -> std::ops::Range<usize> {
+    fn search_range(&self, min: &RawInline, max: &RawInline) -> std::ops::Range<usize> {
         if min > max {
             return 0..0;
         }
@@ -115,24 +115,24 @@ pub trait Universe: Serializable {
 /// construct but uses 32 bytes per distinct value.
 #[derive(Debug, Clone)]
 pub struct OrderedUniverse {
-    values: View<[RawValue]>,
-    handle: SectionHandle<RawValue>,
+    values: View<[RawInline]>,
+    handle: SectionHandle<RawInline>,
 }
 
 impl Universe for OrderedUniverse {
     fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
-        I: Iterator<Item = RawValue>,
+        I: Iterator<Item = RawInline>,
     {
         let collected: Vec<_> = iter.collect();
         OrderedUniverse::from_slice(&collected, sections)
     }
 
-    fn access(&self, pos: usize) -> RawValue {
+    fn access(&self, pos: usize) -> RawInline {
         self.values[pos]
     }
 
-    fn search(&self, v: &RawValue) -> Option<usize> {
+    fn search(&self, v: &RawInline) -> Option<usize> {
         self.values.binary_search(v).ok()
     }
 
@@ -143,29 +143,29 @@ impl Universe for OrderedUniverse {
     /// O(log n) `partition_point` on the byte-sorted values slice;
     /// avoids the virtual-call overhead of the default `access`-driven
     /// binary search.
-    fn search_lower(&self, v: &RawValue) -> usize {
+    fn search_lower(&self, v: &RawInline) -> usize {
         self.values.partition_point(|x| x < v)
     }
 
     /// O(log n) `partition_point` on the byte-sorted values slice;
     /// avoids the virtual-call overhead of the default `access`-driven
     /// binary search.
-    fn search_upper(&self, v: &RawValue) -> usize {
+    fn search_upper(&self, v: &RawInline) -> usize {
         self.values.partition_point(|x| x <= v)
     }
 }
 
 impl OrderedUniverse {
-    fn from_slice(values: &[RawValue], sections: &mut SectionWriter<'_>) -> Self {
-        let mut section = sections.reserve::<RawValue>(values.len()).unwrap();
+    fn from_slice(values: &[RawInline], sections: &mut SectionWriter<'_>) -> Self {
+        let mut section = sections.reserve::<RawInline>(values.len()).unwrap();
         section.as_mut_slice().copy_from_slice(values);
         Self::from_section(section)
     }
 
-    fn from_section(section: anybytes::area::Section<'_, RawValue>) -> Self {
+    fn from_section(section: anybytes::area::Section<'_, RawInline>) -> Self {
         let handle = section.handle();
         let bytes = section.freeze().unwrap();
-        let values = bytes.view::<[RawValue]>().expect("view");
+        let values = bytes.view::<[RawInline]>().expect("view");
         Self { values, handle }
     }
 
@@ -183,7 +183,7 @@ impl OrderedUniverse {
 }
 
 impl Serializable for OrderedUniverse {
-    type Meta = SectionHandle<RawValue>;
+    type Meta = SectionHandle<RawInline>;
     type Error = jerky::error::Error;
 
     fn metadata(&self) -> Self::Meta {
@@ -214,7 +214,7 @@ pub struct CompressedUniverse {
 impl Universe for CompressedUniverse {
     fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
-        I: Iterator<Item = RawValue>,
+        I: Iterator<Item = RawInline>,
     {
         let mut data_fragments: Vec<[u8; 4]> = Vec::new();
         let mut frequency: HashMap<[u8; 4], u64> = HashMap::new();
@@ -256,8 +256,8 @@ impl Universe for CompressedUniverse {
         }
     }
 
-    fn access(&self, pos: usize) -> RawValue {
-        let mut v: RawValue = [0; 32];
+    fn access(&self, pos: usize) -> RawInline {
+        let mut v: RawInline = [0; 32];
 
         for i in 0..8 {
             v[i * 4..i * 4 + 4]
@@ -267,7 +267,7 @@ impl Universe for CompressedUniverse {
         v
     }
 
-    fn search(&self, v: &RawValue) -> Option<usize> {
+    fn search(&self, v: &RawInline) -> Option<usize> {
         if self.len() == 0 {
             return None;
         }
@@ -320,8 +320,8 @@ impl Serializable for CompressedUniverse {
 /// `SEARCH_CACHE` for `search` lookups.
 #[derive(Debug)]
 pub struct CachedUniverse<const ACCESS_CACHE: usize, const SEARCH_CACHE: usize, U: Universe> {
-    access_cache: Cache<usize, RawValue>,
-    search_cache: Cache<RawValue, Option<usize>>,
+    access_cache: Cache<usize, RawInline>,
+    search_cache: Cache<RawInline, Option<usize>>,
     inner: U,
 }
 
@@ -332,7 +332,7 @@ where
 {
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
-        I: Iterator<Item = RawValue>,
+        I: Iterator<Item = RawInline>,
     {
         Self {
             access_cache: Cache::new(ACCESS_CACHE),
@@ -341,13 +341,13 @@ where
         }
     }
 
-    fn access(&self, pos: usize) -> RawValue {
+    fn access(&self, pos: usize) -> RawInline {
         self.access_cache
             .get_or_insert_with::<_, Infallible>(&pos, || Ok(self.inner.access(pos)))
             .unwrap()
     }
 
-    fn search(&self, v: &RawValue) -> Option<usize> {
+    fn search(&self, v: &RawInline) -> Option<usize> {
         if self.len() == 0 {
             return None;
         }

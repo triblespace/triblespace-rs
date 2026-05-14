@@ -495,7 +495,7 @@ fn merge_import_example(
     dst.restore()?;
 
     // 2) Resolve source head commit handle
-    let src_head: Value<Handle<blobschemas::SimpleArchive>> =
+    let src_head: Inline<Handle<blobschemas::SimpleArchive>> =
         src.head(src_branch_id)?.ok_or_else(|| anyhow::anyhow!("source head not found"))?;
 
     // 3) Conservatively copy all reachable blobs from source → destination

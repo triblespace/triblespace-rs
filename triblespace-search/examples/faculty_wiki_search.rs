@@ -37,7 +37,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use anybytes::View;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::prelude::blobschemas;
@@ -135,9 +135,9 @@ fn seed(
 fn refresh(
     pile: &mut Pile,
     kb: &mut TribleSet,
-) -> Result<Value<Handle<SuccinctBM25Blob>>, Box<dyn Error>> {
-    let body_handles: Vec<(Id, Value<Handle<blobschemas::LongString>>)> = find!(
-        (id: Id, body: Value<Handle<blobschemas::LongString>>),
+) -> Result<Inline<Handle<SuccinctBM25Blob>>, Box<dyn Error>> {
+    let body_handles: Vec<(Id, Inline<Handle<blobschemas::LongString>>)> = find!(
+        (id: Id, body: Inline<Handle<blobschemas::LongString>>),
         pattern!(&*kb, [{ ?id @ wiki::body: ?body }])
     )
     .collect();
@@ -172,8 +172,8 @@ fn query(
 
     // Resolve the anchor → handle.
     let anchor = wiki::INDEX_ANCHOR;
-    let handles: Vec<(Value<Handle<SuccinctBM25Blob>>,)> = find!(
-        (h: Value<Handle<SuccinctBM25Blob>>),
+    let handles: Vec<(Inline<Handle<SuccinctBM25Blob>>,)> = find!(
+        (h: Inline<Handle<SuccinctBM25Blob>>),
         pattern!(kb, [{ &anchor @ wiki::index: ?h }])
     )
     .collect();
@@ -190,7 +190,7 @@ fn query(
     // trible pattern joins on the shared `?doc` to pick the
     // title up at the same time. Ranking is operational — score
     // each row through `idx.score` after collecting, then sort.
-    use triblespace_core::value::IntoValue;
+    use triblespace_core::value::IntoInline;
     let tokens = hash_tokens(text);
     let mut rows: Vec<(Id, f32, String)> = find!(
         (doc: Id, title: String),
@@ -199,7 +199,7 @@ fn query(
             pattern!(kb, [{ ?doc @ wiki::title: ?title }])
         )
     )
-    .map(|(doc, title)| (doc, idx.score(&doc.to_value(), &tokens), title))
+    .map(|(doc, title)| (doc, idx.score(&doc.to_inline(), &tokens), title))
     .collect();
     rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     rows.truncate(top_k);
@@ -216,7 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut kb = seed(&mut pile)?;
     let n_seeded = find!(
-        (id: Id, h: Value<Handle<blobschemas::LongString>>),
+        (id: Id, h: Inline<Handle<blobschemas::LongString>>),
         pattern!(&kb, [{ ?id @ wiki::body: ?h }])
     )
     .count();

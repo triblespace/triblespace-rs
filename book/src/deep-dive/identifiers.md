@@ -422,7 +422,7 @@ inline without touching the outer [`find!`](triblespace::core::query::find) sign
 
 Binding the variable as an [`ExclusiveId`](triblespace::core::id::ExclusiveId) means the
 closure that [`find!`](triblespace::core::query::find) installs will run the
-[`TryFromValue`](triblespace::core::value::TryFromValue) implementation for `ExclusiveId`.
+[`TryFromInline`](triblespace::core::value::TryFromInline) implementation for `ExclusiveId`.
 The conversion invokes [`Id::acquire`](triblespace::core::id::Id::acquire) and would silently
 skip the row if the current thread did not own the identifier (filter
 semantics).  The

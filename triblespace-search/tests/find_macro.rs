@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use triblespace_core::find;
 use triblespace_core::id::Id;
-use triblespace_core::value::IntoValue;
+use triblespace_core::value::IntoInline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -80,7 +80,7 @@ fn find_matches_then_score_for_ranking() {
     // present ranked results.
     let mut ranked: Vec<(Id, f32)> = docs
         .into_iter()
-        .map(|d| (d, idx.score(&d.to_value(), &fox)))
+        .map(|d| (d, idx.score(&d.to_inline(), &fox)))
         .collect();
     ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
@@ -143,8 +143,8 @@ fn find_matches_with_floor_drops_low_scoring_docs() {
     b.insert(id(3), hash_tokens("unrelated"));
     let idx = b.build();
     let terms = hash_tokens("fox quick brown jumps");
-    let s1 = idx.score(&id(1).to_value(), &terms);
-    let s2 = idx.score(&id(2).to_value(), &terms);
+    let s1 = idx.score(&id(1).to_inline(), &terms);
+    let s2 = idx.score(&id(2).to_inline(), &terms);
     assert!(s1 > s2);
 
     let rows: Vec<(Id,)> = find!(
@@ -192,7 +192,7 @@ fn find_hnsw_similar_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::value::schemas::hash::{Blake3, Handle};
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
@@ -212,8 +212,8 @@ fn find_hnsw_similar_on_succinct() {
     let probe = handles[0];
     let floor = 0.4f32;
 
-    let rows: Vec<(Value<Handle<Embedding>>,)> = find!(
-        (neighbour: Value<Handle<Embedding>>),
+    let rows: Vec<(Inline<Handle<Embedding>>,)> = find!(
+        (neighbour: Inline<Handle<Embedding>>),
         succinct_view.similar_to(probe, neighbour, floor)
     )
     .collect();
@@ -263,7 +263,7 @@ fn matches_set_equals_score_threshold_set() {
         let mut expected = HashSet::new();
         for byte in 1u8..=4 {
             let d = id(byte);
-            if idx.score(&d.to_value(), &terms) > 0.0 {
+            if idx.score(&d.to_inline(), &terms) > 0.0 {
                 expected.insert(d);
             }
         }

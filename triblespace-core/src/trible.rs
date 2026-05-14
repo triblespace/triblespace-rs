@@ -10,8 +10,8 @@ use std::convert::TryInto;
 
 use crate::id::ExclusiveId;
 use crate::id::Id;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 /// Re-export of [`Fragment`](fragment::Fragment).
 pub use fragment::Fragment;
@@ -77,10 +77,10 @@ impl Trible {
     ///
     /// let e = fucid();
     /// let a = fucid();
-    /// let v: Value<R256> = R256::value_from(42);
+    /// let v: Inline<R256> = R256::inline_from(42);
     /// let trible = Trible::new(&e, &a, &v);
     /// ```
-    pub fn new<V: ValueSchema>(e: &ExclusiveId, a: &Id, v: &Value<V>) -> Trible {
+    pub fn new<V: InlineSchema>(e: &ExclusiveId, a: &Id, v: &Inline<V>) -> Trible {
         let mut data = [0; TRIBLE_LEN];
         data[E_START..=E_END].copy_from_slice(&e[..]);
         data[A_START..=A_END].copy_from_slice(&a[..]);
@@ -115,12 +115,12 @@ impl Trible {
     ///
     /// let e = fucid();
     /// let a = fucid();
-    /// let v: Value<R256> = R256::value_from(42);
+    /// let v: Inline<R256> = R256::inline_from(42);
     /// let trible = Trible::force(&e, &a, &v);
     ///
     /// assert_eq!(trible.e(), &*e);
     /// ```
-    pub fn force<V: ValueSchema>(e: &Id, a: &Id, v: &Value<V>) -> Trible {
+    pub fn force<V: InlineSchema>(e: &Id, a: &Id, v: &Inline<V>) -> Trible {
         Trible::new(ExclusiveId::force_ref(e), a, v)
     }
 
@@ -147,7 +147,7 @@ impl Trible {
     ///    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///    // Attribute
     ///    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///    // Value
+    ///    // Inline
     ///    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     /// ];
@@ -186,7 +186,7 @@ impl Trible {
     ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///   // Attribute
     ///   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///   // Value
+    ///   // Inline
     ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     /// ];
@@ -225,7 +225,7 @@ impl Trible {
     ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///   // Attribute
     ///   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///   // Value
+    ///   // Inline
     ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     /// ];
@@ -253,7 +253,7 @@ impl Trible {
     ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///   // Attribute
     ///   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///   // Value
+    ///   // Inline
     ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     /// ];
@@ -282,17 +282,17 @@ impl Trible {
     ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///   // Attribute
     ///   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///   // Value
+    ///   // Inline
     ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
     /// ];
     /// let trible = Trible::force_raw(data).unwrap();
     /// let value = trible.v::<R256>();
-    /// assert_eq!(value, &Value::new([32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    /// assert_eq!(value, &Inline::new([32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     /// 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]));
     /// ```
-    pub fn v<V: ValueSchema>(&self) -> &Value<V> {
-        Value::as_transmute_raw(self.data[V_START..=V_END].try_into().unwrap())
+    pub fn v<V: InlineSchema>(&self) -> &Inline<V> {
+        Inline::as_transmute_raw(self.data[V_START..=V_END].try_into().unwrap())
     }
 }
 
@@ -302,27 +302,27 @@ crate::key_segmentation!(
 );
 
 crate::key_schema!(
-    /// Key schema ordering: Entity → Attribute → Value.
+    /// Key schema ordering: Entity → Attribute → Inline.
     EAVOrder, TribleSegmentation, TRIBLE_LEN, [0, 1, 2]
 );
 crate::key_schema!(
-    /// Key schema ordering: Entity → Value → Attribute.
+    /// Key schema ordering: Entity → Inline → Attribute.
     EVAOrder, TribleSegmentation, TRIBLE_LEN, [0, 2, 1]
 );
 crate::key_schema!(
-    /// Key schema ordering: Attribute → Entity → Value.
+    /// Key schema ordering: Attribute → Entity → Inline.
     AEVOrder, TribleSegmentation, TRIBLE_LEN, [1, 0, 2]
 );
 crate::key_schema!(
-    /// Key schema ordering: Attribute → Value → Entity.
+    /// Key schema ordering: Attribute → Inline → Entity.
     AVEOrder, TribleSegmentation, TRIBLE_LEN, [1, 2, 0]
 );
 crate::key_schema!(
-    /// Key schema ordering: Value → Entity → Attribute.
+    /// Key schema ordering: Inline → Entity → Attribute.
     VEAOrder, TribleSegmentation, TRIBLE_LEN, [2, 0, 1]
 );
 crate::key_schema!(
-    /// Key schema ordering: Value → Attribute → Entity.
+    /// Key schema ordering: Inline → Attribute → Entity.
     VAEOrder, TribleSegmentation, TRIBLE_LEN, [2, 1, 0]
 );
 

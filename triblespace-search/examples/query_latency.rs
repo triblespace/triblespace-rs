@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use triblespace_core::id::{Id, RawId};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::succinct::SuccinctHNSWIndex;
@@ -87,7 +87,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
     // queries from the same generator biases toward common
     // terms — exactly what a BM25 caller's cache is likely to
     // hit first.
-    let queries: Vec<Value<WordHash>> = (0..200)
+    let queries: Vec<Inline<WordHash>> = (0..200)
         .map(|i| {
             let r = ((i * 37) as f64 / 200.0).powi(2);
             let idx = (r * vocab as f64) as usize;
@@ -101,7 +101,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
         let _: Vec<_> = succinct.query_term(q).collect();
     }
 
-    let time_single = |tag: &str, f: &dyn Fn(&Value<WordHash>)| {
+    let time_single = |tag: &str, f: &dyn Fn(&Inline<WordHash>)| {
         let reps = 10;
         let mut samples: Vec<u128> = Vec::with_capacity(queries.len() * reps);
         for _ in 0..reps {
@@ -134,7 +134,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
     // doesn't currently expose query_multi; sum-of-query_term is
     // equivalent).
     let multi_reps = 10;
-    let tri_queries: Vec<Vec<Value<WordHash>>> = (0..100)
+    let tri_queries: Vec<Vec<Inline<WordHash>>> = (0..100)
         .map(|i| {
             vec![
                 hash_tokens(&format!("w{}", i * 3 % vocab))[0],
@@ -175,13 +175,13 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::value::schemas::hash::{Blake3, Handle};
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);
     let mut store = MemoryBlobStore::new();
     let mut builder = HNSWBuilder::new(dim).with_seed(13);
-    let mut handles: Vec<Value<Handle<Embedding>>> = Vec::with_capacity(n_docs);
+    let mut handles: Vec<Inline<Handle<Embedding>>> = Vec::with_capacity(n_docs);
     for _ in 0..n_docs {
         let v: Vec<f32> = (0..dim)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
@@ -198,7 +198,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
     // handle rather than a raw vector is the new API; callers
     // would typically put their query vector into the store,
     // then probe from the resulting handle.
-    let probes: Vec<Value<Handle<Embedding>>> = (0..100)
+    let probes: Vec<Inline<Handle<Embedding>>> = (0..100)
         .map(|i| handles[(i * 37 + 1) % handles.len()])
         .collect();
 
@@ -209,7 +209,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         let _ = succinct_view.candidates_above(*p, 0.5);
     }
 
-    let time = |tag: &str, f: &dyn Fn(&Value<Handle<Embedding>>)| {
+    let time = |tag: &str, f: &dyn Fn(&Inline<Handle<Embedding>>)| {
         let reps = 5;
         let mut samples: Vec<u128> = Vec::with_capacity(probes.len() * reps);
         for _ in 0..reps {

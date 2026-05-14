@@ -10,9 +10,9 @@ use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
-use crate::value::RawValue;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::RawInline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -36,7 +36,7 @@ pub struct TribleSetConstraint {
 impl TribleSetConstraint {
     /// Creates a triple-pattern constraint over `set` for the given
     /// entity, attribute, and value variables.
-    pub fn new<V: ValueSchema>(
+    pub fn new<V: InlineSchema>(
         variable_e: Variable<GenId>,
         variable_a: Variable<GenId>,
         variable_v: Variable<V>,
@@ -118,25 +118,25 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 self.set.ave.segmented_len(&prefix)
             }
             (None, None, Some(v), true, false, false) => {
-                let mut prefix = [0u8; VALUE_LEN];
-                prefix[0..VALUE_LEN].copy_from_slice(&v[..]);
+                let mut prefix = [0u8; INLINE_LEN];
+                prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.vea.segmented_len(&prefix)
             }
             (None, None, Some(v), false, true, false) => {
-                let mut prefix = [0u8; VALUE_LEN];
-                prefix[0..VALUE_LEN].copy_from_slice(&v[..]);
+                let mut prefix = [0u8; INLINE_LEN];
+                prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.vae.segmented_len(&prefix)
             }
             (None, Some(a), Some(v), true, false, false) => {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(v);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
                 self.set.ave.segmented_len(&prefix)
             }
             (Some(e), None, Some(v), false, true, false) => {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(v);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
                 self.set.eva.segmented_len(&prefix)
             }
             (Some(e), Some(a), None, false, false, true) => {
@@ -152,7 +152,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// Enumerates matching values from the most selective covering index
     /// via `infixes`. The index is chosen to match the bound positions,
     /// so proposals are generated directly from a prefix scan.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
         let v_var = self.variable_v == variable;
@@ -225,17 +225,17 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     .infixes(v, &mut |a: &[u8; 16]| proposals.push(id_into_value(a)));
             }
             (None, Some(a), Some(v), true, false, false) => {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(&v[..]);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.ave.infixes(&prefix, &mut |e: &[u8; 16]| {
                     proposals.push(id_into_value(e))
                 });
             }
             (Some(e), None, Some(v), false, true, false) => {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(&v[..]);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.eva.infixes(&prefix, &mut |a: &[u8; 16]| {
                     proposals.push(id_into_value(a))
                 });
@@ -254,7 +254,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
     /// Retains only proposals whose combined key (bound positions +
     /// proposed value) has a matching prefix in the appropriate index.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
         let v_var = self.variable_v == variable;
@@ -305,9 +305,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 self.set.eav.has_prefix(&prefix)
             }),
             (Some(e), None, None, false, false, true) => proposals.retain(|value| {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(value);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eva.has_prefix(&prefix)
             }),
             (None, Some(a), None, true, false, false) => proposals.retain(|value| {
@@ -320,54 +320,54 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 self.set.aev.has_prefix(&prefix)
             }),
             (None, Some(a), None, false, false, true) => proposals.retain(|value| {
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(value);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.ave.has_prefix(&prefix)
             }),
             (None, None, Some(v), true, false, false) => proposals.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
-                let mut prefix = [0u8; VALUE_LEN + ID_LEN];
-                prefix[0..VALUE_LEN].copy_from_slice(&v[..]);
-                prefix[VALUE_LEN..VALUE_LEN + ID_LEN].copy_from_slice(&id);
+                let mut prefix = [0u8; INLINE_LEN + ID_LEN];
+                prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
+                prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vea.has_prefix(&prefix)
             }),
             (None, None, Some(v), false, true, false) => proposals.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
-                let mut prefix = [0u8; VALUE_LEN + ID_LEN];
-                prefix[0..VALUE_LEN].copy_from_slice(&v[..]);
-                prefix[VALUE_LEN..VALUE_LEN + ID_LEN].copy_from_slice(&id);
+                let mut prefix = [0u8; INLINE_LEN + ID_LEN];
+                prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
+                prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vae.has_prefix(&prefix)
             }),
             (None, Some(a), Some(v), true, false, false) => proposals.retain(|value: &[u8; 32]| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN + ID_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(v);
-                prefix[ID_LEN + VALUE_LEN..ID_LEN + VALUE_LEN + ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.ave.has_prefix(&prefix)
             }),
             (Some(e), None, Some(v), false, true, false) => proposals.retain(|value: &[u8; 32]| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
-                let mut prefix = [0u8; ID_LEN + VALUE_LEN + ID_LEN];
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + VALUE_LEN].copy_from_slice(v);
-                prefix[ID_LEN + VALUE_LEN..ID_LEN + VALUE_LEN + ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eva.has_prefix(&prefix)
             }),
             (Some(e), Some(a), None, false, false, true) => proposals.retain(|value: &[u8; 32]| {
-                let mut prefix = [0u8; ID_LEN + ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + VALUE_LEN].copy_from_slice(value);
+                prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eav.has_prefix(&prefix)
             }),
             _ => panic!("invalid trible constraint state"),
@@ -389,7 +389,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 let Some(a) = id_from_value(a_raw) else {
                     return false;
                 };
-                let mut prefix = [0u8; ID_LEN + ID_LEN + VALUE_LEN];
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(v_raw);
@@ -408,8 +408,8 @@ mod tests {
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::value::schemas::UnknownValue;
-    use crate::value::Value;
+    use crate::value::schemas::UnknownInline;
+    use crate::value::Inline;
 
     #[test]
     fn constant() {
@@ -417,12 +417,12 @@ mod tests {
         set.insert(&Trible::new(
             &rngid(),
             &rngid(),
-            &Value::<UnknownValue>::new([0; 32]),
+            &Inline::<UnknownInline>::new([0; 32]),
         ));
 
         let q = find! {
-            (e: Value<_>, a: Value<_>, v: Value<_>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<_>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         };
         let r: Vec<_> = q.collect();
 

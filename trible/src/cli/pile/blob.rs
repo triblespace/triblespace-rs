@@ -65,11 +65,11 @@ pub fn run(cmd: Command) -> Result<()> {
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
                 for handle in reader.blobs() {
-                    let handle: triblespace_core::value::Value<Handle<UnknownBlob>> =
+                    let handle: triblespace_core::value::Inline<Handle<UnknownBlob>> =
                         handle?;
-                    let hash: triblespace_core::value::Value<Hash<Blake3>> =
+                    let hash: triblespace_core::value::Inline<Hash<Blake3>> =
                         Handle::to_hash(handle);
-                    let string: String = hash.from_value();
+                    let string: String = hash.from_inline();
                     if metadata {
                         let meta_opt = reader.metadata(handle)?;
                         if let Some(meta) = meta_opt {
@@ -102,8 +102,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 let file_handle = File::open(&file)?;
                 let bytes = unsafe { Bytes::map_file(&file_handle)? };
                 let handle = pile.put::<FileBytes, _>(bytes)?;
-                let hash: triblespace_core::value::Value<Hash<Blake3>> = Handle::to_hash(handle);
-                let string: String = hash.from_value();
+                let hash: triblespace_core::value::Inline<Hash<Blake3>> = Handle::to_hash(handle);
+                let string: String = hash.from_inline();
                 println!("{string}");
                 Ok(())
             })();
@@ -128,7 +128,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
+                let handle_val: triblespace_core::value::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()
@@ -160,7 +160,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Value<Handle<UnknownBlob>> =
+                let handle_val: triblespace_core::value::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()
@@ -176,7 +176,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 let ftype = FileType::from_bytes(&blob.bytes);
                 let name = ftype.name();
 
-                let handle_str: String = hash_val.from_value();
+                let handle_str: String = hash_val.from_inline();
                 println!(
                     "Hash: {handle_str}\nTime: {}\nLength: {} bytes\nType: {}",
                     time.to_rfc3339(),

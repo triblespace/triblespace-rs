@@ -3,8 +3,8 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
 
 use super::*;
 
@@ -14,7 +14,7 @@ use super::*;
 /// Proposals enumerate every element in the set; confirmations retain
 /// only proposals that the set contains. Accepts `&HashSet<T>`,
 /// `Rc<HashSet<T>>`, and `Arc<HashSet<T>>` as the backing store.
-pub struct SetConstraint<S: ValueSchema, R, T>
+pub struct SetConstraint<S: InlineSchema, R, T>
 where
     R: Deref<Target = HashSet<T>>,
 {
@@ -22,7 +22,7 @@ where
     set: R,
 }
 
-impl<S: ValueSchema, R, T> SetConstraint<S, R, T>
+impl<S: InlineSchema, R, T> SetConstraint<S, R, T>
 where
     R: Deref<Target = HashSet<T>>,
 {
@@ -32,10 +32,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, R, T> Constraint<'a> for SetConstraint<S, R, T>
+impl<'a, S: InlineSchema, R, T> Constraint<'a> for SetConstraint<S, R, T>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
     R: Deref<Target = HashSet<T>>,
 {
     fn variables(&self) -> VariableSet {
@@ -51,16 +51,16 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
-            proposals.extend(self.set.iter().map(|v| IntoValue::to_value(v).raw));
+            proposals.extend(self.set.iter().map(|v| IntoInline::to_inline(v).raw));
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             proposals.retain(|v| {
-                match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.set.contains(&t),
                     Err(_) => false,
                 }
@@ -69,10 +69,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a HashSet<T>
+impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for &'a HashSet<T>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 
@@ -81,10 +81,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
+impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 
@@ -93,10 +93,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
+impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
 

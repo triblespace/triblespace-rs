@@ -4,7 +4,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::value::schemas::UnknownValue;
+use triblespace_core::value::schemas::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -16,7 +16,7 @@ mod test_ns {
 
 /// Generate a random trible with non-nil entity and attribute.
 fn arb_trible() -> impl Strategy<Value = Trible> {
-    // Entity: 16 bytes (at least one non-zero), Attribute: 16 bytes (at least one non-zero), Value: 32 bytes
+    // Entity: 16 bytes (at least one non-zero), Attribute: 16 bytes (at least one non-zero), Inline: 32 bytes
     (
         prop::array::uniform16(1u8..=255), // entity (all non-zero bytes guarantees non-nil)
         prop::array::uniform16(1u8..=255), // attribute
@@ -156,8 +156,8 @@ proptest! {
             set.insert(t);
         }
         let results: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
         prop_assert_eq!(results.len(), set.len());
     }
@@ -250,7 +250,7 @@ proptest! {
 
         // Query: find labels of entities that link to the first base entity
         if !base_entities.is_empty() {
-            let target_val = (&base_entities[0]).to_value();
+            let target_val = (&base_entities[0]).to_inline();
             let changes: Vec<String> = find!(
                 label: String,
                 pattern_changes!(&full, &delta, [
@@ -280,7 +280,7 @@ proptest! {
                     pattern!(&delta, [{ test_ns::label: ?label }])
                 ).collect();
                 let in_delta_links = find!(
-                    (e: Value<_>,),
+                    (e: Inline<_>,),
                     pattern!(&delta, [{ ?e @ test_ns::link: target_val }])
                 ).count();
 

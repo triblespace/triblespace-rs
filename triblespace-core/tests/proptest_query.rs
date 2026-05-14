@@ -8,7 +8,7 @@ use triblespace_core::query::{
     Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
-use triblespace_core::value::schemas::UnknownValue;
+use triblespace_core::value::schemas::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -51,7 +51,7 @@ proptest! {
         let mut ctx = VariableContext::new();
         let e = ctx.next_variable();
         let a = ctx.next_variable();
-        let v: Variable<UnknownValue> = ctx.next_variable();
+        let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
         let binding = Binding::default();
@@ -69,7 +69,7 @@ proptest! {
         let mut ctx = VariableContext::new();
         let e = ctx.next_variable();
         let a = ctx.next_variable();
-        let v: Variable<UnknownValue> = ctx.next_variable();
+        let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
         let binding = Binding::default();
@@ -87,8 +87,8 @@ proptest! {
     #[test]
     fn find_returns_only_existing_triples(set in arb_tribleset(15)) {
         let results: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
 
         // Every result triple must exist in the set
@@ -115,7 +115,7 @@ proptest! {
             let mut ctx = VariableContext::new();
             let e = ctx.next_variable();
             let a = ctx.next_variable();
-            let v: Variable<UnknownValue> = ctx.next_variable();
+            let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
             let mut binding = Binding::default();
@@ -142,7 +142,7 @@ proptest! {
             let mut ctx = VariableContext::new();
             let e = ctx.next_variable();
             let a = ctx.next_variable();
-            let v: Variable<UnknownValue> = ctx.next_variable();
+            let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
             let mut binding = Binding::default();
@@ -234,16 +234,16 @@ proptest! {
     ) {
         let inter = a.intersect(&b);
         let inter_results: Vec<_> = find!(
-            (e: Value<_>, a_v: Value<_>, v: Value<UnknownValue>),
-            inter.pattern(e, a_v, v as Variable<UnknownValue>)
+            (e: Inline<_>, a_v: Inline<_>, v: Inline<UnknownInline>),
+            inter.pattern(e, a_v, v as Variable<UnknownInline>)
         ).collect();
         let a_results: Vec<_> = find!(
-            (e: Value<_>, a_v: Value<_>, v: Value<UnknownValue>),
-            a.pattern(e, a_v, v as Variable<UnknownValue>)
+            (e: Inline<_>, a_v: Inline<_>, v: Inline<UnknownInline>),
+            a.pattern(e, a_v, v as Variable<UnknownInline>)
         ).collect();
         let b_results: Vec<_> = find!(
-            (e: Value<_>, a_v: Value<_>, v: Value<UnknownValue>),
-            b.pattern(e, a_v, v as Variable<UnknownValue>)
+            (e: Inline<_>, a_v: Inline<_>, v: Inline<UnknownInline>),
+            b.pattern(e, a_v, v as Variable<UnknownInline>)
         ).collect();
         prop_assert!(inter_results.len() <= a_results.len());
         prop_assert!(inter_results.len() <= b_results.len());
@@ -254,12 +254,12 @@ proptest! {
     #[test]
     fn find_is_deterministic(set in arb_tribleset(15)) {
         let results1: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
         let results2: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
         prop_assert_eq!(results1, results2,
             "same query on same set should be deterministic");
@@ -268,8 +268,8 @@ proptest! {
     #[test]
     fn find_no_duplicates(set in arb_tribleset(15)) {
         let results: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
         let unique: HashSet<_> = results.iter().collect();
         prop_assert_eq!(results.len(), unique.len(),
@@ -283,8 +283,8 @@ proptest! {
         use triblespace_core::query::constantconstraint::ConstantConstraint;
 
         let c = ConstantConstraint::new(
-            Variable::<UnknownValue>::new(0),
-            Value::<UnknownValue>::new(val),
+            Variable::<UnknownInline>::new(0),
+            Inline::<UnknownInline>::new(val),
         );
         let binding = Binding::default();
 
@@ -304,8 +304,8 @@ proptest! {
         use triblespace_core::query::constantconstraint::ConstantConstraint;
 
         let c = ConstantConstraint::new(
-            Variable::<UnknownValue>::new(0),
-            Value::<UnknownValue>::new(constant),
+            Variable::<UnknownInline>::new(0),
+            Inline::<UnknownInline>::new(constant),
         );
         let binding = Binding::default();
 
@@ -324,12 +324,12 @@ proptest! {
     #[test]
     fn exists_consistent_with_find(set in arb_tribleset(10)) {
         let has_results = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).next().is_some();
         let exists_result = exists!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         );
         prop_assert_eq!(has_results, exists_result);
     }
@@ -338,8 +338,8 @@ proptest! {
     fn exists_empty_set_is_false(_dummy in 0..1u8) {
         let empty = TribleSet::new();
         let result = exists!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            empty.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            empty.pattern(e, a, v as Variable<UnknownInline>)
         );
         prop_assert!(!result);
     }
@@ -392,18 +392,18 @@ proptest! {
     ) {
         // or! at the raw constraint level: both branches share variables
         let a_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            a.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            a.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
         let b_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            b.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            b.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
         let or_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
             or!(
-                a.pattern(e, attr, v as Variable<UnknownValue>),
-                b.pattern(e, attr, v as Variable<UnknownValue>)
+                a.pattern(e, attr, v as Variable<UnknownInline>),
+                b.pattern(e, attr, v as Variable<UnknownInline>)
             )
         ).collect();
 
@@ -437,18 +437,18 @@ proptest! {
         let union = a.clone() + b.clone();
 
         let mut union_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            union.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            union.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
 
         let a_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            a.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            a.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
 
         let b_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            b.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            b.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
 
         // Merge and deduplicate the individual results
@@ -477,8 +477,8 @@ proptest! {
         }
 
         // Without ignore!: get both name and entity
-        let full_results: Vec<(Value<_>, String)> = find!(
-            (entity: Value<_>, name: String),
+        let full_results: Vec<(Inline<_>, String)> = find!(
+            (entity: Inline<_>, name: String),
             pattern!(&set, [
                 { ?entity @ test_ns::label: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::label: "hub" }
@@ -519,16 +519,16 @@ proptest! {
         let intersect = a.intersect(&b);
 
         let mut intersect_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
-            intersect.pattern(e, attr, v as Variable<UnknownValue>)
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
+            intersect.pattern(e, attr, v as Variable<UnknownInline>)
         ).collect();
 
         // and! of two patterns on different sets = intersection of results
         let mut and_results: Vec<_> = find!(
-            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            (e: Inline<_>, attr: Inline<_>, v: Inline<UnknownInline>),
             and!(
-                a.pattern(e, attr, v as Variable<UnknownValue>),
-                b.pattern(e, attr, v as Variable<UnknownValue>)
+                a.pattern(e, attr, v as Variable<UnknownInline>),
+                b.pattern(e, attr, v as Variable<UnknownInline>)
             )
         ).collect();
 
@@ -552,13 +552,13 @@ proptest! {
         sorted_vals.sort();
         let slice = SortedSlice::new(&sorted_vals).unwrap();
 
-        let mut hash_results: Vec<Value<ShortString>> = find!(
-            v: Value<ShortString>,
+        let mut hash_results: Vec<Inline<ShortString>> = find!(
+            v: Inline<ShortString>,
             hash.has(v)
         ).collect();
 
-        let mut slice_results: Vec<Value<ShortString>> = find!(
-            v: Value<ShortString>,
+        let mut slice_results: Vec<Inline<ShortString>> = find!(
+            v: Inline<ShortString>,
             slice.has(v)
         ).collect();
 
@@ -598,21 +598,21 @@ proptest! {
         sorted.sort();
 
         let presorted = SortedSlice::new(&sorted).unwrap();
-        let mut expected: Vec<Value<ShortString>> = find!(
-            v: Value<ShortString>,
+        let mut expected: Vec<Inline<ShortString>> = find!(
+            v: Inline<ShortString>,
             presorted.has(v)
         ).collect();
 
         // &mut [T] — direct impl path.
-        let mut actual_slice: Vec<Value<ShortString>> = find!(
-            v: Value<ShortString>,
+        let mut actual_slice: Vec<Inline<ShortString>> = find!(
+            v: Inline<ShortString>,
             (&mut shuffled[..]).has(v)
         ).collect();
 
         // Reshuffle and exercise &mut Vec<T> — should reach the impl via DerefMut.
         shuffled.sort_by(|a, b| b.cmp(a));
-        let mut actual_vec: Vec<Value<ShortString>> = find!(
-            v: Value<ShortString>,
+        let mut actual_vec: Vec<Inline<ShortString>> = find!(
+            v: Inline<ShortString>,
             (&mut shuffled).has(v)
         ).collect();
 
@@ -736,15 +736,15 @@ proptest! {
         }
 
         // Single hop from e0 should find e1
-        let start_val = (&entities[0]).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link d))
         ).collect();
 
         prop_assert_eq!(results.len(), 1,
             "expected 1 direct link, got {}", results.len());
-        prop_assert_eq!(results[0].1, (&entities[1]).to_value());
+        prop_assert_eq!(results[0].1, (&entities[1]).to_inline());
     }
 
     #[test]
@@ -760,9 +760,9 @@ proptest! {
         }
 
         // Transitive closure from e0 should find all reachable
-        let start_val = (&entities[0]).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link+ d))
         ).collect();
 
@@ -771,7 +771,7 @@ proptest! {
             "expected {} reachable, got {}", chain_len - 1, results.len());
 
         for i in 1..chain_len {
-            let expected = (&entities[i]).to_value();
+            let expected = (&entities[i]).to_inline();
             prop_assert!(results.iter().any(|(_, d)| *d == expected),
                 "missing entity {} from transitive closure", i);
         }
@@ -790,18 +790,18 @@ proptest! {
         }
 
         // Two-hop path from e0 should reach e2
-        let start_val = (&entities[0]).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val), path!(set.clone(), s (test_ns::link)(test_ns::link) d))
         ).collect();
 
         // e0 → e1 → e2: should find e2
-        prop_assert!(results.iter().any(|(_, d)| *d == (&entities[2]).to_value()),
+        prop_assert!(results.iter().any(|(_, d)| *d == (&entities[2]).to_inline()),
             "two-hop should reach e2");
 
         // Should NOT find e1 (that's one hop, not two)
-        prop_assert!(!results.iter().any(|(_, d)| *d == (&entities[1]).to_value()),
+        prop_assert!(!results.iter().any(|(_, d)| *d == (&entities[1]).to_inline()),
             "two-hop should not include one-hop target");
     }
 
@@ -817,9 +817,9 @@ proptest! {
         }
 
         // star (*) includes the start node itself
-        let start_val = (&entities[0]).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link* d))
         ).collect();
 
@@ -847,11 +847,11 @@ proptest! {
         let start = &entities[0];
         let one_hop = &entities[1];
 
-        let start_val = (&*start).to_value();
+        let start_val = (&*start).to_inline();
         let attr_id = test_ns::link.raw();
         let set_clone = set.clone();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(
                 s.is(start_val),
                 RegularPathConstraint::new(
@@ -869,13 +869,13 @@ proptest! {
         let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
         prop_assert!(dests.contains(&start_val),
             "Optional missing start (zero-step)");
-        prop_assert!(dests.contains(&(&*one_hop).to_value()),
+        prop_assert!(dests.contains(&(&*one_hop).to_inline()),
             "Optional missing one-hop neighbor");
         // Decoy: chain_len > 2 means a 2-hop neighbor exists. Optional
         // must not reach it.
         if chain_len > 2 {
             let two_hop = &entities[2];
-            prop_assert!(!dests.contains(&(&*two_hop).to_value()),
+            prop_assert!(!dests.contains(&(&*two_hop).to_inline()),
                 "Optional should not reach 2-hop neighbor (zero-or-one only)");
         }
     }
@@ -897,9 +897,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let target_val = (&target).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let target_val = (&target).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(target_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -912,7 +912,7 @@ proptest! {
         prop_assert_eq!(dests.len(), n_predecessors,
             "expected {} predecessors, got {}", n_predecessors, dests.len());
         for p in &predecessors {
-            prop_assert!(dests.contains(&(&*p).to_value()),
+            prop_assert!(dests.contains(&(&*p).to_inline()),
                 "inverse hop missing predecessor");
         }
     }
@@ -946,9 +946,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let h_val = (&h).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let h_val = (&h).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(h_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -972,7 +972,7 @@ proptest! {
             "(^link / link)+ from h should include h itself (linkers point back)");
         // Every "other target" must appear (linker → other via link).
         for o in &other_targets {
-            prop_assert!(dests.contains(&(&*o).to_value()),
+            prop_assert!(dests.contains(&(&*o).to_inline()),
                 "(^link / link)+ should reach the other-targets of h's linkers");
         }
     }
@@ -992,16 +992,16 @@ proptest! {
             set += entity! { &start @ test_ns::link: &*n };
         }
         let attr_id = test_ns::link.raw();
-        let start_val = (&start).to_value();
+        let start_val = (&start).to_inline();
 
         let forward: HashSet<_> = find!(
-            (s: Value<_>, d: Value<_>),
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(set.clone(), s, d, &[PathOp::Attr(attr_id)]),
             )
         ).map(|(_, d)| d).collect();
         let double_inv: HashSet<_> = find!(
-            (s: Value<_>, d: Value<_>),
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1029,9 +1029,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let start_val = (&entities[0]).to_value();
-        let results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1046,14 +1046,14 @@ proptest! {
         ).collect();
 
         let dests: HashSet<_> = results.iter().map(|(_, d)| *d).collect();
-        prop_assert!(dests.contains(&(&entities[1]).to_value()),
+        prop_assert!(dests.contains(&(&entities[1]).to_inline()),
             "p / p? should always include first-hop destination");
         if chain_len > 2 {
-            prop_assert!(dests.contains(&(&entities[2]).to_value()),
+            prop_assert!(dests.contains(&(&entities[2]).to_inline()),
                 "p / p? should include second-hop via the optional");
         }
         if chain_len > 3 {
-            prop_assert!(!dests.contains(&(&entities[3]).to_value()),
+            prop_assert!(!dests.contains(&(&entities[3]).to_inline()),
                 "p / p? should not reach 3-hop neighbor");
         }
     }
@@ -1072,7 +1072,7 @@ proptest! {
         for _ in 0..n_links {
             let target = rngid();
             set += entity! { &root @ test_ns::link: &target };
-            link_targets.push((&target).to_value());
+            link_targets.push((&target).to_inline());
         }
         // Root links to other entities via `label` (as GenId, reusing the attr)
         // Actually let's use link for one set and build a second attribute
@@ -1087,15 +1087,15 @@ proptest! {
         }
 
         // Single hop via link
-        let root_val = (&root).to_value();
-        let link_results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let root_val = (&root).to_inline();
+        let link_results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(root_val), path!(set.clone(), s test_ns::link d))
         ).collect();
 
         // link | link should equal link (idempotent alternation)
-        let alt_results: Vec<(Value<_>, Value<_>)> = find!(
-            (s: Value<_>, d: Value<_>),
+        let alt_results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
             and!(s.is(root_val), path!(set.clone(), s (test_ns::link | test_ns::link) d))
         ).collect();
 

@@ -56,13 +56,13 @@ fn main() {
     };
 
     let fanks = find!(
-        (author: Value<_>),
+        (author: Inline<_>),
         pattern!(&kb, [
         {?author @ literature::firstname: "Frank"}]))
     .count();
 
     let herberts = find!(
-        (author: Value<_>),
+        (author: Inline<_>),
         pattern!(&kb, [
         {?author @ literature::lastname: "Herbert"}]))
     .count();
@@ -72,7 +72,7 @@ fn main() {
 
     (0..1000000).for_each(|_| {
         let _count = find!(
-        (title: Value<_>, quote: Value<_>),
+        (title: Inline<_>, quote: Inline<_>),
         pattern!(&kb, [
         {_?author @
             literature::firstname: "Frank",

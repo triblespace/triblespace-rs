@@ -72,7 +72,7 @@ where
     /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false`) are skipped so their stale bindings cannot inject
     /// values that no live variant would produce.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         self.constraints
             .iter()
             .filter(|c| c.satisfied(binding))
@@ -85,7 +85,7 @@ where
     /// then merges the per-variant survivors via
     /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
     /// passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         proposals.sort_unstable();
 
         let union: Vec<_> = self

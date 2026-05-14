@@ -9,7 +9,7 @@ use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
 use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
 use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::IntoValue;
+use triblespace::core::value::IntoInline;
 use triblespace::prelude::*;
 
 mod bench_social {
@@ -284,8 +284,8 @@ mod recursive_join {
             let a = ctx.next_variable::<GenId>();
             let v = ctx.next_variable::<GenId>();
             let constraints: Vec<Box<dyn Constraint<'static>>> = vec![
-                Box::new(e.is(node_id.to_value())),
-                Box::new(a.is(attr_id.to_value())),
+                Box::new(e.is(node_id.to_inline())),
+                Box::new(a.is(attr_id.to_inline())),
                 Box::new(set.pattern(e, a, v)),
             ];
             let dest_idx = v.index;
@@ -361,13 +361,13 @@ mod hybrid {
 
 mod path_macro {
     use super::*;
-    use triblespace::core::value::Value;
+    use triblespace::core::value::Inline;
 
     pub fn reachable_from(set: &TribleSet, _attr: &RawId, start: &RawId) -> HashSet<RawId> {
         let start_id = Id::new(*start).unwrap();
-        let start_val: Value<GenId> = (&start_id).to_value();
+        let start_val: Inline<GenId> = (&start_id).to_inline();
         find!(
-            (s: Value<GenId>, d: Value<GenId>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(
                 s.is(start_val),
                 path!(set.clone(), s bench_social::follows+ d)

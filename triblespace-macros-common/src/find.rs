@@ -103,18 +103,18 @@ fn gen_var_conversion(crate_path: &syn::Path, binding: &Ident, v: &FindVariable)
         if let Some(ref ty) = v.ty {
             quote! {
                 let #name: ::core::result::Result<#ty, _> =
-                    #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
+                    #crate_path::value::TryFromInline::try_from_inline(#name.extract(#binding));
             }
         } else {
             quote! {
                 let #name =
-                    #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
+                    #crate_path::value::TryFromInline::try_from_inline(#name.extract(#binding));
             }
         }
     } else {
         if let Some(ref ty) = v.ty {
             quote! {
-                let #name: #ty = match #crate_path::value::TryFromValue::try_from_value(
+                let #name: #ty = match #crate_path::value::TryFromInline::try_from_inline(
                     #name.extract(#binding)
                 ) {
                     ::core::result::Result::Ok(__v) => __v,
@@ -123,7 +123,7 @@ fn gen_var_conversion(crate_path: &syn::Path, binding: &Ident, v: &FindVariable)
             }
         } else {
             quote! {
-                let #name = match #crate_path::value::TryFromValue::try_from_value(
+                let #name = match #crate_path::value::TryFromInline::try_from_inline(
                     #name.extract(#binding)
                 ) {
                     ::core::result::Result::Ok(__v) => __v,

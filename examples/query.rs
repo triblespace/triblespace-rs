@@ -45,7 +45,7 @@ fn main() {
         HashSet::from_iter(["Frank", "Bob"].iter().map(|s| s.to_string()));
 
     let _result: Vec<_> = find!(
-    (firstname: Value<_>, title: Value<_>, author: Value<_>, quote: Value<_>),
+    (firstname: Inline<_>, title: Inline<_>, author: Inline<_>, quote: Inline<_>),
     and!(
         author_names.has(firstname),
         pattern!(&kb, [

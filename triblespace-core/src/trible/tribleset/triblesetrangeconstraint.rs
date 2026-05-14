@@ -4,10 +4,10 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
 ///
@@ -19,7 +19,7 @@ use crate::value::VALUE_LEN;
 /// Create via [`TribleSet::value_in_range`]:
 ///
 /// ```rust,ignore
-/// find!((id: Id, ts: Value<NsTAIInterval>),
+/// find!((id: Id, ts: Inline<NsTAIInterval>),
 ///     and!(
 ///         pattern!(data, [{ ?id @ exec::requested_at: ?ts }]),
 ///         data.value_in_range(ts, min_ts, max_ts),
@@ -28,8 +28,8 @@ use crate::value::VALUE_LEN;
 /// ```
 pub struct TribleSetRangeConstraint {
     variable_v: VariableId,
-    min: RawValue,
-    max: RawValue,
+    min: RawInline,
+    max: RawInline,
     set: TribleSet,
     // Range bounds are constant and the set's VEA trie does not mutate during
     // query execution, so the estimate is a pure function of construction-time
@@ -38,15 +38,15 @@ pub struct TribleSetRangeConstraint {
 }
 
 impl TribleSetRangeConstraint {
-    pub fn new<V: ValueSchema>(
+    pub fn new<V: InlineSchema>(
         variable_v: Variable<V>,
-        min: Value<V>,
-        max: Value<V>,
+        min: Inline<V>,
+        max: Inline<V>,
         set: TribleSet,
     ) -> Self {
         let cached_estimate = set
             .vea
-            .count_range::<0, VALUE_LEN>(&[0u8; 0], &min.raw, &max.raw)
+            .count_range::<0, INLINE_LEN>(&[0u8; 0], &min.raw, &max.raw)
             .min(usize::MAX as u64) as usize;
         TribleSetRangeConstraint {
             variable_v: variable_v.index,
@@ -70,7 +70,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.variable_v {
             return;
         }
@@ -80,12 +80,12 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // values in [min, max]. The trie prunes branches outside the range.
         self.set
             .vea
-            .infixes_range::<0, VALUE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
+            .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
                 proposals.push(*v);
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.variable_v {
             proposals.retain(|v| *v >= self.min && *v <= self.max);
         }
@@ -115,10 +115,10 @@ mod tests {
         let e3 = ufoid();
         let e4 = ufoid();
 
-        let v10: Value<R256BE> = 10i128.to_value();
-        let v50: Value<R256BE> = 50i128.to_value();
-        let v90: Value<R256BE> = 90i128.to_value();
-        let v100: Value<R256BE> = 100i128.to_value();
+        let v10: Inline<R256BE> = 10i128.to_inline();
+        let v50: Inline<R256BE> = 50i128.to_inline();
+        let v90: Inline<R256BE> = 90i128.to_inline();
+        let v100: Inline<R256BE> = 100i128.to_inline();
 
         let mut data = TribleSet::new();
         data += entity! { &e1 @ range_test_score: v10 };
@@ -127,18 +127,18 @@ mod tests {
         data += entity! { &e4 @ range_test_score: v100 };
 
         // Without range: all 4 results.
-        let all: Vec<Value<R256BE>> = find!(
-            v: Value<R256BE>,
+        let all: Vec<Inline<R256BE>> = find!(
+            v: Inline<R256BE>,
             pattern!(&data, [{ range_test_score: ?v }])
         )
         .collect();
         assert_eq!(all.len(), 4);
 
         // With value_in_range [20..=95]: only v50 and v90.
-        let min: Value<R256BE> = 20i128.to_value();
-        let max: Value<R256BE> = 95i128.to_value();
-        let mut filtered: Vec<Value<R256BE>> = find!(
-            v: Value<R256BE>,
+        let min: Inline<R256BE> = 20i128.to_inline();
+        let max: Inline<R256BE> = 95i128.to_inline();
+        let mut filtered: Vec<Inline<R256BE>> = find!(
+            v: Inline<R256BE>,
             and!(
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min, max),
@@ -151,10 +151,10 @@ mod tests {
         assert_eq!(filtered[1], v90);
 
         // Boundary: exact match on min and max.
-        let min_exact: Value<R256BE> = 50i128.to_value();
-        let max_exact: Value<R256BE> = 90i128.to_value();
-        let mut exact: Vec<Value<R256BE>> = find!(
-            v: Value<R256BE>,
+        let min_exact: Inline<R256BE> = 50i128.to_inline();
+        let max_exact: Inline<R256BE> = 90i128.to_inline();
+        let mut exact: Vec<Inline<R256BE>> = find!(
+            v: Inline<R256BE>,
             and!(
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min_exact, max_exact),
@@ -167,10 +167,10 @@ mod tests {
         assert_eq!(exact[1], v90);
 
         // Empty range: no results.
-        let min_empty: Value<R256BE> = 91i128.to_value();
-        let max_empty: Value<R256BE> = 99i128.to_value();
-        let empty: Vec<Value<R256BE>> = find!(
-            v: Value<R256BE>,
+        let min_empty: Inline<R256BE> = 91i128.to_inline();
+        let max_empty: Inline<R256BE> = 99i128.to_inline();
+        let empty: Vec<Inline<R256BE>> = find!(
+            v: Inline<R256BE>,
             and!(
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min_empty, max_empty),
@@ -189,9 +189,9 @@ mod tests {
         // Three distinct scores, but the middle one is shared by four
         // entities. Tribles-in-range would be 6, distinct-values-in-range
         // would be 3.
-        let v10: Value<R256BE> = 10i128.to_value();
-        let v50: Value<R256BE> = 50i128.to_value();
-        let v90: Value<R256BE> = 90i128.to_value();
+        let v10: Inline<R256BE> = 10i128.to_inline();
+        let v50: Inline<R256BE> = 50i128.to_inline();
+        let v90: Inline<R256BE> = 90i128.to_inline();
 
         let mut data = TribleSet::new();
         data += entity! { &ufoid() @ range_test_score: v10 };
@@ -206,8 +206,8 @@ mod tests {
         let mut ctx = VariableContext::new();
         let v = ctx.next_variable::<R256BE>();
 
-        let min: Value<R256BE> = 0i128.to_value();
-        let max: Value<R256BE> = 100i128.to_value();
+        let min: Inline<R256BE> = 0i128.to_inline();
+        let max: Inline<R256BE> = 100i128.to_inline();
         let constraint = data.value_in_range(v, min, max);
 
         let estimate = constraint.estimate(v.index, &Default::default());

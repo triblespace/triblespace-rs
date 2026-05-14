@@ -30,7 +30,7 @@ deterministic JSON importers and an N-Triples (RDF) importer:
   [`import::rdf_uri`](../src/import/mod.rs) attribute; predicate URIs become
   attribute ids via `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_schema: })`
   — the IRI is the canonical identifier; literal values map into the
-  appropriate native `ValueSchema` based on their XSD datatype.
+  appropriate native `InlineSchema` based on their XSD datatype.
 
 `JsonObjectImporter` uses a fixed mapping for JSON primitives:
 
@@ -53,7 +53,7 @@ Attributes are derived through the entity-core mechanism —
 `Attribute::<S>::from(entity!{ metadata::name: <field handle>,
 metadata::value_schema: <S as MetaDescribe>::id() })` — which hashes the
 sorted+deduped `(attr, value)` pairs to produce a stable attribute id from
-the JSON field name and its fixed `ValueSchema`. The importer caches the
+the JSON field name and its fixed `InlineSchema`. The importer caches the
 resulting `Attribute<S>` per field so the hash only has to be computed once
 per run. Arrays are treated as multi-valued fields: every item is
 encoded and stored under the same attribute identifier, producing one trible per
@@ -157,7 +157,7 @@ URI for any imported entity.
 the entity-core derivation rooted at `metadata::iri` —
 `Attribute::<S>::from(entity!{ metadata::iri: <iri handle>,
 metadata::value_schema: <S as MetaDescribe>::id() })`. Because
-attribute ids are hashed together with the chosen `ValueSchema`, the same
+attribute ids are hashed together with the chosen `InlineSchema`, the same
 predicate used for two different literal types produces two different
 attribute ids — which is what you want: `:birthyear "1920"^^xsd:integer`
 and `:birthyear "1920"` (untyped string) shouldn't collide. (JSON field
@@ -192,7 +192,7 @@ use triblespace::core::blob::ToBlob;
 use triblespace::core::macros::entity;
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::prelude::valueschemas::{Blake3, Handle, I256BE};
-use triblespace::prelude::Value;
+use triblespace::prelude::Inline;
 
 let birthyear = Attribute::<I256BE>::from(entity! {
     metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
@@ -238,6 +238,6 @@ that follows the same pattern: decode the source data, derive attributes via
 `Attribute::<S>::from(entity!{ metadata::<origin>: <handle>, metadata::value_schema: <S as MetaDescribe>::id() })`
 (use `metadata::iri` for URI-identified predicates, `metadata::name` for
 display-name origins like JSON fields), encode values using the appropriate
-`ValueSchema`, and hand the results to `Trible::new`. If the format supplies
+`InlineSchema`, and hand the results to `Trible::new`. If the format supplies
 stable identifiers, mix them into the hashing step or salt so downstream
 systems can keep imports idempotent.

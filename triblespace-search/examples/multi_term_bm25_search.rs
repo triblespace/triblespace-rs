@@ -23,7 +23,7 @@ use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::IntoValue;
+use triblespace_core::value::IntoInline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
@@ -91,7 +91,7 @@ fn main() {
         (book: Id),
         idx.matches(book, &query_terms, 0.0)
     )
-    .map(|(b,)| (b, idx.score(&b.to_value(), &query_terms)))
+    .map(|(b,)| (b, idx.score(&b.to_inline(), &query_terms)))
     .collect();
     standalone.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (b, s) in &standalone {
@@ -111,7 +111,7 @@ fn main() {
             pattern!(&kb, [{ ?book @ literature::author: &target_author }]),
         )
     )
-    .map(|(b,)| (b, idx.score(&b.to_value(), &query_terms)))
+    .map(|(b,)| (b, idx.score(&b.to_inline(), &query_terms)))
     .collect();
     matches.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (b, s) in &matches {

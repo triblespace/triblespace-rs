@@ -15,7 +15,7 @@ use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 use triblespace_core::value::schemas::hash::Handle;
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -117,14 +117,14 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     let probe = handles[0];
     let original_view = original.attach(&reader);
     let reloaded_view = reloaded.attach(&reader);
-    let a: HashSet<Value<Handle<Embedding>>> = find!(
-        (n: Value<Handle<Embedding>>),
+    let a: HashSet<Inline<Handle<Embedding>>> = find!(
+        (n: Inline<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
     .collect();
-    let r: HashSet<Value<Handle<Embedding>>> = find!(
-        (n: Value<Handle<Embedding>>),
+    let r: HashSet<Inline<Handle<Embedding>>> = find!(
+        (n: Inline<Handle<Embedding>>),
         reloaded_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
@@ -201,13 +201,13 @@ fn hnsw_indexes_share_embedding_blobs() {
     let view_a = idx_a.attach(&reader);
     let view_b = idx_b.attach(&reader);
     let hits_a: Vec<_> = find!(
-        (n: Value<Handle<Embedding>>),
+        (n: Inline<Handle<Embedding>>),
         view_a.similar_to(probe, n, 0.99)
     )
     .map(|(h,)| h)
     .collect();
     let hits_b: Vec<_> = find!(
-        (n: Value<Handle<Embedding>>),
+        (n: Inline<Handle<Embedding>>),
         view_b.similar_to(probe, n, 0.99)
     )
     .map(|(h,)| h)

@@ -40,7 +40,7 @@ impl MetaDescribe for WasmCode {
 }
 
 impl IntoSchema<WasmCode> for Bytes
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Form = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {
@@ -49,7 +49,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<WasmCode> for Vec<u8>
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Form = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {
@@ -58,7 +58,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<WasmCode> for &[u8]
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Form = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {

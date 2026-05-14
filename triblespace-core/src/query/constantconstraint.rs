@@ -8,12 +8,12 @@ use super::*;
 /// layer to bind attribute IDs and literal values.
 pub struct ConstantConstraint {
     variable: VariableId,
-    constant: RawValue,
+    constant: RawInline,
 }
 
 impl ConstantConstraint {
     /// Creates a constraint that binds `variable` to `constant`.
-    pub fn new<T: ValueSchema>(variable: Variable<T>, constant: Value<T>) -> Self {
+    pub fn new<T: InlineSchema>(variable: Variable<T>, constant: Inline<T>) -> Self {
         ConstantConstraint {
             variable: variable.index,
             constant: constant.raw,
@@ -36,14 +36,14 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Pushes the single constant value.
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable == variable {
             proposals.push(self.constant);
         }
     }
 
     /// Retains only proposals that match the constant exactly.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable == variable {
             proposals.retain(|v| *v == self.constant);
         }

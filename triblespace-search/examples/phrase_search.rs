@@ -14,17 +14,17 @@ use std::collections::HashMap;
 
 use triblespace_core::id::Id;
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{TryFromValue, Value};
+use triblespace_core::value::{TryFromInline, Inline};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::{bigram_tokens, hash_tokens, BigramHash, WordHash};
 
-/// Decode a `Value<GenId>` posting key to its underlying `Id`.
+/// Decode a `Inline<GenId>` posting key to its underlying `Id`.
 /// Helper used to recover typed `Id`s from posting iterators
 /// after the `*_ids` shortcuts were dropped.
-fn id_from_value(v: Value<GenId>) -> Id {
-    Id::try_from_value(&v).expect("genid posting")
+fn id_from_value(v: Inline<GenId>) -> Id {
+    Id::try_from_inline(&v).expect("genid posting")
 }
 
 fn id(byte: u8) -> Id {

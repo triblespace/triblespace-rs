@@ -56,7 +56,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// When the peer variable is bound, proposes its value.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.a {
             if let Some(v) = binding.get(self.b) {
                 proposals.push(*v);
@@ -69,7 +69,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// Retains only proposals that match the peer variable's binding.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.a {
             if let Some(peer) = binding.get(self.b) {
                 proposals.retain(|v| v == peer);

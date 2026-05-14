@@ -7,7 +7,7 @@ use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::Value;
+use crate::value::Inline;
 
 use super::Trible;
 use super::TribleSet;
@@ -22,7 +22,7 @@ use super::TribleSet;
 /// caller as the fragment's interface.
 ///
 /// The embedded blob store is what makes a Fragment *self-contained*:
-/// handles in the facts (e.g. `metadata::name: <Value<Handle</// LongString>>>`) reference bytes that the fragment carries with
+/// handles in the facts (e.g. `metadata::name: <Inline<Handle</// LongString>>>`) reference bytes that the fragment carries with
 /// itself. An empty `MemoryBlobStore` is structurally a single
 /// PATCH-root pointer — fragments without blobs pay essentially
 /// zero overhead.
@@ -112,7 +112,7 @@ impl Fragment {
     /// an external blob store. Idempotent under content addressing:
     /// putting the same bytes twice returns the same handle and
     /// doesn't grow the store.
-    pub fn put<S, T>(&mut self, item: T) -> Value<Handle<S>>
+    pub fn put<S, T>(&mut self, item: T) -> Inline<Handle<S>>
     where
         S: BlobSchema,
         T: IntoBlob<S>,

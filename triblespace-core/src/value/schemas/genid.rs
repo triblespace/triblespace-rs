@@ -10,12 +10,12 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 
 use std::convert::TryInto;
 
@@ -78,10 +78,10 @@ mod wasm_formatter {
         Ok(())
     }
 }
-impl ValueSchema for GenId {
+impl InlineSchema for GenId {
     type ValidationError = ();
     type FieldKind = Self;
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         if value.raw[0..16] == [0; 16] {
             Ok(value)
         } else {
@@ -90,7 +90,7 @@ impl ValueSchema for GenId {
     }
 }
 
-/// Error returned when extracting an identifier from a [`Value<GenId>`].
+/// Error returned when extracting an identifier from a [`Inline<GenId>`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IdParseError {
     /// The identifier is nil (all zeros), which is reserved.
@@ -100,10 +100,10 @@ pub enum IdParseError {
 }
 
 //RawId
-impl<'a> TryFromValue<'a, GenId> for &'a RawId {
+impl<'a> TryFromInline<'a, GenId> for &'a RawId {
     type Error = IdParseError;
 
-    fn try_from_value(value: &'a Value<GenId>) -> Result<Self, Self::Error> {
+    fn try_from_inline(value: &'a Inline<GenId>) -> Result<Self, Self::Error> {
         if value.raw[0..16] != [0; 16] {
             return Err(IdParseError::BadFormat);
         }
@@ -111,29 +111,29 @@ impl<'a> TryFromValue<'a, GenId> for &'a RawId {
     }
 }
 
-impl TryFromValue<'_, GenId> for RawId {
+impl TryFromInline<'_, GenId> for RawId {
     type Error = IdParseError;
 
-    fn try_from_value(value: &Value<GenId>) -> Result<Self, Self::Error> {
-        let r: Result<&RawId, IdParseError> = value.try_from_value();
+    fn try_from_inline(value: &Inline<GenId>) -> Result<Self, Self::Error> {
+        let r: Result<&RawId, IdParseError> = value.try_from_inline();
         r.copied()
     }
 }
 
 impl IntoSchema<GenId> for RawId {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        let mut data = [0; VALUE_LEN];
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
-        Value::new(data)
+        Inline::new(data)
     }
 }
 
 //Id
-impl<'a> TryFromValue<'a, GenId> for &'a Id {
+impl<'a> TryFromInline<'a, GenId> for &'a Id {
     type Error = IdParseError;
 
-    fn try_from_value(value: &'a Value<GenId>) -> Result<Self, Self::Error> {
+    fn try_from_inline(value: &'a Inline<GenId>) -> Result<Self, Self::Error> {
         if value.raw[0..16] != [0; 16] {
             return Err(IdParseError::BadFormat);
         }
@@ -145,35 +145,35 @@ impl<'a> TryFromValue<'a, GenId> for &'a Id {
     }
 }
 
-impl TryFromValue<'_, GenId> for Id {
+impl TryFromInline<'_, GenId> for Id {
     type Error = IdParseError;
 
-    fn try_from_value(value: &Value<GenId>) -> Result<Self, Self::Error> {
-        let r: Result<&Id, IdParseError> = value.try_from_value();
+    fn try_from_inline(value: &Inline<GenId>) -> Result<Self, Self::Error> {
+        let r: Result<&Id, IdParseError> = value.try_from_inline();
         r.copied()
     }
 }
 
 impl IntoSchema<GenId> for &Id {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        let mut data = [0; VALUE_LEN];
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
-        Value::new(data)
+        Inline::new(data)
     }
 }
 
 impl IntoSchema<GenId> for Id {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        (&self).to_value()
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        (&self).to_inline()
     }
 }
 
-impl TryFromValue<'_, GenId> for uuid::Uuid {
+impl TryFromInline<'_, GenId> for uuid::Uuid {
     type Error = IdParseError;
 
-    fn try_from_value(value: &Value<GenId>) -> Result<Self, Self::Error> {
+    fn try_from_inline(value: &Inline<GenId>) -> Result<Self, Self::Error> {
         if value.raw[0..16] != [0; 16] {
             return Err(IdParseError::BadFormat);
         }
@@ -182,7 +182,7 @@ impl TryFromValue<'_, GenId> for uuid::Uuid {
     }
 }
 
-/// Error returned when extracting an [`ExclusiveId`] from a [`Value<GenId>`].
+/// Error returned when extracting an [`ExclusiveId`] from a [`Inline<GenId>`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ExclusiveIdError {
     /// The raw bytes could not be interpreted as an identifier.
@@ -198,34 +198,34 @@ impl From<IdParseError> for ExclusiveIdError {
     }
 }
 
-impl<'a> TryFromValue<'a, GenId> for ExclusiveId {
+impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
     type Error = ExclusiveIdError;
 
-    fn try_from_value(value: &'a Value<GenId>) -> Result<Self, Self::Error> {
-        let id: Id = value.try_from_value()?;
+    fn try_from_inline(value: &'a Inline<GenId>) -> Result<Self, Self::Error> {
+        let id: Id = value.try_from_inline()?;
         id.acquire().ok_or(ExclusiveIdError::FailedAcquire())
     }
 }
 
 impl IntoSchema<GenId> for ExclusiveId {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        self.id.to_value()
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        self.id.to_inline()
     }
 }
 
 impl IntoSchema<GenId> for &ExclusiveId {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        self.id.to_value()
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        self.id.to_inline()
     }
 }
 
-impl TryFromValue<'_, GenId> for String {
+impl TryFromInline<'_, GenId> for String {
     type Error = IdParseError;
 
-    fn try_from_value(v: &'_ Value<GenId>) -> Result<Self, Self::Error> {
-        let id: Id = v.try_from_value()?;
+    fn try_from_inline(v: &'_ Inline<GenId>) -> Result<Self, Self::Error> {
+        let id: Id = v.try_from_inline()?;
         let mut s = String::new();
         s.push_str("genid:");
         s.push_str(&hex::encode(id));
@@ -234,20 +234,20 @@ impl TryFromValue<'_, GenId> for String {
 }
 
 impl IntoSchema<GenId> for OwnedId<'_> {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        self.id.to_value()
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        self.id.to_inline()
     }
 }
 
 impl IntoSchema<GenId> for &OwnedId<'_> {
-    type Form = Value<GenId>;
-    fn into_schema(self) -> Value<GenId> {
-        self.id.to_value()
+    type Form = Inline<GenId>;
+    fn into_schema(self) -> Inline<GenId> {
+        self.id.to_inline()
     }
 }
 
-/// Error returned when packing a string into a [`Value<GenId>`].
+/// Error returned when packing a string into a [`Inline<GenId>`].
 ///
 /// The expected format is `"genid:<32 hex chars>"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -264,34 +264,34 @@ impl From<FromHexError> for PackIdError {
     }
 }
 
-impl TryToValue<GenId> for &str {
+impl TryToInline<GenId> for &str {
     type Error = PackIdError;
 
-    fn try_to_value(self) -> Result<Value<GenId>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<GenId>, Self::Error> {
         let protocol = "genid:";
         if !self.starts_with(protocol) {
             return Err(PackIdError::BadProtocol);
         }
         let id = RawId::from_hex(&self[protocol.len()..])?;
-        Ok(id.to_value())
+        Ok(id.to_inline())
     }
 }
 
-impl TryToValue<GenId> for uuid::Uuid {
+impl TryToInline<GenId> for uuid::Uuid {
     type Error = NilUuidError;
 
-    fn try_to_value(self) -> Result<Value<GenId>, Self::Error> {
-        let mut data = [0; VALUE_LEN];
+    fn try_to_inline(self) -> Result<Inline<GenId>, Self::Error> {
+        let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(self.as_bytes());
-        Ok(Value::new(data))
+        Ok(Inline::new(data))
     }
 }
 
-impl TryToValue<GenId> for &uuid::Uuid {
+impl TryToInline<GenId> for &uuid::Uuid {
     type Error = NilUuidError;
 
-    fn try_to_value(self) -> Result<Value<GenId>, Self::Error> {
-        (*self).try_to_value()
+    fn try_to_inline(self) -> Result<Inline<GenId>, Self::Error> {
+        (*self).try_to_inline()
     }
 }
 
@@ -339,9 +339,9 @@ impl proptest::strategy::ValueTree for IdValueTree {
 mod tests {
     use super::GenId;
     use crate::id::rngid;
-    use crate::value::TryFromValue;
-    use crate::value::TryToValue;
-    use crate::value::ValueSchema;
+    use crate::value::TryFromInline;
+    use crate::value::TryToInline;
+    use crate::value::InlineSchema;
 
     #[test]
     fn unique() {
@@ -351,9 +351,9 @@ mod tests {
     #[test]
     fn uuid_nil_round_trip() {
         let uuid = uuid::Uuid::nil();
-        let value = uuid.try_to_value().expect("uuid packing should succeed");
+        let value = uuid.try_to_inline().expect("uuid packing should succeed");
         GenId::validate(value).expect("schema validation");
-        let round_trip = uuid::Uuid::try_from_value(&value).expect("uuid unpacking should succeed");
+        let round_trip = uuid::Uuid::try_from_inline(&value).expect("uuid unpacking should succeed");
         assert_eq!(uuid, round_trip);
     }
 }

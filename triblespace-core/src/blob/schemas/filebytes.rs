@@ -49,7 +49,7 @@ impl TryFromBlob<FileBytes> for Bytes {
 }
 
 impl IntoSchema<FileBytes> for Bytes
-where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Form = Blob<FileBytes>;
     fn into_schema(self) -> Blob<FileBytes> {
@@ -58,7 +58,7 @@ where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<FileBytes> for Vec<u8>
-where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Form = Blob<FileBytes>;
     fn into_schema(self) -> Blob<FileBytes> {
@@ -67,7 +67,7 @@ where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
 }
 
 impl IntoSchema<FileBytes> for &[u8]
-where crate::value::schemas::hash::Handle<FileBytes>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Form = Blob<FileBytes>;
     fn into_schema(self) -> Blob<FileBytes> {

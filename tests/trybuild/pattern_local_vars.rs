@@ -14,15 +14,15 @@ fn main() {
     let set = TribleSet::new();
     let delta = set.clone();
 
-    let _: Vec<_> = find!((entity: Value<_>), pattern!(&set, [
+    let _: Vec<_> = find!((entity: Inline<_>), pattern!(&set, [
         { ?entity @ ns::attr: _?value }
     ])).collect();
 
-    let _: Vec<_> = find!((entity: Value<_>), pattern_changes!(&set, &delta, [
+    let _: Vec<_> = find!((entity: Inline<_>), pattern_changes!(&set, &delta, [
         { ?entity @ ns::attr: _?value }
     ])).collect();
 
-    let _: Vec<_> = find!((entity: Value<_>), pattern!(&set, [
+    let _: Vec<_> = find!((entity: Inline<_>), pattern!(&set, [
         { ?entity @ ns::label: _?text, ns::alias: _?text }
     ])).collect();
 }

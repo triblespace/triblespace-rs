@@ -1,7 +1,7 @@
 # Schemas
 
 TribleSpace stores data in strongly typed values and blobs. A *schema*
-describes the language‑agnostic byte layout for these types: [`Value`]s always
+describes the language‑agnostic byte layout for these types: [`Inline`]s always
 occupy exactly 32&nbsp;bytes while [`Blob`]s may be any length. Schemas translate
 those raw bytes to concrete application types and decouple persisted data from a
 particular implementation. This separation lets you refactor to new libraries or
@@ -29,12 +29,12 @@ encoding concerns and makes it easy to reason about memory usage.
 ### Conversion traits
 
 Schemas define how to convert between raw bytes and concrete Rust types. The
-conversion traits `ToValue`/`TryFromValue`/`TryToValue` live on
-the schema types rather than on `Value` itself, avoiding orphan‑rule issues when
-supporting external data types. The `Value` wrapper treats its bytes as opaque;
+conversion traits `IntoInline`/`TryFromInline`/`TryToInline` live on
+the schema types rather than on `Inline` itself, avoiding orphan‑rule issues when
+supporting external data types. The `Inline` wrapper treats its bytes as opaque;
 schemas may validate them or reject invalid patterns during conversion.
 
-Fallible conversions (`TryFromValue` / `TryToValue`) are particularly useful for
+Fallible conversions (`TryFromInline` / `TryToInline`) are particularly useful for
 schemas that must validate invariants, such as checking that a timestamp falls
 within a permitted range or ensuring reserved bits are zeroed. Returning a
 domain‑specific error type keeps validation logic close to the serialization
@@ -42,30 +42,30 @@ code.
 
 ```rust
 use triblespace::core::value::schemas::shortstring::ShortString;
-use triblespace::core::value::{TryFromValue, TryToValue, Value};
+use triblespace::core::value::{TryFromInline, TryToInline, Inline};
 
 struct Username(String);
 
-impl TryToValue<ShortString> for Username {
+impl TryToInline<ShortString> for Username {
     type Error = &'static str;
 
-    fn try_to_value(self) -> Result<Value<ShortString>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<ShortString>, Self::Error> {
         if self.0.is_empty() {
             Err("username must not be empty")
         } else {
             self.0
                 .as_str()
-                .try_to_value()
+                .try_to_inline()
                 .map_err(|_| "username too long or contains NULs")
         }
     }
 }
 
-impl TryFromValue<'_, ShortString> for Username {
+impl TryFromInline<'_, ShortString> for Username {
     type Error = &'static str;
 
-    fn try_from_value(value: &Value<ShortString>) -> Result<Self, Self::Error> {
-        String::try_from_value(value)
+    fn try_from_inline(value: &Inline<ShortString>) -> Result<Self, Self::Error> {
+        String::try_from_inline(value)
             .map(Username)
             .map_err(|_| "invalid utf-8 or too long")
     }
@@ -110,15 +110,15 @@ The crate provides the following value schemas out of the box:
 - `LineLocation` &ndash; a `(start_line, start_col, end_line, end_col)` span encoded as four big-endian u64 values.
 - `RangeU128` &ndash; a half-open `(start, end)` range of two big-endian u128 values.
 - `RangeInclusiveU128` &ndash; an inclusive `(start, end)` range of two big-endian u128 values.
-- `UnknownValue` as a fallback when no specific schema is known.
+- `UnknownInline` as a fallback when no specific schema is known.
 
 ```rust
 # use triblespace::prelude::*;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::schemas::shortstring::ShortString;
-use triblespace::core::value::{ToValue, ValueSchema};
+use triblespace::core::value::{IntoInline, InlineSchema};
 
-let v: Value<ShortString> = "hi".to_value();
+let v: Inline<ShortString> = "hi".to_inline();
 let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
 let schema_id = ShortString::id(); // derived via describe(&mut scratch).root()
 ```
@@ -141,7 +141,7 @@ The crate also ships with these blob schemas:
 ```rust
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::blob::schemas::longstring::LongString;
-use triblespace::core::blob::{Blob, BlobSchema, ToBlob};
+use triblespace::core::blob::{Blob, BlobSchema, IntoBlob};
 
 let b: Blob<LongString> = "example".to_blob();
 let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
@@ -201,7 +201,7 @@ What are you storing?
 │  └─ Handle<SimpleArchive>  (blob, stores a TribleSet)
 │
 └─ Something else?
-   ├─ Fits in 32 bytes? → define a custom ValueSchema
+   ├─ Fits in 32 bytes? → define a custom InlineSchema
    └─ Larger? → define a custom BlobSchema + use Handle
 ```
 
@@ -218,7 +218,7 @@ What are you storing?
 
 ## Defining new schemas
 
-Custom formats implement [`ValueSchema`] or [`BlobSchema`].  A unique identifier
+Custom formats implement [`InlineSchema`] or [`BlobSchema`].  A unique identifier
 serves as the schema ID.  The example below defines a little-endian `u64` value
 schema and a simple blob schema for arbitrary bytes.
 
@@ -239,7 +239,7 @@ following guidelines:
    writers use the replacement ID.
 2. **Annotate data with migration paths.** Store both the schema ID and a
    logical version number if the consumer needs to know which rules to apply.
-   `UnknownValue`/`UnknownBlob` allow you to safely defer decoding until a newer
+   `UnknownInline`/`UnknownBlob` allow you to safely defer decoding until a newer
    binary is available.
 3. **Keep validation centralized.** Place invariants in your schema
    conversions so migrations cannot accidentally create invalid values.
@@ -249,7 +249,7 @@ new representations incrementally: ship readers that understand both IDs, update
 your import pipelines, and finally switch writers once everything recognizes the
 replacement schema.
 
-## Value formatters (WASM)
+## Inline formatters (WASM)
 
 Binary formats are great for portability and performance, but they can be
 painful to inspect if you don’t know the schema ahead of time. TribleSpace

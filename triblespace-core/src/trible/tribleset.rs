@@ -5,7 +5,7 @@ pub mod triblesetrangeconstraint;
 use triblesetconstraint::*;
 
 use crate::query::TriblePattern;
-use crate::value::Value;
+use crate::value::Inline;
 
 use crate::id::Id;
 use crate::patch::Entry;
@@ -20,7 +20,7 @@ use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
 use crate::value::schemas::genid::GenId;
-use crate::value::ValueSchema;
+use crate::value::InlineSchema;
 
 use std::iter::FromIterator;
 use std::iter::Map;
@@ -43,17 +43,17 @@ use std::ops::AddAssign;
 /// and not to remove elements from the set. A subtle but important distinction.
 #[derive(Debug, Clone)]
 pub struct TribleSet {
-    /// Entity → Attribute → Value index.
+    /// Entity → Attribute → Inline index.
     pub eav: PATCH<TRIBLE_LEN, EAVOrder, ()>,
-    /// Value → Entity → Attribute index.
+    /// Inline → Entity → Attribute index.
     pub vea: PATCH<TRIBLE_LEN, VEAOrder, ()>,
-    /// Attribute → Value → Entity index.
+    /// Attribute → Inline → Entity index.
     pub ave: PATCH<TRIBLE_LEN, AVEOrder, ()>,
-    /// Value → Attribute → Entity index.
+    /// Inline → Attribute → Entity index.
     pub vae: PATCH<TRIBLE_LEN, VAEOrder, ()>,
-    /// Entity → Value → Attribute index.
+    /// Entity → Inline → Attribute index.
     pub eva: PATCH<TRIBLE_LEN, EVAOrder, ()>,
-    /// Attribute → Entity → Value index.
+    /// Attribute → Entity → Inline index.
     pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 
@@ -176,18 +176,18 @@ impl TribleSet {
     /// Use with `and!` alongside a `pattern!` for efficient range queries:
     ///
     /// ```rust,ignore
-    /// find!(ts: Value<NsTAIInterval>,
+    /// find!(ts: Inline<NsTAIInterval>,
     ///     and!(
     ///         pattern!(&data, [{ ?id @ attr: ?ts }]),
     ///         data.value_in_range(ts, min_ts, max_ts),
     ///     )
     /// )
     /// ```
-    pub fn value_in_range<V: ValueSchema>(
+    pub fn value_in_range<V: InlineSchema>(
         &self,
         variable: Variable<V>,
-        min: Value<V>,
-        max: Value<V>,
+        min: Inline<V>,
+        max: Inline<V>,
     ) -> triblesetrangeconstraint::TribleSetRangeConstraint {
         triblesetrangeconstraint::TribleSetRangeConstraint::new(variable, min, max, self.clone())
     }
@@ -293,7 +293,7 @@ impl FromIterator<Trible> for TribleSet {
 impl TriblePattern for TribleSet {
     type PatternConstraint<'a> = TribleSetConstraint;
 
-    fn pattern<V: ValueSchema>(
+    fn pattern<V: InlineSchema>(
         &self,
         e: Variable<GenId>,
         a: Variable<GenId>,

@@ -19,7 +19,7 @@ fn main() {
     kb += entity! { &b @ social::likes: &c };
 
     for (s, e) in
-        find!((s: Value<_>, e: Value<_>), path!(kb.clone(), s (social::follows | social::likes)+ e))
+        find!((s: Inline<_>, e: Inline<_>), path!(kb.clone(), s (social::follows | social::likes)+ e))
     {
         println!("{:?} -> {:?}", s, e);
     }

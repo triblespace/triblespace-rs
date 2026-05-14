@@ -30,8 +30,8 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::{
     BlobStore, BlobStoreList, BlobStorePut, BranchStore, PushResult,
 };
-use triblespace_core::value::Value;
-use triblespace_core::value::ValueSchema;
+use triblespace_core::value::Inline;
+use triblespace_core::value::InlineSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
 use crate::channel::NetEvent;
@@ -222,12 +222,12 @@ where
     pub fn fetch<T, Sch>(
         &mut self,
         peer: EndpointId,
-        handle: Value<Handle<Sch>>,
+        handle: Inline<Handle<Sch>>,
     ) -> anyhow::Result<Option<T>>
     where
         Sch: BlobSchema + 'static,
         T: triblespace_core::blob::TryFromBlob<Sch>,
-        Handle<Sch>: ValueSchema,
+        Handle<Sch>: InlineSchema,
     {
         let Some(bytes) = self.sender.fetch(peer, handle.raw)? else {
             return Ok(None);
@@ -398,11 +398,11 @@ where
 {
     type PutError = S::PutError;
 
-    fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Sch>>, Self::PutError>
+    fn put<Sch, T>(&mut self, item: T) -> Result<Inline<Handle<Sch>>, Self::PutError>
     where
         Sch: BlobSchema + 'static,
         T: IntoBlob<Sch>,
-        Handle<Sch>: ValueSchema,
+        Handle<Sch>: InlineSchema,
     {
         let handle = self.store.put(item)?;
         self.sender.announce(handle.raw);
@@ -442,7 +442,7 @@ where
     fn head(
         &mut self,
         id: Id,
-    ) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
+    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         self.refresh();
         self.store.head(id)
     }
@@ -450,8 +450,8 @@ where
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         let result = self.store.update(id, old, new.clone())?;
         if let PushResult::Success() = &result {
@@ -500,13 +500,13 @@ where
 
     let branches = peer.list_remote_branches(remote)?;
     for (id, head) in branches {
-        let meta_handle = Value::<Handle<SimpleArchive>>::new(head);
+        let meta_handle = Inline::<Handle<SimpleArchive>>::new(head);
         let Some(meta) = peer.fetch::<TribleSet, _>(remote, meta_handle)? else {
             continue;
         };
 
-        let name_handles: Vec<Value<Handle<LongString>>> = find!(
-            h: Value<Handle<LongString>>,
+        let name_handles: Vec<Inline<Handle<LongString>>> = find!(
+            h: Inline<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
         )
         .collect();
@@ -532,17 +532,17 @@ fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<
     use triblespace_core::macros::{find, pattern};
 
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<SimpleArchive>>::new(*head_hash);
+    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
     let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
 
-    let name_handle: Value<Handle<LongString>> = find!(
-        h: Value<Handle<LongString>>,
+    let name_handle: Inline<Handle<LongString>> = find!(
+        h: Inline<Handle<LongString>>,
         pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
     )
     .next()
     .or_else(|| {
         find!(
-            h: Value<Handle<LongString>>,
+            h: Inline<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ crate::tracking::remote_name: ?h }])
         )
         .next()

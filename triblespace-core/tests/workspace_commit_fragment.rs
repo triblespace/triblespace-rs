@@ -89,7 +89,7 @@ fn commit_tribleset_auto_promotes() {
     let e = rngid();
     // Put the blob via the workspace's staged store the old way,
     // pass a bare TribleSet to commit.
-    let h: triblespace_core::value::Value<Handle<LongString>> =
+    let h: triblespace_core::value::Inline<Handle<LongString>> =
         ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
     ws.commit(data, "tribleset commit");

@@ -1,6 +1,6 @@
 use crate::macros::entity;
 use crate::macros::pattern;
-use crate::value::TryToValue;
+use crate::value::TryToInline;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;
@@ -16,7 +16,7 @@ use crate::blob::Blob;
 use crate::prelude::valueschemas::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::value::Value;
+use crate::value::Inline;
 
 use crate::value::schemas::hash::Blake3;
 use hifitime::Epoch;
@@ -55,18 +55,18 @@ impl From<SignatureError> for ValidationError {
 /// converge in zero extra rounds.
 pub fn commit_metadata(
     signing_key: &SigningKey,
-    parents: impl IntoIterator<Item = Value<Handle<SimpleArchive>>>,
-    msg: Option<Value<Handle<LongString>>>,
+    parents: impl IntoIterator<Item = Inline<Handle<SimpleArchive>>>,
+    msg: Option<Inline<Handle<LongString>>>,
     content: Option<Blob<SimpleArchive>>,
-    metadata: Option<Value<Handle<SimpleArchive>>>,
+    metadata: Option<Inline<Handle<SimpleArchive>>>,
 ) -> TribleSet {
     // Authored commits carry a timestamp and a signature. Merge commits
     // (content = None) carry neither, so they stay content-deterministic.
     let (content_handle, signed_by, signature, created_at) = match content.as_ref() {
         Some(blob) => {
             let now = Epoch::now().expect("system time");
-            let timestamp: Value<_> =
-                (now, now).try_to_value().expect("point interval");
+            let timestamp: Inline<_> =
+                (now, now).try_to_inline().expect("point interval");
             (
                 Some(blob.get_handle()),
                 Some(signing_key.verifying_key()),
@@ -104,7 +104,7 @@ pub fn commit_metadata(
 pub fn verify(content: Blob<SimpleArchive>, metadata: TribleSet) -> Result<(), ValidationError> {
     let handle = content.get_handle();
     let (pubkey, r, s) = match find!(
-    (pubkey: Value<_>, r, s),
+    (pubkey: Inline<_>, r, s),
     pattern!(&metadata, [
     {
         super::content: handle,
@@ -119,7 +119,7 @@ pub fn verify(content: Blob<SimpleArchive>, metadata: TribleSet) -> Result<(), V
         Err(_) => return Err(ValidationError::AmbiguousSignature),
     };
 
-    let pubkey: VerifyingKey = pubkey.try_from_value()?;
+    let pubkey: VerifyingKey = pubkey.try_from_inline()?;
     let signature = Signature::from_components(r, s);
     pubkey.verify(&content.bytes, &signature)?;
     Ok(())

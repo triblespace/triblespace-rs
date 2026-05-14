@@ -4,11 +4,11 @@ use crate::query::Constraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
-/// Value-range constraint for [`SuccinctArchive`].
+/// Inline-range constraint for [`SuccinctArchive`].
 ///
 /// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
 /// The implementation leans on two archive primitives:
@@ -30,7 +30,7 @@ use crate::value::ValueSchema;
 /// # Example
 ///
 /// ```rust,ignore
-/// find!(ts: Value<NsTAIInterval>,
+/// find!(ts: Inline<NsTAIInterval>,
 ///     and!(
 ///         pattern!(&archive, [{ ?id @ attr: ?ts }]),
 ///         archive.value_in_range(ts, min_ts, max_ts),
@@ -42,8 +42,8 @@ where
     U: Universe,
 {
     variable_v: VariableId,
-    min: RawValue,
-    max: RawValue,
+    min: RawInline,
+    max: RawInline,
     archive: &'a SuccinctArchive<U>,
     /// Cached upper-bound estimate: width of the universe code range
     /// covering `[min, max]`. Computed once at construction so
@@ -55,10 +55,10 @@ impl<'a, U> SuccinctArchiveRangeConstraint<'a, U>
 where
     U: Universe,
 {
-    pub fn new<V: ValueSchema>(
+    pub fn new<V: InlineSchema>(
         variable_v: Variable<V>,
-        min: Value<V>,
-        max: Value<V>,
+        min: Inline<V>,
+        max: Inline<V>,
         archive: &'a SuccinctArchive<U>,
     ) -> Self {
         // O(log n) range lookup once at construction; query-time estimate
@@ -90,7 +90,7 @@ where
         Some(self.cached_estimate)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.variable_v {
             return;
         }
@@ -101,7 +101,7 @@ where
         );
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.variable_v {
             proposals.retain(|v| *v >= self.min && *v <= self.max);
         }

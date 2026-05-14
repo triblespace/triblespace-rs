@@ -19,7 +19,7 @@ fn main() {
     let delta = kb.difference(&base);
 
     let _: Vec<_> = find!(
-        (person: Value<_>),
+        (person: Inline<_>),
         pattern!(&kb, [
             { ?person @ names::first: _?name, names::last: _?name }
         ])
@@ -27,7 +27,7 @@ fn main() {
     .collect();
 
     let _: Vec<_> = find!(
-        (person: Value<_>),
+        (person: Inline<_>),
         pattern_changes!(&kb, &delta, [
             { ?person @ names::first: _?name, names::last: _?name }
         ])

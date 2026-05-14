@@ -20,7 +20,7 @@ impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    pub fn new<V: ValueSchema>(
+    pub fn new<V: InlineSchema>(
         variable_e: Variable<GenId>,
         variable_a: Variable<GenId>,
         variable_v: Variable<V>,
@@ -35,7 +35,7 @@ where
     }
 }
 
-fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawValue) -> Range<usize>
+fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
 where
     U: Universe,
 {
@@ -52,7 +52,7 @@ fn restrict_range<U>(
     universe: &U,
     a: &BitVector<Rank9SelIndex>,
     c: &WaveletMatrix<Rank9SelIndex>,
-    value: &RawValue,
+    value: &RawInline,
     r: &Range<usize>,
 ) -> Range<usize>
 where
@@ -161,7 +161,7 @@ where
         })
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -320,7 +320,7 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;

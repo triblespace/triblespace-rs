@@ -3,9 +3,9 @@ use crate::id::id_into_value;
 use crate::id::ID_LEN;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::value::RawValue;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::RawInline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 
 use super::Binding;
 use super::Constraint;
@@ -17,19 +17,19 @@ use super::VariableSet;
 /// Constrains a variable to full-width values present in a [`PATCH`].
 ///
 /// Proposals enumerate every entry; confirmations check prefix membership.
-pub struct PatchValueConstraint<'a, T: ValueSchema> {
+pub struct PatchValueConstraint<'a, T: InlineSchema> {
     variable: Variable<T>,
-    patch: &'a PATCH<VALUE_LEN, IdentitySchema, ()>,
+    patch: &'a PATCH<INLINE_LEN, IdentitySchema, ()>,
 }
 
-impl<'a, T: ValueSchema> PatchValueConstraint<'a, T> {
+impl<'a, T: InlineSchema> PatchValueConstraint<'a, T> {
     /// Creates a constraint that restricts `variable` to values in `patch`.
-    pub fn new(variable: Variable<T>, patch: &'a PATCH<VALUE_LEN, IdentitySchema, ()>) -> Self {
+    pub fn new(variable: Variable<T>, patch: &'a PATCH<INLINE_LEN, IdentitySchema, ()>) -> Self {
         PatchValueConstraint { variable, patch }
     }
 }
 
-impl<'a, S: ValueSchema> Constraint<'a> for PatchValueConstraint<'a, S> {
+impl<'a, S: InlineSchema> Constraint<'a> for PatchValueConstraint<'a, S> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
     }
@@ -42,21 +42,21 @@ impl<'a, S: ValueSchema> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             self.patch
                 .infixes(&[0; 0], &mut |&k: &[u8; 32]| proposals.push(k));
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             proposals.retain(|v| self.patch.has_prefix(v));
         }
     }
 }
 
-impl<'a, S: ValueSchema> ContainsConstraint<'a, S> for &'a PATCH<VALUE_LEN, IdentitySchema, ()> {
+impl<'a, S: InlineSchema> ContainsConstraint<'a, S> for &'a PATCH<INLINE_LEN, IdentitySchema, ()> {
     type Constraint = PatchValueConstraint<'a, S>;
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
@@ -71,7 +71,7 @@ impl<'a, S: ValueSchema> ContainsConstraint<'a, S> for &'a PATCH<VALUE_LEN, Iden
 /// representation automatically.
 pub struct PatchIdConstraint<S>
 where
-    S: ValueSchema,
+    S: InlineSchema,
 {
     variable: Variable<S>,
     patch: PATCH<ID_LEN, IdentitySchema, ()>,
@@ -79,7 +79,7 @@ where
 
 impl<S> PatchIdConstraint<S>
 where
-    S: ValueSchema,
+    S: InlineSchema,
 {
     /// Creates a constraint that restricts `variable` to IDs in `patch`.
     pub fn new(variable: Variable<S>, patch: PATCH<ID_LEN, IdentitySchema, ()>) -> Self {
@@ -89,7 +89,7 @@ where
 
 impl<'a, S> Constraint<'a> for PatchIdConstraint<S>
 where
-    S: ValueSchema,
+    S: InlineSchema,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
@@ -103,7 +103,7 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
                 proposals.push(id_into_value(id))
@@ -111,7 +111,7 @@ where
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, _variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         proposals.retain(|v| {
             if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)
@@ -122,7 +122,7 @@ where
     }
 }
 
-impl<'a, S: ValueSchema> ContainsConstraint<'a, S> for PATCH<ID_LEN, IdentitySchema, ()> {
+impl<'a, S: InlineSchema> ContainsConstraint<'a, S> for PATCH<ID_LEN, IdentitySchema, ()> {
     type Constraint = PatchIdConstraint<S>;
 
     fn has(self, v: Variable<S>) -> Self::Constraint {

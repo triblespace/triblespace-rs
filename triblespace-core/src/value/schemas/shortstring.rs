@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 use indxvec::Printing;
 use std::str::Utf8Error;
@@ -88,11 +88,11 @@ mod wasm_formatter {
     }
 }
 
-impl ValueSchema for ShortString {
+impl InlineSchema for ShortString {
     type ValidationError = ValidationError;
     type FieldKind = Self;
 
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         let raw = &value.raw;
         let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
         // ensure all bytes after first NUL are zero
@@ -104,10 +104,10 @@ impl ValueSchema for ShortString {
     }
 }
 
-impl<'a> TryFromValue<'a, ShortString> for &'a str {
+impl<'a> TryFromInline<'a, ShortString> for &'a str {
     type Error = Utf8Error;
 
-    fn try_from_value(v: &'a Value<ShortString>) -> Result<&'a str, Self::Error> {
+    fn try_from_inline(v: &'a Inline<ShortString>) -> Result<&'a str, Self::Error> {
         let len = v.raw.iter().position(|&b| b == 0).unwrap_or(v.raw.len());
         #[cfg(kani)]
         {
@@ -120,19 +120,19 @@ impl<'a> TryFromValue<'a, ShortString> for &'a str {
     }
 }
 
-impl<'a> TryFromValue<'a, ShortString> for String {
+impl<'a> TryFromInline<'a, ShortString> for String {
     type Error = Utf8Error;
 
-    fn try_from_value(v: &Value<ShortString>) -> Result<Self, Self::Error> {
-        let s: &str = v.try_from_value()?;
+    fn try_from_inline(v: &Inline<ShortString>) -> Result<Self, Self::Error> {
+        let s: &str = v.try_from_inline()?;
         Ok(s.to_string())
     }
 }
 
-impl TryToValue<ShortString> for &str {
+impl TryToInline<ShortString> for &str {
     type Error = FromStrError;
 
-    fn try_to_value(self) -> Result<Value<ShortString>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<ShortString>, Self::Error> {
         let bytes = self.as_bytes();
         if bytes.len() > 32 {
             return Err(FromStrError::TooLong);
@@ -144,35 +144,35 @@ impl TryToValue<ShortString> for &str {
         let mut data: [u8; 32] = [0; 32];
         data[..bytes.len()].copy_from_slice(bytes);
 
-        Ok(Value::new(data))
+        Ok(Inline::new(data))
     }
 }
 
-impl TryToValue<ShortString> for String {
+impl TryToInline<ShortString> for String {
     type Error = FromStrError;
 
-    fn try_to_value(self) -> Result<Value<ShortString>, Self::Error> {
-        (&self[..]).try_to_value()
+    fn try_to_inline(self) -> Result<Inline<ShortString>, Self::Error> {
+        (&self[..]).try_to_inline()
     }
 }
 
 impl IntoSchema<ShortString> for &str {
-    type Form = Value<ShortString>;
-    fn into_schema(self) -> Value<ShortString> {
-        self.try_to_value().unwrap()
+    type Form = Inline<ShortString>;
+    fn into_schema(self) -> Inline<ShortString> {
+        self.try_to_inline().unwrap()
     }
 }
 
 impl IntoSchema<ShortString> for String {
-    type Form = Value<ShortString>;
-    fn into_schema(self) -> Value<ShortString> {
-        self.try_to_value().unwrap()
+    type Form = Inline<ShortString>;
+    fn into_schema(self) -> Inline<ShortString> {
+        self.try_to_inline().unwrap()
     }
 }
 
 impl IntoSchema<ShortString> for &String {
-    type Form = Value<ShortString>;
-    fn into_schema(self) -> Value<ShortString> {
-        self.to_str().try_to_value().unwrap()
+    type Form = Inline<ShortString>;
+    fn into_schema(self) -> Inline<ShortString> {
+        self.to_str().try_to_inline().unwrap()
     }
 }

@@ -9,7 +9,7 @@ use triblespace_core::id::Id;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{Binding, Constraint, Variable, VariableContext};
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{RawValue, IntoValue, Value};
+use triblespace_core::value::{RawInline, IntoInline, Inline};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -19,12 +19,12 @@ fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }
 
-fn id_as_raw_value(id: Id) -> RawValue {
-    id.to_value().raw
+fn id_as_raw_value(id: Id) -> RawInline {
+    id.to_inline().raw
 }
 
-fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
-    Value::<GenId>::new(*raw).try_from_value::<Id>().ok()
+fn raw_value_to_id(raw: &RawInline) -> Option<Id> {
+    Inline::<GenId>::new(*raw).try_from_inline::<Id>().ok()
 }
 
 /// Build a tiny index and run two constraints through an
@@ -62,7 +62,7 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     // `propose` should yield the intersection of the two posting
     // lists. "fox" is in docs {1,3}; "quick" is in docs {1,3};
     // both sets happen to be identical → proposes both.
-    let mut props: Vec<RawValue> = Vec::new();
+    let mut props: Vec<RawInline> = Vec::new();
     intersection.propose(doc.index, &binding, &mut props);
     let ids: std::collections::HashSet<Id> =
         props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();

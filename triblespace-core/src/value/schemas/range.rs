@@ -7,12 +7,12 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawValue;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
@@ -55,7 +55,7 @@ impl MetaDescribe for RangeU128 {
     }
 }
 
-impl ValueSchema for RangeU128 {
+impl InlineSchema for RangeU128 {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -115,19 +115,19 @@ mod wasm_formatters {
     }
 }
 
-impl ValueSchema for RangeInclusiveU128 {
+impl InlineSchema for RangeInclusiveU128 {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
 
-fn encode_pair(range: (u128, u128)) -> RawValue {
+fn encode_pair(range: (u128, u128)) -> RawInline {
     let mut raw = [0u8; 32];
     raw[..16].copy_from_slice(&range.0.to_be_bytes());
     raw[16..].copy_from_slice(&range.1.to_be_bytes());
     raw
 }
 
-fn decode_pair(raw: &RawValue) -> (u128, u128) {
+fn decode_pair(raw: &RawInline) -> (u128, u128) {
     let mut first = [0u8; 16];
     let mut second = [0u8; 16];
     first.copy_from_slice(&raw[..16]);
@@ -135,72 +135,72 @@ fn decode_pair(raw: &RawValue) -> (u128, u128) {
     (u128::from_be_bytes(first), u128::from_be_bytes(second))
 }
 
-fn encode_range_value<S: ValueSchema>(range: (u128, u128)) -> Value<S> {
-    Value::new(encode_pair(range))
+fn encode_range_value<S: InlineSchema>(range: (u128, u128)) -> Inline<S> {
+    Inline::new(encode_pair(range))
 }
 
-fn decode_range_value<S: ValueSchema>(value: &Value<S>) -> (u128, u128) {
+fn decode_range_value<S: InlineSchema>(value: &Inline<S>) -> (u128, u128) {
     decode_pair(&value.raw)
 }
 
 impl IntoSchema<RangeU128> for (u128, u128) {
-    type Form = Value<RangeU128>;
-    fn into_schema(self) -> Value<RangeU128> {
+    type Form = Inline<RangeU128>;
+    fn into_schema(self) -> Inline<RangeU128> {
         encode_range_value(self)
     }
 }
 
-impl TryFromValue<'_, RangeU128> for (u128, u128) {
+impl TryFromInline<'_, RangeU128> for (u128, u128) {
     type Error = Infallible;
-    fn try_from_value(v: &Value<RangeU128>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<RangeU128>) -> Result<Self, Infallible> {
         Ok(decode_range_value(v))
     }
 }
 
 impl IntoSchema<RangeInclusiveU128> for (u128, u128) {
-    type Form = Value<RangeInclusiveU128>;
-    fn into_schema(self) -> Value<RangeInclusiveU128> {
+    type Form = Inline<RangeInclusiveU128>;
+    fn into_schema(self) -> Inline<RangeInclusiveU128> {
         encode_range_value(self)
     }
 }
 
-impl TryFromValue<'_, RangeInclusiveU128> for (u128, u128) {
+impl TryFromInline<'_, RangeInclusiveU128> for (u128, u128) {
     type Error = Infallible;
-    fn try_from_value(v: &Value<RangeInclusiveU128>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<RangeInclusiveU128>) -> Result<Self, Infallible> {
         Ok(decode_range_value(v))
     }
 }
 
-impl TryToValue<RangeU128> for Range<u128> {
+impl TryToInline<RangeU128> for Range<u128> {
     type Error = Infallible;
 
-    fn try_to_value(self) -> Result<Value<RangeU128>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<RangeU128>, Self::Error> {
         Ok(encode_range_value((self.start, self.end)))
     }
 }
 
-impl TryFromValue<'_, RangeU128> for Range<u128> {
+impl TryFromInline<'_, RangeU128> for Range<u128> {
     type Error = Infallible;
 
-    fn try_from_value(v: &Value<RangeU128>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<RangeU128>) -> Result<Self, Self::Error> {
         let (start, end) = decode_range_value(v);
         Ok(start..end)
     }
 }
 
-impl TryToValue<RangeInclusiveU128> for RangeInclusive<u128> {
+impl TryToInline<RangeInclusiveU128> for RangeInclusive<u128> {
     type Error = Infallible;
 
-    fn try_to_value(self) -> Result<Value<RangeInclusiveU128>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<RangeInclusiveU128>, Self::Error> {
         let (start, end) = self.into_inner();
         Ok(encode_range_value((start, end)))
     }
 }
 
-impl TryFromValue<'_, RangeInclusiveU128> for RangeInclusive<u128> {
+impl TryFromInline<'_, RangeInclusiveU128> for RangeInclusive<u128> {
     type Error = Infallible;
 
-    fn try_from_value(v: &Value<RangeInclusiveU128>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<RangeInclusiveU128>) -> Result<Self, Self::Error> {
         let (start, end) = decode_range_value(v);
         Ok(start..=end)
     }
@@ -209,65 +209,65 @@ impl TryFromValue<'_, RangeInclusiveU128> for RangeInclusive<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoValue, TryFromValue, TryToValue};
+    use crate::value::{IntoInline, TryFromInline, TryToInline};
     use proptest::prelude::*;
 
     proptest! {
         #[test]
         fn range_u128_tuple_roundtrip(a: u128, b: u128) {
             let input = (a, b);
-            let value: Value<RangeU128> = input.to_value();
-            let output: (u128, u128) = value.from_value();
+            let value: Inline<RangeU128> = input.to_inline();
+            let output: (u128, u128) = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn range_u128_range_roundtrip(a: u128, b: u128) {
             let input = a..b;
-            let value: Value<RangeU128> = input.clone().try_to_value().unwrap();
-            let output = Range::<u128>::try_from_value(&value).unwrap();
+            let value: Inline<RangeU128> = input.clone().try_to_inline().unwrap();
+            let output = Range::<u128>::try_from_inline(&value).unwrap();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn range_inclusive_tuple_roundtrip(a: u128, b: u128) {
             let input = (a, b);
-            let value: Value<RangeInclusiveU128> = input.to_value();
-            let output: (u128, u128) = value.from_value();
+            let value: Inline<RangeInclusiveU128> = input.to_inline();
+            let output: (u128, u128) = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn range_inclusive_range_roundtrip(a: u128, b: u128) {
             let input = a..=b;
-            let value: Value<RangeInclusiveU128> = input.clone().try_to_value().unwrap();
-            let output = RangeInclusive::<u128>::try_from_value(&value).unwrap();
+            let value: Inline<RangeInclusiveU128> = input.clone().try_to_inline().unwrap();
+            let output = RangeInclusive::<u128>::try_from_inline(&value).unwrap();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn range_u128_tuple_and_range_agree(a: u128, b: u128) {
-            let tuple_val: Value<RangeU128> = (a, b).to_value();
-            let range_val: Value<RangeU128> = (a..b).try_to_value().unwrap();
+            let tuple_val: Inline<RangeU128> = (a, b).to_inline();
+            let range_val: Inline<RangeU128> = (a..b).try_to_inline().unwrap();
             prop_assert_eq!(tuple_val.raw, range_val.raw);
         }
 
         #[test]
         fn range_inclusive_tuple_and_range_agree(a: u128, b: u128) {
-            let tuple_val: Value<RangeInclusiveU128> = (a, b).to_value();
-            let range_val: Value<RangeInclusiveU128> = (a..=b).try_to_value().unwrap();
+            let tuple_val: Inline<RangeInclusiveU128> = (a, b).to_inline();
+            let range_val: Inline<RangeInclusiveU128> = (a..=b).try_to_inline().unwrap();
             prop_assert_eq!(tuple_val.raw, range_val.raw);
         }
 
         #[test]
         fn range_u128_validates(a: u128, b: u128) {
-            let value: Value<RangeU128> = (a, b).to_value();
+            let value: Inline<RangeU128> = (a, b).to_inline();
             prop_assert!(RangeU128::validate(value).is_ok());
         }
 
         #[test]
         fn range_inclusive_validates(a: u128, b: u128) {
-            let value: Value<RangeInclusiveU128> = (a, b).to_value();
+            let value: Inline<RangeInclusiveU128> = (a, b).to_inline();
             prop_assert!(RangeInclusiveU128::validate(value).is_ok());
         }
     }

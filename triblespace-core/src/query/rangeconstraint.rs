@@ -7,7 +7,7 @@ use super::*;
 /// propose (e.g. a [`pattern!`](crate::macros::pattern)):
 ///
 /// ```rust,ignore
-/// find!((id: Id, ts: Value<NsTAIInterval>),
+/// find!((id: Id, ts: Inline<NsTAIInterval>),
 ///     and!(
 ///         pattern!(data, [{ ?id @ exec::requested_at: ?ts }]),
 ///         value_range(ts, min_ts, max_ts),
@@ -18,16 +18,16 @@ use super::*;
 /// The estimate returns `usize::MAX` so the intersection sorts this
 /// constraint last — the tighter TribleSet constraint proposes first,
 /// then this range constraint filters.
-pub struct ValueRange {
+pub struct InlineRange {
     variable: VariableId,
-    min: RawValue,
-    max: RawValue,
+    min: RawInline,
+    max: RawInline,
 }
 
-impl ValueRange {
+impl InlineRange {
     /// Create a range constraint on `variable` with inclusive bounds.
-    pub fn new<T: ValueSchema>(variable: Variable<T>, min: Value<T>, max: Value<T>) -> Self {
-        ValueRange {
+    pub fn new<T: InlineSchema>(variable: Variable<T>, min: Inline<T>, max: Inline<T>) -> Self {
+        InlineRange {
             variable: variable.index,
             min: min.raw,
             max: max.raw,
@@ -35,16 +35,16 @@ impl ValueRange {
     }
 }
 
-/// Convenience function to create a [`ValueRange`] constraint.
-pub fn value_range<T: ValueSchema>(
+/// Convenience function to create a [`InlineRange`] constraint.
+pub fn value_range<T: InlineSchema>(
     variable: Variable<T>,
-    min: Value<T>,
-    max: Value<T>,
-) -> ValueRange {
-    ValueRange::new(variable, min, max)
+    min: Inline<T>,
+    max: Inline<T>,
+) -> InlineRange {
+    InlineRange::new(variable, min, max)
 }
 
-impl<'a> Constraint<'a> for ValueRange {
+impl<'a> Constraint<'a> for InlineRange {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable)
     }
@@ -60,12 +60,12 @@ impl<'a> Constraint<'a> for ValueRange {
     }
 
     /// Does not propose — the paired TribleSet constraint handles proposals.
-    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut Vec<RawValue>) {
+    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut Vec<RawInline>) {
         // Intentionally empty: this constraint only confirms.
     }
 
     /// Retains only proposals whose raw bytes fall within [min, max] inclusive.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable == variable {
             proposals.retain(|v| *v >= self.min && *v <= self.max);
         }
@@ -95,9 +95,9 @@ mod tests {
         let e2 = ufoid();
         let e3 = ufoid();
 
-        let v10: Value<R256> = 10i128.to_value();
-        let v50: Value<R256> = 50i128.to_value();
-        let v90: Value<R256> = 90i128.to_value();
+        let v10: Inline<R256> = 10i128.to_inline();
+        let v50: Inline<R256> = 50i128.to_inline();
+        let v90: Inline<R256> = 90i128.to_inline();
 
         let mut data = TribleSet::new();
         data += entity! { &e1 @ test_score: v10 };
@@ -105,18 +105,18 @@ mod tests {
         data += entity! { &e3 @ test_score: v90 };
 
         // Without range: all 3 results.
-        let all: Vec<Value<R256>> = find!(
-            v: Value<R256>,
+        let all: Vec<Inline<R256>> = find!(
+            v: Inline<R256>,
             pattern!(&data, [{ test_score: ?v }])
         )
         .collect();
         assert_eq!(all.len(), 3);
 
         // With range [20..80]: only v50.
-        let min: Value<R256> = 20i128.to_value();
-        let max: Value<R256> = 80i128.to_value();
-        let filtered: Vec<Value<R256>> = find!(
-            v: Value<R256>,
+        let min: Inline<R256> = 20i128.to_inline();
+        let max: Inline<R256> = 80i128.to_inline();
+        let filtered: Vec<Inline<R256>> = find!(
+            v: Inline<R256>,
             and!(
                 pattern!(&data, [{ test_score: ?v }]),
                 value_range(v, min, max),

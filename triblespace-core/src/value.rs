@@ -1,11 +1,11 @@
-//! Value type and conversion traits for schema types. For a deeper look at
+//! Inline type and conversion traits for schema types. For a deeper look at
 //! portability goals, common formats, and schema design, refer to the
 //! "Portability & Common Formats" chapter in the project book.
 //!
 //! # Example
 //!
 //! ```
-//! use triblespace_core::value::{Value, ValueSchema, IntoValue, TryFromValue};
+//! use triblespace_core::value::{Inline, InlineSchema, IntoInline, TryFromInline};
 //! use triblespace_core::metadata::MetaDescribe;
 //! use triblespace_core::trible::{Fragment, TribleSet};
 //! use triblespace_core::macros::id_hex;
@@ -23,57 +23,60 @@
 //!        Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new())
 //!    }
 //! }
-//! impl ValueSchema for MyNumber {
+//! impl InlineSchema for MyNumber {
 //!    type ValidationError = ();
+//!    type FieldKind = Self;
 //!    // Every bit pattern is valid for this schema.
 //! }
 //!
 //! // Implement conversion functions for the schema type.
 //! // Use `Error = Infallible` when the conversion cannot fail.
-//! impl TryFromValue<'_, MyNumber> for u32 {
+//! impl TryFromInline<'_, MyNumber> for u32 {
 //!    type Error = Infallible;
-//!    fn try_from_value(v: &Value<MyNumber>) -> Result<Self, Infallible> {
+//!    fn try_from_inline(v: &Inline<MyNumber>) -> Result<Self, Infallible> {
 //!      Ok(u32::from_le_bytes(v.raw[0..4].try_into().unwrap()))
 //!    }
 //! }
 //!
-//! impl IntoValue<MyNumber> for u32 {
-//!   fn to_value(self) -> Value<MyNumber> {
+//! impl triblespace_core::value::IntoSchema<MyNumber> for u32 {
+//!   type Form = Inline<MyNumber>;
+//!   fn into_schema(self) -> Inline<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
 //!      let mut bytes = [0; 32];
 //!      bytes[0..4].copy_from_slice(&self.to_le_bytes());
-//!      Value::new(bytes)
+//!      Inline::new(bytes)
 //!   }
 //! }
 //!
 //! // Use the schema type to store and retrieve a Rust type.
-//! let value: Value<MyNumber> = MyNumber::value_from(42u32);
-//! let i: u32 = value.from_value();
+//! let value: Inline<MyNumber> = MyNumber::inline_from(42u32);
+//! let i: u32 = value.from_inline();
 //! assert_eq!(i, 42);
 //!
 //! // You can also implement conversion functions for other Rust types.
-//! impl TryFromValue<'_, MyNumber> for u64 {
+//! impl TryFromInline<'_, MyNumber> for u64 {
 //!   type Error = Infallible;
-//!   fn try_from_value(v: &Value<MyNumber>) -> Result<Self, Infallible> {
+//!   fn try_from_inline(v: &Inline<MyNumber>) -> Result<Self, Infallible> {
 //!    Ok(u64::from_le_bytes(v.raw[0..8].try_into().unwrap()))
 //!   }
 //! }
 //!
-//! impl IntoValue<MyNumber> for u64 {
-//!  fn to_value(self) -> Value<MyNumber> {
+//! impl triblespace_core::value::IntoSchema<MyNumber> for u64 {
+//!  type Form = Inline<MyNumber>;
+//!  fn into_schema(self) -> Inline<MyNumber> {
 //!   let mut bytes = [0; 32];
 //!   bytes[0..8].copy_from_slice(&self.to_le_bytes());
-//!   Value::new(bytes)
+//!   Inline::new(bytes)
 //!   }
 //! }
 //!
-//! let value: Value<MyNumber> = MyNumber::value_from(42u64);
-//! let i: u64 = value.from_value();
+//! let value: Inline<MyNumber> = MyNumber::inline_from(42u64);
+//! let i: u64 = value.from_inline();
 //! assert_eq!(i, 42);
 //!
 //! // And use a value round-trip to convert between Rust types.
-//! let value: Value<MyNumber> = MyNumber::value_from(42u32);
-//! let i: u64 = value.from_value();
+//! let value: Inline<MyNumber> = MyNumber::inline_from(42u32);
+//! let i: u64 = value.from_inline();
 //! assert_eq!(i, 42);
 //! ```
 
@@ -97,10 +100,10 @@ use zerocopy::TryFromBytes;
 use zerocopy::Unaligned;
 
 /// The length of a value in bytes.
-pub const VALUE_LEN: usize = 32;
+pub const INLINE_LEN: usize = 32;
 
 /// A raw value is simply a 32-byte array.
-pub type RawValue = [u8; VALUE_LEN];
+pub type RawInline = [u8; INLINE_LEN];
 
 /// A value is a 32-byte array that can be (de)serialized as a Rust type.
 /// The schema type parameter is an abstract type that represents the meaning
@@ -114,31 +117,31 @@ pub type RawValue = [u8; VALUE_LEN];
 /// use num_rational::Ratio;
 ///
 /// let ratio = Ratio::new(1, 2);
-/// let value: Value<R256> = R256::value_from(ratio);
-/// let ratio2: Ratio<i128> = value.try_from_value().unwrap();
+/// let value: Inline<R256> = R256::inline_from(ratio);
+/// let ratio2: Ratio<i128> = value.try_from_inline().unwrap();
 /// assert_eq!(ratio, ratio2);
 /// ```
 #[derive(TryFromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(transparent)]
-pub struct Value<T: ValueSchema> {
+pub struct Inline<T: InlineSchema> {
     /// The 32-byte representation of this value.
-    pub raw: RawValue,
+    pub raw: RawInline,
     _schema: PhantomData<T>,
 }
 
-impl<S: ValueSchema> Value<S> {
+impl<S: InlineSchema> Inline<S> {
     /// Create a new value from a 32-byte array.
     ///
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Value, ValueSchema};
-    /// use triblespace_core::value::schemas::UnknownValue;
+    /// use triblespace_core::value::{Inline, InlineSchema};
+    /// use triblespace_core::value::schemas::UnknownInline;
     ///
     /// let bytes = [0; 32];
-    /// let value = Value::<UnknownValue>::new(bytes);
+    /// let value = Inline::<UnknownInline>::new(bytes);
     /// ```
-    pub fn new(value: RawValue) -> Self {
+    pub fn new(value: RawInline) -> Self {
         Self {
             raw: value,
             _schema: PhantomData,
@@ -161,11 +164,11 @@ impl<S: ValueSchema> Value<S> {
     /// This is a zero-cost operation.
     /// This is useful when you have a value with an abstract schema type,
     /// but you know the concrete schema type.
-    pub fn transmute<O>(self) -> Value<O>
+    pub fn transmute<O>(self) -> Inline<O>
     where
-        O: ValueSchema,
+        O: InlineSchema,
     {
-        Value::new(self.raw)
+        Inline::new(self.raw)
     }
 
     /// Transmute a value reference from one schema type to another.
@@ -174,9 +177,9 @@ impl<S: ValueSchema> Value<S> {
     /// This is a zero-cost operation.
     /// This is useful when you have a value reference with an abstract schema type,
     /// but you know the concrete schema type.
-    pub fn as_transmute<O>(&self) -> &Value<O>
+    pub fn as_transmute<O>(&self) -> &Inline<O>
     where
-        O: ValueSchema,
+        O: InlineSchema,
     {
         unsafe { std::mem::transmute(self) }
     }
@@ -186,25 +189,25 @@ impl<S: ValueSchema> Value<S> {
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Value, ValueSchema};
-    /// use triblespace_core::value::schemas::UnknownValue;
+    /// use triblespace_core::value::{Inline, InlineSchema};
+    /// use triblespace_core::value::schemas::UnknownInline;
     /// use std::borrow::Borrow;
     ///
     /// let bytes = [0; 32];
-    /// let value: Value<UnknownValue> = Value::new(bytes);
-    /// let value_ref: &Value<UnknownValue> = &value;
+    /// let value: Inline<UnknownInline> = Inline::new(bytes);
+    /// let value_ref: &Inline<UnknownInline> = &value;
     /// let raw_value_ref: &[u8; 32] = value_ref.borrow();
-    /// let value_ref2: &Value<UnknownValue> = Value::as_transmute_raw(raw_value_ref);
+    /// let value_ref2: &Inline<UnknownInline> = Inline::as_transmute_raw(raw_value_ref);
     /// assert_eq!(&value, value_ref2);
     /// ```
-    pub fn as_transmute_raw(value: &RawValue) -> &Self {
+    pub fn as_transmute_raw(value: &RawInline) -> &Self {
         unsafe { std::mem::transmute(value) }
     }
 
     /// Deserialize a value with an abstract schema type to a concrete Rust type.
     ///
     /// This method only works for infallible conversions (where `Error = Infallible`).
-    /// For fallible conversions, use the [Value::try_from_value] method.
+    /// For fallible conversions, use the [Inline::try_from_inline] method.
     ///
     /// # Example
     ///
@@ -212,14 +215,14 @@ impl<S: ValueSchema> Value<S> {
     /// use triblespace_core::prelude::*;
     /// use valueschemas::F64;
     ///
-    /// let value: Value<F64> = (3.14f64).to_value();
-    /// let concrete: f64 = value.from_value();
+    /// let value: Inline<F64> = (3.14f64).to_inline();
+    /// let concrete: f64 = value.from_inline();
     /// ```
-    pub fn from_value<'a, T>(&'a self) -> T
+    pub fn from_inline<'a, T>(&'a self) -> T
     where
-        T: TryFromValue<'a, S, Error = std::convert::Infallible>,
+        T: TryFromInline<'a, S, Error = std::convert::Infallible>,
     {
-        match <T as TryFromValue<'a, S>>::try_from_value(self) {
+        match <T as TryFromInline<'a, S>>::try_from_inline(self) {
             Ok(v) => v,
             Err(e) => match e {},
         }
@@ -232,7 +235,7 @@ impl<S: ValueSchema> Value<S> {
     /// rust type can't represent the specific value of the schema type,
     /// e.g. if the schema type is a fractional number and the rust type is an integer.
     ///
-    /// For infallible conversions, use the [Value::from_value] method.
+    /// For infallible conversions, use the [Inline::from_inline] method.
     ///
     /// # Example
     ///
@@ -241,70 +244,70 @@ impl<S: ValueSchema> Value<S> {
     /// use valueschemas::R256;
     /// use num_rational::Ratio;
     ///
-    /// let value: Value<R256> = R256::value_from(Ratio::new(1, 2));
-    /// let concrete: Result<Ratio<i128>, _> = value.try_from_value();
+    /// let value: Inline<R256> = R256::inline_from(Ratio::new(1, 2));
+    /// let concrete: Result<Ratio<i128>, _> = value.try_from_inline();
     /// ```
     ///
-    pub fn try_from_value<'a, T>(&'a self) -> Result<T, <T as TryFromValue<'a, S>>::Error>
+    pub fn try_from_inline<'a, T>(&'a self) -> Result<T, <T as TryFromInline<'a, S>>::Error>
     where
-        T: TryFromValue<'a, S>,
+        T: TryFromInline<'a, S>,
     {
-        <T as TryFromValue<'a, S>>::try_from_value(self)
+        <T as TryFromInline<'a, S>>::try_from_inline(self)
     }
 }
 
-impl<T: ValueSchema> Copy for Value<T> {}
+impl<T: InlineSchema> Copy for Inline<T> {}
 
-impl<T: ValueSchema> Clone for Value<T> {
+impl<T: InlineSchema> Clone for Inline<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: ValueSchema> PartialEq for Value<T> {
+impl<T: InlineSchema> PartialEq for Inline<T> {
     fn eq(&self, other: &Self) -> bool {
         self.raw == other.raw
     }
 }
 
-impl<T: ValueSchema> Eq for Value<T> {}
+impl<T: InlineSchema> Eq for Inline<T> {}
 
-impl<T: ValueSchema> Hash for Value<T> {
+impl<T: InlineSchema> Hash for Inline<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.raw.hash(state);
     }
 }
 
-impl<T: ValueSchema> Ord for Value<T> {
+impl<T: InlineSchema> Ord for Inline<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.raw.cmp(&other.raw)
     }
 }
 
-impl<T: ValueSchema> PartialOrd for Value<T> {
+impl<T: InlineSchema> PartialOrd for Inline<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<S: ValueSchema> Borrow<RawValue> for Value<S> {
-    fn borrow(&self) -> &RawValue {
+impl<S: InlineSchema> Borrow<RawInline> for Inline<S> {
+    fn borrow(&self) -> &RawInline {
         &self.raw
     }
 }
 
-impl<T: ValueSchema> Debug for Value<T> {
+impl<T: InlineSchema> Debug for Inline<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Value<{}>({})",
+            "Inline<{}>({})",
             std::any::type_name::<T>(),
             ToHex::encode_hex::<String>(&self.raw)
         )
     }
 }
 
-/// A trait that represents an abstract schema type that can be (de)serialized as a [Value].
+/// A trait that represents an abstract schema type that can be (de)serialized as a [Inline].
 ///
 /// This trait is usually implemented on a type-level empty struct,
 /// but may contain additional information about the schema type as associated constants or types.
@@ -313,15 +316,15 @@ impl<T: ValueSchema> Debug for Value<T> {
 ///
 /// See the [value](crate::value) module for more information.
 /// See the [BlobSchema](crate::blob::BlobSchema) trait for the counterpart trait for blobs.
-pub trait ValueSchema: MetaDescribe + Sized + 'static {
-    /// The error type returned by [`validate`](ValueSchema::validate).
+pub trait InlineSchema: MetaDescribe + Sized + 'static {
+    /// The error type returned by [`validate`](InlineSchema::validate).
     /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;
 
     /// The trait parameter to dispatch via for `entity!{}` field
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `FieldKind = Self` — sources convert via
-    /// `IntoSchema<Self> { Form = Value<Self> }`. For
+    /// `IntoSchema<Self> { Form = Inline<Self> }`. For
     /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
     /// `FieldKind = T` — sources convert via `IntoSchema<T> { Form =
     /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
@@ -330,25 +333,25 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     type FieldKind;
 
     /// Check if the given value conforms to this schema.
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         Ok(value)
     }
 
-    /// Create a new value from a concrete Rust type via [`IntoValue`].
+    /// Create a new value from a concrete Rust type via [`IntoInline`].
     /// Panics if the underlying conversion panics.
-    fn value_from<T: IntoValue<Self>>(t: T) -> Value<Self> {
-        t.to_value()
+    fn inline_from<T: IntoInline<Self>>(t: T) -> Inline<Self> {
+        t.to_inline()
     }
 
-    /// Create a new value from a concrete Rust type via [`TryToValue`].
+    /// Create a new value from a concrete Rust type via [`TryToInline`].
     /// Returns an error if the conversion fails.
-    fn value_try_from<T: TryToValue<Self>>(
+    fn inline_try_from<T: TryToInline<Self>>(
         t: T,
-    ) -> Result<Value<Self>, <T as TryToValue<Self>>::Error> {
-        t.try_to_value()
+    ) -> Result<Inline<Self>, <T as TryToInline<Self>>::Error> {
+        t.try_to_inline()
     }
 
-    /// Expand an already-encoded `Value<Self>` into the field-pair
+    /// Expand an already-encoded `Inline<Self>` into the field-pair
     /// shape `entity!{}` consumes. Inline schemas: `(value, None)`,
     /// no side-blob.
     ///
@@ -356,38 +359,38 @@ pub trait ValueSchema: MetaDescribe + Sized + 'static {
     /// blob-path counterpart lives on
     /// [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair).
     fn into_field_pair(
-        form: Value<Self>,
+        form: Inline<Self>,
     ) -> (
-        Value<Self>,
+        Inline<Self>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
         (form, None)
     }
 }
 
-/// Fallible variant of value conversion — `T → Result<Value<S>, Error>`.
+/// Fallible variant of value conversion — `T → Result<Inline<S>, Error>`.
 ///
 /// Kept as a standalone trait (not folded into [`IntoSchema`])
 /// because the error type is part of the per-source/per-target contract.
 /// Used for parses that can fail (e.g. `&str → Hash<Blake3>` via
 /// hex-decoding).
-pub trait TryToValue<S: ValueSchema> {
+pub trait TryToInline<S: InlineSchema> {
     /// The error type returned when the conversion fails.
     type Error;
-    /// Convert the Rust type to a [Value] with a specific schema type.
-    fn try_to_value(self) -> Result<Value<S>, Self::Error>;
+    /// Convert the Rust type to a [Inline] with a specific schema type.
+    fn try_to_inline(self) -> Result<Inline<S>, Self::Error>;
 }
 
 /// Convert a value into its **form** for a schema target — either a
-/// directly-encoded `Value<S>` (inline path, `S: ValueSchema`) or a
+/// directly-encoded `Inline<S>` (inline path, `S: InlineSchema`) or a
 /// `Blob<S>` for content-addressed storage (handle path, `S: BlobSchema`).
 ///
 /// `IntoSchema<S>` is the **sole** source-to-schema conversion trait.
 /// `S` is intentionally unbounded so the same trait can target either
-/// a `ValueSchema` (Form = `Value<S>`) or a `BlobSchema`
+/// a `InlineSchema` (Form = `Inline<S>`) or a `BlobSchema`
 /// (Form = `Blob<S>`). The Form's relationship to `S` is captured by
 /// [`FieldFormFor`], which knows how to expand the form into the
-/// `(Value<V>, Option<Blob<UnknownBlob>>)` pair that the `entity!{}`
+/// `(Inline<V>, Option<Blob<UnknownBlob>>)` pair that the `entity!{}`
 /// macro folds into a Fragment.
 ///
 /// The key property: with `S` at trait position 0, downstream that
@@ -395,7 +398,7 @@ pub trait TryToValue<S: ValueSchema> {
 /// for MyType` — the local type sits at trait position 0, which
 /// makes Rust's orphan rule see the impl as legal even when `MyType`
 /// is a foreign type (like `Vec<u8>` or a third-party crate's view).
-/// This is the property the IntoValue/IntoBlob split provided
+/// This is the property the IntoInline/IntoBlob split provided
 /// historically; preserved here by keeping the schema type unbuiried.
 pub trait IntoSchema<S> {
     /// The concrete form this source produces.
@@ -404,34 +407,34 @@ pub trait IntoSchema<S> {
     fn into_schema(self) -> Self::Form;
 }
 
-/// Shorthand bound for `IntoSchema<S, Form = Value<S>>` — "this
-/// source produces a directly-encoded `Value<S>`, no side-blob."
+/// Shorthand bound for `IntoSchema<S, Form = Inline<S>>` — "this
+/// source produces a directly-encoded `Inline<S>`, no side-blob."
 ///
-/// `IntoValue` is a supertrait alias over [`IntoSchema`]: any type
-/// that implements `IntoSchema<S>` with `Form = Value<S>`
-/// automatically becomes `IntoValue<S>`, and gains the
-/// `to_value(self) -> Value<S>` convenience method.
-pub trait IntoValue<S: ValueSchema>: IntoSchema<S, Form = Value<S>> {
-    /// Convert directly to `Value<S>`.
-    fn to_value(self) -> Value<S>
+/// `IntoInline` is a supertrait alias over [`IntoSchema`]: any type
+/// that implements `IntoSchema<S>` with `Form = Inline<S>`
+/// automatically becomes `IntoInline<S>`, and gains the
+/// `to_inline(self) -> Inline<S>` convenience method.
+pub trait IntoInline<S: InlineSchema>: IntoSchema<S, Form = Inline<S>> {
+    /// Convert directly to `Inline<S>`.
+    fn to_inline(self) -> Inline<S>
     where
         Self: Sized,
     {
         self.into_schema()
     }
 }
-impl<S, T> IntoValue<S> for T
+impl<S, T> IntoInline<S> for T
 where
-    S: ValueSchema,
-    T: IntoSchema<S, Form = Value<S>>,
+    S: InlineSchema,
+    T: IntoSchema<S, Form = Inline<S>>,
 {
 }
 
-/// Expand an [`IntoSchema::Form`] into the `(Value<V>, Option<Blob<UnknownBlob>>)`
+/// Expand an [`IntoSchema::Form`] into the `(Inline<V>, Option<Blob<UnknownBlob>>)`
 /// pair that the `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Value<V>` delegates to [`ValueSchema::into_field_pair`] — inline
+/// - `Inline<V>` delegates to [`InlineSchema::into_field_pair`] — inline
 ///   path, default `(value, None)`.
 /// - `Blob<T>` targeting `Handle<T>` delegates to
 ///   [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair) —
@@ -444,28 +447,28 @@ where
 /// whatever discriminator the schema uses) and `FieldFormFor` (which
 /// expands the form keyed on the actual value-schema `V`) lets the
 /// per-source impls of `IntoSchema` stay one-line.
-pub trait FieldFormFor<V: ValueSchema> {
+pub trait FieldFormFor<V: InlineSchema> {
     /// Produce the (value, optional-blob) pair the macro absorbs.
     fn into_field_pair(
         self,
     ) -> (
-        Value<V>,
+        Inline<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     );
 }
 
-impl<V: ValueSchema> FieldFormFor<V> for Value<V> {
+impl<V: InlineSchema> FieldFormFor<V> for Inline<V> {
     fn into_field_pair(
         self,
     ) -> (
-        Value<V>,
+        Inline<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        <V as ValueSchema>::into_field_pair(self)
+        <V as InlineSchema>::into_field_pair(self)
     }
 }
 
-/// A trait for converting a [Value] with a specific schema type to a Rust type.
+/// A trait for converting a [Inline] with a specific schema type to a Rust type.
 /// This trait is implemented on the concrete Rust type.
 ///
 /// Values are 32-byte arrays that represent data at a deserialization boundary.
@@ -474,40 +477,40 @@ impl<V: ValueSchema> FieldFormFor<V> for Value<V> {
 /// `ethnum::U256` from `U256BE`), and a real error type for narrowing
 /// conversions (e.g. `u64` from `U256BE`).
 ///
-/// This is the counterpart to the [TryToValue] trait.
+/// This is the counterpart to the [TryToInline] trait.
 ///
 /// See [TryFromBlob](crate::blob::TryFromBlob) for the counterpart trait for blobs.
-pub trait TryFromValue<'a, S: ValueSchema>: Sized {
+pub trait TryFromInline<'a, S: InlineSchema>: Sized {
     /// The error type returned when the conversion fails.
     type Error;
-    /// Convert the [Value] with a specific schema type to the Rust type.
-    fn try_from_value(v: &'a Value<S>) -> Result<Self, Self::Error>;
+    /// Convert the [Inline] with a specific schema type to the Rust type.
+    fn try_from_inline(v: &'a Inline<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: ValueSchema> IntoSchema<S> for Value<S> {
-    type Form = Value<S>;
-    fn into_schema(self) -> Value<S> {
+impl<S: InlineSchema> IntoSchema<S> for Inline<S> {
+    type Form = Inline<S>;
+    fn into_schema(self) -> Inline<S> {
         self
     }
 }
 
-impl<S: ValueSchema> IntoSchema<S> for &Value<S> {
-    type Form = Value<S>;
-    fn into_schema(self) -> Value<S> {
+impl<S: InlineSchema> IntoSchema<S> for &Inline<S> {
+    type Form = Inline<S>;
+    fn into_schema(self) -> Inline<S> {
         *self
     }
 }
 
-impl<'a, S: ValueSchema> TryFromValue<'a, S> for Value<S> {
+impl<'a, S: InlineSchema> TryFromInline<'a, S> for Inline<S> {
     type Error = std::convert::Infallible;
-    fn try_from_value(v: &'a Value<S>) -> Result<Self, std::convert::Infallible> {
+    fn try_from_inline(v: &'a Inline<S>) -> Result<Self, std::convert::Infallible> {
         Ok(*v)
     }
 }
 
-impl<'a, S: ValueSchema> TryFromValue<'a, S> for () {
+impl<'a, S: InlineSchema> TryFromInline<'a, S> for () {
     type Error = std::convert::Infallible;
-    fn try_from_value(_v: &'a Value<S>) -> Result<Self, std::convert::Infallible> {
+    fn try_from_inline(_v: &'a Inline<S>) -> Result<Self, std::convert::Infallible> {
         Ok(())
     }
 }

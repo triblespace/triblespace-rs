@@ -6,24 +6,24 @@ use triblespace::core::blob::{Blob, MemoryBlobStore};
 use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::{reachable, transfer, BlobStoreGet};
 use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::core::value::VALUE_LEN;
+use triblespace::core::value::INLINE_LEN;
 
 #[test]
 fn reachable_keep_and_transfer() {
     let mut source = MemoryBlobStore::new();
 
     // Insert a child blob that will be referenced by the root.
-    let child_blob = Blob::<UnknownBlob>::new(Bytes::from(vec![1u8; VALUE_LEN * 2]));
+    let child_blob = Blob::<UnknownBlob>::new(Bytes::from(vec![1u8; INLINE_LEN * 2]));
     let child_handle = source.insert(child_blob);
 
     // Insert an orphan blob that should be dropped by keep.
-    let orphan_blob = Blob::<UnknownBlob>::new(Bytes::from(vec![2u8; VALUE_LEN * 2]));
+    let orphan_blob = Blob::<UnknownBlob>::new(Bytes::from(vec![2u8; INLINE_LEN * 2]));
     let orphan_handle = source.insert(orphan_blob);
 
     // Root blob references the child handle in its first 32-byte slot.
-    let mut root_bytes = Vec::with_capacity(VALUE_LEN * 2);
+    let mut root_bytes = Vec::with_capacity(INLINE_LEN * 2);
     root_bytes.extend_from_slice(&child_handle.raw);
-    root_bytes.extend_from_slice(&[0u8; VALUE_LEN]);
+    root_bytes.extend_from_slice(&[0u8; INLINE_LEN]);
     let root_blob = Blob::<UnknownBlob>::new(Bytes::from(root_bytes));
     let root_handle = source.insert(root_blob);
 

@@ -4,7 +4,7 @@ pub mod query {
     use crate::query::Constraint;
     use crate::query::VariableId;
     use crate::query::VariableSet;
-    use crate::value::RawValue;
+    use crate::value::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -32,12 +32,12 @@ pub mod query {
             self.constraint.estimate(variable, binding)
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
             self.record.borrow_mut().push(variable);
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
             self.constraint.confirm(variable, binding, proposals);
         }
 
@@ -86,11 +86,11 @@ pub mod query {
             self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
             self.constraint.confirm(variable, binding, proposals);
         }
 

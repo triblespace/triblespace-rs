@@ -9,11 +9,11 @@ use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::RawValue;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -21,7 +21,7 @@ use crate::value::ValueSchema;
 /// trait (`.has(variable)`). Proposals enumerate every key in the map;
 /// confirmations retain only proposals whose key exists. Accepts
 /// `&HashMap<K,V>`, `Rc<HashMap<K,V>>`, and `Arc<HashMap<K,V>>`.
-pub struct KeysConstraint<S: ValueSchema, R, K, V>
+pub struct KeysConstraint<S: InlineSchema, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
 {
@@ -29,7 +29,7 @@ where
     map: R,
 }
 
-impl<S: ValueSchema, R, K, V> KeysConstraint<S, R, K, V>
+impl<S: InlineSchema, R, K, V> KeysConstraint<S, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
 {
@@ -39,10 +39,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
+impl<'a, S: InlineSchema, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b K: IntoValue<S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b K: IntoInline<S>,
     V: 'a,
     R: Deref<Target = HashMap<K, V>>,
 {
@@ -59,17 +59,17 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
-            proposals.extend(self.map.keys().map(|k| IntoValue::to_value(k).raw));
+            proposals.extend(self.map.keys().map(|k| IntoInline::to_inline(k).raw));
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             proposals.retain(|v| {
-                self.map.contains_key(&match TryFromValue::try_from_value(
-                    Value::<S>::as_transmute_raw(v),
+                self.map.contains_key(&match TryFromInline::try_from_inline(
+                    Inline::<S>::as_transmute_raw(v),
                 ) {
                     Ok(v) => v,
                     Err(_) => return false,
@@ -79,10 +79,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for &'a HashMap<K, V>
+impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for &'a HashMap<K, V>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b K: IntoValue<S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b K: IntoInline<S>,
     V: 'a,
 {
     type Constraint = KeysConstraint<S, Self, K, V>;
@@ -92,10 +92,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for Rc<HashMap<K, V>>
+impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for Rc<HashMap<K, V>>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b K: IntoValue<S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b K: IntoInline<S>,
     V: 'a,
 {
     type Constraint = KeysConstraint<S, Self, K, V>;
@@ -105,10 +105,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for Arc<HashMap<K, V>>
+impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for Arc<HashMap<K, V>>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b K: IntoValue<S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b K: IntoInline<S>,
     V: 'a,
 {
     type Constraint = KeysConstraint<S, Self, K, V>;

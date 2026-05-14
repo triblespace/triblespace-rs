@@ -33,11 +33,11 @@ the same invariants:
    Callers combine with `and!` / `or!` / filters in the normal
    query engine; ordering is done in Rust after `.collect()`.
 
-## Term is a `Value`
+## Term is a `Inline`
 
 BM25 in `triblespace-search` is not text-specific. Callers supply
-terms as 32-byte `Value`s; the library provides a
-`hash_tokens(&str) -> Vec<Value>` helper that Blake3-hashes
+terms as 32-byte `Inline`s; the library provides a
+`hash_tokens(&str) -> Vec<Inline>` helper that Blake3-hashes
 tokenized words but never forces it on the schema. Downstream uses:
 
 | Term source                       | What this gets you                    |
@@ -48,7 +48,7 @@ tokenized words but never forces it on the schema. Downstream uses:
 | `hash(n-gram)`                    | Phrase search via query rewrite.      |
 | fragment `Id`                     | "Docs citing this fragment."          |
 
-The BM25 index is therefore a general `(doc: Id, term: Value, score)`
+The BM25 index is therefore a general `(doc: Id, term: Inline, score)`
 relation with IDF and length-normalized scoring baked in at build
 time.
 
@@ -80,8 +80,8 @@ A breaking format change mints a new schema id.
                                         ; (sorted, deduped) + DACs-byte
                                         ; codes, one per unique key.
                                         ; `keys.access(code)` decodes
-                                        ; the 32-byte RawValue.
-[terms               ] n_terms × 32 B  ; sorted RawValue table
+                                        ; the 32-byte RawInline.
+[terms               ] n_terms × 32 B  ; sorted RawInline table
 [doc_lens            ] variable         ; jerky CompactVector body
                                         ; width = ceil(log2(max_len + 1))
                                         ; indexed by universe-code order
@@ -163,7 +163,7 @@ Lookup algorithm:
   docs with correlated keys; ~0.01×–0.02× improvement at 50 k
   because postings dominate the denominator.
 - The architectural win is type-level: `keys.access(code)` goes
-  through the same universe plumbing as every other `Value`
+  through the same universe plumbing as every other `Inline`
   table in the stack; range / prefix / membership queries over
   the keys universe compose for free.
 ### Open compression directions
@@ -208,7 +208,7 @@ is the identity — no in-blob magic or version.
   graph_offsets_meta      32 B   ; CompactVectorMetaOnDisk
   (section_offset, section_len) × 3 = 48 B
 
-[handles             ] n_nodes × 32 B          ; Value<Handle<Embedding>>
+[handles             ] n_nodes × 32 B          ; Inline<Handle<Embedding>>
                                                ; — the node IS the handle;
                                                ; no separate doc-key table.
 [graph_bytes         ] variable                ; two CompactVectors in one
@@ -257,7 +257,7 @@ the bit-packed graph; see
 ### Handle-keyed storage (shipped for both FlatIndex and HNSW)
 
 Both `FlatIndex` and `SuccinctHNSWIndex` store a flat table of
-`Value<Handle<Embedding>>` (32 B per handle). There is
+`Inline<Handle<Embedding>>` (32 B per handle). There is
 no separate "doc key" table — the node IS the handle. Callers
 who want a book-id → embedding-handle mapping keep it as a
 trible attribute they own (`book_embedding` in the examples),
@@ -333,7 +333,7 @@ BM25 binds `doc` only — `matches(doc, &terms, score_floor)` is
 a single-variable filter; ranking happens in Rust via
 `idx.score(&doc, terms)` after `.collect()`. HNSW similarity
 is a binary `similar(a, b, score_floor)` relation over
-`Value<Handle<Embedding>>` variables (see
+`Inline<Handle<Embedding>>` variables (see
 `docs/QUERY_ENGINE_INTEGRATION.md`). Ordering is operational —
 callers collect the iterator and slice.
 
@@ -341,7 +341,7 @@ callers collect the iterator and slice.
 
 | Concern                       | Crate                   |
 | :---------------------------- | :---------------------- |
-| `Value`, `Id`, `TribleSet`    | triblespace             |
+| `Inline`, `Id`, `TribleSet`    | triblespace             |
 | Blob byte buffers (mmap)      | anybytes                |
 | Succinct primitives           | jerky                   |
 | BlobSchema + constraints      | **triblespace-search**  |
@@ -427,7 +427,7 @@ Left uncompressed.
 ### BM25 — build time
 
 Build is O(total postings) with hashmap bookkeeping: `18 M`
-insertions into the `HashMap<RawValue, HashMap<u32, u32>>` tf
+insertions into the `HashMap<RawInline, HashMap<u32, u32>>` tf
 table, then a sort over 300 k term hashes (32-byte compare).
 On current laptop hardware:
 - Hash-tokenize 100 k fragments × 180 tokens ≈ 18 M Blake3 hashes.
@@ -480,7 +480,7 @@ that references them. The HNSW blob only carries the handles
 table and the graph:
 
 - `handles`: 100 k × 32 B = **3.2 MiB** (one
-  `Value<Handle<Embedding>>` per node, the sole
+  `Inline<Handle<Embedding>>` per node, the sole
   per-node table)
 - graph `neighbours`: ~1 M directed edges (average `M`
   neighbours per node plus layer-0 fill-in with `M0 = 32`),

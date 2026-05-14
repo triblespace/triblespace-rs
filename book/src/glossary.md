@@ -6,7 +6,7 @@ relate to one another in TribleSpace.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
-middle position in a trible and carry the `ValueSchema` (or blob-handle schema)
+middle position in a trible and carry the `InlineSchema` (or blob-handle schema)
 that interprets and validates the value. Modules mint them with the
 `attributes!` macro, so they behave like detached struct fields: each attribute
 remains independently typed even when many are combined to describe the same
@@ -118,7 +118,7 @@ traversal across commits while enforcing signatures and branch ownership.
 The set of attribute declarations and codecs that document and enforce the shape
 of data in TribleSpace. Schemas assign language-agnostic meaning to the raw
 bytes—they are not the concrete Rust types—so any implementation that
-understands the schema can interpret the payloads consistently. Value schemas
+understands the schema can interpret the payloads consistently. Inline schemas
 map the fixed 32-byte payload of a trible to native types, while blob schemas
 describe arbitrarily long payloads so tribles referencing those blobs stay
 portable.
@@ -151,7 +151,7 @@ The overall storage model that organises tribles across blobs, PATCHes, and
 repositories. It emphasises immutable, content-addressed data, monotonic set
 semantics, and familiar repository workflows.
 
-### Value
+### Inline
 The third position in a trible. Values store a fixed 32-byte payload interpreted
 through the attribute’s schema. They often embed identifiers for related
 entities or handles referencing larger blobs.

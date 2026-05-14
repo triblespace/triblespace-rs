@@ -4,11 +4,11 @@
 //! macro can't apply an attribute-specific schema cast to the
 //! value. To prevent users from accidentally misinterpreting the
 //! result bytes, the macro requires the value variable to be
-//! typed `Variable<UnknownValue>` and emits a compile-time type
+//! typed `Variable<UnknownInline>` and emits a compile-time type
 //! assertion that fails to compile if the user picks any other
 //! schema. The bytes come back as opaque 32-byte handles; turning
 //! them into something typed is an explicit
-//! `try_from_value::<RealSchema>()` step the receiver makes
+//! `try_from_inline::<RealSchema>()` step the receiver makes
 //! at the use site, where they know which predicate's bytes
 //! they're holding.
 //!
@@ -44,10 +44,10 @@ fn free_attribute_enumerates_predicates_for_fixed_entity() {
 
     // Free-attribute pattern: ask for every (predicate, value) on
     // alice. The receiver gets the predicate Id and an opaque
-    // UnknownValue for each pair.
+    // UnknownInline for each pair.
     let mut seen: HashSet<Id> = HashSet::new();
     for (attr, _val) in find!(
-        (attr: Id, val: Value<UnknownValue>),
+        (attr: Id, val: Inline<UnknownInline>),
         pattern!(&set, [{ alice.id @ ?attr: ?val }])
     ) {
         seen.insert(attr);
@@ -75,7 +75,7 @@ fn free_attribute_filters_with_external_predicate_check() {
 
     let excluded = [ns::friend.id()];
     let kept: Vec<Id> = find!(
-        (attr: Id, val: Value<UnknownValue>),
+        (attr: Id, val: Inline<UnknownInline>),
         pattern!(&set, [{ alice.id @ ?attr: ?val }])
     )
     .map(|(attr, _val)| attr)
@@ -101,7 +101,7 @@ fn free_attribute_with_free_entity_enumerates_full_index() {
     set += entity! { &bob   @ ns::name: "bob" };
 
     let triples: Vec<(Id, Id)> = find!(
-        (e: Id, a: Id, v: Value<UnknownValue>),
+        (e: Id, a: Id, v: Inline<UnknownInline>),
         pattern!(&set, [{ ?e @ ?a: ?v }])
     )
     .map(|(e, a, _v)| (e, a))
@@ -112,17 +112,17 @@ fn free_attribute_with_free_entity_enumerates_full_index() {
 
 #[test]
 fn free_attribute_value_is_byte_addressable() {
-    // The value comes back as `Value<UnknownValue>` — 32 raw
+    // The value comes back as `Inline<UnknownInline>` — 32 raw
     // bytes. We can compare bytes with a known schema value to
     // confirm the lookup is faithful.
     let mut set = TribleSet::new();
     let alice = fucid();
     set += entity! { &alice @ ns::name: "alice" };
 
-    let expected: Value<ShortString> = ShortString::value_from("alice".to_string());
-    let mut found: Option<Value<UnknownValue>> = None;
+    let expected: Inline<ShortString> = ShortString::inline_from("alice".to_string());
+    let mut found: Option<Inline<UnknownInline>> = None;
     for (_attr, val) in find!(
-        (attr: Id, val: Value<UnknownValue>),
+        (attr: Id, val: Inline<UnknownInline>),
         pattern!(&set, [{ alice.id @ ?attr: ?val }])
     ) {
         found = Some(val);
@@ -134,17 +134,17 @@ fn free_attribute_value_is_byte_addressable() {
 #[test]
 fn local_free_attribute_with_projected_value() {
     // `_?attr` (pattern-local) in the attribute slot is supported
-    // when the value is a projected `Variable<UnknownValue>`.
+    // when the value is a projected `Variable<UnknownInline>`.
     // Local helper vars in the value slot of a free-attr pattern
     // are not supported (no schema can be inferred); use `?val`
-    // (a find!-projected Variable<UnknownValue>) instead.
+    // (a find!-projected Variable<UnknownInline>) instead.
     let mut set = TribleSet::new();
     let alice = fucid();
     let bob = fucid();
     set += entity! { &alice @ ns::name: "alice", ns::friend: &bob };
 
-    let rows: Vec<Value<UnknownValue>> = find!(
-        (val: Value<UnknownValue>),
+    let rows: Vec<Inline<UnknownInline>> = find!(
+        (val: Inline<UnknownInline>),
         pattern!(&set, [{ alice.id @ _?a: ?val }])
     )
     .map(|(v,)| v)

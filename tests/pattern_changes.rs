@@ -26,7 +26,7 @@ fn pattern_changes_finds_new_inserts() {
     let delta = updated.difference(&base);
 
     let results: Vec<_> = find!(
-        (author: Value<_>, book: Value<_>, title: Value<_>),
+        (author: Inline<_>, book: Inline<_>, title: Inline<_>),
         pattern_changes!(&updated, &delta, [
             { ?author @ literature::firstname: "William", literature::lastname: "Shakespeare" },
             { ?book @ literature::author: ?author, literature::title: ?title }
@@ -37,9 +37,9 @@ fn pattern_changes_finds_new_inserts() {
     assert_eq!(
         results,
         vec![(
-            shakespeare.to_value(),
-            hamlet.to_value(),
-            "Hamlet".to_value(),
+            shakespeare.to_inline(),
+            hamlet.to_inline(),
+            "Hamlet".to_inline(),
         )]
     );
 }
@@ -53,7 +53,7 @@ fn pattern_changes_empty_delta_returns_no_matches() {
     let delta = TribleSet::new();
 
     let results: Vec<_> = find!(
-        (a: Value<_>),
+        (a: Inline<_>),
         pattern_changes!(&kb, &delta, [
             { ?a @ literature::lastname: "Shakespeare" }
         ])

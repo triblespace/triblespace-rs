@@ -7,10 +7,10 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 use std::num::TryFromIntError;
 
@@ -61,7 +61,7 @@ impl MetaDescribe for U256LE {
         tribles
     }
 }
-impl ValueSchema for U256LE {
+impl InlineSchema for U256LE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -90,7 +90,7 @@ impl MetaDescribe for U256BE {
         tribles
     }
 }
-impl ValueSchema for U256BE {
+impl InlineSchema for U256BE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -119,7 +119,7 @@ impl MetaDescribe for I256LE {
         tribles
     }
 }
-impl ValueSchema for I256LE {
+impl InlineSchema for I256LE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -148,7 +148,7 @@ impl MetaDescribe for I256BE {
         tribles
     }
 }
-impl ValueSchema for I256BE {
+impl InlineSchema for I256BE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -399,203 +399,203 @@ mod wasm_formatter {
 }
 
 impl IntoSchema<U256BE> for ethnum::U256 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(self.to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(self.to_be_bytes())
     }
 }
 
-impl TryFromValue<'_, U256BE> for ethnum::U256 {
+impl TryFromInline<'_, U256BE> for ethnum::U256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<U256BE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<U256BE>) -> Result<Self, Infallible> {
         Ok(ethnum::U256::from_be_bytes(v.raw))
     }
 }
 
 impl IntoSchema<U256LE> for ethnum::U256 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(self.to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(self.to_le_bytes())
     }
 }
 
-impl TryFromValue<'_, U256LE> for ethnum::U256 {
+impl TryFromInline<'_, U256LE> for ethnum::U256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<U256LE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<U256LE>) -> Result<Self, Infallible> {
         Ok(ethnum::U256::from_le_bytes(v.raw))
     }
 }
 
 impl IntoSchema<I256BE> for ethnum::I256 {
-    type Form = Value<I256BE>;
-    fn into_schema(self) -> Value<I256BE> {
-        Value::new(self.to_be_bytes())
+    type Form = Inline<I256BE>;
+    fn into_schema(self) -> Inline<I256BE> {
+        Inline::new(self.to_be_bytes())
     }
 }
 
-impl TryFromValue<'_, I256BE> for ethnum::I256 {
+impl TryFromInline<'_, I256BE> for ethnum::I256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<I256BE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<I256BE>) -> Result<Self, Infallible> {
         Ok(ethnum::I256::from_be_bytes(v.raw))
     }
 }
 
 impl IntoSchema<I256LE> for ethnum::I256 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(self.to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(self.to_le_bytes())
     }
 }
 
-impl TryFromValue<'_, I256LE> for ethnum::I256 {
+impl TryFromInline<'_, I256LE> for ethnum::I256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<I256LE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<I256LE>) -> Result<Self, Infallible> {
         Ok(ethnum::I256::from_le_bytes(v.raw))
     }
 }
 
 impl IntoSchema<U256LE> for u8 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(ethnum::U256::new(self.into()).to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u16 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(ethnum::U256::new(self.into()).to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u32 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(ethnum::U256::new(self.into()).to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u64 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(ethnum::U256::new(self.into()).to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u128 {
-    type Form = Value<U256LE>;
-    fn into_schema(self) -> Value<U256LE> {
-        Value::new(ethnum::U256::new(self).to_le_bytes())
+    type Form = Inline<U256LE>;
+    fn into_schema(self) -> Inline<U256LE> {
+        Inline::new(ethnum::U256::new(self).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u8 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(ethnum::U256::new(self.into()).to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u16 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(ethnum::U256::new(self.into()).to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u32 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(ethnum::U256::new(self.into()).to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u64 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(ethnum::U256::new(self.into()).to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u128 {
-    type Form = Value<U256BE>;
-    fn into_schema(self) -> Value<U256BE> {
-        Value::new(ethnum::U256::new(self).to_be_bytes())
+    type Form = Inline<U256BE>;
+    fn into_schema(self) -> Inline<U256BE> {
+        Inline::new(ethnum::U256::new(self).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i8 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(ethnum::I256::new(self.into()).to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i16 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(ethnum::I256::new(self.into()).to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i32 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(ethnum::I256::new(self.into()).to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i64 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(ethnum::I256::new(self.into()).to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i128 {
-    type Form = Value<I256LE>;
-    fn into_schema(self) -> Value<I256LE> {
-        Value::new(ethnum::I256::new(self).to_le_bytes())
+    type Form = Inline<I256LE>;
+    fn into_schema(self) -> Inline<I256LE> {
+        Inline::new(ethnum::I256::new(self).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i8 {
-    type Form = Value<I256BE>;
-    fn into_schema(self) -> Value<I256BE> {
-        Value::new(ethnum::I256::new(self.into()).to_be_bytes())
+    type Form = Inline<I256BE>;
+    fn into_schema(self) -> Inline<I256BE> {
+        Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i32 {
-    type Form = Value<I256BE>;
-    fn into_schema(self) -> Value<I256BE> {
-        Value::new(ethnum::I256::new(self.into()).to_be_bytes())
+    type Form = Inline<I256BE>;
+    fn into_schema(self) -> Inline<I256BE> {
+        Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i64 {
-    type Form = Value<I256BE>;
-    fn into_schema(self) -> Value<I256BE> {
-        Value::new(ethnum::I256::new(self.into()).to_be_bytes())
+    type Form = Inline<I256BE>;
+    fn into_schema(self) -> Inline<I256BE> {
+        Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i128 {
-    type Form = Value<I256BE>;
-    fn into_schema(self) -> Value<I256BE> {
-        Value::new(ethnum::I256::new(self).to_be_bytes())
+    type Form = Inline<I256BE>;
+    fn into_schema(self) -> Inline<I256BE> {
+        Inline::new(ethnum::I256::new(self).to_be_bytes())
     }
 }
 
-// --- Narrowing TryFromValue impls (U256 → native integers) ---
+// --- Narrowing TryFromInline impls (U256 → native integers) ---
 
 macro_rules! impl_try_from_u256 {
     ($schema:ty, $wide:ty, $($narrow:ty),+) => {
         $(
-            impl TryFromValue<'_, $schema> for $narrow {
+            impl TryFromInline<'_, $schema> for $narrow {
                 type Error = TryFromIntError;
-                fn try_from_value(v: &Value<$schema>) -> Result<Self, Self::Error> {
-                    let wide: $wide = v.from_value();
+                fn try_from_inline(v: &Inline<$schema>) -> Result<Self, Self::Error> {
+                    let wide: $wide = v.from_inline();
                     <$narrow>::try_from(wide)
                 }
             }
@@ -611,7 +611,7 @@ impl_try_from_u256!(I256LE, ethnum::I256, i8, i16, i32, i64, i128);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoValue, TryFromValue};
+    use crate::value::{IntoInline, TryFromInline};
     use proptest::prelude::*;
 
     fn arb_u256() -> impl Strategy<Value = ethnum::U256> {
@@ -627,70 +627,70 @@ mod tests {
     proptest! {
         #[test]
         fn u256be_ethnum_roundtrip(input in arb_u256()) {
-            let value: Value<U256BE> = input.to_value();
-            let output: ethnum::U256 = value.from_value();
+            let value: Inline<U256BE> = input.to_inline();
+            let output: ethnum::U256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_u128_roundtrip(input: u128) {
-            let value: Value<U256BE> = input.to_value();
-            let output = u128::try_from_value(&value).expect("fits in u128");
+            let value: Inline<U256BE> = input.to_inline();
+            let output = u128::try_from_inline(&value).expect("fits in u128");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_u64_roundtrip(input: u64) {
-            let value: Value<U256BE> = input.to_value();
-            let output = u64::try_from_value(&value).expect("fits in u64");
+            let value: Inline<U256BE> = input.to_inline();
+            let output = u64::try_from_inline(&value).expect("fits in u64");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_u32_roundtrip(input: u32) {
-            let value: Value<U256BE> = input.to_value();
-            let output = u32::try_from_value(&value).expect("fits in u32");
+            let value: Inline<U256BE> = input.to_inline();
+            let output = u32::try_from_inline(&value).expect("fits in u32");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_u16_roundtrip(input: u16) {
-            let value: Value<U256BE> = input.to_value();
-            let output = u16::try_from_value(&value).expect("fits in u16");
+            let value: Inline<U256BE> = input.to_inline();
+            let output = u16::try_from_inline(&value).expect("fits in u16");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_u8_roundtrip(input: u8) {
-            let value: Value<U256BE> = input.to_value();
-            let output = u8::try_from_value(&value).expect("fits in u8");
+            let value: Inline<U256BE> = input.to_inline();
+            let output = u8::try_from_inline(&value).expect("fits in u8");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256be_validates(input in arb_u256()) {
-            let value: Value<U256BE> = input.to_value();
+            let value: Inline<U256BE> = input.to_inline();
             prop_assert!(U256BE::validate(value).is_ok());
         }
 
         #[test]
         fn u256be_order_preservation(a in arb_u256(), b in arb_u256()) {
-            let va: Value<U256BE> = a.to_value();
-            let vb: Value<U256BE> = b.to_value();
+            let va: Inline<U256BE> = a.to_inline();
+            let vb: Inline<U256BE> = b.to_inline();
             prop_assert_eq!(a.cmp(&b), va.raw.cmp(&vb.raw));
         }
 
         #[test]
         fn u256be_widening_u64_u128(input: u64) {
-            let v64: Value<U256BE> = input.to_value();
-            let v128: Value<U256BE> = (input as u128).to_value();
+            let v64: Inline<U256BE> = input.to_inline();
+            let v128: Inline<U256BE> = (input as u128).to_inline();
             prop_assert_eq!(v64.raw, v128.raw);
         }
 
         #[test]
         fn u256be_widening_u32_u128(input: u32) {
-            let v32: Value<U256BE> = input.to_value();
-            let v128: Value<U256BE> = (input as u128).to_value();
+            let v32: Inline<U256BE> = input.to_inline();
+            let v128: Inline<U256BE> = (input as u128).to_inline();
             prop_assert_eq!(v32.raw, v128.raw);
         }
 
@@ -698,35 +698,35 @@ mod tests {
 
         #[test]
         fn u256le_ethnum_roundtrip(input in arb_u256()) {
-            let value: Value<U256LE> = input.to_value();
-            let output: ethnum::U256 = value.from_value();
+            let value: Inline<U256LE> = input.to_inline();
+            let output: ethnum::U256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256le_u128_roundtrip(input: u128) {
-            let value: Value<U256LE> = input.to_value();
-            let output = u128::try_from_value(&value).expect("fits in u128");
+            let value: Inline<U256LE> = input.to_inline();
+            let output = u128::try_from_inline(&value).expect("fits in u128");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256le_u64_roundtrip(input: u64) {
-            let value: Value<U256LE> = input.to_value();
-            let output = u64::try_from_value(&value).expect("fits in u64");
+            let value: Inline<U256LE> = input.to_inline();
+            let output = u64::try_from_inline(&value).expect("fits in u64");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn u256le_validates(input in arb_u256()) {
-            let value: Value<U256LE> = input.to_value();
+            let value: Inline<U256LE> = input.to_inline();
             prop_assert!(U256LE::validate(value).is_ok());
         }
 
         #[test]
         fn u256_le_and_be_differ(input in arb_u256().prop_filter("non-zero", |v| *v != ethnum::U256::ZERO)) {
-            let le_val: Value<U256LE> = input.to_value();
-            let be_val: Value<U256BE> = input.to_value();
+            let le_val: Inline<U256LE> = input.to_inline();
+            let be_val: Inline<U256BE> = input.to_inline();
             prop_assert_ne!(le_val.raw, be_val.raw);
         }
 
@@ -734,42 +734,42 @@ mod tests {
 
         #[test]
         fn i256be_ethnum_roundtrip(input in arb_i256()) {
-            let value: Value<I256BE> = input.to_value();
-            let output: ethnum::I256 = value.from_value();
+            let value: Inline<I256BE> = input.to_inline();
+            let output: ethnum::I256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256be_i128_roundtrip(input: i128) {
-            let value: Value<I256BE> = input.to_value();
-            let output = i128::try_from_value(&value).expect("fits in i128");
+            let value: Inline<I256BE> = input.to_inline();
+            let output = i128::try_from_inline(&value).expect("fits in i128");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256be_i64_roundtrip(input: i64) {
-            let value: Value<I256BE> = input.to_value();
-            let output = i64::try_from_value(&value).expect("fits in i64");
+            let value: Inline<I256BE> = input.to_inline();
+            let output = i64::try_from_inline(&value).expect("fits in i64");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256be_i32_roundtrip(input: i32) {
-            let value: Value<I256BE> = input.to_value();
-            let output = i32::try_from_value(&value).expect("fits in i32");
+            let value: Inline<I256BE> = input.to_inline();
+            let output = i32::try_from_inline(&value).expect("fits in i32");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256be_i8_roundtrip(input: i8) {
-            let value: Value<I256BE> = input.to_value();
-            let output = i8::try_from_value(&value).expect("fits in i8");
+            let value: Inline<I256BE> = input.to_inline();
+            let output = i8::try_from_inline(&value).expect("fits in i8");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256be_validates(input in arb_i256()) {
-            let value: Value<I256BE> = input.to_value();
+            let value: Inline<I256BE> = input.to_inline();
             prop_assert!(I256BE::validate(value).is_ok());
         }
 
@@ -780,35 +780,35 @@ mod tests {
 
         #[test]
         fn i256le_ethnum_roundtrip(input in arb_i256()) {
-            let value: Value<I256LE> = input.to_value();
-            let output: ethnum::I256 = value.from_value();
+            let value: Inline<I256LE> = input.to_inline();
+            let output: ethnum::I256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256le_i128_roundtrip(input: i128) {
-            let value: Value<I256LE> = input.to_value();
-            let output = i128::try_from_value(&value).expect("fits in i128");
+            let value: Inline<I256LE> = input.to_inline();
+            let output = i128::try_from_inline(&value).expect("fits in i128");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256le_i64_roundtrip(input: i64) {
-            let value: Value<I256LE> = input.to_value();
-            let output = i64::try_from_value(&value).expect("fits in i64");
+            let value: Inline<I256LE> = input.to_inline();
+            let output = i64::try_from_inline(&value).expect("fits in i64");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn i256le_validates(input in arb_i256()) {
-            let value: Value<I256LE> = input.to_value();
+            let value: Inline<I256LE> = input.to_inline();
             prop_assert!(I256LE::validate(value).is_ok());
         }
 
         #[test]
         fn i256_le_and_be_differ(input in arb_i256().prop_filter("non-zero", |v| *v != ethnum::I256::ZERO)) {
-            let le_val: Value<I256LE> = input.to_value();
-            let be_val: Value<I256BE> = input.to_value();
+            let le_val: Inline<I256LE> = input.to_inline();
+            let be_val: Inline<I256BE> = input.to_inline();
             prop_assert_ne!(le_val.raw, be_val.raw);
         }
     }
@@ -818,21 +818,21 @@ mod tests {
     #[test]
     fn u256be_narrowing_overflow() {
         let input = ethnum::U256::from(u128::MAX) + ethnum::U256::ONE;
-        let value: Value<U256BE> = input.to_value();
-        assert!(u128::try_from_value(&value).is_err());
+        let value: Inline<U256BE> = input.to_inline();
+        assert!(u128::try_from_inline(&value).is_err());
     }
 
     #[test]
     fn i256be_narrowing_overflow_positive() {
         let input = ethnum::I256::from(i128::MAX) + ethnum::I256::ONE;
-        let value: Value<I256BE> = input.to_value();
-        assert!(i128::try_from_value(&value).is_err());
+        let value: Inline<I256BE> = input.to_inline();
+        assert!(i128::try_from_inline(&value).is_err());
     }
 
     #[test]
     fn i256be_narrowing_overflow_negative() {
         let input = ethnum::I256::from(i128::MIN) - ethnum::I256::ONE;
-        let value: Value<I256BE> = input.to_value();
-        assert!(i128::try_from_value(&value).is_err());
+        let value: Inline<I256BE> = input.to_inline();
+        assert!(i128::try_from_inline(&value).is_err());
     }
 }

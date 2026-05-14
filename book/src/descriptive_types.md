@@ -28,7 +28,7 @@ Reading the chapter sequentially should equip you to:
 - entity! constructs ad‑hoc entities (like struct literals).
 - Reified kinds/tags are attached via metadata::tag (GenId); projects often
   export canonical KIND_* constants you can pattern-match directly against.
-- Value schema entities are tagged with metadata::KIND_VALUE_SCHEMA; blob schema
+- Inline schema entities are tagged with metadata::KIND_VALUE_SCHEMA; blob schema
   entities with metadata::KIND_BLOB_SCHEMA.
 - Prefer passing the Workspace + the checkout result (TribleSet) and an
   entity id around — only materialize a concrete Rust view when required.
@@ -190,7 +190,7 @@ fn handle_plan_update(ws: &mut Workspace<Pile>, plan_id: Id) -> io::Result<()> {
     {
         // The returned tuple is already typed. Convert to an owned String only if
         // external APIs demand ownership.
-        process_title(title.from_value::<&str>());
+        process_title(title.from_inline::<&str>());
     }
 
     Ok(())
@@ -216,7 +216,7 @@ fn load_plan_summary<'a>(ws: &'a mut Workspace<Pile>, plan_id: Id) -> io::Result
     .next()
     .map(|(title,)| PlanSummary {
         id: plan_id,
-        title: title.from_value::<&str>(),
+        title: title.from_inline::<&str>(),
     }))
 }
 ```
@@ -234,7 +234,7 @@ typed View API which returns a borrowed &str without copying when possible.
 ```rust,ignore
 let view = ws
     .get::<View<str>, LongString>(handle)
-    .map_err(|e| ...)?; // `handle` is a Value<Handle<LongString>>
+    .map_err(|e| ...)?; // `handle` is a Inline<Handle<LongString>>
 let s: &str = view.as_ref(); // zero-copy view tied to the workspace lifetime
 // If you need an owned String: let owned = view.to_string();
 ```
@@ -298,7 +298,7 @@ repo.push(&mut ws)?;
 - Don't create ephemeral Repository instances every time you need to read or
   write data. Instead, own a long-lived Repository in a manager and expose
   workspace-opening helpers.
-- Don't explicitly convert Values via from_value/to_value; use typed `find!`
+- Don't explicitly convert Values via from_inline/to_inline; use typed `find!`
   patterns `find!((field: <field_type>), ...)` and
   `ws.get::<View<...>, _>(handle)` for blob reads.
 - Don't create helper functions for queries, use `find!` patterns directly in

@@ -26,7 +26,7 @@ use anybytes::area::ByteArea;
 use triblespace_core::blob::{BlobCache, MemoryBlobStore};
 use triblespace_core::repo::BlobStore;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::ring::RingGraph;
@@ -285,7 +285,7 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
     println!("\n── n = {n}   dim = {dim}   k = {k}   ef = {ef} ──");
 
     let (naive, mut store) = build_hnsw(n, dim, seed);
-    let handles: Vec<Value<Handle<Embedding>>> = naive.handles().to_vec();
+    let handles: Vec<Inline<Handle<Embedding>>> = naive.handles().to_vec();
     let entry = naive.entry_point().expect("non-empty");
     let max_level = naive.max_level();
     // Sanity: a realistic HNSW index at 10k-100k sits on

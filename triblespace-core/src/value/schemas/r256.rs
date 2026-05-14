@@ -7,10 +7,10 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -65,7 +65,7 @@ impl MetaDescribe for R256LE {
         tribles
     }
 }
-impl ValueSchema for R256LE {
+impl InlineSchema for R256LE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -141,7 +141,7 @@ mod wasm_formatter {
         Ok(())
     }
 }
-impl ValueSchema for R256BE {
+impl InlineSchema for R256BE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -158,10 +158,10 @@ pub enum RatioError {
     ZeroDenominator,
 }
 
-impl TryFromValue<'_, R256BE> for Ratio<i128> {
+impl TryFromInline<'_, R256BE> for Ratio<i128> {
     type Error = RatioError;
 
-    fn try_from_value(v: &Value<R256BE>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<R256BE>) -> Result<Self, Self::Error> {
         let n = i128::from_be_bytes(v.raw[0..16].try_into().unwrap());
         let d = i128::from_be_bytes(v.raw[16..32].try_into().unwrap());
 
@@ -182,33 +182,33 @@ impl TryFromValue<'_, R256BE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256BE> for Ratio<i128> {
-    type Form = Value<R256BE>;
-    fn into_schema(self) -> Value<R256BE> {
+    type Form = Inline<R256BE>;
+    fn into_schema(self) -> Inline<R256BE> {
         let ratio = self.reduced();
 
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&ratio.numer().to_be_bytes());
         bytes[16..32].copy_from_slice(&ratio.denom().to_be_bytes());
 
-        Value::new(bytes)
+        Inline::new(bytes)
     }
 }
 
 impl IntoSchema<R256BE> for i128 {
-    type Form = Value<R256BE>;
-    fn into_schema(self) -> Value<R256BE> {
+    type Form = Inline<R256BE>;
+    fn into_schema(self) -> Inline<R256BE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_be_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_be_bytes());
 
-        Value::new(bytes)
+        Inline::new(bytes)
     }
 }
 
-impl TryFromValue<'_, R256LE> for Ratio<i128> {
+impl TryFromInline<'_, R256LE> for Ratio<i128> {
     type Error = RatioError;
 
-    fn try_from_value(v: &Value<R256LE>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<R256LE>) -> Result<Self, Self::Error> {
         let n = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
         let d = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
 
@@ -229,31 +229,31 @@ impl TryFromValue<'_, R256LE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256LE> for Ratio<i128> {
-    type Form = Value<R256LE>;
-    fn into_schema(self) -> Value<R256LE> {
+    type Form = Inline<R256LE>;
+    fn into_schema(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.numer().to_le_bytes());
         bytes[16..32].copy_from_slice(&self.denom().to_le_bytes());
 
-        Value::new(bytes)
+        Inline::new(bytes)
     }
 }
 
 impl IntoSchema<R256LE> for i128 {
-    type Form = Value<R256LE>;
-    fn into_schema(self) -> Value<R256LE> {
+    type Form = Inline<R256LE>;
+    fn into_schema(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_le_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_le_bytes());
 
-        Value::new(bytes)
+        Inline::new(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoValue, TryFromValue};
+    use crate::value::{IntoInline, TryFromInline};
     use num_rational::Ratio;
     use proptest::prelude::*;
 
@@ -270,31 +270,31 @@ mod tests {
 
         #[test]
         fn r256be_ratio_roundtrip(input in arb_ratio()) {
-            let value: Value<R256BE> = input.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256BE> = input.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn r256be_canonicalization(n: i128, d in any::<i128>().prop_filter("non-zero", |d| *d != 0)) {
             let ratio = Ratio::new(n, d);
-            let value: Value<R256BE> = ratio.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256BE> = ratio.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             // Output must be in reduced form
             prop_assert_eq!(output, output.reduced());
         }
 
         #[test]
         fn r256be_i128_roundtrip(input: i128) {
-            let value: Value<R256BE> = input.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256BE> = input.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             prop_assert_eq!(*output.numer(), input);
             prop_assert_eq!(*output.denom(), 1i128);
         }
 
         #[test]
         fn r256be_validates(input in arb_ratio()) {
-            let value: Value<R256BE> = input.to_value();
+            let value: Inline<R256BE> = input.to_inline();
             prop_assert!(R256BE::validate(value).is_ok());
         }
 
@@ -302,37 +302,37 @@ mod tests {
 
         #[test]
         fn r256le_ratio_roundtrip(input in arb_ratio()) {
-            let value: Value<R256LE> = input.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256LE> = input.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn r256le_canonicalization(n: i128, d in any::<i128>().prop_filter("non-zero", |d| *d != 0)) {
             let ratio = Ratio::new(n, d);
-            let value: Value<R256LE> = ratio.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256LE> = ratio.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             prop_assert_eq!(output, output.reduced());
         }
 
         #[test]
         fn r256le_i128_roundtrip(input: i128) {
-            let value: Value<R256LE> = input.to_value();
-            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            let value: Inline<R256LE> = input.to_inline();
+            let output = Ratio::<i128>::try_from_inline(&value).expect("valid ratio");
             prop_assert_eq!(*output.numer(), input);
             prop_assert_eq!(*output.denom(), 1i128);
         }
 
         #[test]
         fn r256le_validates(input in arb_ratio()) {
-            let value: Value<R256LE> = input.to_value();
+            let value: Inline<R256LE> = input.to_inline();
             prop_assert!(R256LE::validate(value).is_ok());
         }
 
         #[test]
         fn r256_le_and_be_differ(input in arb_ratio().prop_filter("non-trivial", |r| *r.numer() != 0)) {
-            let le_val: Value<R256LE> = input.to_value();
-            let be_val: Value<R256BE> = input.to_value();
+            let le_val: Inline<R256LE> = input.to_inline();
+            let be_val: Inline<R256BE> = input.to_inline();
             prop_assert_ne!(le_val.raw, be_val.raw);
         }
     }
@@ -344,8 +344,8 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0..16].copy_from_slice(&2i128.to_be_bytes());
         bytes[16..32].copy_from_slice(&4i128.to_be_bytes());
-        let value = Value::<R256BE>::new(bytes);
-        assert!(Ratio::<i128>::try_from_value(&value).is_err());
+        let value = Inline::<R256BE>::new(bytes);
+        assert!(Ratio::<i128>::try_from_inline(&value).is_err());
     }
 
     #[test]
@@ -353,9 +353,9 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0..16].copy_from_slice(&1i128.to_be_bytes());
         bytes[16..32].copy_from_slice(&0i128.to_be_bytes());
-        let value = Value::<R256BE>::new(bytes);
+        let value = Inline::<R256BE>::new(bytes);
         assert!(matches!(
-            Ratio::<i128>::try_from_value(&value),
+            Ratio::<i128>::try_from_inline(&value),
             Err(RatioError::ZeroDenominator)
         ));
     }
@@ -365,8 +365,8 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0..16].copy_from_slice(&6i128.to_le_bytes());
         bytes[16..32].copy_from_slice(&4i128.to_le_bytes());
-        let value = Value::<R256LE>::new(bytes);
-        assert!(Ratio::<i128>::try_from_value(&value).is_err());
+        let value = Inline::<R256LE>::new(bytes);
+        assert!(Ratio::<i128>::try_from_inline(&value).is_err());
     }
 
     #[test]
@@ -374,9 +374,9 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0..16].copy_from_slice(&1i128.to_le_bytes());
         bytes[16..32].copy_from_slice(&0i128.to_le_bytes());
-        let value = Value::<R256LE>::new(bytes);
+        let value = Inline::<R256LE>::new(bytes);
         assert!(matches!(
-            Ratio::<i128>::try_from_value(&value),
+            Ratio::<i128>::try_from_inline(&value),
             Err(RatioError::ZeroDenominator)
         ));
     }

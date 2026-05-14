@@ -70,7 +70,7 @@ impl TryFromBlob<UnknownBlob> for Bytes {
 }
 
 impl IntoSchema<UnknownBlob> for Bytes
-where crate::value::schemas::hash::Handle<UnknownBlob>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<UnknownBlob>: crate::value::InlineSchema,
 {
     type Form = Blob<UnknownBlob>;
     fn into_schema(self) -> Blob<UnknownBlob> {

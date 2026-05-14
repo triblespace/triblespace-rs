@@ -15,11 +15,11 @@ use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::schemas::hash::Hash;
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use super::signing::load_signing_key;
 
-type CommitHandle = Value<Handle<triblespace::prelude::blobschemas::SimpleArchive>>;
+type CommitHandle = Inline<Handle<triblespace::prelude::blobschemas::SimpleArchive>>;
 
 #[derive(Debug, Clone)]
 struct BranchInfo {
@@ -72,7 +72,7 @@ fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
             if name.is_some() {
                 bail!("branch {branch_id:X} has multiple name values");
             }
-            let handle: Value<Handle<LongString>> = *t.v();
+            let handle: Inline<Handle<LongString>> = *t.v();
             let view: View<str> = reader
                 .get(handle)
                 .map_err(|e| anyhow::anyhow!("branch name blob: {e:?}"))?;
@@ -89,8 +89,8 @@ fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
 }
 
 fn commit_hex(handle: CommitHandle) -> String {
-    let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
-    hash.from_value()
+    let hash: Inline<Hash<Blake3>> = Handle::to_hash(handle);
+    hash.from_inline()
 }
 
 pub fn run(

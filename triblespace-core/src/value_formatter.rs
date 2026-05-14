@@ -262,11 +262,11 @@ mod tests {
     use crate::trible::TribleSet;
     use crate::value::schemas::hash::Blake3;
     use crate::value::schemas::hash::Handle;
-    use crate::value::Value;
+    use crate::value::Inline;
 
-    fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Value<Handle<WasmCode>>> {
+    fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Inline<Handle<WasmCode>>> {
         for (schema_id, handle) in find!(
-            (schema_id: Id, handle: Value<Handle<WasmCode>>),
+            (schema_id: Id, handle: Inline<Handle<WasmCode>>),
             pattern!(space, [{ ?schema_id @ metadata::value_formatter: ?handle }])
         ) {
             if schema_id == schema {
@@ -347,9 +347,9 @@ mod tests {
         use crate::value::schemas::range::RangeInclusiveU128;
         use crate::value::schemas::range::RangeU128;
         use crate::value::schemas::shortstring::ShortString;
-        use crate::value::schemas::UnknownValue;
-        use crate::value::Value;
-        use crate::value::ValueSchema;
+        use crate::value::schemas::UnknownInline;
+        use crate::value::Inline;
+        use crate::value::InlineSchema;
 
         let mut bundle = crate::trible::Fragment::empty();
         bundle += Boolean::describe();
@@ -371,7 +371,7 @@ mod tests {
         bundle += ED25519RComponent::describe();
         bundle += ED25519SComponent::describe();
         bundle += ED25519PublicKey::describe();
-        bundle += UnknownValue::describe();
+        bundle += UnknownInline::describe();
         bundle += <Hash<Blake3> as MetaDescribe>::describe();
         bundle += <Handle<LongString> as MetaDescribe>::describe();
 
@@ -404,7 +404,7 @@ mod tests {
         let genid = formatter_for(GenId::id());
         assert_eq!(
             genid
-                .format_value_with_limits(&GenId::value_from(id).raw, limits)
+                .format_value_with_limits(&GenId::inline_from(id).raw, limits)
                 .unwrap(),
             "01".repeat(16)
         );
@@ -412,7 +412,7 @@ mod tests {
         let shortstring = formatter_for(ShortString::id());
         assert_eq!(
             shortstring
-                .format_value_with_limits(&ShortString::value_from("hi").raw, limits)
+                .format_value_with_limits(&ShortString::inline_from("hi").raw, limits)
                 .unwrap(),
             "hi"
         );
@@ -420,7 +420,7 @@ mod tests {
         let float64 = formatter_for(F64::id());
         assert_eq!(
             float64
-                .format_value_with_limits(&F64::value_from(1.5f64).raw, limits)
+                .format_value_with_limits(&F64::inline_from(1.5f64).raw, limits)
                 .unwrap(),
             "1.5"
         );
@@ -428,14 +428,14 @@ mod tests {
         let u256le = formatter_for(U256LE::id());
         assert_eq!(
             u256le
-                .format_value_with_limits(&U256LE::value_from(42u64).raw, limits)
+                .format_value_with_limits(&U256LE::inline_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
         let u256be = formatter_for(U256BE::id());
         assert_eq!(
             u256be
-                .format_value_with_limits(&U256BE::value_from(42u64).raw, limits)
+                .format_value_with_limits(&U256BE::inline_from(42u64).raw, limits)
                 .unwrap(),
             "42"
         );
@@ -443,14 +443,14 @@ mod tests {
         let i256le = formatter_for(I256LE::id());
         assert_eq!(
             i256le
-                .format_value_with_limits(&I256LE::value_from(-1i8).raw, limits)
+                .format_value_with_limits(&I256LE::inline_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
         let i256be = formatter_for(I256BE::id());
         assert_eq!(
             i256be
-                .format_value_with_limits(&I256BE::value_from(-1i8).raw, limits)
+                .format_value_with_limits(&I256BE::inline_from(-1i8).raw, limits)
                 .unwrap(),
             "-1"
         );
@@ -458,14 +458,14 @@ mod tests {
         let r256le = formatter_for(R256LE::id());
         assert_eq!(
             r256le
-                .format_value_with_limits(&R256LE::value_from(-3i128).raw, limits)
+                .format_value_with_limits(&R256LE::inline_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
         let r256be = formatter_for(R256BE::id());
         assert_eq!(
             r256be
-                .format_value_with_limits(&R256BE::value_from(-3i128).raw, limits)
+                .format_value_with_limits(&R256BE::inline_from(-3i128).raw, limits)
                 .unwrap(),
             "-3"
         );
@@ -473,7 +473,7 @@ mod tests {
         let range_u128 = formatter_for(RangeU128::id());
         assert_eq!(
             range_u128
-                .format_value_with_limits(&RangeU128::value_from((5u128, 10u128)).raw, limits)
+                .format_value_with_limits(&RangeU128::inline_from((5u128, 10u128)).raw, limits)
                 .unwrap(),
             "5..10"
         );
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(
             range_inclusive_u128
                 .format_value_with_limits(
-                    &RangeInclusiveU128::value_from((5u128, 10u128)).raw,
+                    &RangeInclusiveU128::inline_from((5u128, 10u128)).raw,
                     limits
                 )
                 .unwrap(),
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(
             linelocation
                 .format_value_with_limits(
-                    &LineLocation::value_from((1u64, 2u64, 3u64, 4u64)).raw,
+                    &LineLocation::inline_from((1u64, 2u64, 3u64, 4u64)).raw,
                     limits
                 )
                 .unwrap(),
@@ -500,7 +500,7 @@ mod tests {
         );
 
         let f256le = formatter_for(F256LE::id());
-        let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
+        let raw = F256LE::inline_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256le.format_value_with_limits(&raw, limits).unwrap(),
             "0x1p+0"
@@ -516,7 +516,7 @@ mod tests {
         );
 
         let f256be = formatter_for(F256BE::id());
-        let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
+        let raw = F256BE::inline_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256be.format_value_with_limits(&raw, limits).unwrap(),
             "0x1p+0"
@@ -549,7 +549,7 @@ mod tests {
             format!("ed25519:pubkey:{}", "AB".repeat(32))
         );
 
-        let unknown = formatter_for(UnknownValue::id());
+        let unknown = formatter_for(UnknownInline::id());
         assert_eq!(
             unknown.format_value_with_limits(&raw, limits).unwrap(),
             format!("unknown:{}", "AB".repeat(32))
@@ -564,7 +564,7 @@ mod tests {
         );
 
         let handle_formatter = formatter_for(Handle::<LongString>::id());
-        let raw = Value::<Handle<LongString>>::new([0xEF; 32]).raw;
+        let raw = Inline::<Handle<LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter
                 .format_value_with_limits(&raw, limits)

@@ -55,7 +55,7 @@ where
     /// Sorts children by estimate, lets the tightest one propose, then
     /// confirms through the rest in ascending estimate order. Children
     /// that return `None` for this variable are skipped entirely.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
@@ -77,7 +77,7 @@ where
 
     /// Confirms proposals through all children that constrain `variable`,
     /// in order of increasing estimate.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()

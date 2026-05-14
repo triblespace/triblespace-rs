@@ -16,8 +16,8 @@ use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
-use crate::value::RawValue;
-use crate::value::IntoValue;
+use crate::value::RawInline;
+use crate::value::IntoInline;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -125,7 +125,7 @@ impl PathExpr {
             PathExpr::Attr(attr_id) => {
                 let a = ctx.next_variable::<GenId>();
                 let dest = ctx.next_variable::<GenId>();
-                constraints.push(Box::new(a.is(attr_id.to_value())));
+                constraints.push(Box::new(a.is(attr_id.to_inline())));
                 constraints.push(Box::new(set.pattern(start, a, dest)));
                 dest
             }
@@ -133,7 +133,7 @@ impl PathExpr {
                 // ^p: dest p start (subject and value swap)
                 let a = ctx.next_variable::<GenId>();
                 let dest = ctx.next_variable::<GenId>();
-                constraints.push(Box::new(a.is(attr_id.to_value())));
+                constraints.push(Box::new(a.is(attr_id.to_inline())));
                 constraints.push(Box::new(set.pattern(dest, a, start)));
                 dest
             }
@@ -237,7 +237,7 @@ fn build_join(
     let mut ctx = VariableContext::new();
     let start_var = ctx.next_variable::<GenId>();
     let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
-    constraints.push(Box::new(start_var.is(start.to_value())));
+    constraints.push(Box::new(start_var.is(start.to_inline())));
     let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
     (IntersectionConstraint::new(constraints), dest_var.index)
 }
@@ -264,7 +264,7 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
 }
 
 /// Inverse single-attribute hop: enumerate subjects `s` such that
-/// `s attr start` holds. Uses the VAE index (Value, Attribute,
+/// `s attr start` holds. Uses the VAE index (Inline, Attribute,
 /// Entity ordering) so the prefix `[start_as_value (32B), attr
 /// (16B)]` lands directly at the slice of matching entity bytes.
 fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
@@ -529,7 +529,7 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
             let mut binding = Binding::default();
-            binding.set(0, &start.to_value().raw);
+            binding.set(0, &start.to_inline().raw);
             constraint.estimate(dest_idx, &binding).unwrap_or(0)
         }
     }
@@ -574,8 +574,8 @@ impl RegularPathConstraint {
 
     /// Lazily collect all GenId nodes in the TribleSet.
     /// Only called when neither start nor end is bound.
-    fn all_nodes(&self) -> Vec<RawValue> {
-        let mut node_set: HashSet<RawValue> = HashSet::new();
+    fn all_nodes(&self) -> Vec<RawInline> {
+        let mut node_set: HashSet<RawInline> = HashSet::new();
         for t in self.set.iter() {
             let v = &t.data[32..64];
             if v[..ID_LEN] == [0; ID_LEN] {
@@ -613,7 +613,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
@@ -651,7 +651,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
                 if let Some(end_id) = id_from_value(end_val) {

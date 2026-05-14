@@ -5,7 +5,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::value::schemas::UnknownValue;
+use triblespace_core::value::schemas::UnknownInline;
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (
@@ -180,13 +180,13 @@ proptest! {
 
         // Full scan: query all (e, a, v) triples
         let mut set_results: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            set.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            set.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
 
         let mut archive_results: Vec<_> = find!(
-            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
-            archive.pattern(e, a, v as Variable<UnknownValue>)
+            (e: Inline<_>, a: Inline<_>, v: Inline<UnknownInline>),
+            archive.pattern(e, a, v as Variable<UnknownInline>)
         ).collect();
 
         set_results.sort();
@@ -209,17 +209,17 @@ proptest! {
         let entity_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first_trible.data[0..16]);
-            Value::<valueschemas::GenId>::new(v)
+            Inline::<valueschemas::GenId>::new(v)
         };
 
         let mut set_results: Vec<_> = find!(
-            (a: Value<_>, v: Value<UnknownValue>),
-            temp!((e), and!(e.is(entity_val), set.pattern(e, a, v as Variable<UnknownValue>)))
+            (a: Inline<_>, v: Inline<UnknownInline>),
+            temp!((e), and!(e.is(entity_val), set.pattern(e, a, v as Variable<UnknownInline>)))
         ).collect();
 
         let mut archive_results: Vec<_> = find!(
-            (a: Value<_>, v: Value<UnknownValue>),
-            temp!((e), and!(e.is(entity_val), archive.pattern(e, a, v as Variable<UnknownValue>)))
+            (a: Inline<_>, v: Inline<UnknownInline>),
+            temp!((e), and!(e.is(entity_val), archive.pattern(e, a, v as Variable<UnknownInline>)))
         ).collect();
 
         set_results.sort();
@@ -242,18 +242,18 @@ proptest! {
         let attr_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first.data[16..32]);
-            Value::<valueschemas::GenId>::new(v)
+            Inline::<valueschemas::GenId>::new(v)
         };
 
         // Query with bound attribute
         let mut set_results: Vec<_> = find!(
-            (e: Value<_>, v: Value<UnknownValue>),
-            temp!((a), and!(a.is(attr_val), set.pattern(e, a, v as Variable<UnknownValue>)))
+            (e: Inline<_>, v: Inline<UnknownInline>),
+            temp!((a), and!(a.is(attr_val), set.pattern(e, a, v as Variable<UnknownInline>)))
         ).collect();
 
         let mut archive_results: Vec<_> = find!(
-            (e: Value<_>, v: Value<UnknownValue>),
-            temp!((a), and!(a.is(attr_val), archive.pattern(e, a, v as Variable<UnknownValue>)))
+            (e: Inline<_>, v: Inline<UnknownInline>),
+            temp!((a), and!(a.is(attr_val), archive.pattern(e, a, v as Variable<UnknownInline>)))
         ).collect();
 
         set_results.sort();

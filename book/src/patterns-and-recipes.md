@@ -152,7 +152,7 @@ engine proves they exist), and separate queries for optional fields:
 ```rust,ignore
 // Required: one pattern, no Option<> needed
 for (id, command, created_at) in find!(
-    (id: Id, cmd: TextHandle, at: Value<NsTAIInterval>),
+    (id: Id, cmd: TextHandle, at: Inline<NsTAIInterval>),
     pattern!(&catalog, [{
         ?id @
         metadata::tag: &KIND_REQUEST,
@@ -182,11 +182,11 @@ change += entity! { &paper @ literature::title: "Dune", literature::author: &her
 change += entity! { &new_paper @
     literature::title: "Foundation",
     literature::author: &asimov,
-    literature::page_count: 255u64.to_value(),
+    literature::page_count: 255u64.to_inline(),
 };
 
 // Query: papers with page_count (only new ones match)
-find!((paper: Id, pages: Value<U256BE>),
+find!((paper: Id, pages: Inline<U256BE>),
     pattern!(&catalog, [{ ?paper @ literature::page_count: ?pages }]))
 
 // Query: all papers (both old and new match)

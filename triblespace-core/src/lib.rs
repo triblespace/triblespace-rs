@@ -32,7 +32,7 @@ pub mod query;
 pub mod repo;
 /// Trible representation, sets, fragments, and spread helpers.
 pub mod trible;
-/// Value types, schemas, and conversion traits.
+/// Inline types, schemas, and conversion traits.
 pub mod value;
 
 #[cfg(feature = "wasm")]

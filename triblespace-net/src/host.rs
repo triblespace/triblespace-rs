@@ -122,9 +122,9 @@ where
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
         use triblespace_core::blob::schemas::UnknownBlob;
-        use triblespace_core::value::Value;
+        use triblespace_core::value::Inline;
         use triblespace_core::value::schemas::hash::{Blake3, Handle};
-        let handle = Value::<Handle<UnknownBlob>>::new(*hash);
+        let handle = Inline::<Handle<UnknownBlob>>::new(*hash);
         self.reader.get::<anybytes::Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
     }
 
@@ -147,12 +147,12 @@ where
     >> {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
-        use triblespace_core::value::Value;
+        use triblespace_core::value::Inline;
         use triblespace_core::value::schemas::hash::{Blake3, Handle};
         let mut out = Vec::new();
         for handle_result in self.reader.blobs() {
             let Ok(handle) = handle_result else { continue };
-            let typed: Value<Handle<SimpleArchive>> = Value::new(handle.raw);
+            let typed: Inline<Handle<SimpleArchive>> = Inline::new(handle.raw);
             if let Ok(blob) = self.reader.get::<Blob<SimpleArchive>, SimpleArchive>(typed) {
                 out.push(blob);
             }
@@ -799,7 +799,7 @@ async fn serve_stream(
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
     use triblespace_core::value::schemas::hash::{Blake3, Handle};
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let op = recv_u8(recv).await?;
     let span = debug_span!("stream", op = op_name(op));
@@ -808,8 +808,8 @@ async fn serve_stream(
     if op == OP_AUTH {
         let cap_handle_raw = recv_hash(recv).await?;
         debug!(cap_handle = %hex::encode(&cap_handle_raw[..4]), "auth: cap handle received");
-        let cap_handle: Value<Handle<SimpleArchive>> =
-            Value::new(cap_handle_raw);
+        let cap_handle: Inline<Handle<SimpleArchive>> =
+            Inline::new(cap_handle_raw);
 
         // Brief sync read inside async — guard is dropped before any
         // .await runs so this never blocks an async worker.
@@ -820,7 +820,7 @@ async fn serve_stream(
             cap_handle,
             peer_pubkey,
             &revoked_snapshot,
-            move |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+            move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
                 let bytes = snap_for_fetch
                     .lock()
                     .unwrap()
@@ -1131,16 +1131,16 @@ mod tests {
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::trible::TribleSet;
-    use triblespace_core::value::TryToValue;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::TryToInline;
+    use triblespace_core::value::Inline;
     use triblespace_core::value::schemas::hash::{Blake3, Handle};
     use triblespace_core::value::schemas::time::NsTAIInterval;
     use hifitime::Epoch;
 
-    fn now_plus_24h() -> Value<NsTAIInterval> {
+    fn now_plus_24h() -> Inline<NsTAIInterval> {
         let now = Epoch::now().expect("system time");
         let later = now + hifitime::Duration::from_seconds(24.0 * 3600.0);
-        (now, later).try_to_value().expect("valid interval")
+        (now, later).try_to_inline().expect("valid interval")
     }
 
     fn empty_scope() -> (triblespace_core::id::Id, TribleSet) {
@@ -1171,10 +1171,10 @@ mod tests {
     /// [`serve_stream`]: `&h.raw → snap.get_blob → Blob<SimpleArchive>`.
     fn fetch_via_snapshot(
         snap: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    ) -> impl FnMut(Value<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>
+    ) -> impl FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>
     {
         let snap = snap.clone();
-        move |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+        move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             let bytes = snap.lock().unwrap().as_ref()?.get_blob(&h.raw)?;
             Some(Blob::new(anybytes::Bytes::from_source(bytes)))
         }
@@ -1194,7 +1194,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let sig_handle: Value<Handle<SimpleArchive>> =
+        let sig_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
 
         let snap_box = snapshot_with_blobs(&[cap_blob, sig_blob]);
@@ -1224,8 +1224,8 @@ mod tests {
 
         // Empty snapshot: no blob keyed by the all-zeros handle exists,
         // so `verify_chain` cannot fetch the leaf signature blob.
-        let zero_handle: Value<Handle<SimpleArchive>> =
-            Value::new([0u8; 32]);
+        let zero_handle: Inline<Handle<SimpleArchive>> =
+            Inline::new([0u8; 32]);
         let revoked = HashSet::new();
         let result = verify_chain(
             team_root.verifying_key(),
@@ -1308,10 +1308,10 @@ mod tests {
 
         let branch_a = ufoid();
         let branch_b = ufoid();
-        let head_a_simple: Value<Handle<SimpleArchive>> =
-            Value::new(head_a.raw);
-        let head_b_simple: Value<Handle<SimpleArchive>> =
-            Value::new(head_b.raw);
+        let head_a_simple: Inline<Handle<SimpleArchive>> =
+            Inline::new(head_a.raw);
+        let head_b_simple: Inline<Handle<SimpleArchive>> =
+            Inline::new(head_b.raw);
         store.update(*branch_a, None, Some(head_a_simple)).unwrap();
         store.update(*branch_b, None, Some(head_b_simple)).unwrap();
 
@@ -1532,7 +1532,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let sig_handle: Value<Handle<SimpleArchive>> =
+        let sig_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
 
         let snap_box = snapshot_with_blobs(&[cap_blob, sig_blob]);
@@ -1737,7 +1737,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let sig_handle: Value<Handle<SimpleArchive>> =
+        let sig_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
 
         let (router, _client_ep, conn) = dial_against_auth_server(
@@ -1811,7 +1811,7 @@ mod tests {
             now_plus_24h(),
         )
         .expect("cap builds");
-        let sig_handle: Value<Handle<SimpleArchive>> =
+        let sig_handle: Inline<Handle<SimpleArchive>> =
             (&sig_blob).get_handle();
 
         let (router, _client_ep, conn) = dial_against_auth_server(

@@ -5,10 +5,10 @@
 //! ```
 //! # use triblespace_core::prelude::*;
 //! # use triblespace_core::prelude::valueschemas::ShortString;
-//! let results = find!((x: Value<ShortString>), x.is("foo".to_value())).collect::<Vec<_>>();
+//! let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 //! ```
 //!
-//! Variables are converted via [`TryFromValue`](crate::value::TryFromValue). By default,
+//! Variables are converted via [`TryFromInline`](crate::value::TryFromInline). By default,
 //! conversion failures silently skip the row (filter semantics). Append `?` to a variable
 //! to receive `Result<T, E>` instead, letting the caller handle errors explicitly.
 //!
@@ -29,7 +29,7 @@ pub mod ignore;
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
-/// [`ValueRange`](rangeconstraint::ValueRange) — restricts a variable to a byte-lexicographic range.
+/// [`InlineRange`](rangeconstraint::InlineRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
 /// [`RegularPathConstraint`] — regular path expressions over graphs.
 pub mod regularpathconstraint;
@@ -50,9 +50,9 @@ use constantconstraint::*;
 pub use ignore::IgnoreConstraint;
 
 use crate::value::schemas::genid::GenId;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -77,11 +77,11 @@ pub trait TriblePattern {
     /// Create a constraint for a given trible pattern.
     /// The method takes three variables, one for each part of the trible.
     /// The schemas of the entities and attributes are always [GenId], while the value
-    /// schema can be any type implementing [ValueSchema] and is specified as a type parameter.
+    /// schema can be any type implementing [InlineSchema] and is specified as a type parameter.
     ///
     /// This method is usually not called directly, but rather through typed query language
     /// macros like [pattern!][crate::macros::pattern].
-    fn pattern<'a, V: ValueSchema>(
+    fn pattern<'a, V: InlineSchema>(
         &'a self,
         e: Variable<GenId>,
         a: Variable<GenId>,
@@ -121,7 +121,7 @@ impl VariableContext {
     ///
     /// This method is usually not called directly, but rather through typed query language
     /// macros like [find!][crate::query].
-    pub fn next_variable<T: ValueSchema>(&mut self) -> Variable<T> {
+    pub fn next_variable<T: InlineSchema>(&mut self) -> Variable<T> {
         assert!(
             self.next_index < 128,
             "currently queries support at most 128 variables"
@@ -135,24 +135,24 @@ impl VariableContext {
 /// A placeholder for unknowns in a query.
 /// Within the query engine each variable is identified by an integer,
 /// which can be accessed via the `index` property.
-/// Variables also have an associated type which is used to parse the [Value]s
+/// Variables also have an associated type which is used to parse the [Inline]s
 /// found by the query engine.
 #[derive(Debug)]
-pub struct Variable<T: ValueSchema> {
+pub struct Variable<T: InlineSchema> {
     /// The integer index identifying this variable in the [`Binding`].
     pub index: VariableId,
     typed: PhantomData<T>,
 }
 
-impl<T: ValueSchema> Copy for Variable<T> {}
+impl<T: InlineSchema> Copy for Variable<T> {}
 
-impl<T: ValueSchema> Clone for Variable<T> {
+impl<T: InlineSchema> Clone for Variable<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: ValueSchema> Variable<T> {
+impl<T: InlineSchema> Variable<T> {
     /// Creates a variable with the given index.
     pub fn new(index: VariableId) -> Self {
         Variable {
@@ -166,21 +166,21 @@ impl<T: ValueSchema> Variable<T> {
     /// # Panics
     ///
     /// Panics if the variable has not been bound.
-    pub fn extract(self, binding: &Binding) -> &Value<T> {
+    pub fn extract(self, binding: &Binding) -> &Inline<T> {
         let raw = binding.get(self.index).unwrap_or_else(|| {
             panic!(
                 "query variable (idx {}) was never bound before projection. This usually means the variable was projected in `find!` but never appeared in any constraint. If you intended a pure existence query, use `find!((), ...)` or `exists!(constraint)`.",
                 self.index
             )
         });
-        Value::as_transmute_raw(raw)
+        Inline::as_transmute_raw(raw)
     }
 }
 
 /// Collections can implement this trait so that they can be used in queries.
 /// The returned constraint will filter the values assigned to the variable
 /// to only those that are contained in the collection.
-pub trait ContainsConstraint<'a, T: ValueSchema> {
+pub trait ContainsConstraint<'a, T: InlineSchema> {
     /// The concrete constraint type produced by [`has`](ContainsConstraint::has).
     type Constraint: Constraint<'a>;
 
@@ -188,14 +188,14 @@ pub trait ContainsConstraint<'a, T: ValueSchema> {
     /// to only those that are contained in the collection.
     ///
     /// The returned constraint will usually perform a conversion between the
-    /// concrete rust type stored in the collection a [Value] of the appropriate schema
+    /// concrete rust type stored in the collection a [Inline] of the appropriate schema
     /// type for the variable.
     fn has(self, v: Variable<T>) -> Self::Constraint;
 }
 
-impl<T: ValueSchema> Variable<T> {
+impl<T: InlineSchema> Variable<T> {
     /// Create a constraint so that only a specific value can be assigned to the variable.
-    pub fn is(self, constant: Value<T>) -> ConstantConstraint {
+    pub fn is(self, constant: Inline<T>) -> ConstantConstraint {
         ConstantConstraint::new(self, constant)
     }
 }
@@ -213,12 +213,12 @@ impl<T: ValueSchema> Variable<T> {
 pub struct Binding {
     /// Bitset tracking which variables have been assigned a value.
     pub bound: VariableSet,
-    values: [RawValue; 128],
+    values: [RawInline; 128],
 }
 
 impl Binding {
     /// Binds `variable` to `value`.
-    pub fn set(&mut self, variable: VariableId, value: &RawValue) {
+    pub fn set(&mut self, variable: VariableId, value: &RawInline) {
         self.values[variable] = *value;
         self.bound.set(variable);
     }
@@ -230,7 +230,7 @@ impl Binding {
     }
 
     /// Check if a variable is bound in the binding.
-    pub fn get(&self, variable: VariableId) -> Option<&RawValue> {
+    pub fn get(&self, variable: VariableId) -> Option<&RawInline> {
         if self.bound.is_set(variable) {
             Some(&self.values[variable])
         } else {
@@ -325,7 +325,7 @@ pub trait Constraint<'a> {
     /// already have values in the vector from a previous round.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>);
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
 
     /// Filters `proposals` to remove values for `variable` that violate
     /// this constraint.
@@ -335,7 +335,7 @@ pub trait Constraint<'a> {
     /// `proposals` that are inconsistent with the current `binding`.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>);
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
 
     /// Returns whether this constraint is consistent with the current
     /// `binding`.
@@ -385,12 +385,12 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let inner: &T = self;
         inner.propose(variable, binding, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let inner: &T = self;
         inner.confirm(variable, binding, proposals)
     }
@@ -417,12 +417,12 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
         let inner: &T = self;
         inner.propose(variable, binding, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposal: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposal: &mut Vec<RawInline>) {
         let inner: &T = self;
         inner.confirm(variable, binding, proposal)
     }
@@ -463,7 +463,7 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     touched_variables: VariableSet,
     stack: ArrayVec<VariableId, 128>,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<Vec<RawValue>>, 128>,
+    values: ArrayVec<Option<Vec<RawInline>>, 128>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -846,7 +846,7 @@ mod parallel {
                         // stealing pressure.
                         let vals = q.values[top].as_mut().unwrap();
                         let mid = vals.len() / 2;
-                        let right_vals: Vec<RawValue> = vals.drain(mid..).collect();
+                        let right_vals: Vec<RawInline> = vals.drain(mid..).collect();
                         let mut right = q.clone();
                         right.values[top] = Some(right_vals);
 
@@ -896,7 +896,7 @@ mod parallel {
 }
 
 /// Iterate over query results, converting each variable via
-/// [`TryFromValue`](crate::value::TryFromValue).
+/// [`TryFromInline`](crate::value::TryFromInline).
 ///
 /// The macro takes two arguments: a tuple of variables with optional type
 /// annotations, and a constraint expression. It injects a `__local_find_context!`
@@ -918,7 +918,7 @@ mod parallel {
 ///
 /// **Filter semantics (default):** when a variable's conversion fails the
 /// entire row is silently skipped — like a constraint that doesn't match.
-/// For types whose `TryFromValue::Error = Infallible` the error branch is
+/// For types whose `TryFromInline::Error = Infallible` the error branch is
 /// dead code, so no rows can ever be accidentally filtered.
 ///
 /// **`?` pass-through:** appending `?` to a variable makes it yield
@@ -932,7 +932,7 @@ mod parallel {
 /// # use triblespace_core::prelude::*;
 /// # use triblespace_core::prelude::valueschemas::ShortString;
 /// // Filter semantics — rows where conversion fails are skipped:
-/// let results = find!((x: Value<ShortString>), x.is("foo".to_value())).collect::<Vec<_>>();
+/// let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 /// ```
 #[macro_export]
 macro_rules! find {
@@ -970,7 +970,7 @@ pub use find;
 ///
 /// ```rust,ignore
 /// exists!(
-///     (name: Value<_>),
+///     (name: Inline<_>),
 ///     pattern!(&kb, [{ ?person @ social::name: ?name }])
 /// )
 /// ```
@@ -995,7 +995,7 @@ pub use exists;
 ///
 /// ```rust,ignore
 /// find!(
-///     (person: Value<_>),
+///     (person: Inline<_>),
 ///     temp!((friend), and!(
 ///         pattern!(&kb, [{ ?person @ social::friend: ?friend }]),
 ///         pattern!(&kb, [{ ?friend @ social::name: "Bob" }])
@@ -1062,27 +1062,27 @@ mod tests {
     #[test]
     fn and_set() {
         let mut books = HashSet::<String>::new();
-        let mut movies = HashSet::<Value<ShortString>>::new();
+        let mut movies = HashSet::<Inline<ShortString>>::new();
 
         books.insert("LOTR".to_string());
         books.insert("Dragonrider".to_string());
         books.insert("Highlander".to_string());
 
-        movies.insert("LOTR".to_value());
-        movies.insert("Highlander".to_value());
+        movies.insert("LOTR".to_inline());
+        movies.insert("Highlander".to_inline());
 
         let inter: Vec<_> =
-            find!((a: Value<ShortString>), and!(books.has(a), movies.has(a))).collect();
+            find!((a: Inline<ShortString>), and!(books.has(a), movies.has(a))).collect();
 
         assert_eq!(inter.len(), 2);
 
         let cross: Vec<_> =
-            find!((a: Value<ShortString>, b: Value<ShortString>), and!(books.has(a), movies.has(b))).collect();
+            find!((a: Inline<ShortString>, b: Inline<ShortString>), and!(books.has(a), movies.has(b))).collect();
 
         assert_eq!(cross.len(), 6);
 
-        let one: Vec<_> = find!((a: Value<ShortString>),
-            and!(books.has(a), a.is(ShortString::value_from("LOTR")))
+        let one: Vec<_> = find!((a: Inline<ShortString>),
+            and!(books.has(a), a.is(ShortString::inline_from("LOTR")))
         )
         .collect();
 
@@ -1138,7 +1138,7 @@ mod tests {
         });
 
         let r: Vec<_> = find!(
-        (author: Value<_>, book: Value<_>, title: Value<_>, quote: Value<_>),
+        (author: Inline<_>, book: Inline<_>, title: Inline<_>, quote: Inline<_>),
         pattern!(&kb, [
         {?author @
             literature::firstname: "Frank",
@@ -1156,10 +1156,10 @@ mod tests {
     #[test]
     fn constant() {
         let r: Vec<_> = find! {
-            (string: Value<_>, number: Value<_>),
+            (string: Inline<_>, number: Inline<_>),
             and!(
-                string.is(ShortString::value_from("Hello World!")),
-                number.is(I256BE::value_from(42))
+                string.is(ShortString::inline_from("Hello World!")),
+                number.is(I256BE::inline_from(42))
             )
         }
         .collect();
@@ -1169,14 +1169,14 @@ mod tests {
 
     #[test]
     fn exists_true() {
-        assert!(exists!((a: Value<_>), a.is(I256BE::value_from(42))));
+        assert!(exists!((a: Inline<_>), a.is(I256BE::inline_from(42))));
     }
 
     #[test]
     fn exists_false() {
         assert!(!exists!(
-            (a: Value<_>),
-            and!(a.is(I256BE::value_from(1)), a.is(I256BE::value_from(2)))
+            (a: Inline<_>),
+            and!(a.is(I256BE::inline_from(1)), a.is(I256BE::inline_from(2)))
         ));
     }
 
@@ -1184,14 +1184,14 @@ mod tests {
     fn exists_no_variables_true() {
         let mut ctx = VariableContext::new();
         let a = ctx.next_variable::<I256BE>();
-        assert!(exists!(a.is(I256BE::value_from(42))));
+        assert!(exists!(a.is(I256BE::inline_from(42))));
     }
 
     #[test]
     fn find_no_variables_yields_unit() {
         let mut ctx = VariableContext::new();
         let a = ctx.next_variable::<I256BE>();
-        let rows: Vec<()> = find!((), a.is(I256BE::value_from(42))).collect();
+        let rows: Vec<()> = find!((), a.is(I256BE::inline_from(42))).collect();
         assert_eq!(rows, vec![()]);
     }
 
@@ -1207,7 +1207,7 @@ mod tests {
         kb += entity! { &bob @ name: "Bob" };
 
         let matches: Vec<_> = find!(
-            (person_name: Value<_>),
+            (person_name: Inline<_>),
             temp!((mutual_friend),
                 and!(
                     pattern!(&kb, [{ _?person @ name: ?person_name, friend: ?mutual_friend }]),
@@ -1218,19 +1218,19 @@ mod tests {
         .collect();
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0.try_from_value::<&str>().unwrap(), "Alice");
+        assert_eq!(matches[0].0.try_from_inline::<&str>().unwrap(), "Alice");
     }
 
     #[test]
     fn ignore_skips_variables() {
         let results: Vec<_> = find!(
-            (x: Value<_>),
-            ignore!((y), and!(x.is(I256BE::value_from(1)), y.is(I256BE::value_from(2))))
+            (x: Inline<_>),
+            ignore!((y), and!(x.is(I256BE::inline_from(1)), y.is(I256BE::inline_from(2))))
         )
         .collect();
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, I256BE::value_from(1));
+        assert_eq!(results[0].0, I256BE::inline_from(1));
     }
 
     #[test]
@@ -1243,8 +1243,8 @@ mod tests {
         let b = ctx.next_variable::<ShortString>();
 
         let base = and!(
-            a.is(ShortString::value_from("A")),
-            b.is(ShortString::value_from("B"))
+            a.is(ShortString::inline_from("A")),
+            b.is(ShortString::inline_from("B"))
         );
 
         let mut wrapper = crate::debug::query::EstimateOverrideConstraint::new(base);

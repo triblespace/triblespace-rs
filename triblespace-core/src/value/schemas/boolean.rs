@@ -7,12 +7,12 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
-use crate::value::VALUE_LEN;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
+use crate::value::INLINE_LEN;
 
 use std::convert::Infallible;
 
@@ -20,7 +20,7 @@ use std::convert::Infallible;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidBoolean;
 
-/// Value schema that stores boolean flags as either all-zero or all-one bit patterns.
+/// Inline schema that stores boolean flags as either all-zero or all-one bit patterns.
 ///
 /// Storing `false` as `0x00` and `true` as `0xFF` in every byte makes it trivial to
 /// distinguish the two cases while leaving room for future SIMD optimisations when
@@ -28,15 +28,15 @@ pub struct InvalidBoolean;
 pub struct Boolean;
 
 impl Boolean {
-    fn encode(flag: bool) -> Value<Self> {
+    fn encode(flag: bool) -> Inline<Self> {
         if flag {
-            Value::new([u8::MAX; VALUE_LEN])
+            Inline::new([u8::MAX; INLINE_LEN])
         } else {
-            Value::new([0u8; VALUE_LEN])
+            Inline::new([0u8; INLINE_LEN])
         }
     }
 
-    fn decode(value: &Value<Self>) -> Result<bool, InvalidBoolean> {
+    fn decode(value: &Inline<Self>) -> Result<bool, InvalidBoolean> {
         if value.raw.iter().all(|&b| b == 0) {
             Ok(false)
         } else if value.raw.iter().all(|&b| b == u8::MAX) {
@@ -97,50 +97,50 @@ mod wasm_formatter {
     }
 }
 
-impl ValueSchema for Boolean {
+impl InlineSchema for Boolean {
     type ValidationError = InvalidBoolean;
     type FieldKind = Self;
 
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         Self::decode(&value)?;
         Ok(value)
     }
 }
 
-impl<'a> TryFromValue<'a, Boolean> for bool {
+impl<'a> TryFromInline<'a, Boolean> for bool {
     type Error = InvalidBoolean;
 
-    fn try_from_value(v: &'a Value<Boolean>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &'a Inline<Boolean>) -> Result<Self, Self::Error> {
         Boolean::decode(v)
     }
 }
 
-impl TryToValue<Boolean> for bool {
+impl TryToInline<Boolean> for bool {
     type Error = Infallible;
 
-    fn try_to_value(self) -> Result<Value<Boolean>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<Boolean>, Self::Error> {
         Ok(Boolean::encode(self))
     }
 }
 
-impl TryToValue<Boolean> for &bool {
+impl TryToInline<Boolean> for &bool {
     type Error = Infallible;
 
-    fn try_to_value(self) -> Result<Value<Boolean>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<Boolean>, Self::Error> {
         Ok(Boolean::encode(*self))
     }
 }
 
 impl IntoSchema<Boolean> for bool {
-    type Form = Value<Boolean>;
-    fn into_schema(self) -> Value<Boolean> {
+    type Form = Inline<Boolean>;
+    fn into_schema(self) -> Inline<Boolean> {
         Boolean::encode(self)
     }
 }
 
 impl IntoSchema<Boolean> for &bool {
-    type Form = Value<Boolean>;
-    fn into_schema(self) -> Value<Boolean> {
+    type Form = Inline<Boolean>;
+    fn into_schema(self) -> Inline<Boolean> {
         Boolean::encode(*self)
     }
 }
@@ -149,28 +149,28 @@ impl IntoSchema<Boolean> for &bool {
 mod tests {
     use super::Boolean;
     use super::InvalidBoolean;
-    use crate::value::Value;
-    use crate::value::ValueSchema;
+    use crate::value::Inline;
+    use crate::value::InlineSchema;
 
     #[test]
     fn encodes_false_as_zero_bytes() {
-        let value = Boolean::value_from(false);
+        let value = Boolean::inline_from(false);
         assert!(value.raw.iter().all(|&b| b == 0));
-        assert_eq!(Boolean::validate(value), Ok(Boolean::value_from(false)));
+        assert_eq!(Boolean::validate(value), Ok(Boolean::inline_from(false)));
     }
 
     #[test]
     fn encodes_true_as_all_ones() {
-        let value = Boolean::value_from(true);
+        let value = Boolean::inline_from(true);
         assert!(value.raw.iter().all(|&b| b == u8::MAX));
-        assert_eq!(Boolean::validate(value), Ok(Boolean::value_from(true)));
+        assert_eq!(Boolean::validate(value), Ok(Boolean::inline_from(true)));
     }
 
     #[test]
     fn rejects_mixed_bit_patterns() {
-        let mut mixed = [0u8; crate::value::VALUE_LEN];
+        let mut mixed = [0u8; crate::value::INLINE_LEN];
         mixed[0] = 1;
-        let value = Value::<Boolean>::new(mixed);
+        let value = Inline::<Boolean>::new(mixed);
         assert_eq!(Boolean::validate(value), Err(InvalidBoolean));
     }
 }

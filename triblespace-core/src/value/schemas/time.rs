@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -61,11 +61,11 @@ pub(crate) fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
     (u128::from_be_bytes(bytes) ^ SIGN_BIT) as i128
 }
 
-impl ValueSchema for NsTAIInterval {
+impl InlineSchema for NsTAIInterval {
     type ValidationError = InvertedIntervalError;
     type FieldKind = Self;
 
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         let lower = i128_from_ordered_be(value.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(value.raw[16..32].try_into().unwrap());
         if lower > upper {
@@ -76,9 +76,9 @@ impl ValueSchema for NsTAIInterval {
     }
 }
 
-impl TryToValue<NsTAIInterval> for (Epoch, Epoch) {
+impl TryToInline<NsTAIInterval> for (Epoch, Epoch) {
     type Error = InvertedIntervalError;
-    fn try_to_value(self) -> Result<Value<NsTAIInterval>, InvertedIntervalError> {
+    fn try_to_inline(self) -> Result<Inline<NsTAIInterval>, InvertedIntervalError> {
         let lower = self.0.to_tai_duration().total_nanoseconds();
         let upper = self.1.to_tai_duration().total_nanoseconds();
         if lower > upper {
@@ -87,13 +87,13 @@ impl TryToValue<NsTAIInterval> for (Epoch, Epoch) {
         let mut value = [0; 32];
         value[0..16].copy_from_slice(&i128_to_ordered_be(lower));
         value[16..32].copy_from_slice(&i128_to_ordered_be(upper));
-        Ok(Value::new(value))
+        Ok(Inline::new(value))
     }
 }
 
-impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
+impl TryFromInline<'_, NsTAIInterval> for (Epoch, Epoch) {
     type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
@@ -106,9 +106,9 @@ impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
     }
 }
 
-impl TryFromValue<'_, NsTAIInterval> for (i128, i128) {
+impl TryFromInline<'_, NsTAIInterval> for (i128, i128) {
     type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
@@ -143,27 +143,27 @@ pub struct Midpoint(pub i128);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Width(pub i128);
 
-impl TryFromValue<'_, NsTAIInterval> for Lower {
+impl TryFromInline<'_, NsTAIInterval> for Lower {
     type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, Infallible> {
         Ok(Lower(i128_from_ordered_be(
             v.raw[0..16].try_into().unwrap(),
         )))
     }
 }
 
-impl TryFromValue<'_, NsTAIInterval> for Upper {
+impl TryFromInline<'_, NsTAIInterval> for Upper {
     type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, Infallible> {
         Ok(Upper(i128_from_ordered_be(
             v.raw[16..32].try_into().unwrap(),
         )))
     }
 }
 
-impl TryFromValue<'_, NsTAIInterval> for Midpoint {
+impl TryFromInline<'_, NsTAIInterval> for Midpoint {
     type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
@@ -173,9 +173,9 @@ impl TryFromValue<'_, NsTAIInterval> for Midpoint {
     }
 }
 
-impl TryFromValue<'_, NsTAIInterval> for Width {
+impl TryFromInline<'_, NsTAIInterval> for Width {
     type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
+    fn try_from_inline(v: &Inline<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
@@ -226,11 +226,11 @@ impl MetaDescribe for NsDuration {
     }
 }
 
-impl ValueSchema for NsDuration {
+impl InlineSchema for NsDuration {
     type ValidationError = ReservedBitsNonZero;
     type FieldKind = Self;
 
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+    fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         if value.raw[16..32] != [0u8; 16] {
             return Err(ReservedBitsNonZero);
         }
@@ -257,18 +257,18 @@ impl std::fmt::Display for ReservedBitsNonZero {
 }
 
 impl IntoSchema<NsDuration> for i128 {
-    type Form = Value<NsDuration>;
-    fn into_schema(self) -> Value<NsDuration> {
+    type Form = Inline<NsDuration>;
+    fn into_schema(self) -> Inline<NsDuration> {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&i128_to_ordered_be(self));
-        Value::new(raw)
+        Inline::new(raw)
     }
 }
 
-impl TryFromValue<'_, NsDuration> for i128 {
+impl TryFromInline<'_, NsDuration> for i128 {
     type Error = ReservedBitsNonZero;
 
-    fn try_from_value(v: &Value<NsDuration>) -> Result<Self, Self::Error> {
+    fn try_from_inline(v: &Inline<NsDuration>) -> Result<Self, Self::Error> {
         if v.raw[16..32] != [0u8; 16] {
             return Err(ReservedBitsNonZero);
         }
@@ -277,17 +277,17 @@ impl TryFromValue<'_, NsDuration> for i128 {
 }
 
 impl IntoSchema<NsDuration> for Duration {
-    type Form = Value<NsDuration>;
-    fn into_schema(self) -> Value<NsDuration> {
-        self.total_nanoseconds().to_value()
+    type Form = Inline<NsDuration>;
+    fn into_schema(self) -> Inline<NsDuration> {
+        self.total_nanoseconds().to_inline()
     }
 }
 
-impl TryFromValue<'_, NsDuration> for Duration {
+impl TryFromInline<'_, NsDuration> for Duration {
     type Error = ReservedBitsNonZero;
 
-    fn try_from_value(v: &Value<NsDuration>) -> Result<Self, Self::Error> {
-        let ns: i128 = v.try_from_value()?;
+    fn try_from_inline(v: &Inline<NsDuration>) -> Result<Self, Self::Error> {
+        let ns: i128 = v.try_from_inline()?;
         Ok(Duration::from_total_nanoseconds(ns))
     }
 }
@@ -310,8 +310,8 @@ mod tests {
     fn hifitime_conversion() {
         let epoch = Epoch::from_tai_duration(Duration::from_total_nanoseconds(0));
         let time_in: (Epoch, Epoch) = (epoch, epoch);
-        let interval: Value<NsTAIInterval> = time_in.try_to_value().unwrap();
-        let time_out: (Epoch, Epoch) = interval.try_from_value().unwrap();
+        let interval: Inline<NsTAIInterval> = time_in.try_to_inline().unwrap();
+        let time_out: (Epoch, Epoch) = interval.try_from_inline().unwrap();
 
         assert_eq!(time_in, time_out);
     }
@@ -322,12 +322,12 @@ mod tests {
         let upper_ns: i128 = 3_000_000_000;
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
-        let interval: Value<NsTAIInterval> = (lower, upper).try_to_value().unwrap();
+        let interval: Inline<NsTAIInterval> = (lower, upper).try_to_inline().unwrap();
 
-        let l: Lower = interval.from_value();
-        let u: Upper = interval.from_value();
-        let m: Midpoint = interval.try_from_value().unwrap();
-        let w: Width = interval.try_from_value().unwrap();
+        let l: Lower = interval.from_inline();
+        let u: Upper = interval.from_inline();
+        let m: Midpoint = interval.try_from_inline().unwrap();
+        let w: Width = interval.try_from_inline().unwrap();
 
         assert_eq!(l.0, lower_ns);
         assert_eq!(u.0, upper_ns);
@@ -340,14 +340,14 @@ mod tests {
     fn try_to_value_rejects_inverted() {
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(2_000_000_000));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
-        let result: Result<Value<NsTAIInterval>, _> = (lower, upper).try_to_value();
+        let result: Result<Inline<NsTAIInterval>, _> = (lower, upper).try_to_inline();
         assert!(result.is_err());
     }
 
     #[test]
     fn validate_accepts_equal() {
         let t = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
-        let interval: Value<NsTAIInterval> = (t, t).try_to_value().unwrap();
+        let interval: Inline<NsTAIInterval> = (t, t).try_to_inline().unwrap();
         assert!(NsTAIInterval::validate(interval).is_ok());
     }
 
@@ -357,9 +357,9 @@ mod tests {
         let upper_ns: i128 = 2_000_000_000;
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
-        let interval: Value<NsTAIInterval> = (lower, upper).try_to_value().unwrap();
+        let interval: Inline<NsTAIInterval> = (lower, upper).try_to_inline().unwrap();
 
-        let (out_lower, out_upper): (i128, i128) = interval.try_from_value().unwrap();
+        let (out_lower, out_upper): (i128, i128) = interval.try_from_inline().unwrap();
         assert_eq!(out_lower, lower_ns);
         assert_eq!(out_upper, upper_ns);
     }
@@ -402,10 +402,10 @@ mod tests {
             1_000_000_000,
             i128::MAX,
         ] {
-            let v: Value<NsDuration> = ns.to_value();
+            let v: Inline<NsDuration> = ns.to_inline();
             // Reserved lower 16 bytes are zero today.
             assert_eq!(v.raw[16..32], [0u8; 16], "lower bits must be reserved=0");
-            let back: i128 = v.try_from_value().unwrap();
+            let back: i128 = v.try_from_inline().unwrap();
             assert_eq!(ns, back);
         }
     }
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn ns_duration_byte_order_matches_numeric_order() {
         // Sorting by byte-lex on the upper 16 bytes must match numeric order.
-        let mut values: Vec<(i128, Value<NsDuration>)> = vec![
+        let mut values: Vec<(i128, Inline<NsDuration>)> = vec![
             i128::MIN,
             -1_000_000_000,
             -1,
@@ -423,7 +423,7 @@ mod tests {
             i128::MAX,
         ]
         .into_iter()
-        .map(|n| (n, n.to_value()))
+        .map(|n| (n, n.to_inline()))
         .collect();
         values.sort_by(|a, b| a.1.raw.cmp(&b.1.raw));
         let sorted_ns: Vec<i128> = values.iter().map(|(n, _)| *n).collect();
@@ -435,8 +435,8 @@ mod tests {
     #[test]
     fn ns_duration_hifitime_duration_roundtrips() {
         let d_in = Duration::from_total_nanoseconds(1_234_567_890_123);
-        let v: Value<NsDuration> = d_in.to_value();
-        let d_out: Duration = v.try_from_value().unwrap();
+        let v: Inline<NsDuration> = d_in.to_inline();
+        let d_out: Duration = v.try_from_inline().unwrap();
         assert_eq!(d_in.total_nanoseconds(), d_out.total_nanoseconds());
     }
 
@@ -445,7 +445,7 @@ mod tests {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&i128_to_ordered_be(0));
         raw[20] = 1; // dirty reserved byte
-        let v: Value<NsDuration> = Value::new(raw);
+        let v: Inline<NsDuration> = Inline::new(raw);
         assert!(NsDuration::validate(v).is_err());
     }
 }

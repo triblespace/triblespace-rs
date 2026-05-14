@@ -152,26 +152,26 @@ pub mod rpc {
     ///
     /// The order of the enum is important for serialization/deserialization
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub enum Value {
+    pub enum Inline {
         Blake3Provider(Blake3Provider),
         ED25519SignedMessage(ED25519SignedMessage),
         Blake3Immutable(Blake3Immutable),
     }
 
-    impl Value {
+    impl Inline {
         /// Returns the kind of this value.
         pub fn kind(&self) -> Kind {
             match self {
-                Value::Blake3Provider(_) => Kind::Blake3Provider,
-                Value::ED25519SignedMessage(_) => Kind::ED25519SignedMessage,
-                Value::Blake3Immutable(_) => Kind::Blake3Immutable,
+                Inline::Blake3Provider(_) => Kind::Blake3Provider,
+                Inline::ED25519SignedMessage(_) => Kind::ED25519SignedMessage,
+                Inline::Blake3Immutable(_) => Kind::Blake3Immutable,
             }
         }
     }
 
     /// DHT value kind type.
     ///
-    /// Must have the same order as [`Value`] for serialization/deserialization
+    /// Must have the same order as [`Inline`] for serialization/deserialization
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Kind {
         Blake3Provider,
@@ -245,7 +245,7 @@ pub mod rpc {
         /// The key to set the value for.
         pub key: Id,
         /// The value being set.
-        pub value: Value,
+        pub value: Inline,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -303,7 +303,7 @@ pub mod rpc {
         #[rpc(tx = oneshot::Sender<SetResponse>)]
         Set(Set),
         /// Get all values of a certain kind for a key, as a stream of values.
-        #[rpc(tx = mpsc::Sender<Value>)]
+        #[rpc(tx = mpsc::Sender<Inline>)]
         GetAll(GetAll),
         /// A request to query the routing table for the most natural locations
         #[rpc(tx = oneshot::Sender<Vec<EndpointAddr>>)]
@@ -338,7 +338,7 @@ pub mod rpc {
             Self(Arc::new(client))
         }
 
-        pub async fn set(&self, key: Id, value: Value) -> irpc::Result<SetResponse> {
+        pub async fn set(&self, key: Id, value: Inline) -> irpc::Result<SetResponse> {
             self.0.rpc(Set { key, value }).await
         }
 
@@ -348,7 +348,7 @@ pub mod rpc {
             kind: Kind,
             seed: Option<NonZeroU64>,
             n: Option<NonZeroU64>,
-        ) -> irpc::Result<irpc::channel::mpsc::Receiver<Value>> {
+        ) -> irpc::Result<irpc::channel::mpsc::Receiver<Inline>> {
             self.0
                 .server_streaming(GetAll { key, kind, seed, n }, 32)
                 .await
@@ -393,7 +393,7 @@ pub mod api {
 
     use crate::dht::{
         now,
-        rpc::{Blake3Immutable, Id, Kind, Value},
+        rpc::{Blake3Immutable, Id, Kind, Inline},
     };
 
     #[rpc_requests(message = ApiMessage)]
@@ -417,8 +417,8 @@ pub mod api {
         },
         #[rpc(tx = mpsc::Sender<EndpointId>)]
         #[wrap(NetworkPut)]
-        NetworkPut { id: Id, value: Value },
-        #[rpc(tx = mpsc::Sender<(EndpointId, Value)>)]
+        NetworkPut { id: Id, value: Inline },
+        #[rpc(tx = mpsc::Sender<(EndpointId, Inline)>)]
         #[wrap(NetworkGet)]
         NetworkGet {
             id: Id,
@@ -499,7 +499,7 @@ pub mod api {
             loop {
                 match rx.recv().await {
                     Ok(Some((_, value))) => {
-                        let Value::Blake3Immutable(Blake3Immutable { data, .. }) = value else {
+                        let Inline::Blake3Immutable(Blake3Immutable { data, .. }) = value else {
                             continue; // Skip non-Blake3Immutable values
                         };
                         if blake3::hash(&data) == hash {
@@ -529,7 +529,7 @@ pub mod api {
                 .server_streaming(
                     NetworkPut {
                         id,
-                        value: Value::Blake3Immutable(Blake3Immutable {
+                        value: Inline::Blake3Immutable(Blake3Immutable {
                             timestamp: now(),
                             data: value.to_vec(),
                         }),
@@ -562,7 +562,7 @@ pub mod api {
                 .server_streaming(
                     NetworkPut {
                         id,
-                        value: Value::Blake3Provider(super::rpc::Blake3Provider {
+                        value: Inline::Blake3Provider(super::rpc::Blake3Provider {
                             timestamp: now(),
                             endpoint_id: id_bytes,
                         }),
@@ -603,7 +603,7 @@ pub mod api {
             loop {
                 match rx.recv().await {
                     Ok(Some((_from, value))) => {
-                        if let Value::Blake3Provider(super::rpc::Blake3Provider { endpoint_id, .. }) = value {
+                        if let Inline::Blake3Provider(super::rpc::Blake3Provider { endpoint_id, .. }) = value {
                             if let Ok(key) = iroh_base::PublicKey::from_bytes(&endpoint_id) {
                                 providers.push(EndpointId::from(key));
                             }
@@ -936,7 +936,7 @@ use crate::dht::{
     api::{ApiMessage, Lookup, NetworkGet, NetworkPut, WeakApiClient},
     pool::ClientPool,
     routing::{ALPHA, BUCKET_COUNT, Buckets, Distance, K, RoutingTable},
-    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Value},
+    rpc::{Id, Kind, RpcClient, RpcMessage, SetResponse, Inline},
     u256::U256,
 };
 
@@ -954,7 +954,7 @@ impl Node {
 struct MemStorage {
     /// The DHT data storage, mapping keys to values.
     /// Separated by kind to allow for efficient retrieval.
-    data: BTreeMap<Id, BTreeMap<Kind, IndexSet<Value>>>,
+    data: BTreeMap<Id, BTreeMap<Kind, IndexSet<Inline>>>,
 }
 
 impl MemStorage {
@@ -965,7 +965,7 @@ impl MemStorage {
     }
 
     /// Set a value for a key.
-    fn set(&mut self, key: Id, value: Value) {
+    fn set(&mut self, key: Id, value: Inline) {
         let kind = value.kind();
         self.data
             .entry(key)
@@ -976,7 +976,7 @@ impl MemStorage {
     }
 
     /// Get all values of a certain kind for a key.
-    fn get_all(&self, key: &Id, kind: &Kind) -> Option<&IndexSet<Value>> {
+    fn get_all(&self, key: &Id, kind: &Kind) -> Option<&IndexSet<Inline>> {
         self.data.get(key).and_then(|kinds| kinds.get(kind))
     }
 }
@@ -1824,7 +1824,7 @@ impl<P: ClientPool> State<P> {
         self,
         initial: Vec<EndpointId>,
         msg: NetworkGet,
-        tx: mpsc::Sender<(EndpointId, Value)>,
+        tx: mpsc::Sender<(EndpointId, Inline)>,
     ) {
         let ids = self.clone().iterative_find_node(msg.id, initial).await;
         stream::iter(ids)

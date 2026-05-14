@@ -1,6 +1,6 @@
 use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
-use triblespace::core::value::schemas::UnknownValue;
+use triblespace::core::value::schemas::UnknownInline;
 use triblespace::prelude::*;
 
 #[test]
@@ -10,12 +10,12 @@ fn distinct_and_enumerate() {
     let a1 = Id::new([10u8; 16]).unwrap();
     let a2 = Id::new([20u8; 16]).unwrap();
 
-    let v1 = Value::<UnknownValue>::new([1u8; 32]);
-    let v2 = Value::<UnknownValue>::new([2u8; 32]);
-    let v3 = Value::<UnknownValue>::new([3u8; 32]);
-    let v4 = Value::<UnknownValue>::new([4u8; 32]);
-    let v5 = Value::<UnknownValue>::new([5u8; 32]);
-    let v6 = Value::<UnknownValue>::new([6u8; 32]);
+    let v1 = Inline::<UnknownInline>::new([1u8; 32]);
+    let v2 = Inline::<UnknownInline>::new([2u8; 32]);
+    let v3 = Inline::<UnknownInline>::new([3u8; 32]);
+    let v4 = Inline::<UnknownInline>::new([4u8; 32]);
+    let v5 = Inline::<UnknownInline>::new([5u8; 32]);
+    let v6 = Inline::<UnknownInline>::new([6u8; 32]);
 
     let mut set = TribleSet::new();
     set.insert(&Trible::force(&e1, &a1, &v1));

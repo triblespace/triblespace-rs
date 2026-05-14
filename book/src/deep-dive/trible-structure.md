@@ -15,7 +15,7 @@ queries can be answered with as little work as possible.
 At a high level a trible is a three-tuple consisting of an entity, an
 attribute, and a value. The entity and attribute are both 128‑bit abstract
 extrinsic identifiers as described in [triblespace::core::id], while the value is an
-arbitrary 256‑bit [triblespace::core::value::Value]. The value width deliberately matches
+arbitrary 256‑bit [triblespace::core::value::Inline]. The value width deliberately matches
 the size of an intrinsic identifier so larger payloads can be referenced via
 blobs without inflating the inlined representation.
 

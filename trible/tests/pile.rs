@@ -407,7 +407,7 @@ fn inspect_outputs_tribles() {
         pile.close().unwrap();
 
         let hash = Handle::to_hash(handle);
-        hash.from_value::<String>()
+        hash.from_inline::<String>()
     };
 
     Command::cargo_bin("trible")

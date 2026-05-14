@@ -18,7 +18,7 @@ use triblespace_core::prelude::valueschemas::{self, Blake3, Handle};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::{TryToValue, Value};
+use triblespace_core::value::{TryToInline, Inline};
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
@@ -46,7 +46,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // the two distinct subject URIs (frank, dune) each appear in the facts,
     // and the URI-valued object (dune) is also tagged with its rdf_uri.
     let uri_count = find!(
-        (entity: Id, uri: Value<Handle<LongString>>),
+        (entity: Id, uri: Inline<Handle<LongString>>),
         pattern!(&facts, [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
@@ -72,7 +72,7 @@ fn ingests_facts_and_roundtrips_via_query() {
         metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
     });
     let firstname_count = find!(
-        (h: Value<Handle<LongString>>),
+        (h: Inline<Handle<LongString>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
     )
     .count();
@@ -225,7 +225,7 @@ fn xsd_temporal_and_binary_types() {
         metadata::value_schema: <NsTAIInterval as MetaDescribe>::id(),
     });
     let born_count = find!(
-        (v: Value<NsTAIInterval>),
+        (v: Inline<NsTAIInterval>),
         pattern!(&facts, [{ _?e @ born: ?v }])
     )
     .count();
@@ -238,7 +238,7 @@ fn xsd_temporal_and_binary_types() {
     });
     assert_eq!(
         find!(
-            (v: Value<NsTAIInterval>),
+            (v: Inline<NsTAIInterval>),
             pattern!(&facts, [{ _?e @ lived: ?v }])
         )
         .count(),
@@ -252,7 +252,7 @@ fn xsd_temporal_and_binary_types() {
     });
     assert_eq!(
         find!(
-            (v: Value<NsTAIInterval>),
+            (v: Inline<NsTAIInterval>),
             pattern!(&facts, [{ _?e @ century: ?v }])
         )
         .count(),
@@ -266,7 +266,7 @@ fn xsd_temporal_and_binary_types() {
     });
     assert_eq!(
         find!(
-            (v: Value<NsDuration>),
+            (v: Inline<NsDuration>),
             pattern!(&facts, [{ _?e @ lifespan: ?v }])
         )
         .count(),
@@ -280,7 +280,7 @@ fn xsd_temporal_and_binary_types() {
     });
     assert_eq!(
         find!(
-            (h: Value<Handle<RawBytes>>),
+            (h: Inline<Handle<RawBytes>>),
             pattern!(&facts, [{ _?e @ checksum: ?h }])
         )
         .count(),
@@ -292,7 +292,7 @@ fn xsd_temporal_and_binary_types() {
     });
     assert_eq!(
         find!(
-            (h: Value<Handle<RawBytes>>),
+            (h: Inline<Handle<RawBytes>>),
             pattern!(&facts, [{ _?e @ avatar: ?h }])
         )
         .count(),
@@ -354,7 +354,7 @@ fn lang_tagged_literals_reify_into_entities() {
     );
 
     // The English label entity carries `rdf_lang = "en"` and one rdf_text trible.
-    let en_value = "en".try_to_value().unwrap();
+    let en_value = "en".try_to_inline().unwrap();
     let en_count = find!(
         (e: Id),
         pattern!(&facts, [{ ?e @ rdf_lang: en_value }])
@@ -362,7 +362,7 @@ fn lang_tagged_literals_reify_into_entities() {
     .count();
     assert_eq!(en_count, 1, "one shared English label entity");
 
-    let de_value = "de".try_to_value().unwrap();
+    let de_value = "de".try_to_inline().unwrap();
     let de_count = find!(
         (e: Id),
         pattern!(&facts, [{ ?e @ rdf_lang: de_value }])
@@ -372,7 +372,7 @@ fn lang_tagged_literals_reify_into_entities() {
 
     // The label entity also carries an `rdf_text` handle.
     let text_count = find!(
-        (e: Id, h: Value<Handle<LongString>>),
+        (e: Id, h: Inline<Handle<LongString>>),
         pattern!(&facts, [{ ?e @ rdf_text: ?h }])
     )
     .count();
@@ -451,7 +451,7 @@ _:b1 <http://ex/q> "x" .
 
     // The same id appears as the subject of the bnode's outgoing fact.
     let outgoing_count = find!(
-        (h: Value<Handle<LongString>>),
+        (h: Inline<Handle<LongString>>),
         pattern!(&facts, [{ target @ q: ?h }])
     )
     .count();

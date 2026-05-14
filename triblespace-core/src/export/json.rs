@@ -16,10 +16,10 @@ use crate::value::schemas::boolean::Boolean;
 use crate::value::schemas::f64::F64;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::{Blake3, Handle, Hash};
-use crate::value::schemas::UnknownValue;
-use crate::value::RawValue;
-use crate::value::IntoValue;
-use crate::value::Value;
+use crate::value::schemas::UnknownInline;
+use crate::value::RawInline;
+use crate::value::IntoInline;
+use crate::value::Inline;
 use anybytes::View;
 use ryu::Buffer;
 
@@ -64,7 +64,7 @@ pub fn export_to_json(
 ) -> Result<(), ExportError> {
     let mut multi_flags = HashSet::new();
     find!(
-        (name_handle: Value<Handle<LongString>>),
+        (name_handle: Inline<Handle<LongString>>),
         temp!((field), pattern!(merged, [
             { ?field @ metadata::name: ?name_handle },
             { ?field @ metadata::tag: metadata::KIND_MULTI }
@@ -102,15 +102,15 @@ fn write_entity(
     let _ = out.write_char('{');
 
     let mut field_values: Vec<(
-        RawValue,
-        Value<Handle<LongString>>,
+        RawInline,
+        Inline<Handle<LongString>>,
         Id,
-        Value<UnknownValue>,
+        Inline<UnknownInline>,
     )> = Vec::new();
     find!(
-        (name_handle: Value<Handle<LongString>>, schema_value: Value<GenId>, value: Value<UnknownValue>),
+        (name_handle: Inline<Handle<LongString>>, schema_value: Inline<GenId>, value: Inline<UnknownInline>),
         temp!((e, attr), and!(
-            e.is(entity.to_value()),
+            e.is(entity.to_inline()),
             merged.pattern(e, attr, value),
             pattern!(merged, [
                 { ?attr @ metadata::name: ?name_handle },
@@ -119,7 +119,7 @@ fn write_entity(
         ))
     )
     .filter_map(|(name_handle, schema_value, value)| {
-        let schema: Id = schema_value.try_from_value().ok()?;
+        let schema: Id = schema_value.try_from_inline().ok()?;
         Some((name_handle.raw, name_handle, schema, value))
     })
     .for_each(|(raw, name_handle, schema, value)| {
@@ -170,7 +170,7 @@ fn write_entity(
 fn render_schema_value(
     merged: &TribleSet,
     schema: Id,
-    value: Value<UnknownValue>,
+    value: Inline<UnknownInline>,
     visited: &mut HashSet<Id>,
     ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
     out: &mut impl FmtWrite,
@@ -186,7 +186,7 @@ fn render_schema_value(
 
     if schema == *BOOLEAN_ID {
         let value = value.transmute::<Boolean>();
-        if let Ok(b) = value.try_from_value::<bool>() {
+        if let Ok(b) = value.try_from_inline::<bool>() {
             let _ = out.write_str(if b { "true" } else { "false" });
         } else {
             let _ = out.write_str("null");
@@ -195,7 +195,7 @@ fn render_schema_value(
     }
     if schema == *F64_ID {
         let value = value.transmute::<F64>();
-        let number = value.from_value::<f64>();
+        let number = value.from_inline::<f64>();
         if !number.is_finite() {
             let _ = out.write_str("null");
             return Ok(());
@@ -210,7 +210,7 @@ fn render_schema_value(
         return Ok(());
     }
     if schema == *GENID_ID {
-        if let Ok(child_id) = value.transmute::<GenId>().try_from_value::<Id>() {
+        if let Ok(child_id) = value.transmute::<GenId>().try_from_inline::<Id>() {
             return write_entity(merged, child_id, visited, ctx, out);
         }
         return Ok(());
@@ -281,20 +281,20 @@ fn write_escaped_str(text: &str, out: &mut impl FmtWrite) {
 
 struct ExportCtx<'a, Store: BlobStoreGet> {
     store: &'a Store,
-    name_cache: HashMap<RawValue, String>,
-    string_cache: HashMap<RawValue, View<str>>,
-    multi_flags: HashSet<RawValue>,
+    name_cache: HashMap<RawInline, String>,
+    string_cache: HashMap<RawInline, View<str>>,
+    multi_flags: HashSet<RawInline>,
 }
 
 fn resolve_name(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
-    handle: Value<Handle<LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<String, ExportError> {
     if let Some(cached) = ctx.name_cache.get(&handle.raw) {
         return Ok(cached.clone());
     }
 
-    let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
+    let hash: Inline<Hash<Blake3>> = Handle::to_hash(handle);
     let text = ctx
         .store
         .get::<View<str>, LongString>(handle)
@@ -309,13 +309,13 @@ fn resolve_name(
 
 fn resolve_string(
     ctx: &mut ExportCtx<'_, impl BlobStoreGet>,
-    handle: Value<Handle<LongString>>,
+    handle: Inline<Handle<LongString>>,
 ) -> Result<View<str>, ExportError> {
     if let Some(cached) = ctx.string_cache.get(&handle.raw) {
         return Ok(cached.clone());
     }
 
-    let hash: Value<Hash<Blake3>> = Handle::to_hash(handle);
+    let hash: Inline<Hash<Blake3>> = Handle::to_hash(handle);
     let text: View<str> = ctx
         .store
         .get::<View<str>, LongString>(handle)

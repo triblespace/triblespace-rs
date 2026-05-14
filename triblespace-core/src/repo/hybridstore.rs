@@ -7,8 +7,8 @@ use crate::repo::BlobStorePut;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
 use crate::value::schemas::hash::Handle;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 /// Store that delegates blob and branch operations to two independent stores.
 ///
@@ -35,11 +35,11 @@ where
 {
     type PutError = B::PutError;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         self.blobs.put(item)
     }
@@ -75,15 +75,15 @@ where
         self.branches.branches()
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         self.branches.head(id)
     }
 
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.branches.update(id, old, new)
     }

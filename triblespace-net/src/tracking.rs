@@ -15,7 +15,7 @@ use triblespace_core::id::{Id, genid};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::time::NsTAIInterval;
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 use triblespace_core::prelude::valueschemas::{GenId, ED25519PublicKey};
 use triblespace_core::prelude::attributes;
@@ -84,7 +84,7 @@ where
         ).next() else { continue; };
 
         let Some(name_handle) = find!(
-            h: Value<Handle<LongString>>,
+            h: Inline<Handle<LongString>>,
             pattern!(&meta, [{ _?e @ remote_name: ?h }])
         ).next() else { continue; };
 
@@ -122,12 +122,12 @@ where
 fn resolve_commit_in_branch_meta<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
-) -> Option<Value<Handle<SimpleArchive>>> {
+) -> Option<Inline<Handle<SimpleArchive>>> {
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<SimpleArchive>>::new(*branch_meta_hash);
+    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
     find!(
-        h: Value<Handle<SimpleArchive>>,
+        h: Inline<Handle<SimpleArchive>>,
         pattern!(&meta, [{ _?e @ triblespace_core::repo::head: ?h }])
     ).next()
 }
@@ -138,12 +138,12 @@ fn resolve_commit_in_branch_meta<S: BlobStore>(
 fn read_updated_at<S: BlobStore>(
     store: &mut S,
     branch_meta_hash: &RawHash,
-) -> Option<Value<NsTAIInterval>> {
+) -> Option<Inline<NsTAIInterval>> {
     let reader = store.reader().ok()?;
-    let meta_handle = Value::<Handle<SimpleArchive>>::new(*branch_meta_hash);
+    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*branch_meta_hash);
     let meta: TribleSet = reader.get(meta_handle).ok()?;
     find!(
-        ts: Value<NsTAIInterval>,
+        ts: Inline<NsTAIInterval>,
         pattern!(&meta, [{ _?e @ triblespace_core::metadata::updated_at: ?ts }])
     ).next()
 }
@@ -151,11 +151,11 @@ fn read_updated_at<S: BlobStore>(
 /// Compare two `NsTAIInterval` values by their lower bound (both bounds
 /// are identical for point-in-time timestamps). Returns true iff `new` is
 /// strictly newer than `current`.
-fn is_newer(new: Value<NsTAIInterval>, current: Value<NsTAIInterval>) -> bool {
-    let Ok((new_ns, _)): Result<(i128, i128), _> = new.try_from_value() else {
+fn is_newer(new: Inline<NsTAIInterval>, current: Inline<NsTAIInterval>) -> bool {
+    let Ok((new_ns, _)): Result<(i128, i128), _> = new.try_from_inline() else {
         return false;
     };
-    let Ok((current_ns, _)): Result<(i128, i128), _> = current.try_from_value() else {
+    let Ok((current_ns, _)): Result<(i128, i128), _> = current.try_from_inline() else {
         return false;
     };
     new_ns > current_ns
@@ -188,7 +188,7 @@ where
     let tracking_id: Id = *genid();
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<LongString>> =
+    let name_handle: Inline<Handle<LongString>> =
         store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
@@ -202,7 +202,7 @@ where
         triblespace_core::metadata::updated_at?: remote_updated_at,
     }
     .into();
-    let meta_handle: Value<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
+    let meta_handle: Inline<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
 
     match store.update(tracking_id, None, Some(meta_handle)).ok()? {
         PushResult::Success() => Some(tracking_id),
@@ -245,7 +245,7 @@ where
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<LongString>> =
+    let name_handle: Inline<Handle<LongString>> =
         store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
@@ -262,7 +262,7 @@ where
     }
     .into();
 
-    let meta_handle: Value<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
+    let meta_handle: Inline<Handle<SimpleArchive>> = store.put(meta_set).ok()?;
 
     match store.update(tracking_branch_id, Some(old_meta), Some(meta_handle)).ok()? {
         PushResult::Success() => Some(()),
@@ -297,7 +297,7 @@ pub enum MergeOutcome {
     /// Local branch was already up-to-date with the tracking branch.
     UpToDate,
     /// Local branch advanced to `new_head` (fast-forward or merge commit).
-    Merged { new_head: Value<Handle<SimpleArchive>> },
+    Merged { new_head: Inline<Handle<SimpleArchive>> },
 }
 
 /// Merge a tracking branch into its same-named local branch.
@@ -470,7 +470,7 @@ mod tests {
         use triblespace_core::blob::IntoBlob;
         use triblespace_core::blob::schemas::longstring::LongString;
         let name_blob = "remote-branch".to_string().to_blob();
-        let name_handle: Value<Handle<LongString>> = store.put(name_blob).unwrap();
+        let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();
         let remote_branch_id = genid();
         // Create a dummy commit blob and set it as the remote head.
         let commit_meta: TribleSet = TribleSet::new();
@@ -505,8 +505,8 @@ mod tests {
         let reader = store2.reader().unwrap();
         let track_meta_handle = store2.head(tracking_id).unwrap().unwrap();
         let track_meta: TribleSet = reader.get(track_meta_handle).unwrap();
-        let track_head: Value<Handle<SimpleArchive>> = find!(
-            h: Value<Handle<SimpleArchive>>,
+        let track_head: Inline<Handle<SimpleArchive>> = find!(
+            h: Inline<Handle<SimpleArchive>>,
             pattern!(&track_meta, [{ _?e @ triblespace_core::repo::head: ?h }])
         ).next().expect("tracking branch should have a head");
         assert_eq!(track_head, commit_handle,

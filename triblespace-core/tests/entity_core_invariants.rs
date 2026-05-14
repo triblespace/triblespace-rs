@@ -90,7 +90,7 @@ fn array_describe_carries_element_schema_annotations() {
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
     use triblespace_core::value::schemas::hash::Handle;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 
@@ -109,8 +109,8 @@ fn array_describe_carries_element_schema_annotations() {
 
     // F32's name annotation is in the same metadata fragment (folded
     // in via the `*:` spread).
-    let f32_names: Vec<Value<Handle<_>>> = find!(
-        (n: Value<Handle<_>>),
+    let f32_names: Vec<Inline<Handle<_>>> = find!(
+        (n: Inline<Handle<_>>),
         pattern!(&frag, [{ f32_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
@@ -118,8 +118,8 @@ fn array_describe_carries_element_schema_annotations() {
     assert_eq!(f32_names.len(), 1, "F32's name annotation reaches the registry");
 
     // And the Array's own annotation under array_id is also present.
-    let array_names: Vec<Value<Handle<_>>> = find!(
-        (n: Value<Handle<_>>),
+    let array_names: Vec<Inline<Handle<_>>> = find!(
+        (n: Inline<Handle<_>>),
         pattern!(&frag, [{ array_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
@@ -138,7 +138,7 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let frag = <Handle<LongString> as MetaDescribe>::describe();
 
@@ -166,16 +166,16 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
 
     // Both sub-schemas' name annotations reach the registry too —
     // proving the `*:` spread folded both sub-fragments in.
-    let blob_names: Vec<Value<Handle<_>>> = find!(
-        (n: Value<Handle<_>>),
+    let blob_names: Vec<Inline<Handle<_>>> = find!(
+        (n: Inline<Handle<_>>),
         pattern!(&frag, [{ blob_schema_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
     .collect();
     assert_eq!(blob_names.len(), 1, "LongString's name annotation reaches the registry");
 
-    let hash_names: Vec<Value<Handle<_>>> = find!(
-        (n: Value<Handle<_>>),
+    let hash_names: Vec<Inline<Handle<_>>> = find!(
+        (n: Inline<Handle<_>>),
         pattern!(&frag, [{ hash_schema_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
@@ -183,8 +183,8 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     assert_eq!(hash_names.len(), 1, "Blake3's name annotation reaches the registry");
 
     // Plus the handle's own annotation under handle_id.
-    let handle_names: Vec<Value<Handle<_>>> = find!(
-        (n: Value<Handle<_>>),
+    let handle_names: Vec<Inline<Handle<_>>> = find!(
+        (n: Inline<Handle<_>>),
         pattern!(&frag, [{ handle_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)
@@ -209,13 +209,13 @@ fn entity_spread_propagates_blobs() {
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::value::schemas::hash::Handle;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 
     let f32_id = F32::id();
-    let f32_name_handle: Value<Handle<LongString>> = find!(
-        (n: Value<Handle<LongString>>),
+    let f32_name_handle: Inline<Handle<LongString>> = find!(
+        (n: Inline<Handle<LongString>>),
         pattern!(&frag, [{ f32_id @ metadata::name: ?n }])
     )
     .map(|(n,)| n)

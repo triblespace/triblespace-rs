@@ -43,7 +43,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace_core::repo::pile::{Pile, ReadError};
     use triblespace_core::trible::TribleSet;
     use triblespace_core::value::schemas::hash::{Blake3, Handle, Hash};
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     match Pile::open(pile_path) {
         Ok(mut pile) => {
@@ -60,7 +60,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                     match item {
                         Ok((handle, blob)) => {
                             total += 1;
-                            let expected: triblespace_core::value::Value<Hash<Blake3>> =
+                            let expected: triblespace_core::value::Inline<Hash<Blake3>> =
                                 Handle::to_hash(handle);
                             let computed = Hash::<Blake3>::digest(&blob.bytes);
                             if expected != computed {
@@ -98,17 +98,17 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
 
                 fn verify_chain(
                     reader: &triblespace_core::repo::pile::PileReader,
-                    start: Value<Handle<SimpleArchive>>,
+                    start: Inline<Handle<SimpleArchive>>,
                     repo_parent_attr: triblespace_core::id::Id,
                     repo_content_attr: triblespace_core::id::Id,
                 ) -> (usize, Option<String>) {
                     use std::collections::BTreeSet;
                     let mut visited: BTreeSet<String> = BTreeSet::new();
-                    let mut stack: Vec<Value<Handle<SimpleArchive>>> = vec![start];
+                    let mut stack: Vec<Inline<Handle<SimpleArchive>>> = vec![start];
                     let mut count = 0usize;
                     while let Some(h) = stack.pop() {
-                        let hh: Value<Hash<Blake3>> = Handle::to_hash(h);
-                        let hex: String = hh.from_value();
+                        let hh: Inline<Hash<Blake3>> = Handle::to_hash(h);
+                        let hex: String = hh.from_inline();
                         if !visited.insert(hex.clone()) {
                             continue;
                         }
@@ -133,8 +133,8 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 )
                             }
                         };
-                        let mut content_handle: Option<Value<Handle<SimpleArchive>>> = None;
-                        let mut parents: Vec<Value<Handle<SimpleArchive>>> = Vec::new();
+                        let mut content_handle: Option<Inline<Handle<SimpleArchive>>> = None;
+                        let mut parents: Vec<Inline<Handle<SimpleArchive>>> = Vec::new();
                         for t in meta.iter() {
                             if t.a() == &repo_content_attr {
                                 content_handle = Some(*t.v::<Handle<SimpleArchive>>());
@@ -183,7 +183,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                         Some(meta_handle) => {
                             let meta_present = reader.metadata(meta_handle)?.is_some();
                             let mut name_val: Option<String> = None;
-                            let mut head_val: Option<Value<Handle<SimpleArchive>>> = None;
+                            let mut head_val: Option<Inline<Handle<SimpleArchive>>> = None;
                             let mut meta_err: Option<String> = None;
                             let name_attr = triblespace_core::metadata::name.id();
                             if meta_present {
@@ -191,7 +191,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                     Ok(meta) => {
                                         for t in meta.iter() {
                                             if t.a() == &name_attr {
-                                                let h: Value<Handle<LongString>> = *t.v();
+                                                let h: Inline<Handle<LongString>> = *t.v();
                                                 if let Ok(view) =
                                                     reader.get::<triblespace::prelude::View<str>, _>(h)
                                                 {
@@ -208,8 +208,8 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                     }
                                 }
                             }
-                            let meta_hash: Value<Hash<Blake3>> = Handle::to_hash(meta_handle);
-                            let meta_hex: String = meta_hash.from_value();
+                            let meta_hash: Inline<Hash<Blake3>> = Handle::to_hash(meta_handle);
+                            let meta_hex: String = meta_hash.from_inline();
                             if let Some(n) = name_val.as_ref() {
                                 println!(
                                     "- {id_hex} ({n}): meta blake3:{meta_hex} [{}]{}",
@@ -292,7 +292,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     use triblespace_core::id::id_hex;
     use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_core::value::schemas::hash::Hash;
-    use triblespace_core::value::Value;
+    use triblespace_core::value::Inline;
 
     let handle = handle.trim();
     let normalized = if !handle.contains(':') && handle.len() == 64 {
@@ -300,9 +300,9 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     } else {
         handle.to_owned()
     };
-    let target: Value<Hash<Blake3>> = crate::cli::util::parse_blob_handle(&normalized)?;
+    let target: Inline<Hash<Blake3>> = crate::cli::util::parse_blob_handle(&normalized)?;
     let needle = target.raw;
-    let needle_str: String = target.from_value();
+    let needle_str: String = target.from_inline();
 
     let file = File::open(pile_path)
         .with_context(|| format!("open pile {}", pile_path.display()))?;
@@ -360,8 +360,8 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
 
             let payload = &bytes[payload_start..payload_start + length];
             if let Some(_) = finder.find(payload) {
-                let container_hash = Value::<Hash<Blake3>>::new(hash_bytes);
-                let container_str: String = container_hash.from_value();
+                let container_hash = Inline::<Hash<Blake3>>::new(hash_bytes);
+                let container_str: String = container_hash.from_inline();
                 for pos in finder.find_iter(payload) {
                     payload_matches += 1;
                     let absolute = payload_start + pos;

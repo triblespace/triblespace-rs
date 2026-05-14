@@ -45,7 +45,7 @@ impl MetaDescribe for SimpleArchive {
 }
 
 impl IntoSchema<SimpleArchive> for TribleSet
-where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
     type Form = Blob<SimpleArchive>;
     fn into_schema(self) -> Blob<SimpleArchive> {
@@ -57,7 +57,7 @@ where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::ValueSch
 }
 
 impl IntoSchema<SimpleArchive> for &TribleSet
-where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::ValueSchema,
+where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
     type Form = Blob<SimpleArchive>;
     fn into_schema(self) -> Blob<SimpleArchive> {

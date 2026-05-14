@@ -12,23 +12,23 @@ The 32-byte window is a deliberate compromise. It is small enough to move
 quickly through memory and across networks, yet it offers enough entropy to hold
 intrinsic identifiers such as hashes. When a payload cannot fit within those 32
 bytes we store the larger content in a blob and reference it from the value via
-its identifier. The uniform size also keeps the storage layer simple: a `Value`
+its identifier. The uniform size also keeps the storage layer simple: a `Inline`
 is always the same size regardless of its schema.
 
 ## Schemas as Contracts
 
 A schema describes which bit patterns are meaningful for a particular value. The
-[`Value`](../../src/value.rs) type is parameterised by such a schema and remains
+[`Inline`](../../src/value.rs) type is parameterised by such a schema and remains
 agnostic about whether the underlying bytes currently satisfy the contract.
-Validation lives in the schema through the [`ValueSchema`](../../src/value.rs)
+Validation lives in the schema through the [`InlineSchema`](../../src/value.rs)
 trait, while conversions to concrete Rust types use [`ToValue`],
-[`TryToValue`], and [`TryFromValue`]. Because conversion traits are implemented
-for the schema instead of the `Value` type itself, we avoid Rust's orphan rule
+[`TryToInline`], and [`TryFromInline`]. Because conversion traits are implemented
+for the schema instead of the `Inline` type itself, we avoid Rust's orphan rule
 and allow downstream crates to add their own adapters.
 
 Schemas carry two optional identifiers:
 
-- **Value schema ID** – Uniquely distinguishes the schema that governs the 32-byte value buffer.
+- **Inline schema ID** – Uniquely distinguishes the schema that governs the 32-byte value buffer.
 - **Blob schema ID** – Identifies the schema of any external blob a value may reference.
 
 These identifiers let us document schemas inside the knowledge graph itself.
@@ -45,7 +45,7 @@ exist to guard against that outcome.
 
 When you define a new schema:
 
-1. Create a zero-sized marker type and implement [`ValueSchema`] for it.
+1. Create a zero-sized marker type and implement [`InlineSchema`] for it.
 2. Add conversions between the schema and your Rust types via the conversion
    traits mentioned above.
 3. Validate inputs when only some bit patterns are acceptable.
@@ -53,7 +53,7 @@ When you define a new schema:
 With those pieces in place, values can round-trip between storage and strongly
 typed Rust code while remaining portable and future-proof.
 
-[`ValueSchema`]: ../../src/value.rs
+[`InlineSchema`]: ../../src/value.rs
 [`ToValue`]: ../../src/value.rs
-[`TryToValue`]: ../../src/value.rs
-[`TryFromValue`]: ../../src/value.rs
+[`TryToInline`]: ../../src/value.rs
+[`TryFromInline`]: ../../src/value.rs

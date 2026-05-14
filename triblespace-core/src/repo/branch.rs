@@ -19,8 +19,8 @@ use crate::prelude::blobschemas::SimpleArchive;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::schemas::time::NsTAIInterval;
-use crate::value::TryToValue;
-use crate::value::Value;
+use crate::value::TryToInline;
+use crate::value::Inline;
 
 /// Current TAI time as a collapsed `NsTAIInterval`. Used as
 /// `metadata::updated_at` on every branch metadata blob so that peers can
@@ -30,9 +30,9 @@ use crate::value::Value;
 /// still mean subsequent publishes land "in the past" from the publisher's
 /// view; receivers simply hold out until the publisher's clock catches up
 /// and a fresher timestamp arrives.
-fn now_updated_at() -> Value<NsTAIInterval> {
+fn now_updated_at() -> Inline<NsTAIInterval> {
     let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    (now, now).try_to_value().expect("same epoch is a valid point interval")
+    (now, now).try_to_inline().expect("same epoch is a valid point interval")
 }
 
 /// Builds a metadata [`TribleSet`] describing a branch and signs it.
@@ -51,9 +51,9 @@ fn now_updated_at() -> Value<NsTAIInterval> {
 pub fn branch_metadata(
     signing_key: &SigningKey,
     branch_id: Id,
-    name: Value<Handle<LongString>>,
+    name: Inline<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Value<Handle<SuccinctArchiveBlob>>>,
+    rollup: Option<Inline<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let (head_handle, signed_by, signature) = match commit_head.as_ref() {
         Some(blob) => (
@@ -84,9 +84,9 @@ pub fn branch_metadata(
 /// therefore be created without access to a private key.
 pub fn branch_unsigned(
     branch_id: Id,
-    name: Value<Handle<LongString>>,
+    name: Inline<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Value<Handle<SuccinctArchiveBlob>>>,
+    rollup: Option<Inline<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let head_handle = commit_head
         .as_ref()
@@ -133,7 +133,7 @@ pub fn verify(
 ) -> Result<(), ValidationError> {
     let handle = commit_head.get_handle();
     let (pubkey, r, s) = match find!(
-    (pubkey: Value<_>, r, s),
+    (pubkey: Inline<_>, r, s),
     pattern!(&metadata, [
     {
         super::head: handle,
@@ -148,7 +148,7 @@ pub fn verify(
         Err(_) => return Err(ValidationError::AmbiguousSignature),
     };
 
-    let Ok(pubkey): Result<VerifyingKey, _> = pubkey.try_from_value() else {
+    let Ok(pubkey): Result<VerifyingKey, _> = pubkey.try_from_inline() else {
         return Err(ValidationError::FailedValidation);
     };
     let signature = Signature::from_components(r, s);

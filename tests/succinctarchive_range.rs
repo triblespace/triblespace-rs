@@ -21,10 +21,10 @@ fn value_in_range_proposes_correctly() {
     let e3 = ufoid();
     let e4 = ufoid();
 
-    let v10: Value<R256BE> = 10i128.to_value();
-    let v50: Value<R256BE> = 50i128.to_value();
-    let v90: Value<R256BE> = 90i128.to_value();
-    let v100: Value<R256BE> = 100i128.to_value();
+    let v10: Inline<R256BE> = 10i128.to_inline();
+    let v50: Inline<R256BE> = 50i128.to_inline();
+    let v90: Inline<R256BE> = 90i128.to_inline();
+    let v100: Inline<R256BE> = 100i128.to_inline();
 
     let mut set = TribleSet::new();
     set += entity! { &e1 @ range_test_score: v10 };
@@ -34,18 +34,18 @@ fn value_in_range_proposes_correctly() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
 
     // Without range: all 4 results.
-    let all: Vec<Value<R256BE>> = find!(
-        v: Value<R256BE>,
+    let all: Vec<Inline<R256BE>> = find!(
+        v: Inline<R256BE>,
         pattern!(&archive, [{ range_test_score: ?v }])
     )
     .collect();
     assert_eq!(all.len(), 4);
 
     // With value_in_range [20..=95]: only v50 and v90.
-    let min: Value<R256BE> = 20i128.to_value();
-    let max: Value<R256BE> = 95i128.to_value();
-    let mut filtered: Vec<Value<R256BE>> = find!(
-        v: Value<R256BE>,
+    let min: Inline<R256BE> = 20i128.to_inline();
+    let max: Inline<R256BE> = 95i128.to_inline();
+    let mut filtered: Vec<Inline<R256BE>> = find!(
+        v: Inline<R256BE>,
         and!(
             pattern!(&archive, [{ range_test_score: ?v }]),
             archive.value_in_range(v, min, max),
@@ -58,10 +58,10 @@ fn value_in_range_proposes_correctly() {
     assert_eq!(filtered[1], v90);
 
     // Boundary: exact match on min and max.
-    let min_exact: Value<R256BE> = 50i128.to_value();
-    let max_exact: Value<R256BE> = 90i128.to_value();
-    let mut exact: Vec<Value<R256BE>> = find!(
-        v: Value<R256BE>,
+    let min_exact: Inline<R256BE> = 50i128.to_inline();
+    let max_exact: Inline<R256BE> = 90i128.to_inline();
+    let mut exact: Vec<Inline<R256BE>> = find!(
+        v: Inline<R256BE>,
         and!(
             pattern!(&archive, [{ range_test_score: ?v }]),
             archive.value_in_range(v, min_exact, max_exact),
@@ -74,10 +74,10 @@ fn value_in_range_proposes_correctly() {
     assert_eq!(exact[1], v90);
 
     // Empty range: no results.
-    let min_empty: Value<R256BE> = 91i128.to_value();
-    let max_empty: Value<R256BE> = 99i128.to_value();
-    let empty: Vec<Value<R256BE>> = find!(
-        v: Value<R256BE>,
+    let min_empty: Inline<R256BE> = 91i128.to_inline();
+    let max_empty: Inline<R256BE> = 99i128.to_inline();
+    let empty: Vec<Inline<R256BE>> = find!(
+        v: Inline<R256BE>,
         and!(
             pattern!(&archive, [{ range_test_score: ?v }]),
             archive.value_in_range(v, min_empty, max_empty),
@@ -87,8 +87,8 @@ fn value_in_range_proposes_correctly() {
     assert_eq!(empty.len(), 0);
 
     // Inverted range (min > max): empty.
-    let inverted: Vec<Value<R256BE>> = find!(
-        v: Value<R256BE>,
+    let inverted: Vec<Inline<R256BE>> = find!(
+        v: Inline<R256BE>,
         and!(
             pattern!(&archive, [{ range_test_score: ?v }]),
             archive.value_in_range(v, v90, v10),
@@ -108,9 +108,9 @@ fn estimate_is_universe_code_range_upper_bound() {
     // The estimate must always be >= the actual distinct V-codes that
     // would be proposed. For three distinct V-position codes (10, 50,
     // 90) all in the range [0, 100], the estimate must be >= 3.
-    let v10: Value<R256BE> = 10i128.to_value();
-    let v50: Value<R256BE> = 50i128.to_value();
-    let v90: Value<R256BE> = 90i128.to_value();
+    let v10: Inline<R256BE> = 10i128.to_inline();
+    let v50: Inline<R256BE> = 50i128.to_inline();
+    let v90: Inline<R256BE> = 90i128.to_inline();
 
     let mut set = TribleSet::new();
     for _ in 0..1 {
@@ -126,8 +126,8 @@ fn estimate_is_universe_code_range_upper_bound() {
 
     let mut ctx = VariableContext::new();
     let v = ctx.next_variable::<R256BE>();
-    let min: Value<R256BE> = 0i128.to_value();
-    let max: Value<R256BE> = 100i128.to_value();
+    let min: Inline<R256BE> = 0i128.to_inline();
+    let max: Inline<R256BE> = 100i128.to_inline();
     let constraint = archive.value_in_range(v, min, max);
 
     let estimate = constraint

@@ -70,7 +70,7 @@ fn random_tribles(length: usize) -> Vec<Trible> {
         }
 
         let v = fucid();
-        vec.push(Trible::new(&e, &a, &v.to_value()))
+        vec.push(Trible::new(&e, &a, &v.to_inline()))
     }
     return vec;
 }
@@ -651,7 +651,7 @@ fn query_benchmark(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("tribleset/single", 1), |b| {
         b.iter(|| {
             find!(
-            (author: Value<_>, title: Value<_>, quote: Value<_>),
+            (author: Inline<_>, title: Inline<_>, quote: Inline<_>),
             pattern!(&kb, [
                 {?author @
                     literature::firstname: "Frank",
@@ -668,7 +668,7 @@ fn query_benchmark(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("tribleset/multi", 1000), |b| {
         b.iter(|| {
             find!(
-            (title: Value<_>, quote: Value<_>),
+            (title: Inline<_>, quote: Inline<_>),
             pattern!(&kb, [
                 {_?author @
                     literature::firstname: "Fake",
@@ -689,7 +689,7 @@ fn query_benchmark(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("archive/single", 1), |b| {
         b.iter(|| {
             find!(
-            (author: Value<_>, title: Value<_>, quote: Value<_>),
+            (author: Inline<_>, title: Inline<_>, quote: Inline<_>),
             pattern!(&kb_archive, [
                 {?author @
                     literature::firstname: "Frank",
@@ -706,7 +706,7 @@ fn query_benchmark(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("archive/multi", 1000), |b| {
         b.iter(|| {
             find!(
-            (title: Value<_>, quote: Value<_>),
+            (title: Inline<_>, quote: Inline<_>),
             pattern!(&kb_archive, [
             {_?author @
                 literature::firstname: "Fake",

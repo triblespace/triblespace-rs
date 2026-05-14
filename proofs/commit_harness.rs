@@ -48,19 +48,19 @@ fn commit_harness() {
 
     // Ensure the content handle and signature info were stored
     let (handle, pubkey, _r, _s) = find!(
-        (h: Value<_>, k: Value<_>, r, s),
+        (h: Inline<_>, k: Inline<_>, r, s),
         pattern!(&commit_set, [{ repo::content: h, repo::signed_by: k, repo::signature_r: r, repo::signature_s: s }])
     )
     .at_most_one()
     .unwrap()
     .expect("missing commit info");
     assert_eq!(handle, content.get_handle());
-    let pk: ed25519_dalek::VerifyingKey = pubkey.try_from_value().unwrap();
+    let pk: ed25519_dalek::VerifyingKey = pubkey.try_from_inline().unwrap();
     assert_eq!(pk, signing_key.verifying_key());
 
     // Ensure both parents are present
     let parents: Vec<_> = find!(
-        (p: Value<_>),
+        (p: Inline<_>),
         pattern!(&commit_set, [{ repo::parent: p }])
     )
     .collect();

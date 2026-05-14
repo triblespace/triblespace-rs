@@ -243,7 +243,7 @@ struct PatternInput {
 }
 
 struct Entity {
-    id: Option<Value>,
+    id: Option<Inline>,
     attributes: Vec<Attribute>,
 }
 
@@ -254,7 +254,7 @@ enum AttributeMode {
     Repeated,
 }
 
-enum Value {
+enum Inline {
     Var(Ident),
     LocalVar(Ident),
     Expr(Expr),
@@ -263,34 +263,34 @@ enum Value {
 struct Attribute {
     /// Attribute identifier in the pattern's `name: value` slot.
     /// Three shapes are supported:
-    ///   - `Value::Expr(e)`     — known attribute constant, e.g.
+    ///   - `Inline::Expr(e)`     — known attribute constant, e.g.
     ///                            `cwork_title`. The macro resolves
     ///                            the attribute Id and uses its
     ///                            schema to type the value.
-    ///   - `Value::Var(ident)`  — free attribute, bound to a
+    ///   - `Inline::Var(ident)`  — free attribute, bound to a
     ///                            `find!`-projected
     ///                            `Variable<GenId>`. The value
     ///                            position is required to be a
-    ///                            `Variable<UnknownValue>` — the
+    ///                            `Variable<UnknownInline>` — the
     ///                            macro emits a compile-time type
     ///                            assertion to that effect.
     ///                            Without a fixed predicate the
     ///                            value bytes can come from any
     ///                            schema, so the user must take an
-    ///                            explicit `try_from_value::<S>()`
+    ///                            explicit `try_from_inline::<S>()`
     ///                            step to decode them and that
     ///                            transmutation has to live at the
     ///                            use site rather than the
     ///                            projection.
-    ///   - `Value::LocalVar(_)` — pattern-local helper variable in
+    ///   - `Inline::LocalVar(_)` — pattern-local helper variable in
     ///                            the attribute slot. Free-attribute
     ///                            in the value slot is rejected
     ///                            (no schema to infer); the user
-    ///                            should project a `Variable<UnknownValue>`
+    ///                            should project a `Variable<UnknownInline>`
     ///                            via `find!` instead.
-    name: Value,
+    name: Inline,
     mode: AttributeMode,
-    value: Value,
+    value: Inline,
 }
 
 impl Parse for PatternInput {
@@ -313,7 +313,7 @@ impl Parse for Entity {
         let content;
         braced!(content in input);
 
-        let mut id: Option<Value> = None;
+        let mut id: Option<Inline> = None;
         {
             let fork = content.fork();
             // Special-case `_ @` so callers can be explicit about content-derived identity
@@ -329,8 +329,8 @@ impl Parse for Entity {
         }
         if id.is_none() {
             let fork = content.fork();
-            if fork.parse::<Value>().is_ok() && fork.peek(Token![@]) {
-                let pv: Value = content.parse()?;
+            if fork.parse::<Inline>().is_ok() && fork.peek(Token![@]) {
+                let pv: Inline = content.parse()?;
                 content.parse::<Token![@]>()?;
                 id = Some(pv);
             }
@@ -362,10 +362,10 @@ impl Parse for Attribute {
                 let fork2 = fork.fork();
                 fork2.parse::<Token![?]>()?;
                 if fork2.peek(Token![:]) {
-                    let name = Value::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
+                    let name = Inline::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
                     input.parse::<Token![?]>()?;
                     input.parse::<Token![:]>()?;
-                    let value: Value = input.parse()?;
+                    let value: Inline = input.parse()?;
                     return Ok(Attribute {
                         name,
                         mode: AttributeMode::Optional,
@@ -378,10 +378,10 @@ impl Parse for Attribute {
                 let fork2 = fork.fork();
                 fork2.parse::<Token![*]>()?;
                 if fork2.peek(Token![:]) {
-                    let name = Value::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
+                    let name = Inline::Expr(Expr::Path(input.parse::<syn::ExprPath>()?));
                     input.parse::<Token![*]>()?;
                     input.parse::<Token![:]>()?;
-                    let value: Value = input.parse()?;
+                    let value: Inline = input.parse()?;
                     return Ok(Attribute {
                         name,
                         mode: AttributeMode::Repeated,
@@ -391,14 +391,14 @@ impl Parse for Attribute {
             }
 
             // Path-like required fact: fall through to the generic
-            // Value branch below, which also accepts `?ident` /
+            // Inline branch below, which also accepts `?ident` /
             // `_?ident`.
             let _ = expr_path;
         }
 
-        let name: Value = input.parse()?;
+        let name: Inline = input.parse()?;
         input.parse::<Token![:]>()?;
-        let value: Value = input.parse()?;
+        let value: Inline = input.parse()?;
         Ok(Attribute {
             name,
             mode: AttributeMode::Required,
@@ -407,7 +407,7 @@ impl Parse for Attribute {
     }
 }
 
-impl Parse for Value {
+impl Parse for Inline {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         if input.peek(Token![_]) {
             let fork = input.fork();
@@ -416,16 +416,16 @@ impl Parse for Value {
                 input.parse::<Token![_]>()?;
                 input.parse::<Token![?]>()?;
                 let var_ident: Ident = input.parse()?;
-                return Ok(Value::LocalVar(var_ident));
+                return Ok(Inline::LocalVar(var_ident));
             }
         }
         if input.peek(Token![?]) {
             input.parse::<Token![?]>()?;
             let var_ident: Ident = input.parse()?;
-            Ok(Value::Var(var_ident))
+            Ok(Inline::Var(var_ident))
         } else {
             let expr: Expr = input.parse()?;
-            Ok(Value::Expr(expr))
+            Ok(Inline::Expr(expr))
         }
     }
 }
@@ -471,23 +471,23 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
         // self-referencing patterns like `{ _?e @ attr: _?e }` or
         // `{ ?e @ attr: ?e }` and desugar them with EqualityConstraint.
         let entity_var_key: Option<(bool, String)> = match entity.id {
-            Some(Value::LocalVar(ref ident)) => Some((true, ident.to_string())),
-            Some(Value::Var(ref ident)) => Some((false, ident.to_string())),
+            Some(Inline::LocalVar(ref ident)) => Some((true, ident.to_string())),
+            Some(Inline::Var(ref ident)) => Some((false, ident.to_string())),
             _ => None,
         };
         let init = if let Some(ref id_val) = entity.id {
             match id_val {
-                Value::Var(ref ident) => {
+                Inline::Var(ref ident) => {
                     quote! { let #e_ident = #ident; }
                 }
-                Value::LocalVar(ref ident) => {
+                Inline::LocalVar(ref ident) => {
                     let local_ident = get_local_var(ident);
                     quote! { let #e_ident = #local_ident; }
                 }
-                Value::Expr(ref id_expr) => {
+                Inline::Expr(ref id_expr) => {
                     quote! {
                         let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoValue::to_value(#id_expr))));
+                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoInline::to_inline(#id_expr))));
                     }
                 }
             }
@@ -501,9 +501,9 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
         for Attribute { name, mode, value } in entity.attributes {
             if mode != AttributeMode::Required {
                 let span_for_err = match &name {
-                    Value::Expr(e) => e.to_token_stream(),
-                    Value::Var(i) => i.to_token_stream(),
-                    Value::LocalVar(i) => i.to_token_stream(),
+                    Inline::Expr(e) => e.to_token_stream(),
+                    Inline::Var(i) => i.to_token_stream(),
+                    Inline::LocalVar(i) => i.to_token_stream(),
                 };
                 return Err(syn::Error::new_spanned(
                     span_for_err,
@@ -512,18 +512,18 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             }
 
             // Set up (or reuse) the attribute variable for this slot.
-            // For Value::Expr (concrete attribute) we keep the
+            // For Inline::Expr (concrete attribute) we keep the
             // existing behaviour: emit a `let __af = &expr` reference
             // to the Attribute constant so downstream value codegen
-            // can call `.value_from(...)` / `.as_variable(...)` on
-            // it. For Value::Var / Value::LocalVar (free attribute)
+            // can call `.inline_from(...)` / `.as_variable(...)` on
+            // it. For Inline::Var / Inline::LocalVar (free attribute)
             // there is no schema available — `__af` is `None` and
-            // the value position must use the opaque `UnknownValue`
+            // the value position must use the opaque `UnknownInline`
             // schema.
             let key = match &name {
-                Value::Var(ident) => format!("?{}", ident),
-                Value::LocalVar(ident) => format!("_?{}", ident),
-                Value::Expr(expr) => expr.to_token_stream().to_string(),
+                Inline::Var(ident) => format!("?{}", ident),
+                Inline::LocalVar(ident) => format!("_?{}", ident),
+                Inline::Expr(expr) => expr.to_token_stream().to_string(),
             };
             let (a_var_ident, af_ident_opt) = attr_map
                 .entry(key)
@@ -532,7 +532,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         format_ident!("__a{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
                     match &name {
-                        Value::Expr(expr) => {
+                        Inline::Expr(expr) => {
                             let af_ident = format_ident!(
                                 "__af{}",
                                 attr_idx,
@@ -541,17 +541,17 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             attr_tokens.extend(quote! {
                                 let #af_ident = &#expr;
                                 let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                                constraints.push(Box::new(#a_ident.is(#base_path::value::IntoValue::to_value(#af_ident.id()))));
+                                constraints.push(Box::new(#a_ident.is(#base_path::value::IntoInline::to_inline(#af_ident.id()))));
                             });
                             (a_ident, Some(af_ident))
                         }
-                        Value::Var(user_ident) => {
+                        Inline::Var(user_ident) => {
                             attr_tokens.extend(quote! {
                                 let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #user_ident;
                             });
                             (a_ident, None)
                         }
-                        Value::LocalVar(local_ident) => {
+                        Inline::LocalVar(local_ident) => {
                             let local_var = get_local_var(local_ident);
                             attr_tokens.extend(quote! {
                                 let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #local_var;
@@ -573,20 +573,20 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             // variables, where the entity and value bind the same
             // user variable).
             let value_var_key: Option<(bool, String)> = match value {
-                Value::Var(ref ident) => Some((false, ident.to_string())),
-                Value::LocalVar(ref ident) => Some((true, ident.to_string())),
+                Inline::Var(ref ident) => Some((false, ident.to_string())),
+                Inline::LocalVar(ref ident) => Some((true, ident.to_string())),
                 _ => None,
             };
             let self_ref = entity_var_key.is_some()
                 && entity_var_key == value_var_key;
 
             // Emit the per-trible constraint. The shape splits along
-            // two axes: Value variant (Var / LocalVar / Expr) and
+            // two axes: Inline variant (Var / LocalVar / Expr) and
             // whether the attribute is concrete (`af_ident_opt =
             // Some`) or free (`af_ident_opt = None`).
             let triple_tokens = match (value, af_ident_opt.as_ref()) {
                 // ---- concrete attribute paths (existing) ----
-                (Value::Var(ref var_ident), Some(af_ident)) if self_ref => {
+                (Inline::Var(ref var_ident), Some(af_ident)) if self_ref => {
                     let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
                     quote! {
                         {
@@ -598,7 +598,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                (Value::Var(ref var_ident), Some(af_ident)) => {
+                (Inline::Var(ref var_ident), Some(af_ident)) => {
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
@@ -607,7 +607,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                (Value::LocalVar(ref var_ident), Some(af_ident)) if self_ref => {
+                (Inline::LocalVar(ref var_ident), Some(af_ident)) if self_ref => {
                     let _local_ident = get_local_var(var_ident);
                     let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
                     quote! {
@@ -620,7 +620,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                (Value::LocalVar(ref var_ident), Some(af_ident)) => {
+                (Inline::LocalVar(ref var_ident), Some(af_ident)) => {
                     let local_ident = get_local_var(var_ident);
                     quote! {
                         {
@@ -630,11 +630,11 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
-                (Value::Expr(ref expr), Some(af_ident)) => {
+                (Inline::Expr(ref expr), Some(af_ident)) => {
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                            let #v_tmp_ident = #af_ident.value_from(#expr);
+                            let #v_tmp_ident = #af_ident.inline_from(#expr);
                             let v_var = #af_ident.as_variable(#ctx_ident.next_variable());
                             constraints.push(Box::new(v_var.is(#v_tmp_ident)));
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
@@ -650,38 +650,38 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 // typed the variable with. Letting any
                 // `Variable<S>` through would compile, the join
                 // would still find the right rows, but
-                // `try_from_value::<S>()` on the result would lie
+                // `try_from_inline::<S>()` on the result would lie
                 // for every row whose predicate isn't actually an
                 // `S`. To make that footgun a compile-time error,
                 // we emit a static type assertion that the user's
-                // variable is exactly `Variable<UnknownValue>` —
+                // variable is exactly `Variable<UnknownInline>` —
                 // forcing the receiver to do an explicit
-                // `try_from_value::<RealSchema>()` at the use site
+                // `try_from_inline::<RealSchema>()` at the use site
                 // when they know which predicate they're decoding.
-                (Value::Var(ref var_ident), None) => {
+                (Inline::Var(ref var_ident), None) => {
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
                             // Compile-time enforcement: the value variable
                             // for a free-attribute pattern must be typed
-                            // `Variable<UnknownValue>`. Any other schema
+                            // `Variable<UnknownInline>`. Any other schema
                             // is rejected here so users can't quietly
                             // misinterpret the bytes downstream.
-                            let _: &#base_path::query::Variable<#base_path::value::schemas::UnknownValue> = &#var_ident;
+                            let _: &#base_path::query::Variable<#base_path::value::schemas::UnknownInline> = &#var_ident;
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, #var_ident)));
                         }
                     }
                 }
-                (Value::LocalVar(ref var_ident), None) => {
+                (Inline::LocalVar(ref var_ident), None) => {
                     return Err(syn::Error::new_spanned(
                         var_ident,
-                        "local helper variables (_?ident) in the value position are not supported with a free attribute (?attr); use a `find!`-projected `Variable<UnknownValue>` (`?val`) instead",
+                        "local helper variables (_?ident) in the value position are not supported with a free attribute (?attr); use a `find!`-projected `Variable<UnknownInline>` (`?val`) instead",
                     ));
                 }
-                (Value::Expr(ref expr), None) => {
+                (Inline::Expr(ref expr), None) => {
                     return Err(syn::Error::new_spanned(
                         expr,
-                        "free attribute (?ident) requires a `Variable<UnknownValue>` query variable in the value position; concrete value expressions need a known attribute so the macro can apply its schema",
+                        "free attribute (?ident) requires a `Variable<UnknownInline>` query variable in the value position; concrete value expressions need a known attribute so the macro can apply its schema",
                     ));
                 }
             };
@@ -732,14 +732,14 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         // no meaningful way to "insert" a fact with a free
         // attribute Id. Free attributes are a query-only construct.
         let field_expr = match attr.name {
-            Value::Expr(e) => e,
-            Value::Var(id) => {
+            Inline::Expr(e) => e,
+            Inline::Var(id) => {
                 return Err(syn::Error::new_spanned(
                     id,
                     "variable attribute bindings (?ident) are not allowed in entity!; use a literal attribute reference here",
                 ));
             }
-            Value::LocalVar(id) => {
+            Inline::LocalVar(id) => {
                 return Err(syn::Error::new_spanned(
                     id,
                     "local variable attribute bindings (_?ident) are not allowed in entity!; use a literal attribute reference here",
@@ -747,14 +747,14 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             }
         };
         let value_expr = match attr.value {
-            Value::Expr(e) => e,
-            Value::Var(id) => {
+            Inline::Expr(e) => e,
+            Inline::Var(id) => {
                 return Err(syn::Error::new_spanned(
                     id,
                     "variable bindings (?ident) are not allowed in entity!; use a literal expression here",
                 ));
             }
-            Value::LocalVar(id) => {
+            Inline::LocalVar(id) => {
                 return Err(syn::Error::new_spanned(
                     id,
                     "local variable bindings (_?ident) are not allowed in entity!; use a literal expression here",
@@ -869,17 +869,17 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let id_init: TokenStream2 = if let Some(val) = id {
         match val {
-            Value::Expr(expr) => quote! {
+            Inline::Expr(expr) => quote! {
                 let id_tmp = #expr;
                 let id_ref: &#base_path::id::ExclusiveId = id_tmp.as_ref();
             },
-            Value::Var(ident) => {
+            Inline::Var(ident) => {
                 return Err(syn::Error::new_spanned(
                     ident,
                     "variable bindings (?ident) are not allowed in entity!; use a literal expression here",
                 ));
             }
-            Value::LocalVar(ident) => {
+            Inline::LocalVar(ident) => {
                 return Err(syn::Error::new_spanned(
                     ident,
                     "local variable bindings (_?ident) are not allowed in entity!; use a literal expression here",
@@ -888,13 +888,13 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         }
     } else if has_dynamic_pairs {
         quote! {
-            let mut __pairs: ::std::vec::Vec<(#base_path::id::Id, #base_path::value::RawValue)> =
+            let mut __pairs: ::std::vec::Vec<(#base_path::id::Id, #base_path::value::RawInline)> =
                 ::std::vec::Vec::with_capacity(#attr_count);
             #pair_push_tokens
             __pairs.sort_unstable();
 
             let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
-            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
+            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawInline)> = None;
             for (__a, __v) in __pairs.iter() {
                 if let Some((__la, __lv)) = __last {
                     if *__a == __la && *__v == __lv {
@@ -914,11 +914,11 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         }
     } else {
         quote! {
-            let mut __pairs: [(#base_path::id::Id, #base_path::value::RawValue); #attr_count] = [#pair_entries];
+            let mut __pairs: [(#base_path::id::Id, #base_path::value::RawInline); #attr_count] = [#pair_entries];
             __pairs.sort_unstable();
 
             let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
-            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawValue)> = None;
+            let mut __last: Option<(#base_path::id::Id, #base_path::value::RawInline)> = None;
             for (__a, __v) in __pairs.iter() {
                 if let Some((__la, __lv)) = __last {
                     if *__a == __la && *__v == __lv {
@@ -1032,23 +1032,23 @@ pub fn pattern_changes_impl(
     for (entity_idx, entity) in pattern.into_iter().enumerate() {
         let e_ident = format_ident!("__e{}", entity_idx, span = Span::mixed_site());
         let entity_var_key: Option<(bool, String)> = match entity.id {
-            Some(Value::LocalVar(ref ident)) => Some((true, ident.to_string())),
-            Some(Value::Var(ref ident)) => Some((false, ident.to_string())),
+            Some(Inline::LocalVar(ref ident)) => Some((true, ident.to_string())),
+            Some(Inline::Var(ref ident)) => Some((false, ident.to_string())),
             _ => None,
         };
         match entity.id {
             Some(ref id_val) => match id_val {
-                Value::Var(ref ident) => {
+                Inline::Var(ref ident) => {
                     entity_decl_tokens.extend(quote! { let #e_ident = #ident; });
                 }
-                Value::LocalVar(ref ident) => {
+                Inline::LocalVar(ref ident) => {
                     let local_ident = get_local_var(ident);
                     entity_decl_tokens.extend(quote! { let #e_ident = #local_ident; });
                 }
-                Value::Expr(ref id_expr) => {
+                Inline::Expr(ref id_expr) => {
                     entity_const_tokens.extend(quote! {
                         let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoValue::to_value(#id_expr))));
+                        constraints.push(Box::new(#e_ident.is(#base_path::value::IntoInline::to_inline(#id_expr))));
                     });
                 }
             },
@@ -1071,14 +1071,14 @@ pub fn pattern_changes_impl(
             // needs more thought to remain spec-correct without a
             // known schema for the value position.
             let attr_expr = match attr_name {
-                Value::Expr(e) => e,
-                Value::Var(ident) => {
+                Inline::Expr(e) => e,
+                Inline::Var(ident) => {
                     return Err(syn::Error::new_spanned(
                         ident,
                         "free attribute (?ident) is not yet supported in pattern_changes!; use a concrete attribute constant",
                     ));
                 }
-                Value::LocalVar(ident) => {
+                Inline::LocalVar(ident) => {
                     return Err(syn::Error::new_spanned(
                         ident,
                         "free attribute (_?ident) is not yet supported in pattern_changes!; use a concrete attribute constant",
@@ -1103,7 +1103,7 @@ pub fn pattern_changes_impl(
                         let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
                     });
                     attr_const_tokens.extend(quote! {
-                        constraints.push(Box::new(#a_ident.is(#base_path::value::IntoValue::to_value(#af_ident.id()))));
+                        constraints.push(Box::new(#a_ident.is(#base_path::value::IntoInline::to_inline(#af_ident.id()))));
                     });
                     (a_ident, af_ident)
                 })
@@ -1113,26 +1113,26 @@ pub fn pattern_changes_impl(
             value_idx += 1;
 
             let value_var_key: Option<(bool, String)> = match value {
-                Value::Var(ref ident) => Some((false, ident.to_string())),
-                Value::LocalVar(ref ident) => Some((true, ident.to_string())),
+                Inline::Var(ref ident) => Some((false, ident.to_string())),
+                Inline::LocalVar(ref ident) => Some((true, ident.to_string())),
                 _ => None,
             };
             let self_ref = entity_var_key.is_some()
                 && entity_var_key == value_var_key;
 
             match value {
-                Value::Expr(expr) => {
+                Inline::Expr(expr) => {
                     let val_ident = format_ident!("__c{}", value_idx, span = Span::mixed_site());
                     value_idx += 1;
                     value_decl_tokens.extend(quote! {
-                        let #val_ident = #af_ident.value_from(#expr);
+                        let #val_ident = #af_ident.inline_from(#expr);
                         let #v_ident = #af_ident.as_variable(#ctx_ident.next_variable());
                     });
                     value_const_tokens.extend(quote! {
                         constraints.push(Box::new(#v_ident.is(#val_ident)));
                     });
                 }
-                Value::Var(_) | Value::LocalVar(_) if self_ref => {
+                Inline::Var(_) | Inline::LocalVar(_) if self_ref => {
                     // Self-referencing: create fresh alias + equality
                     let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
                     value_idx += 1;
@@ -1144,12 +1144,12 @@ pub fn pattern_changes_impl(
                         constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
                     });
                 }
-                Value::Var(var_ident) => {
+                Inline::Var(var_ident) => {
                     value_decl_tokens.extend(quote! {
                         let #v_ident = #af_ident.as_variable(#var_ident);
                     });
                 }
-                Value::LocalVar(ref var_ident) => {
+                Inline::LocalVar(ref var_ident) => {
                     let local_ident = get_local_var(var_ident);
                     value_decl_tokens.extend(quote! {
                         let #v_ident = #af_ident.as_variable(#local_ident);

@@ -163,12 +163,12 @@ Use [`find!`](triblespace::core::macros::find) when you want rows back.
 # let mut kb = TribleSet::new();
 # let alice = fucid();
 # kb += entity! { &alice @ social::name: "Alice" };
-let names: Vec<Value<_>> = find!(
-    name: Value<_>,
+let names: Vec<Inline<_>> = find!(
+    name: Inline<_>,
     pattern!(&kb, [{ _?person @ social::name: ?name }])
 ).collect();
 
-let first: &str = names[0].try_from_value().unwrap();
+let first: &str = names[0].try_from_inline().unwrap();
 assert_eq!(first, "Alice");
 ```
 
@@ -231,7 +231,7 @@ check:
 
 ```rust,ignore
 let has_name = exists!(
-    (name: Value<_>),
+    (name: Inline<_>),
     pattern!(&kb, [{ ?person @ social::name: ?name }])
 );
 ```
@@ -247,7 +247,7 @@ least one contributing trible must come from the change set.
 
 ```rust,ignore
 for (work,) in find!(
-    (work: Value<_>),
+    (work: Inline<_>),
     pattern_changes!(&full, &delta, [
         { ?work @ literature::author: &shakespeare }
     ])
@@ -316,7 +316,7 @@ Use [`and!`](triblespace::core::prelude::and) when every clause must hold:
 
 ```rust,ignore
 find!(
-    (friend: Value<_>),
+    (friend: Inline<_>),
     and!(
         pattern!(&kb, [{ ?person @ social::name: "Alice" }]),
         pattern!(&kb, [{ ?person @ social::friend: ?friend }])
@@ -328,7 +328,7 @@ Use [`or!`](triblespace::core::prelude::or) when any branch may hold:
 
 ```rust,ignore
 find!(
-    (alias: Value<_>),
+    (alias: Inline<_>),
     or!(
         pattern!(&kb, [{ ?person @ social::nickname: ?alias }]),
         pattern!(&kb, [{ ?person @ social::name: ?alias }])
@@ -345,7 +345,7 @@ sub-expression.
 
 ```rust,ignore
 find!(
-    (person: Value<_>),
+    (person: Inline<_>),
     temp!((friend), and!(
         pattern!(&kb, [{ ?person @ social::friend: ?friend }]),
         pattern!(&kb, [{ ?friend @ social::name: "Bob" }])
@@ -363,7 +363,7 @@ variables that should not be visible to the outer planner.
 
 ```rust,ignore
 find!(
-    (person: Value<_>),
+    (person: Inline<_>),
     ignore!((friend),
         pattern!(&kb, [
             { ?person @ social::friend: ?friend },

@@ -24,7 +24,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 type PileBlake3 = Pile;
 
@@ -221,20 +221,20 @@ fn parse_secret_hex(s: &str) -> Result<SigningKey> {
     Ok(SigningKey::from_bytes(&raw))
 }
 
-fn parse_handle_hex(s: &str) -> Result<Value<Handle<SimpleArchive>>> {
+fn parse_handle_hex(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
     let bytes = hex::decode(s).map_err(|e| anyhow!("decode handle hex: {e}"))?;
     let raw: [u8; 32] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("handle must be 32 bytes"))?;
-    Ok(Value::new(raw))
+    Ok(Inline::new(raw))
 }
 
-fn now_plus_30_days() -> Value<triblespace_core::value::schemas::time::NsTAIInterval> {
-    use triblespace_core::value::TryToValue;
+fn now_plus_30_days() -> Inline<triblespace_core::value::schemas::time::NsTAIInterval> {
+    use triblespace_core::value::TryToInline;
     let now = hifitime::Epoch::now().expect("system time");
     let later = now + hifitime::Duration::from_seconds(30.0 * 86400.0);
-    (now, later).try_to_value().expect("valid interval")
+    (now, later).try_to_inline().expect("valid interval")
 }
 
 /// Format the upper bound of an `NsTAIInterval` value as a
@@ -242,10 +242,10 @@ fn now_plus_30_days() -> Value<triblespace_core::value::schemas::time::NsTAIInte
 /// `team create` / `team invite` to surface when the freshly-issued
 /// cap expires — operators rotate caps before that point.
 fn format_expiry(
-    interval: &Value<triblespace_core::value::schemas::time::NsTAIInterval>,
+    interval: &Inline<triblespace_core::value::schemas::time::NsTAIInterval>,
 ) -> String {
-    use triblespace_core::value::TryFromValue;
-    match <(hifitime::Epoch, hifitime::Epoch)>::try_from_value(interval) {
+    use triblespace_core::value::TryFromInline;
+    match <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(interval) {
         Ok((_lower, upper)) => {
             let (y, mo, d, h, mi, s, _ns) = upper.to_gregorian_utc();
             format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02} UTC")
@@ -262,7 +262,7 @@ fn store_blob(pile: &mut PileBlake3, blob: Blob<SimpleArchive>) -> Result<()> {
 
 fn fetch_cap_blob_pair(
     pile: &mut PileBlake3,
-    sig_handle: Value<Handle<SimpleArchive>>,
+    sig_handle: Inline<Handle<SimpleArchive>>,
 ) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>)> {
     use triblespace_core::blob::TryFromBlob;
     use triblespace_core::repo::BlobStore;
@@ -281,8 +281,8 @@ fn fetch_cap_blob_pair(
 
     use triblespace_core::macros::pattern;
     use triblespace_core::query::find;
-    let cap_handle: Value<Handle<SimpleArchive>> = find!(
-        (sig: Id, h: Value<Handle<SimpleArchive>>),
+    let cap_handle: Inline<Handle<SimpleArchive>> = find!(
+        (sig: Id, h: Inline<Handle<SimpleArchive>>),
         pattern!(&sig_set, [{ ?sig @ capability::sig_signs: ?h }])
     )
     .map(|(_, h)| h)
@@ -337,8 +337,8 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     )
     .map_err(|e| anyhow!("build founder cap: {e:?}"))?;
 
-    let cap_handle: Value<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+    let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
+    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
@@ -414,7 +414,7 @@ fn run_invite(
         issuer_cap_sig_handle,
         issuer_pubkey,
         &revoked,
-        |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+        |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             use triblespace_core::repo::BlobStoreGet;
             snap_reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(h)
@@ -457,7 +457,7 @@ fn run_invite(
     )
     .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
 
-    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
@@ -486,7 +486,7 @@ fn run_revoke(
 
     let (rev_blob, sig_blob) = capability::build_revocation(&team_root, target);
 
-    let sig_handle: Value<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
     store_blob(&mut pile, rev_blob)?;
     store_blob(&mut pile, sig_blob)?;
 
@@ -504,18 +504,18 @@ struct CapSummary {
     issuer: VerifyingKey,
     perms: Vec<Id>,
     branches: Vec<Id>,
-    expires_at: Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+    expires_at: Option<Inline<triblespace_core::value::schemas::time::NsTAIInterval>>,
 }
 
 /// Extract the upper-bound `Epoch` of an expiry interval. Used to
 /// sort caps by "expires soonest first" — caps without an expiry
 /// (none should currently exist; defensive) sort to the end.
 fn expiry_upper(
-    interval: &Option<Value<triblespace_core::value::schemas::time::NsTAIInterval>>,
+    interval: &Option<Inline<triblespace_core::value::schemas::time::NsTAIInterval>>,
 ) -> Option<hifitime::Epoch> {
-    use triblespace_core::value::TryFromValue;
+    use triblespace_core::value::TryFromInline;
     let v = interval.as_ref()?;
-    <(hifitime::Epoch, hifitime::Epoch)>::try_from_value(v)
+    <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(v)
         .ok()
         .map(|(_lower, upper)| upper)
 }
@@ -558,8 +558,8 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(h) => h,
             Err(_) => continue,
         };
-        let typed_handle: Value<Handle<SimpleArchive>> =
-            Value::new(handle.raw);
+        let typed_handle: Inline<Handle<SimpleArchive>> =
+            Inline::new(handle.raw);
         let blob: Blob<SimpleArchive> = match reader
             .get::<Blob<SimpleArchive>, SimpleArchive>(typed_handle)
         {
@@ -582,7 +582,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 subject: VerifyingKey,
                 issuer: VerifyingKey,
                 root: Id,
-                exp: Value<triblespace_core::value::schemas::time::NsTAIInterval>,
+                exp: Inline<triblespace_core::value::schemas::time::NsTAIInterval>,
             ),
             pattern!(&set, [{
                 ?e @
@@ -760,7 +760,7 @@ fn run_show(
     let mut leaf_iter = find!(
         (
             sig: Id,
-            signed: Value<Handle<SimpleArchive>>,
+            signed: Inline<Handle<SimpleArchive>>,
             signer: VerifyingKey
         ),
         pattern!(&leaf_sig_set, [{
@@ -795,7 +795,7 @@ fn run_show(
                 subject: VerifyingKey,
                 issuer: VerifyingKey,
                 root: Id,
-                exp: Value<triblespace_core::value::schemas::time::NsTAIInterval>
+                exp: Inline<triblespace_core::value::schemas::time::NsTAIInterval>
             ),
             pattern!(&cap_set, [{
                 ?e @
@@ -864,7 +864,7 @@ fn run_show(
         let parent_pair = find!(
             (
                 e: Id,
-                parent_cap: Value<Handle<SimpleArchive>>,
+                parent_cap: Inline<Handle<SimpleArchive>>,
                 parent_sig_id: Id,
             ),
             pattern!(&cap_set, [{
@@ -938,13 +938,13 @@ fn run_show(
                 let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
                     .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
                 let raw_iter = find!(
-                    (sig: Id, h: Value<Handle<SimpleArchive>>),
+                    (sig: Id, h: Inline<Handle<SimpleArchive>>),
                     pattern!(&leaf_sig_set, [{
                         ?sig @ capability::sig_signs: ?h
                     }])
                 );
                 let mut iter = raw_iter.map(|(_sig, h)| (h,));
-                let cap_h: Value<Handle<SimpleArchive>> = match iter.next() {
+                let cap_h: Inline<Handle<SimpleArchive>> = match iter.next() {
                     Some((h,)) => h,
                     None => return Err(anyhow!("leaf sig blob malformed")),
                 };
@@ -968,7 +968,7 @@ fn run_show(
 
         // Build the fetch_blob closure verify_chain expects, backed
         // by the same pile reader the structural walk used.
-        let fetch = |h: Value<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+        let fetch = |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             use triblespace_core::repo::BlobStoreGet;
             reader
                 .get::<Blob<SimpleArchive>, SimpleArchive>(h)

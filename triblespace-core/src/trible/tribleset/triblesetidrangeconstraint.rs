@@ -10,7 +10,7 @@ use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
-use crate::value::RawValue;
+use crate::value::RawInline;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.
@@ -59,7 +59,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.variable_e {
             return;
         }
@@ -70,7 +70,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.variable_e {
             proposals.retain(|v| {
                 let Some(id) = id_from_value(v) else {
@@ -141,7 +141,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         Some(count.min(usize::MAX as u64) as usize)
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable != self.variable_a {
             return;
         }
@@ -152,7 +152,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
             });
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if variable == self.variable_a {
             proposals.retain(|v| {
                 let Some(id) = id_from_value(v) else {
@@ -192,10 +192,10 @@ mod tests {
         let e3 = ufoid();
         let e4 = ufoid();
 
-        let v10: Value<R256BE> = 10i128.to_value();
-        let v50: Value<R256BE> = 50i128.to_value();
-        let v90: Value<R256BE> = 90i128.to_value();
-        let v100: Value<R256BE> = 100i128.to_value();
+        let v10: Inline<R256BE> = 10i128.to_inline();
+        let v50: Inline<R256BE> = 50i128.to_inline();
+        let v90: Inline<R256BE> = 90i128.to_inline();
+        let v100: Inline<R256BE> = 100i128.to_inline();
 
         let mut data = TribleSet::new();
         data += entity! { &e1 @ id_range_test_score: v10 };
@@ -212,7 +212,7 @@ mod tests {
         let max_id = sorted_ids[2];
 
         let filtered: Vec<Id> = find!(
-            (id: Id, v: Value<R256BE>),
+            (id: Id, v: Inline<R256BE>),
             and!(
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, min_id, max_id),
@@ -224,7 +224,7 @@ mod tests {
 
         // All entities.
         let all: Vec<Id> = find!(
-            (id: Id, v: Value<R256BE>),
+            (id: Id, v: Inline<R256BE>),
             pattern!(&data, [{ ?id @ id_range_test_score: ?v }])
         )
         .map(|(id, _v)| id)
@@ -237,8 +237,8 @@ mod tests {
         let e1 = ufoid();
         let e2 = ufoid();
 
-        let v1: Value<R256BE> = 1i128.to_value();
-        let v2: Value<R256BE> = 2i128.to_value();
+        let v1: Inline<R256BE> = 1i128.to_inline();
+        let v2: Inline<R256BE> = 2i128.to_inline();
 
         let mut data = TribleSet::new();
         data += entity! { &e1 @ id_range_test_score: v1 };
@@ -247,7 +247,7 @@ mod tests {
         // Range that includes only e1 (exact match on min=max=e1).
         let id1: Id = *e1;
         let exact: Vec<Id> = find!(
-            (id: Id, v: Value<R256BE>),
+            (id: Id, v: Inline<R256BE>),
             and!(
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, id1, id1),
@@ -263,7 +263,7 @@ mod tests {
         // Only works if id2 > id1 in byte order; since UFOIDs are random
         // we just test that exact-match on each gives 1 result.
         let exact2: Vec<Id> = find!(
-            (id: Id, v: Value<R256BE>),
+            (id: Id, v: Inline<R256BE>),
             and!(
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, id2, id2),

@@ -1,5 +1,5 @@
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
 
 use super::*;
 
@@ -64,22 +64,22 @@ impl<T> std::ops::Deref for SortedSlice<'_, T> {
 }
 
 /// Constraint backed by a sorted slice — binary search for confirm.
-pub struct SortedSliceConstraint<'a, S: ValueSchema, T> {
+pub struct SortedSliceConstraint<'a, S: InlineSchema, T> {
     variable: Variable<S>,
     slice: SortedSlice<'a, T>,
 }
 
-impl<'a, S: ValueSchema, T> SortedSliceConstraint<'a, S, T> {
+impl<'a, S: InlineSchema, T> SortedSliceConstraint<'a, S, T> {
     /// Creates a constraint that restricts `variable` to values in `slice`.
     pub fn new(variable: Variable<S>, slice: SortedSlice<'a, T>) -> Self {
         SortedSliceConstraint { variable, slice }
     }
 }
 
-impl<'a, S: ValueSchema, T> Constraint<'a> for SortedSliceConstraint<'a, S, T>
+impl<'a, S: InlineSchema, T> Constraint<'a> for SortedSliceConstraint<'a, S, T>
 where
-    T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + Ord + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
@@ -93,16 +93,16 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
-            proposals.extend(self.slice.0.iter().map(|v| IntoValue::to_value(v).raw));
+            proposals.extend(self.slice.0.iter().map(|v| IntoInline::to_inline(v).raw));
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
         if self.variable.index == variable {
             proposals.retain(|v| {
-                match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.slice.0.binary_search(&t).is_ok(),
                     Err(_) => false,
                 }
@@ -111,10 +111,10 @@ where
     }
 }
 
-impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>
+impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>
 where
-    T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + Ord + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     type Constraint = SortedSliceConstraint<'a, S, T>;
 
@@ -135,10 +135,10 @@ where
 ///
 /// Does not conflict with the pre-sorted [`SortedSlice`] impl above:
 /// `SortedSlice<'a, T>` is not a `&mut [T]`.
-impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a mut [T]
+impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for &'a mut [T]
 where
-    T: 'a + Ord + for<'b> TryFromValue<'b, S>,
-    for<'b> &'b T: IntoValue<S>,
+    T: 'a + Ord + for<'b> TryFromInline<'b, S>,
+    for<'b> &'b T: IntoInline<S>,
 {
     type Constraint = SortedSliceConstraint<'a, S, T>;
 

@@ -4,7 +4,7 @@
 //!
 //! What the numbers reveal:
 //! - Build peaks (naive and succinct) are dominated by the
-//!   `term_to_tfs: HashMap<RawValue, HashMap<u32, u32>>`
+//!   `term_to_tfs: HashMap<RawInline, HashMap<u32, u32>>`
 //!   accumulator — at 50 k docs / 20 k vocab that's ~150 MiB
 //!   alone. The streaming `SuccinctPostings::build_with` refactor
 //!   trims a smaller-but-real `Vec<Vec<(u32, f32)>>` intermediate
@@ -149,7 +149,7 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
 
     // Build a builder fresh each time so insert-time accumulation
     // doesn't carry across measurements. The closure also drops
-    // the `Vec<(Value<D>, Vec<Value<T>>)>` insert-arg buffers as
+    // the `Vec<(Inline<D>, Vec<Inline<T>>)>` insert-arg buffers as
     // they fall out of scope inside `insert`.
     let fresh_builder = || {
         let mut b = BM25Builder::new();

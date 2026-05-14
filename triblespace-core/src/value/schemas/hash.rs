@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 
 use anybytes::Bytes;
@@ -34,7 +34,7 @@ pub trait HashProtocol: Sized + 'static + MetaDescribe {
     const NAME: &'static str;
 
     /// One-shot convenience: hash `bytes` and return the digest.
-    fn digest(bytes: &[u8]) -> RawValue;
+    fn digest(bytes: &[u8]) -> RawInline;
 }
 
 /// Blake3 hash protocol — the canonical content-addressing hash
@@ -79,14 +79,14 @@ impl Blake3 {
     }
 
     /// Return the 32-byte digest of the bytes fed so far.
-    pub fn finalize(&self) -> RawValue {
+    pub fn finalize(&self) -> RawInline {
         *self.hasher.finalize().as_bytes()
     }
 
     /// One-shot convenience: hash `bytes` with Blake3 and return
     /// the 32-byte digest. Mirrors [`HashProtocol::digest`] as an
     /// inherent method so call sites don't need to import the trait.
-    pub fn digest(bytes: &[u8]) -> RawValue {
+    pub fn digest(bytes: &[u8]) -> RawInline {
         <Self as HashProtocol>::digest(bytes)
     }
 }
@@ -94,7 +94,7 @@ impl Blake3 {
 impl HashProtocol for Blake3 {
     const NAME: &'static str = "blake3";
 
-    fn digest(bytes: &[u8]) -> RawValue {
+    fn digest(bytes: &[u8]) -> RawInline {
         *blake3::hash(bytes).as_bytes()
     }
 }
@@ -123,7 +123,7 @@ where
     }
 }
 
-impl<H> ValueSchema for Hash<H>
+impl<H> InlineSchema for Hash<H>
 where
     H: HashProtocol,
 {
@@ -136,25 +136,25 @@ where
     H: HashProtocol,
 {
     /// Computes the hash of `blob` and returns it as a value.
-    pub fn digest(blob: &Bytes) -> Value<Self> {
-        Value::new(H::digest(blob))
+    pub fn digest(blob: &Bytes) -> Inline<Self> {
+        Inline::new(H::digest(blob))
     }
 
     /// Parses a hex-encoded digest string into a hash value.
-    pub fn from_hex(hex: &str) -> Result<Value<Self>, FromHexError> {
-        let digest = RawValue::from_hex(hex)?;
-        Ok(Value::new(digest))
+    pub fn from_hex(hex: &str) -> Result<Inline<Self>, FromHexError> {
+        let digest = RawInline::from_hex(hex)?;
+        Ok(Inline::new(digest))
     }
 
     /// Returns the digest as an uppercase hex string.
-    pub fn to_hex(value: &Value<Self>) -> String {
+    pub fn to_hex(value: &Inline<Self>) -> String {
         hex::encode_upper(value.raw)
     }
 }
 
-impl<H: HashProtocol> TryFromValue<'_, Hash<H>> for String {
+impl<H: HashProtocol> TryFromInline<'_, Hash<H>> for String {
     type Error = std::convert::Infallible;
-    fn try_from_value(v: &Value<Hash<H>>) -> Result<Self, std::convert::Infallible> {
+    fn try_from_inline(v: &Inline<Hash<H>>) -> Result<Self, std::convert::Infallible> {
         let mut out = String::new();
         out.push_str(H::NAME);
         out.push(':');
@@ -180,25 +180,25 @@ impl From<FromHexError> for HashError {
     }
 }
 
-impl<H: HashProtocol> TryToValue<Hash<H>> for &str {
+impl<H: HashProtocol> TryToInline<Hash<H>> for &str {
     type Error = HashError;
 
-    fn try_to_value(self) -> Result<Value<Hash<H>>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<Hash<H>>, Self::Error> {
         let protocol = H::NAME;
         if !(self.starts_with(protocol) && &self[protocol.len()..=protocol.len()] == ":") {
             return Err(HashError::BadProtocol);
         }
-        let digest = RawValue::from_hex(&self[protocol.len() + 1..])?;
+        let digest = RawInline::from_hex(&self[protocol.len() + 1..])?;
 
-        Ok(Value::new(digest))
+        Ok(Inline::new(digest))
     }
 }
 
-impl<H: HashProtocol> TryToValue<Hash<H>> for String {
+impl<H: HashProtocol> TryToInline<Hash<H>> for String {
     type Error = HashError;
 
-    fn try_to_value(self) -> Result<Value<Hash<H>>, Self::Error> {
-        (&self[..]).try_to_value()
+    fn try_to_inline(self) -> Result<Inline<Hash<H>>, Self::Error> {
+        (&self[..]).try_to_inline()
     }
 }
 
@@ -264,7 +264,7 @@ mod wasm_formatter {
 /// bytes and stores the handle in the blob; [`Blob::get_handle`][bg]
 /// returns it. A `&Blob<T>` also `AsRef`s to its handle, so passing
 /// "the lightweight reference" through APIs that accept
-/// `&Value<Handle<T>>` is allocation-free.
+/// `&Inline<Handle<T>>` is allocation-free.
 ///
 /// [b]: crate::blob::Blob
 /// [bn]: crate::blob::Blob::new
@@ -280,24 +280,24 @@ pub struct Handle<T: BlobSchema> {
 
 impl<T: BlobSchema> Handle<T> {
     /// Wraps a Blake3 hash value as a typed handle.
-    pub fn from_hash(hash: Value<Hash<Blake3>>) -> Value<Self> {
+    pub fn from_hash(hash: Inline<Hash<Blake3>>) -> Inline<Self> {
         hash.transmute()
     }
 
     /// Extracts the underlying Blake3 hash, discarding the blob schema type.
-    pub fn to_hash(handle: Value<Self>) -> Value<Hash<Blake3>> {
+    pub fn to_hash(handle: Inline<Self>) -> Inline<Hash<Blake3>> {
         handle.transmute()
     }
 }
 
-impl<T: BlobSchema> From<Value<Hash<Blake3>>> for Value<Handle<T>> {
-    fn from(value: Value<Hash<Blake3>>) -> Self {
+impl<T: BlobSchema> From<Inline<Hash<Blake3>>> for Inline<Handle<T>> {
+    fn from(value: Inline<Hash<Blake3>>) -> Self {
         value.transmute()
     }
 }
 
-impl<T: BlobSchema> From<Value<Handle<T>>> for Value<Hash<Blake3>> {
-    fn from(value: Value<Handle<T>>) -> Self {
+impl<T: BlobSchema> From<Inline<Handle<T>>> for Inline<Hash<Blake3>> {
+    fn from(value: Inline<Handle<T>>) -> Self {
         value.transmute()
     }
 }
@@ -342,7 +342,7 @@ where
     }
 }
 
-impl<T: BlobSchema + MetaDescribe> ValueSchema for Handle<T> {
+impl<T: BlobSchema + MetaDescribe> InlineSchema for Handle<T> {
     type ValidationError = Infallible;
     type FieldKind = T;
 }
@@ -363,23 +363,23 @@ mod tests {
 
     #[test]
     fn value_roundtrip() {
-        let v: Value<Hash<Blake3>> = Value::new(rand::random());
-        let s: String = v.from_value();
-        let _: Value<Hash<Blake3>> = s.try_to_value().expect("roundtrip should succeed");
+        let v: Inline<Hash<Blake3>> = Inline::new(rand::random());
+        let s: String = v.from_inline();
+        let _: Inline<Hash<Blake3>> = s.try_to_inline().expect("roundtrip should succeed");
     }
 
     #[test]
     fn value_from_known() {
         let s: &str = "blake3:CA98593CB9DC0FA48B2BE01E53D042E22B47862D646F9F19E2889A7961663663";
-        let _: Value<Hash<Blake3>> = s
-            .try_to_value()
+        let _: Inline<Hash<Blake3>> = s
+            .try_to_inline()
             .expect("packing valid constant should succeed");
     }
 
     #[test]
     fn to_value_fail_protocol() {
         let s: &str = "bad:CA98593CB9DC0FA48B2BE01E53D042E22B47862D646F9F19E2889A7961663663";
-        let err: HashError = <&str as TryToValue<Hash<Blake3>>>::try_to_value(s)
+        let err: HashError = <&str as TryToInline<Hash<Blake3>>>::try_to_inline(s)
             .expect_err("packing invalid protocol should fail");
         assert_eq!(err, HashError::BadProtocol);
     }
@@ -387,7 +387,7 @@ mod tests {
     #[test]
     fn to_value_fail_hex() {
         let s: &str = "blake3:BAD!";
-        let err: HashError = <&str as TryToValue<Hash<Blake3>>>::try_to_value(s)
+        let err: HashError = <&str as TryToInline<Hash<Blake3>>>::try_to_inline(s)
             .expect_err("packing invalid protocol should fail");
         assert!(std::matches!(err, HashError::BadHex(..)));
     }

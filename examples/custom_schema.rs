@@ -2,15 +2,14 @@ use anybytes::Bytes;
 use std::convert::Infallible;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::BlobSchema;
-use triblespace::core::blob::IntoBlob;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::value::TryFromValue;
-use triblespace::core::value::IntoValue;
-use triblespace::core::value::Value;
-use triblespace::core::value::ValueSchema;
-use triblespace::core::value::VALUE_LEN;
+use triblespace::core::value::TryFromInline;
+use triblespace::core::value::Inline;
+use triblespace::core::value::InlineSchema;
+use triblespace::core::value::IntoSchema;
+use triblespace::core::value::INLINE_LEN;
 
 // ANCHOR: custom_schema
 
@@ -25,21 +24,23 @@ impl MetaDescribe for U64LE {
     }
 }
 
-impl ValueSchema for U64LE {
+impl InlineSchema for U64LE {
     type ValidationError = Infallible;
+    type FieldKind = Self;
 }
 
-impl IntoValue<U64LE> for u64 {
-    fn to_value(self) -> Value<U64LE> {
-        let mut raw = [0u8; VALUE_LEN];
+impl IntoSchema<U64LE> for u64 {
+    type Form = Inline<U64LE>;
+    fn into_schema(self) -> Inline<U64LE> {
+        let mut raw = [0u8; INLINE_LEN];
         raw[..8].copy_from_slice(&self.to_le_bytes());
-        Value::new(raw)
+        Inline::new(raw)
     }
 }
 
-impl TryFromValue<'_, U64LE> for u64 {
+impl TryFromInline<'_, U64LE> for u64 {
     type Error = std::convert::Infallible;
-    fn try_from_value(v: &Value<U64LE>) -> Result<Self, std::convert::Infallible> {
+    fn try_from_inline(v: &Inline<U64LE>) -> Result<Self, std::convert::Infallible> {
         Ok(u64::from_le_bytes(v.raw[..8].try_into().unwrap()))
     }
 }
@@ -57,8 +58,9 @@ impl MetaDescribe for BytesBlob {
 
 impl BlobSchema for BytesBlob {}
 
-impl IntoBlob<BytesBlob> for Bytes {
-    fn to_blob(self) -> Blob<BytesBlob> {
+impl IntoSchema<BytesBlob> for Bytes {
+    type Form = Blob<BytesBlob>;
+    fn into_schema(self) -> Blob<BytesBlob> {
         Blob::new(self)
     }
 }

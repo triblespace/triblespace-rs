@@ -31,9 +31,9 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::value::schemas::hash::Handle;
-use crate::value::RawValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::RawInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 
 use super::BlobStore;
 use super::BlobStoreGet;
@@ -146,11 +146,11 @@ impl BlobStorePut for ObjectStoreRemote
 
     type PutError = object_store::Error;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<S>>, Self::PutError>
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: IntoBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         let blob = item.to_blob();
         let handle = blob.get_handle();
@@ -220,7 +220,7 @@ impl BranchStore for ObjectStoreRemote
         ))
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
         let result = self.rt.block_on(async { self.store.get(&path).await });
         match result {
@@ -230,7 +230,7 @@ impl BranchStore for ObjectStoreRemote
                     return Ok(None);
                 }
                 let value = (&bytes[..]).try_into()?;
-                Ok(Some(Value::new(value)))
+                Ok(Some(Inline::new(value)))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(PullBranchErr::StoreErr(e)),
@@ -240,8 +240,8 @@ impl BranchStore for ObjectStoreRemote
     fn update(
         &mut self,
         id: Id,
-        old: Option<Value<Handle<SimpleArchive>>>,
-        new: Option<Value<Handle<SimpleArchive>>>,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
         // We encode "deleted branch" as an empty object. This lets us preserve
@@ -256,14 +256,14 @@ impl BranchStore for ObjectStoreRemote
         };
 
         let parse_branch = |bytes: &bytes::Bytes| -> Result<
-            Option<Value<Handle<SimpleArchive>>>,
+            Option<Inline<Handle<SimpleArchive>>>,
             TryFromSliceError,
         > {
             if bytes.is_empty() {
                 return Ok(None);
             }
             let value = (&bytes[..]).try_into()?;
-            Ok(Some(Value::new(value)))
+            Ok(Some(Inline::new(value)))
         };
 
         if let Some(old_hash) = old {
@@ -376,7 +376,7 @@ impl BlobStoreList for ObjectStoreReader
 {
 
     type Err = ListBlobsErr;
-    type Iter<'a> = BlockingIter<Result<Value<Handle<UnknownBlob>>, Self::Err>>;
+    type Iter<'a> = BlockingIter<Result<Inline<Handle<UnknownBlob>>, Self::Err>>;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         let prefix = self.prefix.child(BLOB_INFIX);
@@ -386,8 +386,8 @@ impl BlobStoreList for ObjectStoreReader
                     .location
                     .filename()
                     .ok_or(ListBlobsErr::NotAFile("no filename"))?;
-                let digest = RawValue::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
-                Ok(Value::new(digest))
+                let digest = RawInline::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
+                Ok(Inline::new(digest))
             }
             Err(e) => Err(ListBlobsErr::List(e)),
         });
@@ -435,12 +435,12 @@ impl BlobStoreGet for ObjectStoreReader
 
     fn get<T, S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
         S: BlobSchema + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         let path = self.blob_path(hex::encode(handle.raw));
         let object = self.rt.block_on(async { self.store.get(&path).await })?;
@@ -459,7 +459,7 @@ pub enum ListBlobsErr {
     /// A listed object had no filename component.
     NotAFile(&'static str),
     /// A listed object's filename was not valid hexadecimal.
-    BadNameHex(<RawValue as FromHex>::Error),
+    BadNameHex(<RawInline as FromHex>::Error),
 }
 
 impl fmt::Display for ListBlobsErr {
@@ -571,11 +571,11 @@ impl crate::repo::BlobStoreMeta for ObjectStoreReader
 
     fn metadata<S>(
         &self,
-        handle: Value<Handle<S>>,
+        handle: Inline<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
         S: BlobSchema + 'static,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);
@@ -599,10 +599,10 @@ impl crate::repo::BlobStoreForget for ObjectStoreRemote
 
     type ForgetError = object_store::Error;
 
-    fn forget<S>(&mut self, handle: Value<Handle<S>>) -> Result<(), Self::ForgetError>
+    fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
     where
         S: BlobSchema + 'static,
-        Handle<S>: ValueSchema,
+        Handle<S>: InlineSchema,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);

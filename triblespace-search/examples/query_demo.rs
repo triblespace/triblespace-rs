@@ -8,7 +8,7 @@
 use triblespace_core::id::Id;
 use triblespace_core::macros::find;
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{IntoValue, Value};
+use triblespace_core::value::{IntoInline, Inline};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
@@ -61,7 +61,7 @@ fn main() {
     println!("\nquery: 'typst'");
     let q = hash_tokens("typst");
     for (doc, score) in reloaded.query_term(&q[0]) {
-        let id: Id = doc.try_from_value().expect("genid posting");
+        let id: Id = doc.try_from_inline().expect("genid posting");
         println!("  {id}  score={score:.3}");
     }
 
@@ -73,14 +73,14 @@ fn main() {
         (doc: Id),
         reloaded.matches_text(doc, "fragment wiki", 0.0)
     )
-    .map(|(d,)| (d, reloaded.score_text(&(&d).to_value(), "fragment wiki")))
+    .map(|(d,)| (d, reloaded.score_text(&(&d).to_inline(), "fragment wiki")))
     .collect();
     hits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (doc, score) in hits.into_iter().take(3) {
         println!("  {doc}  score={score:.3}");
     }
 
-    // Value-as-term: use a doc's Id as a "citation term" and
+    // Inline-as-term: use a doc's Id as a "citation term" and
     // index a new micro-corpus where each doc is a list of the
     // fragments it cites. The same BM25 index gives us
     // "documents citing this fragment".
@@ -89,15 +89,15 @@ fn main() {
     // are `GenId` — the same BM25 index handles "docs containing
     // a mention-of-entity-X term."
     let mut cite_builder: BM25Builder<GenId, GenId> = BM25Builder::new();
-    cite_builder.insert(id(10), vec![(&id(1)).to_value()]);
-    cite_builder.insert(id(11), vec![(&id(1)).to_value(), (&id(3)).to_value()]);
-    cite_builder.insert(id(12), vec![(&id(3)).to_value()]);
+    cite_builder.insert(id(10), vec![(&id(1)).to_inline()]);
+    cite_builder.insert(id(11), vec![(&id(1)).to_inline(), (&id(3)).to_inline()]);
+    cite_builder.insert(id(12), vec![(&id(3)).to_inline()]);
     let cite_idx = cite_builder.build();
 
-    let citation_term: Value<GenId> = (&id(1)).to_value();
+    let citation_term: Inline<GenId> = (&id(1)).to_inline();
     let cites_one: Vec<(Id, f32)> = cite_idx
         .query_term(&citation_term)
-        .filter_map(|(v, s)| v.try_from_value().ok().map(|id: Id| (id, s)))
+        .filter_map(|(v, s)| v.try_from_inline().ok().map(|id: Id| (id, s)))
         .collect();
     println!("  citations of {}: {} doc(s)", id(1), cites_one.len());
     for (doc, _) in cites_one {

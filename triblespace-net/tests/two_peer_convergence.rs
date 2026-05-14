@@ -31,7 +31,7 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use triblespace_net::tracking::{
     ensure_tracking_branch, merge_tracking_into_local, MergeOutcome,
 };
@@ -104,7 +104,7 @@ fn sync_round(
     merge_tracking_into_local(local, tracking_id, branch_name).expect("merge")
 }
 
-fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Value<Handle<SimpleArchive>> {
+fn head_commit(repo: &mut Repository<MemoryRepo>, name: &str) -> Inline<Handle<SimpleArchive>> {
     let id = lookup_id(repo, name);
     let ws = repo.pull(id).unwrap();
     ws.head().expect("branch has head")

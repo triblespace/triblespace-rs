@@ -31,21 +31,21 @@
 
 use crate::id::RawId;
 use crate::trible::Fragment;
-use crate::value::ValueSchema;
+use crate::value::InlineSchema;
 use core::marker::PhantomData;
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
 /// marker.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Attribute<S: ValueSchema> {
+pub struct Attribute<S: InlineSchema> {
     fragment: Fragment,
     _schema: PhantomData<S>,
 }
 
-impl<S: ValueSchema> Clone for Attribute<S> {
+impl<S: InlineSchema> Clone for Attribute<S> {
     // Manual impl: `PhantomData<S>` doesn't require `S: Clone`, but
-    // `#[derive(Clone)]` over a `S: ValueSchema` bound conservatively
+    // `#[derive(Clone)]` over a `S: InlineSchema` bound conservatively
     // adds that constraint. Implementing by hand lets callers clone
     // `Attribute<Boolean>` etc. without needing `Boolean: Clone`.
     fn clone(&self) -> Self {
@@ -56,7 +56,7 @@ impl<S: ValueSchema> Clone for Attribute<S> {
     }
 }
 
-impl<S: ValueSchema> Attribute<S> {
+impl<S: InlineSchema> Attribute<S> {
     /// The attribute's id, equal to the wrapped fragment's root.
     pub fn id(&self) -> crate::id::Id {
         self.fragment
@@ -74,19 +74,19 @@ impl<S: ValueSchema> Attribute<S> {
         &self.fragment
     }
 
-    /// Convert a host value into a typed `Value<S>` using the Field's schema.
-    /// This is a small convenience wrapper around the `IntoValue` trait and
-    /// simplifies macro expansion: `af.value_from(expr)` preserves the
+    /// Convert a host value into a typed `Inline<S>` using the Field's schema.
+    /// This is a small convenience wrapper around the `IntoInline` trait and
+    /// simplifies macro expansion: `af.inline_from(expr)` preserves the
     /// schema `S` for type inference.
-    pub fn value_from<T: crate::value::IntoValue<S>>(&self, v: T) -> crate::value::Value<S> {
-        crate::value::IntoValue::to_value(v)
+    pub fn inline_from<T: crate::value::IntoInline<S>>(&self, v: T) -> crate::value::Inline<S> {
+        crate::value::IntoInline::to_inline(v)
     }
 
-    /// Macro-side entry point: produce the `(Value<S>, Option<Blob>)`
+    /// Macro-side entry point: produce the `(Inline<S>, Option<Blob>)`
     /// pair the `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoSchema`], parameterised by the schema's
-    /// [`FieldKind`](crate::value::ValueSchema::FieldKind) — `S`
+    /// [`FieldKind`](crate::value::InlineSchema::FieldKind) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
     /// `Handle<T>`. The resulting `Form` is expanded into the pair
     /// via [`FieldFormFor`].
@@ -97,13 +97,13 @@ impl<S: ValueSchema> Attribute<S> {
         &self,
         v: V,
     ) -> (
-        crate::value::Value<S>,
+        crate::value::Inline<S>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     )
     where
-        V: crate::value::IntoSchema<<S as crate::value::ValueSchema>::FieldKind>,
+        V: crate::value::IntoSchema<<S as crate::value::InlineSchema>::FieldKind>,
         <V as crate::value::IntoSchema<
-            <S as crate::value::ValueSchema>::FieldKind,
+            <S as crate::value::InlineSchema>::FieldKind,
         >>::Form: crate::value::FieldFormFor<S>,
     {
         use crate::value::FieldFormFor;
@@ -112,7 +112,7 @@ impl<S: ValueSchema> Attribute<S> {
 
     /// Coerce an existing variable of any schema into a variable typed with
     /// this field's schema. This is a convenience for macros: they can
-    /// allocate an untyped/UnknownValue variable and then annotate it with the
+    /// allocate an untyped/UnknownInline variable and then annotate it with the
     /// field's schema using `af.as_variable(raw_var)`.
     ///
     /// The operation is a zero-cost conversion as variables are simply small
@@ -134,7 +134,7 @@ impl<S: ValueSchema> Attribute<S> {
 /// Pinning a schema's attribute ids (so local renames don't churn the
 /// schema) is what the [`attributes!`] macro is for — declare them with
 /// explicit hex literals there.
-impl<S: ValueSchema> From<Fragment> for Attribute<S> {
+impl<S: InlineSchema> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
         fragment
             .root()
@@ -148,7 +148,7 @@ impl<S: ValueSchema> From<Fragment> for Attribute<S> {
 
 impl<S> crate::metadata::Describe for Attribute<S>
 where
-    S: ValueSchema,
+    S: InlineSchema,
 {
     fn describe(&self) -> Fragment {
         // An attribute IS its identity fragment. The wrapped fragment
@@ -176,7 +176,7 @@ mod tests {
     use crate::metadata::{self, Describe, MetaDescribe};
     use crate::value::schemas::hash::{Blake3, Handle};
     use crate::value::schemas::shortstring::ShortString;
-    use crate::value::Value;
+    use crate::value::Inline;
 
     #[test]
     fn dynamic_field_is_deterministic() {
@@ -231,7 +231,7 @@ mod tests {
         use crate::blob::schemas::iri::IRI;
 
         let iri = "http://example.org/foo";
-        let iri_handle: Value<Handle<IRI>> = iri.to_blob().get_handle();
+        let iri_handle: Inline<Handle<IRI>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
             metadata::value_schema: <ShortString as crate::metadata::MetaDescribe>::id(),

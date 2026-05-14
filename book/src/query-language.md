@@ -61,12 +61,12 @@ destructure results.
 ### Typed variables
 
 Variables optionally include a concrete type to convert the underlying value.
-The constraint phase still works with untyped [`Value`](triblespace::core::value::Value)
+The constraint phase still works with untyped [`Inline`](triblespace::core::value::Inline)
 instances; conversion happens when results are emitted.  These conversions use
-[`TryFromValue`](triblespace::core::value::TryFromValue).
+[`TryFromInline`](triblespace::core::value::TryFromInline).
 
 By default, if a conversion fails the entire row is silently skipped — like a
-constraint that doesn't match.  For types whose `TryFromValue::Error` is
+constraint that doesn't match.  For types whose `TryFromInline::Error` is
 [`Infallible`](core::convert::Infallible) the error branch is dead code and no
 rows can ever be accidentally filtered.
 
@@ -78,8 +78,8 @@ to the caller."
 ```rust,ignore
 // `x` is filtered (rows where conversion fails are skipped).
 // `y` is passed through as Result (no filtering).
-find!((x: i32, y: Value<ShortString>?),
-      and!(x.is(1.into()), y.is("foo".to_value())))
+find!((x: i32, y: Inline<ShortString>?),
+      and!(x.is(1.into()), y.is("foo".to_inline())))
 ```
 
 | Syntax | Meaning |
@@ -119,7 +119,7 @@ freely.
 | `has` | Check membership in a collection | Collections such as [`HashSet`](std::collections::HashSet) expose `.has(...)` when they implement [`ContainsConstraint`](triblespace::core::query::hashsetconstraint::ContainsConstraint); triple stores like [`TribleSet`](triblespace::core::trible::TribleSet) instead participate through [`pattern!`](triblespace::core::macros::pattern). |
 | [`EqualityConstraint`](triblespace::core::query::equalityconstraint::EqualityConstraint) | Require two variables to bind the same value | Auto-desugared by `pattern!` for self-referencing patterns like `{ _?e @ link: _?e }`. |
 | [`SortedSlice`](triblespace::core::query::sortedsliceconstraint::SortedSlice) | Check membership via binary search | A binary-search alternative to `HashSet` for sorted data; implements `ContainsConstraint`. |
-| [`value_range`](triblespace::core::query::rangeconstraint::value_range) | Restrict a variable to a byte-lexicographic range | Builds a [`ValueRange`](triblespace::core::query::rangeconstraint::ValueRange) constraint between a min and max bound. |
+| [`value_range`](triblespace::core::query::rangeconstraint::value_range) | Restrict a variable to a byte-lexicographic range | Builds a [`InlineRange`](triblespace::core::query::rangeconstraint::InlineRange) constraint between a min and max bound. |
 
 Any data structure that can iterate its contents, test membership, and report
 its size can implement `ContainsConstraint`. Membership constraints are
@@ -133,14 +133,14 @@ Call [`Variable::is`](triblespace::core::query::Variable::is) when you need a bi
 equal a specific value.  The method returns a
 [`ConstantConstraint`](triblespace::core::query::constantconstraint::ConstantConstraint)
 that checks whether the solver can assign the variable to the provided
-[`Value`](triblespace::core::value::Value).  Constant constraints behave like any other
+[`Inline`](triblespace::core::value::Inline).  Constant constraints behave like any other
 clause: combine them with `and!` to narrow a variable after other constraints
 have proposed candidates, or place them inside `or!` branches to accept
 multiple literals.
 
 ```rust,ignore
-find!((title: Value<_>),
-      and!(dataset.has(title), title.is("Dune".to_value())));
+find!((title: Inline<_>),
+      and!(dataset.has(title), title.is("Dune".to_inline())));
 ```
 
 The snippet above keeps only the rows where `title` equals `"Dune"`.  Because
@@ -153,7 +153,7 @@ values automatically, so you often get the same behaviour simply by writing the
 desired value in the pattern:
 
 ```rust,ignore
-find!((friend: Value<_>),
+find!((friend: Inline<_>),
       pattern!(&dataset,
                [{ _?person @ social::friend: ?friend,
                   social::city: "Caladan" }]));
@@ -177,7 +177,7 @@ convenient way to keep related clauses together without nesting additional
 
 ```rust,ignore
 let favourites = favourite_titles(); // e.g. a HashSet<Id> built elsewhere
-find!((book: Value<_>, author: Value<_>),
+find!((book: Inline<_>, author: Inline<_>),
       and!(favourites.has(book),
            pattern!(&dataset,
                     [{ ?book @ literature::title: "Dune",
@@ -199,7 +199,7 @@ participate in the surrounding query, provided every branch mentions the same
 set of variables:
 
 ```rust,ignore
-find!((alias: Value<_>),
+find!((alias: Inline<_>),
       temp!((entity),
             or!(pattern!(&dataset,
                          [{ ?entity @ profile::nickname: ?alias }]),
@@ -254,7 +254,7 @@ provides, so typical invocations only specify the variable list and nested
 constraint:
 
 ```rust,ignore
-find!((person: Value<_>),
+find!((person: Inline<_>),
       ignore!((street_value),
               pattern!(&dataset, [{ ?person @ contacts::street: ?street_value }])));
 ```
@@ -276,7 +276,7 @@ not show up in the result tuple. Wrap the relevant constraint with
 them in scope:
 
 ```rust,ignore
-find!((person: Value<_>),
+find!((person: Inline<_>),
       temp!((friend),
             and!(pattern!(&dataset,
                           [{ _?p @ social::person: ?person, social::friend: ?friend }]),
@@ -312,9 +312,9 @@ use triblespace::core::examples::{self, literature};
 
 let dataset = examples::dataset();
 
-for (title,) in find!((title: Value<_>),
-                     and!(dataset.has(title), title.is("Dune".to_value()))) {
-    println!("Found {}", title.from_value::<&str>());
+for (title,) in find!((title: Inline<_>),
+                     and!(dataset.has(title), title.is("Dune".to_inline()))) {
+    println!("Found {}", title.from_inline::<&str>());
 }
 ```
 
@@ -324,12 +324,12 @@ filters.  For instance, you can introduce additional variables to retrieve both
 the title and the author while sharing the same dataset predicate:
 
 ```rust,ignore
-for (title, author) in find!((title: Value<_>, author: Value<_>),
-                             and!(title.is("Dune".to_value()),
+for (title, author) in find!((title: Inline<_>, author: Inline<_>),
+                             and!(title.is("Dune".to_inline()),
                                   pattern!(&dataset,
                                            [{ _?book @ literature::title: ?title,
                                               literature::author: ?author }]))) {
-    println!("{title} was written by {}", author.from_value::<&str>());
+    println!("{title} was written by {}", author.from_inline::<&str>());
 }
 ```
 
@@ -384,7 +384,7 @@ let mut kb = TribleSet::new();
 let e = ufoid();
 kb += entity! { &e @ literature::firstname: "Frank", literature::lastname: "Herbert" };
 
-let author_last_names: Vec<_> = find!((last: Value<_>),
+let author_last_names: Vec<_> = find!((last: Inline<_>),
     pattern!(&kb, [{ _?person @ literature::firstname: "Frank", literature::lastname: ?last }])
 ).collect();
 ```
@@ -413,7 +413,7 @@ let bob = ufoid();
 kb += entity! { &alice @ social::name: "Alice", social::friend: &bob };
 kb += entity! { &bob @ social::name: "Bob" };
 
-let results: Vec<_> = find!((friend_name: Value<_>),
+let results: Vec<_> = find!((friend_name: Inline<_>),
     temp!((friend),
           and!(pattern!(&kb, [{ _?person @ social::friend: ?friend,
                                   social::name: ?friend_name }]),
@@ -476,7 +476,7 @@ impl<'a> ContainsConstraint<'a, ShortString> for ExternalTags<'a> {
 let tags: HashSet<String> = ["rust", "datalog"].into_iter().map(String::from).collect();
 let external = ExternalTags { tags: &tags };
 let matches: Vec<_> =
-    find!((tag: Value<ShortString>), external.has(tag)).collect();
+    find!((tag: Inline<ShortString>), external.has(tag)).collect();
 ```
 
 The example wraps an external `HashSet` so it can be queried directly.  A
@@ -528,7 +528,7 @@ let a = fucid(); let b = fucid(); let c = fucid();
 kb += entity!{ &a @ social::follows: &b };
 kb += entity!{ &b @ social::likes: &c };
 
-let results: Vec<_> = find!((s: Value<_>, e: Value<_>),
+let results: Vec<_> = find!((s: Inline<_>, e: Inline<_>),
     path!(&kb, s (social::follows | social::likes)+ e)).collect();
 ```
 
@@ -554,10 +554,10 @@ clauses:
 
 ```rust,ignore
 let interesting_post = fucid();
-let influencers = find!((start: Value<_>),
+let influencers = find!((start: Inline<_>),
     temp!((end),
           and!(path!(&kb, start social::follows+ end),
-               pattern!(&kb, [{ ?end @ social::likes: interesting_post.to_value() }]))))
+               pattern!(&kb, [{ ?end @ social::likes: interesting_post.to_inline() }]))))
     .collect::<Vec<_>>();
 ```
 

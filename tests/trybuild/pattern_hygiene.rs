@@ -19,7 +19,7 @@ fn main() {
     let _ = (__ctx, __a0);
 
     let _: Vec<_> = find!(
-        (__ctx: Value<valueschemas::GenId>, __a0: Value<valueschemas::ShortString>),
+        (__ctx: Inline<valueschemas::GenId>, __a0: Inline<valueschemas::ShortString>),
         pattern!(&base, [
             { ?__ctx @ ns::label: ?__a0 }
         ])
@@ -27,7 +27,7 @@ fn main() {
     .collect::<Vec<_>>();
 
     let _: Vec<_> = find!(
-        (__ctx: Value<valueschemas::GenId>, __a0: Value<valueschemas::ShortString>),
+        (__ctx: Inline<valueschemas::GenId>, __a0: Inline<valueschemas::ShortString>),
         pattern_changes!(&updated, &delta, [
             { ?__ctx @ ns::label: ?__a0 }
         ])

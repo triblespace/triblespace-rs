@@ -27,7 +27,7 @@ use triblespace_core::query::temp;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::macros::attributes;
 
@@ -92,7 +92,7 @@ fn main() {
     // up front so both the HNSW index and the TribleSet can
     // reference the same handles.
     let mut store = MemoryBlobStore::new();
-    let mut handles: std::collections::HashMap<Id, Value<Handle<Embedding>>> =
+    let mut handles: std::collections::HashMap<Id, Inline<Handle<Embedding>>> =
         std::collections::HashMap::new();
     for (pid, _title, vec) in &papers {
         let h = put_embedding::<_>(&mut store, vec.clone()).unwrap();

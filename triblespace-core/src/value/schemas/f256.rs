@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoValue;
-use crate::value::TryFromValue;
-use crate::value::TryToValue;
-use crate::value::Value;
-use crate::value::ValueSchema;
+use crate::value::IntoInline;
+use crate::value::TryFromInline;
+use crate::value::TryToInline;
+use crate::value::Inline;
+use crate::value::InlineSchema;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -52,7 +52,7 @@ impl MetaDescribe for F256LE {
         tribles
     }
 }
-impl ValueSchema for F256LE {
+impl InlineSchema for F256LE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -81,7 +81,7 @@ impl MetaDescribe for F256BE {
         tribles
     }
 }
-impl ValueSchema for F256BE {
+impl InlineSchema for F256BE {
     type ValidationError = Infallible;
     type FieldKind = Self;
 }
@@ -269,31 +269,31 @@ mod wasm_formatter {
     }
 }
 
-impl TryFromValue<'_, F256BE> for f256 {
+impl TryFromInline<'_, F256BE> for f256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<F256BE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<F256BE>) -> Result<Self, Infallible> {
         Ok(f256::from_be_bytes(v.raw))
     }
 }
 
 impl IntoSchema<F256BE> for f256 {
-    type Form = Value<F256BE>;
-    fn into_schema(self) -> Value<F256BE> {
-        Value::new(self.to_be_bytes())
+    type Form = Inline<F256BE>;
+    fn into_schema(self) -> Inline<F256BE> {
+        Inline::new(self.to_be_bytes())
     }
 }
 
-impl TryFromValue<'_, F256LE> for f256 {
+impl TryFromInline<'_, F256LE> for f256 {
     type Error = Infallible;
-    fn try_from_value(v: &Value<F256LE>) -> Result<Self, Infallible> {
+    fn try_from_inline(v: &Inline<F256LE>) -> Result<Self, Infallible> {
         Ok(f256::from_le_bytes(v.raw))
     }
 }
 
 impl IntoSchema<F256LE> for f256 {
-    type Form = Value<F256LE>;
-    fn into_schema(self) -> Value<F256LE> {
-        Value::new(self.to_le_bytes())
+    type Form = Inline<F256LE>;
+    fn into_schema(self) -> Inline<F256LE> {
+        Inline::new(self.to_le_bytes())
     }
 }
 
@@ -316,26 +316,26 @@ impl fmt::Display for JsonNumberToF256Error {
 
 impl std::error::Error for JsonNumberToF256Error {}
 
-impl TryToValue<F256> for JsonNumber {
+impl TryToInline<F256> for JsonNumber {
     type Error = JsonNumberToF256Error;
 
-    fn try_to_value(self) -> Result<Value<F256>, Self::Error> {
-        (&self).try_to_value()
+    fn try_to_inline(self) -> Result<Inline<F256>, Self::Error> {
+        (&self).try_to_inline()
     }
 }
 
-impl TryToValue<F256> for &JsonNumber {
+impl TryToInline<F256> for &JsonNumber {
     type Error = JsonNumberToF256Error;
 
-    fn try_to_value(self) -> Result<Value<F256>, Self::Error> {
+    fn try_to_inline(self) -> Result<Inline<F256>, Self::Error> {
         if let Some(value) = self.as_u128() {
-            return Ok(f256::from(value).to_value());
+            return Ok(f256::from(value).to_inline());
         }
         if let Some(value) = self.as_i128() {
-            return Ok(f256::from(value).to_value());
+            return Ok(f256::from(value).to_inline());
         }
         if let Some(value) = self.as_f64() {
-            return Ok(f256::from(value).to_value());
+            return Ok(f256::from(value).to_inline());
         }
         Err(JsonNumberToF256Error::Unrepresentable)
     }
@@ -344,7 +344,7 @@ impl TryToValue<F256> for &JsonNumber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoValue, TryToValue};
+    use crate::value::{IntoInline, TryToInline};
     use ::f256::f256;
     use proptest::prelude::*;
 
@@ -358,34 +358,34 @@ mod tests {
     proptest! {
         #[test]
         fn f256le_roundtrip(input in arb_f256_non_nan()) {
-            let value: Value<F256LE> = input.to_value();
-            let output: f256 = value.from_value();
+            let value: Inline<F256LE> = input.to_inline();
+            let output: f256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn f256be_roundtrip(input in arb_f256_non_nan()) {
-            let value: Value<F256BE> = input.to_value();
-            let output: f256 = value.from_value();
+            let value: Inline<F256BE> = input.to_inline();
+            let output: f256 = value.from_inline();
             prop_assert_eq!(input, output);
         }
 
         #[test]
         fn f256le_validates(input in arb_f256_non_nan()) {
-            let value: Value<F256LE> = input.to_value();
+            let value: Inline<F256LE> = input.to_inline();
             prop_assert!(F256LE::validate(value).is_ok());
         }
 
         #[test]
         fn f256be_validates(input in arb_f256_non_nan()) {
-            let value: Value<F256BE> = input.to_value();
+            let value: Inline<F256BE> = input.to_inline();
             prop_assert!(F256BE::validate(value).is_ok());
         }
 
         #[test]
         fn f256_le_and_be_differ(input in arb_f256_non_nan().prop_filter("non-zero", |v| *v != f256::ZERO)) {
-            let le_val: Value<F256LE> = input.to_value();
-            let be_val: Value<F256BE> = input.to_value();
+            let le_val: Inline<F256LE> = input.to_inline();
+            let be_val: Inline<F256BE> = input.to_inline();
             prop_assert_ne!(le_val.raw, be_val.raw);
         }
 
@@ -393,8 +393,8 @@ mod tests {
         fn json_number_u128_roundtrip(input: u64) {
             let s = input.to_string();
             let num: JsonNumber = serde_json::from_str(&s).unwrap();
-            let value: Value<F256> = num.try_to_value().expect("valid number");
-            let output: f256 = value.from_value();
+            let value: Inline<F256> = num.try_to_inline().expect("valid number");
+            let output: f256 = value.from_inline();
             prop_assert_eq!(output, f256::from(input as u128));
         }
 
@@ -402,8 +402,8 @@ mod tests {
         fn json_number_negative_roundtrip(input in any::<i64>().prop_filter("negative", |v| *v < 0)) {
             let s = input.to_string();
             let num: JsonNumber = serde_json::from_str(&s).unwrap();
-            let value: Value<F256> = num.try_to_value().expect("valid number");
-            let output: f256 = value.from_value();
+            let value: Inline<F256> = num.try_to_inline().expect("valid number");
+            let output: f256 = value.from_inline();
             prop_assert_eq!(output, f256::from(input as i128));
         }
 
@@ -413,8 +413,8 @@ mod tests {
             let num: JsonNumber = serde_json::from_str(&s).unwrap();
             // Compare via &JsonNumber so we can also inspect the parsed value.
             let expected = f256::from(num.as_f64().unwrap());
-            let value: Value<F256> = (&num).try_to_value().expect("valid number");
-            let output: f256 = value.from_value();
+            let value: Inline<F256> = (&num).try_to_inline().expect("valid number");
+            let output: f256 = value.from_inline();
             // Compare against what serde_json actually parsed (via as_f64),
             // not the original f64, since JSON string round-tripping can
             // shift the least-significant bit.
@@ -425,8 +425,8 @@ mod tests {
         fn json_number_ref_roundtrip(input: u64) {
             let s = input.to_string();
             let num: JsonNumber = serde_json::from_str(&s).unwrap();
-            let value: Value<F256> = (&num).try_to_value().expect("valid ref number");
-            let output: f256 = value.from_value();
+            let value: Inline<F256> = (&num).try_to_inline().expect("valid ref number");
+            let output: f256 = value.from_inline();
             prop_assert_eq!(output, f256::from(input as u128));
         }
     }
@@ -435,8 +435,8 @@ mod tests {
     #[test]
     fn f256_le_roundtrip_nan() {
         let input = f256::NAN;
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
+        let value: Inline<F256LE> = input.to_inline();
+        let output: f256 = value.from_inline();
         assert!(output.is_nan());
     }
 }

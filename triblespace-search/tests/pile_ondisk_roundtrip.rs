@@ -14,7 +14,7 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::value::schemas::hash::Handle;
-use triblespace_core::value::Value;
+use triblespace_core::value::Inline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -126,14 +126,14 @@ fn succinct_hnsw_survives_pile_round_trip() {
     // just the leaf walk.
     let original_view = original.attach(&reader);
     let reloaded_view = reloaded.attach(&reader);
-    let a: HashSet<Value<Handle<Embedding>>> = find!(
-        (n: Value<Handle<Embedding>>),
+    let a: HashSet<Inline<Handle<Embedding>>> = find!(
+        (n: Inline<Handle<Embedding>>),
         original_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
     .collect();
-    let r: HashSet<Value<Handle<Embedding>>> = find!(
-        (n: Value<Handle<Embedding>>),
+    let r: HashSet<Inline<Handle<Embedding>>> = find!(
+        (n: Inline<Handle<Embedding>>),
         reloaded_view.similar_to(probe, n, 0.4)
     )
     .map(|(h,)| h)
