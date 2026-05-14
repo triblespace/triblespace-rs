@@ -10,20 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The canonical-attribute-id + origin-typed-identity + metadata-trait
 unification release. Three related cleanups:
 
-3. **`ConstId` + `ConstDescribe` collapsed into `MetaDescribe`** (renamed
-   from interim `TypeDescribe`). The schema id is now `describe(scratch)
-   .root()` — one trait, one method, no separate identity trait. Every
-   schema's identity-determining hex literal lives inline in its
-   `MetaDescribe::describe` body. `const_blake3` (which existed to derive
-   `Handle<H,T>::ID` and `Array<T>::ID` at compile time from `H::ID` /
-   `T::ID`) is no longer needed: those types now derive their ids at
-   runtime via the *entity-core* pattern (no-`@` `entity!` over a
-   minimal identity-determining fact set; the fragment's intrinsic root
-   IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4 ("Entity
-   Core") for the mental model.
-
-The canonical-attribute-id + origin-typed-identity cleanups:
-
 1. **Dynamic-name attribute id derivation** now goes through the
    same `entity!{...}.root()` mechanism every other entity uses,
    rather than bespoke flat-Blake3 hashing. The metadata
@@ -36,6 +22,17 @@ The canonical-attribute-id + origin-typed-identity cleanups:
    — an IRI-derived attribute and a same-bytes JSON-field-derived
    attribute differ in the (attr_id, value) pair feeding the
    intrinsic-id hash.
+3. **`ConstId` + `ConstDescribe` collapsed into `MetaDescribe`** (renamed
+   from interim `TypeDescribe`). The schema id is now `describe(scratch)
+   .root()` — one trait, one method, no separate identity trait. Every
+   schema's identity-determining hex literal lives inline in its
+   `MetaDescribe::describe` body. `const_blake3` (which existed to derive
+   `Handle<H,T>::ID` and `Array<T>::ID` at compile time from `H::ID` /
+   `T::ID`) is no longer needed: those types now derive their ids at
+   runtime via the *entity-core* pattern (no-`@` `entity!` over a
+   minimal identity-determining fact set; the fragment's intrinsic root
+   IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4 ("Entity
+   Core") for the mental model.
 
 ### Added
 - **`blob::schemas::iri::IRI` BlobSchema** for Internationalized
@@ -229,11 +226,6 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   dep purely for compile-time `Handle`/`Array` id derivation;
   superseded by the runtime entity-core path. Workspace member,
   path dependency, and the `const-blake3/` directory are all gone.
-- **`AttributeUsage::usage_id` private helper removed.** The
-  identity-determining core (`metadata::attribute` + optional
-  `metadata::source_module`) is now built inline at the top of
-  `AttributeUsage::describe` and the annotations attach under its
-  derived root. One source of truth for both id and description.
 - **Blanket `impl<T: ConstDescribe> Describe for T` dropped.**
   Instance `Describe` and type-level `MetaDescribe` are now distinct
   concepts; calling `Boolean.describe(&mut blobs)` (instance-method
@@ -243,10 +235,12 @@ The canonical-attribute-id + origin-typed-identity cleanups:
   downstream crates.
 - **`MetaDescribe::id()` is runtime, not const.** Pre-`0.39.0` code
   could use `T::ID` in `const` contexts. Post-rename `T::id()` is a
-  fn that runs `T::describe(&mut scratch).root()` each call. Most
-  call sites are amortized (attribute construction caches the result
-  in `Attribute::raw`); hot dispatch sites should hoist via
-  `LazyLock<Id>` — see `triblespace-core/src/export/json.rs::render_schema_value`.
+  fn that runs `T::describe(&mut scratch).root()` each call.
+  `Attribute<S>` amortizes per attribute via its stored
+  `fragment.root()` lookup (cheap — single PATCH read). Hot
+  dispatch sites that call `<S as MetaDescribe>::id()` repeatedly
+  should hoist via `LazyLock<Id>` — see
+  `triblespace-core/src/export/json.rs::render_schema_value`.
 
 ### Migration
 - **Attributes declared with explicit hex via `attributes! { "ID"
