@@ -245,8 +245,8 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
-    /// [`InlineSchema::into_value`].
-    fn into_value(blob: Blob<Self>) -> crate::value::Value<Handle<Self>>
+    /// [`InlineSchema::to_value`].
+    fn to_value(blob: Blob<Self>) -> crate::value::Value<Handle<Self>>
     where
         Handle<Self>: InlineSchema,
     {
@@ -321,18 +321,18 @@ where
     }
 }
 
-/// `Blob<T>` is the `IntoValue<Handle<T>>` expander: it delegates to
-/// [`BlobSchema::into_value`] for the actual blob-to-Value lift. The
+/// `Blob<T>` is the `ToValue<Handle<T>>` expander: it delegates to
+/// [`BlobSchema::to_value`] for the actual blob-to-Value lift. The
 /// trait is the macro-side dispatch shim; the logic lives on
 /// `BlobSchema` so users (and schemas that need custom storage
 /// semantics) can call or override it directly.
-impl<T> crate::value::IntoValue<Handle<T>> for Blob<T>
+impl<T> crate::value::ToValue<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
     Handle<T>: InlineSchema,
 {
-    fn into_value(self) -> crate::value::Value<Handle<T>> {
-        <T as BlobSchema>::into_value(self)
+    fn to_value(self) -> crate::value::Value<Handle<T>> {
+        <T as BlobSchema>::to_value(self)
     }
 }
 

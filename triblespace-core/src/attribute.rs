@@ -89,10 +89,10 @@ impl<S: InlineSchema> Attribute<S> {
     /// [`FieldKind`](crate::value::InlineSchema::FieldKind) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
     /// `Handle<T>`. The resulting `Form` is lifted into a [`Value`]
-    /// via [`IntoValue`].
+    /// via [`ToValue`].
     ///
     /// [`IntoSchema`]: crate::value::IntoSchema
-    /// [`IntoValue`]: crate::value::IntoValue
+    /// [`ToValue`]: crate::value::ToValue
     /// [`Value`]: crate::value::Value
     /// [`Value<S>`]: crate::value::Value
     pub fn into_field_value<V>(&self, v: V) -> crate::value::Value<S>
@@ -100,10 +100,10 @@ impl<S: InlineSchema> Attribute<S> {
         V: crate::value::IntoSchema<<S as crate::value::InlineSchema>::FieldKind>,
         <V as crate::value::IntoSchema<
             <S as crate::value::InlineSchema>::FieldKind,
-        >>::Form: crate::value::IntoValue<S>,
+        >>::Form: crate::value::ToValue<S>,
     {
-        use crate::value::IntoValue;
-        v.into_schema().into_value()
+        use crate::value::ToValue;
+        v.into_schema().to_value()
     }
 
     /// Coerce an existing variable of any schema into a variable typed with

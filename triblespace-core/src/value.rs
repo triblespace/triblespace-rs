@@ -357,8 +357,8 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// blob-path counterpart lives on
-    /// [`BlobSchema::into_value`](crate::blob::BlobSchema::into_value).
-    fn into_value(form: Inline<Self>) -> Value<Self> {
+    /// [`BlobSchema::to_value`](crate::blob::BlobSchema::to_value).
+    fn to_value(form: Inline<Self>) -> Value<Self> {
         Value::Inline(form)
     }
 }
@@ -384,7 +384,7 @@ pub trait TryToInline<S: InlineSchema> {
 /// `S` is intentionally unbounded so the same trait can target either
 /// an `InlineSchema` (Form = `Inline<S>`) or a `BlobSchema`
 /// (Form = `Blob<S>`). The Form's relationship to `S` is captured by
-/// [`IntoValue`], which lifts the form into a [`Value`] the
+/// [`ToValue`], which lifts the form into a [`Value`] the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// The key property: with `S` at trait position 0, downstream that
@@ -476,27 +476,29 @@ impl<V: InlineSchema> Value<V> {
     }
 }
 
-/// Convert an [`IntoSchema::Form`] into the [`Value`] sum the
+/// Lift an [`IntoSchema::Form`] into the [`Value`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Inline<V>` delegates to [`InlineSchema::into_value`] — inline
+/// - `Inline<V>` delegates to [`InlineSchema::to_value`] — inline
 ///   path, yields `Value::Inline(form)`.
 /// - `Blob<T>` targeting `Handle<T>` delegates to
-///   [`BlobSchema::into_value`](crate::blob::BlobSchema::into_value) —
+///   [`BlobSchema::to_value`](crate::blob::BlobSchema::to_value) —
 ///   handle path, yields `Value::Blob(form.transmute())`.
 ///
 /// This trait is the **dispatch shim** for the macro layer; the
 /// actual logic lives on the schema traits so users (and overriding
 /// schemas) can call it directly without going through the trait.
-pub trait IntoValue<V: InlineSchema> {
+/// `to_value` matches the `to_inline`/`to_blob` style of the
+/// supertrait aliases.
+pub trait ToValue<V: InlineSchema> {
     /// Produce the [`Value`] the macro absorbs.
-    fn into_value(self) -> Value<V>;
+    fn to_value(self) -> Value<V>;
 }
 
-impl<V: InlineSchema> IntoValue<V> for Inline<V> {
-    fn into_value(self) -> Value<V> {
-        <V as InlineSchema>::into_value(self)
+impl<V: InlineSchema> ToValue<V> for Inline<V> {
+    fn to_value(self) -> Value<V> {
+        <V as InlineSchema>::to_value(self)
     }
 }
 
