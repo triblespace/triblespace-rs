@@ -1,13 +1,13 @@
 //! `entity!{}` auto-puts `Blob<T>` arguments to handle-typed fields.
 //!
 //! Today `IntoSchema<S>` has two relevant impls: identity for
-//! `Inline<S>` (via the blanket from `IntoInline<S>`) and put-and-handle
-//! for `Blob<T>` targeting `Handle<H, T>`. The macro calls
-//! `into_field_value` for every field; when the value side carries
-//! `Some(bytes)`, those bytes get absorbed into the entity's
-//! `MemoryBlobStore`. The resulting Fragment is then
-//! self-contained — every handle in its facts resolves against its
-//! own blob store.
+//! `Inline<S>` (via the blanket from `IntoInline<S>`) and
+//! put-and-handle for `Blob<T>` targeting `Handle<T>`. The macro
+//! calls `into_field_value` for every field, getting back a
+//! `Value<S>`; for `Value::Blob` variants the bytes get absorbed
+//! into the entity's `MemoryBlobStore`. The resulting Fragment is
+//! then self-contained — every handle in its facts resolves against
+//! its own blob store.
 
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::Blob;

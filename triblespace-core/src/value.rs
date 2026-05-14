@@ -382,11 +382,10 @@ pub trait TryToInline<S: InlineSchema> {
 ///
 /// `IntoSchema<S>` is the **sole** source-to-schema conversion trait.
 /// `S` is intentionally unbounded so the same trait can target either
-/// a `InlineSchema` (Form = `Inline<S>`) or a `BlobSchema`
+/// an `InlineSchema` (Form = `Inline<S>`) or a `BlobSchema`
 /// (Form = `Blob<S>`). The Form's relationship to `S` is captured by
-/// [`FieldFormFor`], which knows how to expand the form into the
-/// `(Inline<V>, Option<Blob<UnknownBlob>>)` pair that the `entity!{}`
-/// macro folds into a Fragment.
+/// [`IntoValue`], which lifts the form into a [`Value`] the
+/// `entity!{}` macro folds into a Fragment.
 ///
 /// The key property: with `S` at trait position 0, downstream that
 /// defines a local `MyBlobSchema` writes `impl IntoSchema<MyBlobSchema>
@@ -436,6 +435,7 @@ where
 /// `Value::Inline` never has a stored blob; a `Value::Blob` always
 /// does — and drops the redundant handle that used to be carried
 /// alongside its own blob.
+#[derive(Debug, Clone)]
 pub enum Value<V: InlineSchema> {
     /// 32-byte payload stored directly in the trible.
     Inline(Inline<V>),
