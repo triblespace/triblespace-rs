@@ -27,6 +27,10 @@ use std::convert::Infallible;
 
 use triblespace_core::id::Id;
 use triblespace_core::id_hex;
+use triblespace_core::macros::entity;
+use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{Value, ValueSchema};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
@@ -36,15 +40,23 @@ use triblespace_core::value::{Value, ValueSchema};
 /// `8868FA39C4CDA947DD4CAA1652C30D06`.
 pub enum WordHash {}
 
-impl triblespace_core::metadata::MetaDescribe for WordHash {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+impl MetaDescribe for WordHash {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+        B: triblespace_core::repo::BlobStore<Blake3>,
     {
-        Ok(triblespace_core::trible::Fragment::rooted(
-            id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"),
-            triblespace_core::trible::TribleSet::new(),
-        ))
+        Fragment::rooted(id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"), TribleSet::new())
+            .try_annotated(|id_ref| {
+                let name = blobs.put("WordHash")?;
+                let description = blobs.put(
+                    "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
+                )?;
+                Ok(entity! { id_ref @
+                    metadata::name:        name,
+                    metadata::description: description,
+                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                })
+            })
     }
 }
 
@@ -59,15 +71,23 @@ impl ValueSchema for WordHash {
 /// `2EC1CAAD948B959D32023EF32D500148`.
 pub enum BigramHash {}
 
-impl triblespace_core::metadata::MetaDescribe for BigramHash {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+impl MetaDescribe for BigramHash {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+        B: triblespace_core::repo::BlobStore<Blake3>,
     {
-        Ok(triblespace_core::trible::Fragment::rooted(
-            id_hex!("2EC1CAAD948B959D32023EF32D500148"),
-            triblespace_core::trible::TribleSet::new(),
-        ))
+        Fragment::rooted(id_hex!("2EC1CAAD948B959D32023EF32D500148"), TribleSet::new())
+            .try_annotated(|id_ref| {
+                let name = blobs.put("BigramHash")?;
+                let description = blobs.put(
+                    "Term schema for bigram_tokens — Blake3 hash of a pair of adjacent lowercased words, NUL-delimited.",
+                )?;
+                Ok(entity! { id_ref @
+                    metadata::name:        name,
+                    metadata::description: description,
+                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                })
+            })
     }
 }
 
@@ -84,15 +104,23 @@ impl ValueSchema for BigramHash {
 /// `52472B53D201532D7FAA7D89AE80A6ED`.
 pub enum NgramHash {}
 
-impl triblespace_core::metadata::MetaDescribe for NgramHash {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+impl MetaDescribe for NgramHash {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+        B: triblespace_core::repo::BlobStore<Blake3>,
     {
-        Ok(triblespace_core::trible::Fragment::rooted(
-            id_hex!("52472B53D201532D7FAA7D89AE80A6ED"),
-            triblespace_core::trible::TribleSet::new(),
-        ))
+        Fragment::rooted(id_hex!("52472B53D201532D7FAA7D89AE80A6ED"), TribleSet::new())
+            .try_annotated(|id_ref| {
+                let name = blobs.put("NgramHash")?;
+                let description = blobs.put(
+                    "Term schema for ngram_tokens — Blake3 hash of a character n-gram window, with the n-size prefixed into the hash input so different n values don't collide within the same schema.",
+                )?;
+                Ok(entity! { id_ref @
+                    metadata::name:        name,
+                    metadata::description: description,
+                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                })
+            })
     }
 }
 

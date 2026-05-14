@@ -23,6 +23,10 @@ use anybytes::View;
 use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace_core::id::Id;
 use triblespace_core::id_hex;
+use triblespace_core::macros::entity;
+use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
@@ -39,15 +43,23 @@ use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 /// conversion.
 pub enum F32LE {}
 
-impl triblespace_core::metadata::MetaDescribe for F32LE {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+impl MetaDescribe for F32LE {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+        B: triblespace_core::repo::BlobStore<Blake3>,
     {
-        Ok(triblespace_core::trible::Fragment::rooted(
-            id_hex!("816B4751EA8C12644CCB572F36188EBA"),
-            triblespace_core::trible::TribleSet::new(),
-        ))
+        Fragment::rooted(id_hex!("816B4751EA8C12644CCB572F36188EBA"), TribleSet::new())
+            .try_annotated(|id_ref| {
+                let name = blobs.put("F32LE")?;
+                let description = blobs.put(
+                    "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Value, with the rest zero-padded.",
+                )?;
+                Ok(entity! { id_ref @
+                    metadata::name:        name,
+                    metadata::description: description,
+                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                })
+            })
     }
 }
 
@@ -107,18 +119,23 @@ pub struct Embedding {}
 
 impl BlobSchema for Embedding {}
 
-// MetaDescribe emits an empty metadata fragment keyed on the
-// schema's id — it just has to exist so `attributes!` can
-// declare attributes whose value type is `Handle<Blake3, Embedding>`.
-impl triblespace_core::metadata::MetaDescribe for Embedding {
-    fn describe<B>(_blobs: &mut B) -> Result<triblespace_core::trible::Fragment, B::PutError>
+impl MetaDescribe for Embedding {
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
-        B: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>,
+        B: triblespace_core::repo::BlobStore<Blake3>,
     {
-        Ok(triblespace_core::trible::Fragment::rooted(
-            triblespace_core::id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"),
-            triblespace_core::trible::TribleSet::new(),
-        ))
+        Fragment::rooted(id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"), TribleSet::new())
+            .try_annotated(|id_ref| {
+                let name = blobs.put("Embedding")?;
+                let description = blobs.put(
+                    "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
+                )?;
+                Ok(entity! { id_ref @
+                    metadata::name:        name,
+                    metadata::description: description,
+                    metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+                })
+            })
     }
 }
 
