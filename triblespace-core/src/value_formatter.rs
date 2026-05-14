@@ -353,29 +353,28 @@ mod tests {
 
         let mut store: crate::blob::MemoryBlobStore<Blake3> = crate::blob::MemoryBlobStore::new();
         let mut space = TribleSet::new();
-        space += Boolean::describe(&mut store).expect("boolean metadata");
-        space += GenId::describe(&mut store).expect("genid metadata");
-        space += ShortString::describe(&mut store).expect("shortstring metadata");
-        space += F64::describe(&mut store).expect("f64 metadata");
-        space += F256LE::describe(&mut store).expect("f256le metadata");
-        space += F256BE::describe(&mut store).expect("f256be metadata");
-        space += U256LE::describe(&mut store).expect("u256le metadata");
-        space += U256BE::describe(&mut store).expect("u256be metadata");
-        space += I256LE::describe(&mut store).expect("i256le metadata");
-        space += I256BE::describe(&mut store).expect("i256be metadata");
-        space += R256LE::describe(&mut store).expect("r256le metadata");
-        space += R256BE::describe(&mut store).expect("r256be metadata");
-        space += RangeU128::describe(&mut store).expect("rangeu128 metadata");
-        space += RangeInclusiveU128::describe(&mut store).expect("rangeu128 inclusive metadata");
-        space += LineLocation::describe(&mut store).expect("linelocation metadata");
+        space += Boolean::describe();
+        space += GenId::describe();
+        space += ShortString::describe();
+        space += F64::describe();
+        space += F256LE::describe();
+        space += F256BE::describe();
+        space += U256LE::describe();
+        space += U256BE::describe();
+        space += I256LE::describe();
+        space += I256BE::describe();
+        space += R256LE::describe();
+        space += R256BE::describe();
+        space += RangeU128::describe();
+        space += RangeInclusiveU128::describe();
+        space += LineLocation::describe();
 
-        space += ED25519RComponent::describe(&mut store).expect("ed25519 r metadata");
-        space += ED25519SComponent::describe(&mut store).expect("ed25519 s metadata");
-        space += ED25519PublicKey::describe(&mut store).expect("ed25519 pubkey metadata");
-        space += UnknownValue::describe(&mut store).expect("unknown metadata");
-        space += <Hash<Blake3> as MetaDescribe>::describe(&mut store).expect("hash metadata");
-        space += <Handle<Blake3, LongString> as MetaDescribe>::describe(&mut store)
-            .expect("handle metadata");
+        space += ED25519RComponent::describe();
+        space += ED25519SComponent::describe();
+        space += ED25519PublicKey::describe();
+        space += UnknownValue::describe();
+        space += <Hash<Blake3> as MetaDescribe>::describe();
+        space += <Handle<Blake3, LongString> as MetaDescribe>::describe();
 
         let reader = store.reader().expect("blob reader");
         let formatter_cache: BlobCache<_, Blake3, WasmCode, WasmValueFormatter> =

@@ -10,6 +10,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 
 use anybytes::Bytes;
@@ -29,20 +30,20 @@ pub struct RawBytes;
 impl BlobSchema for RawBytes {}
 
 impl MetaDescribe for RawBytes {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("4C1BA1EB2FDCC637C2F269A46FCA2398");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Opaque raw bytes with no further structural interpretation. Used for content where the bytes themselves are the payload (XSD hexBinary / base64Binary literals, inline digests, key material). Distinct from FileBytes (file-provenance) and from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
-        )?;
-        Ok(entity! {
+        );
+        let name = tribles.put("rawbytes");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("rawbytes")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        };
+        tribles
     }
 }
 

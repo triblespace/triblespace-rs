@@ -84,10 +84,7 @@ pub const kind_array_entry: Id = id_hex!("EB325EABEA8C35DE7E5D700A5EF9207B");
 
 /// Returns a [`Fragment`] describing the lossless JSON tree schema —
 /// all node kinds, attribute definitions, and value/blob schema metadata.
-pub fn build_json_tree_metadata<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
+pub fn build_json_tree_metadata() -> Fragment {
     // The macro-generated `describe()` for this module's attributes!{}
     // block emits each declared attribute's identity, schema spread,
     // and a usage entity rooted at
@@ -96,46 +93,37 @@ where
     // disambiguates "this is the JSON tree schema's usage of `kind`"
     // from any other crate's usage of the same attribute id, so we no
     // longer need a separate `json.kind` rename.
-    let mut metadata = describe(blobs)?;
+    let mut metadata = describe();
 
-    metadata += describe_kind(blobs, kind_object, "json.kind.object", "JSON object node.")?;
-    metadata += describe_kind(blobs, kind_array, "json.kind.array", "JSON array node.")?;
-    metadata += describe_kind(blobs, kind_string, "json.kind.string", "JSON string node.")?;
-    metadata += describe_kind(blobs, kind_number, "json.kind.number", "JSON number node.")?;
-    metadata += describe_kind(blobs, kind_bool, "json.kind.bool", "JSON boolean node.")?;
-    metadata += describe_kind(blobs, kind_null, "json.kind.null", "JSON null node.")?;
+    metadata += describe_kind(kind_object, "json.kind.object", "JSON object node.");
+    metadata += describe_kind(kind_array, "json.kind.array", "JSON array node.");
+    metadata += describe_kind(kind_string, "json.kind.string", "JSON string node.");
+    metadata += describe_kind(kind_number, "json.kind.number", "JSON number node.");
+    metadata += describe_kind(kind_bool, "json.kind.bool", "JSON boolean node.");
+    metadata += describe_kind(kind_null, "json.kind.null", "JSON null node.");
     metadata += describe_kind(
-        blobs,
         kind_field,
         "json.kind.field",
         "JSON object field entry.",
-    )?;
+    );
     metadata += describe_kind(
-        blobs,
         kind_array_entry,
         "json.kind.array_entry",
         "JSON array entry.",
-    )?;
+    );
 
-    Ok(metadata)
+    metadata
 }
 
-fn describe_kind<B>(
-    blobs: &mut B,
-    kind_id: Id,
-    name: &str,
-    description: &str,
-) -> Result<Fragment, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    let name_handle = blobs.put(name.to_owned())?;
-
-    let tribles = entity! { ExclusiveId::force_ref(&kind_id) @
+fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
+    let mut fragment = Fragment::rooted(kind_id, TribleSet::new());
+    let name_handle = fragment.put(name.to_owned());
+    let description_handle = fragment.put(description.to_owned());
+    fragment += entity! { ExclusiveId::force_ref(&kind_id) @
         metadata::name: name_handle,
-        metadata::description: blobs.put(description.to_owned())?,
+        metadata::description: description_handle,
     };
-    Ok(tribles)
+    fragment
 }
 
 #[derive(Clone)]
@@ -202,8 +190,8 @@ where
 
     /// Returns schema metadata for the lossless JSON tree format.
     /// Delegates to [`build_json_tree_metadata`].
-    pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
-        build_json_tree_metadata(self.store)
+    pub fn metadata(&self) -> Fragment {
+        build_json_tree_metadata()
     }
 
     fn parse_value(

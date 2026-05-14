@@ -23,7 +23,7 @@ fn main() {
         kb += entity! { &book @
             literature::author: &author,
             literature::title: Words(1..3).fake::<Vec<String>>().join(" "),
-            literature::quote: blobs.put(Sentence(5..25).fake::<String>()).unwrap(),
+            literature::quote: tribles.put(Sentence(5..25).fake::<String>()).unwrap(),
         };
     });
 }

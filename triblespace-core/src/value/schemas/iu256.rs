@@ -6,6 +6,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -37,120 +38,112 @@ pub type I256 = I256BE;
 pub type U256 = U256BE;
 
 impl MetaDescribe for U256LE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Unsigned 256-bit integer stored in little-endian byte order. The full 32 bytes are dedicated to the magnitude.\n\nUse for large counters, identifiers, or domain-specific fixed-width numbers that exceed u128. Prefer U256BE when bytewise ordering or protocol encoding matters.\n\nIf a smaller width suffices, prefer U64 or U128 in your schema to reduce storage and improve readability.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("u256le");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("u256le")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::U256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::U256_LE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for U256BE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("DC3CFB719B05F019FB8101A6F471A982");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Unsigned 256-bit integer stored in big-endian byte order. Bytewise comparisons align with numeric order.\n\nUse when ordering or network serialization matters. Prefer U256LE for local storage or interop with little-endian APIs.\n\nIf you do not need the full 256-bit range, smaller integer schemas are easier to handle and faster to encode.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("u256be");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("u256be")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::U256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::U256_BE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for U256BE {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for I256LE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("DB94325A37D96037CBFC6941A4C3B66D");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Signed 256-bit integer stored in little-endian twos-complement. This enables extremely large signed ranges in a fixed width.\n\nUse for large signed quantities such as balances or offsets beyond i128. Prefer I256BE when bytewise ordering or external protocols require big-endian.\n\nIf values fit within i64 or i128, smaller schemas are more compact and easier to interoperate with.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("i256le");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("i256le")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::I256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::I256_LE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for I256BE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("CE3A7839231F1EB390E9E8E13DAED782");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Signed 256-bit integer stored in big-endian twos-complement. This variant is convenient for protocol encoding and deterministic ordering.\n\nUse for interoperability or stable bytewise comparisons across systems. Prefer I256LE for local storage or when endianness does not matter.\n\nAs with any signed integer, consider whether the sign bit has semantic meaning and avoid mixing signed and unsigned ranges.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("i256be");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("i256be")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::I256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::I256_BE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for I256BE {

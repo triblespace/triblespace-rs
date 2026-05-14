@@ -44,31 +44,29 @@ pub struct Array<T: ArrayElement>(PhantomData<T>);
 impl<T: ArrayElement> BlobSchema for Array<T> {}
 
 impl<T: ArrayElement> MetaDescribe for Array<T> {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        // Entity core via `*:` spread. `T::describe(blobs)?` runs
-        // once: its root becomes the value of `metadata::array_item_schema`,
-        // and its facts are folded in automatically. The element schema
-        // discriminates `Array<u8>` from `Array<f32>` etc.; element
-        // schemas aren't themselves `BlobSchema`s, so they get their own
-        // attribute (not `metadata::blob_schema`). `try_annotated`
-        // layers the human-facing annotations under the derived root.
-        entity! {
-            metadata::array_item_schema*: T::describe(blobs)?,
+    fn describe() -> Fragment {
+        // Entity core via `*:` spread. `T::describe()` runs once: its
+        // root becomes the value of `metadata::array_item_schema`,
+        // its facts and blobs fold in automatically. The element
+        // schema discriminates `Array<u8>` from `Array<f32>` etc.;
+        // element schemas aren't themselves `BlobSchema`s, so they
+        // get their own attribute (not `metadata::blob_schema`).
+        // `annotated` layers the human-facing annotations under the
+        // derived root.
+        let mut core = entity! {
+            metadata::array_item_schema*: T::describe(),
             metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        }
-        .try_annotated(|id_ref| {
-            let name = blobs.put("array")?;
-            let description = blobs.put(
-                "Flat array of typed values in native byte order. \
-                 Shape is stored externally in TribleSpace triples.",
-            )?;
-            Ok(entity! { id_ref @
+        };
+        let name = core.put("array");
+        let description = core.put(
+            "Flat array of typed values in native byte order. \
+             Shape is stored externally in TribleSpace triples.",
+        );
+        core.annotated(|id_ref| {
+            entity! { id_ref @
                 metadata::name: name,
                 metadata::description: description,
-            })
+            }
         })
     }
 }
@@ -104,25 +102,25 @@ pub mod elements {
             pub struct $marker;
 
             impl MetaDescribe for $marker {
-                fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-                where
-                    B: crate::repo::BlobStore<Blake3>,
-                {
+                fn describe() -> Fragment {
                     // Fixed-id schema: root is the hex id, no derived
-                    // facts contribute to identity. `try_annotated`
-                    // layers the rust marker name + doc-comment
-                    // description under the root so a consumer
-                    // querying `Array<F32>`'s metadata can resolve
-                    // the element schema id to a human-readable name.
-                    Fragment::rooted(crate::id_hex!($id), TribleSet::new())
-                        .try_annotated(|id_ref| {
-                            let name = blobs.put(stringify!($marker))?;
-                            let description = blobs.put($doc)?;
-                            Ok(entity! { id_ref @
-                                metadata::name:        name,
-                                metadata::description: description,
-                            })
-                        })
+                    // facts contribute to identity. `annotated` layers
+                    // the rust marker name + doc-comment description
+                    // under the root so a consumer querying
+                    // `Array<F32>`'s metadata can resolve the element
+                    // schema id to a human-readable name.
+                    let mut fragment = Fragment::rooted(
+                        crate::id_hex!($id),
+                        TribleSet::new(),
+                    );
+                    let name = fragment.put(stringify!($marker));
+                    let description = fragment.put($doc);
+                    fragment.annotated(|id_ref| {
+                        entity! { id_ref @
+                            metadata::name:        name,
+                            metadata::description: description,
+                        }
+                    })
                 }
             }
 

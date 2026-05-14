@@ -491,14 +491,14 @@ where
 
     /// Returns a [`Fragment`] describing every attribute and schema
     /// encountered so far, suitable for committing alongside the data.
-    pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
+    pub fn metadata(&mut self) -> Fragment {
         let mut meta = Fragment::default();
-        meta += <Boolean as MetaDescribe>::describe(self.store)?;
-        meta += <F64 as MetaDescribe>::describe(self.store)?;
-        meta += <GenId as MetaDescribe>::describe(self.store)?;
-        meta += <Handle<Blake3, LongString> as MetaDescribe>::describe(self.store)?;
+        meta += <Boolean as MetaDescribe>::describe();
+        meta += <F64 as MetaDescribe>::describe();
+        meta += <GenId as MetaDescribe>::describe();
+        meta += <Handle<Blake3, LongString> as MetaDescribe>::describe();
         for (key, attr) in self.bool_attrs.iter() {
-            meta += attr.describe(self.store)?;
+            meta += attr.describe();
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -506,7 +506,7 @@ where
             }
         }
         for (key, attr) in self.num_attrs.iter() {
-            meta += attr.describe(self.store)?;
+            meta += attr.describe();
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -514,7 +514,7 @@ where
             }
         }
         for (key, attr) in self.str_attrs.iter() {
-            meta += attr.describe(self.store)?;
+            meta += attr.describe();
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
@@ -522,14 +522,14 @@ where
             }
         }
         for (key, attr) in self.genid_attrs.iter() {
-            meta += attr.describe(self.store)?;
+            meta += attr.describe();
             if self.array_fields.contains(key) {
                 let attr_id = attr.id();
                 let entity = ExclusiveId::force_ref(&attr_id);
                 meta += entity! { &entity @ metadata::tag: metadata::KIND_MULTI };
             }
         }
-        Ok(meta)
+        meta
     }
 
     /// Resets the cached attribute mappings. Call between unrelated import
@@ -681,11 +681,7 @@ mod tests {
         let roots = fragment.exports().collect::<Vec<_>>();
         assert_eq!(roots.len(), 1);
         assert_eq!(fragment.facts().len(), 2);
-        assert!(!importer
-            .metadata()
-            .expect("metadata set")
-            .facts()
-            .is_empty());
+        assert!(!importer.metadata().facts().is_empty());
     }
 
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {

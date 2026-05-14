@@ -68,20 +68,20 @@ pub struct SuccinctArchiveBlob;
 impl BlobSchema for SuccinctArchiveBlob {}
 
 impl MetaDescribe for SuccinctArchiveBlob {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
-        )?;
-        Ok(entity! {
+        );
+        let name = tribles.put("succinctarchive");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("succinctarchive")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        };
+        tribles
     }
 }
 

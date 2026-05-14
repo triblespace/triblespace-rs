@@ -44,22 +44,22 @@ use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 pub enum F32LE {}
 
 impl MetaDescribe for F32LE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("816B4751EA8C12644CCB572F36188EBA"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("F32LE")?;
-                let description = blobs.put(
-                    "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Value, with the rest zero-padded.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("816B4751EA8C12644CCB572F36188EBA"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("F32LE");
+        let description = fragment.put(
+            "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Value, with the rest zero-padded.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+            }
+        })
     }
 }
 
@@ -120,22 +120,22 @@ pub struct Embedding {}
 impl BlobSchema for Embedding {}
 
 impl MetaDescribe for Embedding {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("Embedding")?;
-                let description = blobs.put(
-                    "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_BLOB_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("Embedding");
+        let description = fragment.put(
+            "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+            }
+        })
     }
 }
 

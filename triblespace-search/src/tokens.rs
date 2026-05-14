@@ -41,22 +41,22 @@ use triblespace_core::value::{Value, ValueSchema};
 pub enum WordHash {}
 
 impl MetaDescribe for WordHash {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("WordHash")?;
-                let description = blobs.put(
-                    "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("WordHash");
+        let description = fragment.put(
+            "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+            }
+        })
     }
 }
 
@@ -72,22 +72,22 @@ impl ValueSchema for WordHash {
 pub enum BigramHash {}
 
 impl MetaDescribe for BigramHash {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("2EC1CAAD948B959D32023EF32D500148"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("BigramHash")?;
-                let description = blobs.put(
-                    "Term schema for bigram_tokens — Blake3 hash of a pair of adjacent lowercased words, NUL-delimited.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("2EC1CAAD948B959D32023EF32D500148"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("BigramHash");
+        let description = fragment.put(
+            "Term schema for bigram_tokens — Blake3 hash of a pair of adjacent lowercased words, NUL-delimited.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+            }
+        })
     }
 }
 
@@ -105,22 +105,22 @@ impl ValueSchema for BigramHash {
 pub enum NgramHash {}
 
 impl MetaDescribe for NgramHash {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("52472B53D201532D7FAA7D89AE80A6ED"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("NgramHash")?;
-                let description = blobs.put(
-                    "Term schema for ngram_tokens — Blake3 hash of a character n-gram window, with the n-size prefixed into the hash input so different n values don't collide within the same schema.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_VALUE_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("52472B53D201532D7FAA7D89AE80A6ED"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("NgramHash");
+        let description = fragment.put(
+            "Term schema for ngram_tokens — Blake3 hash of a character n-gram window, with the n-size prefixed into the hash input so different n values don't collide within the same schema.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+            }
+        })
     }
 }
 

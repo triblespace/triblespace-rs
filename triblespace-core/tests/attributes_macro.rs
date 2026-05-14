@@ -53,7 +53,7 @@ fn attributes_macro_emits_usage_metadata() {
     // are emitted by the macro-generated top-level `describe()`
     // function at the attributes!{} declaration site.
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let meta = describe(&mut blobs).expect("registry metadata");
+    let meta = describe();
     let attr_id = fixed.id();
     let usage_count = find!(
         (usage: Id),

@@ -1738,22 +1738,22 @@ impl BlobSchema for SuccinctBM25Blob {}
 // `Handle<Blake3, SuccinctBM25Blob>` without the macro complaining
 // that the schema can't describe itself.
 impl MetaDescribe for SuccinctBM25Blob {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("SuccinctBM25Blob")?;
-                let description = blobs.put(
-                    "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: term-id table, postings, document-frequency table, and an `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_BLOB_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("SuccinctBM25Blob");
+        let description = fragment.put(
+            "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: term-id table, postings, document-frequency table, and an `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+            }
+        })
     }
 }
 
@@ -1815,22 +1815,22 @@ pub enum SuccinctHNSWBlob {}
 impl BlobSchema for SuccinctHNSWBlob {}
 
 impl MetaDescribe for SuccinctHNSWBlob {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: triblespace_core::repo::BlobStore<Blake3>,
-    {
-        Fragment::rooted(id_hex!("8DF997D25C15B73EDCEE9E08076F251E"), TribleSet::new())
-            .try_annotated(|id_ref| {
-                let name = blobs.put("SuccinctHNSWBlob")?;
-                let description = blobs.put(
-                    "Canonical-bytes blob format for the succinct HNSW vector index. Handles + graph live in one shared `anybytes::ByteArea` with a suffix `SuccinctHNSWMeta`; embeddings themselves live as separate blobs in the pile referenced by handle.",
-                )?;
-                Ok(entity! { id_ref @
-                    metadata::name:        name,
-                    metadata::description: description,
-                    metadata::tag:         metadata::KIND_BLOB_SCHEMA,
-                })
-            })
+    fn describe() -> Fragment {
+        let mut fragment = Fragment::rooted(
+            id_hex!("8DF997D25C15B73EDCEE9E08076F251E"),
+            TribleSet::new(),
+        );
+        let name = fragment.put("SuccinctHNSWBlob");
+        let description = fragment.put(
+            "Canonical-bytes blob format for the succinct HNSW vector index. Handles + graph live in one shared `anybytes::ByteArea` with a suffix `SuccinctHNSWMeta`; embeddings themselves live as separate blobs in the pile referenced by handle.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
+                metadata::name:        name,
+                metadata::description: description,
+                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+            }
+        })
     }
 }
 

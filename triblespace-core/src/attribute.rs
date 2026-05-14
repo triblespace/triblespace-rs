@@ -123,19 +123,16 @@ impl<S> crate::metadata::Describe for Attribute<S>
 where
     S: ValueSchema,
 {
-    fn describe<B>(&self, _blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
-    {
+    fn describe(&self) -> Fragment {
         // An attribute IS its identity fragment. The wrapped fragment
         // already carries `metadata::iri` / `metadata::name` and
         // `metadata::value_schema: S::id()` from construction —
         // exactly the facts a registry queries on. The schema's own
         // facts (the human-readable name, description, hash protocol,
         // …) belong to the schema, not the attribute; consumers
-        // wanting them ask `<S as MetaDescribe>::describe(blobs)?`
-        // separately. Pure accessor; no blob puts needed.
-        Ok(self.fragment.clone())
+        // wanting them ask `<S as MetaDescribe>::describe()`
+        // separately. Pure accessor.
+        self.fragment.clone()
     }
 }
 
@@ -216,7 +213,7 @@ mod tests {
         let attr_id = attr.id();
 
         let mut blobs = MemoryBlobStore::<Blake3>::new();
-        let meta = attr.describe(&mut blobs).expect("describe");
+        let meta = attr.describe();
 
         // Discovery-by-IRI: the registry must contain
         // `<attr_id> @ metadata::iri: <handle>`.

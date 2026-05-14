@@ -10,6 +10,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 
 use anybytes::view::ViewError;
@@ -31,24 +32,24 @@ pub struct IRI {}
 impl BlobSchema for IRI {}
 
 impl MetaDescribe for IRI {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("5AA1EB95B924C388C9057FA94DB7130F");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "An Internationalized Resource Identifier (RFC 3987) stored as a blob. \
              Byte layout matches LongString but the distinct schema lets handles \
              carry their IRI-ness at the type level, enables boundary validation, \
              and ensures attribute ids derived from IRIs sort distinctly from \
              attribute ids derived from arbitrary text.",
-        )?;
-        Ok(entity! {
+        );
+        let name = tribles.put("iri");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("iri")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        };
+        tribles
     }
 }
 

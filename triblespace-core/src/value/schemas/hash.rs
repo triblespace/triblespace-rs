@@ -67,11 +67,8 @@ where
     // Hash<H>'s schema id IS H's schema id — Hash<H> is the value-schema
     // facet of the same conceptual entity. describe delegates to H so the
     // fragment's intrinsic root is H's id.
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        H::describe(blobs)
+    fn describe() -> Fragment {
+        H::describe()
     }
 }
 
@@ -162,34 +159,31 @@ where
     }
 }
 
-fn describe_hash<H, B>(blobs: &mut B, id: Id) -> Result<Fragment, B::PutError>
+fn describe_hash<H>(id: Id) -> Fragment
 where
     H: HashProtocol,
-    B: BlobStore<Blake3>,
 {
     // `id` is passed in by the HashProtocol impl so we don't recurse through
     // `H::id()` (which would call `H::describe` which would call us back).
     let name = H::NAME;
-    let description = blobs.put(format!(
+    let mut tribles = Fragment::rooted(id, TribleSet::new());
+    let description = tribles.put(format!(
         "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
-    ))?;
-    let name_handle = blobs.put(name)?;
-    let tribles = entity! { ExclusiveId::force_ref(&id) @
+    ));
+    let name_handle = tribles.put(name);
+    tribles += entity! { ExclusiveId::force_ref(&id) @
         metadata::name: name_handle,
         metadata::description: description,
         metadata::tag: metadata::KIND_VALUE_SCHEMA,
     };
-
     #[cfg(feature = "wasm")]
-    let tribles = {
-        let mut tribles = tribles;
+    {
+        let formatter = tribles.put(wasm_formatter::HASH_HEX_WASM);
         tribles += entity! { ExclusiveId::force_ref(&id) @
-            metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
+            metadata::value_formatter: formatter,
         };
-        tribles
-    };
-
-    Ok(tribles)
+    }
+    tribles
 }
 
 #[cfg(feature = "wasm")]
@@ -237,11 +231,8 @@ impl HashProtocol for Blake3 {
 }
 
 impl MetaDescribe for Blake3 {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        describe_hash::<Self, B>(blobs, id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3"))
+    fn describe() -> Fragment {
+        describe_hash::<Self>(id_hex!("4160218D6C8F620652ECFBD7FDC7BDB3"))
     }
 }
 
@@ -288,28 +279,27 @@ where
     H: HashProtocol,
     T: BlobSchema + MetaDescribe,
 {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        // Entity core via `*:` spread. `T::describe(blobs)?` and
-        // `H::describe(blobs)?` each run once: their roots become the
+    fn describe() -> Fragment {
+        // Entity core via `*:` spread. `T::describe()` and
+        // `H::describe()` each run once: their roots become the
         // values of `metadata::blob_schema` and `metadata::hash_schema`,
-        // and their facts fold in automatically. The hash_schema +
-        // blob_schema pair distinguishes one `Handle<H,T>`
-        // monomorphization from another; `try_annotated` layers the
-        // human-facing annotations under the derived root.
-        entity! {
-            metadata::blob_schema*: T::describe(blobs)?,
-            metadata::hash_schema*: H::describe(blobs)?,
+        // and their facts + blobs fold in automatically. The
+        // hash_schema + blob_schema pair distinguishes one
+        // `Handle<H,T>` monomorphization from another; `annotated`
+        // layers the human-facing annotations under the derived root.
+        let mut core = entity! {
+            metadata::blob_schema*: T::describe(),
+            metadata::hash_schema*: H::describe(),
             metadata::tag: metadata::KIND_VALUE_SCHEMA,
-        }
-        .try_annotated(|id_ref| {
-            let name = H::NAME;
-            let description_handle = blobs.put(format!(
-                "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob schema. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
-            ))?;
-            let name_handle = blobs.put("handle")?;
+        };
+        let name = H::NAME;
+        let description_handle = core.put(format!(
+            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob schema. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
+        ));
+        let name_handle = core.put("handle");
+        #[cfg(feature = "wasm")]
+        let wasm_handle = core.put(wasm_formatter::HASH_HEX_WASM);
+        core.annotated(|id_ref| {
             #[allow(unused_mut)]
             let mut annotations = entity! { id_ref @
                 metadata::name: name_handle,
@@ -318,16 +308,16 @@ where
             #[cfg(feature = "wasm")]
             {
                 annotations += entity! { id_ref @
-                    metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
+                    metadata::value_formatter: wasm_handle,
                 };
             }
-            Ok(annotations)
+            annotations
         })
     }
 
     // id() uses the describe-based default. Handle's describe builds the
     // core entity first and attaches annotations under its root via
-    // `try_annotated` — the fragment's intrinsic root is the core's id,
+    // `annotated` — the fragment's intrinsic root is the core's id,
     // exactly the schema id we want.
 }
 

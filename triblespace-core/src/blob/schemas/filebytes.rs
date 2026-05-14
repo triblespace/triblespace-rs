@@ -10,6 +10,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 
 use anybytes::Bytes;
@@ -23,20 +24,20 @@ pub struct FileBytes;
 impl BlobSchema for FileBytes {}
 
 impl MetaDescribe for FileBytes {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("5DE76157AE4FDEA830019916805E80A4");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Opaque file bytes captured as a blob. Use when the payload represents a file snapshot (attachments, dataset artifacts, exported archives) and you want to preserve that provenance in the schema rather than treating it as UnknownBlob. The meaning is given by adjacent metadata attributes such as mime type, filename, and dimensions.",
-        )?;
-        Ok(entity! {
+        );
+        let name = tribles.put("filebytes");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("filebytes")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        })
+        };
+        tribles
     }
 }
 

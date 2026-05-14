@@ -6,6 +6,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -41,60 +42,56 @@ pub struct R256BE;
 pub type R256 = R256LE;
 
 impl MetaDescribe for R256LE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("0A9B43C5C2ECD45B257CDEFC16544358");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in little-endian, normalized with a positive denominator. This keeps fractions canonical and comparable.\n\nUse for exact rates, proportions, or unit conversions where rounding is unacceptable. Prefer F64 or F256 when approximate floats are fine or when interfacing with floating-point APIs.\n\nDenominator zero is invalid; the schema expects canonicalized fractions. If you need intervals or ranges instead of ratios, use the range schemas.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("r256le");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("r256le")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::R256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::R256_LE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for R256BE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("r256be");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("r256be")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::R256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::R256_BE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 

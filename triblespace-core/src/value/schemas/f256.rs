@@ -6,6 +6,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -28,60 +29,56 @@ pub struct F256BE;
 pub type F256 = F256LE;
 
 impl MetaDescribe for F256LE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "High-precision f256 float stored in little-endian byte order. The format preserves far more precision than f64 and can round-trip large JSON numbers.\n\nUse when precision or exact decimal import matters more than storage or compute cost. Choose the big-endian variant if you need lexicographic ordering or network byte order.\n\nF256 values are heavier to parse and compare than f64. If you only need standard double precision, prefer F64 for faster operations.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("f256le");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("f256le")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::F256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::F256_LE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for F256LE {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for F256BE {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("A629176D4656928D96B155038F9F2220");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "High-precision f256 float stored in big-endian byte order. This variant is convenient for bytewise ordering or wire formats that expect network order.\n\nUse for high-precision metrics or lossless JSON import when ordering matters across systems. For everyday numeric values, F64 is smaller and faster.\n\nAs with all floats, rounding can still occur at the chosen precision. If you need exact fractions, use R256 instead.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("f256be");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("f256be")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::F256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::F256_BE_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for F256BE {

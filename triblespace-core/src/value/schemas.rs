@@ -47,24 +47,19 @@ use std::convert::Infallible;
 pub struct UnknownValue {}
 
 impl MetaDescribe for UnknownValue {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
         };
-
         #[cfg(feature = "wasm")]
         {
+            let formatter = tribles.put(wasm_formatter::UNKNOWN_VALUE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::UNKNOWN_VALUE_WASM)?,
+                metadata::value_formatter: formatter,
             };
         }
-        #[cfg(not(feature = "wasm"))]
-        let _ = (blobs, &mut tribles);
-        Ok(tribles)
+        tribles
     }
 }
 

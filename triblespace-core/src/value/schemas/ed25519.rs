@@ -12,6 +12,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -29,90 +30,81 @@ pub struct ED25519SComponent;
 pub struct ED25519PublicKey;
 
 impl MetaDescribe for ED25519RComponent {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("995A86FFC83DB95ECEAA17E226208897");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob schema (for example LongString with base64 or a custom blob schema).",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("ed25519:r");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:r")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
-
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::ED25519_R_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::ED25519_R_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for ED25519SComponent {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("10D35B0B628E9E409C549D8EC1FB3598");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Ed25519 signature S component stored as a 32-byte field. This is the second half of the standard Ed25519 signature.\n\nUse when storing or querying signatures in a structured form. Pair with the R component to reconstruct or verify the full signature.\n\nAs with the R component, treat this as public data; private signing keys should be stored separately and securely.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("ed25519:s");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:s")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
-
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::ED25519_S_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::ED25519_S_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
 }
 impl MetaDescribe for ED25519PublicKey {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("69A872254E01B4C1ED36E08E40445E93");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Ed25519 public key stored as a 32-byte field. Public keys verify signatures and identify signing identities.\n\nUse for signer registries, verification records, or key references associated with signatures. Private keys are not represented by a built-in schema and should be handled separately.\n\nEd25519 is widely supported and deterministic; if you need another scheme, define a custom schema with its own metadata.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("ed25519:pubkey");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:pubkey")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
-
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::ED25519_PUBKEY_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::ED25519_PUBKEY_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 impl ValueSchema for ED25519PublicKey {

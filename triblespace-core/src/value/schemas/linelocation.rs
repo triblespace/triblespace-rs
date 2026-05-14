@@ -6,6 +6,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::RawValue;
 use crate::value::ToValue;
@@ -21,30 +22,28 @@ use std::convert::Infallible;
 pub struct LineLocation;
 
 impl MetaDescribe for LineLocation {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("DFAED173A908498CB893A076EAD3E578");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Line/column span encoded as four big-endian u64 values (start_line, start_col, end_line, end_col). This captures explicit source positions rather than byte offsets.\n\nUse for editor diagnostics, source maps, or human-facing spans. If you need byte offsets or length-based ranges, use RangeU128 instead.\n\nColumns are raw counts and do not account for variable-width graphemes. Store any display conventions separately if needed.",
-        )?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("line_location");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("line_location")?,
+                metadata::name: name,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::LINELOCATION_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::LINELOCATION_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 

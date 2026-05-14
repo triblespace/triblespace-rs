@@ -6,6 +6,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -43,16 +44,14 @@ pub enum ValidationError {
 pub struct ShortString;
 
 impl MetaDescribe for ShortString {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "UTF-8 string stored inline in 32 bytes with NUL termination and zero padding. Keeping the bytes inside the value makes the string sortable and queryable without an extra blob lookup.\n\nUse for short labels, enum-like names, and keys that must fit in the value boundary. For longer or variable text, store a LongString blob and reference it with a Handle.\n\nInterior NUL bytes are invalid and the maximum length is 32 bytes. The schema stores raw bytes, so it does not account for grapheme width or display columns.",
-        )?;
-        let name = blobs.put("shortstring")?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("shortstring");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
@@ -60,14 +59,13 @@ impl MetaDescribe for ShortString {
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::SHORTSTRING_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::SHORTSTRING_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 

@@ -39,27 +39,24 @@ pub struct UnknownBlob;
 impl BlobSchema for UnknownBlob {}
 
 impl MetaDescribe for UnknownBlob {
-    fn describe<B>(blobs: &mut B) -> Result<crate::trible::Fragment, B::PutError>
-    where
-        B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
-    {
+    fn describe() -> crate::trible::Fragment {
         // Fixed-id fallback schema. Even though it's discouraged in
         // practice, the metadata should still self-describe so a
         // consumer encountering this id can recognise it.
-        crate::trible::Fragment::rooted(
+        let mut fragment = crate::trible::Fragment::rooted(
             id_hex!("EAB14005141181B0C10C4B5DD7985F8D"),
             crate::trible::TribleSet::new(),
-        )
-        .try_annotated(|id_ref| {
-            let name = blobs.put("UnknownBlob")?;
-            let description = blobs.put(
-                "Fallback blob schema for byte payloads with no known type. Discouraged in practice — use a specific blob schema (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
-            )?;
-            Ok(entity! { id_ref @
+        );
+        let name = fragment.put("UnknownBlob");
+        let description = fragment.put(
+            "Fallback blob schema for byte payloads with no known type. Discouraged in practice — use a specific blob schema (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
+        );
+        fragment.annotated(|id_ref| {
+            entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
                 metadata::tag:         metadata::KIND_BLOB_SCHEMA,
-            })
+            }
         })
     }
 }

@@ -64,10 +64,7 @@ fn array_id_distinguishes_element_schema() {
 /// None, fragment.root().unwrap() → panic, or root would differ).
 #[test]
 fn handle_describe_root_matches_id() {
-    use triblespace_core::blob::MemoryBlobStore;
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe(&mut blobs)
-        .expect("describe should succeed");
+    let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe();
     let from_describe = frag.root().expect("rooted fragment");
     let from_id = Handle::<Blake3, LongString>::id();
     assert_eq!(from_describe, from_id);
@@ -75,9 +72,7 @@ fn handle_describe_root_matches_id() {
 
 #[test]
 fn array_describe_root_matches_id() {
-    use triblespace_core::blob::MemoryBlobStore;
-    let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let frag = <Array<F32> as MetaDescribe>::describe(&mut blobs).expect("describe should succeed");
+    let frag = <Array<F32> as MetaDescribe>::describe();
     let from_describe = frag.root().expect("rooted fragment");
     let from_id = Array::<F32>::id();
     assert_eq!(from_describe, from_id);
@@ -99,7 +94,7 @@ fn array_describe_carries_element_schema_annotations() {
     use triblespace_core::value::Value;
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let frag = <Array<F32> as MetaDescribe>::describe(&mut blobs).expect("describe");
+    let frag = <Array<F32> as MetaDescribe>::describe();
 
     let array_id = Array::<F32>::id();
     let f32_id = F32::id();
@@ -149,7 +144,7 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     use triblespace_core::value::Value;
 
     let mut blobs = MemoryBlobStore::<Blake3>::new();
-    let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe(&mut blobs).expect("describe");
+    let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe();
 
     let handle_id = Handle::<Blake3, LongString>::id();
     let blob_schema_id = LongString::id();

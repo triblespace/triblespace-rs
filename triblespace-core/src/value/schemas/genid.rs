@@ -9,6 +9,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use crate::value::schemas::hash::Blake3;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -32,16 +33,14 @@ use proptest::prelude::RngCore;
 pub struct GenId;
 
 impl MetaDescribe for GenId {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
+    fn describe() -> Fragment {
         let id: Id = id_hex!("B08EE1D45EB081E8C47618178AFE0D81");
-        let description = blobs.put(
+        let mut tribles = Fragment::rooted(id, TribleSet::new());
+        let description = tribles.put(
             "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example by wrapping the inputs in `entity!{}` and taking its `root()`, or by hashing them directly).",
-        )?;
-        let name = blobs.put("genid")?;
-        let tribles = entity! {
+        );
+        let name = tribles.put("genid");
+        tribles += entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
@@ -49,14 +48,13 @@ impl MetaDescribe for GenId {
         };
 
         #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
+        {
+            let formatter = tribles.put(wasm_formatter::GENID_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::GENID_WASM)?,
+                metadata::value_formatter: formatter,
             };
-            tribles
-        };
-        Ok(tribles)
+        }
+        tribles
     }
 }
 

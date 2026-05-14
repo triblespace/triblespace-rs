@@ -209,13 +209,13 @@ pub fn attributes_impl(
             base_path,
         )?;
 
-        // Annotation closure body for `Fragment::try_annotated`. The
+        // Annotation closure body for `Fragment::annotated`. The
         // closure receives `__usage_ref: &ExclusiveId` (the derived
-        // usage id) and returns `Result<Fragment, B::PutError>`.
-        // We expand `entity_impl` directly with our `base_path` so
-        // the `entity!{}` inside resolves the same way the outer
-        // `attributes!{}` does. Doc-comments split the body so the
-        // description blob put only happens when the source had one.
+        // usage id) and returns a Fragment. We expand `entity_impl`
+        // directly with our `base_path` so the `entity!{}` inside
+        // resolves the same way the outer `attributes!{}` does.
+        // Doc-comments split the body so the description blob put
+        // only happens when the source had one.
         let annotation_body = if let Some(desc_lit) = description {
             let annotation_tokens = crate::entity_impl(
                 quote! {
@@ -227,8 +227,8 @@ pub fn attributes_impl(
                 base_path,
             )?;
             quote! {
-                let __desc_h = __blobs.put(#desc_lit)?;
-                ::core::result::Result::Ok(#annotation_tokens)
+                let __desc_h = __fragment.put(#desc_lit);
+                #annotation_tokens
             }
         } else {
             let annotation_tokens = crate::entity_impl(
@@ -240,7 +240,7 @@ pub fn attributes_impl(
                 base_path,
             )?;
             quote! {
-                ::core::result::Result::Ok(#annotation_tokens)
+                #annotation_tokens
             }
         };
 
@@ -255,42 +255,36 @@ pub fn attributes_impl(
                 // schema describes itself if a consumer wants those.
                 __fragment += <#base_path::attribute::Attribute<_> as #base_path::metadata::Describe>::describe(
                     &*#name,
-                    __blobs,
-                )?
-                .into_facts();
+                );
 
                 // Annotations: the codebase-local usage entity. Its
                 // id derives from `(metadata::attribute,
                 // metadata::source_module)` so multiple usages of
                 // the same attribute (different modules, different
                 // crates) coexist without clobbering each other.
-                // `try_annotated` layers the rust-identifier name,
-                // the KIND_ATTRIBUTE_USAGE tag, and the optional
+                // `annotated` layers the rust-identifier name, the
+                // KIND_ATTRIBUTE_USAGE tag, and the optional
                 // doc-comment description under that derived usage
-                // id.
+                // id. Blob bytes flow into the parent `__fragment`'s
+                // local blob store via `__fragment.put(...)` —
+                // making the whole describe self-contained.
                 let __attr_id = #name.id();
-                let __usage_name_h = __blobs.put(#name_lit)?;
-                let __usage_module_h = __blobs.put(module_path!())?;
+                let __usage_name_h = __fragment.put(#name_lit);
+                let __usage_module_h = __fragment.put(module_path!());
                 let __usage = (#usage_core_tokens)
-                    .try_annotated(|__usage_ref| {
+                    .annotated(|__usage_ref| {
                         #annotation_body
-                    })?;
-                __fragment += __usage.into_facts();
+                    });
+                __fragment += __usage;
             }
         })
     }).collect::<syn::Result<Vec<_>>>()?;
 
     out.extend(quote! {
-        pub fn describe<__B>(__blobs: &mut __B) -> ::core::result::Result<
-            #base_path::trible::Fragment,
-            __B::PutError,
-        >
-        where
-            __B: #base_path::repo::BlobStore<#base_path::value::schemas::hash::Blake3>,
-        {
+        pub fn describe() -> #base_path::trible::Fragment {
             let mut __fragment = #base_path::trible::Fragment::default();
             #( #per_attr_blocks )*
-            ::core::result::Result::Ok(__fragment)
+            __fragment
         }
     });
 
