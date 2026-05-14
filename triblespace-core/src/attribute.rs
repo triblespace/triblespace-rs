@@ -82,6 +82,19 @@ impl<S: ValueSchema> Attribute<S> {
         crate::value::ToValue::to_value(v)
     }
 
+    /// Macro-side entry point: produce the `(Value<S>, Option<Bytes>)`
+    /// pair the `entity!{}` codegen folds into a Fragment. The bytes
+    /// half (if any) get absorbed into the fragment's local blob
+    /// store via `MemoryBlobStore::insert_bytes`. Anchored on
+    /// `Attribute<S>` so the schema parameter `S` is captured for
+    /// trait resolution on the value side.
+    pub fn into_field_value<V: crate::value::IntoFieldValue<S>>(
+        &self,
+        v: V,
+    ) -> (crate::value::Value<S>, Option<anybytes::Bytes>) {
+        v.into_field_value()
+    }
+
     /// Coerce an existing variable of any schema into a variable typed with
     /// this field's schema. This is a convenience for macros: they can
     /// allocate an untyped/UnknownValue variable and then annotate it with the

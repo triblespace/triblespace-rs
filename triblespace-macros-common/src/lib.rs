@@ -772,14 +772,24 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         match mode {
             AttributeMode::Required => {
                 attr_eval_tokens.extend(quote! {
-                    let #val_ident = #af_ident.value_from(#value_expr);
+                    let (#val_ident, __maybe_bytes) =
+                        #af_ident.into_field_value(#value_expr);
+                    if let Some(__b) = __maybe_bytes {
+                        __blobs.insert_bytes(__b);
+                    }
                 });
             }
             AttributeMode::Optional => {
                 attr_eval_tokens.extend(quote! {
                     let #val_ident = {
                         let __opt: ::std::option::Option<_> = #value_expr;
-                        __opt.map(|__v| #af_ident.value_from(__v))
+                        __opt.map(|__v| {
+                            let (__val, __maybe_bytes) = #af_ident.into_field_value(__v);
+                            if let Some(__b) = __maybe_bytes {
+                                __blobs.insert_bytes(__b);
+                            }
+                            __val
+                        })
                     };
                 });
             }
@@ -789,7 +799,13 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                         let (__spread_iter, __spread_facts) =
                             #base_path::trible::Spread::spread(#value_expr);
                         let __vals = ::std::iter::IntoIterator::into_iter(__spread_iter)
-                            .map(|__v| #af_ident.value_from(__v))
+                            .map(|__v| {
+                                let (__val, __maybe_bytes) = #af_ident.into_field_value(__v);
+                                if let Some(__b) = __maybe_bytes {
+                                    __blobs.insert_bytes(__b);
+                                }
+                                __val
+                            })
                             .collect::<::std::vec::Vec<_>>();
                         (__vals, __spread_facts)
                     };

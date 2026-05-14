@@ -179,3 +179,21 @@ impl<S: BlobSchema> ToBlob<S> for Blob<S> {
         self
     }
 }
+
+/// A `Blob<T>` passed as a `Handle<H, T>`-typed field in `entity!{}`
+/// auto-puts itself: the macro absorbs its bytes into the fragment's
+/// local blob store, and the field value is the handle derived from
+/// those same bytes. The blob store is content-addressed, so the
+/// bytes round-trip cleanly even though the schema is erased at the
+/// storage boundary.
+impl<H, T> crate::value::IntoFieldValue<Handle<H, T>> for Blob<T>
+where
+    H: HashProtocol,
+    T: BlobSchema,
+    Handle<H, T>: ValueSchema,
+{
+    fn into_field_value(self) -> (Value<Handle<H, T>>, Option<Bytes>) {
+        let handle = self.get_handle::<H>();
+        (handle, Some(self.bytes))
+    }
+}

@@ -163,6 +163,35 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
         handle
     }
 
+    /// Number of distinct blobs in the store.
+    pub fn len(&self) -> usize {
+        self.blobs.len() as usize
+    }
+
+    /// True iff the store contains no blobs.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Insert raw bytes keyed only by their content hash, without
+    /// committing to a typed [`BlobSchema`].
+    ///
+    /// Used by the `entity!{}` macro to absorb the bytes returned
+    /// from [`IntoFieldValue::into_field_value`](crate::value::IntoFieldValue)
+    /// — the schema is already captured on the value side (the
+    /// returned `Value<Handle<H, T>>` carries the type), so the
+    /// storage path only cares about the bytes. The corresponding
+    /// `BlobStoreGet<H>::get::<T, …>(handle)` reads them back under
+    /// the original type by content hash.
+    pub fn insert_bytes(&mut self, bytes: anybytes::Bytes) {
+        let blob: Blob<UnknownBlob> = Blob::new(bytes);
+        // Reuse the typed `insert` so handle computation and PATCH
+        // bookkeeping live in one place. The returned handle is
+        // discarded; the caller already owns a typed handle from
+        // `IntoFieldValue::into_field_value` whose bytes are identical.
+        let _ = self.insert(blob);
+    }
+
     // Note that keep is conservative and keeps every blob for which there exists
     // a corresponding trible value, irrespective of that tribles attribute type.
     // This could theoretically allow an attacker to DOS blob garbage collection
