@@ -191,3 +191,55 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     .collect();
     assert_eq!(handle_names.len(), 1, "Handle's own name annotation reaches the registry");
 }
+
+/// The `entity!{}` macro's `*:` spread must propagate not just facts
+/// but also blobs from the spread source into the parent fragment.
+/// This is the macro-level analogue of `Fragment += Fragment` — without
+/// it, schemas that compose by spreading sub-schema describes would
+/// silently produce fragments whose annotation handles (name,
+/// description) don't resolve.
+///
+/// Tested via `Array<F32>::describe()`: F32's `name` handle ("F32")
+/// must resolve against the resulting fragment's embedded blob store.
+#[test]
+fn entity_spread_propagates_blobs() {
+    use triblespace_core::id::Id;
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::repo::BlobStoreGet;
+    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::Value;
+
+    let frag = <Array<F32> as MetaDescribe>::describe();
+
+    let f32_id = F32::id();
+    let f32_name_handle: Value<Handle<Blake3, LongString>> = find!(
+        (n: Value<Handle<Blake3, LongString>>),
+        pattern!(&frag, [{ f32_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .next()
+    .expect("F32 name handle is in the spread-folded facts");
+
+    // The macro must have unioned F32's describe-fragment blob store
+    // into Array<F32>'s describe-fragment blob store. If it didn't,
+    // the handle would be unresolvable here.
+    let mut blobs = frag.blobs().clone();
+    let reader = blobs.reader().expect("blob reader");
+    let bytes: anybytes::View<str> = reader
+        .get::<anybytes::View<str>, LongString>(f32_name_handle)
+        .expect("F32 name blob is present in the fragment's blob store");
+    assert_eq!(&*bytes, "F32");
+
+    // Sanity-check on the handle list too — the spread folds the
+    // *_item_schema role + the f32 entity's annotations all into one
+    // fragment; just verify the f32_id wasn't accidentally dropped.
+    let item_links: Vec<Id> = find!(
+        (item: Id),
+        pattern!(&frag, [{ Array::<F32>::id() @ metadata::array_item_schema: ?item }])
+    )
+    .map(|(item,)| item)
+    .collect();
+    assert_eq!(item_links, vec![f32_id]);
+}

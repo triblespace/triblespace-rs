@@ -711,7 +711,12 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
 
     let Entity { id, attributes } = syn::parse2(wrapped)?;
 
-    let set_init = quote! { let mut set = #base_path::trible::TribleSet::new(); };
+    let set_init = quote! {
+        let mut set = #base_path::trible::TribleSet::new();
+        let mut __blobs: #base_path::blob::MemoryBlobStore<
+            #base_path::value::schemas::hash::Blake3,
+        > = #base_path::blob::MemoryBlobStore::new();
+    };
     let attr_count = attributes.len();
     let has_dynamic_pairs = attributes
         .iter()
@@ -838,7 +843,10 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     for __v in #val_ident.iter() {
                         set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
                     }
-                    set += #extra_ident;
+                    let (__extra_facts, __extra_blobs) =
+                        #extra_ident.into_facts_and_blobs();
+                    set += __extra_facts;
+                    __blobs.union(__extra_blobs);
                 });
             }
         }
@@ -923,7 +931,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             #attr_eval_tokens
             #id_init
             #insert_tokens
-            #base_path::trible::Fragment::rooted(id_ref.id, set)
+            #base_path::trible::Fragment::rooted_with_blobs(id_ref.id, set, __blobs)
         }
     };
 

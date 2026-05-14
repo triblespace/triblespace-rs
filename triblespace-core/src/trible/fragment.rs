@@ -85,6 +85,26 @@ impl Fragment {
         }
     }
 
+    /// Creates a fragment that exports a single root id, with the given
+    /// facts and blob store. The macro-generated `entity!{}` expansion
+    /// uses this to wrap its accumulated state — facts come from per-
+    /// attribute inserts, blobs come from any `field*: spread_source`
+    /// extras the spread sources carried with them.
+    pub fn rooted_with_blobs(
+        root: Id,
+        facts: TribleSet,
+        blobs: MemoryBlobStore<Blake3>,
+    ) -> Self {
+        let mut exports = PATCH::<16>::new();
+        let raw: RawId = root.into();
+        exports.insert(&Entry::new(&raw));
+        Self {
+            exports,
+            facts,
+            blobs,
+        }
+    }
+
     /// Insert a blob into the fragment's local blob store and return the
     /// content-addressed handle that references it.
     ///
