@@ -379,20 +379,23 @@ pub trait TryToValue<S: ValueSchema> {
     fn try_to_value(self) -> Result<Value<S>, Self::Error>;
 }
 
-/// Convert a value into the pair `(Value<S>, Option<Bytes>)` an
-/// `entity!{}` field expects: the encoded value goes into the
-/// fragment's facts, and any side-bytes the conversion produced
-/// (typically a freshly-hashed blob for a `Handle`-typed field) get
-/// absorbed into the fragment's local blob store.
+/// Convert a value into the pair an `entity!{}` field expects: the
+/// encoded `Value<S>` goes into the fragment's facts, and any
+/// side-blob the conversion produced (typically a freshly-built
+/// `Blob<UnknownBlob>` for a `Handle`-typed field) gets absorbed
+/// into the fragment's local blob store.
 ///
 /// This is the entry point the `entity!{}` macro uses internally so
 /// that a fragment is *self-contained by construction* — every
 /// handle that appears in the fragment's facts has its bytes
-/// available without consulting an external blob store. The Bytes
-/// half is type-erased on purpose: the blob store is keyed by
-/// content hash, so the original `BlobSchema` only matters to derive
-/// the handle (which the impl has already done by the time bytes
-/// come out of this trait).
+/// available without consulting an external blob store. The blob
+/// half is **schema-erased** (`Blob<UnknownBlob>`) on purpose: blob
+/// stores key by content hash, so the original `BlobSchema` only
+/// matters on the *value* side (the returned `Value<Handle<T>>`
+/// carries the type). The schema-erased blob also carries its
+/// **cached handle** — the macro hands it straight to
+/// `MemoryBlobStore::insert(blob)` which reuses the cache, so no
+/// double-hash anywhere in the entity-construction pipeline.
 ///
 /// Why a separate trait from [`ToValue`]? `ToValue<S>` is a pure
 /// (value → Value<S>) conversion with no notion of side payload —
@@ -403,14 +406,19 @@ pub trait TryToValue<S: ValueSchema> {
 /// case that needs explicit handling is `Blob<T>` targeting
 /// `Handle<T>`, where the bytes need to come along.
 pub trait IntoFieldValue<S: ValueSchema> {
-    /// Produce the `(value, optional-bytes)` pair for this field.
-    /// The bytes (if any) are content-addressed under the same hash
-    /// that the value's handle references.
-    fn into_field_value(self) -> (Value<S>, Option<anybytes::Bytes>);
+    /// Produce the `(value, optional-blob)` pair for this field.
+    /// The blob (if any) is content-addressed and carries the same
+    /// cached handle that the value side references.
+    fn into_field_value(
+        self,
+    ) -> (
+        Value<S>,
+        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
+    );
 }
 
 /// Blanket: any `ToValue<S>` is an `IntoFieldValue<S>` with no
-/// side-bytes. Covers `Value<S>` itself, `&Value<S>`, native types
+/// side-blob. Covers `Value<S>` itself, `&Value<S>`, native types
 /// (`u32`, `bool`, `&str`, …) that schemas implement `ToValue` for,
 /// and so on.
 impl<S, V> IntoFieldValue<S> for V
@@ -418,7 +426,12 @@ where
     S: ValueSchema,
     V: ToValue<S>,
 {
-    fn into_field_value(self) -> (Value<S>, Option<anybytes::Bytes>) {
+    fn into_field_value(
+        self,
+    ) -> (
+        Value<S>,
+        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
+    ) {
         (self.to_value(), None)
     }
 }

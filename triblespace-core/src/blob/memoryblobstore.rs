@@ -159,20 +159,7 @@ impl MemoryBlobStore {
         self.len() == 0
     }
 
-    /// Insert raw bytes keyed only by their content hash, without
-    /// committing to a typed [`BlobSchema`].
-    ///
-    /// Used by the `entity!{}` macro to absorb the bytes returned
-    /// from [`IntoFieldValue::into_field_value`](crate::value::IntoFieldValue)
-    /// — the schema is already captured on the value side (the
-    /// returned `Value<Handle<T>>` carries the type), so the
-    /// storage path only cares about the bytes.
-    pub fn insert_bytes(&mut self, bytes: anybytes::Bytes) {
-        let blob: Blob<UnknownBlob> = Blob::new(bytes);
-        let _ = self.insert(blob);
-    }
-
-    /// Structurally merge `other` into this store, consuming `other`.
+/// Structurally merge `other` into this store, consuming `other`.
     ///
     /// Handle bytes match by content-addressing — duplicate keys
     /// collapse via PATCH's union semantics (idempotent). Faster

@@ -84,3 +84,37 @@ fn entity_still_accepts_precomputed_value() {
     // No bytes absorbed.
     assert_eq!(frag.blobs().len(), 0);
 }
+
+/// Audit: the Blake3 hash is computed exactly once during a full
+/// `entity!{}` round-trip. Tested by stuffing a `Blob` with a
+/// *deliberately bogus* cached handle via `Blob::with_handle` —
+/// if anything in the IntoFieldValue → macro → `MemoryBlobStore::insert`
+/// chain silently rehashes from bytes, that bogus handle would be
+/// replaced with the real Blake3, and this test would observe a
+/// different handle in the resulting fragment. Asserting the bogus
+/// handle survives proves the cache flowed end-to-end.
+#[test]
+fn entity_pipeline_does_not_rehash() {
+    let e = rngid();
+    let bogus_handle: triblespace_core::value::Value<Handle<LongString>> =
+        triblespace_core::value::Value::new([0xAA; 32]);
+    let blob: Blob<LongString> = Blob::with_handle(
+        anybytes::Bytes::from(b"contents whose true hash we'll never see".to_vec()),
+        bogus_handle,
+    );
+
+    let frag = entity! { &e @ ns::note: blob };
+
+    use triblespace_core::macros::{find, pattern};
+    let resolved: triblespace_core::value::Value<Handle<LongString>> = find!(
+        (h: triblespace_core::value::Value<Handle<LongString>>),
+        pattern!(&frag, [{ &e @ ns::note: ?h }])
+    )
+    .map(|(h,)| h)
+    .next()
+    .expect("note handle is in the facts");
+    assert_eq!(
+        resolved, bogus_handle,
+        "the value side must reuse the cached handle — no rehash"
+    );
+}

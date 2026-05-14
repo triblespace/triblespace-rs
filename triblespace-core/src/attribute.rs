@@ -82,16 +82,20 @@ impl<S: ValueSchema> Attribute<S> {
         crate::value::ToValue::to_value(v)
     }
 
-    /// Macro-side entry point: produce the `(Value<S>, Option<Bytes>)`
-    /// pair the `entity!{}` codegen folds into a Fragment. The bytes
-    /// half (if any) get absorbed into the fragment's local blob
-    /// store via `MemoryBlobStore::insert_bytes`. Anchored on
-    /// `Attribute<S>` so the schema parameter `S` is captured for
-    /// trait resolution on the value side.
+    /// Macro-side entry point: produce the `(Value<S>, Option<Blob>)`
+    /// pair the `entity!{}` codegen folds into a Fragment. The blob
+    /// half (if any) gets absorbed into the fragment's local blob
+    /// store via `MemoryBlobStore::insert`, which reuses the blob's
+    /// cached handle (no rehash). Anchored on `Attribute<S>` so the
+    /// schema parameter `S` is captured for trait resolution on the
+    /// value side.
     pub fn into_field_value<V: crate::value::IntoFieldValue<S>>(
         &self,
         v: V,
-    ) -> (crate::value::Value<S>, Option<anybytes::Bytes>) {
+    ) -> (
+        crate::value::Value<S>,
+        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
+    ) {
         v.into_field_value()
     }
 

@@ -250,9 +250,19 @@ where
     T: BlobSchema,
     Handle<T>: ValueSchema,
 {
-    fn into_field_value(self) -> (Value<Handle<T>>, Option<Bytes>) {
-        // O(1) — handle was computed eagerly at Blob::new.
-        (self.handle, Some(self.bytes))
+    fn into_field_value(
+        self,
+    ) -> (
+        Value<Handle<T>>,
+        Option<Blob<crate::blob::schemas::UnknownBlob>>,
+    ) {
+        // O(1) — handle was computed eagerly at Blob::new and is
+        // preserved by transmute (hash is over bytes, not schema).
+        // The store gets a self-describing blob with its cached
+        // handle and skips the recompute on insert.
+        let handle = self.handle;
+        let blob = self.transmute::<crate::blob::schemas::UnknownBlob>();
+        (handle, Some(blob))
     }
 }
 
