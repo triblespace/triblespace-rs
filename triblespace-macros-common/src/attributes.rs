@@ -246,17 +246,28 @@ pub fn attributes_impl(
 
         Ok(quote! {
             {
-                // Identity + schema spread.
+                // Core: the attribute's own identity-determining facts
+                // (`metadata::iri` / `metadata::name` and
+                // `metadata::value_schema`) — `Attribute::describe`
+                // is a pure accessor that returns the stored
+                // fragment. Schema-level facts (what `S::id()` is,
+                // hash protocol, etc.) are NOT folded in here; the
+                // schema describes itself if a consumer wants those.
                 __fragment += <#base_path::attribute::Attribute<_> as #base_path::metadata::Describe>::describe(
                     &*#name,
                     __blobs,
                 )?
                 .into_facts();
 
-                // Usage entity: core derives its id from
-                // (metadata::attribute, metadata::source_module);
-                // `try_annotated` layers name/tag/description under
-                // that derived id without exposing it.
+                // Annotations: the codebase-local usage entity. Its
+                // id derives from `(metadata::attribute,
+                // metadata::source_module)` so multiple usages of
+                // the same attribute (different modules, different
+                // crates) coexist without clobbering each other.
+                // `try_annotated` layers the rust-identifier name,
+                // the KIND_ATTRIBUTE_USAGE tag, and the optional
+                // doc-comment description under that derived usage
+                // id.
                 let __attr_id = #name.id();
                 let __usage_name_h = __blobs.put(#name_lit)?;
                 let __usage_module_h = __blobs.put(module_path!())?;

@@ -106,11 +106,19 @@ unification release. Three related cleanups:
   level API, no `entity!{}`) to avoid a bootstrap deadlock —
   foundational attributes like `metadata::value_schema` would
   otherwise reference themselves during their own init.
-- **`Describe for Attribute<S>`** clones the wrapped fragment and
-  layers the `metadata::value_schema*:` spread (via `.into_facts()`
-  so the spread's root doesn't escape). The describe output's sole
-  exposed root is the attribute id. Per-attribute `describe()`
-  no longer emits usage facts.
+- **`Describe for Attribute<S>`** is a pure accessor: it returns
+  `self.fragment.clone()` and nothing else. The wrapped identity
+  fragment already carries `metadata::iri` / `metadata::name`
+  together with `metadata::value_schema: S::id()` from construction,
+  which is the complete identity-determining fact set. Schema-level
+  facts (the schema's own name, description, hash protocol info)
+  belong to the schema, not the attribute — consumers wanting them
+  call `<S as MetaDescribe>::describe(blobs)?` directly. Drops the
+  `S: MetaDescribe` bound on the impl (no longer needed); the
+  `blobs` parameter becomes unused (no blob puts needed to describe
+  an attribute). Per-attribute `describe()` also doesn't emit
+  usage facts — those live in the macro-generated top-level
+  `describe()` as separate usage entities.
 - **`AttributeUsage` / `AttributeUsageSource` types removed.**
   An `attributes!{}` declaration site IS an attribute usage; the
   abstract attribute is the shared thing multiple parties agree

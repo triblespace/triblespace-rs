@@ -121,24 +121,21 @@ impl<S: ValueSchema> From<Fragment> for Attribute<S> {
 
 impl<S> crate::metadata::Describe for Attribute<S>
 where
-    S: ValueSchema + crate::metadata::MetaDescribe,
+    S: ValueSchema,
 {
-    fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
+    fn describe<B>(&self, _blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: crate::repo::BlobStore<crate::value::schemas::hash::Blake3>,
     {
-        // The identity-determining fragment carries facts like
-        // `metadata::iri` / `metadata::name` / `metadata::value_schema`
-        // that the registry queries on. We layer the schema spread
-        // (the bare `value_schema: S::id()` grows into the full schema
-        // description) under the same attribute id via
-        // `try_annotated`, which keeps the attribute root as the
-        // sole exposed root.
-        self.fragment.clone().try_annotated(|id_ref| {
-            Ok(entity! { id_ref @
-                crate::metadata::value_schema*: <S as crate::metadata::MetaDescribe>::describe(blobs)?,
-            })
-        })
+        // An attribute IS its identity fragment. The wrapped fragment
+        // already carries `metadata::iri` / `metadata::name` and
+        // `metadata::value_schema: S::id()` from construction —
+        // exactly the facts a registry queries on. The schema's own
+        // facts (the human-readable name, description, hash protocol,
+        // …) belong to the schema, not the attribute; consumers
+        // wanting them ask `<S as MetaDescribe>::describe(blobs)?`
+        // separately. Pure accessor; no blob puts needed.
+        Ok(self.fragment.clone())
     }
 }
 
