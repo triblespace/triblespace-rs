@@ -133,3 +133,70 @@ fn array_describe_carries_element_schema_annotations() {
     .collect();
     assert_eq!(array_names.len(), 1, "Array's own name annotation reaches the registry");
 }
+
+/// `Handle<H, T>::describe` spreads *two* sub-schemas (blob and hash)
+/// in its entity core. Both sub-schemas' annotations should make it
+/// into the metadata fragment alongside the handle's own annotations —
+/// linked through `metadata::blob_schema` and `metadata::hash_schema`
+/// respectively. This is the multi-spread sibling of
+/// `array_describe_carries_element_schema_annotations`.
+#[test]
+fn handle_describe_carries_blob_and_hash_schema_annotations() {
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::id::Id;
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
+    use triblespace_core::value::Value;
+
+    let mut blobs = MemoryBlobStore::<Blake3>::new();
+    let frag = <Handle<Blake3, LongString> as MetaDescribe>::describe(&mut blobs).expect("describe");
+
+    let handle_id = Handle::<Blake3, LongString>::id();
+    let blob_schema_id = LongString::id();
+    let hash_schema_id = Blake3::id();
+
+    // The handle's id is linked to both sub-schemas via
+    // `metadata::blob_schema` and `metadata::hash_schema`.
+    let blob_links: Vec<Id> = find!(
+        (item: Id),
+        pattern!(&frag, [{ handle_id @ metadata::blob_schema: ?item }])
+    )
+    .map(|(item,)| item)
+    .collect();
+    assert_eq!(blob_links, vec![blob_schema_id]);
+
+    let hash_links: Vec<Id> = find!(
+        (item: Id),
+        pattern!(&frag, [{ handle_id @ metadata::hash_schema: ?item }])
+    )
+    .map(|(item,)| item)
+    .collect();
+    assert_eq!(hash_links, vec![hash_schema_id]);
+
+    // Both sub-schemas' name annotations reach the registry too —
+    // proving the `*:` spread folded both sub-fragments in.
+    let blob_names: Vec<Value<Handle<Blake3, _>>> = find!(
+        (n: Value<Handle<Blake3, _>>),
+        pattern!(&frag, [{ blob_schema_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .collect();
+    assert_eq!(blob_names.len(), 1, "LongString's name annotation reaches the registry");
+
+    let hash_names: Vec<Value<Handle<Blake3, _>>> = find!(
+        (n: Value<Handle<Blake3, _>>),
+        pattern!(&frag, [{ hash_schema_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .collect();
+    assert_eq!(hash_names.len(), 1, "Blake3's name annotation reaches the registry");
+
+    // Plus the handle's own annotation under handle_id.
+    let handle_names: Vec<Value<Handle<Blake3, _>>> = find!(
+        (n: Value<Handle<Blake3, _>>),
+        pattern!(&frag, [{ handle_id @ metadata::name: ?n }])
+    )
+    .map(|(n,)| n)
+    .collect();
+    assert_eq!(handle_names.len(), 1, "Handle's own name annotation reaches the registry");
+}
