@@ -772,7 +772,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             AttributeMode::Required => {
                 attr_eval_tokens.extend(quote! {
                     let (#val_ident, __maybe_blob) =
-                        #af_ident.into_field_value(#value_expr);
+                        #af_ident.into_field_value(#value_expr).into_parts();
                     if let Some(__b) = __maybe_blob {
                         __blobs.insert(__b);
                     }
@@ -783,7 +783,8 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     let #val_ident = {
                         let __opt: ::std::option::Option<_> = #value_expr;
                         __opt.map(|__v| {
-                            let (__val, __maybe_blob) = #af_ident.into_field_value(__v);
+                            let (__val, __maybe_blob) =
+                                #af_ident.into_field_value(__v).into_parts();
                             if let Some(__b) = __maybe_blob {
                                 __blobs.insert(__b);
                             }
@@ -799,7 +800,8 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                             #base_path::trible::Spread::spread(#value_expr);
                         let __vals = ::std::iter::IntoIterator::into_iter(__spread_iter)
                             .map(|__v| {
-                                let (__val, __maybe_blob) = #af_ident.into_field_value(__v);
+                                let (__val, __maybe_blob) =
+                                    #af_ident.into_field_value(__v).into_parts();
                                 if let Some(__b) = __maybe_blob {
                                     __blobs.insert(__b);
                                 }

@@ -82,32 +82,28 @@ impl<S: InlineSchema> Attribute<S> {
         crate::value::IntoInline::to_inline(v)
     }
 
-    /// Macro-side entry point: produce the `(Inline<S>, Option<Blob>)`
-    /// pair the `entity!{}` codegen folds into a Fragment.
+    /// Macro-side entry point: produce the [`Value<S>`] the
+    /// `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoSchema`], parameterised by the schema's
     /// [`FieldKind`](crate::value::InlineSchema::FieldKind) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
-    /// `Handle<T>`. The resulting `Form` is expanded into the pair
-    /// via [`FieldFormFor`].
+    /// `Handle<T>`. The resulting `Form` is lifted into a [`Value`]
+    /// via [`IntoValue`].
     ///
     /// [`IntoSchema`]: crate::value::IntoSchema
-    /// [`FieldFormFor`]: crate::value::FieldFormFor
-    pub fn into_field_value<V>(
-        &self,
-        v: V,
-    ) -> (
-        crate::value::Inline<S>,
-        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
-    )
+    /// [`IntoValue`]: crate::value::IntoValue
+    /// [`Value`]: crate::value::Value
+    /// [`Value<S>`]: crate::value::Value
+    pub fn into_field_value<V>(&self, v: V) -> crate::value::Value<S>
     where
         V: crate::value::IntoSchema<<S as crate::value::InlineSchema>::FieldKind>,
         <V as crate::value::IntoSchema<
             <S as crate::value::InlineSchema>::FieldKind,
-        >>::Form: crate::value::FieldFormFor<S>,
+        >>::Form: crate::value::IntoValue<S>,
     {
-        use crate::value::FieldFormFor;
-        v.into_schema().into_field_pair()
+        use crate::value::IntoValue;
+        v.into_schema().into_value()
     }
 
     /// Coerce an existing variable of any schema into a variable typed with

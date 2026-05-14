@@ -237,25 +237,20 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
         t.to_blob()
     }
 
-    /// Expand a `Blob<Self>` into the field-pair shape `entity!{}`
-    /// consumes: the cached handle for the value side, the
-    /// schema-erased blob for the storage side.
+    /// Lift a `Blob<Self>` into the [`Value`](crate::value::Value)
+    /// sum `entity!{}` consumes — yields
+    /// `Value::Blob(blob.transmute())`. The handle lives inside the
+    /// blob; consumers recover it via
+    /// [`Value::inline`](crate::value::Value::inline).
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
-    /// [`InlineSchema::into_field_pair`].
-    fn into_field_pair(
-        blob: Blob<Self>,
-    ) -> (
-        Inline<Handle<Self>>,
-        Option<Blob<crate::blob::schemas::UnknownBlob>>,
-    )
+    /// [`InlineSchema::into_value`].
+    fn into_value(blob: Blob<Self>) -> crate::value::Value<Handle<Self>>
     where
         Handle<Self>: InlineSchema,
     {
-        let handle = blob.handle;
-        let unknown = blob.transmute::<crate::blob::schemas::UnknownBlob>();
-        (handle, Some(unknown))
+        crate::value::Value::Blob(blob.transmute::<crate::blob::schemas::UnknownBlob>())
     }
 }
 
@@ -326,23 +321,18 @@ where
     }
 }
 
-/// `Blob<T>` is the `FieldFormFor<Handle<T>>` expander: it delegates
-/// to [`BlobSchema::into_field_pair`] for the actual handle/blob
-/// split. The trait is the macro-side dispatch shim; the logic lives
-/// on `BlobSchema` so users (and schemas that need custom storage
+/// `Blob<T>` is the `IntoValue<Handle<T>>` expander: it delegates to
+/// [`BlobSchema::into_value`] for the actual blob-to-Value lift. The
+/// trait is the macro-side dispatch shim; the logic lives on
+/// `BlobSchema` so users (and schemas that need custom storage
 /// semantics) can call or override it directly.
-impl<T> crate::value::FieldFormFor<Handle<T>> for Blob<T>
+impl<T> crate::value::IntoValue<Handle<T>> for Blob<T>
 where
     T: BlobSchema,
     Handle<T>: InlineSchema,
 {
-    fn into_field_pair(
-        self,
-    ) -> (
-        Inline<Handle<T>>,
-        Option<Blob<crate::blob::schemas::UnknownBlob>>,
-    ) {
-        <T as BlobSchema>::into_field_pair(self)
+    fn into_value(self) -> crate::value::Value<Handle<T>> {
+        <T as BlobSchema>::into_value(self)
     }
 }
 

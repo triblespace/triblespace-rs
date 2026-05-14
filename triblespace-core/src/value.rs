@@ -351,20 +351,15 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
         t.try_to_inline()
     }
 
-    /// Expand an already-encoded `Inline<Self>` into the field-pair
-    /// shape `entity!{}` consumes. Inline schemas: `(value, None)`,
-    /// no side-blob.
+    /// Lift an already-encoded `Inline<Self>` into the [`Value`] sum
+    /// `entity!{}` consumes — yields `Value::Inline(form)`, no
+    /// side-blob.
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// blob-path counterpart lives on
-    /// [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair).
-    fn into_field_pair(
-        form: Inline<Self>,
-    ) -> (
-        Inline<Self>,
-        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
-    ) {
-        (form, None)
+    /// [`BlobSchema::into_value`](crate::blob::BlobSchema::into_value).
+    fn into_value(form: Inline<Self>) -> Value<Self> {
+        Value::Inline(form)
     }
 }
 
@@ -430,41 +425,78 @@ where
 {
 }
 
-/// Expand an [`IntoSchema::Form`] into the `(Inline<V>, Option<Blob<UnknownBlob>>)`
-/// pair that the `entity!{}` macro folds into a Fragment.
+/// The two-shape sum an attribute's value can take when an
+/// `entity!{}` field is encoded: either a 32-byte [`Inline<V>`]
+/// payload that lives directly in the trible, or a [`Blob`] holding
+/// the heavy content with a derivable handle.
 ///
-/// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Inline<V>` delegates to [`InlineSchema::into_field_pair`] — inline
-///   path, default `(value, None)`.
-/// - `Blob<T>` targeting `Handle<T>` delegates to
-///   [`BlobSchema::into_field_pair`](crate::blob::BlobSchema::into_field_pair) —
-///   handle path, default `(cached_handle, Some(transmuted_blob))`.
-///
-/// This trait is the **dispatch shim** for the macro layer; the
-/// actual logic lives on the schema traits so users (and overriding
-/// schemas) can call it directly without going through the trait.
-/// The split between `IntoSchema` (which produces a `Form` keyed on
-/// whatever discriminator the schema uses) and `FieldFormFor` (which
-/// expands the form keyed on the actual value-schema `V`) lets the
-/// per-source impls of `IntoSchema` stay one-line.
-pub trait FieldFormFor<V: InlineSchema> {
-    /// Produce the (value, optional-blob) pair the macro absorbs.
-    fn into_field_pair(
-        self,
-    ) -> (
-        Inline<V>,
-        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
-    );
+/// Replaces the older `(Inline<V>, Option<Blob>)` pair that carried
+/// an implicit "Option is Some iff V is a Handle schema" invariant.
+/// Encoding the split as a sum makes the invariant structural — a
+/// `Value::Inline` never has a stored blob; a `Value::Blob` always
+/// does — and drops the redundant handle that used to be carried
+/// alongside its own blob.
+pub enum Value<V: InlineSchema> {
+    /// 32-byte payload stored directly in the trible.
+    Inline(Inline<V>),
+    /// Bytes resolvable via a content-addressed handle. The handle
+    /// is `blob.get_handle().transmute::<V>()` — the same 32 bytes,
+    /// just re-phantomed back to the attribute's schema.
+    Blob(crate::blob::Blob<crate::blob::schemas::UnknownBlob>),
 }
 
-impl<V: InlineSchema> FieldFormFor<V> for Inline<V> {
-    fn into_field_pair(
+impl<V: InlineSchema> Value<V> {
+    /// The 32-byte form that goes into the trible. For
+    /// [`Value::Blob`], this rederives the handle from the cached
+    /// hash in the blob (no rehash) and recasts the phantom.
+    pub fn inline(&self) -> Inline<V> {
+        match self {
+            Value::Inline(i) => *i,
+            Value::Blob(b) => b.get_handle().transmute(),
+        }
+    }
+
+    /// Yield the inline form alongside the side-blob (if any). This
+    /// is the macro consumer's destructuring entry point — it gets
+    /// both pieces in one call without losing the structural
+    /// guarantee from [`Value`].
+    pub fn into_parts(
         self,
     ) -> (
         Inline<V>,
         Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
     ) {
-        <V as InlineSchema>::into_field_pair(self)
+        match self {
+            Value::Inline(i) => (i, None),
+            Value::Blob(b) => {
+                let h = b.get_handle().transmute();
+                (h, Some(b))
+            }
+        }
+    }
+}
+
+/// Convert an [`IntoSchema::Form`] into the [`Value`] sum the
+/// `entity!{}` macro folds into a Fragment.
+///
+/// `V` is the *attribute's* value schema. Two impls cover everything:
+/// - `Inline<V>` delegates to [`InlineSchema::into_value`] — inline
+///   path, yields `Value::Inline(form)`.
+/// - `Blob<T>` targeting `Handle<T>` delegates to
+///   [`BlobSchema::into_value`](crate::blob::BlobSchema::into_value) —
+///   handle path, yields `Value::Blob(form.transmute())`.
+///
+/// This trait is the **dispatch shim** for the macro layer; the
+/// actual logic lives on the schema traits so users (and overriding
+/// schemas) can call it directly without going through the trait.
+pub trait IntoValue<V: InlineSchema> {
+    /// Produce the [`Value`] the macro absorbs.
+    fn into_value(self) -> Value<V>;
+}
+
+impl<V: InlineSchema> IntoValue<V> for Inline<V> {
+    fn into_value(self) -> Value<V> {
+        <V as InlineSchema>::into_value(self)
     }
 }
 
