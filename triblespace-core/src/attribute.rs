@@ -95,7 +95,7 @@ impl<S: InlineSchema> Attribute<S> {
     /// [`ToValue`]: crate::value::ToValue
     /// [`Value`]: crate::value::Value
     /// [`Value<S>`]: crate::value::Value
-    pub fn into_field_value<V>(&self, v: V) -> crate::value::Value<S>
+    pub fn to_value<V>(&self, v: V) -> crate::value::Value<S>
     where
         V: crate::value::IntoSchema<<S as crate::value::InlineSchema>::FieldKind>,
         <V as crate::value::IntoSchema<
