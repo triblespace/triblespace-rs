@@ -6,7 +6,7 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
-use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::schemas::hash::Handle;
 use crate::value::Inline;
 
 use super::Trible;

@@ -12,7 +12,7 @@ use anybytes::view::ViewError;
 use anybytes::{Bytes, View};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use crate::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
+use crate::blob::{Blob, BlobSchema, TryFromBlob};
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;

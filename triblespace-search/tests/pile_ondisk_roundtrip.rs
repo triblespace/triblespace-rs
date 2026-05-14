@@ -80,7 +80,7 @@ fn succinct_bm25_survives_pile_round_trip() {
 #[test]
 fn succinct_hnsw_survives_pile_round_trip() {
     use std::collections::HashSet;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     let dir = tempdir().expect("tempdir");

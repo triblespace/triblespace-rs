@@ -97,7 +97,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         } => merge::run(pile, target, sources, signing_key),
         PileCommand::Create { path } => {
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;

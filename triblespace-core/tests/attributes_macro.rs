@@ -5,7 +5,6 @@ use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
     attributes, entity, find, pattern, Attribute, Id, IntoInline, Inline,
 };
-use triblespace_core::value::schemas::hash::Blake3;
 
 attributes! {
     "11111111111111111111111111111111" as pub fixed: ShortString;

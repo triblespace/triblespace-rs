@@ -17,7 +17,7 @@ use crate::id::Id;
 use crate::metadata;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::trible::TribleSet;
-use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::schemas::hash::Handle;
 use crate::value::schemas::time::NsTAIInterval;
 use crate::value::TryToInline;
 use crate::value::Inline;

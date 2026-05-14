@@ -89,7 +89,7 @@ use crate::prelude::valueschemas;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::schemas::hash::Handle;
 use crate::value::schemas::shortstring::ShortString;
 use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::value::schemas::UnknownInline;

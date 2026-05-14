@@ -30,7 +30,7 @@ use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, Repository,
 };
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 use triblespace_net::tracking::{
     ensure_tracking_branch, merge_tracking_into_local, MergeOutcome,

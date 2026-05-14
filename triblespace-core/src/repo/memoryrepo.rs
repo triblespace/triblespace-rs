@@ -9,7 +9,6 @@ use crate::prelude::blobschemas::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
-use crate::value::schemas::hash::Blake3;
 
 use crate::value::schemas::hash::Handle;
 use crate::value::InlineSchema;

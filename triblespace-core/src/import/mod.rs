@@ -11,7 +11,7 @@ pub mod ntriples;
 use triblespace_core_macros::attributes;
 
 use crate::blob::schemas::longstring::LongString;
-use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::schemas::hash::Handle;
 use crate::value::schemas::shortstring::ShortString;
 
 attributes! {

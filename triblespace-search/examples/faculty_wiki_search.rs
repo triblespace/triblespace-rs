@@ -36,7 +36,7 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 use anybytes::View;
 use triblespace_core::macros::{entity, pattern};

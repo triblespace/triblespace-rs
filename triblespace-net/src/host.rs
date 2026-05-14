@@ -123,7 +123,7 @@ where
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
         use triblespace_core::blob::schemas::UnknownBlob;
         use triblespace_core::value::Inline;
-        use triblespace_core::value::schemas::hash::{Blake3, Handle};
+        use triblespace_core::value::schemas::hash::Handle;
         let handle = Inline::<Handle<UnknownBlob>>::new(*hash);
         self.reader.get::<anybytes::Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
     }
@@ -148,7 +148,7 @@ where
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
         use triblespace_core::value::Inline;
-        use triblespace_core::value::schemas::hash::{Blake3, Handle};
+        use triblespace_core::value::schemas::hash::Handle;
         let mut out = Vec::new();
         for handle_result in self.reader.blobs() {
             let Ok(handle) = handle_result else { continue };
@@ -798,7 +798,7 @@ async fn serve_stream(
 ) -> anyhow::Result<()> {
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
-    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+    use triblespace_core::value::schemas::hash::Handle;
     use triblespace_core::value::Inline;
 
     let op = recv_u8(recv).await?;
@@ -1133,7 +1133,7 @@ mod tests {
     use triblespace_core::trible::TribleSet;
     use triblespace_core::value::TryToInline;
     use triblespace_core::value::Inline;
-    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+    use triblespace_core::value::schemas::hash::Handle;
     use triblespace_core::value::schemas::time::NsTAIInterval;
     use hifitime::Epoch;
 

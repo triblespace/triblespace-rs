@@ -14,7 +14,7 @@ use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id, uri_to_id_p
 use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::prelude::valueschemas::{self, Blake3, Handle};
+use triblespace_core::prelude::valueschemas::{self, Handle};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;

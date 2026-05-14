@@ -6,7 +6,6 @@ use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
-use triblespace_core::value::schemas::hash::Blake3;
 
 mod test_ns {
     use triblespace_core::prelude::*;

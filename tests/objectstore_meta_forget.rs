@@ -11,7 +11,7 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     use triblespace::core::blob::Bytes;
     use triblespace::core::repo::objectstore::ObjectStoreRemote;
     use triblespace::core::repo::{BlobStoreForget, BlobStoreMeta};
-    use triblespace::core::value::schemas::hash::Blake3;
+    
     use triblespace::prelude::BlobStorePut;
 
     let dir = tempdir()?;

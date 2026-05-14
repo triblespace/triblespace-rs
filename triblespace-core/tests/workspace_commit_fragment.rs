@@ -16,7 +16,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, Repository};
 use triblespace_core::trible::Fragment;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;

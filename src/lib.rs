@@ -79,7 +79,7 @@ mod readme_example {
 
     mod literature {
         use crate::prelude::blobschemas::LongString;
-        use crate::prelude::valueschemas::{Blake3, GenId, Handle, ShortString, R256};
+        use crate::prelude::valueschemas::{GenId, Handle, ShortString, R256};
         use crate::prelude::*;
 
         attributes! {

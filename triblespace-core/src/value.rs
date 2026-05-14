@@ -1,6 +1,8 @@
-//! Inline type and conversion traits for schema types. For a deeper look at
-//! portability goals, common formats, and schema design, refer to the
-//! "Portability & Common Formats" chapter in the project book.
+//! `Inline<S>` (32-byte stored payload), `Value<V>` (the
+//! Inline-or-Blob sum that `entity!{}` builds), and the conversion
+//! traits between them. For a deeper look at portability goals,
+//! common formats, and schema design, refer to the "Portability &
+//! Common Formats" chapter in the project book.
 //!
 //! # Example
 //!

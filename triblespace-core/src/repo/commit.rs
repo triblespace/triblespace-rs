@@ -18,7 +18,6 @@ use crate::query::find;
 use crate::trible::TribleSet;
 use crate::value::Inline;
 
-use crate::value::schemas::hash::Blake3;
 use hifitime::Epoch;
 
 /// Error returned when commit signature verification fails.

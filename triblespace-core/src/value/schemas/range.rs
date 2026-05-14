@@ -8,7 +8,6 @@ use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::RawInline;
-use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;

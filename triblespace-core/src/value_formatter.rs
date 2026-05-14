@@ -260,7 +260,7 @@ mod tests {
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
     use crate::trible::TribleSet;
-    use crate::value::schemas::hash::Blake3;
+    
     use crate::value::schemas::hash::Handle;
     use crate::value::Inline;
 

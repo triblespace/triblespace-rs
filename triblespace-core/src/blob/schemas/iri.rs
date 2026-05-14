@@ -1,7 +1,6 @@
 use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -128,7 +127,8 @@ where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::schemas::hash::Blake3;
+    use crate::blob::IntoBlob;
+
     use anybytes::Bytes;
 
     #[test]

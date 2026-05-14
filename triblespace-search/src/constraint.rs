@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use triblespace_core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
 use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::{RawInline, Inline};
 
 use crate::bm25::BM25Index;

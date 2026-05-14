@@ -15,7 +15,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::List { url } => {
             use triblespace::prelude::BranchStore;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use url::Url;
 
             let url = Url::parse(&url)?;

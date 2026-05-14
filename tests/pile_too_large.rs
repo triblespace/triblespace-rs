@@ -1,5 +1,4 @@
 use triblespace::core::repo::pile::ReadError;
-use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::prelude::*;
 
 #[test]

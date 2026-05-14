@@ -192,7 +192,6 @@ use crate::blob::schemas::simplearchive::SimpleArchive;
 use crate::blob::schemas::succinctarchive::SuccinctArchiveBlob;
 use crate::prelude::*;
 use crate::value::schemas::ed25519 as ed;
-use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::shortstring::ShortString;
 
 attributes! {

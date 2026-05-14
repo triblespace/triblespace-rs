@@ -1,7 +1,6 @@
 use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -84,7 +83,7 @@ mod tests {
 
     use crate::blob::schemas::longstring::LongString;
     use crate::blob::IntoBlob;
-    use crate::value::schemas::hash::Blake3;
+    
     use crate::value::schemas::hash::Handle;
     use crate::value::Inline;
 

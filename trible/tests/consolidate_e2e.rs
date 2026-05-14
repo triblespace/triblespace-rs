@@ -10,7 +10,6 @@ use triblespace_core::metadata;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 

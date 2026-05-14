@@ -5,7 +5,6 @@ mod universe;
 use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::id_from_value;
 use crate::id::id_into_value;

@@ -5,7 +5,6 @@ use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::blob::{Blob, MemoryBlobStore};
 use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::{reachable, transfer, BlobStoreGet};
-use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::value::INLINE_LEN;
 
 #[test]

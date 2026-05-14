@@ -21,7 +21,7 @@ use triblespace_core::value::IntoSchema;
 use std::convert::Infallible;
 
 use anybytes::View;
-use triblespace_core::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobSchema, TryFromBlob};
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -240,6 +240,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace_core::blob::IntoBlob;
 
     #[test]
     fn round_trip_positive() {
@@ -300,7 +301,7 @@ mod tests {
     fn put_embedding_roundtrips_through_memory_store() {
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::{BlobStore, BlobStoreGet};
-        use triblespace_core::value::schemas::hash::Blake3;
+        
 
         let mut store = MemoryBlobStore::new();
         let vec = vec![1.0_f32, 0.0, 0.0];
@@ -313,7 +314,7 @@ mod tests {
 
     #[test]
     fn embedding_handle_is_content_addressed() {
-        use triblespace_core::value::schemas::hash::{Blake3, Handle};
+        use triblespace_core::value::schemas::hash::Handle;
 
         let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v2: Vec<f32> = vec![1.0, 2.0, 3.0];

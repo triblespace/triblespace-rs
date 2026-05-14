@@ -42,7 +42,7 @@
 //! ```
 
 use triblespace_core::query::Variable;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 
 use crate::schemas::{EmbHandle, Embedding};
@@ -1145,7 +1145,7 @@ mod tests {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
 
     /// Put `vec` into `store` as a normalized [`Embedding`] blob
     /// and return the handle.

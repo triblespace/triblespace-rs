@@ -76,7 +76,7 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
 #[test]
 fn succinct_hnsw_survives_blob_store_roundtrip() {
     use std::collections::HashSet;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     // Build a small HNSW index.
@@ -139,7 +139,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
 #[test]
 fn hnsw_indexes_share_embedding_blobs() {
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     let vecs = [

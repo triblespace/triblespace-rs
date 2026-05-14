@@ -5,7 +5,6 @@
 //! Entity ids are content-addressed so identical subtrees deduplicate across
 //! imports.
 
-use std::marker::PhantomData;
 
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
@@ -500,7 +499,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::macros::{find, pattern};
-    use crate::value::schemas::hash::Blake3;
+    
 
     #[test]
     fn lossless_ids_are_content_based() {

@@ -271,7 +271,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
     use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
     use triblespace::core::blob::Blob;
     use triblespace::core::repo::commit::commit_metadata;
-    use triblespace::core::value::schemas::hash::{Blake3, Handle};
+    use triblespace::core::value::schemas::hash::Handle;
     use triblespace::core::value::schemas::r256::R256;
     use triblespace::core::value::Inline;
 

@@ -8,7 +8,6 @@ use triblespace::prelude::BranchStore;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Blake3;
 
 fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];

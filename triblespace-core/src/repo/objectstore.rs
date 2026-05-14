@@ -3,7 +3,6 @@ use std::convert::Infallible;
 use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use anybytes::Bytes;

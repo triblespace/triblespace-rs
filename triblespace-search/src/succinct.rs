@@ -40,11 +40,10 @@ use jerky::serialization::Serializable;
 use triblespace_core::blob::schemas::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
-use triblespace_core::blob::{Blob, BlobSchema, IntoBlob, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobSchema, TryFromBlob};
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::{Fragment, TribleSet};
 use triblespace_core::value::{RawInline, Inline, InlineSchema};
@@ -2340,7 +2339,7 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::BlobStore;
-        use triblespace_core::value::schemas::hash::Blake3;
+        
 
         // Small deterministic corpus of 4-D vectors. with_seed
         // locks the level sampling so the graph is reproducible.
@@ -2390,7 +2389,7 @@ mod tests {
     ) {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::value::schemas::hash::Blake3;
+        
         let mut store = MemoryBlobStore::new();
         let mut b = HNSWBuilder::new(4).with_seed(17);
         let mut handles = Vec::new();
@@ -2440,7 +2439,7 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
         use triblespace_core::repo::BlobStore;
-        use triblespace_core::value::schemas::hash::Blake3;
+        
         let idx = HNSWBuilder::new(3).build();
         let blob: Blob<SuccinctHNSWBlob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctHNSWIndex =
@@ -2519,7 +2518,7 @@ mod tests {
         use crate::hnsw::HNSWBuilder;
         use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::repo::BlobStore;
-        use triblespace_core::value::schemas::hash::Blake3;
+        
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore = MemoryBlobStore::new();

@@ -122,7 +122,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::schemas::UnknownBlob;
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use triblespace_core::value::schemas::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -154,7 +154,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::Blob;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::BlobMetadata;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use triblespace_core::value::schemas::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;

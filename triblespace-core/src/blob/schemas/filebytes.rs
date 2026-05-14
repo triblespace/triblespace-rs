@@ -1,7 +1,6 @@
 use crate::value::IntoSchema;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;

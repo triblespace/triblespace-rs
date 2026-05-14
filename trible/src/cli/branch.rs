@@ -37,7 +37,7 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use url::Url;
 
             let url = Url::parse(&url)?;
@@ -77,7 +77,7 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use url::Url;
 
             let url = Url::parse(&url)?;

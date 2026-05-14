@@ -118,7 +118,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xFACE_FEED);
@@ -252,7 +252,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xBADF00D);
@@ -427,7 +427,7 @@ fn flat_1k_vectors_threshold_finds_self() {
 
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0x1234_5678);

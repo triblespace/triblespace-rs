@@ -5,7 +5,6 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;
 use triblespace_core::import::json::JsonObjectImporter;
-use triblespace_core::prelude::valueschemas::Blake3;
 use triblespace_core::prelude::BlobStore;
 
 #[test]

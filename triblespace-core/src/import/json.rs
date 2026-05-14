@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::marker::PhantomData;
 use std::str::FromStr;
 
 use anybytes::{Bytes, View};
@@ -664,7 +663,7 @@ mod tests {
     use crate::blob::MemoryBlobStore;
     use crate::blob::IntoBlob;
     use crate::prelude::Attribute;
-    use crate::value::schemas::hash::Blake3;
+    
     use anybytes::View;
 
     #[test]

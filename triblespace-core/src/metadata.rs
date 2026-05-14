@@ -10,7 +10,6 @@ use crate::id::Id;
 use crate::id_hex;
 use crate::prelude::valueschemas;
 use crate::trible::Fragment;
-use crate::value::schemas::hash;
 use core::marker::PhantomData;
 use triblespace_core_macros::attributes;
 

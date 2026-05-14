@@ -26,7 +26,6 @@ use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
 
 use super::Blob;
-use super::IntoBlob;
 use super::TryFromBlob;
 
 /// A blob schema for an unknown blob.

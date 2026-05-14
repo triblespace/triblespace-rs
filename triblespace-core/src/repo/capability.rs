@@ -46,7 +46,6 @@ pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
 use crate::value::schemas::ed25519 as ed;
-use crate::value::schemas::hash::Blake3;
 use crate::blob::schemas::simplearchive::SimpleArchive;
 use crate::value::schemas::genid::GenId;
 use crate::value::schemas::hash::Handle;

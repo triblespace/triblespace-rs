@@ -7,7 +7,6 @@ use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::repo;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::value::schemas::hash::Blake3;
 use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 

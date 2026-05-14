@@ -15,7 +15,6 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::repo::Workspace;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Blake3;
 
 use syn::parse::Parse;
 use syn::parse::ParseStream;
@@ -37,7 +36,7 @@ mod instrumentation_attributes {
     /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
         use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::valueschemas::{Blake3, Handle, ShortString};
+        use triblespace_core::prelude::valueschemas::{Handle, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
@@ -50,7 +49,7 @@ mod instrumentation_attributes {
 
     pub(crate) mod invocation {
         use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::valueschemas::{Blake3, Handle, LineLocation, ShortString};
+        use triblespace_core::prelude::valueschemas::{Handle, LineLocation, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {

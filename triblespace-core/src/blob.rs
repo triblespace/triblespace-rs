@@ -13,7 +13,6 @@ mod memoryblobstore;
 /// Built-in blob schema types and their conversion implementations.
 pub mod schemas;
 
-use crate::value::IntoSchema;
 use crate::metadata::MetaDescribe;
 use crate::value::schemas::hash::Handle;
 use crate::value::Inline;

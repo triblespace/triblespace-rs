@@ -3,7 +3,6 @@ use anybytes::Bytes;
 
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
-use crate::blob::IntoBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;

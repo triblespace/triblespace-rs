@@ -1,7 +1,6 @@
 use proptest::prelude::*;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::import::json::JsonObjectImporter;
-use triblespace_core::value::schemas::hash::Blake3;
 
 proptest! {
     // ── JSON import round-trip ─────────────────────────────────────────

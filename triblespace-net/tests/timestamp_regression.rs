@@ -14,7 +14,7 @@ use triblespace_core::repo::branch::branch_unsigned;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 use triblespace_core::value::Inline;
 use triblespace_net::tracking;
 

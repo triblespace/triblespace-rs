@@ -374,7 +374,7 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             let pile: Pile = Pile::open(&pile)?;
             let key = load_signing_key(&signing_key)?;
             let mut repo = Repository::new(pile, key, TribleSet::new())?;
@@ -471,7 +471,7 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Delete { pile, branch } => {
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -503,7 +503,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::blobschemas::SimpleArchive;
             use triblespace::prelude::valueschemas::Handle;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -620,7 +620,7 @@ pub fn run(cmd: Command) -> Result<()> {
         } => {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use triblespace_core::value::schemas::hash::Handle;
             use triblespace_core::value::Inline;
 
@@ -864,7 +864,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
-            use triblespace_core::value::schemas::hash::Blake3;
+            
             use triblespace_core::value::schemas::hash::Handle;
             use triblespace_core::value::Inline;
 
@@ -1940,7 +1940,7 @@ fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> 
     use triblespace::prelude::blobschemas::SimpleArchive;
     use triblespace::prelude::valueschemas::Handle;
     use triblespace_core::repo;
-    use triblespace_core::value::schemas::hash::Blake3;
+    
     use triblespace_core::value::Inline;
 
     let head_attr = repo::head.id();

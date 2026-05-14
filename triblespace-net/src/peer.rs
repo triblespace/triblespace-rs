@@ -32,7 +32,7 @@ use triblespace_core::repo::{
 };
 use triblespace_core::value::Inline;
 use triblespace_core::value::InlineSchema;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 
 use crate::channel::NetEvent;
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};

@@ -170,7 +170,7 @@ mod tests {
     use crate::id::Id;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
-    use crate::value::schemas::hash::{Blake3, Handle};
+    use crate::value::schemas::hash::Handle;
     use crate::value::schemas::shortstring::ShortString;
     use crate::value::Inline;
 

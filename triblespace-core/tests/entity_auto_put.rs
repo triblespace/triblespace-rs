@@ -14,7 +14,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{BlobStore, BlobStoreGet};
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::schemas::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;

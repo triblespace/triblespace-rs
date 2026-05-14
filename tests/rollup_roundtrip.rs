@@ -17,7 +17,7 @@ use triblespace::core::id::{fucid, ExclusiveId};
 use triblespace::core::macros::{attributes, entity};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{Repository, RollupError};
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
+use triblespace::core::value::schemas::hash::Handle;
 use triblespace::core::value::Inline;
 use triblespace::prelude::valueschemas::GenId;
 use triblespace::prelude::TribleSet;
