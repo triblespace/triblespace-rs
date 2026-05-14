@@ -93,7 +93,8 @@ impl<T: ArrayElement> TryFromBlob<Array<T>> for Bytes {
 /// Access as `blobschemas::array::F32`, `blobschemas::array::U8`, etc.
 pub mod elements {
     use super::ArrayElement;
-    use crate::metadata::MetaDescribe;
+    use crate::macros::entity;
+    use crate::metadata::{self, MetaDescribe};
     use crate::trible::{Fragment, TribleSet};
     use crate::value::schemas::hash::Blake3;
 
@@ -103,11 +104,25 @@ pub mod elements {
             pub struct $marker;
 
             impl MetaDescribe for $marker {
-                fn describe<B>(_blobs: &mut B) -> Result<Fragment, B::PutError>
+                fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
                 where
                     B: crate::repo::BlobStore<Blake3>,
                 {
-                    Ok(Fragment::rooted(crate::id_hex!($id), TribleSet::new()))
+                    // Fixed-id schema: root is the hex id, no derived
+                    // facts contribute to identity. `try_annotated`
+                    // layers the rust marker name + doc-comment
+                    // description under the root so a consumer
+                    // querying `Array<F32>`'s metadata can resolve
+                    // the element schema id to a human-readable name.
+                    Fragment::rooted(crate::id_hex!($id), TribleSet::new())
+                        .try_annotated(|id_ref| {
+                            let name = blobs.put(stringify!($marker))?;
+                            let description = blobs.put($doc)?;
+                            Ok(entity! { id_ref @
+                                metadata::name:        name,
+                                metadata::description: description,
+                            })
+                        })
                 }
             }
 
