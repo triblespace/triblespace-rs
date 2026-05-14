@@ -243,14 +243,34 @@ mod wasm_formatter {
     }
 }
 
-/// This is a value schema for a handle.
-/// A handle to a blob is comprised of a hash of a blob and type level information about the blobs schema.
+/// The **lightweight reference form** of a content-addressed blob.
 ///
-/// The handle can be stored in a Trible, while the blob can be stored in a BlobSet, allowing for a
-/// separation of the blob data from the means of identifying and accessing it.
+/// A `Handle<T>` is a 32-byte Blake3 hash plus a phantom marker for
+/// the referenced blob's schema. It's the small, trible-storable,
+/// network-sendable counterpart to a [`Blob<T>`][b] — the same
+/// content/reference duality as `&[u8]`/`Vec<u8>`, except the
+/// reference is hash-based rather than pointer-based and survives
+/// crossing process and storage boundaries.
 ///
-/// The handle is generated when a blob is inserted into a BlobSet, and the handle
-/// can be used to retrieve the blob from the BlobSet later.
+/// You store handles in tribles. You store blobs in
+/// [`MemoryBlobStore`][m] / [`Pile`][p] / any other [`BlobStore`][bs]
+/// backend. Pairing them — `(handle in trible) ↔ (blob in store)` —
+/// is the canonical pattern for keeping the entity graph compact
+/// while leaving heavy payloads (text, binary data, archived
+/// subgraphs) addressable by content rather than by location.
+///
+/// Handles are produced *by* blobs: [`Blob::new`][bn] hashes the
+/// bytes and stores the handle in the blob; [`Blob::get_handle`][bg]
+/// returns it. A `&Blob<T>` also `AsRef`s to its handle, so passing
+/// "the lightweight reference" through APIs that accept
+/// `&Value<Handle<T>>` is allocation-free.
+///
+/// [b]: crate::blob::Blob
+/// [bn]: crate::blob::Blob::new
+/// [bg]: crate::blob::Blob::get_handle
+/// [m]: crate::blob::MemoryBlobStore
+/// [p]: crate::repo::pile::Pile
+/// [bs]: crate::repo::BlobStore
 #[repr(transparent)]
 pub struct Handle<T: BlobSchema> {
     digest: Hash<Blake3>,

@@ -33,25 +33,40 @@ pub use memoryblobstore::MemoryBlobStore;
 /// Re-export of `anybytes::Bytes` for blob payloads.
 pub use anybytes::Bytes;
 
-/// A blob is an immutable sequence of bytes plus its eagerly-cached
-/// Blake3 content-addressed handle.
+/// A content-addressed value: immutable bytes paired with their
+/// Blake3 handle and a schema marker.
 ///
-/// The handle is computed once at construction (`Blob::new` / `Blob::transmute`)
-/// and cached in the struct, so subsequent calls to `get_handle()` and
-/// `MemoryBlobStore::insert(blob)` are O(1) — no recompute. Schemas
-/// are still distinguished at the type level via the phantom marker,
-/// and `transmute` carries the cached handle across schema casts (the
-/// hash is over bytes, not over schema, so the handle bytes don't
-/// change).
+/// `Blob<S>` is the **heavy form** of a content-addressed payload —
+/// it carries the bytes plus the cached
+/// [`Value<Handle<S>>`][Handle] that names them. The handle is the
+/// **lightweight form**: a 32-byte reference you can store in
+/// tribles, send across the network, or hand around freely without
+/// dragging the bytes along. `Blob` ↔ `Handle<S>` is the same
+/// "content / reference" duality as `Vec<T>` ↔ `&[T]`, except the
+/// reference is hash-based rather than pointer-based and survives
+/// crossing process boundaries.
 ///
-/// The layout was previously `#[repr(transparent)]` around `Bytes` for
-/// the same-size guarantee. We've deliberately given that up: the
-/// double-hash that came with computing the handle at every insert
-/// site was a real cost the cache eliminates, and the only call that
-/// relied on transparency (`as_transmute`'s `mem::transmute`) still
-/// works because `Blob<S>` and `Blob<T>` have identical layouts for
-/// any `S`/`T: BlobSchema` (the phantoms are zero-sized and the
-/// handle is `[u8; 32] + PhantomData`).
+/// The link is enforced by construction:
+/// - [`Blob::new`] hashes the bytes and stores the resulting handle.
+///   Subsequent `get_handle` / `as_ref` calls are O(1).
+/// - [`Blob::with_handle`] is the explicit "trust me" constructor for
+///   read paths where the handle is already known (a blob-store
+///   reader pulling a known-keyed entry, a pile-format decoder where
+///   the index has the hash). Caller asserts `handle == Blake3(bytes)`.
+/// - [`Blob::transmute`] / [`Blob::as_transmute`] preserve the cached
+///   handle across schema casts — the Blake3 hash is over bytes, not
+///   over schema, so the digest survives the phantom change.
+///
+/// `Blob<S>: AsRef<Value<Handle<S>>>` so `&blob` deref-coerces to the
+/// lightweight reference for free.
+///
+/// The previous shape (`#[repr(transparent)]` around `Bytes`) was
+/// given up deliberately: caching the handle in the struct
+/// eliminates a real double-hash that surfaced at every `insert` site,
+/// and the only call that relied on transparency (`as_transmute`'s
+/// `mem::transmute`) still works because `Blob<S>` and `Blob<T>`
+/// have identical layouts for any `S`/`T: BlobSchema` (phantoms
+/// are zero-sized, handle is `[u8; 32] + PhantomData`).
 pub struct Blob<S: BlobSchema> {
     /// The raw byte content of this blob.
     pub bytes: Bytes,
@@ -141,6 +156,11 @@ where
     }
 
     /// Returns the cached Blake3 handle. O(1) — no rehash.
+    ///
+    /// The handle is the *lightweight reference* form of this blob —
+    /// 32 bytes you can store in a trible, share over the network, or
+    /// pass around freely. The blob is the *heavy* form (bytes you
+    /// can decode). Both share the same Blake3 identity.
     pub fn get_handle(&self) -> Value<Handle<S>> {
         self.handle
     }
@@ -166,6 +186,25 @@ where
             handle: self.handle,
             _schema: PhantomData,
         }
+    }
+}
+
+/// `Blob<S>` borrows as the `Value<Handle<S>>` that references it.
+///
+/// Models the heavy/lightweight duality at the type system level:
+/// a `Blob<S>` IS a content-addressed value, and its `Handle<S>` is
+/// the 32-byte reference form. Coercing a `&Blob<S>` to a
+/// `&Value<Handle<S>>` is free — the handle is stored as a field —
+/// so code that wants to pass the lightweight reference around
+/// (e.g. inserting into a trible, sending over the network) can
+/// just `blob.as_ref()` instead of `&blob.get_handle()`.
+impl<S> AsRef<Value<Handle<S>>> for Blob<S>
+where
+    S: BlobSchema,
+    Handle<S>: ValueSchema,
+{
+    fn as_ref(&self) -> &Value<Handle<S>> {
+        &self.handle
     }
 }
 
@@ -297,6 +336,15 @@ mod tests {
             bogus,
         );
         assert_eq!(b.get_handle(), bogus);
+    }
+
+    #[test]
+    fn as_ref_borrows_the_lightweight_handle() {
+        let b: Blob<UnknownBlob> = Blob::new(Bytes::from(b"borrow me".to_vec()));
+        let h_owned: Value<Handle<UnknownBlob>> = b.get_handle();
+        let h_borrowed: &Value<Handle<UnknownBlob>> = b.as_ref();
+        // Same value, no allocation, no rehash.
+        assert_eq!(h_owned, *h_borrowed);
     }
 
     #[test]
