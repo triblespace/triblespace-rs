@@ -14,7 +14,7 @@ fn refresh_during_restore_truncation_is_safe() {
     std::fs::File::create(&path).unwrap();
     let mut pile: Pile = Pile::open(&path).unwrap();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"data".to_vec()));
-    let handle = pile.put(blob).unwrap();
+    let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
     pile.flush().unwrap();
     pile.close().unwrap();
 

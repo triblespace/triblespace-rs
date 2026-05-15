@@ -117,7 +117,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// use triblespace_search::bm25::BM25Builder;
 /// use triblespace_search::tokens::hash_tokens;
 ///
-/// let mut b = BM25Builder::new();
+/// let mut b: BM25Builder = BM25Builder::new();
 /// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("graph search algorithms"));
 /// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("cooking for pangrams"));
 /// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("graph search primer"));
@@ -135,7 +135,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// let mut ranked: Vec<(Id, f32)> = matched
 ///     .into_iter()
 ///     .map(|id| {
-///         use triblespace_core::value::IntoInline;
+///         use triblespace_core::value::{IntoInline, InlineSchema};
 ///         let v: triblespace_core::value::Inline<
 ///             triblespace_core::value::schemas::genid::GenId,
 ///         > = (&id).to_inline();
@@ -723,7 +723,7 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::IntoInline;
+    use triblespace_core::value::{IntoInline, InlineSchema};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -736,11 +736,11 @@ mod tests {
 
     /// `Id` → `GenId`-schema RawInline test helper.
     fn id_to_raw_value(id: Id) -> RawInline {
-        id.to_inline().raw
+        GenId::inline_from(id).raw
     }
 
     fn sample_index() -> BM25Index {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("the quick brown fox"));
         b.insert(id(2), hash_tokens("the lazy brown dog"));
         b.insert(id(3), hash_tokens("quick silver fox jumps"));
@@ -913,7 +913,7 @@ mod tests {
     fn matches_score_floor_drops_low_scoring_docs() {
         // Build a corpus where two docs match different numbers
         // of terms, so the summed scores diverge sharply.
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("fox quick brown jumps"));
         b.insert(id(2), hash_tokens("only fox here, nothing else"));
         b.insert(id(3), hash_tokens("unrelated"));
@@ -958,7 +958,7 @@ mod tests {
             let doc_value: Inline<GenId> = id(byte).to_inline();
             let helper_score = idx.score(&doc_value, &terms);
 
-            let target = id(byte).to_inline().raw;
+            let target = GenId::inline_from(id(byte)).raw;
             let mut expected = 0.0_f32;
             for t in &terms {
                 for (d, s) in idx.query_term(t) {

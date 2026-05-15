@@ -21,7 +21,7 @@ fn metadata_detects_corrupted_blob() {
     let mut pile: Pile = Pile::open(&path).unwrap();
     let data = b"hello metadata".to_vec();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-    let handle = pile.put(blob).unwrap();
+    let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
     pile.flush().unwrap();
     assert!(pile.reader().unwrap().metadata(handle).unwrap().is_some());
     pile.close().unwrap();

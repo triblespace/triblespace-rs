@@ -101,7 +101,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
     }
 
     let fresh_builder = || {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         for (id_u64, doc) in &docs {
             let id = match keys {
                 KeyDist::Scattered => id_from_u64(*id_u64),

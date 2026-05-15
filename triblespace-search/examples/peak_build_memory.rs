@@ -152,7 +152,7 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
     // the `Vec<(Inline<D>, Vec<Inline<T>>)>` insert-arg buffers as
     // they fall out of scope inside `insert`.
     let fresh_builder = || {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         for (id_u64, doc) in &docs {
             b.insert(id_from_u64(*id_u64), hash_tokens(doc));
         }
@@ -177,10 +177,12 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
     // the index *is* its blob, so this is just a refcounted
     // `Bytes::clone`. Peak should be ~zero (the only allocation
     // is the small `Blob` wrapper itself).
-    use triblespace_core::blob::IntoBlob;
-    let blob = measure("SuccinctBM25Index::to_blob (refcounted clone)", || {
-        (&succinct).to_blob()
-    });
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_search::succinct::SuccinctBM25Blob;
+    let blob: Blob<SuccinctBM25Blob> = measure(
+        "SuccinctBM25Index::to_blob (refcounted clone)",
+        || (&succinct).to_blob(),
+    );
 
     println!(
         "  naive byte_size = {}, SB25 blob = {}",

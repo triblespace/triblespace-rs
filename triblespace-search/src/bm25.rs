@@ -26,7 +26,7 @@
 //!     (Id::new([2; 16]).unwrap(), "the lazy brown dog"),
 //!     (Id::new([3; 16]).unwrap(), "quick silver fox"),
 //! ];
-//! let mut b = BM25Builder::new();
+//! let mut b: BM25Builder = BM25Builder::new();
 //! for (id, text) in &docs {
 //!     b.insert(&*id, hash_tokens(text));
 //! }
@@ -563,7 +563,8 @@ mod tests {
     /// stores internally, so `query_term` results can be
     /// compared against it.
     fn id_key(byte: u8) -> RawInline {
-        id(byte).to_inline().raw
+        let v: Inline<GenId> = id(byte).to_inline();
+        v.raw
     }
 
     #[test]
@@ -607,7 +608,7 @@ mod tests {
 
     #[test]
     fn three_docs_basic() {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("the quick brown fox"));
         b.insert(id(2), hash_tokens("the lazy brown dog"));
         b.insert(id(3), hash_tokens("quick silver fox"));
@@ -633,7 +634,7 @@ mod tests {
 
     #[test]
     fn idf_prefers_rare_terms() {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         // "rare" appears once, "common" appears in every doc.
         for i in 1..=10 {
             b.insert(id(i), hash_tokens("common common"));
@@ -660,7 +661,7 @@ mod tests {
         // Two docs, one contains "foo" once, one 100 times. With
         // k1 = 1.5 the second's score should be higher but not
         // 100x higher — saturation.
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("foo bar baz"));
         let many: String = "foo ".repeat(100);
         b.insert(id(2), hash_tokens(&many));
@@ -682,7 +683,7 @@ mod tests {
 
     #[test]
     fn multi_term_query_sums() {
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("quick brown fox"));
         b.insert(id(2), hash_tokens("quick red fox"));
         b.insert(id(3), hash_tokens("slow brown dog"));
@@ -710,7 +711,7 @@ mod tests {
     }
 
     fn build_sample_index() -> BM25Index {
-        let mut b = BM25Builder::new().k1(1.4).b(0.72);
+        let mut b: BM25Builder = BM25Builder::new().k1(1.4).b(0.72);
         b.insert(id(1), hash_tokens("the quick brown fox"));
         b.insert(id(2), hash_tokens("the lazy brown dog"));
         b.insert(id(3), hash_tokens("quick silver fox jumps"));
@@ -751,7 +752,7 @@ mod tests {
         // do. Threaded and single-threaded paths must produce
         // bit-identical indexes.
         fn build(threads: usize) -> BM25Index {
-            let mut b = BM25Builder::new();
+            let mut b: BM25Builder = BM25Builder::new();
             for i in 1..=50u32 {
                 let text = format!(
                     "doc {i} text about {} {}",
@@ -785,7 +786,7 @@ mod tests {
     fn parallel_build_threads_cap_at_doc_count() {
         // 3 docs × 16 threads — the builder caps threads at n_docs
         // and doesn't spawn idle workers.
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(id(1), hash_tokens("one two three"));
         b.insert(id(2), hash_tokens("two three four"));
         b.insert(id(3), hash_tokens("three four five"));

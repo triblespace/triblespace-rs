@@ -1166,7 +1166,7 @@ mod tests {
             rng.fill_bytes(&mut record);
 
             let data: Blob<UnknownBlob> = Blob::new(Bytes::from_source(record));
-            pile.put(data).unwrap();
+            pile.put::<UnknownBlob, _>(data).unwrap();
         });
 
         pile.close().unwrap();
@@ -1184,7 +1184,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1207,7 +1207,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1235,7 +1235,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1262,7 +1262,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1292,7 +1292,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1325,7 +1325,7 @@ mod tests {
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 20]));
-            pile.put(blob).unwrap();
+            pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         }
 
@@ -1356,7 +1356,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![42u8; 100];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
 
         {
             let reader = pile.reader().unwrap();
@@ -1384,7 +1384,7 @@ mod tests {
         let mut expected = HashMap::new();
         for data in blobs {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-            let handle = pile.put(blob).unwrap();
+            let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
             expected.insert(handle, data);
         }
         pile.flush().unwrap();
@@ -1412,7 +1412,7 @@ mod tests {
         let mut baseline_handles: HashSet<Inline<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![1u8; 3], vec![2u8; 4], vec![3u8; 5]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
-            let handle = pile.put(blob).unwrap();
+            let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
             baseline_handles.insert(handle);
         }
         let baseline = pile.reader().unwrap();
@@ -1421,7 +1421,7 @@ mod tests {
         let mut new_handles: HashSet<Inline<Handle<UnknownBlob>>> = HashSet::new();
         for data in [vec![4u8; 6], vec![5u8; 7]] {
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
-            let handle = pile.put(blob).unwrap();
+            let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
             new_handles.insert(handle);
         }
 
@@ -1460,7 +1460,7 @@ mod tests {
             .as_millis() as u64;
         let data = vec![9u8; 10];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
         let reader = pile.reader().unwrap();
@@ -1483,7 +1483,7 @@ mod tests {
         let reader = pile.reader().unwrap();
 
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
 
         assert!(reader.metadata(handle).unwrap().is_none());
 
@@ -1506,7 +1506,7 @@ mod tests {
 
         let data = vec![3u8; 8];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
         let stored: Blob<UnknownBlob> = pile.reader().unwrap().get(handle).unwrap();
@@ -1521,14 +1521,14 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let handle1 = pile.put(blob1).unwrap();
+        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
         pile.update(branch_id, None, Some(handle1.transmute()))
             .unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        pile.put(blob2).unwrap();
+        pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.close().unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1548,7 +1548,7 @@ mod tests {
         let handle = {
             let mut pile: Pile = Pile::open(&path).unwrap();
             let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![3u8; 5]));
-            let handle = pile.put(blob).unwrap();
+            let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.update(branch_id, None, Some(handle.transmute()))
                 .unwrap();
             pile.flush().unwrap();
@@ -1570,7 +1570,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let h = pile.put(blob).unwrap();
+        let h = pile.put::<UnknownBlob, _>(blob).unwrap();
         let branch_id = Id::new([7u8; 16]).unwrap();
         pile.update(branch_id, None, Some(h.transmute())).unwrap();
         pile.flush().unwrap();
@@ -1593,14 +1593,14 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let handle1 = pile.put(blob1).unwrap();
+        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
 
         let branch_id = Id::new([2u8; 16]).unwrap();
         pile.update(branch_id, None, Some(handle1.transmute()))
             .unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let handle2 = pile.put(blob2).unwrap();
+        let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
         match pile
@@ -1627,7 +1627,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let handle1 = pile.put(blob1).unwrap();
+        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
 
         let branch_id = Id::new([1u8; 16]).unwrap();
         pile.update(branch_id, None, Some(handle1.transmute()))
@@ -1635,7 +1635,7 @@ mod tests {
         pile.flush().unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let handle2 = pile.put(blob2).unwrap();
+        let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
 
         let result = pile
             .update(
@@ -1659,7 +1659,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![7u8; 32]));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.close().unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1678,9 +1678,9 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
-        let h1 = pile.put(blob1).unwrap();
+        let h1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 4]));
-        let h2 = pile.put(blob2).unwrap();
+        let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
         let reader = pile.reader().unwrap();
@@ -1701,13 +1701,13 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
-        let h1 = pile.put(blob1).unwrap();
+        let h1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
         let branch_id = Id::new([1u8; 16]).unwrap();
         pile.update(branch_id, None, Some(h1.transmute())).unwrap();
         pile.flush().unwrap();
 
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 5]));
-        let h2 = pile.put(blob2).unwrap();
+        let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
         match pile.update(branch_id, Some(h2.transmute()), Some(h1.transmute())) {
@@ -1727,7 +1727,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
-        pile.put(blob).unwrap();
+        pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
         use std::io::Write;
@@ -1752,7 +1752,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![1u8; 4];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
         use std::io::Write;
@@ -1810,7 +1810,7 @@ mod tests {
 
         // Append a valid copy using the second pile which hasn't seen the first one.
         let blob_dup: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        pile2.put(blob_dup).unwrap();
+        pile2.put::<UnknownBlob, _>(blob_dup).unwrap();
         pile2.flush().unwrap();
 
         // Refresh the first pile; it should replace the corrupted blob with the new one.
@@ -1830,7 +1830,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![9u8; 32];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle1 = pile.put(blob).unwrap();
+        let handle1 = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
         let len_after_first = std::fs::metadata(&path).unwrap().len();
 
@@ -1852,8 +1852,8 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 8]));
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![2u8; 8]));
-        let h1 = pile.put(blob1).unwrap();
-        let h2 = pile.put(blob2).unwrap();
+        let h1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
+        let h2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
         let branch_id = Id::new([3u8; 16]).unwrap();
@@ -1877,8 +1877,8 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"hello".as_slice()));
         let blob2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"world".as_slice()));
-        let handle1 = pile.put(blob1).unwrap();
-        let handle2 = pile.put(blob2).unwrap();
+        let handle1 = pile.put::<UnknownBlob, _>(blob1).unwrap();
+        let handle2 = pile.put::<UnknownBlob, _>(blob2).unwrap();
         pile.flush().unwrap();
 
         let mut reader = pile.reader().unwrap();
@@ -1906,7 +1906,7 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![7u8; 16];
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
 
         let reader = pile.reader().unwrap();
@@ -1938,7 +1938,7 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
 
         {
             let reader = pile.reader().unwrap();

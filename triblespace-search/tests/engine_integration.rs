@@ -20,7 +20,8 @@ fn id(byte: u8) -> Id {
 }
 
 fn id_as_raw_value(id: Id) -> RawInline {
-    id.to_inline().raw
+    let v: Inline<GenId> = id.to_inline();
+    v.raw
 }
 
 fn raw_value_to_id(raw: &RawInline) -> Option<Id> {
@@ -34,7 +35,7 @@ fn raw_value_to_id(raw: &RawInline) -> Option<Id> {
 /// as the proposer and the other as the confirmer.
 #[test]
 fn intersection_of_two_bm25_constraints_yields_overlap() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("the quick brown fox"));
     b.insert(id(2), hash_tokens("the lazy brown dog"));
     b.insert(id(3), hash_tokens("quick silver fox jumps"));
@@ -76,7 +77,7 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
 /// no docs at all.
 #[test]
 fn intersection_with_absent_term_proposes_nothing() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("the quick brown fox"));
     b.insert(id(2), hash_tokens("the lazy brown dog"));
     let idx: SuccinctBM25Index = b.build();
@@ -107,7 +108,7 @@ fn intersection_with_absent_term_proposes_nothing() {
 /// the bound id is in BOTH posting lists.
 #[test]
 fn satisfied_respects_both_clauses() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("quick fox"));
     b.insert(id(2), hash_tokens("quick dog"));
     let idx: SuccinctBM25Index = b.build();

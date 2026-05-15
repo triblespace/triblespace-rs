@@ -8,7 +8,7 @@ use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::TryFromInline;
 use triblespace::core::value::Inline;
 use triblespace::core::value::InlineSchema;
-use triblespace::core::value::IntoEncoded;
+use triblespace::core::value::Encodes;
 use triblespace::core::value::INLINE_LEN;
 
 // ANCHOR: custom_schema

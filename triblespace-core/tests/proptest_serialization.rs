@@ -1,6 +1,7 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
-use triblespace_core::blob::IntoBlob;
+use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
@@ -107,8 +108,8 @@ proptest! {
 
     #[test]
     fn simple_archive_deterministic(set in arb_tribleset(15)) {
-        let blob1 = set.clone().to_blob();
-        let blob2 = set.to_blob();
+        let blob1: Blob<SimpleArchive> = set.clone().to_blob();
+        let blob2: Blob<SimpleArchive> = set.to_blob();
         prop_assert_eq!(blob1.bytes.as_ref(), blob2.bytes.as_ref(),
             "same set should produce identical archive bytes");
     }

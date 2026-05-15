@@ -77,11 +77,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
-    // The entity! macro returns a rooted fragment; merge its facts into
-    // a TribleSet via `+=`.
+    // The entity! macro returns a Fragment carrying both facts and any
+    // blob payloads it auto-put while building. Accumulate into another
+    // Fragment with `+=` so blobs flow through into the commit; commit
+    // accepts anything `Into<Fragment>`.
     let herbert = ufoid();
     let dune = ufoid();
-    let mut library = TribleSet::new();
+    let mut library = Fragment::empty();
 
     library += entity! { &herbert @
         literature::firstname: "Frank",
@@ -91,9 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     library += entity! { &dune @
         literature::title: "Dune",
         literature::author: &herbert,
-        literature::quote: ws.put(
-            "I must not fear. Fear is the mind-killer."
-        ),
+        literature::quote: "I must not fear. Fear is the mind-killer.",
     };
 
     ws.commit(library, "import dune");

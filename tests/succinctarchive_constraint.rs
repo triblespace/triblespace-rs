@@ -39,17 +39,17 @@ fn propose_and_confirm() {
     let constraint = archive.pattern(e_var, a_var, v_var);
 
     let mut binding = Binding::default();
-    binding.set(e_var.index, &e1.to_inline().raw);
+    binding.set(e_var.index, &GenId::inline_from(e1).raw);
 
     let mut proposals = Vec::new();
     constraint.propose(a_var.index, &binding, &mut proposals);
     let attrs: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         attrs,
-        [a1.to_inline().raw, a2.to_inline().raw].into_iter().collect()
+        [GenId::inline_from(a1).raw, GenId::inline_from(a2).raw].into_iter().collect()
     );
 
-    proposals.push(e1.to_inline().raw);
+    proposals.push(GenId::inline_from(e1).raw);
     constraint.confirm(a_var.index, &binding, &mut proposals);
     assert_eq!(proposals.len(), 2);
 }
@@ -84,14 +84,14 @@ fn propose_and_confirm_bound_attribute() {
     let constraint = archive.pattern(e_var, a_var, v_var);
 
     let mut binding = Binding::default();
-    binding.set(a_var.index, &a1.to_inline().raw);
+    binding.set(a_var.index, &GenId::inline_from(a1).raw);
 
     let mut proposals = Vec::new();
     constraint.propose(e_var.index, &binding, &mut proposals);
     let entities: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         entities,
-        [e1.to_inline().raw, e2.to_inline().raw].into_iter().collect()
+        [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw].into_iter().collect()
     );
 
     constraint.confirm(e_var.index, &binding, &mut proposals);
@@ -133,7 +133,7 @@ fn propose_and_confirm_bound_value() {
     let mut proposals = Vec::new();
     constraint.propose(e_var.index, &binding, &mut proposals);
     let ents: HashSet<_> = proposals.iter().cloned().collect();
-    assert_eq!(ents, [e1.to_inline().raw].into_iter().collect());
+    assert_eq!(ents, [GenId::inline_from(e1).raw].into_iter().collect());
 
     constraint.confirm(e_var.index, &binding, &mut proposals);
     assert_eq!(proposals.len(), 1);
@@ -170,8 +170,8 @@ fn propose_and_confirm_two_bound() {
 
     // entity and attribute bound -> expect corresponding values
     let mut binding = Binding::default();
-    binding.set(e_var.index, &e1.to_inline().raw);
-    binding.set(a_var.index, &a1.to_inline().raw);
+    binding.set(e_var.index, &GenId::inline_from(e1).raw);
+    binding.set(a_var.index, &GenId::inline_from(a1).raw);
 
     let mut proposals = Vec::new();
     constraint.propose(v_var.index, &binding, &mut proposals);
@@ -183,24 +183,24 @@ fn propose_and_confirm_two_bound() {
 
     // entity and value bound -> expect attributes
     let mut binding = Binding::default();
-    binding.set(e_var.index, &e1.to_inline().raw);
+    binding.set(e_var.index, &GenId::inline_from(e1).raw);
     binding.set(v_var.index, &v3.raw);
 
     let mut proposals = Vec::new();
     constraint.propose(a_var.index, &binding, &mut proposals);
-    assert_eq!(proposals, vec![a2.to_inline().raw]);
+    assert_eq!(proposals, vec![GenId::inline_from(a2).raw]);
 
     constraint.confirm(a_var.index, &binding, &mut proposals);
     assert_eq!(proposals.len(), 1);
 
     // attribute and value bound -> expect entities
     let mut binding = Binding::default();
-    binding.set(a_var.index, &a2.to_inline().raw);
+    binding.set(a_var.index, &GenId::inline_from(a2).raw);
     binding.set(v_var.index, &v6.raw);
 
     let mut proposals = Vec::new();
     constraint.propose(e_var.index, &binding, &mut proposals);
-    assert_eq!(proposals, vec![e2.to_inline().raw]);
+    assert_eq!(proposals, vec![GenId::inline_from(e2).raw]);
 
     constraint.confirm(e_var.index, &binding, &mut proposals);
     assert_eq!(proposals.len(), 1);

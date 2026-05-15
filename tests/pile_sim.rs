@@ -105,7 +105,7 @@ proptest! {
                     Op::Put(data) => {
                         let blob: Blob<UnknownBlob> =
                             Blob::new(Bytes::from_source(data.clone()));
-                        let handle = piles[actor].put(blob).unwrap();
+                        let handle = piles[actor].put::<UnknownBlob, _>(blob).unwrap();
                         expected.insert(handle, data);
                         handles.push(handle);
                     }

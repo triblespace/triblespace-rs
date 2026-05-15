@@ -28,17 +28,26 @@ encoding concerns and makes it easy to reason about memory usage.
 
 ### Conversion traits
 
-Schemas define how to convert between raw bytes and concrete Rust types. The
-conversion traits `IntoInline`/`TryFromInline`/`TryToInline` live on
-the schema types rather than on `Inline` itself, avoiding orphan‑rule issues when
-supporting external data types. The `Inline` wrapper treats its bytes as opaque;
-schemas may validate them or reject invalid patterns during conversion.
+Conversion goes through the `Encodes<Source>` trait, which lives **on the
+schema** (the schema is the impl target; the source is the trait parameter).
+This is the same direction as std's `From<T>` — and for the same reason: it
+trivially satisfies Rust's orphan rule, so you can write
+`impl Encodes<SomeForeignType> for MyLocalSchema` without any "trait
+position 0" gymnastics.
 
-Fallible conversions (`TryFromInline` / `TryToInline`) are particularly useful for
-schemas that must validate invariants, such as checking that a timestamp falls
-within a permitted range or ensuring reserved bits are zeroed. Returning a
-domain‑specific error type keeps validation logic close to the serialization
-code.
+The ergonomic source-side methods `.to_inline()` / `.to_blob()` /
+`.into_encoded()` are auto-derived blanket implementations — users never
+implement them directly, the same way you never implement `Into<T>` in Rust:
+
+```text
+User implements:     Auto-derived via blanket:
+  Encodes<T> for S     IntoEncoded<S> for T  (+ IntoInline / IntoBlob aliases)
+```
+
+For fallible conversions where the error type is part of the contract (parsing
+a hex string into a hash, validating a timestamp range, rejecting reserved
+bits), use `TryToInline` / `TryFromInline` — kept as separate traits because the
+error type is per‑source.
 
 ```rust
 use triblespace::core::value::schemas::shortstring::ShortString;

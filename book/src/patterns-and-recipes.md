@@ -90,7 +90,7 @@ names via `metadata::name`:
 ```rust,ignore
 // Mint a tag once
 let kind_paper = id_hex!("A1B2C3...");  // or use trible genid for random IDs
-change += entity! { &kind_paper @ metadata::name: ws.put("paper".to_owned()) };
+change += entity! { &kind_paper @ metadata::name: "paper" };
 
 // Tag an entity
 change += entity! { &my_paper @ metadata::tag: &kind_paper };
@@ -109,13 +109,19 @@ systems.
 Values larger than 32 bytes live in blobs. The workspace manages their lifecycle:
 
 ```rust,ignore
-// Write a blob (returns a Handle you can store in an entity)
+// Inline a blob payload — entity!{} auto-puts the bytes into the
+// workspace's blob store and stores the resulting handle in the trible.
+change += entity! { &doc @ article::body: "A very long string..." };
+
+// Read a blob back via the handle stored in the trible:
+let body: View<str> = ws.get(some_body_handle)?;
+println!("{}", body.as_ref());
+
+// If you do want the handle in hand before the entity!{} call —
+// to reuse it across multiple entities, log it, ship it across
+// the wire — `ws.put` still does that:
 let text_handle = ws.put("A very long string...".to_owned());
 change += entity! { &doc @ article::body: text_handle };
-
-// Read a blob back
-let view: View<str> = ws.get(text_handle)?;
-println!("{}", view.as_ref());
 ```
 
 **When to use blobs vs values:**
@@ -141,8 +147,7 @@ change += entity! { &id @
 
 // Optional attributes — only if present
 if let Some(cwd) = default_cwd {
-    let handle = ws.put(cwd.to_owned());
-    change += entity! { &id @ request::cwd: handle };
+    change += entity! { &id @ request::cwd: cwd };
 }
 ```
 

@@ -32,7 +32,7 @@ fn iid(byte: u8) -> Id {
 #[test]
 fn succinct_bm25_survives_blob_store_roundtrip() {
     // Build a small index.
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(iid(1), hash_tokens("the quick brown fox"));
     b.insert(iid(2), hash_tokens("the lazy brown dog"));
     b.insert(iid(3), hash_tokens("quick silver fox jumps"));

@@ -21,10 +21,11 @@ A schema describes which bit patterns are meaningful for a particular value. The
 [`Inline`](../../src/value.rs) type is parameterised by such a schema and remains
 agnostic about whether the underlying bytes currently satisfy the contract.
 Validation lives in the schema through the [`InlineSchema`](../../src/value.rs)
-trait, while conversions to concrete Rust types use [`ToValue`],
-[`TryToInline`], and [`TryFromInline`]. Because conversion traits are implemented
-for the schema instead of the `Inline` type itself, we avoid Rust's orphan rule
-and allow downstream crates to add their own adapters.
+trait. Conversions go through [`Encodes`] (schema-side, the `From`-direction),
+[`TryToInline`], and [`TryFromInline`]. Because `Encodes` is implemented *on* the
+schema (the schema is the impl target; the source is the trait parameter), Rust's
+orphan rule trivially allows downstream crates to define their own adapters
+without needing the local schema to sit at any particular trait-parameter slot.
 
 Schemas carry two optional identifiers:
 
@@ -54,6 +55,6 @@ With those pieces in place, values can round-trip between storage and strongly
 typed Rust code while remaining portable and future-proof.
 
 [`InlineSchema`]: ../../src/value.rs
-[`ToValue`]: ../../src/value.rs
+[`Encodes`]: ../../src/value.rs
 [`TryToInline`]: ../../src/value.rs
 [`TryFromInline`]: ../../src/value.rs

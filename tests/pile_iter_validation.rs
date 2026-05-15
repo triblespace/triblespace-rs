@@ -23,7 +23,7 @@ fn iterator_errors_on_corrupt_blob() {
         std::fs::File::create(&path).unwrap();
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"hello world".as_slice()));
-        pile.put(blob).unwrap();
+        pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
         pile.close().unwrap();
     }

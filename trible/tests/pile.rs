@@ -397,12 +397,14 @@ fn inspect_outputs_tribles() {
     let pile_path = dir.path().join("inspect.pile");
     std::fs::File::create(&pile_path).unwrap();
 
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::blob::{Blob, IntoBlob};
     let dataset = examples::dataset();
-    let blob = dataset.to_blob();
+    let blob: Blob<SimpleArchive> = dataset.to_blob();
 
     let handle_str = {
         let mut pile: Pile = Pile::open(&pile_path).unwrap();
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<SimpleArchive, _>(blob).unwrap();
         pile.close().unwrap();
 
         let hash = Handle::to_hash(handle);

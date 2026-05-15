@@ -59,7 +59,7 @@ fn bm25_1k_docs_roundtrip_consistency() {
     const DOC_LEN: usize = 20;
 
     let mut rng = SplitMix64(0xC0FFEE);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..N_DOCS {
         let doc = fake_document(&mut rng, VOCAB, DOC_LEN);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
@@ -84,7 +84,7 @@ fn bm25_1k_docs_roundtrip_consistency() {
 #[test]
 fn bm25_1k_docs_multi_term_ranks_sanely() {
     let mut rng = SplitMix64(0xDEADBEEF);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 200, 30);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
@@ -177,7 +177,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
 #[test]
 fn succinct_bm25_1k_docs_matches_naive() {
     let mut rng = SplitMix64(0xC0FFEE);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 500, 20);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
@@ -297,7 +297,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
 #[test]
 fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let mut rng = SplitMix64(0xA11CE);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
@@ -330,7 +330,7 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
 #[test]
 fn bm25_quantization_preserves_top10() {
     let mut rng = SplitMix64(0x513E3C);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));

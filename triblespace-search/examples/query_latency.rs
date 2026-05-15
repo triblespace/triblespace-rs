@@ -75,7 +75,7 @@ fn fmt_ns(ns: u128) -> String {
 
 fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
     let mut rng = Rng(0xFEE1_DEAD + n_docs as u64);
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for i in 0..n_docs {
         let doc = fake_doc(&mut rng, vocab, doc_len);
         builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));

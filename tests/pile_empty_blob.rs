@@ -16,7 +16,7 @@ fn put_and_get_empty_blob() {
         std::fs::File::create(&path).unwrap();
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(Vec::<u8>::new()));
-        let handle = pile.put(blob).unwrap();
+        let handle = pile.put::<UnknownBlob, _>(blob).unwrap();
         pile.flush().unwrap();
         pile.close().unwrap();
         handle

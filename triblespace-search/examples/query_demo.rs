@@ -34,7 +34,7 @@ fn main() {
     ];
 
     // Build.
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for (id, text) in &corpus {
         builder.insert(*id, hash_tokens(text));
         println!("indexed {id} ({} tokens)", hash_tokens(text).len());

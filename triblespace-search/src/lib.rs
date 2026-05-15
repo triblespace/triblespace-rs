@@ -73,7 +73,7 @@
 //! use triblespace_search::tokens::hash_tokens;
 //!
 //! // 1. Build an in-memory index.
-//! let mut b = BM25Builder::new();
+//! let mut b: BM25Builder = BM25Builder::new();
 //! b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
 //! b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
 //! b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));

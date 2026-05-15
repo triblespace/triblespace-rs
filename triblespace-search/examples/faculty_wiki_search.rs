@@ -143,7 +143,7 @@ fn refresh(
     .collect();
 
     let reader = pile.reader()?;
-    let mut builder = BM25Builder::new();
+    let mut builder: BM25Builder = BM25Builder::new();
     for (id, handle) in &body_handles {
         let body: View<str> =
             reader.get::<View<str>, blobschemas::LongString>(*handle)?;

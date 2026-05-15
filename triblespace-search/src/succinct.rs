@@ -1320,7 +1320,7 @@ pub struct SuccinctBM25Meta {
 /// use triblespace_search::succinct::SuccinctBM25Index;
 /// use triblespace_search::tokens::hash_tokens;
 ///
-/// let mut b = BM25Builder::new();
+/// let mut b: BM25Builder = BM25Builder::new();
 /// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
 /// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
 /// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
@@ -2057,7 +2057,7 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
 
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(iid(1), hash_tokens("the quick brown fox"));
         b.insert(iid(2), hash_tokens("the lazy brown dog"));
         b.insert(iid(3), hash_tokens("quick silver fox jumps"));
@@ -2123,7 +2123,7 @@ mod tests {
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         b.insert(iid(1), hash_tokens("quick fox"));
         b.insert(iid(2),
             hash_tokens("quick red rapid fox jumps high over fences"),
@@ -2156,7 +2156,7 @@ mod tests {
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
-        let mut b = BM25Builder::new().k1(1.4).b(0.72);
+        let mut b: BM25Builder = BM25Builder::new().k1(1.4).b(0.72);
         b.insert(iid(1), hash_tokens("the quick brown fox"));
         b.insert(iid(2), hash_tokens("the lazy brown dog"));
         b.insert(iid(3), hash_tokens("quick silver fox jumps"));
@@ -2553,7 +2553,7 @@ mod tests {
         // Build a corpus large enough that the bit-packing wins
         // dominate the per-blob fixed overhead (~212B header +
         // metas).
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder = BM25Builder::new();
         for i in 1..=250u16 {
             let text = format!("doc {i} contains the quick brown fox {}", i % 17);
             let id = Id::new([

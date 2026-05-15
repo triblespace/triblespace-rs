@@ -8,6 +8,7 @@ use triblespace_core::query::{
     Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
+use triblespace_core::value::schemas::genid::GenId;
 use triblespace_core::value::schemas::UnknownInline;
 
 mod test_ns {
@@ -1065,8 +1066,8 @@ proptest! {
     ) {
         let mut set = TribleSet::new();
         let root = rngid();
-        let mut link_targets = Vec::new();
-        let mut label_targets = Vec::new();
+        let mut link_targets: Vec<Inline<GenId>> = Vec::new();
+        let mut label_targets: Vec<Inline<GenId>> = Vec::new();
 
         // Root links to some entities via `link`
         for _ in 0..n_links {
@@ -1083,7 +1084,7 @@ proptest! {
             // Use link for the second set too but with different targets
             let t2 = rngid();
             set += entity! { &t2 @ test_ns::link: &target };
-            label_targets.push(target);
+            label_targets.push(GenId::inline_from(&target));
         }
 
         // Single hop via link

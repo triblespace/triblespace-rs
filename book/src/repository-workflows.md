@@ -222,11 +222,17 @@ let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), Trible
 let branch_id = repo.create_branch("main", None).expect("create branch");
 let mut ws = repo.pull(*branch_id).expect("pull branch");
 
-// Stage rich payloads before creating a commit.
-let quote_handle = ws.put("Fear is the mind-killer".to_owned());
-let archive_handle = ws.put(&examples::dataset());
+// `entity!{}` auto-puts blob payloads into the workspace's blob
+// store — the value side of a `Handle<S>`-typed field becomes the
+// content-addressed handle that lives in the trible.
+//
+// When you also need the handle in hand (to read back, log, share,
+// or reuse across multiple entities), call `ws.put` explicitly.
+let quote_handle: Inline<Handle<LongString>> =
+    ws.put("Fear is the mind-killer".to_owned());
+let archive_handle: Inline<Handle<SimpleArchive>> =
+    ws.put(&examples::dataset());
 
-// Embed the handles inside the change set that will be committed.
 let mut change = entity! {
     literature::title: "Dune (annotated)",
     literature::quote: quote_handle.clone(),

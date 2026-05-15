@@ -24,7 +24,7 @@ fn id(byte: u8) -> Id {
 }
 
 fn sample_index() -> SuccinctBM25Index {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("the quick brown fox"));
     b.insert(id(2), hash_tokens("the lazy brown dog"));
     b.insert(id(3), hash_tokens("quick silver fox jumps"));
@@ -56,7 +56,7 @@ fn find_matches_term() {
 /// per-doc summed scores after `score()` is applied.
 #[test]
 fn find_matches_then_score_for_ranking() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     // Two same-length, same-tf "fox" docs (identical scores) +
     // one length-7 doc (lower per-term score because of length
     // normalisation).
@@ -137,7 +137,7 @@ fn find_intersection_of_two_terms() {
 /// proposal set.
 #[test]
 fn find_matches_with_floor_drops_low_scoring_docs() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("fox quick brown jumps"));
     b.insert(id(2), hash_tokens("only fox here, nothing else"));
     b.insert(id(3), hash_tokens("unrelated"));
@@ -233,7 +233,7 @@ fn find_hnsw_similar_on_succinct() {
 /// whose `score()` exceeds the floor.
 #[test]
 fn matches_set_equals_score_threshold_set() {
-    let mut b = BM25Builder::new();
+    let mut b: BM25Builder = BM25Builder::new();
     b.insert(id(1), hash_tokens("the quick brown fox jumps"));
     b.insert(id(2), hash_tokens("a fox and a cat and a dog"));
     b.insert(id(3), hash_tokens("quick silver fox"));
