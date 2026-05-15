@@ -1,6 +1,6 @@
 //! `entity!{}` auto-puts `Blob<T>` arguments to handle-typed fields.
 //!
-//! Today `IntoSchema<S>` has two relevant impls: identity for
+//! Today `IntoEncoded<S>` has two relevant impls: identity for
 //! `Inline<S>` (via the blanket from `IntoInline<S>`) and
 //! put-and-handle for `Blob<T>` targeting `Handle<T>`. The macro
 //! calls `to_value` for every field, getting back a
@@ -29,7 +29,7 @@ fn entity_auto_puts_blob_handle_fields() {
     // Build a Blob (typed as LongString) without ever touching a blob
     // store. Pass it directly into `entity!{}` as the value for a
     // Handle<LongString>-typed field. The macro must:
-    //   1. Run IntoSchema → get back (handle, Some(bytes)).
+    //   1. Run IntoEncoded → get back (handle, Some(bytes)).
     //   2. Insert the bytes into the fragment's local blob store.
     //   3. Use the handle as the field value.
     let blob: Blob<LongString> = "hi from a Blob<LongString>".to_blob();
@@ -60,7 +60,7 @@ fn entity_auto_puts_blob_handle_fields() {
 #[test]
 fn entity_still_accepts_precomputed_value() {
     // Passing a precomputed `Inline<Handle<LongString>>` still
-    // works via the blanket IntoInline→IntoSchema impl. No bytes
+    // works via the blanket IntoInline→IntoEncoded impl. No bytes
     // get absorbed (since the caller didn't hand us any), which is
     // the right behaviour — the caller is responsible for making
     // sure the bytes live somewhere else if they want them resolvable.
@@ -88,7 +88,7 @@ fn entity_still_accepts_precomputed_value() {
 /// Audit: the Blake3 hash is computed exactly once during a full
 /// `entity!{}` round-trip. Tested by stuffing a `Blob` with a
 /// *deliberately bogus* cached handle via `Blob::with_handle` —
-/// if anything in the IntoSchema → macro → `MemoryBlobStore::insert`
+/// if anything in the IntoEncoded → macro → `MemoryBlobStore::insert`
 /// chain silently rehashes from bytes, that bogus handle would be
 /// replaced with the real Blake3, and this test would observe a
 /// different handle in the resulting fragment. Asserting the bogus

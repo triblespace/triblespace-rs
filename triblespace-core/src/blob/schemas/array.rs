@@ -70,12 +70,12 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
 }
 
 /// Store a `Vec<T::Native>` as an `Array<T>` blob (zero-copy via ByteSource).
-impl<T: ArrayElement> crate::value::IntoSchema<Array<T>> for Vec<T::Native>
+impl<T: ArrayElement> crate::value::IntoEncoded<Array<T>> for Vec<T::Native>
 where
     crate::value::schemas::hash::Handle<Array<T>>: crate::value::InlineSchema,
 {
     type Encoded = Blob<Array<T>>;
-    fn into_schema(self) -> Blob<Array<T>> {
+    fn into_encoded(self) -> Blob<Array<T>> {
         Blob::new(Bytes::from_source(self))
     }
 }

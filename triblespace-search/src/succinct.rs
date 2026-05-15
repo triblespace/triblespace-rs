@@ -30,7 +30,7 @@
 //! [`SuccinctGraph`] and the postings sections that *are*
 //! exposed.
 
-use triblespace_core::value::IntoSchema;
+use triblespace_core::value::IntoEncoded;
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
@@ -1756,22 +1756,22 @@ impl MetaDescribe for SuccinctBM25Blob {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> IntoSchema<SuccinctBM25Blob> for &SuccinctBM25Index<D, T>
+impl<D: InlineSchema, T: InlineSchema> IntoEncoded<SuccinctBM25Blob> for &SuccinctBM25Index<D, T>
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctBM25Blob>;
-    fn into_schema(self) -> Blob<SuccinctBM25Blob> {
+    fn into_encoded(self) -> Blob<SuccinctBM25Blob> {
         // Canonical-bytes pattern: the index *is* its blob, so
         // we just hand over a refcounted clone of the bytes.
         Blob::new(self.bytes.clone())
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> IntoSchema<SuccinctBM25Blob> for SuccinctBM25Index<D, T>
+impl<D: InlineSchema, T: InlineSchema> IntoEncoded<SuccinctBM25Blob> for SuccinctBM25Index<D, T>
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctBM25Blob>;
-    fn into_schema(self) -> Blob<SuccinctBM25Blob> {
+    fn into_encoded(self) -> Blob<SuccinctBM25Blob> {
         Blob::new(self.bytes)
     }
 }
@@ -1839,21 +1839,21 @@ impl MetaDescribe for SuccinctHNSWBlob {
     }
 }
 
-impl IntoSchema<SuccinctHNSWBlob> for &SuccinctHNSWIndex
+impl IntoEncoded<SuccinctHNSWBlob> for &SuccinctHNSWIndex
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctHNSWBlob>;
-    fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
+    fn into_encoded(self) -> Blob<SuccinctHNSWBlob> {
         // Canonical-bytes pattern: refcounted handover.
         Blob::new(self.bytes.clone())
     }
 }
 
-impl IntoSchema<SuccinctHNSWBlob> for SuccinctHNSWIndex
+impl IntoEncoded<SuccinctHNSWBlob> for SuccinctHNSWIndex
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctHNSWBlob>;
-    fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
+    fn into_encoded(self) -> Blob<SuccinctHNSWBlob> {
         Blob::new(self.bytes)
     }
 }

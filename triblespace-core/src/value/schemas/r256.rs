@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -180,9 +180,9 @@ impl TryFromInline<'_, R256BE> for Ratio<i128> {
     }
 }
 
-impl IntoSchema<R256BE> for Ratio<i128> {
+impl IntoEncoded<R256BE> for Ratio<i128> {
     type Encoded = Inline<R256BE>;
-    fn into_schema(self) -> Inline<R256BE> {
+    fn into_encoded(self) -> Inline<R256BE> {
         let ratio = self.reduced();
 
         let mut bytes = [0; 32];
@@ -193,9 +193,9 @@ impl IntoSchema<R256BE> for Ratio<i128> {
     }
 }
 
-impl IntoSchema<R256BE> for i128 {
+impl IntoEncoded<R256BE> for i128 {
     type Encoded = Inline<R256BE>;
-    fn into_schema(self) -> Inline<R256BE> {
+    fn into_encoded(self) -> Inline<R256BE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_be_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_be_bytes());
@@ -227,9 +227,9 @@ impl TryFromInline<'_, R256LE> for Ratio<i128> {
     }
 }
 
-impl IntoSchema<R256LE> for Ratio<i128> {
+impl IntoEncoded<R256LE> for Ratio<i128> {
     type Encoded = Inline<R256LE>;
-    fn into_schema(self) -> Inline<R256LE> {
+    fn into_encoded(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.numer().to_le_bytes());
         bytes[16..32].copy_from_slice(&self.denom().to_le_bytes());
@@ -238,9 +238,9 @@ impl IntoSchema<R256LE> for Ratio<i128> {
     }
 }
 
-impl IntoSchema<R256LE> for i128 {
+impl IntoEncoded<R256LE> for i128 {
     type Encoded = Inline<R256LE>;
-    fn into_schema(self) -> Inline<R256LE> {
+    fn into_encoded(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_le_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_le_bytes());

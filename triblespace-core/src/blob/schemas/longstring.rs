@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -49,29 +49,29 @@ impl TryFromBlob<LongString> for View<str> {
     }
 }
 
-impl IntoSchema<LongString> for View<str>
+impl IntoEncoded<LongString> for View<str>
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Encoded = Blob<LongString>;
-    fn into_schema(self) -> Blob<LongString> {
+    fn into_encoded(self) -> Blob<LongString> {
         Blob::new(self.bytes())
     }
 }
 
-impl IntoSchema<LongString> for &'static str
+impl IntoEncoded<LongString> for &'static str
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Encoded = Blob<LongString>;
-    fn into_schema(self) -> Blob<LongString> {
+    fn into_encoded(self) -> Blob<LongString> {
         Blob::new(self.into())
     }
 }
 
-impl IntoSchema<LongString> for String
+impl IntoEncoded<LongString> for String
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
     type Encoded = Blob<LongString>;
-    fn into_schema(self) -> Blob<LongString> {
+    fn into_encoded(self) -> Blob<LongString> {
         Blob::new(self.into())
     }
 }

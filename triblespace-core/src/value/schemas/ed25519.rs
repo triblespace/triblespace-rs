@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use ed25519::ComponentBytes;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
@@ -172,23 +172,23 @@ impl ED25519SComponent {
     }
 }
 
-impl IntoSchema<ED25519RComponent> for Signature {
+impl IntoEncoded<ED25519RComponent> for Signature {
     type Encoded = Inline<ED25519RComponent>;
-    fn into_schema(self) -> Inline<ED25519RComponent> {
+    fn into_encoded(self) -> Inline<ED25519RComponent> {
         ED25519RComponent::from_signature(self)
     }
 }
 
-impl IntoSchema<ED25519SComponent> for Signature {
+impl IntoEncoded<ED25519SComponent> for Signature {
     type Encoded = Inline<ED25519SComponent>;
-    fn into_schema(self) -> Inline<ED25519SComponent> {
+    fn into_encoded(self) -> Inline<ED25519SComponent> {
         ED25519SComponent::from_signature(self)
     }
 }
 
-impl IntoSchema<ED25519RComponent> for ComponentBytes {
+impl IntoEncoded<ED25519RComponent> for ComponentBytes {
     type Encoded = Inline<ED25519RComponent>;
-    fn into_schema(self) -> Inline<ED25519RComponent> {
+    fn into_encoded(self) -> Inline<ED25519RComponent> {
         Inline::new(self)
     }
 }
@@ -200,9 +200,9 @@ impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
     }
 }
 
-impl IntoSchema<ED25519SComponent> for ComponentBytes {
+impl IntoEncoded<ED25519SComponent> for ComponentBytes {
     type Encoded = Inline<ED25519SComponent>;
-    fn into_schema(self) -> Inline<ED25519SComponent> {
+    fn into_encoded(self) -> Inline<ED25519SComponent> {
         Inline::new(self)
     }
 }
@@ -214,9 +214,9 @@ impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
     }
 }
 
-impl IntoSchema<ED25519PublicKey> for VerifyingKey {
+impl IntoEncoded<ED25519PublicKey> for VerifyingKey {
     type Encoded = Inline<ED25519PublicKey>;
-    fn into_schema(self) -> Inline<ED25519PublicKey> {
+    fn into_encoded(self) -> Inline<ED25519PublicKey> {
         Inline::new(self.to_bytes())
     }
 }

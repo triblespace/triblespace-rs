@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VALUE_LEN` → `INLINE_LEN`, plus the matching `*_value` →
   `*_inline` method renames (`to_value`/`from_value`/etc.).
 - **New dispatch trait**: `ToValue<V>` (formerly `FieldFormFor<V>`)
-  lifts an `IntoSchema::Encoded` into a `Value<V>`. The trait's two
+  lifts an `IntoEncoded::Encoded` into a `Value<V>`. The trait's two
   blanket impls delegate to schema-level `InlineSchema::to_value`
   and `BlobSchema::to_value`, so users (and schemas with unusual
   storage semantics) can call the conversion directly without going

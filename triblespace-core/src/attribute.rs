@@ -85,25 +85,25 @@ impl<S: InlineSchema> Attribute<S> {
     /// Macro-side entry point: produce the [`Value<S>`] the
     /// `entity!{}` codegen folds into a Fragment.
     ///
-    /// Dispatches via [`IntoSchema`], parameterised by the schema's
+    /// Dispatches via [`IntoEncoded`], parameterised by the schema's
     /// [`FieldKind`](crate::value::InlineSchema::FieldKind) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
     /// `Handle<T>`. The resulting `Encoded` is lifted into a [`Value`]
     /// via [`ToValue`].
     ///
-    /// [`IntoSchema`]: crate::value::IntoSchema
+    /// [`IntoEncoded`]: crate::value::IntoEncoded
     /// [`ToValue`]: crate::value::ToValue
     /// [`Value`]: crate::value::Value
     /// [`Value<S>`]: crate::value::Value
     pub fn value_from<V>(&self, v: V) -> crate::value::Value<S>
     where
-        V: crate::value::IntoSchema<<S as crate::value::InlineSchema>::FieldKind>,
-        <V as crate::value::IntoSchema<
+        V: crate::value::IntoEncoded<<S as crate::value::InlineSchema>::FieldKind>,
+        <V as crate::value::IntoEncoded<
             <S as crate::value::InlineSchema>::FieldKind,
         >>::Encoded: crate::value::ToValue<S>,
     {
         use crate::value::ToValue;
-        v.into_schema().to_value()
+        v.into_encoded().to_value()
     }
 
     /// Coerce an existing variable of any schema into a variable typed with

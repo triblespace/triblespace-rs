@@ -253,12 +253,12 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     }
 }
 
-/// Shorthand bound for `IntoSchema<S, Encoded = Blob<S>>` — "this
+/// Shorthand bound for `IntoEncoded<S, Encoded = Blob<S>>` — "this
 /// source produces a `Blob<S>` for content-addressed storage."
 ///
 /// `IntoBlob` is a supertrait alias over
-/// [`IntoSchema`](crate::value::IntoSchema): any type that
-/// implements `IntoSchema<S>` with `Encoded = Blob<S>` automatically
+/// [`IntoEncoded`](crate::value::IntoEncoded): any type that
+/// implements `IntoEncoded<S>` with `Encoded = Blob<S>` automatically
 /// becomes `IntoBlob<S>`, and gains the `to_blob(self) -> Blob<S>`
 /// convenience method.
 ///
@@ -268,20 +268,20 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
 /// `MyBlobSchema` sits at trait position 0, satisfying Rust's
 /// orphan rule.
 pub trait IntoBlob<S: BlobSchema>:
-    crate::value::IntoSchema<S, Encoded = Blob<S>>
+    crate::value::IntoEncoded<S, Encoded = Blob<S>>
 {
     /// Convert directly to `Blob<S>`.
     fn to_blob(self) -> Blob<S>
     where
         Self: Sized,
     {
-        self.into_schema()
+        self.into_encoded()
     }
 }
 impl<S, T> IntoBlob<S> for T
 where
     S: BlobSchema,
-    T: crate::value::IntoSchema<S, Encoded = Blob<S>>,
+    T: crate::value::IntoEncoded<S, Encoded = Blob<S>>,
 {
 }
 
@@ -307,15 +307,15 @@ impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
     }
 }
 
-/// `Blob<S>` is the identity source for [`IntoSchema<S>`] in the
+/// `Blob<S>` is the identity source for [`IntoEncoded<S>`] in the
 /// blob path: it converts to itself with no allocation, and the
 /// cached handle inside lets every downstream step skip rehashing.
-impl<S: BlobSchema> crate::value::IntoSchema<S> for Blob<S>
+impl<S: BlobSchema> crate::value::IntoEncoded<S> for Blob<S>
 where
     Handle<S>: InlineSchema,
 {
     type Encoded = Blob<S>;
-    fn into_schema(self) -> Blob<S> {
+    fn into_encoded(self) -> Blob<S> {
         self
     }
 }
@@ -336,27 +336,27 @@ where
 }
 
 /// Precomputed-handle case: a `Inline<Handle<T>>` can be passed as a
-/// `IntoSchema<T>` source (T is the BlobSchema, matching the
+/// `IntoEncoded<T>` source (T is the BlobSchema, matching the
 /// `Handle<T>`-attributed field's `FieldKind`). Encoded is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
-impl<T: BlobSchema> crate::value::IntoSchema<T> for Inline<Handle<T>>
+impl<T: BlobSchema> crate::value::IntoEncoded<T> for Inline<Handle<T>>
 where
     Handle<T>: InlineSchema,
 {
     type Encoded = Inline<Handle<T>>;
-    fn into_schema(self) -> Inline<Handle<T>> {
+    fn into_encoded(self) -> Inline<Handle<T>> {
         self
     }
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T: BlobSchema> crate::value::IntoSchema<T> for &Inline<Handle<T>>
+impl<T: BlobSchema> crate::value::IntoEncoded<T> for &Inline<Handle<T>>
 where
     Handle<T>: InlineSchema,
 {
     type Encoded = Inline<Handle<T>>;
-    fn into_schema(self) -> Inline<Handle<T>> {
+    fn into_encoded(self) -> Inline<Handle<T>> {
         *self
     }
 }

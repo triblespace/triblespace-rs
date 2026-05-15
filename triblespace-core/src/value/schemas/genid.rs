@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
@@ -120,9 +120,9 @@ impl TryFromInline<'_, GenId> for RawId {
     }
 }
 
-impl IntoSchema<GenId> for RawId {
+impl IntoEncoded<GenId> for RawId {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
         Inline::new(data)
@@ -154,18 +154,18 @@ impl TryFromInline<'_, GenId> for Id {
     }
 }
 
-impl IntoSchema<GenId> for &Id {
+impl IntoEncoded<GenId> for &Id {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
         Inline::new(data)
     }
 }
 
-impl IntoSchema<GenId> for Id {
+impl IntoEncoded<GenId> for Id {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         (&self).to_inline()
     }
 }
@@ -207,16 +207,16 @@ impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
     }
 }
 
-impl IntoSchema<GenId> for ExclusiveId {
+impl IntoEncoded<GenId> for ExclusiveId {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }
 
-impl IntoSchema<GenId> for &ExclusiveId {
+impl IntoEncoded<GenId> for &ExclusiveId {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }
@@ -233,16 +233,16 @@ impl TryFromInline<'_, GenId> for String {
     }
 }
 
-impl IntoSchema<GenId> for OwnedId<'_> {
+impl IntoEncoded<GenId> for OwnedId<'_> {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }
 
-impl IntoSchema<GenId> for &OwnedId<'_> {
+impl IntoEncoded<GenId> for &OwnedId<'_> {
     type Encoded = Inline<GenId>;
-    fn into_schema(self) -> Inline<GenId> {
+    fn into_encoded(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }

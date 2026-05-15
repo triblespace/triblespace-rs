@@ -8,7 +8,7 @@ use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::TryFromInline;
 use triblespace::core::value::Inline;
 use triblespace::core::value::InlineSchema;
-use triblespace::core::value::IntoSchema;
+use triblespace::core::value::IntoEncoded;
 use triblespace::core::value::INLINE_LEN;
 
 // ANCHOR: custom_schema
@@ -29,9 +29,9 @@ impl InlineSchema for U64LE {
     type FieldKind = Self;
 }
 
-impl IntoSchema<U64LE> for u64 {
+impl IntoEncoded<U64LE> for u64 {
     type Encoded = Inline<U64LE>;
-    fn into_schema(self) -> Inline<U64LE> {
+    fn into_encoded(self) -> Inline<U64LE> {
         let mut raw = [0u8; INLINE_LEN];
         raw[..8].copy_from_slice(&self.to_le_bytes());
         Inline::new(raw)
@@ -58,9 +58,9 @@ impl MetaDescribe for BytesBlob {
 
 impl BlobSchema for BytesBlob {}
 
-impl IntoSchema<BytesBlob> for Bytes {
+impl IntoEncoded<BytesBlob> for Bytes {
     type Encoded = Blob<BytesBlob>;
-    fn into_schema(self) -> Blob<BytesBlob> {
+    fn into_encoded(self) -> Blob<BytesBlob> {
         Blob::new(self)
     }
 }

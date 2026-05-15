@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -155,23 +155,23 @@ impl TryToInline<ShortString> for String {
     }
 }
 
-impl IntoSchema<ShortString> for &str {
+impl IntoEncoded<ShortString> for &str {
     type Encoded = Inline<ShortString>;
-    fn into_schema(self) -> Inline<ShortString> {
+    fn into_encoded(self) -> Inline<ShortString> {
         self.try_to_inline().unwrap()
     }
 }
 
-impl IntoSchema<ShortString> for String {
+impl IntoEncoded<ShortString> for String {
     type Encoded = Inline<ShortString>;
-    fn into_schema(self) -> Inline<ShortString> {
+    fn into_encoded(self) -> Inline<ShortString> {
         self.try_to_inline().unwrap()
     }
 }
 
-impl IntoSchema<ShortString> for &String {
+impl IntoEncoded<ShortString> for &String {
     type Encoded = Inline<ShortString>;
-    fn into_schema(self) -> Inline<ShortString> {
+    fn into_encoded(self) -> Inline<ShortString> {
         self.to_str().try_to_inline().unwrap()
     }
 }

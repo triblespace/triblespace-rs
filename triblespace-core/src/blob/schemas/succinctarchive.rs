@@ -2,7 +2,7 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -715,24 +715,24 @@ where
     }
 }
 
-impl<U> IntoSchema<SuccinctArchiveBlob> for &SuccinctArchive<U>
+impl<U> IntoEncoded<SuccinctArchiveBlob> for &SuccinctArchive<U>
 where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctArchiveBlob>;
-    fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
+    fn into_encoded(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes.clone())
     }
 }
 
-impl<U> IntoSchema<SuccinctArchiveBlob> for SuccinctArchive<U>
+impl<U> IntoEncoded<SuccinctArchiveBlob> for SuccinctArchive<U>
 where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctArchiveBlob>;
-    fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
+    fn into_encoded(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes)
     }
 }

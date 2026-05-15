@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use anybytes::Bytes;
 
 use crate::blob::Blob;
@@ -38,29 +38,29 @@ impl MetaDescribe for WasmCode {
     }
 }
 
-impl IntoSchema<WasmCode> for Bytes
+impl IntoEncoded<WasmCode> for Bytes
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_schema(self) -> Blob<WasmCode> {
+    fn into_encoded(self) -> Blob<WasmCode> {
         Blob::new(self)
     }
 }
 
-impl IntoSchema<WasmCode> for Vec<u8>
+impl IntoEncoded<WasmCode> for Vec<u8>
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_schema(self) -> Blob<WasmCode> {
+    fn into_encoded(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self))
     }
 }
 
-impl IntoSchema<WasmCode> for &[u8]
+impl IntoEncoded<WasmCode> for &[u8]
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_schema(self) -> Blob<WasmCode> {
+    fn into_encoded(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }
 }

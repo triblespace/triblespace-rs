@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -100,9 +100,9 @@ fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
     )
 }
 
-impl IntoSchema<LineLocation> for (u64, u64, u64, u64) {
+impl IntoEncoded<LineLocation> for (u64, u64, u64, u64) {
     type Encoded = Inline<LineLocation>;
-    fn into_schema(self) -> Inline<LineLocation> {
+    fn into_encoded(self) -> Inline<LineLocation> {
         Inline::new(encode_location(self))
     }
 }
@@ -114,9 +114,9 @@ impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
     }
 }
 
-impl IntoSchema<LineLocation> for Span {
+impl IntoEncoded<LineLocation> for Span {
     type Encoded = Inline<LineLocation>;
-    fn into_schema(self) -> Inline<LineLocation> {
+    fn into_encoded(self) -> Inline<LineLocation> {
         (
             self.start().line() as u64,
             self.start().column() as u64,

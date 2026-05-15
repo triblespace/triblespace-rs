@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -47,29 +47,29 @@ impl TryFromBlob<FileBytes> for Bytes {
     }
 }
 
-impl IntoSchema<FileBytes> for Bytes
+impl IntoEncoded<FileBytes> for Bytes
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<FileBytes>;
-    fn into_schema(self) -> Blob<FileBytes> {
+    fn into_encoded(self) -> Blob<FileBytes> {
         Blob::new(self)
     }
 }
 
-impl IntoSchema<FileBytes> for Vec<u8>
+impl IntoEncoded<FileBytes> for Vec<u8>
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<FileBytes>;
-    fn into_schema(self) -> Blob<FileBytes> {
+    fn into_encoded(self) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(self))
     }
 }
 
-impl IntoSchema<FileBytes> for &[u8]
+impl IntoEncoded<FileBytes> for &[u8]
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<FileBytes>;
-    fn into_schema(self) -> Blob<FileBytes> {
+    fn into_encoded(self) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }
 }

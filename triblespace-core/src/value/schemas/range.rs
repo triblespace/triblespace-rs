@@ -1,4 +1,4 @@
-use crate::value::IntoSchema;
+use crate::value::IntoEncoded;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -142,9 +142,9 @@ fn decode_range_value<S: InlineSchema>(value: &Inline<S>) -> (u128, u128) {
     decode_pair(&value.raw)
 }
 
-impl IntoSchema<RangeU128> for (u128, u128) {
+impl IntoEncoded<RangeU128> for (u128, u128) {
     type Encoded = Inline<RangeU128>;
-    fn into_schema(self) -> Inline<RangeU128> {
+    fn into_encoded(self) -> Inline<RangeU128> {
         encode_range_value(self)
     }
 }
@@ -156,9 +156,9 @@ impl TryFromInline<'_, RangeU128> for (u128, u128) {
     }
 }
 
-impl IntoSchema<RangeInclusiveU128> for (u128, u128) {
+impl IntoEncoded<RangeInclusiveU128> for (u128, u128) {
     type Encoded = Inline<RangeInclusiveU128>;
-    fn into_schema(self) -> Inline<RangeInclusiveU128> {
+    fn into_encoded(self) -> Inline<RangeInclusiveU128> {
         encode_range_value(self)
     }
 }

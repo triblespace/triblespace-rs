@@ -17,7 +17,7 @@
 //! valid LongString-blob handles by construction, so there's
 //! no need for a bespoke "token hash" schema.
 
-use triblespace_core::value::IntoSchema;
+use triblespace_core::value::IntoEncoded;
 use std::convert::Infallible;
 
 use anybytes::View;
@@ -67,18 +67,18 @@ impl InlineSchema for F32LE {
     type FieldKind = Self;
 }
 
-impl IntoSchema<F32LE> for f32 {
+impl IntoEncoded<F32LE> for f32 {
     type Encoded = Inline<F32LE>;
-    fn into_schema(self) -> Inline<F32LE> {
+    fn into_encoded(self) -> Inline<F32LE> {
         let mut raw = [0u8; 32];
         raw[0..4].copy_from_slice(&self.to_le_bytes());
         Inline::new(raw)
     }
 }
 
-impl IntoSchema<F32LE> for &f32 {
+impl IntoEncoded<F32LE> for &f32 {
     type Encoded = Inline<F32LE>;
-    fn into_schema(self) -> Inline<F32LE> {
+    fn into_encoded(self) -> Inline<F32LE> {
         (*self).to_inline()
     }
 }
@@ -166,20 +166,20 @@ impl TryFromBlob<Embedding> for View<[f32]> {
     }
 }
 
-impl IntoSchema<Embedding> for View<[f32]>
+impl IntoEncoded<Embedding> for View<[f32]>
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<Embedding>;
-    fn into_schema(self) -> Blob<Embedding> {
+    fn into_encoded(self) -> Blob<Embedding> {
         Blob::new(self.bytes())
     }
 }
 
-impl IntoSchema<Embedding> for Vec<f32>
+impl IntoEncoded<Embedding> for Vec<f32>
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<Embedding>;
-    fn into_schema(self) -> Blob<Embedding> {
+    fn into_encoded(self) -> Blob<Embedding> {
         // f32 is `IntoBytes` (zerocopy) so this is a straight
         // byte-copy of the `Vec`'s backing storage.
         let mut bytes = Vec::with_capacity(self.len() * 4);
@@ -190,11 +190,11 @@ where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_cor
     }
 }
 
-impl IntoSchema<Embedding> for &[f32]
+impl IntoEncoded<Embedding> for &[f32]
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<Embedding>;
-    fn into_schema(self) -> Blob<Embedding> {
+    fn into_encoded(self) -> Blob<Embedding> {
         let mut bytes = Vec::with_capacity(self.len() * 4);
         for v in self {
             bytes.extend_from_slice(&v.to_le_bytes());

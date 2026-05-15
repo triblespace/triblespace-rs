@@ -40,9 +40,9 @@
 //!    }
 //! }
 //!
-//! impl triblespace_core::value::IntoSchema<MyNumber> for u32 {
+//! impl triblespace_core::value::IntoEncoded<MyNumber> for u32 {
 //!   type Encoded = Inline<MyNumber>;
-//!   fn into_schema(self) -> Inline<MyNumber> {
+//!   fn into_encoded(self) -> Inline<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
 //!      let mut bytes = [0; 32];
 //!      bytes[0..4].copy_from_slice(&self.to_le_bytes());
@@ -63,9 +63,9 @@
 //!   }
 //! }
 //!
-//! impl triblespace_core::value::IntoSchema<MyNumber> for u64 {
+//! impl triblespace_core::value::IntoEncoded<MyNumber> for u64 {
 //!  type Encoded = Inline<MyNumber>;
-//!  fn into_schema(self) -> Inline<MyNumber> {
+//!  fn into_encoded(self) -> Inline<MyNumber> {
 //!   let mut bytes = [0; 32];
 //!   bytes[0..8].copy_from_slice(&self.to_le_bytes());
 //!   Inline::new(bytes)
@@ -326,11 +326,11 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     /// The trait parameter to dispatch via for `entity!{}` field
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `FieldKind = Self` — sources convert via
-    /// `IntoSchema<Self> { Encoded = Inline<Self> }`. For
+    /// `IntoEncoded<Self> { Encoded = Inline<Self> }`. For
     /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
-    /// `FieldKind = T` — sources convert via `IntoSchema<T> { Encoded =
+    /// `FieldKind = T` — sources convert via `IntoEncoded<T> { Encoded =
     /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
-    /// position 0 is what lets downstream impl `IntoSchema<MyBlob>
+    /// position 0 is what lets downstream impl `IntoEncoded<MyBlob>
     /// for MyType` without bumping into the orphan rule.
     type FieldKind;
 
@@ -367,7 +367,7 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
 
 /// Fallible variant of value conversion — `T → Result<Inline<S>, Error>`.
 ///
-/// Kept as a standalone trait (not folded into [`IntoSchema`])
+/// Kept as a standalone trait (not folded into [`IntoEncoded`])
 /// because the error type is part of the per-source/per-target contract.
 /// Used for parses that can fail (e.g. `&str → Hash<Blake3>` via
 /// hex-decoding).
@@ -382,7 +382,7 @@ pub trait TryToInline<S: InlineSchema> {
 /// directly-encoded `Inline<S>` (inline path, `S: InlineSchema`) or a
 /// `Blob<S>` for content-addressed storage (handle path, `S: BlobSchema`).
 ///
-/// `IntoSchema<S>` is the **sole** source-to-schema conversion trait.
+/// `IntoEncoded<S>` is the **sole** source-to-schema conversion trait.
 /// `S` is intentionally unbounded so the same trait can target either
 /// an `InlineSchema` (Encoded = `Inline<S>`) or a `BlobSchema`
 /// (Encoded = `Blob<S>`). The Encoded's relationship to `S` is captured by
@@ -390,39 +390,39 @@ pub trait TryToInline<S: InlineSchema> {
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// The key property: with `S` at trait position 0, downstream that
-/// defines a local `MyBlobSchema` writes `impl IntoSchema<MyBlobSchema>
+/// defines a local `MyBlobSchema` writes `impl IntoEncoded<MyBlobSchema>
 /// for MyType` — the local type sits at trait position 0, which
 /// makes Rust's orphan rule see the impl as legal even when `MyType`
 /// is a foreign type (like `Vec<u8>` or a third-party crate's view).
 /// This is the property the IntoInline/IntoBlob split provided
 /// historically; preserved here by keeping the schema type unbuiried.
-pub trait IntoSchema<S> {
+pub trait IntoEncoded<S> {
     /// The concrete form this source produces.
     type Encoded;
     /// Run the conversion.
-    fn into_schema(self) -> Self::Encoded;
+    fn into_encoded(self) -> Self::Encoded;
 }
 
-/// Shorthand bound for `IntoSchema<S, Encoded = Inline<S>>` — "this
+/// Shorthand bound for `IntoEncoded<S, Encoded = Inline<S>>` — "this
 /// source produces a directly-encoded `Inline<S>`, no side-blob."
 ///
-/// `IntoInline` is a supertrait alias over [`IntoSchema`]: any type
-/// that implements `IntoSchema<S>` with `Encoded = Inline<S>`
+/// `IntoInline` is a supertrait alias over [`IntoEncoded`]: any type
+/// that implements `IntoEncoded<S>` with `Encoded = Inline<S>`
 /// automatically becomes `IntoInline<S>`, and gains the
 /// `to_inline(self) -> Inline<S>` convenience method.
-pub trait IntoInline<S: InlineSchema>: IntoSchema<S, Encoded = Inline<S>> {
+pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Encoded = Inline<S>> {
     /// Convert directly to `Inline<S>`.
     fn to_inline(self) -> Inline<S>
     where
         Self: Sized,
     {
-        self.into_schema()
+        self.into_encoded()
     }
 }
 impl<S, T> IntoInline<S> for T
 where
     S: InlineSchema,
-    T: IntoSchema<S, Encoded = Inline<S>>,
+    T: IntoEncoded<S, Encoded = Inline<S>>,
 {
 }
 
@@ -478,7 +478,7 @@ impl<V: InlineSchema> Value<V> {
     }
 }
 
-/// Lift an [`IntoSchema::Encoded`] into the [`Value`] sum the
+/// Lift an [`IntoEncoded::Encoded`] into the [`Value`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
@@ -523,16 +523,16 @@ pub trait TryFromInline<'a, S: InlineSchema>: Sized {
     fn try_from_inline(v: &'a Inline<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: InlineSchema> IntoSchema<S> for Inline<S> {
+impl<S: InlineSchema> IntoEncoded<S> for Inline<S> {
     type Encoded = Inline<S>;
-    fn into_schema(self) -> Inline<S> {
+    fn into_encoded(self) -> Inline<S> {
         self
     }
 }
 
-impl<S: InlineSchema> IntoSchema<S> for &Inline<S> {
+impl<S: InlineSchema> IntoEncoded<S> for &Inline<S> {
     type Encoded = Inline<S>;
-    fn into_schema(self) -> Inline<S> {
+    fn into_encoded(self) -> Inline<S> {
         *self
     }
 }
