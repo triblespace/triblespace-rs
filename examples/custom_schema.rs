@@ -29,11 +29,12 @@ impl InlineSchema for U64LE {
     type Encoding = Self;
 }
 
-impl IntoEncoded<U64LE> for u64 {
+impl Encodes<u64> for U64LE
+{
     type Encoded = Inline<U64LE>;
-    fn into_encoded(self) -> Inline<U64LE> {
+    fn encode(source: u64) -> Inline<U64LE> {
         let mut raw = [0u8; INLINE_LEN];
-        raw[..8].copy_from_slice(&self.to_le_bytes());
+        raw[..8].copy_from_slice(&source.to_le_bytes());
         Inline::new(raw)
     }
 }
@@ -58,10 +59,11 @@ impl MetaDescribe for BytesBlob {
 
 impl BlobSchema for BytesBlob {}
 
-impl IntoEncoded<BytesBlob> for Bytes {
+impl Encodes<Bytes> for BytesBlob
+{
     type Encoded = Blob<BytesBlob>;
-    fn into_encoded(self) -> Blob<BytesBlob> {
-        Blob::new(self)
+    fn encode(source: Bytes) -> Blob<BytesBlob> {
+        Blob::new(source)
     }
 }
 

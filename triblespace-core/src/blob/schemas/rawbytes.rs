@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -53,29 +53,29 @@ impl TryFromBlob<RawBytes> for Bytes {
     }
 }
 
-impl IntoEncoded<RawBytes> for Bytes
+impl Encodes<Bytes> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<RawBytes>;
-    fn into_encoded(self) -> Blob<RawBytes> {
-        Blob::new(self)
+    fn encode(source: Bytes) -> Blob<RawBytes> {
+        Blob::new(source)
     }
 }
 
-impl IntoEncoded<RawBytes> for Vec<u8>
+impl Encodes<Vec<u8>> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<RawBytes>;
-    fn into_encoded(self) -> Blob<RawBytes> {
-        Blob::new(Bytes::from_source(self))
+    fn encode(source: Vec<u8>) -> Blob<RawBytes> {
+        Blob::new(Bytes::from_source(source))
     }
 }
 
-impl IntoEncoded<RawBytes> for &[u8]
+impl Encodes<&[u8]> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
     type Encoded = Blob<RawBytes>;
-    fn into_encoded(self) -> Blob<RawBytes> {
-        Blob::new(Bytes::from_source(self.to_vec()))
+    fn encode(source: &[u8]) -> Blob<RawBytes> {
+        Blob::new(Bytes::from_source(source.to_vec()))
     }
 }

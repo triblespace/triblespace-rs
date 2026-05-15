@@ -899,10 +899,10 @@ where
         signing_key: SigningKey,
     ) -> Result<ExclusiveId, BranchError<Storage>> {
         let branch_id = genid();
-        let name_blob = branch_name.to_owned().to_blob();
+        let name_blob: Blob<LongString> = branch_name.to_owned().to_blob();
         let name_handle = name_blob.get_handle();
         self.storage
-            .put(name_blob)
+            .put::<LongString, _>(name_blob)
             .map_err(|e| BranchError::StoragePut(e))?;
 
         let branch_set = if let Some(commit) = commit {
@@ -1119,7 +1119,9 @@ where
             let handle = handle.expect("infallible blob enumeration");
             let blob: Blob<UnknownBlob> =
                 workspace_reader.get(handle).expect("infallible blob read");
-            self.storage.put(blob).map_err(PushError::StoragePut)?;
+            self.storage
+                .put::<UnknownBlob, _>(blob)
+                .map_err(PushError::StoragePut)?;
         }
 
         // 1.5 If the workspace's head did not change since the workspace was
@@ -2176,7 +2178,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         //    inside `content_facts` resolve against `self.staged`.
         self.staged.union(content_blobs);
         // 1. Create a commit blob from the current head, content, metadata and the commit message.
-        let content_blob = content_facts.to_blob();
+        let content_blob: Blob<SimpleArchive> = content_facts.to_blob();
         // If a message is provided, store it as a LongString blob and pass the handle.
         let message_handle = message_.map(|m| self.put(m.to_string()));
         let parents = self.head.iter().copied();
@@ -2191,7 +2193,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         // 2. Store the content and commit blobs in `self.staged`.
         let _ = self
             .staged
-            .put(content_blob)
+            .put::<SimpleArchive, _>(content_blob)
             .expect("failed to put content blob");
         let commit_handle = self
             .staged
@@ -2234,7 +2236,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         for r in other_local.blobs() {
             let handle = r.expect("infallible blob enumeration");
             let blob: Blob<UnknownBlob> = other_local.get(handle).expect("infallible blob read");
-            self.staged.put(blob).expect("infallible blob put");
+            self.staged
+                .put::<UnknownBlob, _>(blob)
+                .expect("infallible blob put");
         }
 
         // 2. Integrate `other`'s head via the smart merge_commit. If `other`

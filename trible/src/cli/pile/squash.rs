@@ -197,7 +197,7 @@ pub fn run(
             );
 
             let commit_handle = dst_pile
-                .put(commit_set)
+                .put::<SimpleArchive, _>(commit_set)
                 .map_err(|e| anyhow!("put commit: {e:?}"))?;
 
             prev_commit = Some(commit_handle.transmute());

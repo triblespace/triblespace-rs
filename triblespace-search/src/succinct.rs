@@ -30,7 +30,7 @@
 //! [`SuccinctGraph`] and the postings sections that *are*
 //! exposed.
 
-use triblespace_core::value::IntoEncoded;
+use triblespace_core::value::Encodes;
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
@@ -1756,23 +1756,23 @@ impl MetaDescribe for SuccinctBM25Blob {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> IntoEncoded<SuccinctBM25Blob> for &SuccinctBM25Index<D, T>
+impl<D: InlineSchema, T: InlineSchema> Encodes<&SuccinctBM25Index<D, T>> for SuccinctBM25Blob
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctBM25Blob>;
-    fn into_encoded(self) -> Blob<SuccinctBM25Blob> {
+    fn encode(source: &SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
         // Canonical-bytes pattern: the index *is* its blob, so
         // we just hand over a refcounted clone of the bytes.
-        Blob::new(self.bytes.clone())
+        Blob::new(source.bytes.clone())
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> IntoEncoded<SuccinctBM25Blob> for SuccinctBM25Index<D, T>
+impl<D: InlineSchema, T: InlineSchema> Encodes<SuccinctBM25Index<D, T>> for SuccinctBM25Blob
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctBM25Blob>;
-    fn into_encoded(self) -> Blob<SuccinctBM25Blob> {
-        Blob::new(self.bytes)
+    fn encode(source: SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
+        Blob::new(source.bytes)
     }
 }
 
@@ -1839,22 +1839,22 @@ impl MetaDescribe for SuccinctHNSWBlob {
     }
 }
 
-impl IntoEncoded<SuccinctHNSWBlob> for &SuccinctHNSWIndex
+impl Encodes<&SuccinctHNSWIndex> for SuccinctHNSWBlob
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctHNSWBlob>;
-    fn into_encoded(self) -> Blob<SuccinctHNSWBlob> {
+    fn encode(source: &SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
         // Canonical-bytes pattern: refcounted handover.
-        Blob::new(self.bytes.clone())
+        Blob::new(source.bytes.clone())
     }
 }
 
-impl IntoEncoded<SuccinctHNSWBlob> for SuccinctHNSWIndex
+impl Encodes<SuccinctHNSWIndex> for SuccinctHNSWBlob
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
     type Encoded = Blob<SuccinctHNSWBlob>;
-    fn into_encoded(self) -> Blob<SuccinctHNSWBlob> {
-        Blob::new(self.bytes)
+    fn encode(source: SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
+        Blob::new(source.bytes)
     }
 }
 

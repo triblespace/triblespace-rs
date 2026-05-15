@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -100,10 +100,11 @@ fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
     )
 }
 
-impl IntoEncoded<LineLocation> for (u64, u64, u64, u64) {
+impl Encodes<(u64, u64, u64, u64)> for LineLocation
+{
     type Encoded = Inline<LineLocation>;
-    fn into_encoded(self) -> Inline<LineLocation> {
-        Inline::new(encode_location(self))
+    fn encode(source: (u64, u64, u64, u64)) -> Inline<LineLocation> {
+        Inline::new(encode_location(source))
     }
 }
 
@@ -114,14 +115,15 @@ impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
     }
 }
 
-impl IntoEncoded<LineLocation> for Span {
+impl Encodes<Span> for LineLocation
+{
     type Encoded = Inline<LineLocation>;
-    fn into_encoded(self) -> Inline<LineLocation> {
+    fn encode(source: Span) -> Inline<LineLocation> {
         (
-            self.start().line() as u64,
-            self.start().column() as u64,
-            self.end().line() as u64,
-            self.end().column() as u64,
+            source.start().line() as u64,
+            source.start().column() as u64,
+            source.end().line() as u64,
+            source.end().column() as u64,
         )
             .to_inline()
     }

@@ -378,29 +378,58 @@ pub trait TryToInline<S: InlineSchema> {
     fn try_to_inline(self) -> Result<Inline<S>, Self::Error>;
 }
 
-/// Convert a value into its **form** for a schema target — either a
-/// directly-encoded `Inline<S>` (inline path, `S: InlineSchema`) or a
-/// `Blob<S>` for content-addressed storage (handle path, `S: BlobSchema`).
+/// User-implemented schema-side encoding trait, in the `From`
+/// direction: **the schema is the impl target**, the source is the
+/// trait parameter.
 ///
-/// `IntoEncoded<S>` is the **sole** source-to-schema conversion trait.
-/// `S` is intentionally unbounded so the same trait can target either
-/// an `InlineSchema` (Encoded = `Inline<S>`) or a `BlobSchema`
-/// (Encoded = `Blob<S>`). The Encoded's relationship to `S` is captured by
-/// [`ToValue`], which lifts the form into a [`Value`] the
-/// `entity!{}` macro folds into a Fragment.
+/// ```ignore
+/// impl Encodes<&str> for LongString {
+///     type Encoded = Blob<LongString>;
+///     fn encode(s: &str) -> Blob<LongString> { Blob::new(s.into()) }
+/// }
+/// ```
 ///
-/// The key property: with `S` at trait position 0, downstream that
-/// defines a local `MyBlobSchema` writes `impl IntoEncoded<MyBlobSchema>
-/// for MyType` — the local type sits at trait position 0, which
-/// makes Rust's orphan rule see the impl as legal even when `MyType`
-/// is a foreign type (like `Vec<u8>` or a third-party crate's view).
-/// This is the property the IntoInline/IntoBlob split provided
-/// historically; preserved here by keeping the schema type unbuiried.
+/// This is the canonical orphan-rule shape (mirroring `From<T>` in
+/// std): downstream that defines a local `MyBlobSchema` writes
+/// `impl Encodes<ForeignType> for MyBlobSchema` — the local schema
+/// sits at the impl-target position so Rust's orphan checker
+/// trivially accepts the impl, no matter how foreign the source
+/// type is.
+///
+/// The user-facing source-side ergonomic — `source.into_encoded()` /
+/// `source.to_inline()` / `source.to_blob()` — is blanket-derived
+/// from this trait via [`IntoEncoded`].
+pub trait Encodes<Source> {
+    /// The concrete form this source produces when encoded for this
+    /// schema. `Inline<Self>` for inline schemas, `Blob<Self>` for
+    /// blob schemas, or `Inline<Handle<Self>>` for the
+    /// precomputed-handle case where `Self: BlobSchema`.
+    type Encoded;
+    /// Run the encoding.
+    fn encode(source: Source) -> Self::Encoded;
+}
+
+/// Source-side ergonomic counterpart of [`Encodes`], in the `Into`
+/// direction: methods like `42u32.to_inline()` resolve here.
+///
+/// Blanket-derived from every `Encodes` impl — users never implement
+/// `IntoEncoded` directly. The split mirrors std's `From`/`Into`:
+/// implement `From`, get `Into` for free.
 pub trait IntoEncoded<S> {
     /// The concrete form this source produces.
     type Encoded;
     /// Run the conversion.
     fn into_encoded(self) -> Self::Encoded;
+}
+
+impl<S, T> IntoEncoded<S> for T
+where
+    S: Encodes<T>,
+{
+    type Encoded = <S as Encodes<T>>::Encoded;
+    fn into_encoded(self) -> Self::Encoded {
+        <S as Encodes<T>>::encode(self)
+    }
 }
 
 /// Shorthand bound for `IntoEncoded<S, Encoded = Inline<S>>` — "this
@@ -523,17 +552,19 @@ pub trait TryFromInline<'a, S: InlineSchema>: Sized {
     fn try_from_inline(v: &'a Inline<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: InlineSchema> IntoEncoded<S> for Inline<S> {
+impl<S: InlineSchema> Encodes<Inline<S>> for S
+{
     type Encoded = Inline<S>;
-    fn into_encoded(self) -> Inline<S> {
-        self
+    fn encode(source: Inline<S>) -> Inline<S> {
+        source
     }
 }
 
-impl<S: InlineSchema> IntoEncoded<S> for &Inline<S> {
+impl<S: InlineSchema> Encodes<&Inline<S>> for S
+{
     type Encoded = Inline<S>;
-    fn into_encoded(self) -> Inline<S> {
-        *self
+    fn encode(source: &Inline<S>) -> Inline<S> {
+        *source
     }
 }
 

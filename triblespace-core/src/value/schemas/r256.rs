@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -180,10 +180,11 @@ impl TryFromInline<'_, R256BE> for Ratio<i128> {
     }
 }
 
-impl IntoEncoded<R256BE> for Ratio<i128> {
+impl Encodes<Ratio<i128>> for R256BE
+{
     type Encoded = Inline<R256BE>;
-    fn into_encoded(self) -> Inline<R256BE> {
-        let ratio = self.reduced();
+    fn encode(source: Ratio<i128>) -> Inline<R256BE> {
+        let ratio = source.reduced();
 
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&ratio.numer().to_be_bytes());
@@ -193,11 +194,12 @@ impl IntoEncoded<R256BE> for Ratio<i128> {
     }
 }
 
-impl IntoEncoded<R256BE> for i128 {
+impl Encodes<i128> for R256BE
+{
     type Encoded = Inline<R256BE>;
-    fn into_encoded(self) -> Inline<R256BE> {
+    fn encode(source: i128) -> Inline<R256BE> {
         let mut bytes = [0; 32];
-        bytes[0..16].copy_from_slice(&self.to_be_bytes());
+        bytes[0..16].copy_from_slice(&source.to_be_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_be_bytes());
 
         Inline::new(bytes)
@@ -227,22 +229,24 @@ impl TryFromInline<'_, R256LE> for Ratio<i128> {
     }
 }
 
-impl IntoEncoded<R256LE> for Ratio<i128> {
+impl Encodes<Ratio<i128>> for R256LE
+{
     type Encoded = Inline<R256LE>;
-    fn into_encoded(self) -> Inline<R256LE> {
+    fn encode(source: Ratio<i128>) -> Inline<R256LE> {
         let mut bytes = [0; 32];
-        bytes[0..16].copy_from_slice(&self.numer().to_le_bytes());
-        bytes[16..32].copy_from_slice(&self.denom().to_le_bytes());
+        bytes[0..16].copy_from_slice(&source.numer().to_le_bytes());
+        bytes[16..32].copy_from_slice(&source.denom().to_le_bytes());
 
         Inline::new(bytes)
     }
 }
 
-impl IntoEncoded<R256LE> for i128 {
+impl Encodes<i128> for R256LE
+{
     type Encoded = Inline<R256LE>;
-    fn into_encoded(self) -> Inline<R256LE> {
+    fn encode(source: i128) -> Inline<R256LE> {
         let mut bytes = [0; 32];
-        bytes[0..16].copy_from_slice(&self.to_le_bytes());
+        bytes[0..16].copy_from_slice(&source.to_le_bytes());
         bytes[16..32].copy_from_slice(&1i128.to_le_bytes());
 
         Inline::new(bytes)

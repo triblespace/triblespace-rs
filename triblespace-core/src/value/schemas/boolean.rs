@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -130,17 +130,19 @@ impl TryToInline<Boolean> for &bool {
     }
 }
 
-impl IntoEncoded<Boolean> for bool {
+impl Encodes<bool> for Boolean
+{
     type Encoded = Inline<Boolean>;
-    fn into_encoded(self) -> Inline<Boolean> {
-        Boolean::encode(self)
+    fn encode(source: bool) -> Inline<Boolean> {
+        Boolean::encode(source)
     }
 }
 
-impl IntoEncoded<Boolean> for &bool {
+impl Encodes<&bool> for Boolean
+{
     type Encoded = Inline<Boolean>;
-    fn into_encoded(self) -> Inline<Boolean> {
-        Boolean::encode(*self)
+    fn encode(source: &bool) -> Inline<Boolean> {
+        Boolean::encode(*source)
     }
 }
 

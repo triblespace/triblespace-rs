@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -82,45 +82,45 @@ pub fn looks_like_iri(s: &str) -> bool {
     s.contains(':')
 }
 
-impl IntoEncoded<IRI> for View<str>
+impl Encodes<View<str>> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Encoded = Blob<IRI>;
-    fn into_encoded(self) -> Blob<IRI> {
+    fn encode(source: View<str>) -> Blob<IRI> {
         debug_assert!(
-            looks_like_iri(self.as_ref()),
+            looks_like_iri(source.as_ref()),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",
-            self.as_ref()
+            source.as_ref()
         );
-        Blob::new(self.bytes())
+        Blob::new(source.bytes())
     }
 }
 
-impl IntoEncoded<IRI> for &'static str
+impl Encodes<&'static str> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Encoded = Blob<IRI>;
-    fn into_encoded(self) -> Blob<IRI> {
+    fn encode(source: &'static str) -> Blob<IRI> {
         debug_assert!(
-            looks_like_iri(self),
+            looks_like_iri(source),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",
-            self
+            source
         );
-        Blob::new(self.into())
+        Blob::new(source.into())
     }
 }
 
-impl IntoEncoded<IRI> for String
+impl Encodes<String> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
     type Encoded = Blob<IRI>;
-    fn into_encoded(self) -> Blob<IRI> {
+    fn encode(source: String) -> Blob<IRI> {
         debug_assert!(
-            looks_like_iri(&self),
+            looks_like_iri(&source),
             "IRI::to_blob received a string that fails the IRI predicate: {:?}",
-            self
+            source
         );
-        Blob::new(self.into())
+        Blob::new(source.into())
     }
 }
 

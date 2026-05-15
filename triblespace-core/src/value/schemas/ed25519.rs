@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use ed25519::ComponentBytes;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
@@ -172,24 +172,27 @@ impl ED25519SComponent {
     }
 }
 
-impl IntoEncoded<ED25519RComponent> for Signature {
+impl Encodes<Signature> for ED25519RComponent
+{
     type Encoded = Inline<ED25519RComponent>;
-    fn into_encoded(self) -> Inline<ED25519RComponent> {
-        ED25519RComponent::from_signature(self)
+    fn encode(source: Signature) -> Inline<ED25519RComponent> {
+        ED25519RComponent::from_signature(source)
     }
 }
 
-impl IntoEncoded<ED25519SComponent> for Signature {
+impl Encodes<Signature> for ED25519SComponent
+{
     type Encoded = Inline<ED25519SComponent>;
-    fn into_encoded(self) -> Inline<ED25519SComponent> {
-        ED25519SComponent::from_signature(self)
+    fn encode(source: Signature) -> Inline<ED25519SComponent> {
+        ED25519SComponent::from_signature(source)
     }
 }
 
-impl IntoEncoded<ED25519RComponent> for ComponentBytes {
+impl Encodes<ComponentBytes> for ED25519RComponent
+{
     type Encoded = Inline<ED25519RComponent>;
-    fn into_encoded(self) -> Inline<ED25519RComponent> {
-        Inline::new(self)
+    fn encode(source: ComponentBytes) -> Inline<ED25519RComponent> {
+        Inline::new(source)
     }
 }
 
@@ -200,10 +203,11 @@ impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
     }
 }
 
-impl IntoEncoded<ED25519SComponent> for ComponentBytes {
+impl Encodes<ComponentBytes> for ED25519SComponent
+{
     type Encoded = Inline<ED25519SComponent>;
-    fn into_encoded(self) -> Inline<ED25519SComponent> {
-        Inline::new(self)
+    fn encode(source: ComponentBytes) -> Inline<ED25519SComponent> {
+        Inline::new(source)
     }
 }
 
@@ -214,10 +218,11 @@ impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
     }
 }
 
-impl IntoEncoded<ED25519PublicKey> for VerifyingKey {
+impl Encodes<VerifyingKey> for ED25519PublicKey
+{
     type Encoded = Inline<ED25519PublicKey>;
-    fn into_encoded(self) -> Inline<ED25519PublicKey> {
-        Inline::new(self.to_bytes())
+    fn encode(source: VerifyingKey) -> Inline<ED25519PublicKey> {
+        Inline::new(source.to_bytes())
     }
 }
 

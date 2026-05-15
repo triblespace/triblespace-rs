@@ -376,13 +376,13 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), true.to_inline().raw));
+                pairs.push((attr.raw(), attr.inline_from(true).raw));
                 Ok(())
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), false.to_inline().raw));
+                pairs.push((attr.raw(), attr.inline_from(false).raw));
                 Ok(())
             }
             Some(b'"') => {

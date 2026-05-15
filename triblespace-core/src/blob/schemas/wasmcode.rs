@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use anybytes::Bytes;
 
 use crate::blob::Blob;
@@ -38,30 +38,30 @@ impl MetaDescribe for WasmCode {
     }
 }
 
-impl IntoEncoded<WasmCode> for Bytes
+impl Encodes<Bytes> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_encoded(self) -> Blob<WasmCode> {
-        Blob::new(self)
+    fn encode(source: Bytes) -> Blob<WasmCode> {
+        Blob::new(source)
     }
 }
 
-impl IntoEncoded<WasmCode> for Vec<u8>
+impl Encodes<Vec<u8>> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_encoded(self) -> Blob<WasmCode> {
-        Blob::new(Bytes::from_source(self))
+    fn encode(source: Vec<u8>) -> Blob<WasmCode> {
+        Blob::new(Bytes::from_source(source))
     }
 }
 
-impl IntoEncoded<WasmCode> for &[u8]
+impl Encodes<&[u8]> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
     type Encoded = Blob<WasmCode>;
-    fn into_encoded(self) -> Blob<WasmCode> {
-        Blob::new(Bytes::from_source(self.to_vec()))
+    fn encode(source: &[u8]) -> Blob<WasmCode> {
+        Blob::new(Bytes::from_source(source.to_vec()))
     }
 }
 

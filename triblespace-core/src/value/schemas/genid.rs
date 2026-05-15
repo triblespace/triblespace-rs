@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
@@ -120,12 +120,20 @@ impl TryFromInline<'_, GenId> for RawId {
     }
 }
 
-impl IntoEncoded<GenId> for RawId {
+impl Encodes<RawId> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
+    fn encode(source: RawId) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
-        data[16..32].copy_from_slice(&self[..]);
+        data[16..32].copy_from_slice(&source[..]);
         Inline::new(data)
+    }
+}
+
+impl Encodes<&RawId> for GenId {
+    type Encoded = Inline<GenId>;
+    fn encode(source: &RawId) -> Inline<GenId> {
+        <GenId as Encodes<RawId>>::encode(*source)
     }
 }
 
@@ -154,19 +162,21 @@ impl TryFromInline<'_, GenId> for Id {
     }
 }
 
-impl IntoEncoded<GenId> for &Id {
+impl Encodes<&Id> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
+    fn encode(source: &Id) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
-        data[16..32].copy_from_slice(&self[..]);
+        data[16..32].copy_from_slice(&source[..]);
         Inline::new(data)
     }
 }
 
-impl IntoEncoded<GenId> for Id {
+impl Encodes<Id> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
-        (&self).to_inline()
+    fn encode(source: Id) -> Inline<GenId> {
+        (&source).to_inline()
     }
 }
 
@@ -207,17 +217,19 @@ impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
     }
 }
 
-impl IntoEncoded<GenId> for ExclusiveId {
+impl Encodes<ExclusiveId> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
-        self.id.to_inline()
+    fn encode(source: ExclusiveId) -> Inline<GenId> {
+        source.id.to_inline()
     }
 }
 
-impl IntoEncoded<GenId> for &ExclusiveId {
+impl Encodes<&ExclusiveId> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
-        self.id.to_inline()
+    fn encode(source: &ExclusiveId) -> Inline<GenId> {
+        source.id.to_inline()
     }
 }
 
@@ -233,17 +245,19 @@ impl TryFromInline<'_, GenId> for String {
     }
 }
 
-impl IntoEncoded<GenId> for OwnedId<'_> {
+impl Encodes<OwnedId<'_>> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
-        self.id.to_inline()
+    fn encode(source: OwnedId<'_>) -> Inline<GenId> {
+        source.id.to_inline()
     }
 }
 
-impl IntoEncoded<GenId> for &OwnedId<'_> {
+impl Encodes<&OwnedId<'_>> for GenId
+{
     type Encoded = Inline<GenId>;
-    fn into_encoded(self) -> Inline<GenId> {
-        self.id.to_inline()
+    fn encode(source: &OwnedId<'_>) -> Inline<GenId> {
+        source.id.to_inline()
     }
 }
 

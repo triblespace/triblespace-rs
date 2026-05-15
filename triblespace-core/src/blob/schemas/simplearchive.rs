@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::TryFromBlob;
@@ -43,25 +43,25 @@ impl MetaDescribe for SimpleArchive {
     }
 }
 
-impl IntoEncoded<SimpleArchive> for TribleSet
+impl Encodes<TribleSet> for SimpleArchive
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
     type Encoded = Blob<SimpleArchive>;
-    fn into_encoded(self) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
-        tribles.extend(self.eav.iter_ordered());
+    fn encode(source: TribleSet) -> Blob<SimpleArchive> {
+        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
+        tribles.extend(source.eav.iter_ordered());
         let bytes: Bytes = tribles.into();
         Blob::new(bytes)
     }
 }
 
-impl IntoEncoded<SimpleArchive> for &TribleSet
+impl Encodes<&TribleSet> for SimpleArchive
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
     type Encoded = Blob<SimpleArchive>;
-    fn into_encoded(self) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
-        tribles.extend(self.eav.iter_ordered());
+    fn encode(source: &TribleSet) -> Blob<SimpleArchive> {
+        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
+        tribles.extend(source.eav.iter_ordered());
         let bytes: Bytes = tribles.into();
         Blob::new(bytes)
     }

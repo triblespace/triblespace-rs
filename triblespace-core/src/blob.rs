@@ -310,13 +310,13 @@ impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
 /// `Blob<S>` is the identity source for [`IntoEncoded<S>`] in the
 /// blob path: it converts to itself with no allocation, and the
 /// cached handle inside lets every downstream step skip rehashing.
-impl<S: BlobSchema> crate::value::IntoEncoded<S> for Blob<S>
+impl<S: BlobSchema> crate::value::Encodes<Blob<S>> for S
 where
     Handle<S>: InlineSchema,
 {
     type Encoded = Blob<S>;
-    fn into_encoded(self) -> Blob<S> {
-        self
+    fn encode(source: Blob<S>) -> Blob<S> {
+        source
     }
 }
 
@@ -340,24 +340,24 @@ where
 /// `Handle<T>`-attributed field's `Encoding`). Encoded is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
-impl<T: BlobSchema> crate::value::IntoEncoded<T> for Inline<Handle<T>>
+impl<T: BlobSchema> crate::value::Encodes<Inline<Handle<T>>> for T
 where
     Handle<T>: InlineSchema,
 {
     type Encoded = Inline<Handle<T>>;
-    fn into_encoded(self) -> Inline<Handle<T>> {
-        self
+    fn encode(source: Inline<Handle<T>>) -> Inline<Handle<T>> {
+        source
     }
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T: BlobSchema> crate::value::IntoEncoded<T> for &Inline<Handle<T>>
+impl<T: BlobSchema> crate::value::Encodes<&Inline<Handle<T>>> for T
 where
     Handle<T>: InlineSchema,
 {
     type Encoded = Inline<Handle<T>>;
-    fn into_encoded(self) -> Inline<Handle<T>> {
-        *self
+    fn encode(source: &Inline<Handle<T>>) -> Inline<Handle<T>> {
+        *source
     }
 }
 

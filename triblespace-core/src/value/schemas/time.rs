@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -256,11 +256,12 @@ impl std::fmt::Display for ReservedBitsNonZero {
     }
 }
 
-impl IntoEncoded<NsDuration> for i128 {
+impl Encodes<i128> for NsDuration
+{
     type Encoded = Inline<NsDuration>;
-    fn into_encoded(self) -> Inline<NsDuration> {
+    fn encode(source: i128) -> Inline<NsDuration> {
         let mut raw = [0u8; 32];
-        raw[0..16].copy_from_slice(&i128_to_ordered_be(self));
+        raw[0..16].copy_from_slice(&i128_to_ordered_be(source));
         Inline::new(raw)
     }
 }
@@ -276,10 +277,11 @@ impl TryFromInline<'_, NsDuration> for i128 {
     }
 }
 
-impl IntoEncoded<NsDuration> for Duration {
+impl Encodes<Duration> for NsDuration
+{
     type Encoded = Inline<NsDuration>;
-    fn into_encoded(self) -> Inline<NsDuration> {
-        self.total_nanoseconds().to_inline()
+    fn encode(source: Duration) -> Inline<NsDuration> {
+        source.total_nanoseconds().to_inline()
     }
 }
 

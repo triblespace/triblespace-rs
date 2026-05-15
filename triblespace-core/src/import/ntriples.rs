@@ -93,6 +93,8 @@ use crate::value::schemas::hash::Handle;
 use crate::value::schemas::shortstring::ShortString;
 use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::value::schemas::UnknownInline;
+use crate::value::schemas::boolean::Boolean;
+use crate::value::schemas::f64::F64;
 use crate::value::{RawInline, IntoInline, TryToInline, Inline};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -1463,19 +1465,22 @@ fn emit_typed_literal<Blobs>(
             "float" | "double" => {
                 if let Ok(val) = text.parse::<f64>() {
                     let attr_id = attr_cache.f64(predicate);
-                    facts.insert(&Trible::new(e, &attr_id, &val.to_inline()));
+                    let v: Inline<F64> = val.to_inline();
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
             }
             "boolean" => match text.as_ref() {
                 "true" | "1" => {
                     let attr_id = attr_cache.boolean(predicate);
-                    facts.insert(&Trible::new(e, &attr_id, &true.to_inline()));
+                    let v: Inline<Boolean> = true.to_inline();
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
                 "false" | "0" => {
                     let attr_id = attr_cache.boolean(predicate);
-                    facts.insert(&Trible::new(e, &attr_id, &false.to_inline()));
+                    let v: Inline<Boolean> = false.to_inline();
+                    facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
                 _ => {}
@@ -1586,7 +1591,8 @@ fn emit_lang_literal<Blobs>(
         .expect("intrinsic id from rdf_lang+rdf_text");
     *facts += label_fragment;
     let attr_id = attr_cache.genid(predicate);
-    facts.insert(&Trible::new(e, &attr_id, &label_id.to_inline()));
+    let v: Inline<GenId> = label_id.to_inline();
+    facts.insert(&Trible::new(e, &attr_id, &v));
 }
 
 /// Convenience wrapper around [`import_bytes`] that opens a file at

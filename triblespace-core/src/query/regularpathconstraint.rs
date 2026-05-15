@@ -16,6 +16,7 @@ use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
+use crate::value::Inline;
 use crate::value::RawInline;
 use crate::value::IntoInline;
 
@@ -529,7 +530,8 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
             let mut binding = Binding::default();
-            binding.set(0, &start.to_inline().raw);
+            let start_inline: Inline<GenId> = start.to_inline();
+            binding.set(0, &start_inline.raw);
             constraint.estimate(dest_idx, &binding).unwrap_or(0)
         }
     }

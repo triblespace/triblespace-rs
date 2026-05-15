@@ -1,4 +1,4 @@
-use crate::value::IntoEncoded;
+use crate::value::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -276,10 +276,11 @@ impl TryFromInline<'_, F256BE> for f256 {
     }
 }
 
-impl IntoEncoded<F256BE> for f256 {
+impl Encodes<f256> for F256BE
+{
     type Encoded = Inline<F256BE>;
-    fn into_encoded(self) -> Inline<F256BE> {
-        Inline::new(self.to_be_bytes())
+    fn encode(source: f256) -> Inline<F256BE> {
+        Inline::new(source.to_be_bytes())
     }
 }
 
@@ -290,10 +291,11 @@ impl TryFromInline<'_, F256LE> for f256 {
     }
 }
 
-impl IntoEncoded<F256LE> for f256 {
+impl Encodes<f256> for F256LE
+{
     type Encoded = Inline<F256LE>;
-    fn into_encoded(self) -> Inline<F256LE> {
-        Inline::new(self.to_le_bytes())
+    fn encode(source: f256) -> Inline<F256LE> {
+        Inline::new(source.to_le_bytes())
     }
 }
 
