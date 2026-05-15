@@ -101,7 +101,7 @@ fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
 }
 
 impl IntoSchema<LineLocation> for (u64, u64, u64, u64) {
-    type Form = Inline<LineLocation>;
+    type Encoded = Inline<LineLocation>;
     fn into_schema(self) -> Inline<LineLocation> {
         Inline::new(encode_location(self))
     }
@@ -115,7 +115,7 @@ impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
 }
 
 impl IntoSchema<LineLocation> for Span {
-    type Form = Inline<LineLocation>;
+    type Encoded = Inline<LineLocation>;
     fn into_schema(self) -> Inline<LineLocation> {
         (
             self.start().line() as u64,

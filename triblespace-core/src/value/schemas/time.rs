@@ -257,7 +257,7 @@ impl std::fmt::Display for ReservedBitsNonZero {
 }
 
 impl IntoSchema<NsDuration> for i128 {
-    type Form = Inline<NsDuration>;
+    type Encoded = Inline<NsDuration>;
     fn into_schema(self) -> Inline<NsDuration> {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&i128_to_ordered_be(self));
@@ -277,7 +277,7 @@ impl TryFromInline<'_, NsDuration> for i128 {
 }
 
 impl IntoSchema<NsDuration> for Duration {
-    type Form = Inline<NsDuration>;
+    type Encoded = Inline<NsDuration>;
     fn into_schema(self) -> Inline<NsDuration> {
         self.total_nanoseconds().to_inline()
     }

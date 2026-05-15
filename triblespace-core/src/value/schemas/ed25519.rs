@@ -173,21 +173,21 @@ impl ED25519SComponent {
 }
 
 impl IntoSchema<ED25519RComponent> for Signature {
-    type Form = Inline<ED25519RComponent>;
+    type Encoded = Inline<ED25519RComponent>;
     fn into_schema(self) -> Inline<ED25519RComponent> {
         ED25519RComponent::from_signature(self)
     }
 }
 
 impl IntoSchema<ED25519SComponent> for Signature {
-    type Form = Inline<ED25519SComponent>;
+    type Encoded = Inline<ED25519SComponent>;
     fn into_schema(self) -> Inline<ED25519SComponent> {
         ED25519SComponent::from_signature(self)
     }
 }
 
 impl IntoSchema<ED25519RComponent> for ComponentBytes {
-    type Form = Inline<ED25519RComponent>;
+    type Encoded = Inline<ED25519RComponent>;
     fn into_schema(self) -> Inline<ED25519RComponent> {
         Inline::new(self)
     }
@@ -201,7 +201,7 @@ impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
 }
 
 impl IntoSchema<ED25519SComponent> for ComponentBytes {
-    type Form = Inline<ED25519SComponent>;
+    type Encoded = Inline<ED25519SComponent>;
     fn into_schema(self) -> Inline<ED25519SComponent> {
         Inline::new(self)
     }
@@ -215,7 +215,7 @@ impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
 }
 
 impl IntoSchema<ED25519PublicKey> for VerifyingKey {
-    type Form = Inline<ED25519PublicKey>;
+    type Encoded = Inline<ED25519PublicKey>;
     fn into_schema(self) -> Inline<ED25519PublicKey> {
         Inline::new(self.to_bytes())
     }

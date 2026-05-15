@@ -143,7 +143,7 @@ fn decode_range_value<S: InlineSchema>(value: &Inline<S>) -> (u128, u128) {
 }
 
 impl IntoSchema<RangeU128> for (u128, u128) {
-    type Form = Inline<RangeU128>;
+    type Encoded = Inline<RangeU128>;
     fn into_schema(self) -> Inline<RangeU128> {
         encode_range_value(self)
     }
@@ -157,7 +157,7 @@ impl TryFromInline<'_, RangeU128> for (u128, u128) {
 }
 
 impl IntoSchema<RangeInclusiveU128> for (u128, u128) {
-    type Form = Inline<RangeInclusiveU128>;
+    type Encoded = Inline<RangeInclusiveU128>;
     fn into_schema(self) -> Inline<RangeInclusiveU128> {
         encode_range_value(self)
     }

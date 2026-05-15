@@ -41,7 +41,7 @@
 //! }
 //!
 //! impl triblespace_core::value::IntoSchema<MyNumber> for u32 {
-//!   type Form = Inline<MyNumber>;
+//!   type Encoded = Inline<MyNumber>;
 //!   fn into_schema(self) -> Inline<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
 //!      let mut bytes = [0; 32];
@@ -64,7 +64,7 @@
 //! }
 //!
 //! impl triblespace_core::value::IntoSchema<MyNumber> for u64 {
-//!  type Form = Inline<MyNumber>;
+//!  type Encoded = Inline<MyNumber>;
 //!  fn into_schema(self) -> Inline<MyNumber> {
 //!   let mut bytes = [0; 32];
 //!   bytes[0..8].copy_from_slice(&self.to_le_bytes());
@@ -326,9 +326,9 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     /// The trait parameter to dispatch via for `entity!{}` field
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `FieldKind = Self` — sources convert via
-    /// `IntoSchema<Self> { Form = Inline<Self> }`. For
+    /// `IntoSchema<Self> { Encoded = Inline<Self> }`. For
     /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
-    /// `FieldKind = T` — sources convert via `IntoSchema<T> { Form =
+    /// `FieldKind = T` — sources convert via `IntoSchema<T> { Encoded =
     /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
     /// position 0 is what lets downstream impl `IntoSchema<MyBlob>
     /// for MyType` without bumping into the orphan rule.
@@ -384,8 +384,8 @@ pub trait TryToInline<S: InlineSchema> {
 ///
 /// `IntoSchema<S>` is the **sole** source-to-schema conversion trait.
 /// `S` is intentionally unbounded so the same trait can target either
-/// an `InlineSchema` (Form = `Inline<S>`) or a `BlobSchema`
-/// (Form = `Blob<S>`). The Form's relationship to `S` is captured by
+/// an `InlineSchema` (Encoded = `Inline<S>`) or a `BlobSchema`
+/// (Encoded = `Blob<S>`). The Encoded's relationship to `S` is captured by
 /// [`ToValue`], which lifts the form into a [`Value`] the
 /// `entity!{}` macro folds into a Fragment.
 ///
@@ -398,19 +398,19 @@ pub trait TryToInline<S: InlineSchema> {
 /// historically; preserved here by keeping the schema type unbuiried.
 pub trait IntoSchema<S> {
     /// The concrete form this source produces.
-    type Form;
+    type Encoded;
     /// Run the conversion.
-    fn into_schema(self) -> Self::Form;
+    fn into_schema(self) -> Self::Encoded;
 }
 
-/// Shorthand bound for `IntoSchema<S, Form = Inline<S>>` — "this
+/// Shorthand bound for `IntoSchema<S, Encoded = Inline<S>>` — "this
 /// source produces a directly-encoded `Inline<S>`, no side-blob."
 ///
 /// `IntoInline` is a supertrait alias over [`IntoSchema`]: any type
-/// that implements `IntoSchema<S>` with `Form = Inline<S>`
+/// that implements `IntoSchema<S>` with `Encoded = Inline<S>`
 /// automatically becomes `IntoInline<S>`, and gains the
 /// `to_inline(self) -> Inline<S>` convenience method.
-pub trait IntoInline<S: InlineSchema>: IntoSchema<S, Form = Inline<S>> {
+pub trait IntoInline<S: InlineSchema>: IntoSchema<S, Encoded = Inline<S>> {
     /// Convert directly to `Inline<S>`.
     fn to_inline(self) -> Inline<S>
     where
@@ -422,7 +422,7 @@ pub trait IntoInline<S: InlineSchema>: IntoSchema<S, Form = Inline<S>> {
 impl<S, T> IntoInline<S> for T
 where
     S: InlineSchema,
-    T: IntoSchema<S, Form = Inline<S>>,
+    T: IntoSchema<S, Encoded = Inline<S>>,
 {
 }
 
@@ -478,7 +478,7 @@ impl<V: InlineSchema> Value<V> {
     }
 }
 
-/// Lift an [`IntoSchema::Form`] into the [`Value`] sum the
+/// Lift an [`IntoSchema::Encoded`] into the [`Value`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
@@ -524,14 +524,14 @@ pub trait TryFromInline<'a, S: InlineSchema>: Sized {
 }
 
 impl<S: InlineSchema> IntoSchema<S> for Inline<S> {
-    type Form = Inline<S>;
+    type Encoded = Inline<S>;
     fn into_schema(self) -> Inline<S> {
         self
     }
 }
 
 impl<S: InlineSchema> IntoSchema<S> for &Inline<S> {
-    type Form = Inline<S>;
+    type Encoded = Inline<S>;
     fn into_schema(self) -> Inline<S> {
         *self
     }

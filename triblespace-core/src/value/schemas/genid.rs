@@ -121,7 +121,7 @@ impl TryFromInline<'_, GenId> for RawId {
 }
 
 impl IntoSchema<GenId> for RawId {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
@@ -155,7 +155,7 @@ impl TryFromInline<'_, GenId> for Id {
 }
 
 impl IntoSchema<GenId> for &Id {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&self[..]);
@@ -164,7 +164,7 @@ impl IntoSchema<GenId> for &Id {
 }
 
 impl IntoSchema<GenId> for Id {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         (&self).to_inline()
     }
@@ -208,14 +208,14 @@ impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
 }
 
 impl IntoSchema<GenId> for ExclusiveId {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }
 
 impl IntoSchema<GenId> for &ExclusiveId {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         self.id.to_inline()
     }
@@ -234,14 +234,14 @@ impl TryFromInline<'_, GenId> for String {
 }
 
 impl IntoSchema<GenId> for OwnedId<'_> {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         self.id.to_inline()
     }
 }
 
 impl IntoSchema<GenId> for &OwnedId<'_> {
-    type Form = Inline<GenId>;
+    type Encoded = Inline<GenId>;
     fn into_schema(self) -> Inline<GenId> {
         self.id.to_inline()
     }

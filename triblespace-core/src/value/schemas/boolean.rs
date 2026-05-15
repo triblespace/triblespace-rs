@@ -131,14 +131,14 @@ impl TryToInline<Boolean> for &bool {
 }
 
 impl IntoSchema<Boolean> for bool {
-    type Form = Inline<Boolean>;
+    type Encoded = Inline<Boolean>;
     fn into_schema(self) -> Inline<Boolean> {
         Boolean::encode(self)
     }
 }
 
 impl IntoSchema<Boolean> for &bool {
-    type Form = Inline<Boolean>;
+    type Encoded = Inline<Boolean>;
     fn into_schema(self) -> Inline<Boolean> {
         Boolean::encode(*self)
     }

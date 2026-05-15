@@ -398,7 +398,7 @@ mod wasm_formatter {
 }
 
 impl IntoSchema<U256BE> for ethnum::U256 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(self.to_be_bytes())
     }
@@ -412,7 +412,7 @@ impl TryFromInline<'_, U256BE> for ethnum::U256 {
 }
 
 impl IntoSchema<U256LE> for ethnum::U256 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(self.to_le_bytes())
     }
@@ -426,7 +426,7 @@ impl TryFromInline<'_, U256LE> for ethnum::U256 {
 }
 
 impl IntoSchema<I256BE> for ethnum::I256 {
-    type Form = Inline<I256BE>;
+    type Encoded = Inline<I256BE>;
     fn into_schema(self) -> Inline<I256BE> {
         Inline::new(self.to_be_bytes())
     }
@@ -440,7 +440,7 @@ impl TryFromInline<'_, I256BE> for ethnum::I256 {
 }
 
 impl IntoSchema<I256LE> for ethnum::I256 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(self.to_le_bytes())
     }
@@ -454,133 +454,133 @@ impl TryFromInline<'_, I256LE> for ethnum::I256 {
 }
 
 impl IntoSchema<U256LE> for u8 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u16 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u32 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u64 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256LE> for u128 {
-    type Form = Inline<U256LE>;
+    type Encoded = Inline<U256LE>;
     fn into_schema(self) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(self).to_le_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u8 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u16 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u32 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u64 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<U256BE> for u128 {
-    type Form = Inline<U256BE>;
+    type Encoded = Inline<U256BE>;
     fn into_schema(self) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(self).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i8 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i16 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i32 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i64 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(self.into()).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256LE> for i128 {
-    type Form = Inline<I256LE>;
+    type Encoded = Inline<I256LE>;
     fn into_schema(self) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(self).to_le_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i8 {
-    type Form = Inline<I256BE>;
+    type Encoded = Inline<I256BE>;
     fn into_schema(self) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i32 {
-    type Form = Inline<I256BE>;
+    type Encoded = Inline<I256BE>;
     fn into_schema(self) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i64 {
-    type Form = Inline<I256BE>;
+    type Encoded = Inline<I256BE>;
     fn into_schema(self) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(self.into()).to_be_bytes())
     }
 }
 
 impl IntoSchema<I256BE> for i128 {
-    type Form = Inline<I256BE>;
+    type Encoded = Inline<I256BE>;
     fn into_schema(self) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(self).to_be_bytes())
     }

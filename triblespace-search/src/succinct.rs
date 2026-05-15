@@ -1759,7 +1759,7 @@ impl MetaDescribe for SuccinctBM25Blob {
 impl<D: InlineSchema, T: InlineSchema> IntoSchema<SuccinctBM25Blob> for &SuccinctBM25Index<D, T>
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
-    type Form = Blob<SuccinctBM25Blob>;
+    type Encoded = Blob<SuccinctBM25Blob>;
     fn into_schema(self) -> Blob<SuccinctBM25Blob> {
         // Canonical-bytes pattern: the index *is* its blob, so
         // we just hand over a refcounted clone of the bytes.
@@ -1770,7 +1770,7 @@ where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblesp
 impl<D: InlineSchema, T: InlineSchema> IntoSchema<SuccinctBM25Blob> for SuccinctBM25Index<D, T>
 where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
 {
-    type Form = Blob<SuccinctBM25Blob>;
+    type Encoded = Blob<SuccinctBM25Blob>;
     fn into_schema(self) -> Blob<SuccinctBM25Blob> {
         Blob::new(self.bytes)
     }
@@ -1842,7 +1842,7 @@ impl MetaDescribe for SuccinctHNSWBlob {
 impl IntoSchema<SuccinctHNSWBlob> for &SuccinctHNSWIndex
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
-    type Form = Blob<SuccinctHNSWBlob>;
+    type Encoded = Blob<SuccinctHNSWBlob>;
     fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
         // Canonical-bytes pattern: refcounted handover.
         Blob::new(self.bytes.clone())
@@ -1852,7 +1852,7 @@ where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblesp
 impl IntoSchema<SuccinctHNSWBlob> for SuccinctHNSWIndex
 where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
 {
-    type Form = Blob<SuccinctHNSWBlob>;
+    type Encoded = Blob<SuccinctHNSWBlob>;
     fn into_schema(self) -> Blob<SuccinctHNSWBlob> {
         Blob::new(self.bytes)
     }

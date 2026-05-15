@@ -56,7 +56,7 @@ impl TryFromBlob<RawBytes> for Bytes {
 impl IntoSchema<RawBytes> for Bytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Form = Blob<RawBytes>;
+    type Encoded = Blob<RawBytes>;
     fn into_schema(self) -> Blob<RawBytes> {
         Blob::new(self)
     }
@@ -65,7 +65,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 impl IntoSchema<RawBytes> for Vec<u8>
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Form = Blob<RawBytes>;
+    type Encoded = Blob<RawBytes>;
     fn into_schema(self) -> Blob<RawBytes> {
         Blob::new(Bytes::from_source(self))
     }
@@ -74,7 +74,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 impl IntoSchema<RawBytes> for &[u8]
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Form = Blob<RawBytes>;
+    type Encoded = Blob<RawBytes>;
     fn into_schema(self) -> Blob<RawBytes> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }

@@ -181,7 +181,7 @@ impl TryFromInline<'_, R256BE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256BE> for Ratio<i128> {
-    type Form = Inline<R256BE>;
+    type Encoded = Inline<R256BE>;
     fn into_schema(self) -> Inline<R256BE> {
         let ratio = self.reduced();
 
@@ -194,7 +194,7 @@ impl IntoSchema<R256BE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256BE> for i128 {
-    type Form = Inline<R256BE>;
+    type Encoded = Inline<R256BE>;
     fn into_schema(self) -> Inline<R256BE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_be_bytes());
@@ -228,7 +228,7 @@ impl TryFromInline<'_, R256LE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256LE> for Ratio<i128> {
-    type Form = Inline<R256LE>;
+    type Encoded = Inline<R256LE>;
     fn into_schema(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.numer().to_le_bytes());
@@ -239,7 +239,7 @@ impl IntoSchema<R256LE> for Ratio<i128> {
 }
 
 impl IntoSchema<R256LE> for i128 {
-    type Form = Inline<R256LE>;
+    type Encoded = Inline<R256LE>;
     fn into_schema(self) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&self.to_le_bytes());

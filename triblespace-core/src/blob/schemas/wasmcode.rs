@@ -41,7 +41,7 @@ impl MetaDescribe for WasmCode {
 impl IntoSchema<WasmCode> for Bytes
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Form = Blob<WasmCode>;
+    type Encoded = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(self)
     }
@@ -50,7 +50,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 impl IntoSchema<WasmCode> for Vec<u8>
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Form = Blob<WasmCode>;
+    type Encoded = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self))
     }
@@ -59,7 +59,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 impl IntoSchema<WasmCode> for &[u8]
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Form = Blob<WasmCode>;
+    type Encoded = Blob<WasmCode>;
     fn into_schema(self) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(self.to_vec()))
     }

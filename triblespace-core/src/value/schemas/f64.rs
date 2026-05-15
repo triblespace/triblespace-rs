@@ -76,7 +76,7 @@ impl TryFromInline<'_, F64> for f64 {
 }
 
 impl IntoSchema<F64> for f64 {
-    type Form = Inline<F64>;
+    type Encoded = Inline<F64>;
     fn into_schema(self) -> Inline<F64> {
         let mut raw = [0u8; 32];
         raw[..8].copy_from_slice(&self.to_le_bytes());

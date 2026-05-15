@@ -46,7 +46,7 @@ impl MetaDescribe for SimpleArchive {
 impl IntoSchema<SimpleArchive> for TribleSet
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
-    type Form = Blob<SimpleArchive>;
+    type Encoded = Blob<SimpleArchive>;
     fn into_schema(self) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
         tribles.extend(self.eav.iter_ordered());
@@ -58,7 +58,7 @@ where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSc
 impl IntoSchema<SimpleArchive> for &TribleSet
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
-    type Form = Blob<SimpleArchive>;
+    type Encoded = Blob<SimpleArchive>;
     fn into_schema(self) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(self.len());
         tribles.extend(self.eav.iter_ordered());

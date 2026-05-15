@@ -156,21 +156,21 @@ impl TryToInline<ShortString> for String {
 }
 
 impl IntoSchema<ShortString> for &str {
-    type Form = Inline<ShortString>;
+    type Encoded = Inline<ShortString>;
     fn into_schema(self) -> Inline<ShortString> {
         self.try_to_inline().unwrap()
     }
 }
 
 impl IntoSchema<ShortString> for String {
-    type Form = Inline<ShortString>;
+    type Encoded = Inline<ShortString>;
     fn into_schema(self) -> Inline<ShortString> {
         self.try_to_inline().unwrap()
     }
 }
 
 impl IntoSchema<ShortString> for &String {
-    type Form = Inline<ShortString>;
+    type Encoded = Inline<ShortString>;
     fn into_schema(self) -> Inline<ShortString> {
         self.to_str().try_to_inline().unwrap()
     }

@@ -720,7 +720,7 @@ where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
-    type Form = Blob<SuccinctArchiveBlob>;
+    type Encoded = Blob<SuccinctArchiveBlob>;
     fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes.clone())
     }
@@ -731,7 +731,7 @@ where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
-    type Form = Blob<SuccinctArchiveBlob>;
+    type Encoded = Blob<SuccinctArchiveBlob>;
     fn into_schema(self) -> Blob<SuccinctArchiveBlob> {
         Blob::new(self.bytes)
     }

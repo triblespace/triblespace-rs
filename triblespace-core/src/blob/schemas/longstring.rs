@@ -52,7 +52,7 @@ impl TryFromBlob<LongString> for View<str> {
 impl IntoSchema<LongString> for View<str>
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Form = Blob<LongString>;
+    type Encoded = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.bytes())
     }
@@ -61,7 +61,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 impl IntoSchema<LongString> for &'static str
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Form = Blob<LongString>;
+    type Encoded = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.into())
     }
@@ -70,7 +70,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 impl IntoSchema<LongString> for String
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Form = Blob<LongString>;
+    type Encoded = Blob<LongString>;
     fn into_schema(self) -> Blob<LongString> {
         Blob::new(self.into())
     }

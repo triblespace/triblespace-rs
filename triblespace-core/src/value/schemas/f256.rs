@@ -277,7 +277,7 @@ impl TryFromInline<'_, F256BE> for f256 {
 }
 
 impl IntoSchema<F256BE> for f256 {
-    type Form = Inline<F256BE>;
+    type Encoded = Inline<F256BE>;
     fn into_schema(self) -> Inline<F256BE> {
         Inline::new(self.to_be_bytes())
     }
@@ -291,7 +291,7 @@ impl TryFromInline<'_, F256LE> for f256 {
 }
 
 impl IntoSchema<F256LE> for f256 {
-    type Form = Inline<F256LE>;
+    type Encoded = Inline<F256LE>;
     fn into_schema(self) -> Inline<F256LE> {
         Inline::new(self.to_le_bytes())
     }

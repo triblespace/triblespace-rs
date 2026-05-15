@@ -30,7 +30,7 @@ impl InlineSchema for U64LE {
 }
 
 impl IntoSchema<U64LE> for u64 {
-    type Form = Inline<U64LE>;
+    type Encoded = Inline<U64LE>;
     fn into_schema(self) -> Inline<U64LE> {
         let mut raw = [0u8; INLINE_LEN];
         raw[..8].copy_from_slice(&self.to_le_bytes());
@@ -59,7 +59,7 @@ impl MetaDescribe for BytesBlob {
 impl BlobSchema for BytesBlob {}
 
 impl IntoSchema<BytesBlob> for Bytes {
-    type Form = Blob<BytesBlob>;
+    type Encoded = Blob<BytesBlob>;
     fn into_schema(self) -> Blob<BytesBlob> {
         Blob::new(self)
     }

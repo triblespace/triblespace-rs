@@ -74,7 +74,7 @@ impl<T: ArrayElement> crate::value::IntoSchema<Array<T>> for Vec<T::Native>
 where
     crate::value::schemas::hash::Handle<Array<T>>: crate::value::InlineSchema,
 {
-    type Form = Blob<Array<T>>;
+    type Encoded = Blob<Array<T>>;
     fn into_schema(self) -> Blob<Array<T>> {
         Blob::new(Bytes::from_source(self))
     }
