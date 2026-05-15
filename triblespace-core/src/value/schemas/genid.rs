@@ -80,7 +80,7 @@ mod wasm_formatter {
 }
 impl InlineSchema for GenId {
     type ValidationError = ();
-    type FieldKind = Self;
+    type Encoding = Self;
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         if value.raw[0..16] == [0; 16] {
             Ok(value)

@@ -26,7 +26,7 @@ impl MetaDescribe for U64LE {
 
 impl InlineSchema for U64LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 impl IntoEncoded<U64LE> for u64 {

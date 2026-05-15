@@ -89,7 +89,7 @@ mod wasm_formatter {
 
 impl InlineSchema for ShortString {
     type ValidationError = ValidationError;
-    type FieldKind = Self;
+    type Encoding = Self;
 
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         let raw = &value.raw;

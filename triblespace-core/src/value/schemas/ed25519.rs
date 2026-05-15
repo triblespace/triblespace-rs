@@ -53,7 +53,7 @@ impl MetaDescribe for ED25519RComponent {
 }
 impl InlineSchema for ED25519RComponent {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for ED25519SComponent {
     fn describe() -> Fragment {
@@ -81,7 +81,7 @@ impl MetaDescribe for ED25519SComponent {
 }
 impl InlineSchema for ED25519SComponent {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for ED25519PublicKey {
     fn describe() -> Fragment {
@@ -109,7 +109,7 @@ impl MetaDescribe for ED25519PublicKey {
 }
 impl InlineSchema for ED25519PublicKey {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 #[cfg(feature = "wasm")]

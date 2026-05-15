@@ -84,7 +84,7 @@ mod wasm_formatter {
 
 impl InlineSchema for UnknownInline {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         Ok(value)

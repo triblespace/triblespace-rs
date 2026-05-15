@@ -337,7 +337,7 @@ where
 
 /// Precomputed-handle case: a `Inline<Handle<T>>` can be passed as a
 /// `IntoEncoded<T>` source (T is the BlobSchema, matching the
-/// `Handle<T>`-attributed field's `FieldKind`). Encoded is the value
+/// `Handle<T>`-attributed field's `Encoding`). Encoded is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
 impl<T: BlobSchema> crate::value::IntoEncoded<T> for Inline<Handle<T>>

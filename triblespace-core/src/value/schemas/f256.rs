@@ -54,7 +54,7 @@ impl MetaDescribe for F256LE {
 }
 impl InlineSchema for F256LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for F256BE {
     fn describe() -> Fragment {
@@ -83,7 +83,7 @@ impl MetaDescribe for F256BE {
 }
 impl InlineSchema for F256BE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 #[cfg(feature = "wasm")]

@@ -86,7 +86,7 @@ impl<S: InlineSchema> Attribute<S> {
     /// `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoEncoded`], parameterised by the schema's
-    /// [`FieldKind`](crate::value::InlineSchema::FieldKind) — `S`
+    /// [`Encoding`](crate::value::InlineSchema::Encoding) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
     /// `Handle<T>`. The resulting `Encoded` is lifted into a [`Value`]
     /// via [`ToValue`].
@@ -97,9 +97,9 @@ impl<S: InlineSchema> Attribute<S> {
     /// [`Value<S>`]: crate::value::Value
     pub fn value_from<V>(&self, v: V) -> crate::value::Value<S>
     where
-        V: crate::value::IntoEncoded<<S as crate::value::InlineSchema>::FieldKind>,
+        V: crate::value::IntoEncoded<<S as crate::value::InlineSchema>::Encoding>,
         <V as crate::value::IntoEncoded<
-            <S as crate::value::InlineSchema>::FieldKind,
+            <S as crate::value::InlineSchema>::Encoding,
         >>::Encoded: crate::value::ToValue<S>,
     {
         use crate::value::ToValue;

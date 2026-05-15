@@ -71,7 +71,7 @@ mod wasm_formatter {
 
 impl InlineSchema for LineLocation {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 fn encode_location(lines: (u64, u64, u64, u64)) -> RawInline {

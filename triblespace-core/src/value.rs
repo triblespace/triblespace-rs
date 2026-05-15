@@ -27,7 +27,7 @@
 //! }
 //! impl InlineSchema for MyNumber {
 //!    type ValidationError = ();
-//!    type FieldKind = Self;
+//!    type Encoding = Self;
 //!    // Every bit pattern is valid for this schema.
 //! }
 //!
@@ -325,14 +325,14 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
 
     /// The trait parameter to dispatch via for `entity!{}` field
     /// conversion. For *inline* schemas (32-byte data lives in the
-    /// trible), set `FieldKind = Self` — sources convert via
+    /// trible), set `Encoding = Self` — sources convert via
     /// `IntoEncoded<Self> { Encoded = Inline<Self> }`. For
     /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
-    /// `FieldKind = T` — sources convert via `IntoEncoded<T> { Encoded =
+    /// `Encoding = T` — sources convert via `IntoEncoded<T> { Encoded =
     /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
     /// position 0 is what lets downstream impl `IntoEncoded<MyBlob>
     /// for MyType` without bumping into the orphan rule.
-    type FieldKind;
+    type Encoding;
 
     /// Check if the given value conforms to this schema.
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {

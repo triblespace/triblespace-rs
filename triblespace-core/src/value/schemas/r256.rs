@@ -66,7 +66,7 @@ impl MetaDescribe for R256LE {
 }
 impl InlineSchema for R256LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for R256BE {
     fn describe() -> Fragment {
@@ -142,7 +142,7 @@ mod wasm_formatter {
 }
 impl InlineSchema for R256BE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 /// An error that can occur when converting a ratio value.

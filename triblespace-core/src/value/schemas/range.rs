@@ -56,7 +56,7 @@ impl MetaDescribe for RangeU128 {
 
 impl InlineSchema for RangeU128 {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 impl MetaDescribe for RangeInclusiveU128 {
@@ -116,7 +116,7 @@ mod wasm_formatters {
 
 impl InlineSchema for RangeInclusiveU128 {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 fn encode_pair(range: (u128, u128)) -> RawInline {

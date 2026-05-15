@@ -63,7 +63,7 @@ mod wasm_formatter {
 
 impl InlineSchema for F64 {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 impl TryFromInline<'_, F64> for f64 {

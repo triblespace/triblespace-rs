@@ -63,7 +63,7 @@ pub(crate) fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
 
 impl InlineSchema for NsTAIInterval {
     type ValidationError = InvertedIntervalError;
-    type FieldKind = Self;
+    type Encoding = Self;
 
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         let lower = i128_from_ordered_be(value.raw[0..16].try_into().unwrap());
@@ -228,7 +228,7 @@ impl MetaDescribe for NsDuration {
 
 impl InlineSchema for NsDuration {
     type ValidationError = ReservedBitsNonZero;
-    type FieldKind = Self;
+    type Encoding = Self;
 
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         if value.raw[16..32] != [0u8; 16] {

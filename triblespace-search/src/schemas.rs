@@ -64,7 +64,7 @@ impl MetaDescribe for F32LE {
 
 impl InlineSchema for F32LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 impl IntoEncoded<F32LE> for f32 {

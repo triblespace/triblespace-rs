@@ -128,7 +128,7 @@ where
     H: HashProtocol,
 {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 impl<H> Hash<H>
@@ -344,7 +344,7 @@ where
 
 impl<T: BlobSchema + MetaDescribe> InlineSchema for Handle<T> {
     type ValidationError = Infallible;
-    type FieldKind = T;
+    type Encoding = T;
 }
 
 impl MetaDescribe for Blake3 {

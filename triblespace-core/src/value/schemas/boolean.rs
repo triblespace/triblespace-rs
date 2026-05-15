@@ -98,7 +98,7 @@ mod wasm_formatter {
 
 impl InlineSchema for Boolean {
     type ValidationError = InvalidBoolean;
-    type FieldKind = Self;
+    type Encoding = Self;
 
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
         Self::decode(&value)?;

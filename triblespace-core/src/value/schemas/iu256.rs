@@ -62,7 +62,7 @@ impl MetaDescribe for U256LE {
 }
 impl InlineSchema for U256LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for U256BE {
     fn describe() -> Fragment {
@@ -91,7 +91,7 @@ impl MetaDescribe for U256BE {
 }
 impl InlineSchema for U256BE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for I256LE {
     fn describe() -> Fragment {
@@ -120,7 +120,7 @@ impl MetaDescribe for I256LE {
 }
 impl InlineSchema for I256LE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 impl MetaDescribe for I256BE {
     fn describe() -> Fragment {
@@ -149,7 +149,7 @@ impl MetaDescribe for I256BE {
 }
 impl InlineSchema for I256BE {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 #[cfg(feature = "wasm")]

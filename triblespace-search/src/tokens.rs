@@ -60,7 +60,7 @@ impl MetaDescribe for WordHash {
 
 impl InlineSchema for WordHash {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 /// Term schema for [`bigram_tokens`] — Blake3 hash of a pair of
@@ -92,7 +92,7 @@ impl MetaDescribe for BigramHash {
 
 impl InlineSchema for BigramHash {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 /// Term schema for [`ngram_tokens`] — Blake3 hash of a
@@ -126,7 +126,7 @@ impl MetaDescribe for NgramHash {
 
 impl InlineSchema for NgramHash {
     type ValidationError = Infallible;
-    type FieldKind = Self;
+    type Encoding = Self;
 }
 
 /// Tokenize `text` with a simple whitespace-and-lowercase scheme
