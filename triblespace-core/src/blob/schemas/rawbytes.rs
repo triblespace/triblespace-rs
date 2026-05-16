@@ -15,14 +15,17 @@ use anybytes::Bytes;
 
 /// Opaque raw bytes — no structural interpretation.
 ///
-/// Use this when the payload is intentionally bytes-without-further-
-/// structure, e.g. an XSD `hexBinary` / `base64Binary` literal, a
-/// digest value carried inline, or any other "the bytes ARE the
-/// content" case. Distinct from [`FileBytes`](super::filebytes::FileBytes)
-/// (which signals file provenance — attachments, dataset artifacts) and
-/// from [`UnknownBlob`](super::UnknownBlob) (the explicit "I don't know
-/// what schema this is" fallback): RawBytes is a positive choice
+/// Use this for any payload whose decode target is `Bytes`/`Vec<u8>` —
+/// XSD `hexBinary` / `base64Binary` literals, file contents, digest
+/// values carried inline, attachments, key material. Distinct from
+/// [`UnknownBlob`](super::UnknownBlob) (the explicit "I don't know
+/// what schema this is" fallback): `RawBytes` is a positive choice
 /// meaning "I do know what this is — it's bytes."
+///
+/// "File-provenance" or "attachment" semantic intent lives at the
+/// attribute level (`file::contents`, `request::body`, etc.), not at
+/// the encoding level — `RawBytes` is the byte encoding; attributes
+/// supply the meaning.
 pub struct RawBytes;
 
 impl BlobSchema for RawBytes {}
@@ -32,7 +35,7 @@ impl MetaDescribe for RawBytes {
         let id: Id = id_hex!("4C1BA1EB2FDCC637C2F269A46FCA2398");
         let mut tribles = Fragment::rooted(id, TribleSet::new());
         let description = tribles.put(
-            "Opaque raw bytes with no further structural interpretation. Used for content where the bytes themselves are the payload (XSD hexBinary / base64Binary literals, inline digests, key material). Distinct from FileBytes (file-provenance) and from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
+            "Opaque raw bytes with no further structural interpretation. Used for any payload whose decode target is Bytes/Vec<u8>: XSD hexBinary / base64Binary literals, file contents, inline digests, key material. Distinct from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
         );
         let name = tribles.put("rawbytes");
         tribles += entity! {

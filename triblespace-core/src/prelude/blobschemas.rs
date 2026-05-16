@@ -4,8 +4,6 @@
 pub use crate::blob::schemas::array::elements;
 /// Re-export of [`Array`] and [`ArrayElement`].
 pub use crate::blob::schemas::array::{Array, ArrayElement};
-/// Re-export of [`FileBytes`].
-pub use crate::blob::schemas::filebytes::FileBytes;
 /// Re-export of [`LongString`].
 pub use crate::blob::schemas::longstring::LongString;
 /// Re-export of [`RawBytes`].

@@ -317,7 +317,7 @@ Writing is explicit: open a transaction on a CAS variable.
 let mut tx = layer.txn(branch_id)?;
 
 // stage blobs (policy decides tier: memory/disk/etc.)
-let file = tx.put::<FileBytes, _>(bytes)?;
+let file = tx.put::<RawBytes, _>(bytes)?;
 
 // create a commit (facts are persisted as a content blob in the overlay)
 tx.commit(fragment, None, Some("update"))?;

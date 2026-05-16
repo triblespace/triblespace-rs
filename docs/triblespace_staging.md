@@ -27,7 +27,7 @@ This is intentionally Git-shaped: a workspace feels like an index/staging area.
    you can publish a head that is not dereferenceable in the durable store.
 
 2. **Large blobs make "in-memory staging" a footgun.**
-   `FileBytes` / attachments can be huge; keeping payloads in RAM is often an
+   `RawBytes` / attachments can be huge; keeping payloads in RAM is often an
    anti-pattern.
 
 3. **The Git mental model may not be buying us much.**

@@ -39,7 +39,7 @@ In practice, a **commit handle** is already an excellent bundle root:
   - the content blob (`SimpleArchive`), and optionally metadata and message
     blobs.
 - The content blob references:
-  - any additional blobs via typed handle values (e.g. `LongString`, `FileBytes`,
+  - any additional blobs via typed handle values (e.g. `LongString`, `RawBytes`,
     `WasmCode`, ...).
 
 So "exporting a graph" becomes:
@@ -97,7 +97,7 @@ Today `reachable` scans each blob's bytes for 32-byte windows and probes the
 store to see if they are handles. This is maximally generic, but it has two
 downsides:
 
-- Performance: scanning huge blobs (e.g. `FileBytes`) is expensive and can
+- Performance: scanning huge blobs (e.g. `RawBytes`) is expensive and can
   trigger many remote `get` probes.
 - Semantics: opaque file bytes should generally *not* be interpreted as a graph
   of references.
@@ -131,7 +131,7 @@ This is orthogonal to bundling and can be addressed with:
 
 1. Decide whether we want an explicit `Bundle` type (or keep bundles as plain
    `Vec<Handle<UnknownBlob>>` roots).
-2. Decide on reachability policy for `FileBytes` and other opaque blobs.
+2. Decide on reachability policy for `RawBytes` and other opaque blobs.
 3. Add a small cookbook section to the Tribles book showing:
    - "commit a fragment, export by commit handle"
    - "transfer reachable closure to a new repo"

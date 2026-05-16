@@ -2,8 +2,6 @@
 
 /// Flat typed array blob schema.
 pub mod array;
-/// Raw file bytes blob schema.
-pub mod filebytes;
 /// Arbitrary-length UTF-8 text blob schema.
 pub mod longstring;
 /// Opaque raw bytes blob schema (positive choice, distinct from UnknownBlob).

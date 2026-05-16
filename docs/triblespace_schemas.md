@@ -3,7 +3,7 @@
 ## Built-in blob schemas
 
 - `LongString` — UTF-8 text stored as a blob.
-- `FileBytes` — opaque file-backed byte payloads.
+- `RawBytes` — opaque file-backed byte payloads.
 - `SimpleArchive` — archived `TribleSet` blobs.
 - `SuccinctArchiveBlob` — compressed succinct archive index blobs.
 - `WasmCode` — WebAssembly modules stored as blobs.

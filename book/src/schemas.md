@@ -137,7 +137,7 @@ let schema_id = ShortString::id(); // derived via describe(&mut scratch).root()
 The crate also ships with these blob schemas:
 
 - `LongString` for arbitrarily long UTF‑8 strings.
-- `FileBytes` for opaque file-backed byte payloads.
+- `RawBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
   type](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/succinctarchive/struct.SuccinctArchive.html)
@@ -204,7 +204,7 @@ What are you storing?
 │  └─ Signature? → ED25519RComponent / ED25519SComponent / ED25519PublicKey
 │
 ├─ A file or binary payload?
-│  └─ Handle<FileBytes>  (blob)
+│  └─ Handle<RawBytes>  (blob)
 │
 ├─ A large structured dataset?
 │  └─ Handle<SimpleArchive>  (blob, stores a TribleSet)
