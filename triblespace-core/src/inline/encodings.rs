@@ -1,6 +1,6 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Inline]s.
 
-/// Boolean value schema (all-zero / all-one encoding).
+/// Boolean inline encoding (all-zero / all-one encoding).
 pub mod boolean;
 /// Ed25519 signature component and public key schemas.
 pub mod ed25519;
@@ -36,10 +36,10 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
-/// A value schema for an unknown value.
-/// This value schema is used as a fallback when the value schema is not known.
-/// It is not recommended to use this value schema in practice.
-/// Instead, use a specific value schema.
+/// A inline encoding for an unknown value.
+/// This inline encoding is used as a fallback when the inline encoding is not known.
+/// It is not recommended to use this inline encoding in practice.
+/// Instead, use a specific inline encoding.
 ///
 /// Any bit pattern can be a valid value of this schema.
 pub struct UnknownInline {}

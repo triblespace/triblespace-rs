@@ -15,16 +15,16 @@ use std::num::TryFromIntError;
 
 use ethnum;
 
-/// A value schema for a 256-bit unsigned integer in little-endian byte order.
+/// A inline encoding for a 256-bit unsigned integer in little-endian byte order.
 pub struct U256LE;
 
-/// A value schema for a 256-bit unsigned integer in big-endian byte order.
+/// A inline encoding for a 256-bit unsigned integer in big-endian byte order.
 pub struct U256BE;
 
-/// A value schema for a 256-bit signed integer in little-endian byte order.
+/// A inline encoding for a 256-bit signed integer in little-endian byte order.
 pub struct I256LE;
 
-/// A value schema for a 256-bit signed integer in big-endian byte order.
+/// A inline encoding for a 256-bit signed integer in big-endian byte order.
 pub struct I256BE;
 
 /// A type alias for a 256-bit signed integer.

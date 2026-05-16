@@ -18,10 +18,10 @@ use std::fmt;
 use f256::f256;
 use serde_json::Number as JsonNumber;
 
-/// A value schema for a 256-bit floating point number in little-endian byte order.
+/// A inline encoding for a 256-bit floating point number in little-endian byte order.
 pub struct F256LE;
 
-/// A value schema for a 256-bit floating point number in big-endian byte order.
+/// A inline encoding for a 256-bit floating point number in big-endian byte order.
 pub struct F256BE;
 
 /// Type alias for [`F256LE`], the default little-endian 256-bit float schema.

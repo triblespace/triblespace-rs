@@ -37,14 +37,14 @@ pub enum JsonImportError {
     /// The document root is a primitive (string, number, bool, null) — only
     /// objects and arrays of objects are accepted.
     PrimitiveRoot,
-    /// A string field could not be encoded into the target value schema.
+    /// A string field could not be encoded into the target inline encoding.
     EncodeString {
         /// Name of the JSON field.
         field: String,
         /// Underlying encoding error.
         source: EncodeError,
     },
-    /// A number field could not be encoded into the target value schema.
+    /// A number field could not be encoded into the target inline encoding.
     EncodeNumber {
         /// Name of the JSON field.
         field: String,

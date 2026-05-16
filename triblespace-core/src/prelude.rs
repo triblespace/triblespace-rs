@@ -28,7 +28,7 @@
 //! things, `triblespace` allows you to build consistent distributed systems.
 //!
 
-/// Re-exports of blob schema types.
+/// Re-exports of blob encoding types.
 pub mod blobencodings;
 /// Re-exports of inline schema types.
 pub mod inlineencodings;

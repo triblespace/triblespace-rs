@@ -12,7 +12,7 @@ use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
 
-/// A blob schema for WebAssembly bytecode.
+/// A blob encoding for WebAssembly bytecode.
 ///
 /// This schema is intended for sandboxed helper modules such as value formatters
 /// (see `metadata::value_formatter`).

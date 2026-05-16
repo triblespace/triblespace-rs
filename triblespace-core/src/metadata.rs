@@ -81,9 +81,9 @@ where
 // namespace constants
 /// Tag for entities that can have multiple simultaneous kinds.
 pub const KIND_MULTI: Id = id_hex!("C36D9C16B34729D855BD6C36A624E1BF");
-/// Tag for entities that represent value schemas.
+/// Tag for entities that represent inline encodings.
 pub const KIND_INLINE_ENCODING: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB");
-/// Tag for entities that represent blob schemas.
+/// Tag for entities that represent blob encodings.
 pub const KIND_BLOB_ENCODING: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
 /// Tag for entities that describe an attribute usage in some source context.
 pub const KIND_ATTRIBUTE_USAGE: Id = id_hex!("45759727A79C28D657EC06D5C6013649");
@@ -96,12 +96,12 @@ attributes! {
     /// Optional long-form description stored as a LongString handle.
     ///
     /// This attribute is general-purpose: it can describe any entity. Schema
-    /// metadata uses it for documenting value/blob schemas, but it is equally
+    /// metadata uses it for documenting value/blob encodings, but it is equally
     /// valid for domain entities.
     "AE94660A55D2EE3C428D2BB299E02EC3" as description: inlineencodings::Handle<LongString>;
-    /// Links an attribute or handle to its value schema identifier.
+    /// Links an attribute or handle to its inline encoding identifier.
     "213F89E3F49628A105B3830BD3A6612C" as value_encoding: inlineencodings::GenId;
-    /// Links a handle to its blob schema identifier.
+    /// Links a handle to its blob encoding identifier.
     "43C134652906547383054B1E31E23DF4" as blob_encoding: inlineencodings::GenId;
     /// Links an `Array<T>` schema entity to its element schema's id. Distinct
     /// from `blob_encoding` because element schemas are not themselves

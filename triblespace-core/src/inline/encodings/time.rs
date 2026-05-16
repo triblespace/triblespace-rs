@@ -18,7 +18,7 @@ use std::convert::TryInto;
 
 use hifitime::prelude::*;
 
-/// A value schema for a TAI interval (order-preserving big-endian).
+/// A inline encoding for a TAI interval (order-preserving big-endian).
 ///
 /// A TAI interval is a pair of TAI epochs stored as two 128-bit signed
 /// integers (lower, upper) in **order-preserving big-endian** byte order.
@@ -194,7 +194,7 @@ pub struct InvertedIntervalError {
     pub upper: i128,
 }
 
-/// A value schema for a signed nanosecond duration delta.
+/// A inline encoding for a signed nanosecond duration delta.
 ///
 /// log2(ns / Planck second) ≈ 113.8, so a 128-bit ns count comfortably
 /// holds every duration physics has an opinion about. We use the upper

@@ -39,7 +39,7 @@ assert_ne!(social::name.id(), social::friend.id());
 Reach for this macro when:
 
 - you are defining a namespace or schema module
-- you want attributes with stable ids and value schemas
+- you want attributes with stable ids and inline encodings
 - you want doc comments to become attribute metadata
 
 If you already have attributes, you usually do not need `attributes!` in the

@@ -1,13 +1,13 @@
 # Triblespace Schemas (Quick Notes)
 
-## Built-in blob schemas
+## Built-in blob encodings
 
 - `LongString` — UTF-8 text stored as a blob.
 - `RawBytes` — opaque file-backed byte payloads.
 - `SimpleArchive` — archived `TribleSet` blobs.
 - `SuccinctArchiveBlob` — compressed succinct archive index blobs.
 - `WasmCode` — WebAssembly modules stored as blobs.
-- `UnknownBlob` — fallback when the blob schema is not known.
+- `UnknownBlob` — fallback when the blob encoding is not known.
 
 For details, see `triblespace-rs/book/src/schemas.md`.
 

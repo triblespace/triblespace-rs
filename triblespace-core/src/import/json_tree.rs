@@ -82,7 +82,7 @@ pub const kind_field: Id = id_hex!("890FC1F34B9FAD18F93E6EDF1B69A1A2");
 pub const kind_array_entry: Id = id_hex!("EB325EABEA8C35DE7E5D700A5EF9207B");
 
 /// Returns a [`Fragment`] describing the lossless JSON tree schema —
-/// all node kinds, attribute definitions, and value/blob schema metadata.
+/// all node kinds, attribute definitions, and value/blob encoding metadata.
 pub fn build_json_tree_metadata() -> Fragment {
     // The macro-generated `describe()` for this module's attributes!{}
     // block emits each declared attribute's identity, schema spread,

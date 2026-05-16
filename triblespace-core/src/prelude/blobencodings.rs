@@ -1,4 +1,4 @@
-//! Re-exports of blob schema types for convenient glob imports.
+//! Re-exports of blob encoding types for convenient glob imports.
 
 /// Re-export of built-in element types (`F32`, `U8`, etc.).
 pub use crate::blob::encodings::array::elements;

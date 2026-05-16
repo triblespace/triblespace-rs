@@ -34,7 +34,7 @@ pub enum ValidationError {
     Utf8(Utf8Error),
 }
 
-/// A value schema for a short string.
+/// A inline encoding for a short string.
 /// A short string is a UTF-8 encoded string with a maximum length of 32 bytes (inclusive)
 /// The string is null-terminated.
 /// If the string is shorter than 32 bytes, the remaining bytes are zero.

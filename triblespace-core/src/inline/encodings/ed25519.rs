@@ -18,13 +18,13 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
-/// A value schema for the R component of an Ed25519 signature.
+/// A inline encoding for the R component of an Ed25519 signature.
 pub struct ED25519RComponent;
 
-/// A value schema for the S component of an Ed25519 signature.
+/// A inline encoding for the S component of an Ed25519 signature.
 pub struct ED25519SComponent;
 
-/// A value schema for an Ed25519 public key.
+/// A inline encoding for an Ed25519 public key.
 pub struct ED25519PublicKey;
 
 impl MetaDescribe for ED25519RComponent {
@@ -32,7 +32,7 @@ impl MetaDescribe for ED25519RComponent {
         let id: Id = id_hex!("995A86FFC83DB95ECEAA17E226208897");
         let mut tribles = Fragment::rooted(id, TribleSet::new());
         let description = tribles.put(
-            "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob schema (for example LongString with base64 or a custom blob schema).",
+            "Ed25519 signature R component stored as a 32-byte field. This is one half of the standard 64-byte Ed25519 signature.\n\nUse when you store signatures as structured values or need to index the components separately. Pair with the S component to reconstruct or verify the full signature.\n\nIf you prefer storing the signature as a single binary blob, use a blob encoding (for example LongString with base64 or a custom blob encoding).",
         );
         let name = tribles.put("ed25519:r");
         tribles += entity! {

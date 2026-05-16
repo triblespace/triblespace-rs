@@ -132,7 +132,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     assert_eq!(a, r, "pile round-trip diverged on {probe:?}");
 }
 
-/// The `Embedding` blob schema is content-addressed, so two
+/// The `Embedding` blob encoding is content-addressed, so two
 /// HNSW indexes that embed the same vectors end up with the same
 /// handles — and share the same underlying blobs in the store.
 /// Explicitly test that load-bearing property.

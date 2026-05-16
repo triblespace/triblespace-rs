@@ -15,7 +15,7 @@ use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
-/// A value schema for representing a pair of `u128` values.
+/// A inline encoding for representing a pair of `u128` values.
 ///
 /// [`RangeU128`] encodes the pair as a half-open interval while
 /// [`RangeInclusiveU128`] represents an inclusive range. Both schemas encode the

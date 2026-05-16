@@ -7,8 +7,8 @@ those raw bytes to concrete application types and decouple persisted data from a
 particular implementation. This separation lets you refactor to new libraries or
 frameworks without rewriting what's already stored or coordinating live
 migrations. The crate ships with a collection of ready‑made schemas located in
-[`triblespace::core::inline::encodings`](https://docs.rs/triblespace/latest/triblespace/core/value/schemas/index.html) and
-[`triblespace::core::blob::encodings`](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/index.html).
+[`triblespace::core::inline::encodings`](https://docs.rs/triblespace/latest/triblespace/core/inline/encodings/index.html) and
+[`triblespace::core::blob::encodings`](https://docs.rs/triblespace/latest/triblespace/core/blob/encodings/index.html).
 
 When data crosses the FFI boundary or is consumed by a different language, the
 schema is the contract both sides agree on. Consumers only need to understand
@@ -102,9 +102,9 @@ literal, which is useful for quick experiments or internal attributes; for
 schema that will be shared across binaries or languages prefer explicit ids so
 the column remains stable even if the attribute name later changes.
 
-## Built‑in value schemas
+## Built‑in inline encodings
 
-The crate provides the following value schemas out of the box:
+The crate provides the following inline encodings out of the box:
 - `GenId` &ndash; an abstract 128 bit identifier.
 - `ShortString` &ndash; a UTF-8 string up to 32 bytes.
 - `U256BE` / `U256LE` &ndash; 256-bit unsigned integers.
@@ -132,9 +132,9 @@ let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
 let schema_id = ShortString::id(); // derived via describe(&mut scratch).root()
 ```
 
-## Built‑in blob schemas
+## Built‑in blob encodings
 
-The crate also ships with these blob schemas:
+The crate also ships with these blob encodings:
 
 - `LongString` for arbitrarily long UTF‑8 strings.
 - `RawBytes` for opaque file-backed byte payloads.
@@ -156,7 +156,7 @@ let b: Blob<LongString> = "example".to_blob();
 let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
 ```
 
-Both value and blob schemas can emit optional discovery metadata. Calling
+Both value and blob encodings can emit optional discovery metadata. Calling
 `MetaDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
 whose facts tag the schema entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
@@ -221,7 +221,7 @@ What are you storing?
   a blob lookup.
 - Use `GenId` for relationships between entities. Never store entity references as
   strings.
-- When in doubt between a value schema and a blob, ask: "will I ever want to
+- When in doubt between a inline encoding and a blob, ask: "will I ever want to
   query or join on this directly?" If yes, it should be a value. If it's opaque
   content you just retrieve, use a blob handle.
 
@@ -229,7 +229,7 @@ What are you storing?
 
 Custom formats implement [`InlineEncoding`] or [`BlobEncoding`].  A unique identifier
 serves as the schema ID.  The example below defines a little-endian `u64` value
-schema and a simple blob schema for arbitrary bytes.
+schema and a simple blob encoding for arbitrary bytes.
 
 ```rust,ignore
 {{#include ../../examples/custom_schema.rs:custom_schema}}
@@ -262,7 +262,7 @@ replacement schema.
 
 Binary formats are great for portability and performance, but they can be
 painful to inspect if you don’t know the schema ahead of time. TribleSpace
-supports an optional schema-level formatter mechanism: a value schema can point
+supports an optional schema-level formatter mechanism: a inline encoding can point
 to a small sandboxed WebAssembly module that turns its raw 32 bytes into a
 human-readable string.
 

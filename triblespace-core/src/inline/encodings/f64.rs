@@ -16,7 +16,7 @@ use serde_json::Number as JsonNumber;
 use std::convert::Infallible;
 use std::fmt;
 
-/// A value schema for an IEEE-754 double in little-endian byte order.
+/// A inline encoding for an IEEE-754 double in little-endian byte order.
 pub struct F64;
 
 impl MetaDescribe for F64 {

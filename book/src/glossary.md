@@ -119,7 +119,7 @@ The set of attribute declarations and codecs that document and enforce the shape
 of data in TribleSpace. Schemas assign language-agnostic meaning to the raw
 bytes—they are not the concrete Rust types—so any implementation that
 understands the schema can interpret the payloads consistently. Inline schemas
-map the fixed 32-byte payload of a trible to native types, while blob schemas
+map the fixed 32-byte payload of a trible to native types, while blob encodings
 describe arbitrarily long payloads so tribles referencing those blobs stay
 portable.
 

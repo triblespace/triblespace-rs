@@ -28,7 +28,7 @@ Reading the chapter sequentially should equip you to:
 - entity! constructs ad‑hoc entities (like struct literals).
 - Reified kinds/tags are attached via metadata::tag (GenId); projects often
   export canonical KIND_* constants you can pattern-match directly against.
-- Inline schema entities are tagged with metadata::KIND_INLINE_ENCODING; blob schema
+- Inline schema entities are tagged with metadata::KIND_INLINE_ENCODING; blob encoding
   entities with metadata::KIND_BLOB_ENCODING.
 - Prefer passing the Workspace + the checkout result (TribleSet) and an
   entity id around — only materialize a concrete Rust view when required.
@@ -228,7 +228,7 @@ external interface forces your hand.
 
 ### 4. Read LongString as &str (zero-copy)
 
-Blob schema types in tribles are intentionally zerocopy. Prefer the
+Blob encoding types in tribles are intentionally zerocopy. Prefer the
 typed View API which returns a borrowed &str without copying when possible.
 
 ```rust,ignore
@@ -322,7 +322,7 @@ repo.push(&mut ws)?;
 - find!: the macro you use to discover entities matching a pattern (a
   descriptive type declaration).
 - entity!: construct an ad-hoc entity fragment (facts + exported id). Merge it into a TribleSet via `+=` or call `.into_facts()` when you explicitly need a plain TribleSet (dropping exports).
-- LongString: zero-copy blob schema for potentially-large text.
+- LongString: zero-copy blob encoding for potentially-large text.
 
 ## Closing notes
 

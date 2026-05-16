@@ -8,7 +8,7 @@
 //! Predicate URIs become attribute ids by wrapping the IRI handle in
 //! [`entity!`] under [`metadata::iri`] and [`metadata::value_encoding`],
 //! then taking the resulting fragment's root via
-//! [`Attribute::<S>::from`]. The value schema is chosen from the
+//! [`Attribute::<S>::from`]. The inline encoding is chosen from the
 //! object's XSD datatype:
 //!
 //! - `xsd:integer` / `xsd:long` / `xsd:int` / `xsd:short` / `xsd:byte`

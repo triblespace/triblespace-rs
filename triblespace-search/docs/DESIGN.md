@@ -273,7 +273,7 @@ FlatIndex:         [h_a, h_b, h_c, ...]          ← 32 B per entry
 SuccinctHNSWIndex: [h_a, h_b, h_c, ...] + graph  ← 32 B per entry + bits
 ```
 
-The `Embedding` blob schema id is
+The `Embedding` blob encoding id is
 `EEC5DFDEA2FFCED70850DF83B03CB62B` (minted via `trible genid`).
 At query time the walk resolves each handle through
 `BlobStoreGet`, and the `BlobCache` wrapper in

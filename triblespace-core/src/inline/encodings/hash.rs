@@ -42,7 +42,7 @@ pub trait HashProtocol: Sized + 'static + MetaDescribe {
 /// and [`Handle`] types are all implicitly Blake3-backed.
 ///
 /// Implements [`HashProtocol`] so [`Hash<Blake3>`] is also a valid
-/// "blake3 digest" value schema, parallel to hypothetical
+/// "blake3 digest" inline encoding, parallel to hypothetical
 /// `Hash<Sha256>` etc. for foreign-hash fingerprints.
 pub struct Blake3 {
     hasher: blake3::Hasher,
@@ -99,7 +99,7 @@ impl HashProtocol for Blake3 {
     }
 }
 
-/// A value schema for a 32-byte hash digest.
+/// A inline encoding for a 32-byte hash digest.
 ///
 /// `H` selects the hash function — `Hash<Blake3>` for blake3-produced
 /// digests, hypothetical `Hash<Sha256>` for foreign 256-bit
@@ -284,7 +284,7 @@ impl<T: BlobEncoding> Handle<T> {
         hash.transmute()
     }
 
-    /// Extracts the underlying Blake3 hash, discarding the blob schema type.
+    /// Extracts the underlying Blake3 hash, discarding the blob encoding type.
     pub fn to_hash(handle: Inline<Self>) -> Inline<Hash<Blake3>> {
         handle.transmute()
     }
@@ -310,7 +310,7 @@ where
         // Entity core via `*:` spread. `T::describe()` runs once: its
         // root becomes the value of `metadata::blob_encoding` and its
         // facts + blobs fold in automatically. With the hash protocol
-        // fixed to Blake3, only the blob schema parameter distinguishes
+        // fixed to Blake3, only the blob encoding parameter distinguishes
         // one `Handle<T>` monomorphization from another; `annotated`
         // layers the human-facing annotations under the derived root.
         let mut core = entity! {
@@ -320,7 +320,7 @@ where
         };
         let name = Blake3::NAME;
         let description_handle = core.put(format!(
-            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob schema. The schema id is derived from the hash and blob schema.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
+            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob encoding. The schema id is derived from the hash and blob encoding.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
         ));
         let name_handle = core.put("handle");
         #[cfg(feature = "wasm")]

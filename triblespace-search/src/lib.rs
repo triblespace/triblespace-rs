@@ -146,6 +146,6 @@ pub mod testing {
 // in `succinct.rs`). The type system then rules out
 // mismatched-layout deserialization — there's no single
 // global version number. `git log docs/DESIGN.md` has the
-// progression of layout decisions; the blob schema id in
+// progression of layout decisions; the blob encoding id in
 // `succinct.rs` is authoritative for what any given binary
 // can load.

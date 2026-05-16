@@ -256,7 +256,7 @@ let archive_bytes: Blob<SimpleArchive> = ws
 std::fs::write("dataset.car", archive_bytes.bytes.as_ref()).expect("persist archive");
 ```
 
-Rust infers the blob schema for both `put` and `get` from the handles and the
+Rust infers the blob encoding for both `put` and `get` from the handles and the
 assignment context, so the calls stay concise without explicit turbofish
 annotations.
 

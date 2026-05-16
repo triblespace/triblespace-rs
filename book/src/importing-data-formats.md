@@ -166,7 +166,7 @@ names use the same shape but with `metadata::name` instead of
 same-spelled IRIs.)
 
 **Literal → native value.** XSD datatypes map into the appropriate
-triblespace value schemas:
+triblespace inline encodings:
 
 | XSD datatype | triblespace schema |
 |---|---|

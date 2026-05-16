@@ -10,7 +10,7 @@
 
 mod cache;
 mod memoryblobstore;
-/// Built-in blob schema types and their conversion implementations.
+/// Built-in blob encoding types and their conversion implementations.
 pub mod encodings;
 
 use crate::metadata::MetaDescribe;

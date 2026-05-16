@@ -116,7 +116,7 @@ without custom extensions:
 - `RgbaColor` packing four 8‑bit channels into one value.
 - `BigDecimal` for high‑precision numbers up to 256 bits.
 
-### Blob schemas
+### Blob encodings
 - `Json`, `Cbor` and `Yaml` for structured data interchange.
 - `Csv` for comma‑separated tables.
 - `Protobuf` or `MessagePack` for compact typed messages.

@@ -82,7 +82,7 @@
 //! assert_eq!(i, 42);
 //! ```
 
-/// Built-in value schema types and their conversion implementations.
+/// Built-in inline encoding types and their conversion implementations.
 pub mod encodings;
 
 use crate::metadata::MetaDescribe;
@@ -402,7 +402,7 @@ pub trait TryToInline<S: InlineEncoding> {
 pub trait Encodes<Source> {
     /// The concrete form this source produces when encoded for this
     /// schema. `Inline<Self>` for inline schemas, `Blob<Self>` for
-    /// blob schemas, or `Inline<Handle<Self>>` for the
+    /// blob encodings, or `Inline<Handle<Self>>` for the
     /// precomputed-handle case where `Self: BlobEncoding`.
     type Output;
     /// Run the encoding.
@@ -510,7 +510,7 @@ impl<V: InlineEncoding> Encoded<V> {
 /// Lift an [`IntoEncoded::Output`] into the [`Encoded`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
-/// `V` is the *attribute's* value schema. Two impls cover everything:
+/// `V` is the *attribute's* inline encoding. Two impls cover everything:
 /// - `Inline<V>` delegates to [`InlineEncoding::to_encoded`] — inline
 ///   path, yields `Encoded::Inline(form)`.
 /// - `Blob<T>` targeting `Handle<T>` delegates to

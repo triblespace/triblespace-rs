@@ -15,7 +15,7 @@ use crate::inline::InlineEncoding;
 use proc_macro::Span;
 use std::convert::Infallible;
 
-/// A value schema for representing a span using explicit line and column
+/// A inline encoding for representing a span using explicit line and column
 /// coordinates.
 #[derive(Debug, Clone, Copy)]
 pub struct LineLocation;

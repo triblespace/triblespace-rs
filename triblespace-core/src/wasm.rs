@@ -1,4 +1,4 @@
-//! WebAssembly utilities backed by the [`WasmCode`](crate::blob::encodings::wasmcode::WasmCode) blob schema.
+//! WebAssembly utilities backed by the [`WasmCode`](crate::blob::encodings::wasmcode::WasmCode) blob encoding.
 //!
 //! The implementation lives alongside `blob::encodings::wasmcode` so schema
 //! conversions (e.g. `TryFromBlob<WasmCode> for wasmi::Module`) stay close to the

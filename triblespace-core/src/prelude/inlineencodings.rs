@@ -1,4 +1,4 @@
-//! Re-exports of value schema types for convenient glob imports.
+//! Re-exports of inline encoding types for convenient glob imports.
 
 /// Re-export of [`Boolean`].
 pub use crate::inline::encodings::boolean::Boolean;

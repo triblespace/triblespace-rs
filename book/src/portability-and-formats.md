@@ -30,7 +30,7 @@ without needing the local schema to sit at any particular trait-parameter slot.
 Schemas carry two optional identifiers:
 
 - **Inline schema ID** – Uniquely distinguishes the schema that governs the 32-byte value buffer.
-- **Blob schema ID** – Identifies the schema of any external blob a value may reference.
+- **Blob encoding ID** – Identifies the schema of any external blob a value may reference.
 
 These identifiers let us document schemas inside the knowledge graph itself.
 They also provide stable lookup keys for registries or tooling that need to

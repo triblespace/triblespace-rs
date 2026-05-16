@@ -1,15 +1,15 @@
-//! Inline and blob schemas minted for triblespace-search.
+//! Inline and blob encodings minted for triblespace-search.
 //!
-//! - [`F32LE`] (value schema): packs an f32 into a 32-byte
+//! - [`F32LE`] (inline encoding): packs an f32 into a 32-byte
 //!   triblespace value, used by score-as-bound-variable
 //!   constraints.
-//! - [`Embedding`] (blob schema): an arbitrary-length `[f32]`
+//! - [`Embedding`] (blob encoding): an arbitrary-length `[f32]`
 //!   (little-endian) stored as a blob. HNSW indexes no longer
 //!   inline vectors — they store `Handle<Embedding>` instead,
 //!   so embeddings are content-addressed and dedupe across
 //!   indexes.
 //!
-//! Other blob schemas (`SuccinctBM25Blob`, `SuccinctHNSWBlob`)
+//! Other blob encodings (`SuccinctBM25Blob`, `SuccinctHNSWBlob`)
 //! live next to their index types.
 //!
 //! The built-in tokenizers in [`crate::tokens`] return
@@ -143,7 +143,7 @@ impl MetaDescribe for Embedding {
     }
 }
 
-/// Shorthand for the most common embedding-handle value schema:
+/// Shorthand for the most common embedding-handle inline encoding:
 /// `Handle<Embedding>`. Use in trible attributes, in
 /// similarity constraint variables, wherever you'd otherwise
 /// spell the full type.

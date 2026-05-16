@@ -292,7 +292,7 @@ that the pile *does* use for dispatch.
 ### What the caller has to rotate
 
 If you have an attribute whose value type references one of
-our blob schemas — e.g.
+our blob encodings — e.g.
 
 ```rust
 struct WikiBm25Handle;
@@ -322,7 +322,7 @@ Migration recipe:
 3. Transition readers to the new attribute. The old
    attribute + its stored triples become inert (any binary
    using them would have to keep the old crate version
-   pinned anyway, because the old blob schema doesn't
+   pinned anyway, because the old blob encoding doesn't
    survive the rotation).
 4. Once no reader references the old attribute, `pile keep`
    sweeps the orphaned blobs at the next consolidation.

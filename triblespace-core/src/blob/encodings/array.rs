@@ -1,6 +1,6 @@
-//! Flat typed array blob schema.
+//! Flat typed array blob encoding.
 //!
-//! `Array<T>` is a structural blob schema: it says "this blob is a flat array
+//! `Array<T>` is a structural blob encoding: it says "this blob is a flat array
 //! of T values in native byte order." The semantics (weight tensor, audio
 //! samples, embeddings) come from the TribleSpace attributes that reference
 //! the blob, not the schema itself — same as `LongString` being structural
@@ -31,7 +31,7 @@ pub trait ArrayElement: MetaDescribe + 'static {
 
 /// A flat array of `T` values in native byte order.
 ///
-/// The blob schema ID is *derived* from describing the schema — including
+/// The blob encoding ID is *derived* from describing the schema — including
 /// `T::id()` as `metadata::blob_encoding` — so `Array<u8>` and `Array<f32>`
 /// get distinct ids without needing compile-time hashing.
 ///

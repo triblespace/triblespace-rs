@@ -1,16 +1,16 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Blob]s.
 
-/// Flat typed array blob schema.
+/// Flat typed array blob encoding.
 pub mod array;
-/// Arbitrary-length UTF-8 text blob schema.
+/// Arbitrary-length UTF-8 text blob encoding.
 pub mod longstring;
-/// Opaque raw bytes blob schema (positive choice, distinct from UnknownBlob).
+/// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
 pub mod rawbytes;
-/// Canonical trible sequence blob schema.
+/// Canonical trible sequence blob encoding.
 pub mod simplearchive;
-/// Succinct (Ring-based) compressed trible archive blob schema.
+/// Succinct (Ring-based) compressed trible archive blob encoding.
 pub mod succinctarchive;
-/// WebAssembly bytecode blob schema.
+/// WebAssembly bytecode blob encoding.
 pub mod wasmcode;
 
 use crate::inline::Encodes;
@@ -24,10 +24,10 @@ use crate::metadata::{self, MetaDescribe};
 use super::Blob;
 use super::TryFromBlob;
 
-/// A blob schema for an unknown blob.
-/// This blob schema is used as a fallback when the blob schema is not known.
-/// It is not recommended to use this blob schema in practice.
-/// Instead, use a specific blob schema.
+/// A blob encoding for an unknown blob.
+/// This blob encoding is used as a fallback when the blob encoding is not known.
+/// It is not recommended to use this blob encoding in practice.
+/// Instead, use a specific blob encoding.
 ///
 /// Any bit pattern can be a valid blob of this schema.
 pub struct UnknownBlob;
@@ -44,7 +44,7 @@ impl MetaDescribe for UnknownBlob {
         );
         let name = fragment.put("UnknownBlob");
         let description = fragment.put(
-            "Fallback blob schema for byte payloads with no known type. Discouraged in practice — use a specific blob schema (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
+            "Fallback blob encoding for byte payloads with no known type. Discouraged in practice — use a specific blob encoding (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
         );
         fragment.annotated(|id_ref| {
             entity! { id_ref @

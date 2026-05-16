@@ -42,7 +42,7 @@ mod instrumentation_attributes {
         attributes! {
             // Instrumentation-specific: link back to the macro invocation entity.
             "19D4972B2DF977FA64541FC967C4B133" as invocation: ShortString;
-            // Instrumentation-specific: the Rust type tokens for this attribute's value schema.
+            // Instrumentation-specific: the Rust type tokens for this attribute's inline encoding.
             "D97A427FF782B0BF08B55AC84877B486" as attribute_type: Handle<LongString>;
         }
     }

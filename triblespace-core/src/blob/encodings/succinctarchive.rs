@@ -46,7 +46,7 @@ use jerky::char_sequences::wavelet_matrix::WaveletMatrixMeta;
 use jerky::char_sequences::{WaveletMatrix, WaveletMatrixBuilder};
 use jerky::serialization::{Metadata, Serializable};
 
-/// Blob schema for a succinct archive based on *The Ring* (Arroyuelo
+/// Blob encoding for a succinct archive based on *The Ring* (Arroyuelo
 /// et al., 2024) — a compact index that supports worst-case optimal
 /// joins over triples in almost no extra space.
 ///
