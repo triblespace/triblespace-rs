@@ -62,7 +62,7 @@ constraint types can participate without custom planner hooks.
 
 You might notice that trible.space does not define a global ontology or schema
 beyond associating attributes with a
-[`InlineEncoding`](triblespace::core::value::InlineEncoding) or
+[`InlineEncoding`](triblespace::core::inline::InlineEncoding) or
 [`BlobEncoding`](triblespace::core::prelude::BlobEncoding). This is deliberate. The semantic web
 taught us that per-value typing, while desirable, was awkward in RDF: literal
 datatypes are optional, custom types need globally scoped IRIs and there is no

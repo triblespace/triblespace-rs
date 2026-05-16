@@ -88,14 +88,14 @@ use crate::macros::entity;
 use crate::prelude::inlineencodings;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::hash::Handle;
-use crate::value::encodings::shortstring::ShortString;
-use crate::value::encodings::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
-use crate::value::encodings::UnknownInline;
-use crate::value::encodings::boolean::Boolean;
-use crate::value::encodings::f64::F64;
-use crate::value::{RawInline, IntoInline, TryToInline, Inline};
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::shortstring::ShortString;
+use crate::inline::encodings::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
+use crate::inline::encodings::UnknownInline;
+use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::f64::F64;
+use crate::inline::{RawInline, IntoInline, TryToInline, Inline};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 

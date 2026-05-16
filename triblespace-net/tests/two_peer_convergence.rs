@@ -30,8 +30,8 @@ use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, Repository,
 };
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_net::tracking::{
     ensure_tracking_branch, merge_tracking_into_local, MergeOutcome,
 };

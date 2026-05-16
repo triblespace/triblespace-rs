@@ -5,11 +5,11 @@ use triblespace::core::blob::BlobEncoding;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::value::TryFromInline;
-use triblespace::core::value::Inline;
-use triblespace::core::value::InlineEncoding;
-use triblespace::core::value::Encodes;
-use triblespace::core::value::INLINE_LEN;
+use triblespace::core::inline::TryFromInline;
+use triblespace::core::inline::Inline;
+use triblespace::core::inline::InlineEncoding;
+use triblespace::core::inline::Encodes;
+use triblespace::core::inline::INLINE_LEN;
 
 // ANCHOR: custom_schema
 

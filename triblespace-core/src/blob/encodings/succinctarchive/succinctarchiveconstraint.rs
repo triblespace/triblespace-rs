@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use super::*;
 use crate::query::*;
-use crate::value::encodings::genid::GenId;
+use crate::inline::encodings::genid::GenId;
 use jerky::bit_vector::Select;
 
 pub struct SuccinctArchiveConstraint<'a, U>

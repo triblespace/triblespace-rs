@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -44,7 +44,7 @@ impl MetaDescribe for SimpleArchive {
 }
 
 impl Encodes<TribleSet> for SimpleArchive
-where crate::value::encodings::hash::Handle<SimpleArchive>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
@@ -56,7 +56,7 @@ where crate::value::encodings::hash::Handle<SimpleArchive>: crate::value::Inline
 }
 
 impl Encodes<&TribleSet> for SimpleArchive
-where crate::value::encodings::hash::Handle<SimpleArchive>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {

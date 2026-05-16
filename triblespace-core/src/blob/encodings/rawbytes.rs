@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -57,7 +57,7 @@ impl TryFromBlob<RawBytes> for Bytes {
 }
 
 impl Encodes<Bytes> for RawBytes
-where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Bytes) -> Blob<RawBytes> {
@@ -66,7 +66,7 @@ where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncod
 }
 
 impl Encodes<Vec<u8>> for RawBytes
-where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Vec<u8>) -> Blob<RawBytes> {
@@ -75,7 +75,7 @@ where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncod
 }
 
 impl Encodes<&[u8]> for RawBytes
-where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: &[u8]) -> Blob<RawBytes> {

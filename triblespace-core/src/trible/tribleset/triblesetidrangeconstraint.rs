@@ -9,8 +9,8 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::encodings::genid::GenId;
-use crate::value::RawInline;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::RawInline;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.

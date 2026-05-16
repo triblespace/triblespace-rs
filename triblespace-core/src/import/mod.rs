@@ -11,8 +11,8 @@ pub mod ntriples;
 use triblespace_core_macros::attributes;
 
 use crate::blob::encodings::longstring::LongString;
-use crate::value::encodings::hash::Handle;
-use crate::value::encodings::shortstring::ShortString;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::shortstring::ShortString;
 
 attributes! {
     /// The canonical RDF URI for an entity. Use this when importing data

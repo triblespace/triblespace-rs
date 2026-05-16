@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the same time. We rescore each survivor via
             // `idx.score_text` afterwards for ranking — same
             // pattern as HNSW's similar/recompute split.
-            use triblespace_core::value::ToEncoded;
+            use triblespace_core::inline::ToEncoded;
             let mut rows: Vec<(Id, f32, String)> = find!(
                 (doc: Id, title: String),
                 and!(
@@ -213,7 +213,7 @@ index, which tokenises internally). Same pattern as HNSW's
 `similar`/recompute-cosine split:
 
 ```rust,ignore
-use triblespace_core::value::ToEncoded;
+use triblespace_core::inline::ToEncoded;
 let mut ranked: Vec<(Id, f32)> = find!(
     (doc: Id),
     idx.matches_text(doc, "typst links", 0.0)

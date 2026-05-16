@@ -118,7 +118,7 @@ fn main() {
 
     // ─ Bonus: filter through the engine, score precisely after ─
     println!("\nscored variant: title 'fox' with BM25 scores:");
-    use triblespace_core::value::IntoInline;
+    use triblespace_core::inline::IntoInline;
     let mut scored: Vec<(Id, f32)> = find!(
         (book: Id),
         idx.matches(book, &fox, 0.0)

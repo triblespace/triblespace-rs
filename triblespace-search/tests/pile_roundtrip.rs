@@ -14,8 +14,8 @@ use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;

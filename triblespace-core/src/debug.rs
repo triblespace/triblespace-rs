@@ -4,7 +4,7 @@ pub mod query {
     use crate::query::Constraint;
     use crate::query::VariableId;
     use crate::query::VariableSet;
-    use crate::value::RawInline;
+    use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
 

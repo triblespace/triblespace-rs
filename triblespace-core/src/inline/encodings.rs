@@ -32,8 +32,8 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 /// A value schema for an unknown value.

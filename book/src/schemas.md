@@ -7,7 +7,7 @@ those raw bytes to concrete application types and decouple persisted data from a
 particular implementation. This separation lets you refactor to new libraries or
 frameworks without rewriting what's already stored or coordinating live
 migrations. The crate ships with a collection of ready‑made schemas located in
-[`triblespace::core::value::encodings`](https://docs.rs/triblespace/latest/triblespace/core/value/schemas/index.html) and
+[`triblespace::core::inline::encodings`](https://docs.rs/triblespace/latest/triblespace/core/value/schemas/index.html) and
 [`triblespace::core::blob::encodings`](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/index.html).
 
 When data crosses the FFI boundary or is consumed by a different language, the
@@ -50,8 +50,8 @@ bits), use `TryToInline` / `TryFromInline` — kept as separate traits because t
 error type is per‑source.
 
 ```rust
-use triblespace::core::value::encodings::shortstring::ShortString;
-use triblespace::core::value::{TryFromInline, TryToInline, Inline};
+use triblespace::core::inline::encodings::shortstring::ShortString;
+use triblespace::core::inline::{TryFromInline, TryToInline, Inline};
 
 struct Username(String);
 
@@ -124,8 +124,8 @@ The crate provides the following value schemas out of the box:
 ```rust
 # use triblespace::prelude::*;
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::value::encodings::shortstring::ShortString;
-use triblespace::core::value::{IntoInline, InlineEncoding};
+use triblespace::core::inline::encodings::shortstring::ShortString;
+use triblespace::core::inline::{IntoInline, InlineEncoding};
 
 let v: Inline<ShortString> = "hi".to_inline();
 let raw_bytes = v.raw; // Persist alongside the schema's metadata id.

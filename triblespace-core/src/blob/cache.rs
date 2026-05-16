@@ -5,9 +5,9 @@ use quick_cache::sync::Cache;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::repo::BlobStoreGet;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 const DEFAULT_BLOB_CACHE_CAPACITY: usize = 256;
 

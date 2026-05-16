@@ -3,8 +3,8 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
 
 use super::*;
 

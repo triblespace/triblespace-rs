@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawInline;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 use anybytes::Bytes;
@@ -356,7 +356,7 @@ impl MetaDescribe for Blake3 {
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use crate::value::encodings::hash::HashError;
+    use crate::inline::encodings::hash::HashError;
     use rand;
 
     use super::{Blake3, Hash};

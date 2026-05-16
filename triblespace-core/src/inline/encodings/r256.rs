@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,9 +7,9 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::TryFromInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -256,7 +256,7 @@ impl Encodes<i128> for R256LE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoInline, TryFromInline};
+    use crate::inline::{IntoInline, TryFromInline};
     use num_rational::Ratio;
     use proptest::prelude::*;
 

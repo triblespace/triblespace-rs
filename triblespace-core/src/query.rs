@@ -8,7 +8,7 @@
 //! let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 //! ```
 //!
-//! Variables are converted via [`TryFromInline`](crate::value::TryFromInline). By default,
+//! Variables are converted via [`TryFromInline`](crate::inline::TryFromInline). By default,
 //! conversion failures silently skip the row (filter semantics). Append `?` to a variable
 //! to receive `Result<T, E>` instead, letting the caller handle errors explicitly.
 //!
@@ -49,10 +49,10 @@ use constantconstraint::*;
 /// Re-export of [`IgnoreConstraint`].
 pub use ignore::IgnoreConstraint;
 
-use crate::value::encodings::genid::GenId;
-use crate::value::RawInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -896,7 +896,7 @@ mod parallel {
 }
 
 /// Iterate over query results, converting each variable via
-/// [`TryFromInline`](crate::value::TryFromInline).
+/// [`TryFromInline`](crate::inline::TryFromInline).
 ///
 /// The macro takes two arguments: a tuple of variables with optional type
 /// annotations, and a constraint expression. It injects a `__local_find_context!`

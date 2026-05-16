@@ -1,5 +1,5 @@
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
 
 use super::*;
 

@@ -24,12 +24,12 @@ use crate::metadata;
 use crate::metadata::{MetaDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::{Fragment, Trible, TribleSet};
-use crate::value::encodings::boolean::Boolean;
-use crate::value::encodings::f64::F64;
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::hash::{Blake3, Handle};
-use crate::value::encodings::UnknownInline;
-use crate::value::{RawInline, IntoInline, Inline, InlineEncoding};
+use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::f64::F64;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::{Blake3, Handle};
+use crate::inline::encodings::UnknownInline;
+use crate::inline::{RawInline, IntoInline, Inline, InlineEncoding};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]

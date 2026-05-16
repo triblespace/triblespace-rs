@@ -13,7 +13,7 @@ pub mod succinctarchive;
 /// WebAssembly bytecode blob schema.
 pub mod wasmcode;
 
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use anybytes::Bytes;
 
 use crate::blob::BlobEncoding;
@@ -65,7 +65,7 @@ impl TryFromBlob<UnknownBlob> for Bytes {
 }
 
 impl Encodes<Bytes> for UnknownBlob
-where crate::value::encodings::hash::Handle<UnknownBlob>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<UnknownBlob>: crate::inline::InlineEncoding,
 {
     type Output = Blob<UnknownBlob>;
     fn encode(source: Bytes) -> Blob<UnknownBlob> {

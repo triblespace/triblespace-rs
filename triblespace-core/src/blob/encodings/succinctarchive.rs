@@ -2,7 +2,7 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -18,11 +18,11 @@ use crate::query::TriblePattern;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::UnknownInline;
-use crate::value::RawInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::UnknownInline;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use succinctarchiveconstraint::*;
 
 /// Re-export all universe types and traits.
@@ -718,7 +718,7 @@ where
 impl<U> Encodes<&SuccinctArchive<U>> for SuccinctArchiveBlob
 where
     U: Universe + Serializable,
-    crate::value::encodings::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineEncoding,
+    crate::inline::encodings::hash::Handle<SuccinctArchiveBlob>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: &SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
@@ -729,7 +729,7 @@ where
 impl<U> Encodes<SuccinctArchive<U>> for SuccinctArchiveBlob
 where
     U: Universe + Serializable,
-    crate::value::encodings::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineEncoding,
+    crate::inline::encodings::hash::Handle<SuccinctArchiveBlob>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
@@ -780,8 +780,8 @@ mod tests {
     use crate::prelude::*;
     use crate::query::find;
     use crate::trible::Trible;
-    use crate::value::IntoInline;
-    use crate::value::TryToInline;
+    use crate::inline::IntoInline;
+    use crate::inline::TryToInline;
 
     use super::*;
     use anybytes::area::ByteArea;

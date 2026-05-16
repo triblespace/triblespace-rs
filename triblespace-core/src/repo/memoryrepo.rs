@@ -10,8 +10,8 @@ use crate::prelude::*;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
 
-use crate::value::encodings::hash::Handle;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::InlineEncoding;
 
 /// Simple in-memory implementation of [`BlobStore`] and [`BranchStore`].
 ///

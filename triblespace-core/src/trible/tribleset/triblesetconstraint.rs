@@ -9,10 +9,10 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::encodings::genid::GenId;
-use crate::value::RawInline;
-use crate::value::InlineEncoding;
-use crate::value::INLINE_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::RawInline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
@@ -408,8 +408,8 @@ mod tests {
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::value::encodings::UnknownInline;
-    use crate::value::Inline;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
 
     #[test]
     fn constant() {

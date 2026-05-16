@@ -23,8 +23,8 @@ use triblespace_core::repo::capability;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 
 type PileBlake3 = Pile;
 
@@ -230,8 +230,8 @@ fn parse_handle_hex(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
     Ok(Inline::new(raw))
 }
 
-fn now_plus_30_days() -> Inline<triblespace_core::value::encodings::time::NsTAIInterval> {
-    use triblespace_core::value::TryToInline;
+fn now_plus_30_days() -> Inline<triblespace_core::inline::encodings::time::NsTAIInterval> {
+    use triblespace_core::inline::TryToInline;
     let now = hifitime::Epoch::now().expect("system time");
     let later = now + hifitime::Duration::from_seconds(30.0 * 86400.0);
     (now, later).try_to_inline().expect("valid interval")
@@ -242,9 +242,9 @@ fn now_plus_30_days() -> Inline<triblespace_core::value::encodings::time::NsTAII
 /// `team create` / `team invite` to surface when the freshly-issued
 /// cap expires — operators rotate caps before that point.
 fn format_expiry(
-    interval: &Inline<triblespace_core::value::encodings::time::NsTAIInterval>,
+    interval: &Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
 ) -> String {
-    use triblespace_core::value::TryFromInline;
+    use triblespace_core::inline::TryFromInline;
     match <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(interval) {
         Ok((_lower, upper)) => {
             let (y, mo, d, h, mi, s, _ns) = upper.to_gregorian_utc();
@@ -504,16 +504,16 @@ struct CapSummary {
     issuer: VerifyingKey,
     perms: Vec<Id>,
     branches: Vec<Id>,
-    expires_at: Option<Inline<triblespace_core::value::encodings::time::NsTAIInterval>>,
+    expires_at: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
 }
 
 /// Extract the upper-bound `Epoch` of an expiry interval. Used to
 /// sort caps by "expires soonest first" — caps without an expiry
 /// (none should currently exist; defensive) sort to the end.
 fn expiry_upper(
-    interval: &Option<Inline<triblespace_core::value::encodings::time::NsTAIInterval>>,
+    interval: &Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
 ) -> Option<hifitime::Epoch> {
-    use triblespace_core::value::TryFromInline;
+    use triblespace_core::inline::TryFromInline;
     let v = interval.as_ref()?;
     <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(v)
         .ok()
@@ -582,7 +582,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 subject: VerifyingKey,
                 issuer: VerifyingKey,
                 root: Id,
-                exp: Inline<triblespace_core::value::encodings::time::NsTAIInterval>,
+                exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
             ),
             pattern!(&set, [{
                 ?e @
@@ -795,7 +795,7 @@ fn run_show(
                 subject: VerifyingKey,
                 issuer: VerifyingKey,
                 root: Id,
-                exp: Inline<triblespace_core::value::encodings::time::NsTAIInterval>
+                exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>
             ),
             pattern!(&cap_set, [{
                 ?e @

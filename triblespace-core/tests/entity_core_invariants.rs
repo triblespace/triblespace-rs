@@ -23,7 +23,7 @@ use triblespace_core::blob::encodings::array::{
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::rawbytes::RawBytes;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::value::encodings::hash::{Blake3, Handle};
+use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 
 #[test]
 fn handle_id_is_deterministic() {
@@ -89,8 +89,8 @@ fn array_describe_carries_element_schema_annotations() {
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 
@@ -138,7 +138,7 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::Inline;
 
     let frag = <Handle<LongString> as MetaDescribe>::describe();
 
@@ -208,8 +208,8 @@ fn entity_spread_propagates_blobs() {
     use triblespace_core::metadata;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 

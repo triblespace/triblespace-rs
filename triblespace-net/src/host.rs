@@ -122,8 +122,8 @@ where
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
         use triblespace_core::blob::encodings::UnknownBlob;
-        use triblespace_core::value::Inline;
-        use triblespace_core::value::encodings::hash::Handle;
+        use triblespace_core::inline::Inline;
+        use triblespace_core::inline::encodings::hash::Handle;
         let handle = Inline::<Handle<UnknownBlob>>::new(*hash);
         self.reader.get::<anybytes::Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
     }
@@ -147,8 +147,8 @@ where
     >> {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::value::Inline;
-        use triblespace_core::value::encodings::hash::Handle;
+        use triblespace_core::inline::Inline;
+        use triblespace_core::inline::encodings::hash::Handle;
         let mut out = Vec::new();
         for handle_result in self.reader.blobs() {
             let Ok(handle) = handle_result else { continue };
@@ -798,8 +798,8 @@ async fn serve_stream(
 ) -> anyhow::Result<()> {
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
 
     let op = recv_u8(recv).await?;
     let span = debug_span!("stream", op = op_name(op));
@@ -1131,10 +1131,10 @@ mod tests {
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::trible::TribleSet;
-    use triblespace_core::value::TryToInline;
-    use triblespace_core::value::Inline;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::encodings::time::NsTAIInterval;
+    use triblespace_core::inline::TryToInline;
+    use triblespace_core::inline::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::encodings::time::NsTAIInterval;
     use hifitime::Epoch;
 
     fn now_plus_24h() -> Inline<NsTAIInterval> {

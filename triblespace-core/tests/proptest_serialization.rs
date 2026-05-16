@@ -6,7 +6,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::value::encodings::UnknownInline;
+use triblespace_core::inline::encodings::UnknownInline;
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (

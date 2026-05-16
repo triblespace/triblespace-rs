@@ -6,9 +6,9 @@ use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 /// Store that delegates blob and branch operations to two independent stores.
 ///

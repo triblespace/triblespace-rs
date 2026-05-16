@@ -10,7 +10,7 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 use triblespace::prelude::{BlobStore, TribleSet};
 
 type Reader = <MemoryBlobStore as BlobStore<Blake3>>::Reader;

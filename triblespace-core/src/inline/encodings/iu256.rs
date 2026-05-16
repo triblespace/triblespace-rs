@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,9 +7,9 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::TryFromInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::num::TryFromIntError;
 
@@ -633,7 +633,7 @@ impl_try_from_u256!(I256LE, ethnum::I256, i8, i16, i32, i64, i128);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoInline, TryFromInline};
+    use crate::inline::{IntoInline, TryFromInline};
     use proptest::prelude::*;
 
     fn arb_u256() -> impl Strategy<Value = ethnum::U256> {

@@ -18,11 +18,11 @@ use crate::metadata;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::encodings::boolean::Boolean;
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::hash::{Blake3, Handle};
-use crate::value::encodings::iu256::U256BE;
-use crate::value::Inline;
+use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::{Blake3, Handle};
+use crate::inline::encodings::iu256::U256BE;
+use crate::inline::Inline;
 use triblespace_core_macros::attributes;
 
 use crate::import::json::{

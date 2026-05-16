@@ -41,8 +41,8 @@ use crate::prelude::inlineencodings::GenId;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
-use crate::value::RawInline;
-use crate::value::INLINE_LEN;
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 
 thread_local!(static OWNED_IDS: IdOwner = IdOwner::new());
 
@@ -662,8 +662,8 @@ mod tests {
     use crate::prelude::*;
     use crate::query::Query;
     use crate::query::VariableContext;
-    use crate::value::encodings::genid::GenId;
-    use crate::value::encodings::shortstring::ShortString;
+    use crate::inline::encodings::genid::GenId;
+    use crate::inline::encodings::shortstring::ShortString;
 
     #[test]
     fn id_formatting() {

@@ -4,9 +4,9 @@ use crate::query::Constraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::RawInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 /// Inline-range constraint for [`SuccinctArchive`].
 ///

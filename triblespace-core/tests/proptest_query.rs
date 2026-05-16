@@ -8,8 +8,8 @@ use triblespace_core::query::{
     Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
-use triblespace_core::value::encodings::genid::GenId;
-use triblespace_core::value::encodings::UnknownInline;
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -546,7 +546,7 @@ proptest! {
         values in proptest::collection::hash_set("[a-z]{1,6}", 1..15),
     ) {
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::value::encodings::shortstring::ShortString;
+        use triblespace_core::inline::encodings::shortstring::ShortString;
 
         let hash: HashSet<String> = values;
         let mut sorted_vals: Vec<String> = hash.iter().cloned().collect();
@@ -590,7 +590,7 @@ proptest! {
         // `&mut [T]` (and anything that derefs to one) should sort on
         // `.has()` and produce the same rows as a pre-sorted `SortedSlice`.
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::value::encodings::shortstring::ShortString;
+        use triblespace_core::inline::encodings::shortstring::ShortString;
 
         let mut shuffled: Vec<String> = values.into_iter().collect();
         // Scramble deterministically so we have something to sort.

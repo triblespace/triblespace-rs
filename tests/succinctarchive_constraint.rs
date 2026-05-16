@@ -5,8 +5,8 @@ use triblespace::core::query::Binding;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::query::VariableContext;
-use triblespace::core::value::encodings::genid::GenId;
-use triblespace::core::value::encodings::UnknownInline;
+use triblespace::core::inline::encodings::genid::GenId;
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::prelude::*;
 
 #[test]

@@ -16,7 +16,7 @@
 use std::time::Instant;
 
 use triblespace_core::id::{Id, RawId};
-use triblespace_core::value::Inline;
+use triblespace_core::inline::Inline;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::succinct::SuccinctHNSWIndex;
@@ -174,8 +174,8 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);

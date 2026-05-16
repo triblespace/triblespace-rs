@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -16,9 +16,9 @@ use anybytes::View;
 
 /// Arbitrary-length UTF-8 text stored as a blob.
 ///
-/// Use for text that does not fit in the 32-byte [`ShortString`](crate::value::encodings::shortstring::ShortString)
+/// Use for text that does not fit in the 32-byte [`ShortString`](crate::inline::encodings::shortstring::ShortString)
 /// value boundary — documents, prompts, JSON payloads, logs, etc.
-/// Reference it from tribles via a [`Handle<LongString>`](crate::value::encodings::hash::Handle).
+/// Reference it from tribles via a [`Handle<LongString>`](crate::inline::encodings::hash::Handle).
 pub struct LongString {}
 
 impl BlobEncoding for LongString {}
@@ -50,7 +50,7 @@ impl TryFromBlob<LongString> for View<str> {
 }
 
 impl Encodes<View<str>> for LongString
-where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: View<str>) -> Blob<LongString> {
@@ -59,7 +59,7 @@ where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEnc
 }
 
 impl Encodes<&'static str> for LongString
-where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: &'static str) -> Blob<LongString> {
@@ -68,7 +68,7 @@ where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEnc
 }
 
 impl Encodes<String> for LongString
-where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: String) -> Blob<LongString> {
@@ -84,8 +84,8 @@ mod tests {
     use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
     
-    use crate::value::encodings::hash::Handle;
-    use crate::value::Inline;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
 
     #[test]
     fn string_handle() {

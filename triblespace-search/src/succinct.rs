@@ -30,7 +30,7 @@
 //! [`SuccinctGraph`] and the postings sections that *are*
 //! exposed.
 
-use triblespace_core::value::Encodes;
+use triblespace_core::inline::Encodes;
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::view::View;
 use anybytes::{ByteArea, Bytes};
@@ -46,7 +46,7 @@ use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::Variable;
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{RawInline, Inline, InlineEncoding};
+use triblespace_core::inline::{RawInline, Inline, InlineEncoding};
 
 use crate::schemas::{EmbHandle, Embedding};
 
@@ -747,8 +747,8 @@ const _: () = assert!(
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::value::encodings::hash::{Blake3, Handle};
-/// use triblespace_core::value::Inline;
+/// use triblespace_core::inline::encodings::hash::{Blake3, Handle};
+/// use triblespace_core::inline::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, Embedding};
 /// use triblespace_search::succinct::SuccinctHNSWIndex;
@@ -1339,7 +1339,7 @@ pub struct SuccinctBM25Meta {
 /// assert!(blob.bytes.len() > 0);
 /// ```
 pub struct SuccinctBM25Index<
-    D: InlineEncoding = triblespace_core::value::encodings::genid::GenId,
+    D: InlineEncoding = triblespace_core::inline::encodings::genid::GenId,
     T: InlineEncoding = crate::tokens::WordHash,
 > {
     /// Canonical blob bytes — single owner of every section's
@@ -1757,7 +1757,7 @@ impl MetaDescribe for SuccinctBM25Blob {
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> Encodes<&SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::value::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineEncoding,
+where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: &SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -1768,7 +1768,7 @@ where triblespace_core::value::encodings::hash::Handle<SuccinctBM25Blob>: trible
 }
 
 impl<D: InlineEncoding, T: InlineEncoding> Encodes<SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::value::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineEncoding,
+where triblespace_core::inline::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -1840,7 +1840,7 @@ impl MetaDescribe for SuccinctHNSWBlob {
 }
 
 impl Encodes<&SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::value::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineEncoding,
+where triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: &SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -1850,7 +1850,7 @@ where triblespace_core::value::encodings::hash::Handle<SuccinctHNSWBlob>: trible
 }
 
 impl Encodes<SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::value::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineEncoding,
+where triblespace_core::inline::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::inline::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -2102,7 +2102,7 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_corpus() {
         use crate::bm25::BM25Builder;
-        use triblespace_core::value::encodings::genid::GenId;
+        use triblespace_core::inline::encodings::genid::GenId;
         let succinct = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
@@ -2202,7 +2202,7 @@ mod tests {
     fn succinct_bm25_empty_round_trip() {
         use crate::bm25::BM25Builder;
         use triblespace_core::blob::{Blob, TryFromBlob};
-        use triblespace_core::value::encodings::genid::GenId;
+        use triblespace_core::inline::encodings::genid::GenId;
         let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         let blob: Blob<SuccinctBM25Blob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctBM25Index =
@@ -2219,7 +2219,7 @@ mod tests {
         use triblespace_core::blob::{Blob, TryFromBlob};
         let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source([0u8; 10].to_vec()));
         let err = SuccinctBM25Index::<
-            triblespace_core::value::encodings::genid::GenId,
+            triblespace_core::inline::encodings::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_blob(blob)
         .unwrap_err();
@@ -2247,7 +2247,7 @@ mod tests {
         let truncated = full[..full.len() - 2].to_vec();
         let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source(truncated));
         let err = SuccinctBM25Index::<
-            triblespace_core::value::encodings::genid::GenId,
+            triblespace_core::inline::encodings::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_blob(blob)
         .unwrap_err();
@@ -2380,8 +2380,8 @@ mod tests {
         SuccinctHNSWIndex,
         triblespace_core::blob::MemoryBlobStore,
         Vec<
-            triblespace_core::value::Inline<
-                triblespace_core::value::encodings::hash::Handle<
+            triblespace_core::inline::Inline<
+                triblespace_core::inline::encodings::hash::Handle<
                     crate::schemas::Embedding,
                 >,
             >,

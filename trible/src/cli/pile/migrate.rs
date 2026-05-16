@@ -8,7 +8,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStoreMeta;
 use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
+use triblespace_core::inline::encodings::hash::Handle;
 
 type NameHandle = Inline<Handle<blobencodings::LongString>>;
 type BranchMetaHandle = Inline<Handle<blobencodings::SimpleArchive>>;

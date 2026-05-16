@@ -36,8 +36,8 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use anybytes::View;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::prelude::blobencodings;
@@ -190,7 +190,7 @@ fn query(
     // trible pattern joins on the shared `?doc` to pick the
     // title up at the same time. Ranking is operational — score
     // each row through `idx.score` after collecting, then sort.
-    use triblespace_core::value::IntoInline;
+    use triblespace_core::inline::IntoInline;
     let tokens = hash_tokens(text);
     let mut rows: Vec<(Id, f32, String)> = find!(
         (doc: Id, title: String),

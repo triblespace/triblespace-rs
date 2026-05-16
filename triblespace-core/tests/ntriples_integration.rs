@@ -18,7 +18,7 @@ use triblespace_core::prelude::inlineencodings::{self, Handle};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::{TryToInline, Inline};
+use triblespace_core::inline::{TryToInline, Inline};
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
@@ -200,7 +200,7 @@ fn xsd_datatypes_map_to_native_schemas() {
 #[test]
 fn xsd_temporal_and_binary_types() {
     use triblespace_core::blob::encodings::rawbytes::RawBytes;
-    use triblespace_core::value::encodings::time::{NsDuration, NsTAIInterval};
+    use triblespace_core::inline::encodings::time::{NsDuration, NsTAIInterval};
 
     let mut repo = new_repo();
     let branch_id = repo.ensure_branch("main", None).unwrap();

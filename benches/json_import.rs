@@ -8,7 +8,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::import::json_tree::JsonTreeImporter;
-use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 
 struct Fixture {
     name: &'static str,

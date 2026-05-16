@@ -3,9 +3,9 @@ use crate::id::id_into_value;
 use crate::id::ID_LEN;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::value::RawInline;
-use crate::value::InlineEncoding;
-use crate::value::INLINE_LEN;
+use crate::inline::RawInline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 
 use super::Binding;
 use super::Constraint;

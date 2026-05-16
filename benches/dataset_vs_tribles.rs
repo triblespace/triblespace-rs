@@ -4,7 +4,7 @@ use std::hint::black_box;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::fucid;
 use triblespace::core::trible::Trible;
-use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 use triblespace::prelude::{BlobStorePut, IdOwner, IntoInline, TribleSet, Inline};
 
 struct PreparedData {

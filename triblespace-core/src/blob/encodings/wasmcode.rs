@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use anybytes::Bytes;
 
 use crate::blob::Blob;
@@ -39,7 +39,7 @@ impl MetaDescribe for WasmCode {
 }
 
 impl Encodes<Bytes> for WasmCode
-where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<WasmCode>: crate::inline::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: Bytes) -> Blob<WasmCode> {
@@ -48,7 +48,7 @@ where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncod
 }
 
 impl Encodes<Vec<u8>> for WasmCode
-where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<WasmCode>: crate::inline::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: Vec<u8>) -> Blob<WasmCode> {
@@ -57,7 +57,7 @@ where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncod
 }
 
 impl Encodes<&[u8]> for WasmCode
-where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
+where crate::inline::encodings::hash::Handle<WasmCode>: crate::inline::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: &[u8]) -> Blob<WasmCode> {

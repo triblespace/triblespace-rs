@@ -29,10 +29,10 @@ use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::prelude::blobencodings::SimpleArchive;
-use crate::value::encodings::hash::Handle;
-use crate::value::RawInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 use super::BlobStore;
 use super::BlobStoreGet;

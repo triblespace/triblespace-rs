@@ -10,8 +10,8 @@ use std::convert::TryInto;
 
 use crate::id::ExclusiveId;
 use crate::id::Id;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 /// Re-export of [`Fragment`](fragment::Fragment).
 pub use fragment::Fragment;

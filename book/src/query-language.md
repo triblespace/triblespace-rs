@@ -61,9 +61,9 @@ destructure results.
 ### Typed variables
 
 Variables optionally include a concrete type to convert the underlying value.
-The constraint phase still works with untyped [`Inline`](triblespace::core::value::Inline)
+The constraint phase still works with untyped [`Inline`](triblespace::core::inline::Inline)
 instances; conversion happens when results are emitted.  These conversions use
-[`TryFromInline`](triblespace::core::value::TryFromInline).
+[`TryFromInline`](triblespace::core::inline::TryFromInline).
 
 By default, if a conversion fails the entire row is silently skipped — like a
 constraint that doesn't match.  For types whose `TryFromInline::Error` is
@@ -133,7 +133,7 @@ Call [`Variable::is`](triblespace::core::query::Variable::is) when you need a bi
 equal a specific value.  The method returns a
 [`ConstantConstraint`](triblespace::core::query::constantconstraint::ConstantConstraint)
 that checks whether the solver can assign the variable to the provided
-[`Inline`](triblespace::core::value::Inline).  Constant constraints behave like any other
+[`Inline`](triblespace::core::inline::Inline).  Constant constraints behave like any other
 clause: combine them with `and!` to narrow a variable after other constraints
 have proposed candidates, or place them inside `or!` branches to accept
 multiple literals.

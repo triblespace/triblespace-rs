@@ -29,7 +29,7 @@ use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{Inline, InlineEncoding};
+use triblespace_core::inline::{Inline, InlineEncoding};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
 /// produce Blake3 hashes of a lowercased word / code segment.
@@ -603,7 +603,7 @@ mod tests {
         // docs that contain those two words adjacently.
         use crate::bm25::BM25Builder;
         use triblespace_core::id::Id;
-        use triblespace_core::value::encodings::genid::GenId;
+        use triblespace_core::inline::encodings::genid::GenId;
 
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()

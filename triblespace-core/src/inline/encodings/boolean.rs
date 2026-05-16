@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
-use crate::value::INLINE_LEN;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 
 use std::convert::Infallible;
 
@@ -150,8 +150,8 @@ impl Encodes<&bool> for Boolean
 mod tests {
     use super::Boolean;
     use super::InvalidBoolean;
-    use crate::value::Inline;
-    use crate::value::InlineEncoding;
+    use crate::inline::Inline;
+    use crate::inline::InlineEncoding;
 
     #[test]
     fn encodes_false_as_zero_bytes() {
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn rejects_mixed_bit_patterns() {
-        let mut mixed = [0u8; crate::value::INLINE_LEN];
+        let mut mixed = [0u8; crate::inline::INLINE_LEN];
         mixed[0] = 1;
         let value = Inline::<Boolean>::new(mixed);
         assert_eq!(Boolean::validate(value), Err(InvalidBoolean));

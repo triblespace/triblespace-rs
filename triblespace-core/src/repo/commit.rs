@@ -1,6 +1,6 @@
 use crate::macros::entity;
 use crate::macros::pattern;
-use crate::value::TryToInline;
+use crate::inline::TryToInline;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;
@@ -16,7 +16,7 @@ use crate::blob::Blob;
 use crate::prelude::inlineencodings::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::value::Inline;
+use crate::inline::Inline;
 
 use hifitime::Epoch;
 

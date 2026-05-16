@@ -391,7 +391,7 @@ fn diagnose_reports_invalid_hash() {
 fn inspect_outputs_tribles() {
     use triblespace::prelude::*;
     use triblespace_core::examples;
-    use triblespace_core::value::encodings::hash::Handle;
+    use triblespace_core::inline::encodings::hash::Handle;
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("inspect.pile");

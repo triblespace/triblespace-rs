@@ -15,10 +15,10 @@ use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::encodings::genid::GenId;
-use crate::value::Inline;
-use crate::value::RawInline;
-use crate::value::IntoInline;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::Inline;
+use crate::inline::RawInline;
+use crate::inline::IntoInline;
 
 // ── Path expression types ────────────────────────────────────────────────
 

@@ -89,14 +89,14 @@ pub use crate::trible::Spread;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
 pub use crate::trible::TribleSetFingerprint;
-pub use crate::value::encodings::UnknownInline;
-pub use crate::value::IntoInline;
-pub use crate::value::ToEncoded;
-pub use crate::value::TryFromInline;
-pub use crate::value::TryToInline;
-pub use crate::value::Inline;
-pub use crate::value::InlineEncoding;
-pub use crate::value::Encoded;
+pub use crate::inline::encodings::UnknownInline;
+pub use crate::inline::IntoInline;
+pub use crate::inline::ToEncoded;
+pub use crate::inline::TryFromInline;
+pub use crate::inline::TryToInline;
+pub use crate::inline::Inline;
+pub use crate::inline::InlineEncoding;
+pub use crate::inline::Encoded;
 pub use anybytes::View;
 // Re-export the pattern/entity procedural macros into the prelude so they can
 // be imported with `use triblespace::prelude::*;` and called as `pattern!(...)`.

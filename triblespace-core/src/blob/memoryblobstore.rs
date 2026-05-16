@@ -8,9 +8,9 @@ use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
-use crate::value::INLINE_LEN;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::INLINE_LEN;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -139,7 +139,7 @@ impl MemoryBlobStore {
     pub fn insert<S>(&mut self, blob: Blob<S>) -> Inline<Handle<S>>
     where
         S: BlobEncoding,
-        Handle<S>: crate::value::InlineEncoding,
+        Handle<S>: crate::inline::InlineEncoding,
     {
         let handle: Inline<Handle<S>> = blob.get_handle();
         let unknown_handle: Inline<Handle<UnknownBlob>> = handle.transmute();

@@ -51,11 +51,11 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
-use crate::value::encodings::hash::Blake3;
-use crate::value::encodings::hash::Hash;
-use crate::value::RawInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Blake3;
+use crate::inline::encodings::hash::Hash;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");

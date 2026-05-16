@@ -12,10 +12,10 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Blake3;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::encodings::hash::Hash;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Blake3;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::encodings::hash::Hash;
+use triblespace_core::inline::Inline;
 
 use super::signing::load_signing_key;
 

@@ -181,18 +181,18 @@ use crate::patch::PATCH;
 use crate::prelude::inlineencodings::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
-use crate::value::INLINE_LEN;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::prelude::*;
-use crate::value::encodings::ed25519 as ed;
-use crate::value::encodings::shortstring::ShortString;
+use crate::inline::encodings::ed25519 as ed;
+use crate::inline::encodings::shortstring::ShortString;
 
 attributes! {
     /// The actual data of the commit.

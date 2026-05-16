@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
@@ -10,12 +10,12 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
-use crate::value::INLINE_LEN;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 
 use std::convert::TryInto;
 
@@ -353,9 +353,9 @@ impl proptest::strategy::ValueTree for IdValueTree {
 mod tests {
     use super::GenId;
     use crate::id::rngid;
-    use crate::value::TryFromInline;
-    use crate::value::TryToInline;
-    use crate::value::InlineEncoding;
+    use crate::inline::TryFromInline;
+    use crate::inline::TryToInline;
+    use crate::inline::InlineEncoding;
 
     #[test]
     fn unique() {

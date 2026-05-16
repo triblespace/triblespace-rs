@@ -45,10 +45,10 @@ pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
 /// Tag indicating a scope grants admin (delegation + revocation) authority.
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
-use crate::value::encodings::ed25519 as ed;
+use crate::inline::encodings::ed25519 as ed;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::hash::Handle;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Handle;
 
 triblespace_core_macros::attributes! {
     // ── Cap blob ──────────────────────────────────────────────────────
@@ -133,9 +133,9 @@ use crate::macros::entity;
 use crate::macros::pattern;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::value::Inline;
-use crate::value::IntoInline;
-use crate::value::encodings::time::NsTAIInterval;
+use crate::inline::Inline;
+use crate::inline::IntoInline;
+use crate::inline::encodings::time::NsTAIInterval;
 
 /// Errors returned by [`build_capability`].
 #[derive(Debug)]
@@ -188,7 +188,7 @@ pub enum BuildError {
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToInline;
+/// use triblespace_core::inline::TryToInline;
 /// use triblespace_core::repo::capability::{build_capability, PERM_READ};
 /// use rand::rngs::OsRng;
 ///
@@ -576,7 +576,7 @@ where
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToInline;
+/// use triblespace_core::inline::TryToInline;
 /// use triblespace_core::repo::capability::{
 ///     build_capability, build_revocation, build_revocation_set,
 ///     extract_revocation_pairs, PERM_READ,
@@ -693,8 +693,8 @@ where
 
 use ed25519_dalek::Verifier;
 use std::collections::HashSet;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use hifitime::Epoch;
 
 /// Errors returned by [`verify_chain`].
@@ -995,9 +995,9 @@ struct CapFields {
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
-/// use triblespace_core::value::TryToInline;
-/// use triblespace_core::value::Inline;
-/// use triblespace_core::value::encodings::hash::{Blake3, Handle};
+/// use triblespace_core::inline::TryToInline;
+/// use triblespace_core::inline::Inline;
+/// use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 /// use triblespace_core::repo::capability::{
 ///     build_capability, verify_chain, PERM_READ,
 /// };
@@ -1216,7 +1216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::TryToInline;
+    use crate::inline::TryToInline;
     use ed25519_dalek::Verifier;
     use hifitime::Epoch;
     use rand::rngs::OsRng;

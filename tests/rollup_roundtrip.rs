@@ -17,8 +17,8 @@ use triblespace::core::id::{fucid, ExclusiveId};
 use triblespace::core::macros::{attributes, entity};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{Repository, RollupError};
-use triblespace::core::value::encodings::hash::Handle;
-use triblespace::core::value::Inline;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::TribleSet;
 

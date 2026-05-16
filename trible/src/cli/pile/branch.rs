@@ -20,8 +20,8 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::{Blake3, Handle, Hash};
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
+use triblespace_core::inline::Inline;
 
 use super::signing::load_signing_key;
 use triblespace_core::repo::BlobStoreMeta;
@@ -400,9 +400,9 @@ pub fn run(cmd: Command) -> Result<()> {
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
-            use triblespace_core::value::encodings::hash::Blake3;
-            use triblespace_core::value::encodings::hash::Hash;
-            use triblespace_core::value::Inline;
+            use triblespace_core::inline::encodings::hash::Blake3;
+            use triblespace_core::inline::encodings::hash::Hash;
+            use triblespace_core::inline::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -504,7 +504,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::inlineencodings::Handle;
             use triblespace_core::repo::pile::Pile;
             
-            use triblespace_core::value::Inline;
+            use triblespace_core::inline::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -621,8 +621,8 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
             
-            use triblespace_core::value::encodings::hash::Handle;
-            use triblespace_core::value::Inline;
+            use triblespace_core::inline::encodings::hash::Handle;
+            use triblespace_core::inline::Inline;
 
             let bid = parse_branch_id_hex(&branch)?;
 
@@ -643,7 +643,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
                 // Prepare a mapping from source handle raw -> destination handle for later lookup.
                 use std::collections::HashMap;
-                use triblespace_core::value::INLINE_LEN;
+                use triblespace_core::inline::INLINE_LEN;
                 let mut mapping: HashMap<[u8; INLINE_LEN], Inline<Handle<_>>> =
                     HashMap::new();
 
@@ -721,9 +721,9 @@ pub fn run(cmd: Command) -> Result<()> {
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
-            use triblespace_core::value::encodings::hash::Blake3;
-            use triblespace_core::value::encodings::hash::Hash;
-            use triblespace_core::value::Inline;
+            use triblespace_core::inline::encodings::hash::Blake3;
+            use triblespace_core::inline::encodings::hash::Hash;
+            use triblespace_core::inline::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -865,8 +865,8 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
             
-            use triblespace_core::value::encodings::hash::Handle;
-            use triblespace_core::value::Inline;
+            use triblespace_core::inline::encodings::hash::Handle;
+            use triblespace_core::inline::Inline;
 
             struct CopyStats {
                 visited: usize,
@@ -1347,7 +1347,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     };
 
                     let ts_str = if let Some(ts_val) = info.timestamp {
-                        use triblespace_core::value::encodings::time::Lower;
+                        use triblespace_core::inline::encodings::time::Lower;
                         let lower: Lower = ts_val.try_from_inline().unwrap_or(Lower(0));
                         let epoch = hifitime::Epoch::from_tai_duration(
                             hifitime::Duration::from_total_nanoseconds(lower.0));
@@ -1872,16 +1872,16 @@ struct CommitInfo {
     metadata: Option<Inline<Handle<SimpleArchive>>>,
     message: Option<Inline<Handle<LongString>>>,
     short_message: Option<String>,
-    timestamp: Option<Inline<triblespace_core::value::encodings::time::NsTAIInterval>>,
+    timestamp: Option<Inline<triblespace_core::inline::encodings::time::NsTAIInterval>>,
     signed_by: Option<[u8; 32]>,
 }
 
 /// Parse a commit TribleSet into structured fields.
 fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     use triblespace_core::repo;
-    use triblespace_core::value::encodings::ed25519 as ed;
-    use triblespace_core::value::encodings::shortstring::ShortString;
-    use triblespace_core::value::encodings::time::NsTAIInterval;
+    use triblespace_core::inline::encodings::ed25519 as ed;
+    use triblespace_core::inline::encodings::shortstring::ShortString;
+    use triblespace_core::inline::encodings::time::NsTAIInterval;
 
     let content_attr = repo::content.id();
     let metadata_attr = repo::metadata.id();
@@ -1941,7 +1941,7 @@ fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> 
     use triblespace::prelude::inlineencodings::Handle;
     use triblespace_core::repo;
     
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::Inline;
 
     let head_attr = repo::head.id();
     let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;

@@ -33,7 +33,7 @@ pub mod repo;
 /// Trible representation, sets, fragments, and spread helpers.
 pub mod trible;
 /// Inline types, schemas, and conversion traits.
-pub mod value;
+pub mod inline;
 
 #[cfg(feature = "wasm")]
 /// WebAssembly integration helpers.

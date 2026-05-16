@@ -17,10 +17,10 @@ use crate::id::Id;
 use crate::metadata;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::trible::TribleSet;
-use crate::value::encodings::hash::Handle;
-use crate::value::encodings::time::NsTAIInterval;
-use crate::value::TryToInline;
-use crate::value::Inline;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::time::NsTAIInterval;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
 
 /// Current TAI time as a collapsed `NsTAIInterval`. Used as
 /// `metadata::updated_at` on every branch metadata blob so that peers can

@@ -3,7 +3,7 @@
 use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
 use triblespace::prelude::*;
 use triblespace::core::repo::{self, commit};
-use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::core::inline::encodings::hash::Blake3;
 use kani::BoundedArbitrary;
 use crate::pattern;
 use crate::entity;

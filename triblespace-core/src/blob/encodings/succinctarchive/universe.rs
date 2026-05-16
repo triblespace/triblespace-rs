@@ -1,4 +1,4 @@
-use crate::value::RawInline;
+use crate::inline::RawInline;
 
 use std::cmp::Reverse;
 use std::collections::HashMap;

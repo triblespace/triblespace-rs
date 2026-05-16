@@ -10,8 +10,8 @@ use triblespace_core::metadata;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 
 fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
@@ -50,7 +50,7 @@ fn consolidate_merges_branch_heads() {
             assert!(res.is_none(), "unexpected push conflict");
 
             let head = ws.head().expect("head present");
-            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+            let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                 Handle::to_hash(head);
             original_heads.push(hh.from_inline());
         }
@@ -131,7 +131,7 @@ fn consolidate_merges_branch_heads() {
     for t in commit_meta.iter() {
         if t.a() == &repo_parent_attr {
             let p = *t.v::<Handle<SimpleArchive>>();
-            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+            let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                 Handle::to_hash(p);
             parents.insert(hh.from_inline());
         }
@@ -185,7 +185,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "alpha-A commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_a = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+        let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
             Handle::to_hash(head_a);
         alpha_heads.push(hh.from_inline());
 
@@ -206,7 +206,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "alpha-B commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_b = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+        let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
             Handle::to_hash(head_b);
         alpha_heads.push(hh.from_inline());
 
@@ -220,7 +220,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         ws.commit(content, "beta commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_c = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+        let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
             Handle::to_hash(head_c);
         beta_head = hh.from_inline();
 
@@ -331,7 +331,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
                 for t in commit_meta.iter() {
                     if t.a() == &repo_parent_attr {
                         let p = *t.v::<Handle<SimpleArchive>>();
-                        let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+                        let hash: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                             Handle::to_hash(p);
                         parents.insert(hash.from_inline());
                     }
@@ -361,7 +361,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
             }
         }
         if let Some(hh) = head_handle {
-            let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+            let hash: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                 Handle::to_hash(hh);
             if hash.from_inline::<String>() == beta_head {
                 found_beta_direct = true;
@@ -428,7 +428,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         ws_b.commit(content2, "gamma-B commit");
         assert!(repo.try_push(&mut ws_b).expect("push").is_none());
         let head_b = ws_b.head().expect("head");
-        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+        let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
             Handle::to_hash(head_b);
         descendant_head = hh.from_inline();
 
@@ -503,7 +503,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         }
         if is_gamma {
             if let Some(hh) = head_handle {
-                let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+                let hash: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                     Handle::to_hash(hh);
                 let hex: String = hash.from_inline();
                 // The active branch should still point to the descendant head.
@@ -548,7 +548,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
             ws.commit(content, &format!("delta-{i}"));
             assert!(repo.try_push(&mut ws).expect("push").is_none());
             let head = ws.head().expect("head");
-            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+            let hh: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                 Handle::to_hash(head);
             delta_heads.push(hh.from_inline());
         }
@@ -639,7 +639,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
                     for t in commit_meta.iter() {
                         if t.a() == &repo_parent_attr {
                             let p = *t.v::<Handle<SimpleArchive>>();
-                            let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
+                            let hash: Inline<triblespace_core::inline::encodings::hash::Hash<triblespace_core::inline::encodings::hash::Blake3>> =
                                 Handle::to_hash(p);
                             parents.insert(hash.from_inline());
                         }

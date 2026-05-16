@@ -14,7 +14,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{BlobStore, BlobStoreGet};
-use triblespace_core::value::encodings::hash::Handle;
+use triblespace_core::inline::encodings::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;
@@ -39,8 +39,8 @@ fn entity_auto_puts_blob_handle_fields() {
 
     // The handle in the facts must match what the macro computed.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -72,8 +72,8 @@ fn entity_still_accepts_precomputed_value() {
 
     // Handle is in the facts.
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)
@@ -96,8 +96,8 @@ fn entity_still_accepts_precomputed_value() {
 #[test]
 fn entity_pipeline_does_not_rehash() {
     let e = rngid();
-    let bogus_handle: triblespace_core::value::Inline<Handle<LongString>> =
-        triblespace_core::value::Inline::new([0xAA; 32]);
+    let bogus_handle: triblespace_core::inline::Inline<Handle<LongString>> =
+        triblespace_core::inline::Inline::new([0xAA; 32]);
     let blob: Blob<LongString> = Blob::with_handle(
         anybytes::Bytes::from(b"contents whose true hash we'll never see".to_vec()),
         bogus_handle,
@@ -106,8 +106,8 @@ fn entity_pipeline_does_not_rehash() {
     let frag = entity! { &e @ ns::note: blob };
 
     use triblespace_core::macros::{find, pattern};
-    let resolved: triblespace_core::value::Inline<Handle<LongString>> = find!(
-        (h: triblespace_core::value::Inline<Handle<LongString>>),
+    let resolved: triblespace_core::inline::Inline<Handle<LongString>> = find!(
+        (h: triblespace_core::inline::Inline<Handle<LongString>>),
         pattern!(&frag, [{ &e @ ns::note: ?h }])
     )
     .map(|(h,)| h)

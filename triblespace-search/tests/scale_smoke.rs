@@ -388,8 +388,8 @@ fn bm25_quantization_preserves_top10() {
             continue;
         }
 
-        let mut raw_scores: Vec<(triblespace_core::value::RawInline, f32)> = Vec::new();
-        let mut q_scores: Vec<(triblespace_core::value::RawInline, f32)> = Vec::new();
+        let mut raw_scores: Vec<(triblespace_core::inline::RawInline, f32)> = Vec::new();
+        let mut q_scores: Vec<(triblespace_core::inline::RawInline, f32)> = Vec::new();
         for term in &terms {
             for (d, s) in idx.query_term(term) {
                 let d_raw = d.raw;

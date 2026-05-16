@@ -7,8 +7,8 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::repo;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 
 use super::signing::load_signing_key;
 

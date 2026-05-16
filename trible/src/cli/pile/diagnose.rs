@@ -42,8 +42,8 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace_core::repo::BlobStoreMeta;
     use triblespace_core::repo::pile::{Pile, ReadError};
     use triblespace_core::trible::TribleSet;
-    use triblespace_core::value::encodings::hash::{Blake3, Handle, Hash};
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
+    use triblespace_core::inline::Inline;
 
     match Pile::open(pile_path) {
         Ok(mut pile) => {
@@ -60,7 +60,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                     match item {
                         Ok((handle, blob)) => {
                             total += 1;
-                            let expected: triblespace_core::value::Inline<Hash<Blake3>> =
+                            let expected: triblespace_core::inline::Inline<Hash<Blake3>> =
                                 Handle::to_hash(handle);
                             let computed = Hash::<Blake3>::digest(&blob.bytes);
                             if expected != computed {
@@ -290,9 +290,9 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     use memchr::memmem::Finder;
     use triblespace_core::blob::Bytes;
     use triblespace_core::id::id_hex;
-    use triblespace_core::value::encodings::hash::Blake3;
-    use triblespace_core::value::encodings::hash::Hash;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Blake3;
+    use triblespace_core::inline::encodings::hash::Hash;
+    use triblespace_core::inline::Inline;
 
     let handle = handle.trim();
     let normalized = if !handle.contains(':') && handle.len() == 64 {

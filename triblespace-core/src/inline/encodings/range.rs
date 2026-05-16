@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawInline;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
@@ -210,7 +210,7 @@ impl TryFromInline<'_, RangeInclusiveU128> for RangeInclusive<u128> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoInline, TryFromInline, TryToInline};
+    use crate::inline::{IntoInline, TryFromInline, TryToInline};
     use proptest::prelude::*;
 
     proptest! {

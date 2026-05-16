@@ -8,8 +8,8 @@ use triblespace::core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
 use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
-use triblespace::core::value::encodings::genid::GenId;
-use triblespace::core::value::IntoInline;
+use triblespace::core::inline::encodings::genid::GenId;
+use triblespace::core::inline::IntoInline;
 use triblespace::prelude::*;
 
 mod bench_social {
@@ -361,7 +361,7 @@ mod hybrid {
 
 mod path_macro {
     use super::*;
-    use triblespace::core::value::Inline;
+    use triblespace::core::inline::Inline;
 
     pub fn reachable_from(set: &TribleSet, _attr: &RawId, start: &RawId) -> HashSet<RawId> {
         let start_id = Id::new(*start).unwrap();

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 
 use triblespace_core::find;
 use triblespace_core::id::Id;
-use triblespace_core::value::IntoInline;
+use triblespace_core::inline::IntoInline;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -191,8 +191,8 @@ fn find_matches_term_on_succinct() {
 fn find_hnsw_similar_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::encodings::hash::Handle;
-    use triblespace_core::value::Inline;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 

@@ -14,8 +14,8 @@ use triblespace_core::repo::branch::branch_unsigned;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_net::tracking;
 
 /// Build a remote-style branch metadata blob and put it into `store`.

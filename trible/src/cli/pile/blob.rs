@@ -55,9 +55,9 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::BlobStoreList;
             use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::encodings::hash::Blake3;
-            use triblespace_core::value::encodings::hash::Handle;
-            use triblespace_core::value::encodings::hash::Hash;
+            use triblespace_core::inline::encodings::hash::Blake3;
+            use triblespace_core::inline::encodings::hash::Handle;
+            use triblespace_core::inline::encodings::hash::Hash;
 
             let mut pile: Pile = Pile::open(&path)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -65,9 +65,9 @@ pub fn run(cmd: Command) -> Result<()> {
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
                 for handle in reader.blobs() {
-                    let handle: triblespace_core::value::Inline<Handle<UnknownBlob>> =
+                    let handle: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                         handle?;
-                    let hash: triblespace_core::value::Inline<Hash<Blake3>> =
+                    let hash: triblespace_core::inline::Inline<Hash<Blake3>> =
                         Handle::to_hash(handle);
                     let string: String = hash.from_inline();
                     if metadata {
@@ -93,16 +93,16 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::BlobStorePut;
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::encodings::hash::Blake3;
-            use triblespace_core::value::encodings::hash::Handle;
-            use triblespace_core::value::encodings::hash::Hash;
+            use triblespace_core::inline::encodings::hash::Blake3;
+            use triblespace_core::inline::encodings::hash::Handle;
+            use triblespace_core::inline::encodings::hash::Hash;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let file_handle = File::open(&file)?;
                 let bytes = unsafe { Bytes::map_file(&file_handle)? };
                 let handle = pile.put::<RawBytes, _>(bytes)?;
-                let hash: triblespace_core::value::Inline<Hash<Blake3>> = Handle::to_hash(handle);
+                let hash: triblespace_core::inline::Inline<Hash<Blake3>> = Handle::to_hash(handle);
                 let string: String = hash.from_inline();
                 println!("{string}");
                 Ok(())
@@ -123,12 +123,12 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
             
-            use triblespace_core::value::encodings::hash::Handle;
+            use triblespace_core::inline::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Inline<Handle<UnknownBlob>> =
+                let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()
@@ -155,12 +155,12 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::BlobMetadata;
             
-            use triblespace_core::value::encodings::hash::Handle;
+            use triblespace_core::inline::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
                 let hash_val = parse_blob_handle(&handle)?;
-                let handle_val: triblespace_core::value::Inline<Handle<UnknownBlob>> =
+                let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                     hash_val.into();
                 let reader = pile
                     .reader()

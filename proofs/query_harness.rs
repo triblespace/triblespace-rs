@@ -2,8 +2,8 @@
 
 use super::util;
 use crate::prelude::*;
-use crate::value::encodings::genid::GenId;
-use crate::value::encodings::UnknownInline;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::UnknownInline;
 
 /// Namespace used by the query harness with unconstrained values.
 pub mod qns {

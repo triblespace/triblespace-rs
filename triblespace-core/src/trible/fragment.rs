@@ -6,8 +6,8 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
 
 use super::Trible;
 use super::TribleSet;

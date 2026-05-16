@@ -30,9 +30,9 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::{
     BlobStore, BlobStoreList, BlobStorePut, BranchStore, PushResult,
 };
-use triblespace_core::value::Inline;
-use triblespace_core::value::InlineEncoding;
-use triblespace_core::value::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
+use triblespace_core::inline::InlineEncoding;
+use triblespace_core::inline::encodings::hash::Handle;
 
 use crate::channel::NetEvent;
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
@@ -66,7 +66,7 @@ pub use crate::host::PeerConfig;
 /// use ed25519_dalek::SigningKey;
 /// use rand::rngs::OsRng;
 /// use triblespace_core::repo::pile::Pile;
-/// use triblespace_core::value::encodings::hash::Blake3;
+/// use triblespace_core::inline::encodings::hash::Blake3;
 /// use triblespace_net::peer::{Peer, PeerConfig};
 ///
 /// let key = SigningKey::generate(&mut OsRng);

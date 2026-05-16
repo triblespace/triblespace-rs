@@ -1,9 +1,9 @@
 #![cfg(kani)]
 
-use crate::value::encodings::shortstring::ShortString;
-use crate::value::TryFromInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::shortstring::ShortString;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 #[kani::proof]
 #[kani::unwind(33)]

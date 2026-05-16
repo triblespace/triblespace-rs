@@ -9,11 +9,11 @@ use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::RawInline;
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///

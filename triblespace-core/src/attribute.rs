@@ -31,7 +31,7 @@
 
 use crate::id::RawId;
 use crate::trible::Fragment;
-use crate::value::InlineEncoding;
+use crate::inline::InlineEncoding;
 use core::marker::PhantomData;
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
@@ -78,31 +78,31 @@ impl<S: InlineEncoding> Attribute<S> {
     /// This is a small convenience wrapper around the `IntoInline` trait and
     /// simplifies macro expansion: `af.inline_from(expr)` preserves the
     /// schema `S` for type inference.
-    pub fn inline_from<T: crate::value::IntoInline<S>>(&self, v: T) -> crate::value::Inline<S> {
-        crate::value::IntoInline::to_inline(v)
+    pub fn inline_from<T: crate::inline::IntoInline<S>>(&self, v: T) -> crate::inline::Inline<S> {
+        crate::inline::IntoInline::to_inline(v)
     }
 
     /// Macro-side entry point: produce the [`Encoded<S>`] the
     /// `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoEncoded`], parameterised by the schema's
-    /// [`Encoding`](crate::value::InlineEncoding::Encoding) — `S`
+    /// [`Encoding`](crate::inline::InlineEncoding::Encoding) — `S`
     /// itself for inline schemas, the inner `BlobEncoding` for
     /// `Handle<T>`. The resulting `Output` is lifted into a [`Encoded`]
     /// via [`ToEncoded`].
     ///
-    /// [`IntoEncoded`]: crate::value::IntoEncoded
-    /// [`ToEncoded`]: crate::value::ToEncoded
-    /// [`Encoded`]: crate::value::Encoded
-    /// [`Encoded<S>`]: crate::value::Encoded
-    pub fn encoded_from<V>(&self, v: V) -> crate::value::Encoded<S>
+    /// [`IntoEncoded`]: crate::inline::IntoEncoded
+    /// [`ToEncoded`]: crate::inline::ToEncoded
+    /// [`Encoded`]: crate::inline::Encoded
+    /// [`Encoded<S>`]: crate::inline::Encoded
+    pub fn encoded_from<V>(&self, v: V) -> crate::inline::Encoded<S>
     where
-        V: crate::value::IntoEncoded<<S as crate::value::InlineEncoding>::Encoding>,
-        <V as crate::value::IntoEncoded<
-            <S as crate::value::InlineEncoding>::Encoding,
-        >>::Output: crate::value::ToEncoded<S>,
+        V: crate::inline::IntoEncoded<<S as crate::inline::InlineEncoding>::Encoding>,
+        <V as crate::inline::IntoEncoded<
+            <S as crate::inline::InlineEncoding>::Encoding,
+        >>::Output: crate::inline::ToEncoded<S>,
     {
-        use crate::value::ToEncoded;
+        use crate::inline::ToEncoded;
         v.into_encoded().to_encoded()
     }
 
@@ -170,9 +170,9 @@ mod tests {
     use crate::id::Id;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
-    use crate::value::encodings::hash::Handle;
-    use crate::value::encodings::shortstring::ShortString;
-    use crate::value::Inline;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::encodings::shortstring::ShortString;
+    use crate::inline::Inline;
 
     #[test]
     fn dynamic_field_is_deterministic() {

@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use triblespace_core::value::{Inline, InlineEncoding, IntoInline, TryFromInline};
+//! use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, TryFromInline};
 //! use triblespace_core::metadata::MetaDescribe;
 //! use triblespace_core::trible::{Fragment, TribleSet};
 //! use triblespace_core::macros::id_hex;
@@ -40,7 +40,7 @@
 //!    }
 //! }
 //!
-//! impl triblespace_core::value::IntoEncoded<MyNumber> for u32 {
+//! impl triblespace_core::inline::IntoEncoded<MyNumber> for u32 {
 //!   type Output = Inline<MyNumber>;
 //!   fn into_encoded(self) -> Inline<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
@@ -63,7 +63,7 @@
 //!   }
 //! }
 //!
-//! impl triblespace_core::value::IntoEncoded<MyNumber> for u64 {
+//! impl triblespace_core::inline::IntoEncoded<MyNumber> for u64 {
 //!  type Output = Inline<MyNumber>;
 //!  fn into_encoded(self) -> Inline<MyNumber> {
 //!   let mut bytes = [0; 32];
@@ -137,8 +137,8 @@ impl<S: InlineEncoding> Inline<S> {
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Inline, InlineEncoding};
-    /// use triblespace_core::value::encodings::UnknownInline;
+    /// use triblespace_core::inline::{Inline, InlineEncoding};
+    /// use triblespace_core::inline::encodings::UnknownInline;
     ///
     /// let bytes = [0; 32];
     /// let value = Inline::<UnknownInline>::new(bytes);
@@ -191,8 +191,8 @@ impl<S: InlineEncoding> Inline<S> {
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Inline, InlineEncoding};
-    /// use triblespace_core::value::encodings::UnknownInline;
+    /// use triblespace_core::inline::{Inline, InlineEncoding};
+    /// use triblespace_core::inline::encodings::UnknownInline;
     /// use std::borrow::Borrow;
     ///
     /// let bytes = [0; 32];
@@ -313,7 +313,7 @@ impl<T: InlineEncoding> Debug for Inline<T> {
 ///
 /// This trait is usually implemented on a type-level empty struct,
 /// but may contain additional information about the schema type as associated constants or types.
-/// The [Handle](crate::value::encodings::hash::Handle) type for example contains type information about the hash algorithm,
+/// The [Handle](crate::inline::encodings::hash::Handle) type for example contains type information about the hash algorithm,
 /// and the schema of the referenced blob.
 ///
 /// See the [value](crate::value) module for more information.
@@ -327,7 +327,7 @@ pub trait InlineEncoding: MetaDescribe + Sized + 'static {
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `Encoding = Self` — sources convert via
     /// `IntoEncoded<Self> { Output = Inline<Self> }`. For
-    /// [`Handle<T>`](crate::value::encodings::hash::Handle), set
+    /// [`Handle<T>`](crate::inline::encodings::hash::Handle), set
     /// `Encoding = T` — sources convert via `IntoEncoded<T> { Output =
     /// Blob<T> }`. The BlobEncoding `T` sitting directly at trait
     /// position 0 is what lets downstream impl `IntoEncoded<MyBlob>

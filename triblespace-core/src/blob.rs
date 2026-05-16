@@ -14,9 +14,9 @@ mod memoryblobstore;
 pub mod encodings;
 
 use crate::metadata::MetaDescribe;
-use crate::value::encodings::hash::Handle;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -92,7 +92,7 @@ where
     /// have a blob path that's *never* hashed and the eager cost
     /// matters, reach for the raw `Bytes` instead.
     pub fn new(bytes: Bytes) -> Self {
-        let digest = crate::value::encodings::hash::Blake3::digest(&bytes);
+        let digest = crate::inline::encodings::hash::Blake3::digest(&bytes);
         Self {
             bytes,
             handle: Inline::new(digest),
@@ -236,20 +236,20 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
         t.to_blob()
     }
 
-    /// Lift a `Blob<Self>` into the [`Encoded`](crate::value::Encoded)
+    /// Lift a `Blob<Self>` into the [`Encoded`](crate::inline::Encoded)
     /// sum `entity!{}` consumes — yields
     /// `Encoded::Blob(blob.transmute())`. The handle lives inside the
     /// blob; consumers recover it via
-    /// [`Encoded::inline`](crate::value::Encoded::inline).
+    /// [`Encoded::inline`](crate::inline::Encoded::inline).
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
     /// [`InlineEncoding::to_encoded`].
-    fn to_encoded(blob: Blob<Self>) -> crate::value::Encoded<Handle<Self>>
+    fn to_encoded(blob: Blob<Self>) -> crate::inline::Encoded<Handle<Self>>
     where
         Handle<Self>: InlineEncoding,
     {
-        crate::value::Encoded::Blob(blob.transmute::<crate::blob::encodings::UnknownBlob>())
+        crate::inline::Encoded::Blob(blob.transmute::<crate::blob::encodings::UnknownBlob>())
     }
 }
 
@@ -257,7 +257,7 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
 /// source produces a `Blob<S>` for content-addressed storage."
 ///
 /// `IntoBlob` is a supertrait alias over
-/// [`IntoEncoded`](crate::value::IntoEncoded): any type that
+/// [`IntoEncoded`](crate::inline::IntoEncoded): any type that
 /// implements `IntoEncoded<S>` with `Output = Blob<S>` automatically
 /// becomes `IntoBlob<S>`, and gains the `to_blob(self) -> Blob<S>`
 /// convenience method.
@@ -268,7 +268,7 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
 /// `MyBlobSchema` sits at trait position 0, satisfying Rust's
 /// orphan rule.
 pub trait IntoBlob<S: BlobEncoding>:
-    crate::value::IntoEncoded<S, Output = Blob<S>>
+    crate::inline::IntoEncoded<S, Output = Blob<S>>
 {
     /// Convert directly to `Blob<S>`.
     fn to_blob(self) -> Blob<S>
@@ -281,7 +281,7 @@ pub trait IntoBlob<S: BlobEncoding>:
 impl<S, T> IntoBlob<S> for T
 where
     S: BlobEncoding,
-    T: crate::value::IntoEncoded<S, Output = Blob<S>>,
+    T: crate::inline::IntoEncoded<S, Output = Blob<S>>,
 {
 }
 
@@ -291,7 +291,7 @@ where
 /// This might return an error if the conversion is not possible,
 /// This is the counterpart to the [`IntoBlob`] trait.
 ///
-/// See [TryFromInline](crate::value::TryFromInline) for the counterpart trait for values.
+/// See [TryFromInline](crate::inline::TryFromInline) for the counterpart trait for values.
 pub trait TryFromBlob<S: BlobEncoding>: Sized {
     /// The error type returned when the conversion fails.
     type Error: Error + Send + Sync + 'static;
@@ -310,7 +310,7 @@ impl<S: BlobEncoding> TryFromBlob<S> for Blob<S> {
 /// `Blob<S>` is the identity source for [`IntoEncoded<S>`] in the
 /// blob path: it converts to itself with no allocation, and the
 /// cached handle inside lets every downstream step skip rehashing.
-impl<S: BlobEncoding> crate::value::Encodes<Blob<S>> for S
+impl<S: BlobEncoding> crate::inline::Encodes<Blob<S>> for S
 where
     Handle<S>: InlineEncoding,
 {
@@ -325,12 +325,12 @@ where
 /// trait is the macro-side dispatch shim; the logic lives on
 /// `BlobEncoding` so users (and schemas that need custom storage
 /// semantics) can call or override it directly.
-impl<T> crate::value::ToEncoded<Handle<T>> for Blob<T>
+impl<T> crate::inline::ToEncoded<Handle<T>> for Blob<T>
 where
     T: BlobEncoding,
     Handle<T>: InlineEncoding,
 {
-    fn to_encoded(self) -> crate::value::Encoded<Handle<T>> {
+    fn to_encoded(self) -> crate::inline::Encoded<Handle<T>> {
         <T as BlobEncoding>::to_encoded(self)
     }
 }
@@ -340,7 +340,7 @@ where
 /// `Handle<T>`-attributed field's `Encoding`). Output is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
-impl<T: BlobEncoding> crate::value::Encodes<Inline<Handle<T>>> for T
+impl<T: BlobEncoding> crate::inline::Encodes<Inline<Handle<T>>> for T
 where
     Handle<T>: InlineEncoding,
 {
@@ -351,7 +351,7 @@ where
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T: BlobEncoding> crate::value::Encodes<&Inline<Handle<T>>> for T
+impl<T: BlobEncoding> crate::inline::Encodes<&Inline<Handle<T>>> for T
 where
     Handle<T>: InlineEncoding,
 {
@@ -365,7 +365,7 @@ where
 mod tests {
     use super::*;
     use crate::blob::encodings::UnknownBlob;
-    use crate::value::encodings::hash::Blake3;
+    use crate::inline::encodings::hash::Blake3;
 
     #[test]
     fn new_computes_and_caches_handle() {

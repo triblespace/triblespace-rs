@@ -5,7 +5,7 @@ pub mod triblesetrangeconstraint;
 use triblesetconstraint::*;
 
 use crate::query::TriblePattern;
-use crate::value::Inline;
+use crate::inline::Inline;
 
 use crate::id::Id;
 use crate::patch::Entry;
@@ -19,8 +19,8 @@ use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
-use crate::value::encodings::genid::GenId;
-use crate::value::InlineEncoding;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::InlineEncoding;
 
 use std::iter::FromIterator;
 use std::iter::Map;

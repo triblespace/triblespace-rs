@@ -50,8 +50,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use triblespace_core::value::encodings::genid::GenId;
-use triblespace_core::value::{RawInline, IntoInline, Inline, InlineEncoding};
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::{RawInline, IntoInline, Inline, InlineEncoding};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -578,8 +578,8 @@ mod tests {
 
     #[test]
     fn insert_indexes_by_string_key() {
-        use triblespace_core::value::encodings::shortstring::ShortString;
-        use triblespace_core::value::{IntoInline, Inline};
+        use triblespace_core::inline::encodings::shortstring::ShortString;
+        use triblespace_core::inline::{IntoInline, Inline};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::new();
         let red: Inline<ShortString> = "red".to_inline();

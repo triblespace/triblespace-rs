@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
-use crate::value::TryToInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -346,7 +346,7 @@ impl TryToInline<F256> for &JsonNumber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{IntoInline, TryToInline};
+    use crate::inline::{IntoInline, TryToInline};
     use ::f256::f256;
     use proptest::prelude::*;
 

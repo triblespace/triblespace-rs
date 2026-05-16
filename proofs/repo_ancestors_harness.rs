@@ -8,8 +8,8 @@ use crate::repo::commit;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{self, Repository};
 use crate::tribleset::TribleSet;
-use crate::value::encodings::hash::{Blake3, Handle};
-use crate::value::Inline;
+use crate::inline::encodings::hash::{Blake3, Handle};
+use crate::inline::Inline;
 
 use super::util::bounded_commit_dag;
 

@@ -261,8 +261,8 @@ mod tests {
     use crate::repo::BlobStorePut;
     use crate::trible::TribleSet;
     
-    use crate::value::encodings::hash::Handle;
-    use crate::value::Inline;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
 
     fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Inline<Handle<WasmCode>>> {
         for (schema_id, handle) in find!(
@@ -302,7 +302,7 @@ mod tests {
         let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
-        let schema_id = crate::value::encodings::shortstring::ShortString::id();
+        let schema_id = crate::inline::encodings::shortstring::ShortString::id();
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
         let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
@@ -326,30 +326,30 @@ mod tests {
     #[test]
     fn builtins_emit_and_run() {
         use crate::blob::encodings::longstring::LongString;
-        use crate::value::encodings::boolean::Boolean;
-        use crate::value::encodings::ed25519::ED25519PublicKey;
-        use crate::value::encodings::ed25519::ED25519RComponent;
-        use crate::value::encodings::ed25519::ED25519SComponent;
-        use crate::value::encodings::f256::F256BE;
-        use crate::value::encodings::f256::F256LE;
-        use crate::value::encodings::f64::F64;
-        use crate::value::encodings::genid::GenId;
-        use crate::value::encodings::hash::Blake3;
-        use crate::value::encodings::hash::Handle;
-        use crate::value::encodings::hash::Hash;
-        use crate::value::encodings::iu256::I256BE;
-        use crate::value::encodings::iu256::I256LE;
-        use crate::value::encodings::iu256::U256BE;
-        use crate::value::encodings::iu256::U256LE;
-        use crate::value::encodings::linelocation::LineLocation;
-        use crate::value::encodings::r256::R256BE;
-        use crate::value::encodings::r256::R256LE;
-        use crate::value::encodings::range::RangeInclusiveU128;
-        use crate::value::encodings::range::RangeU128;
-        use crate::value::encodings::shortstring::ShortString;
-        use crate::value::encodings::UnknownInline;
-        use crate::value::Inline;
-        use crate::value::InlineEncoding;
+        use crate::inline::encodings::boolean::Boolean;
+        use crate::inline::encodings::ed25519::ED25519PublicKey;
+        use crate::inline::encodings::ed25519::ED25519RComponent;
+        use crate::inline::encodings::ed25519::ED25519SComponent;
+        use crate::inline::encodings::f256::F256BE;
+        use crate::inline::encodings::f256::F256LE;
+        use crate::inline::encodings::f64::F64;
+        use crate::inline::encodings::genid::GenId;
+        use crate::inline::encodings::hash::Blake3;
+        use crate::inline::encodings::hash::Handle;
+        use crate::inline::encodings::hash::Hash;
+        use crate::inline::encodings::iu256::I256BE;
+        use crate::inline::encodings::iu256::I256LE;
+        use crate::inline::encodings::iu256::U256BE;
+        use crate::inline::encodings::iu256::U256LE;
+        use crate::inline::encodings::linelocation::LineLocation;
+        use crate::inline::encodings::r256::R256BE;
+        use crate::inline::encodings::r256::R256LE;
+        use crate::inline::encodings::range::RangeInclusiveU128;
+        use crate::inline::encodings::range::RangeU128;
+        use crate::inline::encodings::shortstring::ShortString;
+        use crate::inline::encodings::UnknownInline;
+        use crate::inline::Inline;
+        use crate::inline::InlineEncoding;
 
         let mut bundle = crate::trible::Fragment::empty();
         bundle += Boolean::describe();

@@ -1,4 +1,4 @@
-use crate::value::Encodes;
+use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -7,11 +7,11 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::RawInline;
-use crate::value::IntoInline;
-use crate::value::TryFromInline;
-use crate::value::Inline;
-use crate::value::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use proc_macro::Span;
 use std::convert::Infallible;
 
@@ -132,7 +132,7 @@ impl Encodes<Span> for LineLocation
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::IntoInline;
+    use crate::inline::IntoInline;
     use proptest::prelude::*;
 
     proptest! {

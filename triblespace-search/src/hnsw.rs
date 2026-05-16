@@ -16,7 +16,7 @@
 //! ```
 //! # use triblespace_core::blob::MemoryBlobStore;
 //! # use triblespace_core::repo::BlobStore;
-//! # use triblespace_core::value::encodings::hash::Blake3;
+//! # use triblespace_core::inline::encodings::hash::Blake3;
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace_search::schemas::put_embedding;
 //! let mut store = MemoryBlobStore::new();
@@ -42,8 +42,8 @@
 //! ```
 
 use triblespace_core::query::Variable;
-use triblespace_core::value::encodings::hash::Handle;
-use triblespace_core::value::Inline;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 
 use crate::schemas::{EmbHandle, Embedding};
 
