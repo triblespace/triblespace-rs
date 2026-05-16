@@ -52,7 +52,7 @@ impl TryFromBlob<LongString> for View<str> {
 impl Encodes<View<str>> for LongString
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<LongString>;
+    type Output = Blob<LongString>;
     fn encode(source: View<str>) -> Blob<LongString> {
         Blob::new(source.bytes())
     }
@@ -61,7 +61,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 impl Encodes<&'static str> for LongString
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<LongString>;
+    type Output = Blob<LongString>;
     fn encode(source: &'static str) -> Blob<LongString> {
         Blob::new(source.into())
     }
@@ -70,7 +70,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 impl Encodes<String> for LongString
 where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<LongString>;
+    type Output = Blob<LongString>;
     fn encode(source: String) -> Blob<LongString> {
         Blob::new(source.into())
     }

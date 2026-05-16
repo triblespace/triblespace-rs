@@ -74,7 +74,7 @@ impl<T: ArrayElement> crate::value::Encodes<Vec<T::Native>> for Array<T>
 where
     crate::value::schemas::hash::Handle<Array<T>>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<Array<T>>;
+    type Output = Blob<Array<T>>;
     fn encode(source: Vec<T::Native>) -> Blob<Array<T>> {
         Blob::new(Bytes::from_source(source))
     }

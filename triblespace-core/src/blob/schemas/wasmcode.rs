@@ -41,7 +41,7 @@ impl MetaDescribe for WasmCode {
 impl Encodes<Bytes> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<WasmCode>;
+    type Output = Blob<WasmCode>;
     fn encode(source: Bytes) -> Blob<WasmCode> {
         Blob::new(source)
     }
@@ -50,7 +50,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 impl Encodes<Vec<u8>> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<WasmCode>;
+    type Output = Blob<WasmCode>;
     fn encode(source: Vec<u8>) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(source))
     }
@@ -59,7 +59,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 impl Encodes<&[u8]> for WasmCode
 where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<WasmCode>;
+    type Output = Blob<WasmCode>;
     fn encode(source: &[u8]) -> Blob<WasmCode> {
         Blob::new(Bytes::from_source(source.to_vec()))
     }

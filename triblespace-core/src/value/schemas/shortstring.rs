@@ -157,7 +157,7 @@ impl TryToInline<ShortString> for String {
 
 impl Encodes<&str> for ShortString
 {
-    type Encoded = Inline<ShortString>;
+    type Output = Inline<ShortString>;
     fn encode(source: &str) -> Inline<ShortString> {
         source.try_to_inline().unwrap()
     }
@@ -165,7 +165,7 @@ impl Encodes<&str> for ShortString
 
 impl Encodes<String> for ShortString
 {
-    type Encoded = Inline<ShortString>;
+    type Output = Inline<ShortString>;
     fn encode(source: String) -> Inline<ShortString> {
         source.try_to_inline().unwrap()
     }
@@ -173,7 +173,7 @@ impl Encodes<String> for ShortString
 
 impl Encodes<&String> for ShortString
 {
-    type Encoded = Inline<ShortString>;
+    type Output = Inline<ShortString>;
     fn encode(source: &String) -> Inline<ShortString> {
         source.to_str().try_to_inline().unwrap()
     }

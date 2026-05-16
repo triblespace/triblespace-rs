@@ -50,7 +50,7 @@ impl TryFromBlob<FileBytes> for Bytes {
 impl Encodes<Bytes> for FileBytes
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<FileBytes>;
+    type Output = Blob<FileBytes>;
     fn encode(source: Bytes) -> Blob<FileBytes> {
         Blob::new(source)
     }
@@ -59,7 +59,7 @@ where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema
 impl Encodes<Vec<u8>> for FileBytes
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<FileBytes>;
+    type Output = Blob<FileBytes>;
     fn encode(source: Vec<u8>) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(source))
     }
@@ -68,7 +68,7 @@ where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema
 impl Encodes<&[u8]> for FileBytes
 where crate::value::schemas::hash::Handle<FileBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<FileBytes>;
+    type Output = Blob<FileBytes>;
     fn encode(source: &[u8]) -> Blob<FileBytes> {
         Blob::new(Bytes::from_source(source.to_vec()))
     }

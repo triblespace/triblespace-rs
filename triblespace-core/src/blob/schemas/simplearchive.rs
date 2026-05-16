@@ -46,7 +46,7 @@ impl MetaDescribe for SimpleArchive {
 impl Encodes<TribleSet> for SimpleArchive
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<SimpleArchive>;
+    type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
         tribles.extend(source.eav.iter_ordered());
@@ -58,7 +58,7 @@ where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSc
 impl Encodes<&TribleSet> for SimpleArchive
 where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<SimpleArchive>;
+    type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {
         let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
         tribles.extend(source.eav.iter_ordered());

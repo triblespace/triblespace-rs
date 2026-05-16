@@ -122,7 +122,7 @@ impl TryFromInline<'_, GenId> for RawId {
 
 impl Encodes<RawId> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: RawId) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&source[..]);
@@ -131,7 +131,7 @@ impl Encodes<RawId> for GenId
 }
 
 impl Encodes<&RawId> for GenId {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: &RawId) -> Inline<GenId> {
         <GenId as Encodes<RawId>>::encode(*source)
     }
@@ -164,7 +164,7 @@ impl TryFromInline<'_, GenId> for Id {
 
 impl Encodes<&Id> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: &Id) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
         data[16..32].copy_from_slice(&source[..]);
@@ -174,7 +174,7 @@ impl Encodes<&Id> for GenId
 
 impl Encodes<Id> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: Id) -> Inline<GenId> {
         (&source).to_inline()
     }
@@ -219,7 +219,7 @@ impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
 
 impl Encodes<ExclusiveId> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: ExclusiveId) -> Inline<GenId> {
         source.id.to_inline()
     }
@@ -227,7 +227,7 @@ impl Encodes<ExclusiveId> for GenId
 
 impl Encodes<&ExclusiveId> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: &ExclusiveId) -> Inline<GenId> {
         source.id.to_inline()
     }
@@ -247,7 +247,7 @@ impl TryFromInline<'_, GenId> for String {
 
 impl Encodes<OwnedId<'_>> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: OwnedId<'_>) -> Inline<GenId> {
         source.id.to_inline()
     }
@@ -255,7 +255,7 @@ impl Encodes<OwnedId<'_>> for GenId
 
 impl Encodes<&OwnedId<'_>> for GenId
 {
-    type Encoded = Inline<GenId>;
+    type Output = Inline<GenId>;
     fn encode(source: &OwnedId<'_>) -> Inline<GenId> {
         source.id.to_inline()
     }

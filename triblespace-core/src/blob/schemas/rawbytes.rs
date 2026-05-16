@@ -56,7 +56,7 @@ impl TryFromBlob<RawBytes> for Bytes {
 impl Encodes<Bytes> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<RawBytes>;
+    type Output = Blob<RawBytes>;
     fn encode(source: Bytes) -> Blob<RawBytes> {
         Blob::new(source)
     }
@@ -65,7 +65,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 impl Encodes<Vec<u8>> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<RawBytes>;
+    type Output = Blob<RawBytes>;
     fn encode(source: Vec<u8>) -> Blob<RawBytes> {
         Blob::new(Bytes::from_source(source))
     }
@@ -74,7 +74,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 impl Encodes<&[u8]> for RawBytes
 where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<RawBytes>;
+    type Output = Blob<RawBytes>;
     fn encode(source: &[u8]) -> Blob<RawBytes> {
         Blob::new(Bytes::from_source(source.to_vec()))
     }

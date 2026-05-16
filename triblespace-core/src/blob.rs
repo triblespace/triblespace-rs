@@ -253,12 +253,12 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     }
 }
 
-/// Shorthand bound for `IntoEncoded<S, Encoded = Blob<S>>` — "this
+/// Shorthand bound for `IntoEncoded<S, Output = Blob<S>>` — "this
 /// source produces a `Blob<S>` for content-addressed storage."
 ///
 /// `IntoBlob` is a supertrait alias over
 /// [`IntoEncoded`](crate::value::IntoEncoded): any type that
-/// implements `IntoEncoded<S>` with `Encoded = Blob<S>` automatically
+/// implements `IntoEncoded<S>` with `Output = Blob<S>` automatically
 /// becomes `IntoBlob<S>`, and gains the `to_blob(self) -> Blob<S>`
 /// convenience method.
 ///
@@ -268,7 +268,7 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
 /// `MyBlobSchema` sits at trait position 0, satisfying Rust's
 /// orphan rule.
 pub trait IntoBlob<S: BlobSchema>:
-    crate::value::IntoEncoded<S, Encoded = Blob<S>>
+    crate::value::IntoEncoded<S, Output = Blob<S>>
 {
     /// Convert directly to `Blob<S>`.
     fn to_blob(self) -> Blob<S>
@@ -281,7 +281,7 @@ pub trait IntoBlob<S: BlobSchema>:
 impl<S, T> IntoBlob<S> for T
 where
     S: BlobSchema,
-    T: crate::value::IntoEncoded<S, Encoded = Blob<S>>,
+    T: crate::value::IntoEncoded<S, Output = Blob<S>>,
 {
 }
 
@@ -314,7 +314,7 @@ impl<S: BlobSchema> crate::value::Encodes<Blob<S>> for S
 where
     Handle<S>: InlineSchema,
 {
-    type Encoded = Blob<S>;
+    type Output = Blob<S>;
     fn encode(source: Blob<S>) -> Blob<S> {
         source
     }
@@ -337,14 +337,14 @@ where
 
 /// Precomputed-handle case: a `Inline<Handle<T>>` can be passed as a
 /// `IntoEncoded<T>` source (T is the BlobSchema, matching the
-/// `Handle<T>`-attributed field's `Encoding`). Encoded is the value
+/// `Handle<T>`-attributed field's `Encoding`). Output is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
 impl<T: BlobSchema> crate::value::Encodes<Inline<Handle<T>>> for T
 where
     Handle<T>: InlineSchema,
 {
-    type Encoded = Inline<Handle<T>>;
+    type Output = Inline<Handle<T>>;
     fn encode(source: Inline<Handle<T>>) -> Inline<Handle<T>> {
         source
     }
@@ -355,7 +355,7 @@ impl<T: BlobSchema> crate::value::Encodes<&Inline<Handle<T>>> for T
 where
     Handle<T>: InlineSchema,
 {
-    type Encoded = Inline<Handle<T>>;
+    type Output = Inline<Handle<T>>;
     fn encode(source: &Inline<Handle<T>>) -> Inline<Handle<T>> {
         *source
     }

@@ -71,7 +71,7 @@ impl TryFromBlob<UnknownBlob> for Bytes {
 impl Encodes<Bytes> for UnknownBlob
 where crate::value::schemas::hash::Handle<UnknownBlob>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<UnknownBlob>;
+    type Output = Blob<UnknownBlob>;
     fn encode(source: Bytes) -> Blob<UnknownBlob> {
         Blob::new(source)
     }

@@ -85,7 +85,7 @@ pub fn looks_like_iri(s: &str) -> bool {
 impl Encodes<View<str>> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<IRI>;
+    type Output = Blob<IRI>;
     fn encode(source: View<str>) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(source.as_ref()),
@@ -99,7 +99,7 @@ where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 impl Encodes<&'static str> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<IRI>;
+    type Output = Blob<IRI>;
     fn encode(source: &'static str) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(source),
@@ -113,7 +113,7 @@ where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 impl Encodes<String> for IRI
 where crate::value::schemas::hash::Handle<IRI>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<IRI>;
+    type Output = Blob<IRI>;
     fn encode(source: String) -> Blob<IRI> {
         debug_assert!(
             looks_like_iri(&source),

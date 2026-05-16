@@ -77,7 +77,7 @@ impl TryFromInline<'_, F64> for f64 {
 
 impl Encodes<f64> for F64
 {
-    type Encoded = Inline<F64>;
+    type Output = Inline<F64>;
     fn encode(source: f64) -> Inline<F64> {
         let mut raw = [0u8; 32];
         raw[..8].copy_from_slice(&source.to_le_bytes());

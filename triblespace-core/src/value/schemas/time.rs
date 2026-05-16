@@ -258,7 +258,7 @@ impl std::fmt::Display for ReservedBitsNonZero {
 
 impl Encodes<i128> for NsDuration
 {
-    type Encoded = Inline<NsDuration>;
+    type Output = Inline<NsDuration>;
     fn encode(source: i128) -> Inline<NsDuration> {
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&i128_to_ordered_be(source));
@@ -279,7 +279,7 @@ impl TryFromInline<'_, NsDuration> for i128 {
 
 impl Encodes<Duration> for NsDuration
 {
-    type Encoded = Inline<NsDuration>;
+    type Output = Inline<NsDuration>;
     fn encode(source: Duration) -> Inline<NsDuration> {
         source.total_nanoseconds().to_inline()
     }

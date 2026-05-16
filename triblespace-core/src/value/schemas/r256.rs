@@ -182,7 +182,7 @@ impl TryFromInline<'_, R256BE> for Ratio<i128> {
 
 impl Encodes<Ratio<i128>> for R256BE
 {
-    type Encoded = Inline<R256BE>;
+    type Output = Inline<R256BE>;
     fn encode(source: Ratio<i128>) -> Inline<R256BE> {
         let ratio = source.reduced();
 
@@ -196,7 +196,7 @@ impl Encodes<Ratio<i128>> for R256BE
 
 impl Encodes<i128> for R256BE
 {
-    type Encoded = Inline<R256BE>;
+    type Output = Inline<R256BE>;
     fn encode(source: i128) -> Inline<R256BE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&source.to_be_bytes());
@@ -231,7 +231,7 @@ impl TryFromInline<'_, R256LE> for Ratio<i128> {
 
 impl Encodes<Ratio<i128>> for R256LE
 {
-    type Encoded = Inline<R256LE>;
+    type Output = Inline<R256LE>;
     fn encode(source: Ratio<i128>) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&source.numer().to_le_bytes());
@@ -243,7 +243,7 @@ impl Encodes<Ratio<i128>> for R256LE
 
 impl Encodes<i128> for R256LE
 {
-    type Encoded = Inline<R256LE>;
+    type Output = Inline<R256LE>;
     fn encode(source: i128) -> Inline<R256LE> {
         let mut bytes = [0; 32];
         bytes[0..16].copy_from_slice(&source.to_le_bytes());

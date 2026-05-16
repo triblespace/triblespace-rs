@@ -132,7 +132,7 @@ impl TryToInline<Boolean> for &bool {
 
 impl Encodes<bool> for Boolean
 {
-    type Encoded = Inline<Boolean>;
+    type Output = Inline<Boolean>;
     fn encode(source: bool) -> Inline<Boolean> {
         Boolean::encode(source)
     }
@@ -140,7 +140,7 @@ impl Encodes<bool> for Boolean
 
 impl Encodes<&bool> for Boolean
 {
-    type Encoded = Inline<Boolean>;
+    type Output = Inline<Boolean>;
     fn encode(source: &bool) -> Inline<Boolean> {
         Boolean::encode(*source)
     }

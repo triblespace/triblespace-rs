@@ -720,7 +720,7 @@ where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<SuccinctArchiveBlob>;
+    type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: &SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
         Blob::new(source.bytes.clone())
     }
@@ -731,7 +731,7 @@ where
     U: Universe + Serializable,
     crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
 {
-    type Encoded = Blob<SuccinctArchiveBlob>;
+    type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
         Blob::new(source.bytes)
     }

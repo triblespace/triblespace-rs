@@ -278,7 +278,7 @@ impl TryFromInline<'_, F256BE> for f256 {
 
 impl Encodes<f256> for F256BE
 {
-    type Encoded = Inline<F256BE>;
+    type Output = Inline<F256BE>;
     fn encode(source: f256) -> Inline<F256BE> {
         Inline::new(source.to_be_bytes())
     }
@@ -293,7 +293,7 @@ impl TryFromInline<'_, F256LE> for f256 {
 
 impl Encodes<f256> for F256LE
 {
-    type Encoded = Inline<F256LE>;
+    type Output = Inline<F256LE>;
     fn encode(source: f256) -> Inline<F256LE> {
         Inline::new(source.to_le_bytes())
     }

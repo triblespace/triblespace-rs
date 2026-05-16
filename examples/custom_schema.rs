@@ -31,7 +31,7 @@ impl InlineSchema for U64LE {
 
 impl Encodes<u64> for U64LE
 {
-    type Encoded = Inline<U64LE>;
+    type Output = Inline<U64LE>;
     fn encode(source: u64) -> Inline<U64LE> {
         let mut raw = [0u8; INLINE_LEN];
         raw[..8].copy_from_slice(&source.to_le_bytes());
@@ -61,7 +61,7 @@ impl BlobSchema for BytesBlob {}
 
 impl Encodes<Bytes> for BytesBlob
 {
-    type Encoded = Blob<BytesBlob>;
+    type Output = Blob<BytesBlob>;
     fn encode(source: Bytes) -> Blob<BytesBlob> {
         Blob::new(source)
     }

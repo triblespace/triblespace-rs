@@ -102,7 +102,7 @@ fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
 
 impl Encodes<(u64, u64, u64, u64)> for LineLocation
 {
-    type Encoded = Inline<LineLocation>;
+    type Output = Inline<LineLocation>;
     fn encode(source: (u64, u64, u64, u64)) -> Inline<LineLocation> {
         Inline::new(encode_location(source))
     }
@@ -117,7 +117,7 @@ impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
 
 impl Encodes<Span> for LineLocation
 {
-    type Encoded = Inline<LineLocation>;
+    type Output = Inline<LineLocation>;
     fn encode(source: Span) -> Inline<LineLocation> {
         (
             source.start().line() as u64,

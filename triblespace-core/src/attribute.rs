@@ -88,7 +88,7 @@ impl<S: InlineSchema> Attribute<S> {
     /// Dispatches via [`IntoEncoded`], parameterised by the schema's
     /// [`Encoding`](crate::value::InlineSchema::Encoding) — `S`
     /// itself for inline schemas, the inner `BlobSchema` for
-    /// `Handle<T>`. The resulting `Encoded` is lifted into a [`Value`]
+    /// `Handle<T>`. The resulting `Output` is lifted into a [`Value`]
     /// via [`ToValue`].
     ///
     /// [`IntoEncoded`]: crate::value::IntoEncoded
@@ -100,7 +100,7 @@ impl<S: InlineSchema> Attribute<S> {
         V: crate::value::IntoEncoded<<S as crate::value::InlineSchema>::Encoding>,
         <V as crate::value::IntoEncoded<
             <S as crate::value::InlineSchema>::Encoding,
-        >>::Encoded: crate::value::ToValue<S>,
+        >>::Output: crate::value::ToValue<S>,
     {
         use crate::value::ToValue;
         v.into_encoded().to_value()

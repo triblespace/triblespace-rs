@@ -41,7 +41,7 @@
 //! }
 //!
 //! impl triblespace_core::value::IntoEncoded<MyNumber> for u32 {
-//!   type Encoded = Inline<MyNumber>;
+//!   type Output = Inline<MyNumber>;
 //!   fn into_encoded(self) -> Inline<MyNumber> {
 //!      // Convert the Rust type to the schema type, i.e. a 32-byte array.
 //!      let mut bytes = [0; 32];
@@ -64,7 +64,7 @@
 //! }
 //!
 //! impl triblespace_core::value::IntoEncoded<MyNumber> for u64 {
-//!  type Encoded = Inline<MyNumber>;
+//!  type Output = Inline<MyNumber>;
 //!  fn into_encoded(self) -> Inline<MyNumber> {
 //!   let mut bytes = [0; 32];
 //!   bytes[0..8].copy_from_slice(&self.to_le_bytes());
@@ -326,9 +326,9 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     /// The trait parameter to dispatch via for `entity!{}` field
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `Encoding = Self` — sources convert via
-    /// `IntoEncoded<Self> { Encoded = Inline<Self> }`. For
+    /// `IntoEncoded<Self> { Output = Inline<Self> }`. For
     /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
-    /// `Encoding = T` — sources convert via `IntoEncoded<T> { Encoded =
+    /// `Encoding = T` — sources convert via `IntoEncoded<T> { Output =
     /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
     /// position 0 is what lets downstream impl `IntoEncoded<MyBlob>
     /// for MyType` without bumping into the orphan rule.
@@ -384,7 +384,7 @@ pub trait TryToInline<S: InlineSchema> {
 ///
 /// ```ignore
 /// impl Encodes<&str> for LongString {
-///     type Encoded = Blob<LongString>;
+///     type Output = Blob<LongString>;
 ///     fn encode(s: &str) -> Blob<LongString> { Blob::new(s.into()) }
 /// }
 /// ```
@@ -404,9 +404,9 @@ pub trait Encodes<Source> {
     /// schema. `Inline<Self>` for inline schemas, `Blob<Self>` for
     /// blob schemas, or `Inline<Handle<Self>>` for the
     /// precomputed-handle case where `Self: BlobSchema`.
-    type Encoded;
+    type Output;
     /// Run the encoding.
-    fn encode(source: Source) -> Self::Encoded;
+    fn encode(source: Source) -> Self::Output;
 }
 
 /// Source-side ergonomic counterpart of [`Encodes`], in the `Into`
@@ -417,29 +417,29 @@ pub trait Encodes<Source> {
 /// implement `From`, get `Into` for free.
 pub trait IntoEncoded<S> {
     /// The concrete form this source produces.
-    type Encoded;
+    type Output;
     /// Run the conversion.
-    fn into_encoded(self) -> Self::Encoded;
+    fn into_encoded(self) -> Self::Output;
 }
 
 impl<S, T> IntoEncoded<S> for T
 where
     S: Encodes<T>,
 {
-    type Encoded = <S as Encodes<T>>::Encoded;
-    fn into_encoded(self) -> Self::Encoded {
+    type Output = <S as Encodes<T>>::Output;
+    fn into_encoded(self) -> Self::Output {
         <S as Encodes<T>>::encode(self)
     }
 }
 
-/// Shorthand bound for `IntoEncoded<S, Encoded = Inline<S>>` — "this
+/// Shorthand bound for `IntoEncoded<S, Output = Inline<S>>` — "this
 /// source produces a directly-encoded `Inline<S>`, no side-blob."
 ///
 /// `IntoInline` is a supertrait alias over [`IntoEncoded`]: any type
-/// that implements `IntoEncoded<S>` with `Encoded = Inline<S>`
+/// that implements `IntoEncoded<S>` with `Output = Inline<S>`
 /// automatically becomes `IntoInline<S>`, and gains the
 /// `to_inline(self) -> Inline<S>` convenience method.
-pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Encoded = Inline<S>> {
+pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Output = Inline<S>> {
     /// Convert directly to `Inline<S>`.
     fn to_inline(self) -> Inline<S>
     where
@@ -451,7 +451,7 @@ pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Encoded = Inline<S>> {
 impl<S, T> IntoInline<S> for T
 where
     S: InlineSchema,
-    T: IntoEncoded<S, Encoded = Inline<S>>,
+    T: IntoEncoded<S, Output = Inline<S>>,
 {
 }
 
@@ -507,7 +507,7 @@ impl<V: InlineSchema> Value<V> {
     }
 }
 
-/// Lift an [`IntoEncoded::Encoded`] into the [`Value`] sum the
+/// Lift an [`IntoEncoded::Output`] into the [`Value`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
@@ -554,7 +554,7 @@ pub trait TryFromInline<'a, S: InlineSchema>: Sized {
 
 impl<S: InlineSchema> Encodes<Inline<S>> for S
 {
-    type Encoded = Inline<S>;
+    type Output = Inline<S>;
     fn encode(source: Inline<S>) -> Inline<S> {
         source
     }
@@ -562,7 +562,7 @@ impl<S: InlineSchema> Encodes<Inline<S>> for S
 
 impl<S: InlineSchema> Encodes<&Inline<S>> for S
 {
-    type Encoded = Inline<S>;
+    type Output = Inline<S>;
     fn encode(source: &Inline<S>) -> Inline<S> {
         *source
     }

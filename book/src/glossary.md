@@ -124,7 +124,7 @@ describe arbitrarily long payloads so tribles referencing those blobs stay
 portable.
 
 ### Scope
-The set of permissions a [Capability](#capability) grants. Encoded as tribles
+The set of permissions a [Capability](#capability) grants. Output as tribles
 hung off the cap's `cap_scope_root` entity: one or more `metadata::tag: PERM_*`
 triples (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`) optionally combined with
 `scope_branch: <branch_id>` triples that restrict the permission to specific

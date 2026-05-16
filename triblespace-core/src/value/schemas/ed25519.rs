@@ -174,7 +174,7 @@ impl ED25519SComponent {
 
 impl Encodes<Signature> for ED25519RComponent
 {
-    type Encoded = Inline<ED25519RComponent>;
+    type Output = Inline<ED25519RComponent>;
     fn encode(source: Signature) -> Inline<ED25519RComponent> {
         ED25519RComponent::from_signature(source)
     }
@@ -182,7 +182,7 @@ impl Encodes<Signature> for ED25519RComponent
 
 impl Encodes<Signature> for ED25519SComponent
 {
-    type Encoded = Inline<ED25519SComponent>;
+    type Output = Inline<ED25519SComponent>;
     fn encode(source: Signature) -> Inline<ED25519SComponent> {
         ED25519SComponent::from_signature(source)
     }
@@ -190,7 +190,7 @@ impl Encodes<Signature> for ED25519SComponent
 
 impl Encodes<ComponentBytes> for ED25519RComponent
 {
-    type Encoded = Inline<ED25519RComponent>;
+    type Output = Inline<ED25519RComponent>;
     fn encode(source: ComponentBytes) -> Inline<ED25519RComponent> {
         Inline::new(source)
     }
@@ -205,7 +205,7 @@ impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
 
 impl Encodes<ComponentBytes> for ED25519SComponent
 {
-    type Encoded = Inline<ED25519SComponent>;
+    type Output = Inline<ED25519SComponent>;
     fn encode(source: ComponentBytes) -> Inline<ED25519SComponent> {
         Inline::new(source)
     }
@@ -220,7 +220,7 @@ impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
 
 impl Encodes<VerifyingKey> for ED25519PublicKey
 {
-    type Encoded = Inline<ED25519PublicKey>;
+    type Output = Inline<ED25519PublicKey>;
     fn encode(source: VerifyingKey) -> Inline<ED25519PublicKey> {
         Inline::new(source.to_bytes())
     }

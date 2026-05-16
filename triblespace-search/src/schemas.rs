@@ -69,7 +69,7 @@ impl InlineSchema for F32LE {
 
 impl Encodes<f32> for F32LE
 {
-    type Encoded = Inline<F32LE>;
+    type Output = Inline<F32LE>;
     fn encode(source: f32) -> Inline<F32LE> {
         let mut raw = [0u8; 32];
         raw[0..4].copy_from_slice(&source.to_le_bytes());
@@ -79,7 +79,7 @@ impl Encodes<f32> for F32LE
 
 impl Encodes<&f32> for F32LE
 {
-    type Encoded = Inline<F32LE>;
+    type Output = Inline<F32LE>;
     fn encode(source: &f32) -> Inline<F32LE> {
         (*source).to_inline()
     }
@@ -171,7 +171,7 @@ impl TryFromBlob<Embedding> for View<[f32]> {
 impl Encodes<View<[f32]>> for Embedding
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
-    type Encoded = Blob<Embedding>;
+    type Output = Blob<Embedding>;
     fn encode(source: View<[f32]>) -> Blob<Embedding> {
         Blob::new(source.bytes())
     }
@@ -180,7 +180,7 @@ where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_cor
 impl Encodes<Vec<f32>> for Embedding
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
-    type Encoded = Blob<Embedding>;
+    type Output = Blob<Embedding>;
     fn encode(source: Vec<f32>) -> Blob<Embedding> {
         // f32 is `IntoBytes` (zerocopy) so this is a straight
         // byte-copy of the `Vec`'s backing storage.
@@ -195,7 +195,7 @@ where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_cor
 impl Encodes<&[f32]> for Embedding
 where triblespace_core::value::schemas::hash::Handle<Embedding>: triblespace_core::value::InlineSchema,
 {
-    type Encoded = Blob<Embedding>;
+    type Output = Blob<Embedding>;
     fn encode(source: &[f32]) -> Blob<Embedding> {
         let mut bytes = Vec::with_capacity(source.len() * 4);
         for v in source {
