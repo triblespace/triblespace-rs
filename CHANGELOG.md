@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-05-16
+
+The TLS-roots-from-OS-store release. Patches one specific
+failure mode in corporate-proxy / sandbox environments where
+egress does TLS interception with a non-Mozilla CA.
+
+### Fixed
+
+- **`triblespace-net` now reads TLS trust anchors from the OS
+  trust store** (via `rustls-platform-verifier`) instead of
+  the compiled-in Mozilla `webpki-roots` bundle. The
+  `platform-verifier` feature on iroh is enabled and the
+  endpoint builder calls `.ca_roots_config(CaRootsConfig::system())`.
+
+  Without this fix, sandbox environments that present a custom
+  CA at TLS egress (e.g. Anthropic's web-sandbox's
+  "sandbox-egress-production TLS Inspection CA") silently
+  break iroh's discovery layer: every relay HTTPS probe and
+  every pkarr publish/lookup to `dns.iroh.link` returns
+  `invalid peer certificate: UnknownIssuer`, hole-punching
+  never starts, and the QUIC peer handshake has no chance.
+
+  Normal environments are unaffected — the OS trust store
+  contains the same Mozilla roots that `webpki-roots` ships,
+  so iroh's HTTPS to public infrastructure still works on
+  macOS (Security framework), Linux (`/etc/ssl/certs`), and
+  Windows (certificate store).
+
+  Diagnosed by another Claude instance running in the web
+  sandbox after the 0.40.0 tracing-instrumentation pass
+  surfaced the `UnknownIssuer` WARN lines from iroh's
+  internal logging. See `triblespace-net/CHANGELOG.md`.
+
+- **`triblespace-core`, `triblespace-search`,
+  `triblespace-macros{,-common}`, `triblespace-core-macros`**:
+  lock-step 0.40.1 → 0.40.2 patch bump, no source changes.
+
 ## [0.40.1] - 2026-05-16
 
 ### Changed
