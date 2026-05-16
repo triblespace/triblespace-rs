@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
-use iroh_base::EndpointId;
+use iroh_base::{EndpointAddr, EndpointId};
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -147,7 +147,7 @@ where
     ///
     /// Fire-and-forget: returns immediately. Use [`pull_branch`](Self::pull_branch)
     /// if you want to block until the tracking branch is materialized.
-    pub fn track(&self, peer: EndpointId, branch: RawBranchId) {
+    pub fn track(&self, peer: impl Into<EndpointAddr>, branch: RawBranchId) {
         self.sender.track(peer, branch);
     }
 
@@ -163,10 +163,11 @@ where
     /// the HEAD.
     pub fn pull_branch(
         &mut self,
-        remote: EndpointId,
+        remote: impl Into<EndpointAddr>,
         name: &str,
     ) -> anyhow::Result<Id> {
-        let (remote_id, _head) = resolve_branch_name(self, remote, name)?
+        let remote: EndpointAddr = remote.into();
+        let (remote_id, _head) = resolve_branch_name(self, remote.clone(), name)?
             .ok_or_else(|| anyhow::anyhow!("branch '{name}' not found on remote"))?;
 
         let branch_bytes: [u8; 16] = remote_id.into();
@@ -190,7 +191,7 @@ where
     /// a branch name to its ID before calling [`track`](Self::track)).
     pub fn list_remote_branches(
         &self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
     ) -> anyhow::Result<Vec<(Id, RawHash)>> {
         self.sender.list_remote_branches(peer)
     }
@@ -199,7 +200,7 @@ where
     /// One protocol round trip.
     pub fn head_of_remote(
         &mut self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
         branch: RawBranchId,
     ) -> anyhow::Result<Option<RawHash>> {
         self.sender.head_of_remote(peer, branch)
@@ -221,7 +222,7 @@ where
     /// [bsg]: triblespace_core::repo::BlobStoreGet::get
     pub fn fetch<T, Sch>(
         &mut self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
         handle: Inline<Handle<Sch>>,
     ) -> anyhow::Result<Option<T>>
     where
@@ -488,7 +489,7 @@ where
 /// branch's reachable blob closure.
 pub fn resolve_branch_name<S>(
     peer: &mut Peer<S>,
-    remote: EndpointId,
+    remote: impl Into<EndpointAddr>,
     name: &str,
 ) -> anyhow::Result<Option<(Id, RawHash)>>
 where
@@ -498,10 +499,11 @@ where
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::trible::TribleSet;
 
-    let branches = peer.list_remote_branches(remote)?;
+    let remote: EndpointAddr = remote.into();
+    let branches = peer.list_remote_branches(remote.clone())?;
     for (id, head) in branches {
         let meta_handle = Inline::<Handle<SimpleArchive>>::new(head);
-        let Some(meta) = peer.fetch::<TribleSet, _>(remote, meta_handle)? else {
+        let Some(meta) = peer.fetch::<TribleSet, _>(remote.clone(), meta_handle)? else {
             continue;
         };
 
@@ -512,7 +514,7 @@ where
         .collect();
 
         for name_handle in name_handles {
-            let Some(name_view) = peer.fetch::<anybytes::View<str>, _>(remote, name_handle)? else {
+            let Some(name_view) = peer.fetch::<anybytes::View<str>, _>(remote.clone(), name_handle)? else {
                 continue;
             };
             if name_view.as_ref() == name {

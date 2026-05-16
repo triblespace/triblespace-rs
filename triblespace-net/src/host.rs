@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use iroh_base::EndpointId;
+use iroh_base::{EndpointAddr, EndpointId};
 use ed25519_dalek::SigningKey;
 use tracing::{debug, debug_span, error, info, info_span, instrument, warn, Instrument};
 
@@ -190,19 +190,26 @@ impl NetSender {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
-    pub fn track(&self, peer: EndpointId, branch: RawBranchId) {
-        let _ = self.cmd_tx.send(NetCommand::Track { peer, branch });
+    /// Track a remote branch. `peer` accepts anything convertible
+    /// into `EndpointAddr` — a bare `EndpointId` works (discovery
+    /// resolves the addresses) and a full `EndpointAddr` skips
+    /// discovery by carrying relay URL + direct addresses through.
+    /// The latter is the path for environments where pkarr publish
+    /// / relay probes are blocked (corporate proxies, shared-IP
+    /// sandboxes that get rate-limited by iroh-canary, etc.).
+    pub fn track(&self, peer: impl Into<EndpointAddr>, branch: RawBranchId) {
+        let _ = self.cmd_tx.send(NetCommand::Track { peer: peer.into(), branch });
     }
 
     /// RPC: list a remote peer's branches. Blocks the calling thread until
     /// the network thread completes one protocol round trip.
     pub fn list_remote_branches(
         &self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
     ) -> anyhow::Result<Vec<(triblespace_core::id::Id, RawHash)>> {
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(NetCommand::ListBranches { peer, reply: tx })
+            .send(NetCommand::ListBranches { peer: peer.into(), reply: tx })
             .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
         rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
     }
@@ -210,12 +217,12 @@ impl NetSender {
     /// RPC: query a remote peer for its current head of one branch.
     pub fn head_of_remote(
         &self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
         branch: RawBranchId,
     ) -> anyhow::Result<Option<RawHash>> {
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(NetCommand::HeadOfRemote { peer, branch, reply: tx })
+            .send(NetCommand::HeadOfRemote { peer: peer.into(), branch, reply: tx })
             .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
         rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
     }
@@ -225,12 +232,12 @@ impl NetSender {
     /// caller is responsible for putting them into a local store.
     pub fn fetch(
         &self,
-        peer: EndpointId,
+        peer: impl Into<EndpointAddr>,
         hash: RawHash,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(NetCommand::Fetch { peer, hash, reply: tx })
+            .send(NetCommand::Fetch { peer: peer.into(), hash, reply: tx })
             .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
         rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
     }
@@ -330,10 +337,10 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 /// our capability so subsequent ops are authorised. Protocol v4 makes
 /// this mandatory — the server rejects any op until the connection
 /// completes auth.
-#[instrument(level = "info", skip(ep, self_cap), fields(peer = %peer.fmt_short()))]
+#[instrument(level = "info", skip(ep, self_cap), fields(peer = %peer.id.fmt_short()))]
 async fn connect_authed(
     ep: &iroh::Endpoint,
-    peer: EndpointId,
+    peer: EndpointAddr,
     self_cap: &RawHash,
 ) -> anyhow::Result<iroh::endpoint::Connection> {
     debug!(alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN), "connecting");
@@ -388,6 +395,19 @@ async fn host_loop(
         Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
     };
     ep.online().await;
+
+    // Print the rich ticket (id + relay URL + direct addrs) once
+    // the endpoint is up. This is the form to paste into another
+    // peer's `--peers` or `pile net pull <REMOTE>` for sandbox /
+    // restricted-network environments where iroh discovery isn't
+    // reachable. Use `eprintln` (not just tracing) so it shows up
+    // at default log levels — this is operator-facing info.
+    {
+        use iroh_tickets::endpoint::EndpointTicket;
+        let local_addr = ep.addr();
+        let ticket: EndpointTicket = local_addr.into();
+        eprintln!("ticket: {ticket}");
+    }
 
     let my_id = ep.id();
     let self_cap: RawHash = config.self_cap;
@@ -527,11 +547,12 @@ async fn host_loop(
                     let dht = dht_api.clone();
                     let self_cap = self_cap;
                     tokio::spawn(async move {
+                        let peer_id = peer.id;
                         // Discover the remote HEAD (gossip would have it for
                         // free; explicit track has to ask).
-                        let conn = match connect_authed(&ep, peer, &self_cap).await {
+                        let conn = match connect_authed(&ep, peer.clone(), &self_cap).await {
                             Ok(c) => c,
-                            Err(e) => { warn!(error = %e, peer = %peer.fmt_short(), "track: connect failed"); return; }
+                            Err(e) => { warn!(error = %e, peer = %peer_id.fmt_short(), "track: connect failed"); return; }
                         };
                         let head = match op_head(&conn, &branch).await {
                             Ok(Some(h)) => h,
@@ -542,7 +563,7 @@ async fn host_loop(
                         // For explicit track, the publisher is the peer
                         // we asked (they vouched for this head).
                         let mut publisher = [0u8; 32];
-                        publisher.copy_from_slice(peer.as_bytes());
+                        publisher.copy_from_slice(peer_id.as_bytes());
                         track_known_head(&ep, peer, branch, head, publisher, &dht, &events_tx, &self_cap).await;
                     });
                 }
@@ -599,7 +620,7 @@ async fn fetch_blob(
     ep: &iroh::Endpoint,
     hash: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
-    hint_peer: EndpointId,
+    hint_peer: EndpointAddr,
     self_cap: &RawHash,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let verify = |data: &[u8]| -> bool {
@@ -612,7 +633,8 @@ async fn fetch_blob(
         let blake3_hash = blake3::Hash::from_bytes(*hash);
         if let Ok(providers) = api.find_providers(blake3_hash).await {
             for provider in providers {
-                if let Ok(conn) = connect_authed(ep, provider, self_cap).await {
+                let provider_addr: EndpointAddr = EndpointId::from(provider).into();
+                if let Ok(conn) = connect_authed(ep, provider_addr, self_cap).await {
                     if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
                         conn.close(0u32.into(), b"ok");
                         if verify(&data) {
@@ -626,13 +648,14 @@ async fn fetch_blob(
     }
 
     // Hint peer: the gossip sender likely has it.
+    let hint_id = hint_peer.id;
     if let Ok(conn) = connect_authed(ep, hint_peer, self_cap).await {
         if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
             conn.close(0u32.into(), b"ok");
             if verify(&data) {
                 return Ok(Some(data));
             }
-            warn!(peer = %hint_peer.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from hint peer");
+            warn!(peer = %hint_id.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from hint peer");
         }
     }
 
@@ -643,7 +666,7 @@ async fn fetch_blob(
 /// Uses DHT for blob discovery when available, falls back to direct peer.
 async fn fetch_reachable(
     ep: &iroh::Endpoint,
-    peer: EndpointId,
+    peer: EndpointAddr,
     head: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
@@ -653,7 +676,7 @@ async fn fetch_reachable(
     seen.insert(*head);
 
     // Fetch head blob.
-    if let Some(data) = fetch_blob(ep, head, dht, peer, self_cap).await? {
+    if let Some(data) = fetch_blob(ep, head, dht, peer.clone(), self_cap).await? {
         let _ = events.send(NetEvent::Blob(data));
     }
 
@@ -663,13 +686,13 @@ async fn fetch_reachable(
         let mut next_level = Vec::new();
         for parent in &current_level {
             // CHILDREN from the gossip sender (they know the structure).
-            let conn = connect_authed(ep, peer, self_cap).await?;
+            let conn = connect_authed(ep, peer.clone(), self_cap).await?;
             let children = op_children(&conn, parent).await?;
             conn.close(0u32.into(), b"ok");
 
             for hash in children {
                 if !seen.insert(hash) { continue; }
-                if let Some(data) = fetch_blob(ep, &hash, dht, peer, self_cap).await? {
+                if let Some(data) = fetch_blob(ep, &hash, dht, peer.clone(), self_cap).await? {
                     let _ = events.send(NetEvent::Blob(data));
                     next_level.push(hash);
                 }
@@ -691,7 +714,7 @@ async fn fetch_reachable(
 /// `Track` asks the peer via `op_head` first.
 async fn track_known_head(
     ep: &iroh::Endpoint,
-    fetch_peer: EndpointId,
+    fetch_peer: EndpointAddr,
     branch: RawBranchId,
     head: RawHash,
     publisher: crate::channel::PublisherKey,
@@ -699,8 +722,9 @@ async fn track_known_head(
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
 ) {
+    let fetch_id = fetch_peer.id;
     if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap).await {
-        warn!(error = %e, peer = %fetch_peer.fmt_short(), "fetch_reachable failed");
+        warn!(error = %e, peer = %fetch_id.fmt_short(), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
     }

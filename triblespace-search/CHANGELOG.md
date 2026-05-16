@@ -4,6 +4,13 @@ All notable changes to `triblespace-search`.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.41.1] - 2026-05-17
+
+Lock-step bump alongside the EndpointTicket-everywhere work
+in `triblespace-net` / `trible`. No source changes in
+`triblespace-search`. See the workspace
+[`../CHANGELOG.md`](../CHANGELOG.md) for the full release notes.
+
 ## [0.41.0] - 2026-05-16
 
 Lock-step bump alongside the iroh 0.98 family upgrade in

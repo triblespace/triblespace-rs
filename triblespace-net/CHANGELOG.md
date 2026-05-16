@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.1] - 2026-05-17
+
+### Changed (breaking — public API)
+- **`Peer::{track, pull_branch, list_remote_branches, fetch,
+  head_of_remote}` and `resolve_branch_name`** now take
+  `impl Into<EndpointAddr>` instead of bare `EndpointId`.
+  Source-compatible for `EndpointId` callers via the standard
+  `Into<EndpointAddr>` impl; new callers can pass a full
+  `EndpointAddr` (with relay URL + direct addresses) to
+  bypass iroh's discovery layer in environments where pkarr
+  publish / relay probes are blocked.
+
+- **`NetCommand::{Track, ListBranches, HeadOfRemote, Fetch}`**
+  carry `EndpointAddr` instead of `EndpointId` on the wire.
+
+- **`connect_authed`** + the private `fetch_blob`,
+  `fetch_reachable`, `track_known_head` helpers in `host.rs`
+  take `EndpointAddr`, threading address info down to iroh's
+  `Endpoint::connect` so it can dial directly without
+  resolving via discovery.
+
+### Added
+- **Rich `EndpointTicket` print at sync startup.**
+  `host_loop` calls `ep.addr()` after `ep.online()` returns
+  and writes a `ticket: …` line to stderr containing the
+  full `EndpointAddr` (id + relay URL + direct addresses) as
+  a standard iroh `EndpointTicket`. This is the form to paste
+  into another peer's `--peers` flag for direct dial.
+
+- `iroh-tickets 0.5` dependency for the ticket
+  serialization.
+
 ## [0.41.0] - 2026-05-16
 
 ### Changed (breaking — transitive)

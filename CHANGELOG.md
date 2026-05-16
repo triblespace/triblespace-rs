@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-05-17
+
+The `EndpointTicket`-everywhere release. Makes sandbox /
+corporate-proxy environments actually able to dial peers
+without going through iroh discovery — the missing piece
+behind the v0.41.0 / faculties v0.14.4 round of testing.
+
+### Changed (breaking — public API of `triblespace-net::peer`)
+
+- **`Peer::track`, `Peer::pull_branch`, `Peer::list_remote_branches`,
+  `Peer::fetch`, `Peer::head_of_remote`, and the free function
+  `resolve_branch_name`** now take `impl Into<EndpointAddr>`
+  instead of bare `EndpointId`.
+
+  Source-compatible for existing callers passing `EndpointId`
+  (the `Into<EndpointAddr>` impl is automatic). Lets new
+  callers pass a full `EndpointAddr` — carrying the relay URL
+  and direct socket addresses — through to iroh's
+  `Endpoint::connect`, which honours those addresses and
+  skips discovery entirely.
+
+  Why this matters: discovery is broken in many real
+  environments. claude.ai's web sandbox is a Firecracker
+  microVM behind a TLS-intercepting egress with a shared IP
+  rate-limited by iroh-canary; corporate networks block pkarr
+  publish; some restricted CI environments block UDP entirely.
+  In all these cases, `Endpoint::connect(EndpointAddr, ALPN)`
+  with the addresses pre-filled in the `EndpointAddr`
+  succeeds where the discovery-resolved path fails silently.
+
+- **`NetCommand::Track`, `NetCommand::ListBranches`,
+  `NetCommand::HeadOfRemote`, `NetCommand::Fetch`** carry
+  `EndpointAddr` instead of `EndpointId` on the wire from
+  `NetSender` to `host_loop`. Internal but listed here for
+  anyone implementing the channel directly.
+
+- **`fetch_blob`, `fetch_reachable`, `track_known_head`,
+  `connect_authed`** (private helpers in `host.rs`) take
+  `EndpointAddr` so address info flows through to the QUIC
+  layer. Callers with only an `EndpointId` use
+  `EndpointAddr::from(id)` (no addresses → discovery fallback,
+  same behaviour as before).
+
+### Added
+
+- **`pile net sync` prints an `EndpointTicket`** to stderr
+  once the iroh endpoint is online — the rich form encoding
+  `node_id + relay URL + direct addrs`. This is what to copy
+  into a peer's `--peers` flag for direct dial in
+  discovery-hostile environments. Printed via `eprintln`
+  (not just tracing) so it shows at default log levels.
+
+- **`pile net identity` prints an `EndpointTicket`** alongside
+  the bare pubkey. Without a running endpoint this carries
+  only the id (no addresses); use the richer ticket from
+  `pile net sync` startup for direct-dial scenarios.
+
+- **`pile net pull <REMOTE>` accepts an `EndpointTicket`** as
+  the `<REMOTE>` argument in addition to the legacy bare-
+  pubkey form. Backward-compatible.
+
+- **`pile net sync --peers <STR>` accepts `EndpointTicket`s**
+  in addition to bare hex pubkeys. Mixed lists are fine.
+  Tickets are decoded to `EndpointAddr`; for the gossip
+  bootstrap path the id is extracted (the address info is
+  not yet used to seed iroh's address cache for gossip, but
+  the address info IS used end-to-end for the
+  `pile net pull` path).
+
+### Notes
+
+- The `pile net sync` gossip bootstrap doesn't yet seed iroh's
+  address cache from ticket addresses, so sandbox-side `sync`
+  with bare tickets still needs discovery for the gossip mesh
+  to populate. The `pile net pull` path is fully address-
+  threaded and works without discovery. Address-cache seeding
+  for sync's gossip bootstrap is a follow-up (would require an
+  `AddressLookup` provider plugged into iroh's
+  `address_lookup` builder, or an `ep.connect()` seed pass
+  at startup).
+
+- `iroh-tickets 0.5` added as a dependency of both
+  `triblespace-net` (for the rich-ticket print) and `trible`
+  (for parsing). Pairs cleanly with iroh-base 0.98.
+
 ## [0.41.0] - 2026-05-16
 
 The iroh-0.98 release. Replaces the 0.40.3 Cargo.lock workaround

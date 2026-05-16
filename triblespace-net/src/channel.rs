@@ -25,18 +25,24 @@ pub enum NetCommand {
     /// Start tracking a remote branch: recursively fetch the blobs
     /// reachable from its head and materialize a tracking branch
     /// (fire-and-forget — results arrive via `NetEvent`s).
-    Track { peer: iroh_base::EndpointId, branch: RawBranchId },
+    ///
+    /// `peer` is an `EndpointAddr`, not just `EndpointId`, so a
+    /// relay URL and/or direct socket addresses can be carried
+    /// through to iroh's connect path without requiring
+    /// discovery — crucial for environments where pkarr publish
+    /// / relay probes are blocked.
+    Track { peer: iroh_base::EndpointAddr, branch: RawBranchId },
 
     /// RPC: list a remote peer's branches. One protocol round trip.
     /// Replies with the (branch_id, branch_metadata_blob_hash) pairs.
     ListBranches {
-        peer: iroh_base::EndpointId,
+        peer: iroh_base::EndpointAddr,
         reply: Sender<anyhow::Result<Vec<(Id, RawHash)>>>,
     },
     /// RPC: query a remote peer for its current head of one branch.
     /// One protocol round trip.
     HeadOfRemote {
-        peer: iroh_base::EndpointId,
+        peer: iroh_base::EndpointAddr,
         branch: RawBranchId,
         reply: Sender<anyhow::Result<Option<RawHash>>>,
     },
@@ -45,7 +51,7 @@ pub enum NetCommand {
     /// doesn't have it). The Peer wrapper method is responsible for
     /// putting the bytes into the local store.
     Fetch {
-        peer: iroh_base::EndpointId,
+        peer: iroh_base::EndpointAddr,
         hash: RawHash,
         reply: Sender<anyhow::Result<Option<Vec<u8>>>>,
     },

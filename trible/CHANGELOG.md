@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.1] - 2026-05-17
+
+### Added
+- **`pile net identity` prints an `EndpointTicket`** in
+  addition to the bare pubkey. Carries only the id at
+  identity-time (no relay/direct addrs); use the richer
+  ticket printed by `pile net sync` at startup for
+  direct-dial scenarios.
+- **`pile net sync --peers <STR>`** accepts `EndpointTicket`s
+  (the rich form, `endpoint…`) in addition to bare hex
+  pubkeys. The address info is decoded but only the id is
+  threaded into gossip bootstrap for now — address-cache
+  seeding for sync's gossip path is a follow-up.
+- **`pile net pull <REMOTE>`** accepts an `EndpointTicket` as
+  the `<REMOTE>` argument. End-to-end discovery-free: the
+  address info is threaded down to iroh's
+  `Endpoint::connect`, so the pull works in
+  sandbox / corporate-proxy environments where iroh
+  discovery is blocked.
+- **`pile net sync` prints a rich `EndpointTicket`** to
+  stderr once the iroh endpoint is online (from
+  triblespace-net's host loop) — id + relay URL + direct
+  addresses. This is the form to share with a remote peer
+  for direct dial.
+
+### Notes
+- `iroh-tickets 0.5` added as a dependency for ticket
+  parsing.
+
 ## [0.41.0] - 2026-05-16
 
 ### Changed

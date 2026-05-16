@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use iroh_base::EndpointId;
+use iroh_base::{EndpointAddr, EndpointId};
+use iroh_tickets::endpoint::EndpointTicket;
 
 use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::identity::load_or_create_key;
@@ -16,9 +17,32 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
     Pile::open(path).map_err(|e| anyhow!("open pile: {e:?}"))
 }
 
-fn parse_peers(strs: &[String]) -> Vec<EndpointId> {
+/// Parse a `--peers` argument. Accepts two formats:
+///
+/// 1. **`EndpointTicket`** (iroh-tickets `endpoint…` base32 form) —
+///    carries the peer's id plus relay URL and direct socket
+///    addresses. Lets the dialer skip iroh's discovery layer
+///    entirely, which is the working path in sandbox / corporate-
+///    proxy environments where pkarr publish and relay HTTPS
+///    probes are blocked.
+/// 2. **Bare hex pubkey** (32 bytes / 64 hex chars) — the legacy
+///    form. Iroh still needs discovery to find the addresses, so
+///    this only works in environments where discovery is healthy.
+///    Backward-compatible with prior trible versions.
+///
+/// Skips entries that don't parse as either; intentionally permissive
+/// so the CLI doesn't bail when an arg is mistyped — the missing-peers
+/// surface in the resulting tracing output makes the error obvious.
+fn parse_peers(strs: &[String]) -> Vec<EndpointAddr> {
     strs.iter()
-        .filter_map(|s| s.parse::<iroh_base::PublicKey>().ok().map(EndpointId::from))
+        .filter_map(|s| {
+            if let Ok(ticket) = s.parse::<EndpointTicket>() {
+                return Some(ticket.endpoint_addr().clone());
+            }
+            s.parse::<iroh_base::PublicKey>()
+                .ok()
+                .map(|pk| EndpointAddr::from(EndpointId::from(pk)))
+        })
         .collect()
 }
 
@@ -125,7 +149,15 @@ fn run_identity(sk: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let key = load_or_create_key(&sk, &cwd)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
-    println!("node: {public}");
+    println!("node:   {public}");
+    // EndpointTicket form (just the id — no relay or direct addrs
+    // known at identity-time; those require a running endpoint).
+    // Paste this into another peer's `--peers` to dial this node;
+    // the receiving end still needs discovery to resolve the
+    // addresses, so for sandbox/restricted-network use, also share
+    // the richer ticket printed by `pile net sync` at startup.
+    let ticket = EndpointTicket::from(EndpointAddr::from(EndpointId::from(public)));
+    println!("ticket: {ticket}  (id only — no relay/direct addrs)");
     Ok(())
 }
 
@@ -173,7 +205,14 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
-    let peers = parse_peers(&peer_strs);
+    // parse_peers handles EndpointTicket + bare-pubkey. For sync we
+    // pass through the ids — gossip + DHT bootstrap take EndpointId,
+    // and ticket address info (relay URL / direct addrs) is the
+    // bigger story for the `pile net pull` path. The richer story
+    // for sync (seeding iroh's address cache from ticket addresses
+    // so gossip can connect without discovery) is a follow-up.
+    let parsed_peers = parse_peers(&peer_strs);
+    let peers: Vec<EndpointId> = parsed_peers.iter().map(|a| a.id).collect();
 
     // Single pile handle, wrapped in a Peer (which spawns the iroh thread)
     // and then a Repository for the workspace/commit API. Reads on the Peer
@@ -239,9 +278,18 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf
 fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option<PathBuf>) -> Result<()> {
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
 
-    let remote_key: iroh_base::PublicKey = remote.parse()
-        .map_err(|e| anyhow!("bad node ID: {e}"))?;
-    let remote_endpoint: iroh_base::EndpointId = remote_key.into();
+    // Accept either an EndpointTicket (rich form — carries relay
+    // URL + direct addresses; skips iroh discovery, works in
+    // sandbox/proxy environments) or a bare hex pubkey (legacy
+    // form — needs iroh discovery to find the addresses).
+    let remote_addr: EndpointAddr = if let Ok(ticket) = remote.parse::<EndpointTicket>() {
+        ticket.endpoint_addr().clone()
+    } else {
+        let pk: iroh_base::PublicKey = remote.parse()
+            .map_err(|e| anyhow!("bad remote: not an EndpointTicket and not a hex pubkey ({e})"))?;
+        EndpointAddr::from(EndpointId::from(pk))
+    };
+    let remote_short = remote_addr.id.fmt_short();
 
     // Spin up the Peer — pull-only mode (gossip: false), no flood
     // subscription, just direct fetch + DHT.
@@ -259,9 +307,9 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
 
-    eprintln!("connecting to {}...", remote_key.fmt_short());
+    eprintln!("connecting to {remote_short}...");
     eprintln!("syncing...");
-    let tracking_id = repo.storage_mut().pull_branch(remote_endpoint, &branch)?;
+    let tracking_id = repo.storage_mut().pull_branch(remote_addr, &branch)?;
 
     use triblespace_net::tracking::MergeOutcome;
     let outcome = triblespace_net::tracking::merge_tracking_into_local(
