@@ -45,37 +45,37 @@ pub mod schema {
     #[allow(non_upper_case_globals)]
     pub const telemetry_metadata: Id = crate::macros::id_hex!("BCFDE38F7E452924C72803239392EA05");
 
-    pub fn build_telemetry_metadata<B>(blobs: &mut B) -> std::result::Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        let attrs = describe(blobs)?;
+    /// Build the telemetry-protocol metadata fragment.
+    ///
+    /// After the Fragment-self-contained refactor, `describe` is no longer
+    /// fallible and doesn't take a blob store — each entity!{} auto-puts
+    /// long-form bytes (descriptions, names) into the fragment's own
+    /// MemoryBlobStore. The returned Fragment is self-contained.
+    pub fn build_telemetry_metadata() -> Fragment {
+        let attrs = describe();
 
         let mut protocol = entity! { ExclusiveId::force_ref(&telemetry_metadata) @
-            metadata::name: blobs.put("triblespace_telemetry")?,
-            metadata::description: blobs.put(
+            metadata::name: "triblespace_telemetry",
+            metadata::description:
                 "Span-based profiling events emitted by TribleSpace telemetry.",
-            )?,
             metadata::tag: metadata::KIND_PROTOCOL,
             metadata::attribute*: attrs,
         };
 
         protocol += entity! { ExclusiveId::force_ref(&kind_session) @
-            metadata::name: blobs.put("telemetry_session")?,
-            metadata::description: blobs.put(
+            metadata::name: "telemetry_session",
+            metadata::description:
                 "A profiling session. Groups spans emitted during one telemetry run.",
-            )?,
             metadata::tag: metadata::KIND_TAG,
         };
         protocol += entity! { ExclusiveId::force_ref(&kind_span) @
-            metadata::name: blobs.put("telemetry_span")?,
-            metadata::description: blobs.put(
+            metadata::name: "telemetry_span",
+            metadata::description:
                 "A begin/end span with optional parent links.",
-            )?,
             metadata::tag: metadata::KIND_TAG,
         };
 
-        Ok(protocol)
+        protocol
     }
 }
 
@@ -338,9 +338,8 @@ impl Telemetry {
         }
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let metadata_set: TribleSet = schema::build_telemetry_metadata(&mut pile)
-            .ok()?
-            .into();
+        let metadata_fragment = schema::build_telemetry_metadata();
+        let metadata_set: TribleSet = metadata_fragment.into();
         let mut repo = Repository::new(pile, signing_key, metadata_set).ok()?;
 
         // Commit session start entity.
