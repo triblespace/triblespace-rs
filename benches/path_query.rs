@@ -8,15 +8,15 @@ use triblespace::core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
 use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
-use triblespace::core::value::schemas::genid::GenId;
+use triblespace::core::value::encodings::genid::GenId;
 use triblespace::core::value::IntoInline;
 use triblespace::prelude::*;
 
 mod bench_social {
     use triblespace::prelude::*;
     attributes! {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineschemas::GenId;
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: inlineschemas::GenId;
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineencodings::GenId;
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: inlineencodings::GenId;
     }
 }
 

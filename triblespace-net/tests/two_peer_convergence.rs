@@ -22,7 +22,7 @@
 //! just… don't.
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
 use triblespace_core::prelude::{BlobStore, BranchStore};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -30,7 +30,7 @@ use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, Repository,
 };
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 use triblespace_net::tracking::{
     ensure_tracking_branch, merge_tracking_into_local, MergeOutcome,
@@ -53,11 +53,11 @@ fn copy_all_blobs(src: &mut Repository<MemoryRepo>, dst: &mut Repository<MemoryR
         .collect();
     for handle in handles {
         let bytes: anybytes::Bytes = reader
-            .get::<anybytes::Bytes, triblespace_core::blob::schemas::UnknownBlob>(handle)
+            .get::<anybytes::Bytes, triblespace_core::blob::encodings::UnknownBlob>(handle)
             .expect("src has the blob");
         let _ = dst
             .storage_mut()
-            .put::<triblespace_core::blob::schemas::UnknownBlob, _>(bytes);
+            .put::<triblespace_core::blob::encodings::UnknownBlob, _>(bytes);
     }
 }
 

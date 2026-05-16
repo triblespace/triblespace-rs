@@ -110,7 +110,7 @@ pub trait AnySnapshot: Send + 'static {
     fn all_simple_archive_blobs(
         &self,
     ) -> Vec<triblespace_core::blob::Blob<
-        triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+        triblespace_core::blob::encodings::simplearchive::SimpleArchive,
     >>;
 }
 
@@ -121,9 +121,9 @@ where
         + Send + 'static,
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
-        use triblespace_core::blob::schemas::UnknownBlob;
+        use triblespace_core::blob::encodings::UnknownBlob;
         use triblespace_core::value::Inline;
-        use triblespace_core::value::schemas::hash::Handle;
+        use triblespace_core::value::encodings::hash::Handle;
         let handle = Inline::<Handle<UnknownBlob>>::new(*hash);
         self.reader.get::<anybytes::Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
     }
@@ -143,12 +143,12 @@ where
     fn all_simple_archive_blobs(
         &self,
     ) -> Vec<triblespace_core::blob::Blob<
-        triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+        triblespace_core::blob::encodings::simplearchive::SimpleArchive,
     >> {
         use triblespace_core::blob::Blob;
-        use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::value::Inline;
-        use triblespace_core::value::schemas::hash::Handle;
+        use triblespace_core::value::encodings::hash::Handle;
         let mut out = Vec::new();
         for handle_result in self.reader.blobs() {
             let Ok(handle) = handle_result else { continue };
@@ -797,8 +797,8 @@ async fn serve_stream(
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
     use triblespace_core::blob::Blob;
-    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::value::encodings::hash::Handle;
     use triblespace_core::value::Inline;
 
     let op = recv_u8(recv).await?;
@@ -1122,7 +1122,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use triblespace_core::blob::Blob;
-    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::id::{ExclusiveId, ufoid};
     use triblespace_core::macros::entity;
     use triblespace_core::repo::BlobStorePut;
@@ -1133,8 +1133,8 @@ mod tests {
     use triblespace_core::trible::TribleSet;
     use triblespace_core::value::TryToInline;
     use triblespace_core::value::Inline;
-    use triblespace_core::value::schemas::hash::Handle;
-    use triblespace_core::value::schemas::time::NsTAIInterval;
+    use triblespace_core::value::encodings::hash::Handle;
+    use triblespace_core::value::encodings::time::NsTAIInterval;
     use hifitime::Epoch;
 
     fn now_plus_24h() -> Inline<NsTAIInterval> {
@@ -1286,7 +1286,7 @@ mod tests {
         RawHash,
         RawHash,
     ) {
-        use triblespace_core::blob::schemas::UnknownBlob;
+        use triblespace_core::blob::encodings::UnknownBlob;
         use triblespace_core::repo::BranchStore;
         let mut store = MemoryRepo::default();
 
@@ -1509,7 +1509,7 @@ mod tests {
         fn all_simple_archive_blobs(
             &self,
         ) -> Vec<triblespace_core::blob::Blob<
-            triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+            triblespace_core::blob::encodings::simplearchive::SimpleArchive,
         >> {
             self.0.all_simple_archive_blobs()
         }

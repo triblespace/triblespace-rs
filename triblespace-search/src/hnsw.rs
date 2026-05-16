@@ -16,7 +16,7 @@
 //! ```
 //! # use triblespace_core::blob::MemoryBlobStore;
 //! # use triblespace_core::repo::BlobStore;
-//! # use triblespace_core::value::schemas::hash::Blake3;
+//! # use triblespace_core::value::encodings::hash::Blake3;
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace_search::schemas::put_embedding;
 //! let mut store = MemoryBlobStore::new();
@@ -42,7 +42,7 @@
 //! ```
 
 use triblespace_core::query::Variable;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 
 use crate::schemas::{EmbHandle, Embedding};
@@ -50,7 +50,7 @@ use crate::schemas::{EmbHandle, Embedding};
 // ── HNSW blob byte format ────────────────────────────────────────────
 //
 // No magic bytes, no version field: the blob-level type
-// (a typed `BlobSchema` / handle on the pile side, or the
+// (a typed `BlobEncoding` / handle on the pile side, or the
 // `HNSWIndex::try_from_bytes` entry point itself) is the
 // identity. A breaking format change mints a new schema ID
 // and therefore a new type, so the compiler polices it.

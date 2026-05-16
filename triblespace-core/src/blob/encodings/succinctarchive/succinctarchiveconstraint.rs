@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use super::*;
 use crate::query::*;
-use crate::value::schemas::genid::GenId;
+use crate::value::encodings::genid::GenId;
 use jerky::bit_vector::Select;
 
 pub struct SuccinctArchiveConstraint<'a, U>
@@ -20,7 +20,7 @@ impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    pub fn new<V: InlineSchema>(
+    pub fn new<V: InlineEncoding>(
         variable_e: Variable<GenId>,
         variable_a: Variable<GenId>,
         variable_v: Variable<V>,

@@ -10,18 +10,18 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace_core::blob::schemas::longstring::LongString;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, Repository};
 use triblespace_core::trible::Fragment;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000010" as pub note: inlineschemas::Handle<blobschemas::LongString>;
+        "DD00000000000000DD00000000000010" as pub note: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

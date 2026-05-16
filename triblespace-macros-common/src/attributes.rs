@@ -143,7 +143,7 @@ pub fn attributes_impl(
         // Both branches build a rooted fragment whose root IS the
         // attribute id. The Hex branch constructs the fragment via
         // the low-level `Fragment::rooted` API rather than `entity!{}`
-        // — bootstrapping attributes like `metadata::value_schema` are
+        // — bootstrapping attributes like `metadata::value_encoding` are
         // themselves declared via `attributes!{}`, and any reference
         // to them from inside their own LazyLock init would deadlock.
         // Derived attributes expand `entity_impl` directly (same
@@ -165,7 +165,7 @@ pub fn attributes_impl(
             AttributeId::Derived => {
                 let entity_input = quote! {
                     #base_path::metadata::name:         #name_lit.to_blob().get_handle(),
-                    #base_path::metadata::value_schema: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                    #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
                 };
                 crate::entity_impl(entity_input, base_path)?
             }
@@ -248,7 +248,7 @@ pub fn attributes_impl(
             {
                 // Core: the attribute's own identity-determining facts
                 // (`metadata::iri` / `metadata::name` and
-                // `metadata::value_schema`) — `Attribute::describe`
+                // `metadata::value_encoding`) — `Attribute::describe`
                 // is a pure accessor that returns the stored
                 // fragment. Schema-level facts (what `S::id()` is,
                 // hash protocol, etc.) are NOT folded in here; the

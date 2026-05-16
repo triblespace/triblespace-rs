@@ -9,17 +9,17 @@
 //! then self-contained — every handle in its facts resolves against
 //! its own blob store.
 
-use triblespace_core::blob::schemas::longstring::LongString;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{BlobStore, BlobStoreGet};
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000020" as pub note: inlineschemas::Handle<blobschemas::LongString>;
+        "DD00000000000000DD00000000000020" as pub note: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

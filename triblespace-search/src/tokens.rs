@@ -8,7 +8,7 @@
 //!
 //! # Per-tokenizer schemas
 //!
-//! Each tokenizer produces a distinct [`InlineSchema`], so the
+//! Each tokenizer produces a distinct [`InlineEncoding`], so the
 //! compiler keeps their outputs from mixing at the type level
 //! (the old string-prefix approach was a statistical safeguard
 //! only — user text containing literal `"3:foo"` could collide
@@ -29,7 +29,7 @@ use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{Inline, InlineSchema};
+use triblespace_core::value::{Inline, InlineEncoding};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
 /// produce Blake3 hashes of a lowercased word / code segment.
@@ -52,13 +52,13 @@ impl MetaDescribe for WordHash {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                metadata::tag:         metadata::KIND_INLINE_ENCODING,
             }
         })
     }
 }
 
-impl InlineSchema for WordHash {
+impl InlineEncoding for WordHash {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -84,13 +84,13 @@ impl MetaDescribe for BigramHash {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                metadata::tag:         metadata::KIND_INLINE_ENCODING,
             }
         })
     }
 }
 
-impl InlineSchema for BigramHash {
+impl InlineEncoding for BigramHash {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -118,13 +118,13 @@ impl MetaDescribe for NgramHash {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_VALUE_SCHEMA,
+                metadata::tag:         metadata::KIND_INLINE_ENCODING,
             }
         })
     }
 }
 
-impl InlineSchema for NgramHash {
+impl InlineEncoding for NgramHash {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -603,7 +603,7 @@ mod tests {
         // docs that contain those two words adjacently.
         use crate::bm25::BM25Builder;
         use triblespace_core::id::Id;
-        use triblespace_core::value::schemas::genid::GenId;
+        use triblespace_core::value::encodings::genid::GenId;
 
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()

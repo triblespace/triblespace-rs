@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 
-use crate::blob::schemas::UnknownBlob;
-use crate::blob::BlobSchema;
+use crate::blob::encodings::UnknownBlob;
+use crate::blob::BlobEncoding;
 use crate::blob::MemoryBlobStore;
 use crate::blob::IntoBlob;
-use crate::prelude::blobschemas::SimpleArchive;
+use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
 
-use crate::value::schemas::hash::Handle;
-use crate::value::InlineSchema;
+use crate::value::encodings::hash::Handle;
+use crate::value::InlineEncoding;
 
 /// Simple in-memory implementation of [`BlobStore`] and [`BranchStore`].
 ///
@@ -29,9 +29,9 @@ impl crate::repo::BlobStorePut for MemoryRepo {
     type PutError = <MemoryBlobStore as crate::repo::BlobStorePut>::PutError;
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         self.blobs.put(item)
     }

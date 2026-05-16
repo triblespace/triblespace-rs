@@ -259,7 +259,7 @@ on every call.
 ## Schema-rotation migrations
 
 `triblespace-search` identifies each blob format by a
-`BlobSchema`'s schema id (the hex literal inlined in its
+`BlobEncoding`'s schema id (the hex literal inlined in its
 `MetaDescribe::describe` body). A breaking byte-layout change
 rotates that ID. Understanding what that *doesn't* do is
 important:
@@ -268,7 +268,7 @@ important:
 
 `SuccinctBM25Blob::id()` is used by the describe/introspection
 machinery and by derived-id schemas like `Handle<H, T>` (whose
-id falls out of `entity!{ blob_schema: T::id(), hash_schema:
+id falls out of `entity!{ blob_encoding: T::id(), hash_schema:
 H::id() }.root()`). It is **not** checked by `try_from_blob` —
 that dispatches on the Rust type parameter. After an ID
 rotation:
@@ -329,6 +329,6 @@ Migration recipe:
 
 Attributes whose value type is a plain `ShortString`,
 `LongString`, `GenId`, etc. (anything not parameterized on a
-crate-owned `BlobSchema`) are unaffected by our schema
+crate-owned `BlobEncoding`) are unaffected by our schema
 rotations — only handles to *our* blob types transitively
 depend on our IDs.

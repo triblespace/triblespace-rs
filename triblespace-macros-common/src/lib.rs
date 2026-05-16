@@ -486,14 +486,14 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 }
                 Inline::Expr(ref id_expr) => {
                     quote! {
-                        let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                        let #e_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                         constraints.push(Box::new(#e_ident.is(#base_path::value::IntoInline::to_inline(#id_expr))));
                     }
                 }
             }
         } else {
             quote! {
-                let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                let #e_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
             }
         };
         entity_tokens.extend(init);
@@ -540,21 +540,21 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             );
                             attr_tokens.extend(quote! {
                                 let #af_ident = &#expr;
-                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                                let #a_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                                 constraints.push(Box::new(#a_ident.is(#base_path::value::IntoInline::to_inline(#af_ident.id()))));
                             });
                             (a_ident, Some(af_ident))
                         }
                         Inline::Var(user_ident) => {
                             attr_tokens.extend(quote! {
-                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #user_ident;
+                                let #a_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #user_ident;
                             });
                             (a_ident, None)
                         }
                         Inline::LocalVar(local_ident) => {
                             let local_var = get_local_var(local_ident);
                             attr_tokens.extend(quote! {
-                                let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #local_var;
+                                let #a_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #local_var;
                             });
                             (a_ident, None)
                         }
@@ -591,7 +591,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                            let #alias_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                             let v_var = #af_ident.as_variable(#alias_ident);
                             constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
@@ -613,7 +613,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                            let #alias_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                             let v_var = #af_ident.as_variable(#alias_ident);
                             constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
@@ -667,7 +667,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             // `Variable<UnknownInline>`. Any other schema
                             // is rejected here so users can't quietly
                             // misinterpret the bytes downstream.
-                            let _: &#base_path::query::Variable<#base_path::value::schemas::UnknownInline> = &#var_ident;
+                            let _: &#base_path::query::Variable<#base_path::value::encodings::UnknownInline> = &#var_ident;
                             constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, #var_ident)));
                         }
                     }
@@ -895,7 +895,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             #pair_push_tokens
             __pairs.sort_unstable();
 
-            let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
+            let mut __hasher = #base_path::value::encodings::hash::Blake3::new();
             let mut __last: Option<(#base_path::id::Id, #base_path::value::RawInline)> = None;
             for (__a, __v) in __pairs.iter() {
                 if let Some((__la, __lv)) = __last {
@@ -919,7 +919,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             let mut __pairs: [(#base_path::id::Id, #base_path::value::RawInline); #attr_count] = [#pair_entries];
             __pairs.sort_unstable();
 
-            let mut __hasher = #base_path::value::schemas::hash::Blake3::new();
+            let mut __hasher = #base_path::value::encodings::hash::Blake3::new();
             let mut __last: Option<(#base_path::id::Id, #base_path::value::RawInline)> = None;
             for (__a, __v) in __pairs.iter() {
                 if let Some((__la, __lv)) = __last {
@@ -1049,14 +1049,14 @@ pub fn pattern_changes_impl(
                 }
                 Inline::Expr(ref id_expr) => {
                     entity_const_tokens.extend(quote! {
-                        let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                        let #e_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                         constraints.push(Box::new(#e_ident.is(#base_path::value::IntoInline::to_inline(#id_expr))));
                     });
                 }
             },
             None => {
                 entity_decl_tokens.extend(quote! {
-                    let #e_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                    let #e_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                 });
             }
         }
@@ -1102,7 +1102,7 @@ pub fn pattern_changes_impl(
                     attr_idx += 1;
                     attr_decl_tokens.extend(quote! {
                         let #af_ident = &#attr_expr;
-                        let #a_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                        let #a_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                     });
                     attr_const_tokens.extend(quote! {
                         constraints.push(Box::new(#a_ident.is(#base_path::value::IntoInline::to_inline(#af_ident.id()))));
@@ -1139,7 +1139,7 @@ pub fn pattern_changes_impl(
                     let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
                     value_idx += 1;
                     value_decl_tokens.extend(quote! {
-                        let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                        let #alias_ident: #base_path::query::Variable<#base_path::value::encodings::genid::GenId> = #ctx_ident.next_variable();
                         let #v_ident = #af_ident.as_variable(#alias_ident);
                     });
                     entity_const_tokens.extend(quote! {

@@ -62,8 +62,8 @@ constraint types can participate without custom planner hooks.
 
 You might notice that trible.space does not define a global ontology or schema
 beyond associating attributes with a
-[`InlineSchema`](triblespace::core::value::InlineSchema) or
-[`BlobSchema`](triblespace::core::prelude::BlobSchema). This is deliberate. The semantic web
+[`InlineEncoding`](triblespace::core::value::InlineEncoding) or
+[`BlobEncoding`](triblespace::core::prelude::BlobEncoding). This is deliberate. The semantic web
 taught us that per-value typing, while desirable, was awkward in RDF: literal
 datatypes are optional, custom types need globally scoped IRIs and there is no
 enforcement, so most data degenerates into untyped strings. Trying to regain
@@ -117,7 +117,7 @@ use std::collections::HashSet;
 use triblespace::core::examples::literature;
 use triblespace::core::query::ContainsConstraint;
 use triblespace::prelude::*;
-use triblespace::prelude::inlineschemas::ShortString;
+use triblespace::prelude::inlineencodings::ShortString;
 
 fn main() {
     let mut kb = TribleSet::new();

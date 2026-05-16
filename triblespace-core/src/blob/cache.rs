@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use quick_cache::sync::Cache;
 
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::repo::BlobStoreGet;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 const DEFAULT_BLOB_CACHE_CAPACITY: usize = 256;
 
@@ -15,9 +15,9 @@ const DEFAULT_BLOB_CACHE_CAPACITY: usize = 256;
 pub struct BlobCache<B, S, T>
 where
     B: BlobStoreGet,
-    S: BlobSchema + 'static,
+    S: BlobEncoding + 'static,
     T: TryFromBlob<S>,
-    Handle<S>: InlineSchema,
+    Handle<S>: InlineEncoding,
 {
     blobs: B,
     by_handle: Cache<Inline<Handle<S>>, Arc<T>>,
@@ -26,9 +26,9 @@ where
 impl<B, S, T> BlobCache<B, S, T>
 where
     B: BlobStoreGet,
-    S: BlobSchema + 'static,
+    S: BlobEncoding + 'static,
     T: TryFromBlob<S>,
-    Handle<S>: InlineSchema,
+    Handle<S>: InlineEncoding,
 {
     /// Creates a new cache backed by `blobs` with the default capacity.
     pub fn new(blobs: B) -> Self {

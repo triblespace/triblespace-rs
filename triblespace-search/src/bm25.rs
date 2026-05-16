@@ -50,8 +50,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::{RawInline, IntoInline, Inline, InlineSchema};
+use triblespace_core::value::encodings::genid::GenId;
+use triblespace_core::value::{RawInline, IntoInline, Inline, InlineEncoding};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -61,8 +61,8 @@ const DEFAULT_B: f32 = 0.75;
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
 ///
-/// Generic over `D` (the doc-key [`InlineSchema`]) and `T` (the
-/// term [`InlineSchema`]). Typical shapes:
+/// Generic over `D` (the doc-key [`InlineEncoding`]) and `T` (the
+/// term [`InlineEncoding`]). Typical shapes:
 ///
 /// - `BM25Builder<GenId, WordHash>` — classic text search
 ///   keyed by entity id; terms come from
@@ -78,7 +78,7 @@ const DEFAULT_B: f32 = 0.75;
 ///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
-pub struct BM25Builder<D: InlineSchema = GenId, T: InlineSchema = crate::tokens::WordHash> {
+pub struct BM25Builder<D: InlineEncoding = GenId, T: InlineEncoding = crate::tokens::WordHash> {
     pub(crate) docs: Vec<(RawInline, Vec<RawInline>)>,
     pub(crate) k1: f32,
     pub(crate) b: f32,
@@ -86,11 +86,11 @@ pub struct BM25Builder<D: InlineSchema = GenId, T: InlineSchema = crate::tokens:
 }
 
 // Manual `Clone` impl (not derive) so the bound stays on
-// `D: InlineSchema, T: InlineSchema` rather than the auto-derive's
+// `D: InlineEncoding, T: InlineEncoding` rather than the auto-derive's
 // `D: Clone, T: Clone` — `PhantomData<(D, T)>` is `Clone`
 // regardless of `D` / `T`, and the rest of the fields are
 // already `Clone`.
-impl<D: InlineSchema, T: InlineSchema> Clone for BM25Builder<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> Clone for BM25Builder<D, T> {
     fn clone(&self) -> Self {
         Self {
             docs: self.docs.clone(),
@@ -101,13 +101,13 @@ impl<D: InlineSchema, T: InlineSchema> Clone for BM25Builder<D, T> {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> Default for BM25Builder<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> Default for BM25Builder<D, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> BM25Builder<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     /// Create an empty builder with the standard BM25 tuning.
     ///
     /// Type parameters are usually inferred from downstream
@@ -349,7 +349,7 @@ fn accumulate_tfs(
 /// saturating term frequency (`k1`) and length-normalized doc
 /// length (`b`).
 #[doc(hidden)]
-pub struct BM25Index<D: InlineSchema = GenId, T: InlineSchema = crate::tokens::WordHash> {
+pub struct BM25Index<D: InlineEncoding = GenId, T: InlineEncoding = crate::tokens::WordHash> {
     /// Per-doc 32-byte keys. Stored raw; `Inline<D>` at the API
     /// boundary.
     keys: Vec<RawInline>,
@@ -363,7 +363,7 @@ pub struct BM25Index<D: InlineSchema = GenId, T: InlineSchema = crate::tokens::W
     _phantom: PhantomData<(D, T)>,
 }
 
-impl<D: InlineSchema, T: InlineSchema> std::fmt::Debug for BM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> std::fmt::Debug for BM25Index<D, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BM25Index")
             .field("n_docs", &self.keys.len())
@@ -375,7 +375,7 @@ impl<D: InlineSchema, T: InlineSchema> std::fmt::Debug for BM25Index<D, T> {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> Clone for BM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> Clone for BM25Index<D, T> {
     fn clone(&self) -> Self {
         Self {
             keys: self.keys.clone(),
@@ -391,7 +391,7 @@ impl<D: InlineSchema, T: InlineSchema> Clone for BM25Index<D, T> {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> BM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> BM25Index<D, T> {
     /// Number of documents in the index.
     pub fn doc_count(&self) -> usize {
         self.keys.len()
@@ -517,7 +517,7 @@ impl<D: InlineSchema, T: InlineSchema> BM25Index<D, T> {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> PartialEq for BM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> PartialEq for BM25Index<D, T> {
     /// Bit-exact equality, including on `f32` fields — used by
     /// parallel-build tests that assert byte-identical output
     /// across thread counts. Score computation is deterministic
@@ -543,7 +543,7 @@ impl<D: InlineSchema, T: InlineSchema> PartialEq for BM25Index<D, T> {
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> Eq for BM25Index<D, T> {}
+impl<D: InlineEncoding, T: InlineEncoding> Eq for BM25Index<D, T> {}
 
 
 #[cfg(test)]
@@ -578,7 +578,7 @@ mod tests {
 
     #[test]
     fn insert_indexes_by_string_key() {
-        use triblespace_core::value::schemas::shortstring::ShortString;
+        use triblespace_core::value::encodings::shortstring::ShortString;
         use triblespace_core::value::{IntoInline, Inline};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::new();

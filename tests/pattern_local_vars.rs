@@ -6,8 +6,8 @@ pub mod names {
     use triblespace::prelude::*;
 
     attributes! {
-        "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: inlineschemas::ShortString;
-        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" as last: inlineschemas::ShortString;
+        "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: inlineencodings::ShortString;
+        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" as last: inlineencodings::ShortString;
     }
 }
 
@@ -15,8 +15,8 @@ mod social {
     use triblespace::prelude::*;
 
     attributes! {
-        "C2C8D4D6E3E5479EA6F4D71D979CD3CE" as friend: inlineschemas::GenId;
-        "E2175D85AC9F4A09BB52A0F7971D7569" as best_friend: inlineschemas::GenId;
+        "C2C8D4D6E3E5479EA6F4D71D979CD3CE" as friend: inlineencodings::GenId;
+        "E2175D85AC9F4A09BB52A0F7971D7569" as best_friend: inlineencodings::GenId;
     }
 }
 
@@ -24,8 +24,8 @@ mod library {
     use triblespace::prelude::*;
 
     attributes! {
-        "6E7843FC4D9C428EBF5C9C86CB8C33C4" as title: inlineschemas::ShortString;
-        "3E51B9E2E4C14D2DA0DC6B0ACB5CBF56" as subtitle: inlineschemas::ShortString;
+        "6E7843FC4D9C428EBF5C9C86CB8C33C4" as title: inlineencodings::ShortString;
+        "3E51B9E2E4C14D2DA0DC6B0ACB5CBF56" as subtitle: inlineencodings::ShortString;
     }
 }
 

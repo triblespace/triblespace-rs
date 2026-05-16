@@ -53,11 +53,11 @@ pub fn run(cmd: Command) -> Result<()> {
 
             use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreList;
-            use triblespace_core::blob::schemas::UnknownBlob;
+            use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
-            use triblespace_core::value::schemas::hash::Handle;
-            use triblespace_core::value::schemas::hash::Hash;
+            use triblespace_core::value::encodings::hash::Blake3;
+            use triblespace_core::value::encodings::hash::Handle;
+            use triblespace_core::value::encodings::hash::Hash;
 
             let mut pile: Pile = Pile::open(&path)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -89,13 +89,13 @@ pub fn run(cmd: Command) -> Result<()> {
             res.and(close_res)?;
         }
         Command::Put { pile, file } => {
-            use triblespace::prelude::blobschemas::RawBytes;
+            use triblespace::prelude::blobencodings::RawBytes;
             use triblespace::prelude::BlobStorePut;
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
-            use triblespace_core::value::schemas::hash::Blake3;
-            use triblespace_core::value::schemas::hash::Handle;
-            use triblespace_core::value::schemas::hash::Hash;
+            use triblespace_core::value::encodings::hash::Blake3;
+            use triblespace_core::value::encodings::hash::Handle;
+            use triblespace_core::value::encodings::hash::Hash;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -119,11 +119,11 @@ pub fn run(cmd: Command) -> Result<()> {
 
             use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreGet;
-            use triblespace_core::blob::schemas::UnknownBlob;
+            use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::blob::Bytes;
             use triblespace_core::repo::pile::Pile;
             
-            use triblespace_core::value::schemas::hash::Handle;
+            use triblespace_core::value::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {
@@ -150,12 +150,12 @@ pub fn run(cmd: Command) -> Result<()> {
 
             use triblespace::prelude::BlobStore;
             use triblespace::prelude::BlobStoreGet;
-            use triblespace_core::blob::schemas::UnknownBlob;
+            use triblespace_core::blob::encodings::UnknownBlob;
             use triblespace_core::blob::Blob;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::BlobMetadata;
             
-            use triblespace_core::value::schemas::hash::Handle;
+            use triblespace_core::value::encodings::hash::Handle;
 
             let mut pile: Pile = Pile::open(&pile)?;
             let res = (|| -> Result<(), anyhow::Error> {

@@ -11,12 +11,12 @@
 mod cache;
 mod memoryblobstore;
 /// Built-in blob schema types and their conversion implementations.
-pub mod schemas;
+pub mod encodings;
 
 use crate::metadata::MetaDescribe;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -65,9 +65,9 @@ pub use anybytes::Bytes;
 /// eliminates a real double-hash that surfaced at every `insert` site,
 /// and the only call that relied on transparency (`as_transmute`'s
 /// `mem::transmute`) still works because `Blob<S>` and `Blob<T>`
-/// have identical layouts for any `S`/`T: BlobSchema` (phantoms
+/// have identical layouts for any `S`/`T: BlobEncoding` (phantoms
 /// are zero-sized, handle is `[u8; 32] + PhantomData`).
-pub struct Blob<S: BlobSchema> {
+pub struct Blob<S: BlobEncoding> {
     /// The raw byte content of this blob.
     pub bytes: Bytes,
     /// Cached content-addressed handle. Computed eagerly at
@@ -79,8 +79,8 @@ pub struct Blob<S: BlobSchema> {
 
 impl<S> Blob<S>
 where
-    S: BlobSchema,
-    Handle<S>: InlineSchema,
+    S: BlobEncoding,
+    Handle<S>: InlineEncoding,
 {
     /// Creates a new blob from a sequence of bytes.
     ///
@@ -92,7 +92,7 @@ where
     /// have a blob path that's *never* hashed and the eager cost
     /// matters, reach for the raw `Bytes` instead.
     pub fn new(bytes: Bytes) -> Self {
-        let digest = crate::value::schemas::hash::Blake3::digest(&bytes);
+        let digest = crate::value::encodings::hash::Blake3::digest(&bytes);
         Self {
             bytes,
             handle: Inline::new(digest),
@@ -133,9 +133,9 @@ where
     /// This is a zero-copy transformation: bytes pass through and the
     /// cached handle is recast at the phantom level. It does **not**
     /// validate that the data actually conforms to the new schema.
-    pub fn transmute<T: BlobSchema>(self) -> Blob<T>
+    pub fn transmute<T: BlobEncoding>(self) -> Blob<T>
     where
-        Handle<T>: InlineSchema,
+        Handle<T>: InlineEncoding,
     {
         Blob {
             bytes: self.bytes,
@@ -149,9 +149,9 @@ where
     /// If the schema types are not compatible, this will not cause undefined behavior,
     /// but it might cause unexpected results.
     ///
-    /// This is primarily used to give blobs with an [UnknownBlob](crate::blob::schemas::UnknownBlob) schema a more specific schema.
+    /// This is primarily used to give blobs with an [UnknownBlob](crate::blob::encodings::UnknownBlob) schema a more specific schema.
     /// Use with caution.
-    pub fn as_transmute<T: BlobSchema>(&self) -> &Blob<T> {
+    pub fn as_transmute<T: BlobEncoding>(&self) -> &Blob<T> {
         unsafe { std::mem::transmute(self) }
     }
 
@@ -177,8 +177,8 @@ where
 
 impl<T> Clone for Blob<T>
 where
-    T: BlobSchema,
-    Handle<T>: InlineSchema,
+    T: BlobEncoding,
+    Handle<T>: InlineEncoding,
 {
     fn clone(&self) -> Self {
         Self {
@@ -200,37 +200,37 @@ where
 /// just `blob.as_ref()` instead of `&blob.get_handle()`.
 impl<S> AsRef<Inline<Handle<S>>> for Blob<S>
 where
-    S: BlobSchema,
-    Handle<S>: InlineSchema,
+    S: BlobEncoding,
+    Handle<S>: InlineEncoding,
 {
     fn as_ref(&self) -> &Inline<Handle<S>> {
         &self.handle
     }
 }
 
-impl<T: BlobSchema> PartialEq for Blob<T> {
+impl<T: BlobEncoding> PartialEq for Blob<T> {
     fn eq(&self, other: &Self) -> bool {
         self.bytes == other.bytes
     }
 }
 
-impl<T: BlobSchema> Eq for Blob<T> {}
+impl<T: BlobEncoding> Eq for Blob<T> {}
 
-impl<T: BlobSchema> Hash for Blob<T> {
+impl<T: BlobEncoding> Hash for Blob<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.bytes.hash(state);
     }
 }
 
-impl<T: BlobSchema> Debug for Blob<T> {
+impl<T: BlobEncoding> Debug for Blob<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Blob<{}>", std::any::type_name::<T>())
     }
 }
 
 /// A trait for defining the abstract schema type of a blob.
-/// This is similar to the [`InlineSchema`] trait in the [`value`](crate::value) module.
-pub trait BlobSchema: MetaDescribe + Sized + 'static {
+/// This is similar to the [`InlineEncoding`] trait in the [`value`](crate::value) module.
+pub trait BlobEncoding: MetaDescribe + Sized + 'static {
     /// Converts a concrete Rust type to a blob with this schema via [`IntoBlob`].
     fn blob_from<T: IntoBlob<Self>>(t: T) -> Blob<Self> {
         t.to_blob()
@@ -244,12 +244,12 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
-    /// [`InlineSchema::to_value`].
+    /// [`InlineEncoding::to_value`].
     fn to_value(blob: Blob<Self>) -> crate::value::Value<Handle<Self>>
     where
-        Handle<Self>: InlineSchema,
+        Handle<Self>: InlineEncoding,
     {
-        crate::value::Value::Blob(blob.transmute::<crate::blob::schemas::UnknownBlob>())
+        crate::value::Value::Blob(blob.transmute::<crate::blob::encodings::UnknownBlob>())
     }
 }
 
@@ -262,12 +262,12 @@ pub trait BlobSchema: MetaDescribe + Sized + 'static {
 /// becomes `IntoBlob<S>`, and gains the `to_blob(self) -> Blob<S>`
 /// convenience method.
 ///
-/// The trait parameter is the [`BlobSchema`] directly (not
+/// The trait parameter is the [`BlobEncoding`] directly (not
 /// `Handle<S>`) — this is what makes `impl IntoBlob<MyBlobSchema>
 /// for MyForeignType` legal for downstream crates: the local
 /// `MyBlobSchema` sits at trait position 0, satisfying Rust's
 /// orphan rule.
-pub trait IntoBlob<S: BlobSchema>:
+pub trait IntoBlob<S: BlobEncoding>:
     crate::value::IntoEncoded<S, Output = Blob<S>>
 {
     /// Convert directly to `Blob<S>`.
@@ -280,7 +280,7 @@ pub trait IntoBlob<S: BlobSchema>:
 }
 impl<S, T> IntoBlob<S> for T
 where
-    S: BlobSchema,
+    S: BlobEncoding,
     T: crate::value::IntoEncoded<S, Output = Blob<S>>,
 {
 }
@@ -292,14 +292,14 @@ where
 /// This is the counterpart to the [`IntoBlob`] trait.
 ///
 /// See [TryFromInline](crate::value::TryFromInline) for the counterpart trait for values.
-pub trait TryFromBlob<S: BlobSchema>: Sized {
+pub trait TryFromBlob<S: BlobEncoding>: Sized {
     /// The error type returned when the conversion fails.
     type Error: Error + Send + Sync + 'static;
     /// Attempts to convert a blob into this type.
     fn try_from_blob(b: Blob<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
+impl<S: BlobEncoding> TryFromBlob<S> for Blob<S> {
     type Error = Infallible;
 
     fn try_from_blob(b: Blob<S>) -> Result<Self, Self::Error> {
@@ -310,9 +310,9 @@ impl<S: BlobSchema> TryFromBlob<S> for Blob<S> {
 /// `Blob<S>` is the identity source for [`IntoEncoded<S>`] in the
 /// blob path: it converts to itself with no allocation, and the
 /// cached handle inside lets every downstream step skip rehashing.
-impl<S: BlobSchema> crate::value::Encodes<Blob<S>> for S
+impl<S: BlobEncoding> crate::value::Encodes<Blob<S>> for S
 where
-    Handle<S>: InlineSchema,
+    Handle<S>: InlineEncoding,
 {
     type Output = Blob<S>;
     fn encode(source: Blob<S>) -> Blob<S> {
@@ -321,28 +321,28 @@ where
 }
 
 /// `Blob<T>` is the `ToValue<Handle<T>>` expander: it delegates to
-/// [`BlobSchema::to_value`] for the actual blob-to-Value lift. The
+/// [`BlobEncoding::to_value`] for the actual blob-to-Value lift. The
 /// trait is the macro-side dispatch shim; the logic lives on
-/// `BlobSchema` so users (and schemas that need custom storage
+/// `BlobEncoding` so users (and schemas that need custom storage
 /// semantics) can call or override it directly.
 impl<T> crate::value::ToValue<Handle<T>> for Blob<T>
 where
-    T: BlobSchema,
-    Handle<T>: InlineSchema,
+    T: BlobEncoding,
+    Handle<T>: InlineEncoding,
 {
     fn to_value(self) -> crate::value::Value<Handle<T>> {
-        <T as BlobSchema>::to_value(self)
+        <T as BlobEncoding>::to_value(self)
     }
 }
 
 /// Precomputed-handle case: a `Inline<Handle<T>>` can be passed as a
-/// `IntoEncoded<T>` source (T is the BlobSchema, matching the
+/// `IntoEncoded<T>` source (T is the BlobEncoding, matching the
 /// `Handle<T>`-attributed field's `Encoding`). Output is the value
 /// itself; no side-blob — caller asserts the bytes live somewhere
 /// resolvable.
-impl<T: BlobSchema> crate::value::Encodes<Inline<Handle<T>>> for T
+impl<T: BlobEncoding> crate::value::Encodes<Inline<Handle<T>>> for T
 where
-    Handle<T>: InlineSchema,
+    Handle<T>: InlineEncoding,
 {
     type Output = Inline<Handle<T>>;
     fn encode(source: Inline<Handle<T>>) -> Inline<Handle<T>> {
@@ -351,9 +351,9 @@ where
 }
 
 /// Reference form of the precomputed-handle case.
-impl<T: BlobSchema> crate::value::Encodes<&Inline<Handle<T>>> for T
+impl<T: BlobEncoding> crate::value::Encodes<&Inline<Handle<T>>> for T
 where
-    Handle<T>: InlineSchema,
+    Handle<T>: InlineEncoding,
 {
     type Output = Inline<Handle<T>>;
     fn encode(source: &Inline<Handle<T>>) -> Inline<Handle<T>> {
@@ -364,8 +364,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::schemas::UnknownBlob;
-    use crate::value::schemas::hash::Blake3;
+    use crate::blob::encodings::UnknownBlob;
+    use crate::value::encodings::hash::Blake3;
 
     #[test]
     fn new_computes_and_caches_handle() {
@@ -409,8 +409,8 @@ mod tests {
         let h_before: Inline<Handle<UnknownBlob>> = b.get_handle();
         // Schema cast — handle bytes stay identical, only the phantom
         // changes.
-        let b2: Blob<crate::blob::schemas::longstring::LongString> =
-            b.transmute::<crate::blob::schemas::longstring::LongString>();
+        let b2: Blob<crate::blob::encodings::longstring::LongString> =
+            b.transmute::<crate::blob::encodings::longstring::LongString>();
         let h_after = b2.get_handle();
         assert_eq!(h_before.raw, h_after.raw);
     }

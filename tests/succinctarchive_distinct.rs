@@ -1,6 +1,6 @@
-use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
-use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
-use triblespace::core::value::schemas::UnknownInline;
+use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
+use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+use triblespace::core::value::encodings::UnknownInline;
 use triblespace::prelude::*;
 
 #[test]

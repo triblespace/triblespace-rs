@@ -53,7 +53,7 @@ These topics are less urgent but still deserve coverage so that readers can
 reuse advanced building blocks without digging through source code.
 
 ### Succinct archive indexes
-`blob::schemas::succinctarchive::SuccinctArchive` converts a `TribleSet` into
+`blob::encodings::succinctarchive::SuccinctArchive` converts a `TribleSet` into
 compressed wavelet matrices, exposes helpers such as `distinct_in` and
 `enumerate_in`, implements `TriblePattern`, and serialises via ordered,
 compressed or cached `Universe` implementations. A dedicated section should walk

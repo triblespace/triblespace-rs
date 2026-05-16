@@ -78,8 +78,8 @@ mod readme_example {
     use rand::rngs::OsRng;
 
     mod literature {
-        use crate::prelude::blobschemas::LongString;
-        use crate::prelude::inlineschemas::{GenId, Handle, ShortString, R256};
+        use crate::prelude::blobencodings::LongString;
+        use crate::prelude::inlineencodings::{GenId, Handle, ShortString, R256};
         use crate::prelude::*;
 
         attributes! {

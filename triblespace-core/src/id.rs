@@ -37,7 +37,7 @@ pub use ufoid::ufoid;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::prelude::inlineschemas::GenId;
+use crate::prelude::inlineencodings::GenId;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
@@ -491,7 +491,7 @@ impl IdOwner {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::ShortString;
+    /// use inlineencodings::ShortString;
     /// use triblespace_core::id_hex;
     ///
     /// let mut owner = IdOwner::new();
@@ -662,8 +662,8 @@ mod tests {
     use crate::prelude::*;
     use crate::query::Query;
     use crate::query::VariableContext;
-    use crate::value::schemas::genid::GenId;
-    use crate::value::schemas::shortstring::ShortString;
+    use crate::value::encodings::genid::GenId;
+    use crate::value::encodings::shortstring::ShortString;
 
     #[test]
     fn id_formatting() {

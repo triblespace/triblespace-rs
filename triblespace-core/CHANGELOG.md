@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The canonical-attribute-id + bounded-path-estimation release.
 See the workspace [`../CHANGELOG.md`](../CHANGELOG.md) for the
 full release notes on dynamic-name attribute id derivation,
-the IRI BlobSchema, `metadata::iri`, `Attribute::from_iri`, the
+the IRI BlobEncoding, `metadata::iri`, `Attribute::from_iri`, the
 `MemoryBlobStore::union` structural merge, and the `Workspace`
 `local_blobs → staged` rename.
 

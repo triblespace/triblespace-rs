@@ -9,15 +9,15 @@
 
 use tracing::debug;
 
-use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::time::NsTAIInterval;
+use triblespace_core::value::encodings::time::NsTAIInterval;
 use triblespace_core::value::Inline;
-use triblespace_core::value::schemas::hash::Handle;
-use triblespace_core::prelude::inlineschemas::{GenId, ED25519PublicKey};
+use triblespace_core::value::encodings::hash::Handle;
+use triblespace_core::prelude::inlineencodings::{GenId, ED25519PublicKey};
 use triblespace_core::prelude::attributes;
 use triblespace_core::macros::{find, pattern, entity};
 
@@ -468,7 +468,7 @@ mod tests {
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
         use triblespace_core::repo::branch::branch_unsigned;
         use triblespace_core::blob::IntoBlob;
-        use triblespace_core::blob::schemas::longstring::LongString;
+        use triblespace_core::blob::encodings::longstring::LongString;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();
         let remote_branch_id = genid();

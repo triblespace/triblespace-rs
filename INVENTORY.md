@@ -35,7 +35,7 @@
   have to compute them manually.
 - Add an exporter for the lossless JSON schema so archived JSON can be
   reconstructed (including field ordering).
-- Add a diagnosis tool that reports attributes missing `name`, `value_schema`,
+- Add a diagnosis tool that reports attributes missing `name`, `value_encoding`,
   or `value_formatter` metadata so strict renderers can explain omissions.
 - Explore replacing `CommitSelector` ranges with a set-based API
   built on commit reachability. The goal is to mirror git's revision

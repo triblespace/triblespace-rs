@@ -4,7 +4,7 @@
 //! schema marker. The fragment's `root()` IS the attribute id; its
 //! facts are the identity-determining data (e.g.
 //! `metadata::iri: <handle>` or `metadata::name: <handle>` together
-//! with `metadata::value_schema: <schema id>`). The attribute is the
+//! with `metadata::value_encoding: <schema id>`). The attribute is the
 //! *abstract shared thing* multiple parties agree on; codebase-local
 //! annotations (the rust identifier, source location, doc comment)
 //! are emitted at the [`attributes!`] call site as usage facts —
@@ -16,13 +16,13 @@
 //! // Display-name origin (JSON fields, config keys, column headers):
 //! Attribute::<S>::from(entity! {
 //!     metadata::name:         name.to_blob().get_handle(),
-//!     metadata::value_schema: <S as MetaDescribe>::id(),
+//!     metadata::value_encoding: <S as MetaDescribe>::id(),
 //! })
 //!
 //! // RDF / JSON-LD predicate (IRI as canonical identifier):
 //! Attribute::<S>::from(entity! {
 //!     metadata::iri:          iri.to_blob().get_handle(),
-//!     metadata::value_schema: <S as MetaDescribe>::id(),
+//!     metadata::value_encoding: <S as MetaDescribe>::id(),
 //! })
 //!
 //! // Explicit hex id (pinned attribute namespace):
@@ -31,21 +31,21 @@
 
 use crate::id::RawId;
 use crate::trible::Fragment;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use core::marker::PhantomData;
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
 /// marker.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Attribute<S: InlineSchema> {
+pub struct Attribute<S: InlineEncoding> {
     fragment: Fragment,
     _schema: PhantomData<S>,
 }
 
-impl<S: InlineSchema> Clone for Attribute<S> {
+impl<S: InlineEncoding> Clone for Attribute<S> {
     // Manual impl: `PhantomData<S>` doesn't require `S: Clone`, but
-    // `#[derive(Clone)]` over a `S: InlineSchema` bound conservatively
+    // `#[derive(Clone)]` over a `S: InlineEncoding` bound conservatively
     // adds that constraint. Implementing by hand lets callers clone
     // `Attribute<Boolean>` etc. without needing `Boolean: Clone`.
     fn clone(&self) -> Self {
@@ -56,7 +56,7 @@ impl<S: InlineSchema> Clone for Attribute<S> {
     }
 }
 
-impl<S: InlineSchema> Attribute<S> {
+impl<S: InlineEncoding> Attribute<S> {
     /// The attribute's id, equal to the wrapped fragment's root.
     pub fn id(&self) -> crate::id::Id {
         self.fragment
@@ -86,8 +86,8 @@ impl<S: InlineSchema> Attribute<S> {
     /// `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoEncoded`], parameterised by the schema's
-    /// [`Encoding`](crate::value::InlineSchema::Encoding) — `S`
-    /// itself for inline schemas, the inner `BlobSchema` for
+    /// [`Encoding`](crate::value::InlineEncoding::Encoding) — `S`
+    /// itself for inline schemas, the inner `BlobEncoding` for
     /// `Handle<T>`. The resulting `Output` is lifted into a [`Value`]
     /// via [`ToValue`].
     ///
@@ -97,9 +97,9 @@ impl<S: InlineSchema> Attribute<S> {
     /// [`Value<S>`]: crate::value::Value
     pub fn value_from<V>(&self, v: V) -> crate::value::Value<S>
     where
-        V: crate::value::IntoEncoded<<S as crate::value::InlineSchema>::Encoding>,
+        V: crate::value::IntoEncoded<<S as crate::value::InlineEncoding>::Encoding>,
         <V as crate::value::IntoEncoded<
-            <S as crate::value::InlineSchema>::Encoding,
+            <S as crate::value::InlineEncoding>::Encoding,
         >>::Output: crate::value::ToValue<S>,
     {
         use crate::value::ToValue;
@@ -123,14 +123,14 @@ impl<S: InlineSchema> Attribute<S> {
 ///
 /// The fragment's `root()` is the attribute id; its facts (typically
 /// `metadata::iri | metadata::name` together with
-/// `metadata::value_schema`) are carried through to [`Describe`] so the
+/// `metadata::value_encoding`) are carried through to [`Describe`] so the
 /// attribute remains queryable in the metadata registry by its
 /// originating identity attribute.
 ///
 /// Pinning a schema's attribute ids (so local renames don't churn the
 /// schema) is what the [`attributes!`] macro is for — declare them with
 /// explicit hex literals there.
-impl<S: InlineSchema> From<Fragment> for Attribute<S> {
+impl<S: InlineEncoding> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
         fragment
             .root()
@@ -144,12 +144,12 @@ impl<S: InlineSchema> From<Fragment> for Attribute<S> {
 
 impl<S> crate::metadata::Describe for Attribute<S>
 where
-    S: InlineSchema,
+    S: InlineEncoding,
 {
     fn describe(&self) -> Fragment {
         // An attribute IS its identity fragment. The wrapped fragment
         // already carries `metadata::iri` / `metadata::name` and
-        // `metadata::value_schema: S::id()` from construction —
+        // `metadata::value_encoding: S::id()` from construction —
         // exactly the facts a registry queries on. The schema's own
         // facts (the human-readable name, description, hash protocol,
         // …) belong to the schema, not the attribute; consumers
@@ -165,13 +165,13 @@ pub use crate::id::RawId as RawIdAlias;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::schemas::longstring::LongString;
+    use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
-    use crate::value::schemas::hash::Handle;
-    use crate::value::schemas::shortstring::ShortString;
+    use crate::value::encodings::hash::Handle;
+    use crate::value::encodings::shortstring::ShortString;
     use crate::value::Inline;
 
     #[test]
@@ -180,11 +180,11 @@ mod tests {
         let h2 = "title".to_blob().get_handle();
         let a1 = Attribute::<ShortString>::from(entity! {
             metadata::name:         h1,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
         let a2 = Attribute::<ShortString>::from(entity! {
             metadata::name:         h2,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
 
         assert_eq!(a1.raw(), a2.raw());
@@ -197,11 +197,11 @@ mod tests {
         let h_author = "author".to_blob().get_handle();
         let title = Attribute::<ShortString>::from(entity! {
             metadata::name:         h_title,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
         let author = Attribute::<ShortString>::from(entity! {
             metadata::name:         h_author,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
 
         assert_ne!(title.raw(), author.raw());
@@ -212,11 +212,11 @@ mod tests {
         let h = "title".to_blob().get_handle();
         let short = Attribute::<ShortString>::from(entity! {
             metadata::name:         h,
-            metadata::value_schema: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
         let handle = Attribute::<Handle<LongString>>::from(entity! {
             metadata::name:         h,
-            metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
+            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
         });
 
         assert_ne!(short.raw(), handle.raw());
@@ -228,7 +228,7 @@ mod tests {
         let iri_handle: Inline<Handle<LongString>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
-            metadata::value_schema: <ShortString as crate::metadata::MetaDescribe>::id(),
+            metadata::value_encoding: <ShortString as crate::metadata::MetaDescribe>::id(),
         });
         let attr_id = attr.id();
 

@@ -12,14 +12,14 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::blob::schemas::longstring::LongString;
+use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::id::{fucid, ExclusiveId};
 use triblespace::core::macros::{attributes, entity};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{Repository, RollupError};
-use triblespace::core::value::schemas::hash::Handle;
+use triblespace::core::value::encodings::hash::Handle;
 use triblespace::core::value::Inline;
-use triblespace::prelude::inlineschemas::GenId;
+use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::TribleSet;
 
 attributes! {

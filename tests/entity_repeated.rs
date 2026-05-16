@@ -8,17 +8,17 @@ fn entity_id(set: &TribleSet) -> triblespace::core::id::Id {
 #[test]
 fn entity_repeated_order_and_duplicates_are_ignored() {
     let tags_ab = entity! { _ @
-        metadata::tag*: [metadata::KIND_MULTI, metadata::KIND_VALUE_SCHEMA],
+        metadata::tag*: [metadata::KIND_MULTI, metadata::KIND_INLINE_ENCODING],
     };
 
     let tags_ba = entity! { _ @
-        metadata::tag*: [metadata::KIND_VALUE_SCHEMA, metadata::KIND_MULTI],
+        metadata::tag*: [metadata::KIND_INLINE_ENCODING, metadata::KIND_MULTI],
     };
 
     let tags_dup = entity! { _ @
         metadata::tag*: [
             metadata::KIND_MULTI,
-            metadata::KIND_VALUE_SCHEMA,
+            metadata::KIND_INLINE_ENCODING,
             metadata::KIND_MULTI,
         ],
     };
@@ -53,7 +53,7 @@ fn entity_repeated_affects_id_and_insertions() {
     };
 
     let with_tags = entity! { _ @
-        metadata::tag*: [metadata::KIND_MULTI, metadata::KIND_VALUE_SCHEMA],
+        metadata::tag*: [metadata::KIND_MULTI, metadata::KIND_INLINE_ENCODING],
     };
 
     assert_ne!(entity_id(&base), entity_id(&with_tags));

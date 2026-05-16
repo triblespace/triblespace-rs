@@ -3,14 +3,14 @@ use ed25519_dalek::SigningKey;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use tempfile::tempdir;
-use triblespace::prelude::blobschemas::SimpleArchive;
+use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
 use triblespace_core::id::id_hex;
 use triblespace_core::metadata;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 
 fn random_signing_key() -> SigningKey {
@@ -41,7 +41,7 @@ fn consolidate_merges_branch_heads() {
             let mut ws = repo.pull(*branch_id).expect("pull");
             let e = ufoid();
             let mut content = TribleSet::new();
-            let label = ws.put::<blobschemas::LongString, _>(format!("branch-{i}"));
+            let label = ws.put::<blobencodings::LongString, _>(format!("branch-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("commit-{i}"));
 
@@ -50,7 +50,7 @@ fn consolidate_merges_branch_heads() {
             assert!(res.is_none(), "unexpected push conflict");
 
             let head = ws.head().expect("head present");
-            let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                 Handle::to_hash(head);
             original_heads.push(hh.from_inline());
         }
@@ -131,7 +131,7 @@ fn consolidate_merges_branch_heads() {
     for t in commit_meta.iter() {
         if t.a() == &repo_parent_attr {
             let p = *t.v::<Handle<SimpleArchive>>();
-            let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                 Handle::to_hash(p);
             parents.insert(hh.from_inline());
         }
@@ -180,12 +180,12 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_a).expect("pull alpha-A");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobschemas::LongString, _>("alpha-A-data".to_string());
+        let label = ws.put::<blobencodings::LongString, _>("alpha-A-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-A commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_a = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
             Handle::to_hash(head_a);
         alpha_heads.push(hh.from_inline());
 
@@ -201,12 +201,12 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_b).expect("pull alpha-B");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobschemas::LongString, _>("alpha-B-data".to_string());
+        let label = ws.put::<blobencodings::LongString, _>("alpha-B-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "alpha-B commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_b = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
             Handle::to_hash(head_b);
         alpha_heads.push(hh.from_inline());
 
@@ -215,12 +215,12 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut ws = repo.pull(*bid_c).expect("pull beta");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobschemas::LongString, _>("beta-data".to_string());
+        let label = ws.put::<blobencodings::LongString, _>("beta-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "beta commit");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
         let head_c = ws.head().expect("head");
-        let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
             Handle::to_hash(head_c);
         beta_head = hh.from_inline();
 
@@ -301,7 +301,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
         let mut branch_name = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobschemas::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     branch_name = Some(view.as_ref().to_string());
                 }
@@ -331,7 +331,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
                 for t in commit_meta.iter() {
                     if t.a() == &repo_parent_attr {
                         let p = *t.v::<Handle<SimpleArchive>>();
-                        let hash: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+                        let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                             Handle::to_hash(p);
                         parents.insert(hash.from_inline());
                     }
@@ -361,7 +361,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
             }
         }
         if let Some(hh) = head_handle {
-            let hash: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+            let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                 Handle::to_hash(hh);
             if hash.from_inline::<String>() == beta_head {
                 found_beta_direct = true;
@@ -403,7 +403,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         let mut ws_a = repo.pull(*bid_a).expect("pull gamma-A");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws_a.put::<blobschemas::LongString, _>("gamma-A".to_string());
+        let label = ws_a.put::<blobencodings::LongString, _>("gamma-A".to_string());
         content += entity! { &e @ metadata::name: label };
         ws_a.commit(content, "gamma-A commit");
         assert!(repo.try_push(&mut ws_a).expect("push").is_none());
@@ -423,12 +423,12 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         ws_b.merge_commit(head_a).expect("merge C1 into B");
         let e2 = ufoid();
         let mut content2 = TribleSet::new();
-        let label2 = ws_b.put::<blobschemas::LongString, _>("gamma-B".to_string());
+        let label2 = ws_b.put::<blobencodings::LongString, _>("gamma-B".to_string());
         content2 += entity! { &e2 @ metadata::name: label2 };
         ws_b.commit(content2, "gamma-B commit");
         assert!(repo.try_push(&mut ws_b).expect("push").is_none());
         let head_b = ws_b.head().expect("head");
-        let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+        let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
             Handle::to_hash(head_b);
         descendant_head = hh.from_inline();
 
@@ -490,7 +490,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobschemas::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "gamma" {
                         is_gamma = true;
@@ -503,7 +503,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         }
         if is_gamma {
             if let Some(hh) = head_handle {
-                let hash: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+                let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                     Handle::to_hash(hh);
                 let hex: String = hash.from_inline();
                 // The active branch should still point to the descendant head.
@@ -543,12 +543,12 @@ fn consolidate_by_name_merges_active_same_name_branches() {
             let mut ws = repo.pull(*bid).expect("pull");
             let e = ufoid();
             let mut content = TribleSet::new();
-            let label = ws.put::<blobschemas::LongString, _>(format!("delta-{i}"));
+            let label = ws.put::<blobencodings::LongString, _>(format!("delta-{i}"));
             content += entity! { &e @ metadata::name: label };
             ws.commit(content, &format!("delta-{i}"));
             assert!(repo.try_push(&mut ws).expect("push").is_none());
             let head = ws.head().expect("head");
-            let hh: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+            let hh: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                 Handle::to_hash(head);
             delta_heads.push(hh.from_inline());
         }
@@ -560,7 +560,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let mut ws = repo.pull(*bid).expect("pull");
         let e = ufoid();
         let mut content = TribleSet::new();
-        let label = ws.put::<blobschemas::LongString, _>("epsilon-data".to_string());
+        let label = ws.put::<blobencodings::LongString, _>("epsilon-data".to_string());
         content += entity! { &e @ metadata::name: label };
         ws.commit(content, "epsilon");
         assert!(repo.try_push(&mut ws).expect("push").is_none());
@@ -621,7 +621,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
         let mut head_handle = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
-                let h: Inline<Handle<blobschemas::LongString>> = *t.v();
+                let h: Inline<Handle<blobencodings::LongString>> = *t.v();
                 if let Ok(view) = reader.get::<View<str>, _>(h) {
                     if view.as_ref() == "delta" {
                         is_delta = true;
@@ -639,7 +639,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
                     for t in commit_meta.iter() {
                         if t.a() == &repo_parent_attr {
                             let p = *t.v::<Handle<SimpleArchive>>();
-                            let hash: Inline<triblespace_core::value::schemas::hash::Hash<triblespace_core::value::schemas::hash::Blake3>> =
+                            let hash: Inline<triblespace_core::value::encodings::hash::Hash<triblespace_core::value::encodings::hash::Blake3>> =
                                 Handle::to_hash(p);
                             parents.insert(hash.from_inline());
                         }

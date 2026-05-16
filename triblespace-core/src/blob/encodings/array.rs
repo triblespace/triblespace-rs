@@ -12,7 +12,7 @@ use anybytes::view::ViewError;
 use anybytes::{Bytes, View};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-use crate::blob::{Blob, BlobSchema, TryFromBlob};
+use crate::blob::{Blob, BlobEncoding, TryFromBlob};
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -22,7 +22,7 @@ use crate::trible::Fragment;
 ///
 /// Implement this for zero-sized marker types (e.g. `F32`, `BF16`, `I8`)
 /// that identify an element format. `Native` provides the actual data
-/// type for zerocopy access; `MetaDescribe` (super-trait via `BlobSchema`
+/// type for zerocopy access; `MetaDescribe` (super-trait via `BlobEncoding`
 /// downstream) provides schema identity.
 pub trait ArrayElement: MetaDescribe + 'static {
     /// The native Rust type for this element.
@@ -32,14 +32,14 @@ pub trait ArrayElement: MetaDescribe + 'static {
 /// A flat array of `T` values in native byte order.
 ///
 /// The blob schema ID is *derived* from describing the schema — including
-/// `T::id()` as `metadata::blob_schema` — so `Array<u8>` and `Array<f32>`
+/// `T::id()` as `metadata::blob_encoding` — so `Array<u8>` and `Array<f32>`
 /// get distinct ids without needing compile-time hashing.
 ///
 /// Shape metadata lives in TribleSpace triples, not in the blob.
 /// Use `View<[T::Native]>` for zero-copy access via `TryFromBlob`.
 pub struct Array<T: ArrayElement>(PhantomData<T>);
 
-impl<T: ArrayElement> BlobSchema for Array<T> {}
+impl<T: ArrayElement> BlobEncoding for Array<T> {}
 
 impl<T: ArrayElement> MetaDescribe for Array<T> {
     fn describe() -> Fragment {
@@ -47,13 +47,13 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
         // root becomes the value of `metadata::array_item_schema`,
         // its facts and blobs fold in automatically. The element
         // schema discriminates `Array<u8>` from `Array<f32>` etc.;
-        // element schemas aren't themselves `BlobSchema`s, so they
-        // get their own attribute (not `metadata::blob_schema`).
+        // element schemas aren't themselves `BlobEncoding`s, so they
+        // get their own attribute (not `metadata::blob_encoding`).
         // `annotated` layers the human-facing annotations under the
         // derived root.
         let mut core = entity! {
             metadata::array_item_schema*: T::describe(),
-            metadata::tag: metadata::KIND_BLOB_SCHEMA,
+            metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         let name = core.put("array");
         let description = core.put(
@@ -72,7 +72,7 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
 /// Store a `Vec<T::Native>` as an `Array<T>` blob (zero-copy via ByteSource).
 impl<T: ArrayElement> crate::value::Encodes<Vec<T::Native>> for Array<T>
 where
-    crate::value::schemas::hash::Handle<Array<T>>: crate::value::InlineSchema,
+    crate::value::encodings::hash::Handle<Array<T>>: crate::value::InlineEncoding,
 {
     type Output = Blob<Array<T>>;
     fn encode(source: Vec<T::Native>) -> Blob<Array<T>> {
@@ -90,7 +90,7 @@ impl<T: ArrayElement> TryFromBlob<Array<T>> for Bytes {
 
 /// Built-in element types for common native Rust types.
 ///
-/// Access as `blobschemas::array::F32`, `blobschemas::array::U8`, etc.
+/// Access as `blobencodings::array::F32`, `blobencodings::array::U8`, etc.
 pub mod elements {
     use super::ArrayElement;
     use crate::macros::entity;

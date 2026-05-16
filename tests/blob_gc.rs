@@ -1,7 +1,7 @@
 use anybytes::Bytes;
 use std::collections::HashSet;
 
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::{Blob, MemoryBlobStore};
 use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::{reachable, transfer, BlobStoreGet};

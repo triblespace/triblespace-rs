@@ -354,8 +354,8 @@ Parenthesised expressions remain supported for explicit literals.
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineschemas::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineschemas::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -376,8 +376,8 @@ scoped to the pattern:
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineschemas::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineschemas::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -403,8 +403,8 @@ To share a hidden binding across multiple patterns, declare it once with
 # mod social {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineschemas::ShortString;
-#         "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineschemas::GenId;
+#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::ShortString;
+#         "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineencodings::GenId;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -458,7 +458,7 @@ into a [`TribleSet`](triblespace::core::trible::TribleSet).
 use std::collections::HashSet;
 
 use triblespace::prelude::*;
-use triblespace::prelude::inlineschemas::ShortString;
+use triblespace::prelude::inlineencodings::ShortString;
 use triblespace::core::query::hashsetconstraint::SetConstraint;
 
 struct ExternalTags<'a> {
@@ -517,7 +517,7 @@ use triblespace::prelude::*;
 
 mod social {
   use triblespace::prelude::*;
-  use triblespace::prelude::inlineschemas::*;
+  use triblespace::prelude::inlineencodings::*;
   attributes! {
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: GenId;
     "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: GenId;
@@ -535,7 +535,7 @@ let results: Vec<_> = find!((s: Inline<_>, e: Inline<_>),
 You can omit the hex literal in `attributes!` when you only need local or
 short‑lived attributes—the macro then derives a deterministic id from the name
 and schema via the entity-core mechanism (equivalent to
-`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_schema: <S as MetaDescribe>::id() })`).
+`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })`).
 Stick with explicit ids when the attributes form part of a shared protocol.
 
 The middle section uses a familiar regex syntax to describe allowed edge

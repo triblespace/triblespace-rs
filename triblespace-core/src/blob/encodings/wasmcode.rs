@@ -2,7 +2,7 @@ use crate::value::Encodes;
 use anybytes::Bytes;
 
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -18,7 +18,7 @@ use crate::trible::TribleSet;
 /// (see `metadata::value_formatter`).
 pub struct WasmCode;
 
-impl BlobSchema for WasmCode {}
+impl BlobEncoding for WasmCode {}
 
 impl MetaDescribe for WasmCode {
     fn describe() -> Fragment {
@@ -32,14 +32,14 @@ impl MetaDescribe for WasmCode {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         tribles
     }
 }
 
 impl Encodes<Bytes> for WasmCode
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: Bytes) -> Blob<WasmCode> {
@@ -48,7 +48,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 }
 
 impl Encodes<Vec<u8>> for WasmCode
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: Vec<u8>) -> Blob<WasmCode> {
@@ -57,7 +57,7 @@ where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
 }
 
 impl Encodes<&[u8]> for WasmCode
-where crate::value::schemas::hash::Handle<WasmCode>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<WasmCode>: crate::value::InlineEncoding,
 {
     type Output = Blob<WasmCode>;
     fn encode(source: &[u8]) -> Blob<WasmCode> {

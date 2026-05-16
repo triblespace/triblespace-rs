@@ -9,7 +9,7 @@ use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::TryFromInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -51,7 +51,7 @@ impl MetaDescribe for R256LE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -64,7 +64,7 @@ impl MetaDescribe for R256LE {
         tribles
     }
 }
-impl InlineSchema for R256LE {
+impl InlineEncoding for R256LE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -80,7 +80,7 @@ impl MetaDescribe for R256BE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -140,7 +140,7 @@ mod wasm_formatter {
         Ok(())
     }
 }
-impl InlineSchema for R256BE {
+impl InlineEncoding for R256BE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

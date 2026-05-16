@@ -38,7 +38,7 @@ fn workspace_checkout_empty_branch_returns_empty_set() {
 
 #[test]
 fn workspace_checkout_unions_commits() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -75,7 +75,7 @@ fn workspace_checkout_unions_commits() {
 
 #[test]
 fn workspace_checkout_single_commit() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -99,7 +99,7 @@ fn workspace_checkout_single_commit() {
 
 #[test]
 fn workspace_checkout_vec_commits() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -132,7 +132,7 @@ fn workspace_checkout_vec_commits() {
 
 #[test]
 fn workspace_checkout_metadata_returns_repo_metadata() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let meta_e = ufoid();
     let meta_a = ufoid();
@@ -160,7 +160,7 @@ fn workspace_checkout_metadata_returns_repo_metadata() {
 
 #[test]
 fn workspace_checkout_with_metadata_returns_both() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let meta_e = ufoid();
     let meta_a = ufoid();
@@ -194,7 +194,7 @@ fn workspace_checkout_with_metadata_returns_both() {
 
 #[test]
 fn workspace_commit_uses_repo_metadata() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let meta_e = ufoid();
     let meta_a = ufoid();
@@ -228,7 +228,7 @@ fn workspace_commit_uses_repo_metadata() {
 
 #[test]
 fn workspace_checkout_range_variants() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -268,11 +268,11 @@ fn workspace_checkout_range_variants() {
 fn workspace_checkout_range_stops_at_explicit_boundaries() {
     use std::iter;
 
-    use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::Blob;
     use triblespace::core::repo::commit::commit_metadata;
-    use triblespace::core::value::schemas::hash::Handle;
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::hash::Handle;
+    use triblespace::core::value::encodings::r256::R256;
     use triblespace::core::value::Inline;
 
     type CommitHandle = Inline<Handle<SimpleArchive>>;
@@ -341,7 +341,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
 
 #[test]
 fn workspace_checkout_symmetric_diff() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -371,7 +371,7 @@ fn workspace_checkout_symmetric_diff() {
 
 #[test]
 fn workspace_checkout_set_operation_selectors() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -416,7 +416,7 @@ fn workspace_checkout_set_operation_selectors() {
 
 #[test]
 fn workspace_get_local_and_base() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -446,7 +446,7 @@ fn workspace_get_local_and_base() {
 
 #[test]
 fn workspace_checkout_head_collects_history() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -477,7 +477,7 @@ fn workspace_checkout_head_collects_history() {
 
 #[test]
 fn workspace_nth_ancestor_selector() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -511,7 +511,7 @@ fn workspace_nth_ancestor_selector() {
 
 #[test]
 fn workspace_parents_selector() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
@@ -564,7 +564,7 @@ fn workspace_parents_selector() {
 
 #[test]
 fn workspace_history_of_entity() {
-    use triblespace::core::value::schemas::r256::R256;
+    use triblespace::core::value::encodings::r256::R256;
 
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();

@@ -1,14 +1,14 @@
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::id::Id;
-use crate::prelude::blobschemas::SimpleArchive;
+use crate::prelude::blobencodings::SimpleArchive;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::BranchStore;
 use crate::repo::PushResult;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 /// Store that delegates blob and branch operations to two independent stores.
 ///
@@ -37,9 +37,9 @@ where
 
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         self.blobs.put(item)
     }

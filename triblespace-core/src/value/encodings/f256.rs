@@ -11,7 +11,7 @@ use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -39,7 +39,7 @@ impl MetaDescribe for F256LE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -52,7 +52,7 @@ impl MetaDescribe for F256LE {
         tribles
     }
 }
-impl InlineSchema for F256LE {
+impl InlineEncoding for F256LE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -68,7 +68,7 @@ impl MetaDescribe for F256BE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -81,7 +81,7 @@ impl MetaDescribe for F256BE {
         tribles
     }
 }
-impl InlineSchema for F256BE {
+impl InlineEncoding for F256BE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

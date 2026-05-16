@@ -26,7 +26,7 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::query::temp;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 use triblespace_core::macros::{entity, pattern};
 use triblespace_core::macros::attributes;

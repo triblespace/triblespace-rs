@@ -2,10 +2,10 @@ use anybytes::Bytes;
 use proptest::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::repo::PushResult;
-use triblespace::prelude::blobschemas::SimpleArchive;
-use triblespace::prelude::inlineschemas::Handle;
+use triblespace::prelude::blobencodings::SimpleArchive;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
 #[derive(Debug, Clone)]

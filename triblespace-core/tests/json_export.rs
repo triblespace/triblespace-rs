@@ -1,6 +1,6 @@
 use anybytes::Bytes;
 use serde_json::json;
-use triblespace_core::blob::schemas::longstring::LongString;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::export::json::export_to_json;

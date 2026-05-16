@@ -41,8 +41,8 @@ use triblespace::prelude::*;
 
 mod literature {
     use triblespace::prelude::*;
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::inlineschemas::{Blake3, GenId, Handle, R256, ShortString};
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
 
     attributes! {
         /// The title of a work.
@@ -77,7 +77,7 @@ mod literature {
 // can omit the hex literal and `attributes!` will derive a deterministic id
 // from the attribute name and schema via the entity-core mechanism —
 // `Attribute::<S>::from(entity!{ metadata::name: <name handle>,
-// metadata::value_schema: <S as MetaDescribe>::id() })`.
+// metadata::value_encoding: <S as MetaDescribe>::id() })`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory

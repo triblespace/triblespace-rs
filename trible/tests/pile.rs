@@ -78,7 +78,7 @@ fn delete_branch_removes_branch_id_from_list() {
 
 #[test]
 fn branch_stats_reports_fast_and_full_counts() {
-    use triblespace::prelude::blobschemas::LongString;
+    use triblespace::prelude::blobencodings::LongString;
     use triblespace::prelude::*;
 
     let dir = tempdir().unwrap();
@@ -391,13 +391,13 @@ fn diagnose_reports_invalid_hash() {
 fn inspect_outputs_tribles() {
     use triblespace::prelude::*;
     use triblespace_core::examples;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::encodings::hash::Handle;
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("inspect.pile");
     std::fs::File::create(&pile_path).unwrap();
 
-    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::{Blob, IntoBlob};
     let dataset = examples::dataset();
     let blob: Blob<SimpleArchive> = dataset.to_blob();

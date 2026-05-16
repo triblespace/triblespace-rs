@@ -4,7 +4,7 @@
 //!
 //! ```
 //! # use triblespace_core::prelude::*;
-//! # use triblespace_core::prelude::inlineschemas::ShortString;
+//! # use triblespace_core::prelude::inlineencodings::ShortString;
 //! let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 //! ```
 //!
@@ -49,10 +49,10 @@ use constantconstraint::*;
 /// Re-export of [`IgnoreConstraint`].
 pub use ignore::IgnoreConstraint;
 
-use crate::value::schemas::genid::GenId;
+use crate::value::encodings::genid::GenId;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -77,11 +77,11 @@ pub trait TriblePattern {
     /// Create a constraint for a given trible pattern.
     /// The method takes three variables, one for each part of the trible.
     /// The schemas of the entities and attributes are always [GenId], while the value
-    /// schema can be any type implementing [InlineSchema] and is specified as a type parameter.
+    /// schema can be any type implementing [InlineEncoding] and is specified as a type parameter.
     ///
     /// This method is usually not called directly, but rather through typed query language
     /// macros like [pattern!][crate::macros::pattern].
-    fn pattern<'a, V: InlineSchema>(
+    fn pattern<'a, V: InlineEncoding>(
         &'a self,
         e: Variable<GenId>,
         a: Variable<GenId>,
@@ -121,7 +121,7 @@ impl VariableContext {
     ///
     /// This method is usually not called directly, but rather through typed query language
     /// macros like [find!][crate::query].
-    pub fn next_variable<T: InlineSchema>(&mut self) -> Variable<T> {
+    pub fn next_variable<T: InlineEncoding>(&mut self) -> Variable<T> {
         assert!(
             self.next_index < 128,
             "currently queries support at most 128 variables"
@@ -138,21 +138,21 @@ impl VariableContext {
 /// Variables also have an associated type which is used to parse the [Inline]s
 /// found by the query engine.
 #[derive(Debug)]
-pub struct Variable<T: InlineSchema> {
+pub struct Variable<T: InlineEncoding> {
     /// The integer index identifying this variable in the [`Binding`].
     pub index: VariableId,
     typed: PhantomData<T>,
 }
 
-impl<T: InlineSchema> Copy for Variable<T> {}
+impl<T: InlineEncoding> Copy for Variable<T> {}
 
-impl<T: InlineSchema> Clone for Variable<T> {
+impl<T: InlineEncoding> Clone for Variable<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: InlineSchema> Variable<T> {
+impl<T: InlineEncoding> Variable<T> {
     /// Creates a variable with the given index.
     pub fn new(index: VariableId) -> Self {
         Variable {
@@ -180,7 +180,7 @@ impl<T: InlineSchema> Variable<T> {
 /// Collections can implement this trait so that they can be used in queries.
 /// The returned constraint will filter the values assigned to the variable
 /// to only those that are contained in the collection.
-pub trait ContainsConstraint<'a, T: InlineSchema> {
+pub trait ContainsConstraint<'a, T: InlineEncoding> {
     /// The concrete constraint type produced by [`has`](ContainsConstraint::has).
     type Constraint: Constraint<'a>;
 
@@ -193,7 +193,7 @@ pub trait ContainsConstraint<'a, T: InlineSchema> {
     fn has(self, v: Variable<T>) -> Self::Constraint;
 }
 
-impl<T: InlineSchema> Variable<T> {
+impl<T: InlineEncoding> Variable<T> {
     /// Create a constraint so that only a specific value can be assigned to the variable.
     pub fn is(self, constant: Inline<T>) -> ConstantConstraint {
         ConstantConstraint::new(self, constant)
@@ -930,7 +930,7 @@ mod parallel {
 ///
 /// ```
 /// # use triblespace_core::prelude::*;
-/// # use triblespace_core::prelude::inlineschemas::ShortString;
+/// # use triblespace_core::prelude::inlineencodings::ShortString;
 /// // Filter semantics — rows where conversion fails are skipped:
 /// let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 /// ```
@@ -1023,10 +1023,10 @@ pub use temp;
 
 #[cfg(test)]
 mod tests {
-    use inlineschemas::ShortString;
+    use inlineencodings::ShortString;
 
     use crate::ignore;
-    use crate::prelude::inlineschemas::*;
+    use crate::prelude::inlineencodings::*;
     use crate::prelude::*;
 
     use crate::examples::literature;
@@ -1045,8 +1045,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "8143F46E812E88C4544E7094080EC523" as loves: inlineschemas::GenId;
-            "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineschemas::ShortString;
+            "8143F46E812E88C4544E7094080EC523" as loves: inlineencodings::GenId;
+            "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineencodings::ShortString;
         }
     }
 
@@ -1054,8 +1054,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineschemas::ShortString;
-            "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineschemas::GenId;
+            "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::ShortString;
+            "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineencodings::GenId;
         }
     }
 

@@ -7,15 +7,15 @@ use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, hint};
-use triblespace::core::blob::schemas::longstring::LongString;
-use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::prelude::{BlobSchema, BlobStore, TribleSet};
+use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::prelude::{BlobEncoding, BlobStore, TribleSet};
 
 const FIXTURE_NAME: &str = "mapping-authorities-gnd-agrovoc_lds.jsonld";
 

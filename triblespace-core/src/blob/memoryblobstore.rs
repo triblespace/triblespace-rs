@@ -1,6 +1,6 @@
-use crate::blob::schemas::UnknownBlob;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::repo::BlobStore;
@@ -8,7 +8,7 @@ use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
 use crate::value::INLINE_LEN;
 
@@ -138,8 +138,8 @@ impl MemoryBlobStore {
     /// (same handle ⇒ same bytes).
     pub fn insert<S>(&mut self, blob: Blob<S>) -> Inline<Handle<S>>
     where
-        S: BlobSchema,
-        Handle<S>: crate::value::InlineSchema,
+        S: BlobEncoding,
+        Handle<S>: crate::value::InlineEncoding,
     {
         let handle: Inline<Handle<S>> = blob.get_handle();
         let unknown_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
@@ -296,7 +296,7 @@ impl BlobStoreGet for MemoryBlobStoreReader {
         handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: BlobSchema,
+        S: BlobEncoding,
         T: TryFromBlob<S>,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
@@ -318,7 +318,7 @@ impl BlobStorePut for MemoryBlobStore {
 
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema,
+        S: BlobEncoding,
         T: IntoBlob<S>,
     {
         let blob = item.to_blob();
@@ -347,8 +347,8 @@ mod tests {
     use fake::locales::EN;
     use fake::Fake;
 
-    use blobschemas::LongString;
-    use inlineschemas::Handle;
+    use blobencodings::LongString;
+    use inlineencodings::Handle;
 
     attributes! {
         "5AD0FAFB1FECBC197A385EC20166899E" as description: Handle<LongString>;

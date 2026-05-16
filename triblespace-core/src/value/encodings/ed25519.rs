@@ -15,7 +15,7 @@ use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::TryFromInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 
 /// A value schema for the R component of an Ed25519 signature.
@@ -39,7 +39,7 @@ impl MetaDescribe for ED25519RComponent {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         #[cfg(feature = "wasm")]
         {
@@ -51,7 +51,7 @@ impl MetaDescribe for ED25519RComponent {
         tribles
     }
 }
-impl InlineSchema for ED25519RComponent {
+impl InlineEncoding for ED25519RComponent {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -67,7 +67,7 @@ impl MetaDescribe for ED25519SComponent {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         #[cfg(feature = "wasm")]
         {
@@ -79,7 +79,7 @@ impl MetaDescribe for ED25519SComponent {
         tribles
     }
 }
-impl InlineSchema for ED25519SComponent {
+impl InlineEncoding for ED25519SComponent {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -95,7 +95,7 @@ impl MetaDescribe for ED25519PublicKey {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         #[cfg(feature = "wasm")]
         {
@@ -107,7 +107,7 @@ impl MetaDescribe for ED25519PublicKey {
         tribles
     }
 }
-impl InlineSchema for ED25519PublicKey {
+impl InlineEncoding for ED25519PublicKey {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

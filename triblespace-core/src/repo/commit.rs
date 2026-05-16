@@ -10,10 +10,10 @@ use itertools::Itertools;
 
 use ed25519::signature::Signer;
 
-use crate::blob::schemas::longstring::LongString;
-use crate::blob::schemas::simplearchive::SimpleArchive;
+use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
-use crate::prelude::inlineschemas::Handle;
+use crate::prelude::inlineencodings::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
 use crate::value::Inline;

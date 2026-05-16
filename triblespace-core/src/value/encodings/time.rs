@@ -11,7 +11,7 @@ use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -42,7 +42,7 @@ impl MetaDescribe for NsTAIInterval {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         tribles
     }
@@ -61,7 +61,7 @@ pub(crate) fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
     (u128::from_be_bytes(bytes) ^ SIGN_BIT) as i128
 }
 
-impl InlineSchema for NsTAIInterval {
+impl InlineEncoding for NsTAIInterval {
     type ValidationError = InvertedIntervalError;
     type Encoding = Self;
 
@@ -220,13 +220,13 @@ impl MetaDescribe for NsDuration {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         tribles
     }
 }
 
-impl InlineSchema for NsDuration {
+impl InlineEncoding for NsDuration {
     type ValidationError = ReservedBitsNonZero;
     type Encoding = Self;
 

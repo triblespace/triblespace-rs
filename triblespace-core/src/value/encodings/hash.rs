@@ -1,4 +1,4 @@
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -11,7 +11,7 @@ use crate::value::RawInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 
 use anybytes::Bytes;
@@ -123,7 +123,7 @@ where
     }
 }
 
-impl<H> InlineSchema for Hash<H>
+impl<H> InlineEncoding for Hash<H>
 where
     H: HashProtocol,
 {
@@ -212,7 +212,7 @@ fn describe_hash<H: HashProtocol>(id: Id) -> Fragment {
     tribles += entity! { ExclusiveId::force_ref(&id) @
         metadata::name: name_handle,
         metadata::description: description,
-        metadata::tag: metadata::KIND_VALUE_SCHEMA,
+        metadata::tag: metadata::KIND_INLINE_ENCODING,
     };
     #[cfg(feature = "wasm")]
     {
@@ -273,12 +273,12 @@ mod wasm_formatter {
 /// [p]: crate::repo::pile::Pile
 /// [bs]: crate::repo::BlobStore
 #[repr(transparent)]
-pub struct Handle<T: BlobSchema> {
+pub struct Handle<T: BlobEncoding> {
     digest: Hash<Blake3>,
     _type: PhantomData<T>,
 }
 
-impl<T: BlobSchema> Handle<T> {
+impl<T: BlobEncoding> Handle<T> {
     /// Wraps a Blake3 hash value as a typed handle.
     pub fn from_hash(hash: Inline<Hash<Blake3>>) -> Inline<Self> {
         hash.transmute()
@@ -290,13 +290,13 @@ impl<T: BlobSchema> Handle<T> {
     }
 }
 
-impl<T: BlobSchema> From<Inline<Hash<Blake3>>> for Inline<Handle<T>> {
+impl<T: BlobEncoding> From<Inline<Hash<Blake3>>> for Inline<Handle<T>> {
     fn from(value: Inline<Hash<Blake3>>) -> Self {
         value.transmute()
     }
 }
 
-impl<T: BlobSchema> From<Inline<Handle<T>>> for Inline<Hash<Blake3>> {
+impl<T: BlobEncoding> From<Inline<Handle<T>>> for Inline<Hash<Blake3>> {
     fn from(value: Inline<Handle<T>>) -> Self {
         value.transmute()
     }
@@ -304,19 +304,19 @@ impl<T: BlobSchema> From<Inline<Handle<T>>> for Inline<Hash<Blake3>> {
 
 impl<T> MetaDescribe for Handle<T>
 where
-    T: BlobSchema + MetaDescribe,
+    T: BlobEncoding + MetaDescribe,
 {
     fn describe() -> Fragment {
         // Entity core via `*:` spread. `T::describe()` runs once: its
-        // root becomes the value of `metadata::blob_schema` and its
+        // root becomes the value of `metadata::blob_encoding` and its
         // facts + blobs fold in automatically. With the hash protocol
         // fixed to Blake3, only the blob schema parameter distinguishes
         // one `Handle<T>` monomorphization from another; `annotated`
         // layers the human-facing annotations under the derived root.
         let mut core = entity! {
-            metadata::blob_schema*: T::describe(),
+            metadata::blob_encoding*: T::describe(),
             metadata::hash_schema*: Blake3::describe(),
-            metadata::tag: metadata::KIND_VALUE_SCHEMA,
+            metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         let name = Blake3::NAME;
         let description_handle = core.put(format!(
@@ -342,7 +342,7 @@ where
     }
 }
 
-impl<T: BlobSchema + MetaDescribe> InlineSchema for Handle<T> {
+impl<T: BlobEncoding + MetaDescribe> InlineEncoding for Handle<T> {
     type ValidationError = Infallible;
     type Encoding = T;
 }
@@ -356,7 +356,7 @@ impl MetaDescribe for Blake3 {
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
-    use crate::value::schemas::hash::HashError;
+    use crate::value::encodings::hash::HashError;
     use rand;
 
     use super::{Blake3, Hash};

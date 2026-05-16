@@ -65,7 +65,7 @@ use triblespace::core::repo::hybridstore::HybridStore;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::objectstore::ObjectStoreRemote;
 use triblespace::core::repo::Repository;
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::value::encodings::hash::Blake3;
 use url::Url;
 
 let blob_remote: ObjectStoreRemote<Blake3> =
@@ -215,7 +215,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::examples::{self, literature};
 use triblespace::prelude::*;
 use triblespace::core::repo::{self, memoryrepo::MemoryRepo, Repository};
-use blobschemas::{LongString, SimpleArchive};
+use blobencodings::{LongString, SimpleArchive};
 
 let storage = MemoryRepo::default();
 let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
@@ -398,7 +398,7 @@ use rand::rngs::OsRng;
 use triblespace::prelude::*;
 use triblespace::core::repo::objectstore::ObjectStoreRemote;
 use triblespace::core::repo::Repository;
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::value::encodings::hash::Blake3;
 use url::Url;
 
 fn open_remote_repo(raw_url: &str) -> anyhow::Result<()> {
@@ -485,8 +485,8 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::prelude::*;
 use triblespace::core::repo::{self, pile::Pile, Repository};
-use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::core::value::schemas::hash::Handle;
+use triblespace::core::value::encodings::hash::Blake3;
+use triblespace::core::value::encodings::hash::Handle;
 
 fn merge_import_example(
     src_path: &std::path::Path,
@@ -501,7 +501,7 @@ fn merge_import_example(
     dst.restore()?;
 
     // 2) Resolve source head commit handle
-    let src_head: Inline<Handle<blobschemas::SimpleArchive>> =
+    let src_head: Inline<Handle<blobencodings::SimpleArchive>> =
         src.head(src_branch_id)?.ok_or_else(|| anyhow::anyhow!("source head not found"))?;
 
     // 3) Conservatively copy all reachable blobs from source → destination

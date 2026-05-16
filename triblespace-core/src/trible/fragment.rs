@@ -1,12 +1,12 @@
 use std::ops::{Add, AddAssign, Deref};
 
-use crate::blob::{BlobSchema, MemoryBlobStore, IntoBlob};
+use crate::blob::{BlobEncoding, MemoryBlobStore, IntoBlob};
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::PATCH;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
 
 use super::Trible;
@@ -114,7 +114,7 @@ impl Fragment {
     /// doesn't grow the store.
     pub fn put<S, T>(&mut self, item: T) -> Inline<Handle<S>>
     where
-        S: BlobSchema,
+        S: BlobEncoding,
         T: IntoBlob<S>,
     {
         self.blobs.insert(item.to_blob())

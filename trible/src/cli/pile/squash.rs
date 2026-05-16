@@ -2,12 +2,12 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 use triblespace::prelude::*;
-use triblespace_core::blob::schemas::UnknownBlob;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::repo;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 
 use super::signing::load_signing_key;
@@ -78,7 +78,7 @@ pub fn run(
             for t in meta.iter() {
                 if *t.a() == name_attr {
                     let handle: Inline<
-                        Handle<triblespace_core::blob::schemas::longstring::LongString>,
+                        Handle<triblespace_core::blob::encodings::longstring::LongString>,
                     > = Inline::new(t.data[32..64].try_into().unwrap());
                     let name_view: View<str> = reader.get(handle).ok()?;
                     return Some(name_view.to_string());
@@ -181,7 +181,7 @@ pub fn run(
             } else {
                 format!("squashed {} ({}/{})", name, i + 1, num_chunks)
             };
-            let msg_blob: Blob<triblespace_core::blob::schemas::longstring::LongString> =
+            let msg_blob: Blob<triblespace_core::blob::encodings::longstring::LongString> =
                 triblespace_core::blob::IntoBlob::to_blob(msg_text);
             let msg_handle = dst_pile
                 .put(msg_blob)
@@ -218,7 +218,7 @@ pub fn run(
 
         let name_handle = dst_pile
             .put(triblespace_core::blob::IntoBlob::<
-                triblespace_core::blob::schemas::longstring::LongString,
+                triblespace_core::blob::encodings::longstring::LongString,
             >::to_blob(name.clone()))
             .map_err(|e| anyhow!("put name: {e:?}"))?;
 

@@ -25,7 +25,7 @@ use anybytes::area::ByteArea;
 
 use triblespace_core::blob::{BlobCache, MemoryBlobStore};
 use triblespace_core::repo::BlobStore;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 
 use triblespace_search::hnsw::HNSWBuilder;

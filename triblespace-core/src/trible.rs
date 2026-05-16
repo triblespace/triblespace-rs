@@ -11,7 +11,7 @@ use std::convert::TryInto;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 /// Re-export of [`Fragment`](fragment::Fragment).
 pub use fragment::Fragment;
@@ -73,14 +73,14 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::R256;
+    /// use inlineencodings::R256;
     ///
     /// let e = fucid();
     /// let a = fucid();
     /// let v: Inline<R256> = R256::inline_from(42);
     /// let trible = Trible::new(&e, &a, &v);
     /// ```
-    pub fn new<V: InlineSchema>(e: &ExclusiveId, a: &Id, v: &Inline<V>) -> Trible {
+    pub fn new<V: InlineEncoding>(e: &ExclusiveId, a: &Id, v: &Inline<V>) -> Trible {
         let mut data = [0; TRIBLE_LEN];
         data[E_START..=E_END].copy_from_slice(&e[..]);
         data[A_START..=A_END].copy_from_slice(&a[..]);
@@ -111,7 +111,7 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::R256;
+    /// use inlineencodings::R256;
     ///
     /// let e = fucid();
     /// let a = fucid();
@@ -120,7 +120,7 @@ impl Trible {
     ///
     /// assert_eq!(trible.e(), &*e);
     /// ```
-    pub fn force<V: InlineSchema>(e: &Id, a: &Id, v: &Inline<V>) -> Trible {
+    pub fn force<V: InlineEncoding>(e: &Id, a: &Id, v: &Inline<V>) -> Trible {
         Trible::new(ExclusiveId::force_ref(e), a, v)
     }
 
@@ -275,7 +275,7 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::R256;
+    /// use inlineencodings::R256;
     ///
     /// let data = [
     ///   // Entity
@@ -291,7 +291,7 @@ impl Trible {
     /// assert_eq!(value, &Inline::new([32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     /// 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]));
     /// ```
-    pub fn v<V: InlineSchema>(&self) -> &Inline<V> {
+    pub fn v<V: InlineEncoding>(&self) -> &Inline<V> {
         Inline::as_transmute_raw(self.data[V_START..=V_END].try_into().unwrap())
     }
 }

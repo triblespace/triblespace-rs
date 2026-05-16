@@ -6,7 +6,7 @@ use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 /// Inline-range constraint for [`SuccinctArchive`].
 ///
@@ -55,7 +55,7 @@ impl<'a, U> SuccinctArchiveRangeConstraint<'a, U>
 where
     U: Universe,
 {
-    pub fn new<V: InlineSchema>(
+    pub fn new<V: InlineEncoding>(
         variable_v: Variable<V>,
         min: Inline<V>,
         max: Inline<V>,

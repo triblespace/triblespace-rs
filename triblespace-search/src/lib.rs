@@ -142,7 +142,7 @@ pub mod testing {
 }
 
 // Versioning policy: breaking byte-layout changes mint a new
-// `BlobSchema` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`
+// `BlobEncoding` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`
 // in `succinct.rs`). The type system then rules out
 // mismatched-layout deserialization — there's no single
 // global version number. `git log docs/DESIGN.md` has the

@@ -11,7 +11,7 @@ use crate::value::RawInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
@@ -40,7 +40,7 @@ impl MetaDescribe for RangeU128 {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -54,7 +54,7 @@ impl MetaDescribe for RangeU128 {
     }
 }
 
-impl InlineSchema for RangeU128 {
+impl InlineEncoding for RangeU128 {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -71,7 +71,7 @@ impl MetaDescribe for RangeInclusiveU128 {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -114,7 +114,7 @@ mod wasm_formatters {
     }
 }
 
-impl InlineSchema for RangeInclusiveU128 {
+impl InlineEncoding for RangeInclusiveU128 {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -134,11 +134,11 @@ fn decode_pair(raw: &RawInline) -> (u128, u128) {
     (u128::from_be_bytes(first), u128::from_be_bytes(second))
 }
 
-fn encode_range_value<S: InlineSchema>(range: (u128, u128)) -> Inline<S> {
+fn encode_range_value<S: InlineEncoding>(range: (u128, u128)) -> Inline<S> {
     Inline::new(encode_pair(range))
 }
 
-fn decode_range_value<S: InlineSchema>(value: &Inline<S>) -> (u128, u128) {
+fn decode_range_value<S: InlineEncoding>(value: &Inline<S>) -> (u128, u128) {
     decode_pair(&value.raw)
 }
 

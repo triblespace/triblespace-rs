@@ -13,7 +13,7 @@ use crate::value::RawInline;
 use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -21,7 +21,7 @@ use crate::value::InlineSchema;
 /// trait (`.has(variable)`). Proposals enumerate every key in the map;
 /// confirmations retain only proposals whose key exists. Accepts
 /// `&HashMap<K,V>`, `Rc<HashMap<K,V>>`, and `Arc<HashMap<K,V>>`.
-pub struct KeysConstraint<S: InlineSchema, R, K, V>
+pub struct KeysConstraint<S: InlineEncoding, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
 {
@@ -29,7 +29,7 @@ where
     map: R,
 }
 
-impl<S: InlineSchema, R, K, V> KeysConstraint<S, R, K, V>
+impl<S: InlineEncoding, R, K, V> KeysConstraint<S, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
 {
@@ -39,7 +39,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
+impl<'a, S: InlineEncoding, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
 where
     K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b K: IntoInline<S>,
@@ -79,7 +79,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for &'a HashMap<K, V>
+impl<'a, S: InlineEncoding, K, V> ContainsConstraint<'a, S> for &'a HashMap<K, V>
 where
     K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b K: IntoInline<S>,
@@ -92,7 +92,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for Rc<HashMap<K, V>>
+impl<'a, S: InlineEncoding, K, V> ContainsConstraint<'a, S> for Rc<HashMap<K, V>>
 where
     K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b K: IntoInline<S>,
@@ -105,7 +105,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, K, V> ContainsConstraint<'a, S> for Arc<HashMap<K, V>>
+impl<'a, S: InlineEncoding, K, V> ContainsConstraint<'a, S> for Arc<HashMap<K, V>>
 where
     K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b K: IntoInline<S>,

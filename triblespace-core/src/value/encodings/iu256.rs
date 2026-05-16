@@ -9,7 +9,7 @@ use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::TryFromInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 use std::num::TryFromIntError;
 
@@ -47,7 +47,7 @@ impl MetaDescribe for U256LE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -60,7 +60,7 @@ impl MetaDescribe for U256LE {
         tribles
     }
 }
-impl InlineSchema for U256LE {
+impl InlineEncoding for U256LE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -76,7 +76,7 @@ impl MetaDescribe for U256BE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -89,7 +89,7 @@ impl MetaDescribe for U256BE {
         tribles
     }
 }
-impl InlineSchema for U256BE {
+impl InlineEncoding for U256BE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -105,7 +105,7 @@ impl MetaDescribe for I256LE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -118,7 +118,7 @@ impl MetaDescribe for I256LE {
         tribles
     }
 }
-impl InlineSchema for I256LE {
+impl InlineEncoding for I256LE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -134,7 +134,7 @@ impl MetaDescribe for I256BE {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -147,7 +147,7 @@ impl MetaDescribe for I256BE {
         tribles
     }
 }
-impl InlineSchema for I256BE {
+impl InlineEncoding for I256BE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

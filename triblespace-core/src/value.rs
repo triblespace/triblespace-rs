@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```
-//! use triblespace_core::value::{Inline, InlineSchema, IntoInline, TryFromInline};
+//! use triblespace_core::value::{Inline, InlineEncoding, IntoInline, TryFromInline};
 //! use triblespace_core::metadata::MetaDescribe;
 //! use triblespace_core::trible::{Fragment, TribleSet};
 //! use triblespace_core::macros::id_hex;
@@ -25,7 +25,7 @@
 //!        Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new())
 //!    }
 //! }
-//! impl InlineSchema for MyNumber {
+//! impl InlineEncoding for MyNumber {
 //!    type ValidationError = ();
 //!    type Encoding = Self;
 //!    // Every bit pattern is valid for this schema.
@@ -83,7 +83,7 @@
 //! ```
 
 /// Built-in value schema types and their conversion implementations.
-pub mod schemas;
+pub mod encodings;
 
 use crate::metadata::MetaDescribe;
 
@@ -115,7 +115,7 @@ pub type RawInline = [u8; INLINE_LEN];
 ///
 /// ```
 /// use triblespace_core::prelude::*;
-/// use inlineschemas::R256;
+/// use inlineencodings::R256;
 /// use num_rational::Ratio;
 ///
 /// let ratio = Ratio::new(1, 2);
@@ -125,20 +125,20 @@ pub type RawInline = [u8; INLINE_LEN];
 /// ```
 #[derive(TryFromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(transparent)]
-pub struct Inline<T: InlineSchema> {
+pub struct Inline<T: InlineEncoding> {
     /// The 32-byte representation of this value.
     pub raw: RawInline,
     _schema: PhantomData<T>,
 }
 
-impl<S: InlineSchema> Inline<S> {
+impl<S: InlineEncoding> Inline<S> {
     /// Create a new value from a 32-byte array.
     ///
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Inline, InlineSchema};
-    /// use triblespace_core::value::schemas::UnknownInline;
+    /// use triblespace_core::value::{Inline, InlineEncoding};
+    /// use triblespace_core::value::encodings::UnknownInline;
     ///
     /// let bytes = [0; 32];
     /// let value = Inline::<UnknownInline>::new(bytes);
@@ -168,7 +168,7 @@ impl<S: InlineSchema> Inline<S> {
     /// but you know the concrete schema type.
     pub fn transmute<O>(self) -> Inline<O>
     where
-        O: InlineSchema,
+        O: InlineEncoding,
     {
         Inline::new(self.raw)
     }
@@ -181,7 +181,7 @@ impl<S: InlineSchema> Inline<S> {
     /// but you know the concrete schema type.
     pub fn as_transmute<O>(&self) -> &Inline<O>
     where
-        O: InlineSchema,
+        O: InlineEncoding,
     {
         unsafe { std::mem::transmute(self) }
     }
@@ -191,8 +191,8 @@ impl<S: InlineSchema> Inline<S> {
     /// # Example
     ///
     /// ```
-    /// use triblespace_core::value::{Inline, InlineSchema};
-    /// use triblespace_core::value::schemas::UnknownInline;
+    /// use triblespace_core::value::{Inline, InlineEncoding};
+    /// use triblespace_core::value::encodings::UnknownInline;
     /// use std::borrow::Borrow;
     ///
     /// let bytes = [0; 32];
@@ -215,7 +215,7 @@ impl<S: InlineSchema> Inline<S> {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::F64;
+    /// use inlineencodings::F64;
     ///
     /// let value: Inline<F64> = (3.14f64).to_inline();
     /// let concrete: f64 = value.from_inline();
@@ -243,7 +243,7 @@ impl<S: InlineSchema> Inline<S> {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineschemas::R256;
+    /// use inlineencodings::R256;
     /// use num_rational::Ratio;
     ///
     /// let value: Inline<R256> = R256::inline_from(Ratio::new(1, 2));
@@ -258,47 +258,47 @@ impl<S: InlineSchema> Inline<S> {
     }
 }
 
-impl<T: InlineSchema> Copy for Inline<T> {}
+impl<T: InlineEncoding> Copy for Inline<T> {}
 
-impl<T: InlineSchema> Clone for Inline<T> {
+impl<T: InlineEncoding> Clone for Inline<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: InlineSchema> PartialEq for Inline<T> {
+impl<T: InlineEncoding> PartialEq for Inline<T> {
     fn eq(&self, other: &Self) -> bool {
         self.raw == other.raw
     }
 }
 
-impl<T: InlineSchema> Eq for Inline<T> {}
+impl<T: InlineEncoding> Eq for Inline<T> {}
 
-impl<T: InlineSchema> Hash for Inline<T> {
+impl<T: InlineEncoding> Hash for Inline<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.raw.hash(state);
     }
 }
 
-impl<T: InlineSchema> Ord for Inline<T> {
+impl<T: InlineEncoding> Ord for Inline<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.raw.cmp(&other.raw)
     }
 }
 
-impl<T: InlineSchema> PartialOrd for Inline<T> {
+impl<T: InlineEncoding> PartialOrd for Inline<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<S: InlineSchema> Borrow<RawInline> for Inline<S> {
+impl<S: InlineEncoding> Borrow<RawInline> for Inline<S> {
     fn borrow(&self) -> &RawInline {
         &self.raw
     }
 }
 
-impl<T: InlineSchema> Debug for Inline<T> {
+impl<T: InlineEncoding> Debug for Inline<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -313,13 +313,13 @@ impl<T: InlineSchema> Debug for Inline<T> {
 ///
 /// This trait is usually implemented on a type-level empty struct,
 /// but may contain additional information about the schema type as associated constants or types.
-/// The [Handle](crate::value::schemas::hash::Handle) type for example contains type information about the hash algorithm,
+/// The [Handle](crate::value::encodings::hash::Handle) type for example contains type information about the hash algorithm,
 /// and the schema of the referenced blob.
 ///
 /// See the [value](crate::value) module for more information.
-/// See the [BlobSchema](crate::blob::BlobSchema) trait for the counterpart trait for blobs.
-pub trait InlineSchema: MetaDescribe + Sized + 'static {
-    /// The error type returned by [`validate`](InlineSchema::validate).
+/// See the [BlobEncoding](crate::blob::BlobEncoding) trait for the counterpart trait for blobs.
+pub trait InlineEncoding: MetaDescribe + Sized + 'static {
+    /// The error type returned by [`validate`](InlineEncoding::validate).
     /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;
 
@@ -327,9 +327,9 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     /// conversion. For *inline* schemas (32-byte data lives in the
     /// trible), set `Encoding = Self` — sources convert via
     /// `IntoEncoded<Self> { Output = Inline<Self> }`. For
-    /// [`Handle<T>`](crate::value::schemas::hash::Handle), set
+    /// [`Handle<T>`](crate::value::encodings::hash::Handle), set
     /// `Encoding = T` — sources convert via `IntoEncoded<T> { Output =
-    /// Blob<T> }`. The BlobSchema `T` sitting directly at trait
+    /// Blob<T> }`. The BlobEncoding `T` sitting directly at trait
     /// position 0 is what lets downstream impl `IntoEncoded<MyBlob>
     /// for MyType` without bumping into the orphan rule.
     type Encoding;
@@ -359,7 +359,7 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// blob-path counterpart lives on
-    /// [`BlobSchema::to_value`](crate::blob::BlobSchema::to_value).
+    /// [`BlobEncoding::to_value`](crate::blob::BlobEncoding::to_value).
     fn to_value(form: Inline<Self>) -> Value<Self> {
         Value::Inline(form)
     }
@@ -371,7 +371,7 @@ pub trait InlineSchema: MetaDescribe + Sized + 'static {
 /// because the error type is part of the per-source/per-target contract.
 /// Used for parses that can fail (e.g. `&str → Hash<Blake3>` via
 /// hex-decoding).
-pub trait TryToInline<S: InlineSchema> {
+pub trait TryToInline<S: InlineEncoding> {
     /// The error type returned when the conversion fails.
     type Error;
     /// Convert the Rust type to a [Inline] with a specific schema type.
@@ -403,7 +403,7 @@ pub trait Encodes<Source> {
     /// The concrete form this source produces when encoded for this
     /// schema. `Inline<Self>` for inline schemas, `Blob<Self>` for
     /// blob schemas, or `Inline<Handle<Self>>` for the
-    /// precomputed-handle case where `Self: BlobSchema`.
+    /// precomputed-handle case where `Self: BlobEncoding`.
     type Output;
     /// Run the encoding.
     fn encode(source: Source) -> Self::Output;
@@ -439,7 +439,7 @@ where
 /// that implements `IntoEncoded<S>` with `Output = Inline<S>`
 /// automatically becomes `IntoInline<S>`, and gains the
 /// `to_inline(self) -> Inline<S>` convenience method.
-pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Output = Inline<S>> {
+pub trait IntoInline<S: InlineEncoding>: IntoEncoded<S, Output = Inline<S>> {
     /// Convert directly to `Inline<S>`.
     fn to_inline(self) -> Inline<S>
     where
@@ -450,7 +450,7 @@ pub trait IntoInline<S: InlineSchema>: IntoEncoded<S, Output = Inline<S>> {
 }
 impl<S, T> IntoInline<S> for T
 where
-    S: InlineSchema,
+    S: InlineEncoding,
     T: IntoEncoded<S, Output = Inline<S>>,
 {
 }
@@ -467,16 +467,16 @@ where
 /// does — and drops the redundant handle that used to be carried
 /// alongside its own blob.
 #[derive(Debug, Clone)]
-pub enum Value<V: InlineSchema> {
+pub enum Value<V: InlineEncoding> {
     /// 32-byte payload stored directly in the trible.
     Inline(Inline<V>),
     /// Bytes resolvable via a content-addressed handle. The handle
     /// is `blob.get_handle().transmute::<V>()` — the same 32 bytes,
     /// just re-phantomed back to the attribute's schema.
-    Blob(crate::blob::Blob<crate::blob::schemas::UnknownBlob>),
+    Blob(crate::blob::Blob<crate::blob::encodings::UnknownBlob>),
 }
 
-impl<V: InlineSchema> Value<V> {
+impl<V: InlineEncoding> Value<V> {
     /// The 32-byte form that goes into the trible. For
     /// [`Value::Blob`], this rederives the handle from the cached
     /// hash in the blob (no rehash) and recasts the phantom.
@@ -495,7 +495,7 @@ impl<V: InlineSchema> Value<V> {
         self,
     ) -> (
         Inline<V>,
-        Option<crate::blob::Blob<crate::blob::schemas::UnknownBlob>>,
+        Option<crate::blob::Blob<crate::blob::encodings::UnknownBlob>>,
     ) {
         match self {
             Value::Inline(i) => (i, None),
@@ -511,10 +511,10 @@ impl<V: InlineSchema> Value<V> {
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Inline<V>` delegates to [`InlineSchema::to_value`] — inline
+/// - `Inline<V>` delegates to [`InlineEncoding::to_value`] — inline
 ///   path, yields `Value::Inline(form)`.
 /// - `Blob<T>` targeting `Handle<T>` delegates to
-///   [`BlobSchema::to_value`](crate::blob::BlobSchema::to_value) —
+///   [`BlobEncoding::to_value`](crate::blob::BlobEncoding::to_value) —
 ///   handle path, yields `Value::Blob(form.transmute())`.
 ///
 /// This trait is the **dispatch shim** for the macro layer; the
@@ -522,14 +522,14 @@ impl<V: InlineSchema> Value<V> {
 /// schemas) can call it directly without going through the trait.
 /// `to_value` matches the `to_inline`/`to_blob` style of the
 /// supertrait aliases.
-pub trait ToValue<V: InlineSchema> {
+pub trait ToValue<V: InlineEncoding> {
     /// Produce the [`Value`] the macro absorbs.
     fn to_value(self) -> Value<V>;
 }
 
-impl<V: InlineSchema> ToValue<V> for Inline<V> {
+impl<V: InlineEncoding> ToValue<V> for Inline<V> {
     fn to_value(self) -> Value<V> {
-        <V as InlineSchema>::to_value(self)
+        <V as InlineEncoding>::to_value(self)
     }
 }
 
@@ -545,14 +545,14 @@ impl<V: InlineSchema> ToValue<V> for Inline<V> {
 /// This is the counterpart to the [TryToInline] trait.
 ///
 /// See [TryFromBlob](crate::blob::TryFromBlob) for the counterpart trait for blobs.
-pub trait TryFromInline<'a, S: InlineSchema>: Sized {
+pub trait TryFromInline<'a, S: InlineEncoding>: Sized {
     /// The error type returned when the conversion fails.
     type Error;
     /// Convert the [Inline] with a specific schema type to the Rust type.
     fn try_from_inline(v: &'a Inline<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: InlineSchema> Encodes<Inline<S>> for S
+impl<S: InlineEncoding> Encodes<Inline<S>> for S
 {
     type Output = Inline<S>;
     fn encode(source: Inline<S>) -> Inline<S> {
@@ -560,7 +560,7 @@ impl<S: InlineSchema> Encodes<Inline<S>> for S
     }
 }
 
-impl<S: InlineSchema> Encodes<&Inline<S>> for S
+impl<S: InlineEncoding> Encodes<&Inline<S>> for S
 {
     type Output = Inline<S>;
     fn encode(source: &Inline<S>) -> Inline<S> {
@@ -568,14 +568,14 @@ impl<S: InlineSchema> Encodes<&Inline<S>> for S
     }
 }
 
-impl<'a, S: InlineSchema> TryFromInline<'a, S> for Inline<S> {
+impl<'a, S: InlineEncoding> TryFromInline<'a, S> for Inline<S> {
     type Error = std::convert::Infallible;
     fn try_from_inline(v: &'a Inline<S>) -> Result<Self, std::convert::Infallible> {
         Ok(*v)
     }
 }
 
-impl<'a, S: InlineSchema> TryFromInline<'a, S> for () {
+impl<'a, S: InlineEncoding> TryFromInline<'a, S> for () {
     type Error = std::convert::Infallible;
     fn try_from_inline(_v: &'a Inline<S>) -> Result<Self, std::convert::Infallible> {
         Ok(())

@@ -7,8 +7,8 @@ those raw bytes to concrete application types and decouple persisted data from a
 particular implementation. This separation lets you refactor to new libraries or
 frameworks without rewriting what's already stored or coordinating live
 migrations. The crate ships with a collection of ready‑made schemas located in
-[`triblespace::core::value::schemas`](https://docs.rs/triblespace/latest/triblespace/core/value/schemas/index.html) and
-[`triblespace::core::blob::schemas`](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/index.html).
+[`triblespace::core::value::encodings`](https://docs.rs/triblespace/latest/triblespace/core/value/schemas/index.html) and
+[`triblespace::core::blob::encodings`](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/index.html).
 
 When data crosses the FFI boundary or is consumed by a different language, the
 schema is the contract both sides agree on. Consumers only need to understand
@@ -50,7 +50,7 @@ bits), use `TryToInline` / `TryFromInline` — kept as separate traits because t
 error type is per‑source.
 
 ```rust
-use triblespace::core::value::schemas::shortstring::ShortString;
+use triblespace::core::value::encodings::shortstring::ShortString;
 use triblespace::core::value::{TryFromInline, TryToInline, Inline};
 
 struct Username(String);
@@ -94,7 +94,7 @@ hash protocol.
 
 Identifiers also make it possible to derive deterministic attribute IDs when you
 ingest external formats. Wrap the source field name in an entity-core fragment —
-`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_schema: <S as MetaDescribe>::id() })` —
+`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })` —
 to combine the schema ID with the source field name and produce a stable
 attribute so re-importing the same data always targets the same column.
 The `attributes!` macro applies the same derivation when you omit the 128-bit id
@@ -124,8 +124,8 @@ The crate provides the following value schemas out of the box:
 ```rust
 # use triblespace::prelude::*;
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::value::schemas::shortstring::ShortString;
-use triblespace::core::value::{IntoInline, InlineSchema};
+use triblespace::core::value::encodings::shortstring::ShortString;
+use triblespace::core::value::{IntoInline, InlineEncoding};
 
 let v: Inline<ShortString> = "hi".to_inline();
 let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
@@ -149,8 +149,8 @@ The crate also ships with these blob schemas:
 
 ```rust
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::blob::schemas::longstring::LongString;
-use triblespace::core::blob::{Blob, BlobSchema, IntoBlob};
+use triblespace::core::blob::encodings::longstring::LongString;
+use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob};
 
 let b: Blob<LongString> = "example".to_blob();
 let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
@@ -158,8 +158,8 @@ let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
 
 Both value and blob schemas can emit optional discovery metadata. Calling
 `MetaDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
-whose facts tag the schema entity with `metadata::KIND_VALUE_SCHEMA` or
-`metadata::KIND_BLOB_SCHEMA` and may attach a `metadata::name` and
+whose facts tag the schema entity with `metadata::KIND_INLINE_ENCODING` or
+`metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
 `metadata::description` (LongString handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
 
@@ -200,7 +200,7 @@ What are you storing?
 │
 ├─ A cryptographic value?
 │  ├─ Content hash? → Hash<Blake3>
-│  ├─ Reference to a blob? → Handle<BlobSchema>
+│  ├─ Reference to a blob? → Handle<BlobEncoding>
 │  └─ Signature? → ED25519RComponent / ED25519SComponent / ED25519PublicKey
 │
 ├─ A file or binary payload?
@@ -210,8 +210,8 @@ What are you storing?
 │  └─ Handle<SimpleArchive>  (blob, stores a TribleSet)
 │
 └─ Something else?
-   ├─ Fits in 32 bytes? → define a custom InlineSchema
-   └─ Larger? → define a custom BlobSchema + use Handle
+   ├─ Fits in 32 bytes? → define a custom InlineEncoding
+   └─ Larger? → define a custom BlobEncoding + use Handle
 ```
 
 **Rules of thumb:**
@@ -227,7 +227,7 @@ What are you storing?
 
 ## Defining new schemas
 
-Custom formats implement [`InlineSchema`] or [`BlobSchema`].  A unique identifier
+Custom formats implement [`InlineEncoding`] or [`BlobEncoding`].  A unique identifier
 serves as the schema ID.  The example below defines a little-endian `u64` value
 schema and a simple blob schema for arbitrary bytes.
 
@@ -266,7 +266,7 @@ supports an optional schema-level formatter mechanism: a value schema can point
 to a small sandboxed WebAssembly module that turns its raw 32 bytes into a
 human-readable string.
 
-The formatter is stored as a blob (`blobschemas::WasmCode`) and referenced from
+The formatter is stored as a blob (`blobencodings::WasmCode`) and referenced from
 the schema identifier entity via the metadata attribute `metadata::value_formatter`.
 
 The built-in runner lives behind the `wasm` feature flag (enabled by default in

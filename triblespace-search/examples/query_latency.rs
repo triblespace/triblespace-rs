@@ -174,7 +174,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::encodings::hash::Handle;
     use triblespace_core::value::Inline;
     use triblespace_search::schemas::{put_embedding, Embedding};
 

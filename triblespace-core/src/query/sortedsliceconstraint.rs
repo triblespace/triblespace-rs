@@ -64,19 +64,19 @@ impl<T> std::ops::Deref for SortedSlice<'_, T> {
 }
 
 /// Constraint backed by a sorted slice — binary search for confirm.
-pub struct SortedSliceConstraint<'a, S: InlineSchema, T> {
+pub struct SortedSliceConstraint<'a, S: InlineEncoding, T> {
     variable: Variable<S>,
     slice: SortedSlice<'a, T>,
 }
 
-impl<'a, S: InlineSchema, T> SortedSliceConstraint<'a, S, T> {
+impl<'a, S: InlineEncoding, T> SortedSliceConstraint<'a, S, T> {
     /// Creates a constraint that restricts `variable` to values in `slice`.
     pub fn new(variable: Variable<S>, slice: SortedSlice<'a, T>) -> Self {
         SortedSliceConstraint { variable, slice }
     }
 }
 
-impl<'a, S: InlineSchema, T> Constraint<'a> for SortedSliceConstraint<'a, S, T>
+impl<'a, S: InlineEncoding, T> Constraint<'a> for SortedSliceConstraint<'a, S, T>
 where
     T: 'a + Ord + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,
@@ -111,7 +111,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>
+impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>
 where
     T: 'a + Ord + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,
@@ -135,7 +135,7 @@ where
 ///
 /// Does not conflict with the pre-sorted [`SortedSlice`] impl above:
 /// `SortedSlice<'a, T>` is not a `&mut [T]`.
-impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for &'a mut [T]
+impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for &'a mut [T]
 where
     T: 'a + Ord + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,

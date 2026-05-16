@@ -8,7 +8,7 @@
 use triblespace_core::id::Id;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{Binding, Constraint, Variable, VariableContext};
-use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::encodings::genid::GenId;
 use triblespace_core::value::{RawInline, IntoInline, Inline};
 
 use triblespace_search::bm25::BM25Builder;

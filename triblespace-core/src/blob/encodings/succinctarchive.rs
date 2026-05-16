@@ -4,7 +4,7 @@ mod universe;
 
 use crate::value::Encodes;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::id_from_value;
 use crate::id::id_into_value;
@@ -18,11 +18,11 @@ use crate::query::TriblePattern;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::UnknownInline;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::UnknownInline;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use succinctarchiveconstraint::*;
 
 /// Re-export all universe types and traits.
@@ -63,7 +63,7 @@ use jerky::serialization::{Metadata, Serializable};
 /// datasets where compact storage matters more than incremental updates.
 pub struct SuccinctArchiveBlob;
 
-impl BlobSchema for SuccinctArchiveBlob {}
+impl BlobEncoding for SuccinctArchiveBlob {}
 
 impl MetaDescribe for SuccinctArchiveBlob {
     fn describe() -> Fragment {
@@ -77,7 +77,7 @@ impl MetaDescribe for SuccinctArchiveBlob {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         tribles
     }
@@ -249,7 +249,7 @@ where
     ///     )
     /// )
     /// ```
-    pub fn value_in_range<V: InlineSchema>(
+    pub fn value_in_range<V: InlineEncoding>(
         &self,
         variable: crate::query::Variable<V>,
         min: Inline<V>,
@@ -649,7 +649,7 @@ where
     where
         U: 'a;
 
-    fn pattern<'a, V: InlineSchema>(
+    fn pattern<'a, V: InlineEncoding>(
         &'a self,
         e: crate::query::Variable<GenId>,
         a: crate::query::Variable<GenId>,
@@ -718,7 +718,7 @@ where
 impl<U> Encodes<&SuccinctArchive<U>> for SuccinctArchiveBlob
 where
     U: Universe + Serializable,
-    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
+    crate::value::encodings::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineEncoding,
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: &SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
@@ -729,7 +729,7 @@ where
 impl<U> Encodes<SuccinctArchive<U>> for SuccinctArchiveBlob
 where
     U: Universe + Serializable,
-    crate::value::schemas::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineSchema,
+    crate::value::encodings::hash::Handle<SuccinctArchiveBlob>: crate::value::InlineEncoding,
 {
     type Output = Blob<SuccinctArchiveBlob>;
     fn encode(source: SuccinctArchive<U>) -> Blob<SuccinctArchiveBlob> {
@@ -792,9 +792,9 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "328edd7583de04e2bedd6bd4fd50e651" as loves: inlineschemas::GenId;
-            "328147856cc1984f0806dbb824d2b4cb" as name: inlineschemas::ShortString;
-            "328f2c33d2fdd675e733388770b2d6c4" as title: inlineschemas::ShortString;
+            "328edd7583de04e2bedd6bd4fd50e651" as loves: inlineencodings::GenId;
+            "328147856cc1984f0806dbb824d2b4cb" as name: inlineencodings::ShortString;
+            "328f2c33d2fdd675e733388770b2d6c4" as title: inlineencodings::ShortString;
         }
     }
 

@@ -4,13 +4,13 @@ use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::value::schemas::UnknownInline;
+use triblespace_core::value::encodings::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "AA00000000000000AA00000000000001" as pub link: inlineschemas::GenId;
-        "AA00000000000000AA00000000000002" as pub label: inlineschemas::ShortString;
+        "AA00000000000000AA00000000000001" as pub link: inlineencodings::GenId;
+        "AA00000000000000AA00000000000002" as pub label: inlineencodings::ShortString;
     }
 }
 

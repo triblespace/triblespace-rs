@@ -9,9 +9,9 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::schemas::genid::GenId;
+use crate::value::encodings::genid::GenId;
 use crate::value::RawInline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use crate::value::INLINE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
@@ -36,7 +36,7 @@ pub struct TribleSetConstraint {
 impl TribleSetConstraint {
     /// Creates a triple-pattern constraint over `set` for the given
     /// entity, attribute, and value variables.
-    pub fn new<V: InlineSchema>(
+    pub fn new<V: InlineEncoding>(
         variable_e: Variable<GenId>,
         variable_a: Variable<GenId>,
         variable_v: Variable<V>,
@@ -408,7 +408,7 @@ mod tests {
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::value::schemas::UnknownInline;
+    use crate::value::encodings::UnknownInline;
     use crate::value::Inline;
 
     #[test]

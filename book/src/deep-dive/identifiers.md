@@ -269,8 +269,8 @@ would halve the effective security of a 256-bit hash, reducing it to \( 2^{128} 
 current or theoretical technology. As a result, 256 bits remains a future-proof choice for intrinsic identifiers.  
 
 Such 256-bit intrinsic identifiers are represented by the types
-[`Hash`](triblespace::core::value::schemas::hash::Hash) and
-[`Handle`](triblespace::core::value::schemas::hash::Handle).  
+[`Hash`](triblespace::core::value::encodings::hash::Hash) and
+[`Handle`](triblespace::core::value::encodings::hash::Handle).  
 
 Not every workflow needs cryptographic strength. We therefore ship three
 high-entropy abstract identifier families—**RNGID, UFOID, and FUCID**—that keep
@@ -291,7 +291,7 @@ predictability enables tighter compression and cache-friendly scans, but
 reveals mint metadata (time or source) and is therefore unsuitable
 whenever adversarial unpredictability matters. For those cases prefer
 RNGID's fully random bits, or step up to a 256-bit cryptographic
-[`Hash`](triblespace::core::value::schemas::hash::Hash).
+[`Hash`](triblespace::core::value::encodings::hash::Hash).
 
 ## Example: Scientific Publishing
 

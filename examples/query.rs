@@ -15,12 +15,12 @@ pub mod literature {
     use triblespace::prelude::*;
 
     attributes! {
-        "8F180883F9FD5F787E9E0AF0DF5866B9" as author: inlineschemas::GenId;
-        "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineschemas::ShortString;
-        "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineschemas::ShortString;
-        "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineschemas::ShortString;
-        "FCCE870BECA333D059D5CD68C43B98F0" as page_count: inlineschemas::R256;
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineschemas::Handle<blobschemas::LongString>;
+        "8F180883F9FD5F787E9E0AF0DF5866B9" as author: inlineencodings::GenId;
+        "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::ShortString;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
+        "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineencodings::ShortString;
+        "FCCE870BECA333D059D5CD68C43B98F0" as page_count: inlineencodings::R256;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

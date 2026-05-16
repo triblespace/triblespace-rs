@@ -29,8 +29,8 @@
 use std::collections::HashSet;
 
 use triblespace_core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
-use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::genid::GenId;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::{RawInline, Inline};
 
 use crate::bm25::BM25Index;
@@ -45,7 +45,7 @@ use crate::schemas::Embedding;
 pub trait BM25Queryable {
     /// Iterate `(key, score)` for the posting list of `term`.
     /// Keys are 32-byte triblespace `RawInline`s — the caller's
-    /// `Variable<S>` decodes them through whatever `InlineSchema`
+    /// `Variable<S>` decodes them through whatever `InlineEncoding`
     /// is appropriate. Empty iterator if the term is absent.
     fn query_term_boxed<'a>(
         &'a self,
@@ -53,7 +53,7 @@ pub trait BM25Queryable {
     ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a>;
 }
 
-impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding, T: triblespace_core::value::InlineEncoding>
     BM25Queryable for BM25Index<D, T>
 {
     fn query_term_boxed<'a>(
@@ -68,7 +68,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding, T: triblespace_core::value::InlineEncoding>
     BM25Queryable for crate::succinct::SuccinctBM25Index<D, T>
 {
     fn query_term_boxed<'a>(
@@ -135,9 +135,9 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// let mut ranked: Vec<(Id, f32)> = matched
 ///     .into_iter()
 ///     .map(|id| {
-///         use triblespace_core::value::{IntoInline, InlineSchema};
+///         use triblespace_core::value::{IntoInline, InlineEncoding};
 ///         let v: triblespace_core::value::Inline<
-///             triblespace_core::value::schemas::genid::GenId,
+///             triblespace_core::value::encodings::genid::GenId,
 ///         > = (&id).to_inline();
 ///         (id, idx.score(&v, &terms))
 ///     })
@@ -147,7 +147,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// ```
 pub struct BM25Filter<S = GenId>
 where
-    S: triblespace_core::value::InlineSchema,
+    S: triblespace_core::value::InlineEncoding,
 {
     doc: Variable<S>,
     /// Pre-filtered set of doc keys whose summed score
@@ -158,7 +158,7 @@ where
 
 impl<S> BM25Filter<S>
 where
-    S: triblespace_core::value::InlineSchema,
+    S: triblespace_core::value::InlineEncoding,
 {
     /// Build a filter from a pre-computed doc list. Use the
     /// `matches` method on [`BM25Index`] or `SuccinctBM25Index`
@@ -200,7 +200,7 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
         .collect()
 }
 
-impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding, T: triblespace_core::value::InlineEncoding>
     BM25Index<D, T>
 {
     /// Multi-term BM25 filter constraint. Binds `doc` to
@@ -250,7 +250,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// then delegate. Available only on indexes whose term schema is
 /// [`crate::tokens::WordHash`] — pair them up with
 /// `BM25Builder::<D, WordHash>::new()` builders.
-impl<D: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding>
     BM25Index<D, crate::tokens::WordHash>
 {
     /// Same as [`Self::matches`], but takes a query string and
@@ -274,7 +274,7 @@ impl<D: triblespace_core::value::InlineSchema>
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding, T: triblespace_core::value::InlineEncoding>
     crate::succinct::SuccinctBM25Index<D, T>
 {
     /// Succinct-side sibling of [`BM25Index::matches`]. Same
@@ -308,7 +308,7 @@ impl<D: triblespace_core::value::InlineSchema, T: triblespace_core::value::Inlin
 /// Word-hash convenience for the succinct path — same shape as the
 /// naive-index sugar, picks up the u16-quantised scoring transparently.
 #[cfg(feature = "succinct")]
-impl<D: triblespace_core::value::InlineSchema>
+impl<D: triblespace_core::value::InlineEncoding>
     crate::succinct::SuccinctBM25Index<D, crate::tokens::WordHash>
 {
     /// Succinct-side sibling of [`BM25Index::matches_text`].
@@ -329,7 +329,7 @@ impl<D: triblespace_core::value::InlineSchema>
 
 impl<'a, S> Constraint<'a> for BM25Filter<S>
 where
-    S: triblespace_core::value::InlineSchema + 'a,
+    S: triblespace_core::value::InlineEncoding + 'a,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
@@ -435,7 +435,7 @@ pub trait SimilaritySearch {
 /// use triblespace_core::find;
 /// use triblespace_core::query::temp;
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_core::value::encodings::hash::Blake3;
 /// use triblespace_core::value::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -625,7 +625,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_core::value::encodings::hash::Blake3;
 /// use triblespace_core::value::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
@@ -723,7 +723,7 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::{IntoInline, InlineSchema};
+    use triblespace_core::value::{IntoInline, InlineEncoding};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()

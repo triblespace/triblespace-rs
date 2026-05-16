@@ -1,12 +1,12 @@
 use std::collections::HashSet;
-use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
-use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
+use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
+use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::query::Binding;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::query::VariableContext;
-use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::schemas::UnknownInline;
+use triblespace::core::value::encodings::genid::GenId;
+use triblespace::core::value::encodings::UnknownInline;
 use triblespace::prelude::*;
 
 #[test]

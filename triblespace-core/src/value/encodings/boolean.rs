@@ -10,7 +10,7 @@ use crate::trible::TribleSet;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use crate::value::INLINE_LEN;
 
 use std::convert::Infallible;
@@ -58,7 +58,7 @@ impl MetaDescribe for Boolean {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -96,7 +96,7 @@ mod wasm_formatter {
     }
 }
 
-impl InlineSchema for Boolean {
+impl InlineEncoding for Boolean {
     type ValidationError = InvalidBoolean;
     type Encoding = Self;
 
@@ -151,7 +151,7 @@ mod tests {
     use super::Boolean;
     use super::InvalidBoolean;
     use crate::value::Inline;
-    use crate::value::InlineSchema;
+    use crate::value::InlineEncoding;
 
     #[test]
     fn encodes_false_as_zero_bytes() {

@@ -2,7 +2,7 @@ use anybytes::Bytes;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Barrier;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::prelude::*;
 
 #[test]

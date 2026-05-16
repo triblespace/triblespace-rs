@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `entity!{}` builds. The handle is no longer carried twice — for
   `Value::Blob`, it lives inside the blob's cached digest and is
   recovered via `Value::inline()` (phantom recast, no rehash).
-- **Workspace-wide rename**: `ValueSchema` → `InlineSchema`,
+- **Workspace-wide rename**: `ValueSchema` → `InlineEncoding`,
   `IntoValue` → `IntoInline`, `TryToValue` → `TryToInline`,
   `TryFromValue` → `TryFromInline`, `ValueRange` → `InlineRange`,
   `UnknownValue` → `UnknownInline`, `RawValue` → `RawInline`,
@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `*_inline` method renames (`to_value`/`from_value`/etc.).
 - **New dispatch trait**: `ToValue<V>` (formerly `FieldFormFor<V>`)
   lifts an `IntoEncoded::Output` into a `Value<V>`. The trait's two
-  blanket impls delegate to schema-level `InlineSchema::to_value`
-  and `BlobSchema::to_value`, so users (and schemas with unusual
+  blanket impls delegate to schema-level `InlineEncoding::to_value`
+  and `BlobEncoding::to_value`, so users (and schemas with unusual
   storage semantics) can call the conversion directly without going
   through the shim.
 - **Attribute helpers** rename to match `<destination>_from(v)`
@@ -79,20 +79,20 @@ unification release. Four related cleanups:
    self-containment" below for the full breakdown.
 
 ### Added
-- **`blob::schemas::iri::IRI` BlobSchema** for Internationalized
+- **`blob::encodings::iri::IRI` BlobEncoding** for Internationalized
   Resource Identifiers. Byte layout matches `LongString` but the
   distinct schema lets handles carry their IRI-ness at the type
   level, enables boundary validation (`iri::looks_like_iri` —
   permissive RFC 3987 subset; debug-asserted at `ToBlob`), and makes
   IRI-derived attribute ids distinct from same-bytes
-  LongString-derived ones. Re-exported as `prelude::blobschemas::IRI`.
+  LongString-derived ones. Re-exported as `prelude::blobencodings::IRI`.
 - **`metadata::iri: Handle<Blake3, IRI>`** attribute. The canonical
   identity-determining attribute for RDF-imported entities.
   Distinct from `metadata::name` (which stays display-only).
-- **`impl<S: InlineSchema> From<Fragment> for Attribute<S>`** — the
+- **`impl<S: InlineEncoding> From<Fragment> for Attribute<S>`** — the
   canonical dynamic-attribute constructor. Hand it an
   `entity!{ metadata::<identity-attr>: <value>,
-  metadata::value_schema: S::id() }` fragment whose root captures the
+  metadata::value_encoding: S::id() }` fragment whose root captures the
   identity-determining facts, and you get the typed attribute back.
   This is the *only* dynamic-attribute path: there is no specialized
   helper privileging any specific identity-attribute, so call sites
@@ -102,20 +102,20 @@ unification release. Four related cleanups:
 - **`metadata::array_item_schema: GenId`** attribute (id
   `56C43BEE48BE99521886D99BE9026A3B`). `Array<T>` references its
   element schema through this attribute rather than abusing
-  `metadata::blob_schema` (element schemas are not themselves
-  `BlobSchema`s).
+  `metadata::blob_encoding` (element schemas are not themselves
+  `BlobEncoding`s).
 
 ### Changed (breaking)
 - **`Attribute<S>` now stores a rooted `Fragment` (not just a raw
   id).** The wrapped fragment carries the identity-determining facts
-  (`metadata::iri | metadata::name` + `metadata::value_schema`),
+  (`metadata::iri | metadata::name` + `metadata::value_encoding`),
   which `describe()` re-emits so the metadata registry stays
   queryable by IRI / name — that round-trip was lost in the prior
   `raw: RawId`-only shape. `id()` becomes
   `self.fragment.root().expect("rooted")`.
 - **`Attribute::<S>::from_name`, `from_iri`, `from_id`, and
   `from_id_with_usage` removed.** The single public construction
-  path is `impl<S: InlineSchema> From<Fragment> for Attribute<S>`.
+  path is `impl<S: InlineEncoding> From<Fragment> for Attribute<S>`.
   Replace each call with explicit `Attribute::<S>::from(entity!{ … })`,
   naming the identity attribute (`metadata::name`, `metadata::iri`,
   or an explicit `@`-prefixed hex id) at the call site:
@@ -123,19 +123,19 @@ unification release. Four related cleanups:
   // display-name origins (JSON fields, config keys, column headers):
   Attribute::<S>::from(entity! {
       metadata::name:         name.to_blob().get_handle::<Blake3>(),
-      metadata::value_schema: <S as MetaDescribe>::id(),
+      metadata::value_encoding: <S as MetaDescribe>::id(),
   })
 
   // RDF / JSON-LD predicates (IRI as canonical identifier):
   Attribute::<S>::from(entity! {
       metadata::iri:          iri.to_blob().get_handle::<Blake3>(),
-      metadata::value_schema: <S as MetaDescribe>::id(),
+      metadata::value_encoding: <S as MetaDescribe>::id(),
   })
 
   // Explicit hex id (schema pinning, bootstrap attrs):
   let id: Id = id_hex!("…");
   Attribute::<S>::from(entity! { &ExclusiveId::force_ref(&id) @
-      metadata::value_schema: <S as MetaDescribe>::id(),
+      metadata::value_encoding: <S as MetaDescribe>::id(),
   })
   ```
   The derivation is unchanged — canonical
@@ -148,12 +148,12 @@ unification release. Four related cleanups:
   derived ones. Within the LazyLock init, the Hex branch
   constructs via `Fragment::rooted(id, TribleSet::new())` (low-
   level API, no `entity!{}`) to avoid a bootstrap deadlock —
-  foundational attributes like `metadata::value_schema` would
+  foundational attributes like `metadata::value_encoding` would
   otherwise reference themselves during their own init.
 - **`Describe for Attribute<S>`** is a pure accessor: it returns
   `self.fragment.clone()` and nothing else. The wrapped identity
   fragment already carries `metadata::iri` / `metadata::name`
-  together with `metadata::value_schema: S::id()` from construction,
+  together with `metadata::value_encoding: S::id()` from construction,
   which is the complete identity-determining fact set. Schema-level
   facts (the schema's own name, description, hash protocol info)
   belong to the schema, not the attribute — consumers wanting them
@@ -213,7 +213,7 @@ unification release. Four related cleanups:
 - **`ImportAttribute` removed.** It was a thin wrapper around two
   separate patterns: (1) "build an attribute from a name handle"
   (now just `Attribute::<S>::from(entity!{ metadata::name: handle,
-  metadata::value_schema: <S as MetaDescribe>::id() })` in the
+  metadata::value_encoding: <S as MetaDescribe>::id() })` in the
   JSON object importer) and (2) "attach a contextual name fact to
   an existing attribute id" (the `import::json_tree::build_json_tree_metadata`
   rename pattern, which is gone — the macro-generated `describe()`
@@ -253,15 +253,15 @@ unification release. Four related cleanups:
   ConstDescribe + ConstId`). The id flows through describe like
   every other schema; the bound stops conflating "I have a stable
   identifier" with "I implement a digest function".
-- **`InlineSchema` and `BlobSchema` super-traits now `+ MetaDescribe`**
+- **`InlineEncoding` and `BlobEncoding` super-traits now `+ MetaDescribe`**
   (was `+ ConstId`). Schemas must describe themselves; the id is a
   property of that description, not a separate trait method.
 - **`Handle<H,T>::describe`, `Array<T>::describe`, and
   `Attribute<S>::describe` use the entity-core split with `entity!`'s
   `*:` spread syntax** — sub-schemas are described *once* and their
-  roots become the values of `metadata::blob_schema` /
+  roots become the values of `metadata::blob_encoding` /
   `metadata::hash_schema` / `metadata::array_item_schema` /
-  `metadata::value_schema`, while their facts fold into the parent
+  `metadata::value_encoding`, while their facts fold into the parent
   fragment automatically. Annotations (name, description, tag) attach
   via `&id @ …` so reworking documentation doesn't rotate the id.
   Net effect: `Handle<Blake3, LongString>::id()` and similar
@@ -269,9 +269,9 @@ unification release. Four related cleanups:
   hashes. Re-ingest is required (consistent with the 0.39 attribute-
   id break above).
 - **`Array<T>` uses `metadata::array_item_schema` (not
-  `metadata::blob_schema`)** to reference its element type. Element
+  `metadata::blob_encoding`)** to reference its element type. Element
   schemas (`array::F32`, `array::U8`, …) are not themselves
-  `BlobSchema`s — they only carry an `ArrayElement::Native` byte
+  `BlobEncoding`s — they only carry an `ArrayElement::Native` byte
   layout — so the dedicated attribute prevents semantically misleading
   edges. The id derivation is structurally the same shape but
   attribute-id differs, so existing `Array<T>` ids rotate again.
@@ -877,7 +877,7 @@ surface-level details. Highlights:
   schema identifier, eliminating the former `metadata_id` accessors.
 - `Metadata::describe` and `ConstMetadata::describe` are now fallible so blob
   write errors can be propagated instead of silently ignored.
-- `InlineSchema` inherits its identifier and default description behavior from
+- `InlineEncoding` inherits its identifier and default description behavior from
   `ConstMetadata`, removing duplicate `id`, `metadata_id`, and `describe`
   methods from the schema trait itself.
 - Hash protocol metadata now emits the protocol name alongside the identifier
@@ -925,7 +925,7 @@ surface-level details. Highlights:
 - Guidance on how `ExclusiveId` ownership narrows safe absence checks while
   keeping queries monotonic across collaborators in the incremental queries
   chapter of the book.
-- `metadata::KIND_VALUE_SCHEMA` and `metadata::KIND_BLOB_SCHEMA` tags, now
+- `metadata::KIND_INLINE_ENCODING` and `metadata::KIND_BLOB_ENCODING` tags, now
   emitted by built-in schema metadata for discovery.
 - `metadata::description`, a LongString-backed attribute for schema
   documentation, and `metadata::name`/`metadata::description` emission for
@@ -947,7 +947,7 @@ surface-level details. Highlights:
   and nested objects to `GenId` links, hashing attribute/value pairs (with an
   optional 32-byte salt) to derive stable entity ids, while streaming blobs into
   a caller-provided store and exposing data/metadata separately.
-- `inlineschemas::Boolean` for encoding `false` as all-zero bytes and `true` as
+- `inlineencodings::Boolean` for encoding `false` as all-zero bytes and `true` as
   all ones, providing an unambiguous target for JSON boolean importers.
 - `RangeU128` and `RangeInclusiveU128` value schemas for encoding pairs of
   packed `u128` values, enabling compact storage of start/end markers such as
@@ -978,7 +978,7 @@ surface-level details. Highlights:
 - Shared `proofs::util` module providing bounded Kani generators for tribles,
   PATCH entries, and small commit DAGs, and updated the query harness to reuse
   them.
-- `metadata::value_formatter` and `blobschemas::WasmCode` for attaching
+- `metadata::value_formatter` and `blobencodings::WasmCode` for attaching
   schema-level WebAssembly value formatters, plus an optional `wasm` feature
   (enabled by default in the `triblespace` facade crate) that runs them in a
   sandboxed `wasmi` interpreter with strict limits.
@@ -1031,7 +1031,7 @@ surface-level details. Highlights:
 - Simplified attribute naming by replacing the internal `AttributeName` enum
   with an optional `Cow<'static, str>`, keeping const-friendly static ids while
   storing dynamic field names directly.
-- Replaced the `InlineSchema::VALUE_SCHEMA_ID` and `BlobSchema::BLOB_SCHEMA_ID`
+- Replaced the `InlineEncoding::VALUE_SCHEMA_ID` and `BlobEncoding::BLOB_SCHEMA_ID`
   associated constants with `ConstMetadata::id()` across value and blob schemas,
   preserving existing identifiers and deriving composite `Handle` schema IDs
   deterministically from their hash protocol and blob schema components.
@@ -1039,7 +1039,7 @@ surface-level details. Highlights:
   the unified metadata API alongside value and blob schemas.
 - Documented why schema identifiers remain regular functions until `blake3`
   exposes a const-friendly hashing API for composite handle schemas.
-- Removed the `InlineSchema::BLOB_SCHEMA_ID` associated constant and stopped
+- Removed the `InlineEncoding::BLOB_SCHEMA_ID` associated constant and stopped
   emitting attribute metadata that relied on blob schema coupling.
 - Glossary chapter in the book for quick reference to core terminology.
 - Expanded the Identifiers chapter with a `local_ids` + `IdOwner` workflow
@@ -1411,7 +1411,7 @@ surface-level details. Highlights:
   - Updated `SuccinctArchive` to use `BitVectorDataMeta` for prefix bit vectors.
 
 ### Fixed
-- Reinstated the `InlineSchema` documentation that notes hash handles still carry
+- Reinstated the `InlineEncoding` documentation that notes hash handles still carry
   their referenced blob schema type parameter.
 - Updated deterministic JSON importer metadata tests to align with attribute
   metadata now emitting only value schema descriptors.
@@ -1424,7 +1424,7 @@ surface-level details. Highlights:
   examples. Book snippets now rely on type inference for `to_blob()` to match
   idiomatic usage.
 - Corrected the JSON import benchmark to use the re-exported
-  `inlineschemas::Blake3` handle schema so it compiles again.
+  `inlineencodings::Blake3` handle schema so it compiles again.
 - Added the missing `serde_json` and `f256` dev-dependencies so the JSON import
   benchmark builds successfully.
 - Buffered the JSON importers so encoding errors roll back an entire import
@@ -1846,9 +1846,9 @@ surface-level details. Highlights:
   `kani::any()` or bounded constructors for nondeterministic inputs.
 - Fixed Kani playback build errors by using `dst_len` to access `child_table`
   length without implicit autorefs.
-- Introduced `InlineSchema::validate` to verify raw value bit patterns.
+- Introduced `InlineEncoding::validate` to verify raw value bit patterns.
 - Query and value harnesses use this to avoid invalid `ShortString` data during playback.
-- `InlineSchema::validate` now returns a `Result` and `Inline::is_valid` provides
+- `InlineEncoding::validate` now returns a `Result` and `Inline::is_valid` provides
   a convenient boolean check.
 - Corrected the workspace example to merge conflicts into the returned workspace
   and push that result.

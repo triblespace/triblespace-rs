@@ -7,12 +7,12 @@ pub mod literature {
     #![allow(unused)]
     use super::*;
     use crate::prelude::*;
-    use blobschemas::LongString;
-    use inlineschemas::Blake3;
-    use inlineschemas::GenId;
-    use inlineschemas::Handle;
-    use inlineschemas::ShortString;
-    use inlineschemas::R256;
+    use blobencodings::LongString;
+    use inlineencodings::Blake3;
+    use inlineencodings::GenId;
+    use inlineencodings::Handle;
+    use inlineencodings::ShortString;
+    use inlineencodings::R256;
 
     attributes! {
         /// The title of a work.

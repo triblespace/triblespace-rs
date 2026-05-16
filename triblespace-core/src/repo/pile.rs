@@ -39,9 +39,9 @@ use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 use zerocopy::TryFromBytes;
 
-use crate::blob::schemas::UnknownBlob;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
@@ -49,13 +49,13 @@ use crate::id::RawId;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::prelude::blobschemas::SimpleArchive;
-use crate::prelude::inlineschemas::Handle;
-use crate::value::schemas::hash::Blake3;
-use crate::value::schemas::hash::Hash;
+use crate::prelude::blobencodings::SimpleArchive;
+use crate::prelude::inlineencodings::Handle;
+use crate::value::encodings::hash::Blake3;
+use crate::value::encodings::hash::Hash;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -244,9 +244,9 @@ impl BlobStoreGet for PileReader {
         handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
         let Some(entry) = self.blobs.get(&hash.raw) else {
@@ -876,9 +876,9 @@ impl BlobStorePut for Pile {
     /// appends; other filesystems may corrupt the pile.
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
@@ -1091,8 +1091,8 @@ impl crate::repo::BlobStoreMeta for PileReader {
         handle: Inline<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
-        S: BlobSchema + 'static,
-        Handle<S>: InlineSchema,
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
     {
         // re-use existing implementation logic
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();

@@ -6,7 +6,7 @@
 //! triblespace `Id` across processes, so repeated imports converge.
 //!
 //! Predicate URIs become attribute ids by wrapping the IRI handle in
-//! [`entity!`] under [`metadata::iri`] and [`metadata::value_schema`],
+//! [`entity!`] under [`metadata::iri`] and [`metadata::value_encoding`],
 //! then taking the resulting fragment's root via
 //! [`Attribute::<S>::from`]. The value schema is chosen from the
 //! object's XSD datatype:
@@ -80,21 +80,21 @@ use winnow::token::{take, take_while};
 use winnow::Parser;
 
 use crate::attribute::Attribute;
-use crate::blob::schemas::longstring::LongString;
-use crate::blob::schemas::rawbytes::RawBytes;
+use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::rawbytes::RawBytes;
 use crate::blob::{Blob, IntoBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
-use crate::prelude::inlineschemas;
+use crate::prelude::inlineencodings;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::Handle;
-use crate::value::schemas::shortstring::ShortString;
-use crate::value::schemas::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
-use crate::value::schemas::UnknownInline;
-use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::f64::F64;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::hash::Handle;
+use crate::value::encodings::shortstring::ShortString;
+use crate::value::encodings::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
+use crate::value::encodings::UnknownInline;
+use crate::value::encodings::boolean::Boolean;
+use crate::value::encodings::f64::F64;
 use crate::value::{RawInline, IntoInline, TryToInline, Inline};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
@@ -996,7 +996,7 @@ where
 /// success, `false` on malformed input (caller skips to next line).
 /// Per-import cache of predicate-IRI → attribute-id, one slot per value
 /// schema the parser dispatches to. Each cache method computes
-/// `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_schema: }).id()`,
+/// `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_encoding: }).id()`,
 /// which runs `<S as MetaDescribe>::id()` and an `entity!{}.root()` per
 /// call — both nontrivial — so caching by (S, IRI) avoids redoing that
 /// work for every trible sharing a predicate.
@@ -1017,110 +1017,110 @@ struct NTriplesAttrCache {
 impl NTriplesAttrCache {
     fn genid(&mut self, iri: &str) -> Id {
         *self.genid.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::GenId>::from(entity! {
+            Attribute::<inlineencodings::GenId>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::GenId as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::GenId as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn longstring(&mut self, iri: &str) -> Id {
         *self.longstring.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<Handle<LongString>>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <Handle<LongString> as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <Handle<LongString> as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn rawbytes(&mut self, iri: &str) -> Id {
         *self.rawbytes.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<Handle<RawBytes>>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <Handle<RawBytes> as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <Handle<RawBytes> as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn i256be(&mut self, iri: &str) -> Id {
         *self.i256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::I256BE>::from(entity! {
+            Attribute::<inlineencodings::I256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::I256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::I256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn u256be(&mut self, iri: &str) -> Id {
         *self.u256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::U256BE>::from(entity! {
+            Attribute::<inlineencodings::U256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::U256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::U256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn r256be(&mut self, iri: &str) -> Id {
         *self.r256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::R256BE>::from(entity! {
+            Attribute::<inlineencodings::R256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::R256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::R256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn f64(&mut self, iri: &str) -> Id {
         *self.f64.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::F64>::from(entity! {
+            Attribute::<inlineencodings::F64>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::F64 as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::F64 as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn boolean(&mut self, iri: &str) -> Id {
         *self.boolean.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<inlineschemas::Boolean>::from(entity! {
+            Attribute::<inlineencodings::Boolean>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <inlineschemas::Boolean as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <inlineencodings::Boolean as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn nsduration(&mut self, iri: &str) -> Id {
         *self.nsduration.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<NsDuration>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <NsDuration as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <NsDuration as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
     }
     fn nstai(&mut self, iri: &str) -> Id {
         *self.nstai.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
+            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<NsTAIInterval>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <NsTAIInterval as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_encoding: <NsTAIInterval as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1440,7 +1440,7 @@ fn emit_typed_literal<Blobs>(
             | "nonPositiveInteger" => {
                 if let Ok(val) = text.parse::<i128>() {
                     let attr_id = attr_cache.i256be(predicate);
-                    let v: Inline<inlineschemas::I256BE> = val.to_inline();
+                    let v: Inline<inlineencodings::I256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
@@ -1449,7 +1449,7 @@ fn emit_typed_literal<Blobs>(
             | "unsignedShort" | "unsignedByte" => {
                 if let Ok(val) = text.parse::<u128>() {
                     let attr_id = attr_cache.u256be(predicate);
-                    let v: Inline<inlineschemas::U256BE> = val.to_inline();
+                    let v: Inline<inlineencodings::U256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
@@ -1457,7 +1457,7 @@ fn emit_typed_literal<Blobs>(
             "decimal" => {
                 if let Some(val) = parse_decimal(text.as_ref()) {
                     let attr_id = attr_cache.r256be(predicate);
-                    let v: Inline<inlineschemas::R256BE> = val.to_inline();
+                    let v: Inline<inlineencodings::R256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }

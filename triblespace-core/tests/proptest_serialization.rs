@@ -1,12 +1,12 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::value::schemas::UnknownInline;
+use triblespace_core::value::encodings::UnknownInline;
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (
@@ -118,8 +118,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_iter_matches_tribleset(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
 
@@ -134,8 +134,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_preserves_len(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
         prop_assert_eq!(set.len(), archive.iter().count());
@@ -143,8 +143,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_empty(_dummy in 0..1u8) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         let empty = TribleSet::new();
         let archive: SuccinctArchive<OrderedUniverse> = (&empty).into();
@@ -153,8 +153,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_blob_roundtrip(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::{SuccinctArchive, SuccinctArchiveBlob};
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::{SuccinctArchive, SuccinctArchiveBlob};
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
         let blob: triblespace_core::blob::Blob<SuccinctArchiveBlob> = archive.to_blob();
@@ -174,8 +174,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_full_scan_matches(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
 
@@ -198,8 +198,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_entity_scan_matches(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         if set.is_empty() { return Ok(()); }
 
@@ -210,7 +210,7 @@ proptest! {
         let entity_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first_trible.data[0..16]);
-            Inline::<inlineschemas::GenId>::new(v)
+            Inline::<inlineencodings::GenId>::new(v)
         };
 
         let mut set_results: Vec<_> = find!(
@@ -231,8 +231,8 @@ proptest! {
 
     #[test]
     fn succinct_archive_attribute_scan_matches(set in arb_tribleset(15)) {
-        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
-        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::encodings::succinctarchive::OrderedUniverse;
 
         if set.is_empty() { return Ok(()); }
 
@@ -243,7 +243,7 @@ proptest! {
         let attr_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first.data[16..32]);
-            Inline::<inlineschemas::GenId>::new(v)
+            Inline::<inlineencodings::GenId>::new(v)
         };
 
         // Query with bound attribute

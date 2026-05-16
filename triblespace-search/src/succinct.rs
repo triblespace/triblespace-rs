@@ -37,16 +37,16 @@ use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
 use jerky::serialization::Serializable;
-use triblespace_core::blob::schemas::succinctarchive::{
+use triblespace_core::blob::encodings::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
-use triblespace_core::blob::{Blob, BlobSchema, TryFromBlob};
+use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::Variable;
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_core::value::{RawInline, Inline, InlineSchema};
+use triblespace_core::value::{RawInline, Inline, InlineEncoding};
 
 use crate::schemas::{EmbHandle, Embedding};
 
@@ -747,7 +747,7 @@ const _: () = assert!(
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
 /// use triblespace_core::repo::BlobStore;
-/// use triblespace_core::value::schemas::hash::{Blake3, Handle};
+/// use triblespace_core::value::encodings::hash::{Blake3, Handle};
 /// use triblespace_core::value::Inline;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, Embedding};
@@ -1339,8 +1339,8 @@ pub struct SuccinctBM25Meta {
 /// assert!(blob.bytes.len() > 0);
 /// ```
 pub struct SuccinctBM25Index<
-    D: InlineSchema = triblespace_core::value::schemas::genid::GenId,
-    T: InlineSchema = crate::tokens::WordHash,
+    D: InlineEncoding = triblespace_core::value::encodings::genid::GenId,
+    T: InlineEncoding = crate::tokens::WordHash,
 > {
     /// Canonical blob bytes — single owner of every section's
     /// backing memory. `to_blob` is `O(1)` (refcounted clone of
@@ -1373,7 +1373,7 @@ pub struct SuccinctBM25Index<
     _phantom: std::marker::PhantomData<(D, T)>,
 }
 
-impl<D: InlineSchema, T: InlineSchema> std::fmt::Debug for SuccinctBM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> std::fmt::Debug for SuccinctBM25Index<D, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuccinctBM25Index")
             .field("n_docs", &self.keys.len())
@@ -1385,7 +1385,7 @@ impl<D: InlineSchema, T: InlineSchema> std::fmt::Debug for SuccinctBM25Index<D, 
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> SuccinctBM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// Direct-to-succinct builder path: consume a
     /// [`BM25Builder`][crate::bm25::BM25Builder] and produce the
     /// succinct index in a single pass through the docs.
@@ -1707,7 +1707,7 @@ impl std::fmt::Display for SuccinctLoadError {
 
 impl std::error::Error for SuccinctLoadError {}
 
-/// Content-addressed [`BlobSchema`] marker for the succinct
+/// Content-addressed [`BlobEncoding`] marker for the succinct
 /// BM25 blob format — canonical-bytes layout where every
 /// section (keys, doc_lens, terms, postings) lives in one
 /// shared [`anybytes::ByteArea`] and the [`SuccinctBM25Meta`]
@@ -1730,7 +1730,7 @@ impl std::error::Error for SuccinctLoadError {}
 ///   produced by the shared `ByteArea`).
 pub enum SuccinctBM25Blob {}
 
-impl BlobSchema for SuccinctBM25Blob {}
+impl BlobEncoding for SuccinctBM25Blob {}
 
 // Default `describe` — fragment rooted at `Self::ID` with an
 // empty TribleSet. Lets `attributes!` declare value types like
@@ -1750,14 +1750,14 @@ impl MetaDescribe for SuccinctBM25Blob {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+                metadata::tag:         metadata::KIND_BLOB_ENCODING,
             }
         })
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> Encodes<&SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
+impl<D: InlineEncoding, T: InlineEncoding> Encodes<&SuccinctBM25Index<D, T>> for SuccinctBM25Blob
+where triblespace_core::value::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: &SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -1767,8 +1767,8 @@ where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblesp
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> Encodes<SuccinctBM25Index<D, T>> for SuccinctBM25Blob
-where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineSchema,
+impl<D: InlineEncoding, T: InlineEncoding> Encodes<SuccinctBM25Index<D, T>> for SuccinctBM25Blob
+where triblespace_core::value::encodings::hash::Handle<SuccinctBM25Blob>: triblespace_core::value::InlineEncoding,
 {
     type Output = Blob<SuccinctBM25Blob>;
     fn encode(source: SuccinctBM25Index<D, T>) -> Blob<SuccinctBM25Blob> {
@@ -1776,7 +1776,7 @@ where triblespace_core::value::schemas::hash::Handle<SuccinctBM25Blob>: triblesp
     }
 }
 
-impl<D: InlineSchema, T: InlineSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
+impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctBM25Blob>) -> Result<Self, Self::Error> {
@@ -1789,7 +1789,7 @@ impl<D: InlineSchema, T: InlineSchema> TryFromBlob<SuccinctBM25Blob> for Succinc
     }
 }
 
-/// Content-addressed [`BlobSchema`] marker for the succinct
+/// Content-addressed [`BlobEncoding`] marker for the succinct
 /// HNSW blob format — canonical-bytes layout where handles +
 /// graph live in one shared [`anybytes::ByteArea`] and the
 /// [`SuccinctHNSWMeta`] header sits at the suffix. The index
@@ -1817,7 +1817,7 @@ impl<D: InlineSchema, T: InlineSchema> TryFromBlob<SuccinctBM25Blob> for Succinc
 ///   (suffix-meta, no custom header at all).
 pub enum SuccinctHNSWBlob {}
 
-impl BlobSchema for SuccinctHNSWBlob {}
+impl BlobEncoding for SuccinctHNSWBlob {}
 
 impl MetaDescribe for SuccinctHNSWBlob {
     fn describe() -> Fragment {
@@ -1833,14 +1833,14 @@ impl MetaDescribe for SuccinctHNSWBlob {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+                metadata::tag:         metadata::KIND_BLOB_ENCODING,
             }
         })
     }
 }
 
 impl Encodes<&SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
+where triblespace_core::value::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: &SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -1850,7 +1850,7 @@ where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblesp
 }
 
 impl Encodes<SuccinctHNSWIndex> for SuccinctHNSWBlob
-where triblespace_core::value::schemas::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineSchema,
+where triblespace_core::value::encodings::hash::Handle<SuccinctHNSWBlob>: triblespace_core::value::InlineEncoding,
 {
     type Output = Blob<SuccinctHNSWBlob>;
     fn encode(source: SuccinctHNSWIndex) -> Blob<SuccinctHNSWBlob> {
@@ -2102,7 +2102,7 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_corpus() {
         use crate::bm25::BM25Builder;
-        use triblespace_core::value::schemas::genid::GenId;
+        use triblespace_core::value::encodings::genid::GenId;
         let succinct = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
@@ -2202,7 +2202,7 @@ mod tests {
     fn succinct_bm25_empty_round_trip() {
         use crate::bm25::BM25Builder;
         use triblespace_core::blob::{Blob, TryFromBlob};
-        use triblespace_core::value::schemas::genid::GenId;
+        use triblespace_core::value::encodings::genid::GenId;
         let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         let blob: Blob<SuccinctBM25Blob> = Blob::new(idx.bytes.clone());
         let reloaded: SuccinctBM25Index =
@@ -2219,7 +2219,7 @@ mod tests {
         use triblespace_core::blob::{Blob, TryFromBlob};
         let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source([0u8; 10].to_vec()));
         let err = SuccinctBM25Index::<
-            triblespace_core::value::schemas::genid::GenId,
+            triblespace_core::value::encodings::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_blob(blob)
         .unwrap_err();
@@ -2227,7 +2227,7 @@ mod tests {
     }
 
     // Magic/version rejection tests retired along with the
-    // fields themselves — the typed `BlobSchema` handle
+    // fields themselves — the typed `BlobEncoding` handle
     // carries blob identity now, and a breaking layout change
     // mints a new schema id (a different type).
 
@@ -2247,7 +2247,7 @@ mod tests {
         let truncated = full[..full.len() - 2].to_vec();
         let blob: Blob<SuccinctBM25Blob> = Blob::new(Bytes::from_source(truncated));
         let err = SuccinctBM25Index::<
-            triblespace_core::value::schemas::genid::GenId,
+            triblespace_core::value::encodings::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_blob(blob)
         .unwrap_err();
@@ -2381,7 +2381,7 @@ mod tests {
         triblespace_core::blob::MemoryBlobStore,
         Vec<
             triblespace_core::value::Inline<
-                triblespace_core::value::schemas::hash::Handle<
+                triblespace_core::value::encodings::hash::Handle<
                     crate::schemas::Embedding,
                 >,
             >,

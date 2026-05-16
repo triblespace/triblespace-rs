@@ -33,7 +33,7 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use std::convert::Infallible;
 
 /// A value schema for an unknown value.
@@ -49,7 +49,7 @@ impl MetaDescribe for UnknownInline {
         let id: Id = id_hex!("4EC697E8599AC79D667C722E2C8BEBF4");
         #[allow(unused_mut)]
         let mut tribles = entity! {
-            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_VALUE_SCHEMA
+            ExclusiveId::force_ref(&id) @ metadata::tag: metadata::KIND_INLINE_ENCODING
         };
         #[cfg(feature = "wasm")]
         {
@@ -82,7 +82,7 @@ mod wasm_formatter {
     }
 }
 
-impl InlineSchema for UnknownInline {
+impl InlineEncoding for UnknownInline {
     type ValidationError = Infallible;
     type Encoding = Self;
 

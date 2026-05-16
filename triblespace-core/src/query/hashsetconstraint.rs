@@ -14,7 +14,7 @@ use super::*;
 /// Proposals enumerate every element in the set; confirmations retain
 /// only proposals that the set contains. Accepts `&HashSet<T>`,
 /// `Rc<HashSet<T>>`, and `Arc<HashSet<T>>` as the backing store.
-pub struct SetConstraint<S: InlineSchema, R, T>
+pub struct SetConstraint<S: InlineEncoding, R, T>
 where
     R: Deref<Target = HashSet<T>>,
 {
@@ -22,7 +22,7 @@ where
     set: R,
 }
 
-impl<S: InlineSchema, R, T> SetConstraint<S, R, T>
+impl<S: InlineEncoding, R, T> SetConstraint<S, R, T>
 where
     R: Deref<Target = HashSet<T>>,
 {
@@ -32,7 +32,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, R, T> Constraint<'a> for SetConstraint<S, R, T>
+impl<'a, S: InlineEncoding, R, T> Constraint<'a> for SetConstraint<S, R, T>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,
@@ -69,7 +69,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for &'a HashSet<T>
+impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for &'a HashSet<T>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,
@@ -81,7 +81,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
+impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,
@@ -93,7 +93,7 @@ where
     }
 }
 
-impl<'a, S: InlineSchema, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
+impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
     for<'b> &'b T: IntoInline<S>,

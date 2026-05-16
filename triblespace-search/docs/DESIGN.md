@@ -56,7 +56,7 @@ time.
 
 Self-contained blob, zero-copy via `anybytes::Bytes`, bit-packed
 via jerky. Schema id: `5A1EF3FFD638B15E3EBEAA1E92660441` (see
-`succinct::SuccinctBM25Blob`). The typed `BlobSchema` handle is
+`succinct::SuccinctBM25Blob`). The typed `BlobEncoding` handle is
 the identity — no magic bytes, no version field in the blob.
 A breaking format change mints a new schema id.
 
@@ -104,7 +104,7 @@ The four `CompactVectorMetaOnDisk` structs are a
 `CompactVectorMeta` (jerky's upstream derives only `FromBytes`).
 Four `u64` fields, 32 bytes each, `#[repr(C)]`. The
 `CompressedUniverseMetaOnDisk` is the same trick for
-`triblespace::core::blob::schemas::succinctarchive::CompressedUniverseMeta`
+`triblespace::core::blob::encodings::succinctarchive::CompressedUniverseMeta`
 — five `u64` fields, 40 bytes, `#[repr(C)]`. Static asserts in
 `succinct.rs` lock the size and layout equivalence.
 
@@ -344,7 +344,7 @@ callers collect the iterator and slice.
 | `Inline`, `Id`, `TribleSet`    | triblespace             |
 | Blob byte buffers (mmap)      | anybytes                |
 | Succinct primitives           | jerky                   |
-| BlobSchema + constraints      | **triblespace-search**  |
+| BlobEncoding + constraints      | **triblespace-search**  |
 | Tokenizers (opt-in helpers)   | **triblespace-search**  |
 | Caller-supplied embeddings    | downstream              |
 

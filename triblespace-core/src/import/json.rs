@@ -14,7 +14,7 @@ use std::str::FromStr;
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
-use crate::blob::schemas::longstring::LongString;
+use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::attribute::Attribute;
@@ -24,12 +24,12 @@ use crate::metadata;
 use crate::metadata::{MetaDescribe, Describe};
 use crate::repo::BlobStore;
 use crate::trible::{Fragment, Trible, TribleSet};
-use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::f64::F64;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::schemas::UnknownInline;
-use crate::value::{RawInline, IntoInline, Inline, InlineSchema};
+use crate::value::encodings::boolean::Boolean;
+use crate::value::encodings::f64::F64;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::hash::{Blake3, Handle};
+use crate::value::encodings::UnknownInline;
+use crate::value::{RawInline, IntoInline, Inline, InlineEncoding};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
@@ -151,7 +151,7 @@ impl<'a, Store> JsonObjectImporter<'a, Store>
 where
     Store: BlobStore,
 {
-    fn attr_from_field<S: InlineSchema + MetaDescribe>(
+    fn attr_from_field<S: InlineEncoding + MetaDescribe>(
         &mut self,
         field: &ParsedString,
     ) -> Result<Attribute<S>, JsonImportError> {
@@ -164,7 +164,7 @@ where
                 })?;
         Ok(Attribute::<S>::from(entity! {
             metadata::name:         handle,
-            metadata::value_schema: <S as MetaDescribe>::id(),
+            metadata::value_encoding: <S as MetaDescribe>::id(),
         }))
     }
 
@@ -686,7 +686,7 @@ mod tests {
             .get_handle();
         let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
             metadata::name:         h,
-            metadata::value_schema: <Handle<LongString> as MetaDescribe>::id(),
+            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
         })
         .id();
         let trible = facts

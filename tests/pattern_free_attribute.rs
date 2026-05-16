@@ -17,15 +17,15 @@
 //! for general-purpose schema-erased iteration over an entity.
 
 use std::collections::HashSet;
-use triblespace::prelude::inlineschemas::ShortString;
+use triblespace::prelude::inlineencodings::ShortString;
 use triblespace::prelude::*;
 
 mod ns {
     use triblespace::prelude::*;
     attributes! {
-        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" as name: inlineschemas::ShortString;
-        "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B" as friend: inlineschemas::GenId;
-        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" as nickname: inlineschemas::ShortString;
+        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" as name: inlineencodings::ShortString;
+        "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B" as friend: inlineencodings::GenId;
+        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" as nickname: inlineencodings::ShortString;
     }
 }
 

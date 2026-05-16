@@ -16,14 +16,14 @@
 //!    (`Array<F32>` ≠ `Array<U8>`, `Handle<LongString>` ≠
 //!    `Handle<RawBytes>`).
 
-use triblespace_core::blob::schemas::array::{
+use triblespace_core::blob::encodings::array::{
     elements::{F32, U8},
     Array,
 };
-use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::blob::schemas::rawbytes::RawBytes;
+use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::rawbytes::RawBytes;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::encodings::hash::{Blake3, Handle};
 
 #[test]
 fn handle_id_is_deterministic() {
@@ -89,7 +89,7 @@ fn array_describe_carries_element_schema_annotations() {
     use triblespace_core::id::Id;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::encodings::hash::Handle;
     use triblespace_core::value::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
@@ -130,7 +130,7 @@ fn array_describe_carries_element_schema_annotations() {
 /// `Handle<H, T>::describe` spreads *two* sub-schemas (blob and hash)
 /// in its entity core. Both sub-schemas' annotations should make it
 /// into the metadata fragment alongside the handle's own annotations —
-/// linked through `metadata::blob_schema` and `metadata::hash_schema`
+/// linked through `metadata::blob_encoding` and `metadata::hash_schema`
 /// respectively. This is the multi-spread sibling of
 /// `array_describe_carries_element_schema_annotations`.
 #[test]
@@ -147,10 +147,10 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     let hash_schema_id = Blake3::id();
 
     // The handle's id is linked to both sub-schemas via
-    // `metadata::blob_schema` and `metadata::hash_schema`.
+    // `metadata::blob_encoding` and `metadata::hash_schema`.
     let blob_links: Vec<Id> = find!(
         (item: Id),
-        pattern!(&frag, [{ handle_id @ metadata::blob_schema: ?item }])
+        pattern!(&frag, [{ handle_id @ metadata::blob_encoding: ?item }])
     )
     .map(|(item,)| item)
     .collect();
@@ -208,7 +208,7 @@ fn entity_spread_propagates_blobs() {
     use triblespace_core::metadata;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::encodings::hash::Handle;
     use triblespace_core::value::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();

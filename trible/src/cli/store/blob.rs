@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::cli::util::parse_blob_handle;
 use object_store::parse_url;
-use triblespace_core::blob::schemas::UnknownBlob;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Bytes;
 use triblespace_core::repo::objectstore::ObjectStoreRemote;
 use triblespace_core::repo::BlobStore;
@@ -13,8 +13,8 @@ use triblespace_core::repo::BlobStoreForget;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::repo::BlobStoreList;
 use triblespace_core::repo::BlobStoreMeta;
-use triblespace_core::value::schemas::hash::Blake3;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Blake3;
+use triblespace_core::value::encodings::hash::Handle;
 use url::Url;
 
 #[derive(Parser)]
@@ -72,8 +72,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 match item_res {
                     Ok(handle_val) => {
                         let hash: triblespace_core::value::Inline<
-                            triblespace_core::value::schemas::hash::Hash<
-                                triblespace_core::value::schemas::hash::Blake3,
+                            triblespace_core::value::encodings::hash::Hash<
+                                triblespace_core::value::encodings::hash::Blake3,
                             >,
                         > = Handle::to_hash(handle_val);
                         let string: String = hash.from_inline();
@@ -86,11 +86,11 @@ pub fn run(cmd: Command) -> Result<()> {
             Ok(())
         }
         Command::Put { url, file } => {
-            use triblespace::prelude::blobschemas::RawBytes;
+            use triblespace::prelude::blobencodings::RawBytes;
             use triblespace::prelude::BlobStorePut;
             use triblespace_core::blob::Bytes;
 
-            use triblespace_core::value::schemas::hash::Hash;
+            use triblespace_core::value::encodings::hash::Hash;
 
             let url = Url::parse(&url)?;
             let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;

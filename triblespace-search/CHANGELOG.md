@@ -702,7 +702,7 @@ schema of their own.
 
 ### Schemas
 
-- `schemas::F32LE` — 32-byte `InlineSchema` for `f32` scores,
+- `schemas::F32LE` — 32-byte `InlineEncoding` for `f32` scores,
   used by the scored BM25 + similarity constraints.
 
 ### Examples (runnable)

@@ -15,7 +15,7 @@ use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::schemas::genid::GenId;
+use crate::value::encodings::genid::GenId;
 use crate::value::Inline;
 use crate::value::RawInline;
 use crate::value::IntoInline;

@@ -7,20 +7,20 @@ use std::path::PathBuf;
 
 // DEFAULT_MAX_PILE_SIZE removed; the new Pile API no longer uses a size const generic
 
-use triblespace::prelude::blobschemas::SimpleArchive;
+use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStorePut;
 use triblespace::prelude::BranchStore;
 use triblespace::prelude::View;
-use triblespace_core::blob::schemas::longstring::LongString;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::id_hex;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::{Blake3, Handle, Hash};
+use triblespace_core::value::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::value::Inline;
 
 use super::signing::load_signing_key;
@@ -395,13 +395,13 @@ pub fn run(cmd: Command) -> Result<()> {
             res.and(close_res)?;
         }
         Command::Inspect { pile, branch } => {
-            use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::inlineschemas::Handle;
+            use triblespace::prelude::blobencodings::SimpleArchive;
+            use triblespace::prelude::inlineencodings::Handle;
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
-            use triblespace_core::value::schemas::hash::Blake3;
-            use triblespace_core::value::schemas::hash::Hash;
+            use triblespace_core::value::encodings::hash::Blake3;
+            use triblespace_core::value::encodings::hash::Hash;
             use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -500,8 +500,8 @@ pub fn run(cmd: Command) -> Result<()> {
             meta,
             expected,
         } => {
-            use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::inlineschemas::Handle;
+            use triblespace::prelude::blobencodings::SimpleArchive;
+            use triblespace::prelude::inlineencodings::Handle;
             use triblespace_core::repo::pile::Pile;
             
             use triblespace_core::value::Inline;
@@ -621,7 +621,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
             
-            use triblespace_core::value::schemas::hash::Handle;
+            use triblespace_core::value::encodings::hash::Handle;
             use triblespace_core::value::Inline;
 
             let bid = parse_branch_id_hex(&branch)?;
@@ -716,13 +716,13 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Stats { pile, branch, full } => {
             use std::collections::{BTreeSet, HashSet};
-            use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::inlineschemas::Handle;
+            use triblespace::prelude::blobencodings::SimpleArchive;
+            use triblespace::prelude::inlineencodings::Handle;
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
-            use triblespace_core::value::schemas::hash::Blake3;
-            use triblespace_core::value::schemas::hash::Hash;
+            use triblespace_core::value::encodings::hash::Blake3;
+            use triblespace_core::value::encodings::hash::Hash;
             use triblespace_core::value::Inline;
 
             let mut pile: Pile = Pile::open(&pile)?;
@@ -860,12 +860,12 @@ pub fn run(cmd: Command) -> Result<()> {
             to_id,
             signing_key,
         } => {
-            use triblespace::prelude::blobschemas::SimpleArchive;
+            use triblespace::prelude::blobencodings::SimpleArchive;
             use triblespace_core::repo;
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::repo::Repository;
             
-            use triblespace_core::value::schemas::hash::Handle;
+            use triblespace_core::value::encodings::hash::Handle;
             use triblespace_core::value::Inline;
 
             struct CopyStats {
@@ -1347,7 +1347,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     };
 
                     let ts_str = if let Some(ts_val) = info.timestamp {
-                        use triblespace_core::value::schemas::time::Lower;
+                        use triblespace_core::value::encodings::time::Lower;
                         let lower: Lower = ts_val.try_from_inline().unwrap_or(Lower(0));
                         let epoch = hifitime::Epoch::from_tai_duration(
                             hifitime::Duration::from_total_nanoseconds(lower.0));
@@ -1577,7 +1577,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             let mut usage_entities: HashSet<Id> = HashSet::new();
                             for t in meta_set.iter() {
                                 if t.a() == &tag_attr {
-                                    let v: Inline<triblespace::prelude::inlineschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::inlineencodings::GenId> =
                                         *t.v();
                                     if let Ok(gid) =
                                         v.try_from_inline::<triblespace_core::id::Id>()
@@ -1595,7 +1595,7 @@ pub fn run(cmd: Command) -> Result<()> {
                                     continue;
                                 }
                                 if t.a() == &attr_attr {
-                                    let v: Inline<triblespace::prelude::inlineschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::inlineencodings::GenId> =
                                         *t.v();
                                     if let Ok(described_id) =
                                         v.try_from_inline::<triblespace_core::id::Id>()
@@ -1872,16 +1872,16 @@ struct CommitInfo {
     metadata: Option<Inline<Handle<SimpleArchive>>>,
     message: Option<Inline<Handle<LongString>>>,
     short_message: Option<String>,
-    timestamp: Option<Inline<triblespace_core::value::schemas::time::NsTAIInterval>>,
+    timestamp: Option<Inline<triblespace_core::value::encodings::time::NsTAIInterval>>,
     signed_by: Option<[u8; 32]>,
 }
 
 /// Parse a commit TribleSet into structured fields.
 fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     use triblespace_core::repo;
-    use triblespace_core::value::schemas::ed25519 as ed;
-    use triblespace_core::value::schemas::shortstring::ShortString;
-    use triblespace_core::value::schemas::time::NsTAIInterval;
+    use triblespace_core::value::encodings::ed25519 as ed;
+    use triblespace_core::value::encodings::shortstring::ShortString;
+    use triblespace_core::value::encodings::time::NsTAIInterval;
 
     let content_attr = repo::content.id();
     let metadata_attr = repo::metadata.id();
@@ -1937,8 +1937,8 @@ fn blob_padding(len: u64) -> u64 {
 }
 
 fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> {
-    use triblespace::prelude::blobschemas::SimpleArchive;
-    use triblespace::prelude::inlineschemas::Handle;
+    use triblespace::prelude::blobencodings::SimpleArchive;
+    use triblespace::prelude::inlineencodings::Handle;
     use triblespace_core::repo;
     
     use triblespace_core::value::Inline;

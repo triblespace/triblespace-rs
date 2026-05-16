@@ -23,16 +23,16 @@ use std::collections::HashMap;
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::{BlobSchema, IntoBlob};
-use triblespace_core::blob::schemas::UnknownBlob;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::{BlobEncoding, IntoBlob};
+use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{
     BlobStore, BlobStoreList, BlobStorePut, BranchStore, PushResult,
 };
 use triblespace_core::value::Inline;
-use triblespace_core::value::InlineSchema;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::InlineEncoding;
+use triblespace_core::value::encodings::hash::Handle;
 
 use crate::channel::NetEvent;
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
@@ -66,7 +66,7 @@ pub use crate::host::PeerConfig;
 /// use ed25519_dalek::SigningKey;
 /// use rand::rngs::OsRng;
 /// use triblespace_core::repo::pile::Pile;
-/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_core::value::encodings::hash::Blake3;
 /// use triblespace_net::peer::{Peer, PeerConfig};
 ///
 /// let key = SigningKey::generate(&mut OsRng);
@@ -225,9 +225,9 @@ where
         handle: Inline<Handle<Sch>>,
     ) -> anyhow::Result<Option<T>>
     where
-        Sch: BlobSchema + 'static,
+        Sch: BlobEncoding + 'static,
         T: triblespace_core::blob::TryFromBlob<Sch>,
-        Handle<Sch>: InlineSchema,
+        Handle<Sch>: InlineEncoding,
     {
         let Some(bytes) = self.sender.fetch(peer, handle.raw)? else {
             return Ok(None);
@@ -400,9 +400,9 @@ where
 
     fn put<Sch, T>(&mut self, item: T) -> Result<Inline<Handle<Sch>>, Self::PutError>
     where
-        Sch: BlobSchema + 'static,
+        Sch: BlobEncoding + 'static,
         T: IntoBlob<Sch>,
-        Handle<Sch>: InlineSchema,
+        Handle<Sch>: InlineEncoding,
     {
         let handle = self.store.put(item)?;
         self.sender.announce(handle.raw);
@@ -494,7 +494,7 @@ pub fn resolve_branch_name<S>(
 where
     S: BlobStore + BlobStorePut + BranchStore,
 {
-    use triblespace_core::blob::schemas::longstring::LongString;
+    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::trible::TribleSet;
 
@@ -527,7 +527,7 @@ where
 /// first (normal branches) and falls back to `remote_name` (tracking
 /// branches mirrored from a remote peer).
 fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<String> {
-    use triblespace_core::blob::schemas::longstring::LongString;
+    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::macros::{find, pattern};
 

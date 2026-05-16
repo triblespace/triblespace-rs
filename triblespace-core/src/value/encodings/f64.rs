@@ -11,7 +11,7 @@ use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use serde_json::Number as JsonNumber;
 use std::convert::Infallible;
 use std::fmt;
@@ -31,7 +31,7 @@ impl MetaDescribe for F64 {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -61,7 +61,7 @@ mod wasm_formatter {
     }
 }
 
-impl InlineSchema for F64 {
+impl InlineEncoding for F64 {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

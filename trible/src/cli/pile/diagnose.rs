@@ -35,14 +35,14 @@ pub fn run(cmd: Command) -> Result<()> {
 }
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
-    use triblespace::prelude::blobschemas::{LongString, SimpleArchive};
+    use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
     use triblespace::prelude::{BlobStore, BlobStoreGet, BranchStore};
 
     use triblespace_core::id::id_hex;
     use triblespace_core::repo::BlobStoreMeta;
     use triblespace_core::repo::pile::{Pile, ReadError};
     use triblespace_core::trible::TribleSet;
-    use triblespace_core::value::schemas::hash::{Blake3, Handle, Hash};
+    use triblespace_core::value::encodings::hash::{Blake3, Handle, Hash};
     use triblespace_core::value::Inline;
 
     match Pile::open(pile_path) {
@@ -290,8 +290,8 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     use memchr::memmem::Finder;
     use triblespace_core::blob::Bytes;
     use triblespace_core::id::id_hex;
-    use triblespace_core::value::schemas::hash::Blake3;
-    use triblespace_core::value::schemas::hash::Hash;
+    use triblespace_core::value::encodings::hash::Blake3;
+    use triblespace_core::value::encodings::hash::Hash;
     use triblespace_core::value::Inline;
 
     let handle = handle.trim();

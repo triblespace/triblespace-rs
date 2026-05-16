@@ -10,9 +10,9 @@ pub mod ntriples;
 
 use triblespace_core_macros::attributes;
 
-use crate::blob::schemas::longstring::LongString;
-use crate::value::schemas::hash::Handle;
-use crate::value::schemas::shortstring::ShortString;
+use crate::blob::encodings::longstring::LongString;
+use crate::value::encodings::hash::Handle;
+use crate::value::encodings::shortstring::ShortString;
 
 attributes! {
     /// The canonical RDF URI for an entity. Use this when importing data

@@ -3,7 +3,7 @@
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::patch::Entry;
 use crate::trible::Trible;
-use crate::value::schemas::UnknownInline;
+use crate::value::encodings::UnknownInline;
 use crate::value::{Inline, INLINE_LEN};
 use kani::BoundedArbitrary;
 

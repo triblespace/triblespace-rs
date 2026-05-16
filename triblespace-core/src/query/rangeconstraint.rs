@@ -26,7 +26,7 @@ pub struct InlineRange {
 
 impl InlineRange {
     /// Create a range constraint on `variable` with inclusive bounds.
-    pub fn new<T: InlineSchema>(variable: Variable<T>, min: Inline<T>, max: Inline<T>) -> Self {
+    pub fn new<T: InlineEncoding>(variable: Variable<T>, min: Inline<T>, max: Inline<T>) -> Self {
         InlineRange {
             variable: variable.index,
             min: min.raw,
@@ -36,7 +36,7 @@ impl InlineRange {
 }
 
 /// Convenience function to create a [`InlineRange`] constraint.
-pub fn value_range<T: InlineSchema>(
+pub fn value_range<T: InlineEncoding>(
     variable: Variable<T>,
     min: Inline<T>,
     max: Inline<T>,
@@ -82,7 +82,7 @@ impl<'a> Constraint<'a> for InlineRange {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::inlineschemas::R256;
+    use crate::prelude::inlineencodings::R256;
     use crate::prelude::*;
 
     attributes! {

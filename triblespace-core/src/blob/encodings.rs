@@ -16,7 +16,7 @@ pub mod wasmcode;
 use crate::value::Encodes;
 use anybytes::Bytes;
 
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
@@ -31,7 +31,7 @@ use super::TryFromBlob;
 ///
 /// Any bit pattern can be a valid blob of this schema.
 pub struct UnknownBlob;
-impl BlobSchema for UnknownBlob {}
+impl BlobEncoding for UnknownBlob {}
 
 impl MetaDescribe for UnknownBlob {
     fn describe() -> crate::trible::Fragment {
@@ -50,7 +50,7 @@ impl MetaDescribe for UnknownBlob {
             entity! { id_ref @
                 metadata::name:        name,
                 metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_SCHEMA,
+                metadata::tag:         metadata::KIND_BLOB_ENCODING,
             }
         })
     }
@@ -65,7 +65,7 @@ impl TryFromBlob<UnknownBlob> for Bytes {
 }
 
 impl Encodes<Bytes> for UnknownBlob
-where crate::value::schemas::hash::Handle<UnknownBlob>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<UnknownBlob>: crate::value::InlineEncoding,
 {
     type Output = Blob<UnknownBlob>;
     fn encode(source: Bytes) -> Blob<UnknownBlob> {

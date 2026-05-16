@@ -3,11 +3,11 @@
 //! `cwork:dateModified`), which collapsed before this constraint
 //! existed because the previous fallback was a full V-column scan.
 
-use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
-use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
+use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
+use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::VariableContext;
-use triblespace::prelude::inlineschemas::R256BE;
+use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
 
 attributes! {

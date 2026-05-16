@@ -27,7 +27,7 @@
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
 //! use triblespace::prelude::*;
-//! use triblespace::prelude::inlineschemas::{GenId, ShortString};
+//! use triblespace::prelude::inlineencodings::{GenId, ShortString};
 //! use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
 //!
 //! let storage = MemoryRepo::default();
@@ -165,10 +165,10 @@ use commit::commit_metadata;
 use hifitime::Epoch;
 use itertools::Itertools;
 
-use crate::blob::schemas::simplearchive::UnarchiveError;
-use crate::blob::schemas::UnknownBlob;
+use crate::blob::encodings::simplearchive::UnarchiveError;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::MemoryBlobStore;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
@@ -178,21 +178,21 @@ use crate::id::Id;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::prelude::inlineschemas::GenId;
+use crate::prelude::inlineencodings::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::hash::Handle;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use crate::value::INLINE_LEN;
 use ed25519_dalek::SigningKey;
 
-use crate::blob::schemas::longstring::LongString;
-use crate::blob::schemas::simplearchive::SimpleArchive;
-use crate::blob::schemas::succinctarchive::SuccinctArchiveBlob;
+use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::prelude::*;
-use crate::value::schemas::ed25519 as ed;
-use crate::value::schemas::shortstring::ShortString;
+use crate::value::encodings::ed25519 as ed;
+use crate::value::encodings::shortstring::ShortString;
 
 attributes! {
     /// The actual data of the commit.
@@ -277,8 +277,8 @@ pub trait BlobStoreMeta {
         handle: Inline<Handle<S>>,
     ) -> Result<Option<BlobMetadata>, Self::MetaError>
     where
-        S: BlobSchema + 'static,
-        Handle<S>: InlineSchema;
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
 }
 
 /// Trait exposing a monotonic "forget" operation.
@@ -292,8 +292,8 @@ pub trait BlobStoreForget {
     /// Removes the materialized blob identified by `handle` from this store.
     fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
     where
-        S: BlobSchema + 'static,
-        Handle<S>: InlineSchema;
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
 }
 
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
@@ -314,9 +314,9 @@ pub trait BlobStoreGet {
         handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: InlineSchema;
+        Handle<S>: InlineEncoding;
 }
 
 /// The `PutBlob` trait is used to store blobs in a repository.
@@ -327,9 +327,9 @@ pub trait BlobStorePut {
     /// Serialises `item` as a blob, stores it, and returns its handle.
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema;
+        Handle<S>: InlineEncoding;
 }
 
 /// Combined read/write blob storage.
@@ -1226,7 +1226,7 @@ where
         }
     }
 
-    /// Builds a [`SuccinctArchive`](crate::blob::schemas::succinctarchive::SuccinctArchive) rollup of the branch's current HEAD,
+    /// Builds a [`SuccinctArchive`](crate::blob::encodings::succinctarchive::SuccinctArchive) rollup of the branch's current HEAD,
     /// stores it as a blob in the underlying storage, and attaches the
     /// resulting handle to the branch metadata via CAS.
     ///
@@ -1246,10 +1246,10 @@ where
         &mut self,
         branch_id: Id,
     ) -> Result<
-        Inline<Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
+        Inline<Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>>,
         RollupError<Storage>,
     > {
-        use crate::blob::schemas::succinctarchive::{OrderedUniverse, SuccinctArchive};
+        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
         use crate::blob::IntoBlob;
 
         let mut ws = self.pull(branch_id).map_err(RollupError::Pull)?;
@@ -1265,7 +1265,7 @@ where
         // staging needed; the CAS below references it by handle.
         let archive_blob = (&archive).to_blob();
         let handle: Inline<
-            Handle<crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>,
+            Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>,
         > = self
             .storage
             .put(archive_blob)
@@ -2114,9 +2114,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// Mirrors [`BlobStorePut::put`](crate::repo::BlobStorePut) for ease of use.
     pub fn put<S, T>(&mut self, item: T) -> Inline<Handle<S>>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         self.staged.put(item).expect("infallible blob put")
     }
@@ -2131,9 +2131,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         handle: Inline<Handle<S>>,
     ) -> Result<T, <Blobs::Reader as BlobStoreGet>::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         self.staged
             .reader()

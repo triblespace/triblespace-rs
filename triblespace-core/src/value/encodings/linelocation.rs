@@ -11,7 +11,7 @@ use crate::value::RawInline;
 use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use proc_macro::Span;
 use std::convert::Infallible;
 
@@ -32,7 +32,7 @@ impl MetaDescribe for LineLocation {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -69,7 +69,7 @@ mod wasm_formatter {
     }
 }
 
-impl InlineSchema for LineLocation {
+impl InlineEncoding for LineLocation {
     type ValidationError = Infallible;
     type Encoding = Self;
 }

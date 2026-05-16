@@ -191,7 +191,7 @@ fn find_matches_term_on_succinct() {
 fn find_hnsw_similar_on_succinct() {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
-    use triblespace_core::value::schemas::hash::Handle;
+    use triblespace_core::value::encodings::hash::Handle;
     use triblespace_core::value::Inline;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};

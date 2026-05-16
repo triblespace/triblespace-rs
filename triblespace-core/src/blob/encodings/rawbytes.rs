@@ -1,6 +1,6 @@
 use crate::value::Encodes;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -28,7 +28,7 @@ use anybytes::Bytes;
 /// supply the meaning.
 pub struct RawBytes;
 
-impl BlobSchema for RawBytes {}
+impl BlobEncoding for RawBytes {}
 
 impl MetaDescribe for RawBytes {
     fn describe() -> Fragment {
@@ -42,7 +42,7 @@ impl MetaDescribe for RawBytes {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         tribles
     }
@@ -57,7 +57,7 @@ impl TryFromBlob<RawBytes> for Bytes {
 }
 
 impl Encodes<Bytes> for RawBytes
-where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Bytes) -> Blob<RawBytes> {
@@ -66,7 +66,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 }
 
 impl Encodes<Vec<u8>> for RawBytes
-where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Vec<u8>) -> Blob<RawBytes> {
@@ -75,7 +75,7 @@ where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
 }
 
 impl Encodes<&[u8]> for RawBytes
-where crate::value::schemas::hash::Handle<RawBytes>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<RawBytes>: crate::value::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: &[u8]) -> Blob<RawBytes> {

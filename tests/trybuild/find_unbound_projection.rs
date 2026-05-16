@@ -4,7 +4,7 @@ mod social {
     use triblespace::prelude::*;
 
     attributes! {
-        "C2C8D4D6E3E5479EA6F4D71D979CD3CE" as friend: inlineschemas::GenId;
+        "C2C8D4D6E3E5479EA6F4D71D979CD3CE" as friend: inlineencodings::GenId;
     }
 }
 

@@ -19,8 +19,8 @@ use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
-use crate::value::schemas::genid::GenId;
-use crate::value::InlineSchema;
+use crate::value::encodings::genid::GenId;
+use crate::value::InlineEncoding;
 
 use std::iter::FromIterator;
 use std::iter::Map;
@@ -183,7 +183,7 @@ impl TribleSet {
     ///     )
     /// )
     /// ```
-    pub fn value_in_range<V: InlineSchema>(
+    pub fn value_in_range<V: InlineEncoding>(
         &self,
         variable: Variable<V>,
         min: Inline<V>,
@@ -293,7 +293,7 @@ impl FromIterator<Trible> for TribleSet {
 impl TriblePattern for TribleSet {
     type PatternConstraint<'a> = TribleSetConstraint;
 
-    fn pattern<V: InlineSchema>(
+    fn pattern<V: InlineEncoding>(
         &self,
         e: Variable<GenId>,
         a: Variable<GenId>,

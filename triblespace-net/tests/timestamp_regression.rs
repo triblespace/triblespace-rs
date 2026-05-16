@@ -4,8 +4,8 @@
 //! a late-finishing fetch for an older HEAD from clobbering a newer HEAD
 //! that already advanced the tracking branch.
 
-use triblespace_core::blob::schemas::longstring::LongString;
-use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::id::{genid, Id};
 use triblespace_core::macros::entity;
@@ -14,7 +14,7 @@ use triblespace_core::repo::branch::branch_unsigned;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 use triblespace_net::tracking;
 

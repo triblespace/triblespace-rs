@@ -35,8 +35,8 @@ mod instrumentation_attributes {
     /// Reuses `metadata::name`, `metadata::attribute`, and `metadata::tag` for
     /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
-        use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::inlineschemas::{Handle, ShortString};
+        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::prelude::inlineencodings::{Handle, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
@@ -48,8 +48,8 @@ mod instrumentation_attributes {
     }
 
     pub(crate) mod invocation {
-        use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::inlineschemas::{Handle, LineLocation, ShortString};
+        use triblespace_core::blob::encodings::longstring::LongString;
+        use triblespace_core::prelude::inlineencodings::{Handle, LineLocation, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
@@ -243,8 +243,8 @@ impl Parse for AttributeDefinitions {
 
 fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
     use triblespace_core::metadata;
-    use triblespace_core::prelude::InlineSchema;
-    use triblespace_core::value::schemas::genid::GenId;
+    use triblespace_core::prelude::InlineEncoding;
+    use triblespace_core::value::encodings::genid::GenId;
 
     let Ok(parsed) =
         syn::parse2::<AttributeDefinitions>(TokenStream2::from(context.tokens().clone()))
@@ -299,7 +299,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
 /// ```rust,ignore
 /// mod social {
 ///     use triblespace::prelude::*;
-///     use triblespace::prelude::inlineschemas::{GenId, ShortString};
+///     use triblespace::prelude::inlineencodings::{GenId, ShortString};
 ///
 ///     attributes! {
 ///         /// A person's display name.

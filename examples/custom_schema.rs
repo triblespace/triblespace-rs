@@ -1,13 +1,13 @@
 use anybytes::Bytes;
 use std::convert::Infallible;
 use triblespace::core::blob::Blob;
-use triblespace::core::blob::BlobSchema;
+use triblespace::core::blob::BlobEncoding;
 use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::value::TryFromInline;
 use triblespace::core::value::Inline;
-use triblespace::core::value::InlineSchema;
+use triblespace::core::value::InlineEncoding;
 use triblespace::core::value::Encodes;
 use triblespace::core::value::INLINE_LEN;
 
@@ -24,7 +24,7 @@ impl MetaDescribe for U64LE {
     }
 }
 
-impl InlineSchema for U64LE {
+impl InlineEncoding for U64LE {
     type ValidationError = Infallible;
     type Encoding = Self;
 }
@@ -57,7 +57,7 @@ impl MetaDescribe for BytesBlob {
     }
 }
 
-impl BlobSchema for BytesBlob {}
+impl BlobEncoding for BytesBlob {}
 
 impl Encodes<Bytes> for BytesBlob
 {

@@ -6,7 +6,7 @@ relate to one another in TribleSpace.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
-middle position in a trible and carry the `InlineSchema` (or blob-handle schema)
+middle position in a trible and carry the `InlineEncoding` (or blob-handle schema)
 that interprets and validates the value. Modules mint them with the
 `attributes!` macro, so they behave like detached struct fields: each attribute
 remains independently typed even when many are combined to describe the same
@@ -20,7 +20,7 @@ takes the root for you), which is handy for short-lived or internal attributes.
 An immutable chunk of binary data addressed by the hash of its contents. Blobs
 store payloads that do not fit in the fixed 32-byte value slot—long strings,
 media assets, archived `TribleSet`s, commit metadata, and other large
-artifacts. Each blob is tagged with a `BlobSchema` so applications can decode it
+artifacts. Each blob is tagged with a `BlobEncoding` so applications can decode it
 back into native types.
 
 ### Blob Store

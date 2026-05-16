@@ -1,6 +1,6 @@
 use anybytes::Bytes;
 use tempfile::tempdir;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::BlobStore;

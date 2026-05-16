@@ -31,8 +31,8 @@ use triblespace::prelude::*;
 
 mod literature {
     use triblespace::prelude::*;
-    use triblespace::prelude::blobschemas::LongString;
-    use triblespace::prelude::inlineschemas::{Blake3, GenId, Handle, R256, ShortString};
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
 
     attributes! {
         /// The title of a work.

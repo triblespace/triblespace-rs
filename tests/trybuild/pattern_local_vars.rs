@@ -4,9 +4,9 @@ mod ns {
     use triblespace::prelude::*;
 
     attributes! {
-        "71C9AB6D8DF645C894D4473ED04E12CC" as attr: inlineschemas::GenId;
-        "4E6F8648635C4F84A79F4C54602C1E5A" as label: inlineschemas::ShortString;
-        "32C5243958B147B6ACDEAB7D5EEAC669" as alias: inlineschemas::ShortString;
+        "71C9AB6D8DF645C894D4473ED04E12CC" as attr: inlineencodings::GenId;
+        "4E6F8648635C4F84A79F4C54602C1E5A" as label: inlineencodings::ShortString;
+        "32C5243958B147B6ACDEAB7D5EEAC669" as alias: inlineencodings::ShortString;
     }
 }
 

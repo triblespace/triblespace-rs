@@ -6,7 +6,7 @@ use crate::query::VariableSet;
 use crate::trible::TribleSet;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use crate::value::INLINE_LEN;
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
@@ -38,7 +38,7 @@ pub struct TribleSetRangeConstraint {
 }
 
 impl TribleSetRangeConstraint {
-    pub fn new<V: InlineSchema>(
+    pub fn new<V: InlineEncoding>(
         variable_v: Variable<V>,
         min: Inline<V>,
         max: Inline<V>,
@@ -101,7 +101,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::inlineschemas::R256BE;
+    use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
 
     attributes! {

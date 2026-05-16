@@ -3,7 +3,7 @@ use std::fmt;
 use std::fmt::Write as FmtWrite;
 
 use crate::and;
-use crate::blob::schemas::longstring::LongString;
+use crate::blob::encodings::longstring::LongString;
 use crate::id::Id;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -12,11 +12,11 @@ use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;
 use crate::temp;
 use crate::trible::TribleSet;
-use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::f64::F64;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle, Hash};
-use crate::value::schemas::UnknownInline;
+use crate::value::encodings::boolean::Boolean;
+use crate::value::encodings::f64::F64;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::hash::{Blake3, Handle, Hash};
+use crate::value::encodings::UnknownInline;
 use crate::value::RawInline;
 use crate::value::IntoInline;
 use crate::value::Inline;
@@ -114,7 +114,7 @@ fn write_entity(
             merged.pattern(e, attr, value),
             pattern!(merged, [
                 { ?attr @ metadata::name: ?name_handle },
-                { ?attr @ metadata::value_schema: ?schema_value }
+                { ?attr @ metadata::value_encoding: ?schema_value }
             ])
         ))
     )

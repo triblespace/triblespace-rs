@@ -80,7 +80,7 @@ handles were touched without writing bespoke walkers:
 ```rust,ignore
 use triblespace::core::blob::memoryblobstore::MemoryBlobStore;
 use triblespace::core::repo::{self, BlobStoreKeep, BlobStoreList, BranchStore};
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::value::encodings::hash::Blake3;
 
 let mut store = MemoryBlobStore::default();
 // ... populate the store or import data ...

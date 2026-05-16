@@ -8,14 +8,14 @@ use triblespace_core::query::{
     Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
-use triblespace_core::value::schemas::genid::GenId;
-use triblespace_core::value::schemas::UnknownInline;
+use triblespace_core::value::encodings::genid::GenId;
+use triblespace_core::value::encodings::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "BB00000000000000BB00000000000001" as pub link: inlineschemas::GenId;
-        "BB00000000000000BB00000000000002" as pub label: inlineschemas::ShortString;
+        "BB00000000000000BB00000000000001" as pub link: inlineencodings::GenId;
+        "BB00000000000000BB00000000000002" as pub label: inlineencodings::ShortString;
     }
 }
 
@@ -546,7 +546,7 @@ proptest! {
         values in proptest::collection::hash_set("[a-z]{1,6}", 1..15),
     ) {
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::value::schemas::shortstring::ShortString;
+        use triblespace_core::value::encodings::shortstring::ShortString;
 
         let hash: HashSet<String> = values;
         let mut sorted_vals: Vec<String> = hash.iter().cloned().collect();
@@ -590,7 +590,7 @@ proptest! {
         // `&mut [T]` (and anything that derefs to one) should sort on
         // `.has()` and produce the same rows as a pre-sorted `SortedSlice`.
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::value::schemas::shortstring::ShortString;
+        use triblespace_core::value::encodings::shortstring::ShortString;
 
         let mut shuffled: Vec<String> = values.into_iter().collect();
         // Scramble deterministically so we have something to sort.

@@ -20,6 +20,6 @@ For details, see `triblespace-rs/book/src/schemas.md`.
   to record contextual names and docs without forcing a single canonical label on the attribute id.
 
 Importers use a private attribute wrapper that emits `metadata::name` and
-`metadata::value_schema` directly on the attribute id, but *does not* emit usage
+`metadata::value_encoding` directly on the attribute id, but *does not* emit usage
 annotations. Usage annotations are reserved for code-defined attributes where
 the source context matters.

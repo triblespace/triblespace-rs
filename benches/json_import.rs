@@ -3,12 +3,12 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
-use triblespace::core::blob::schemas::longstring::LongString;
+use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json::JsonObjectImporter;
 use triblespace::core::import::json_tree::JsonTreeImporter;
-use triblespace::core::value::schemas::hash::Blake3;
+use triblespace::core::value::encodings::hash::Blake3;
 
 struct Fixture {
     name: &'static str,

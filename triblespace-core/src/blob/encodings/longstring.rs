@@ -1,6 +1,6 @@
 use crate::value::Encodes;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -16,12 +16,12 @@ use anybytes::View;
 
 /// Arbitrary-length UTF-8 text stored as a blob.
 ///
-/// Use for text that does not fit in the 32-byte [`ShortString`](crate::value::schemas::shortstring::ShortString)
+/// Use for text that does not fit in the 32-byte [`ShortString`](crate::value::encodings::shortstring::ShortString)
 /// value boundary — documents, prompts, JSON payloads, logs, etc.
-/// Reference it from tribles via a [`Handle<LongString>`](crate::value::schemas::hash::Handle).
+/// Reference it from tribles via a [`Handle<LongString>`](crate::value::encodings::hash::Handle).
 pub struct LongString {}
 
-impl BlobSchema for LongString {}
+impl BlobEncoding for LongString {}
 
 impl MetaDescribe for LongString {
     fn describe() -> Fragment {
@@ -35,7 +35,7 @@ impl MetaDescribe for LongString {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         tribles
     }
@@ -50,7 +50,7 @@ impl TryFromBlob<LongString> for View<str> {
 }
 
 impl Encodes<View<str>> for LongString
-where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: View<str>) -> Blob<LongString> {
@@ -59,7 +59,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 }
 
 impl Encodes<&'static str> for LongString
-where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: &'static str) -> Blob<LongString> {
@@ -68,7 +68,7 @@ where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchem
 }
 
 impl Encodes<String> for LongString
-where crate::value::schemas::hash::Handle<LongString>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<LongString>: crate::value::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: String) -> Blob<LongString> {
@@ -81,10 +81,10 @@ mod tests {
     use anybytes::Bytes;
     use anybytes::View;
 
-    use crate::blob::schemas::longstring::LongString;
+    use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
     
-    use crate::value::schemas::hash::Handle;
+    use crate::value::encodings::hash::Handle;
     use crate::value::Inline;
 
     #[test]

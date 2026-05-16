@@ -10,7 +10,7 @@ use triblespace_core::repo::Repository;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000001" as pub label: inlineschemas::ShortString;
+        "DD00000000000000DD00000000000001" as pub label: inlineencodings::ShortString;
     }
 }
 
@@ -321,7 +321,7 @@ proptest! {
         content in vec(any::<u8>(), 0..200),
     ) {
         use triblespace_core::blob::MemoryBlobStore;
-        use triblespace_core::blob::schemas::longstring::LongString;
+        use triblespace_core::blob::encodings::longstring::LongString;
         use triblespace_core::repo::{BlobStorePut, BlobStore, BlobStoreGet};
         use anybytes::View;
 

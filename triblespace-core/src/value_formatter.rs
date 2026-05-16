@@ -6,7 +6,7 @@ use wasmi::Linker;
 use wasmi::Module;
 use wasmi::Store;
 
-use crate::blob::schemas::wasmcode::WasmCode;
+use crate::blob::encodings::wasmcode::WasmCode;
 use crate::blob::Blob;
 
 /// Resource limits for sandboxed WASM value formatters.
@@ -261,7 +261,7 @@ mod tests {
     use crate::repo::BlobStorePut;
     use crate::trible::TribleSet;
     
-    use crate::value::schemas::hash::Handle;
+    use crate::value::encodings::hash::Handle;
     use crate::value::Inline;
 
     fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Inline<Handle<WasmCode>>> {
@@ -302,7 +302,7 @@ mod tests {
         let handle = store.put(wasm).expect("put wasm module");
         let reader = store.reader().expect("blob reader");
 
-        let schema_id = crate::value::schemas::shortstring::ShortString::id();
+        let schema_id = crate::value::encodings::shortstring::ShortString::id();
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
         let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
@@ -325,31 +325,31 @@ mod tests {
 
     #[test]
     fn builtins_emit_and_run() {
-        use crate::blob::schemas::longstring::LongString;
-        use crate::value::schemas::boolean::Boolean;
-        use crate::value::schemas::ed25519::ED25519PublicKey;
-        use crate::value::schemas::ed25519::ED25519RComponent;
-        use crate::value::schemas::ed25519::ED25519SComponent;
-        use crate::value::schemas::f256::F256BE;
-        use crate::value::schemas::f256::F256LE;
-        use crate::value::schemas::f64::F64;
-        use crate::value::schemas::genid::GenId;
-        use crate::value::schemas::hash::Blake3;
-        use crate::value::schemas::hash::Handle;
-        use crate::value::schemas::hash::Hash;
-        use crate::value::schemas::iu256::I256BE;
-        use crate::value::schemas::iu256::I256LE;
-        use crate::value::schemas::iu256::U256BE;
-        use crate::value::schemas::iu256::U256LE;
-        use crate::value::schemas::linelocation::LineLocation;
-        use crate::value::schemas::r256::R256BE;
-        use crate::value::schemas::r256::R256LE;
-        use crate::value::schemas::range::RangeInclusiveU128;
-        use crate::value::schemas::range::RangeU128;
-        use crate::value::schemas::shortstring::ShortString;
-        use crate::value::schemas::UnknownInline;
+        use crate::blob::encodings::longstring::LongString;
+        use crate::value::encodings::boolean::Boolean;
+        use crate::value::encodings::ed25519::ED25519PublicKey;
+        use crate::value::encodings::ed25519::ED25519RComponent;
+        use crate::value::encodings::ed25519::ED25519SComponent;
+        use crate::value::encodings::f256::F256BE;
+        use crate::value::encodings::f256::F256LE;
+        use crate::value::encodings::f64::F64;
+        use crate::value::encodings::genid::GenId;
+        use crate::value::encodings::hash::Blake3;
+        use crate::value::encodings::hash::Handle;
+        use crate::value::encodings::hash::Hash;
+        use crate::value::encodings::iu256::I256BE;
+        use crate::value::encodings::iu256::I256LE;
+        use crate::value::encodings::iu256::U256BE;
+        use crate::value::encodings::iu256::U256LE;
+        use crate::value::encodings::linelocation::LineLocation;
+        use crate::value::encodings::r256::R256BE;
+        use crate::value::encodings::r256::R256LE;
+        use crate::value::encodings::range::RangeInclusiveU128;
+        use crate::value::encodings::range::RangeU128;
+        use crate::value::encodings::shortstring::ShortString;
+        use crate::value::encodings::UnknownInline;
         use crate::value::Inline;
-        use crate::value::InlineSchema;
+        use crate::value::InlineEncoding;
 
         let mut bundle = crate::trible::Fragment::empty();
         bundle += Boolean::describe();

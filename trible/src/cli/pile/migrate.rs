@@ -8,17 +8,17 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStoreMeta;
 use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 
-type NameHandle = Inline<Handle<blobschemas::LongString>>;
-type BranchMetaHandle = Inline<Handle<blobschemas::SimpleArchive>>;
+type NameHandle = Inline<Handle<blobencodings::LongString>>;
+type BranchMetaHandle = Inline<Handle<blobencodings::SimpleArchive>>;
 
 mod legacy_branch_metadata {
     use super::*;
 
     // Legacy branch-name attribute (ShortString) used by older triblespace versions.
     attributes! {
-        "2E26F8BA886495A8DF04ACF0ED3ACBD4" as legacy_name: inlineschemas::ShortString;
+        "2E26F8BA886495A8DF04ACF0ED3ACBD4" as legacy_name: inlineencodings::ShortString;
     }
 }
 
@@ -84,7 +84,7 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
             };
 
             let meta: TribleSet =
-                match reader.get::<TribleSet, blobschemas::SimpleArchive>(meta_handle) {
+                match reader.get::<TribleSet, blobencodings::SimpleArchive>(meta_handle) {
                     Ok(meta) => meta,
                     Err(_) => continue,
                 };
@@ -156,7 +156,7 @@ fn migrate_branch_metadata_name(
             };
 
             let meta: TribleSet =
-                match reader.get::<TribleSet, blobschemas::SimpleArchive>(meta_handle) {
+                match reader.get::<TribleSet, blobencodings::SimpleArchive>(meta_handle) {
                     Ok(meta) => meta,
                     Err(_) => continue,
                 };
@@ -207,7 +207,7 @@ fn migrate_branch_metadata_name(
             }
 
             let name_handle: NameHandle = pile
-                .put::<blobschemas::LongString, _>(legacy_name.clone())
+                .put::<blobencodings::LongString, _>(legacy_name.clone())
                 .context("store branch name blob")?;
 
             let new_meta = rewrite_branch_meta(&info.meta, info.meta_entity, name_handle);
@@ -388,11 +388,11 @@ fn rename_duplicate_branch_names(
             }
 
             let name_handle: NameHandle = pile
-                .put::<blobschemas::LongString, _>(new_name.clone())
+                .put::<blobencodings::LongString, _>(new_name.clone())
                 .context("store renamed branch name blob")?;
 
             let meta: TribleSet = reader
-                .get::<TribleSet, blobschemas::SimpleArchive>(orphan.meta_handle)
+                .get::<TribleSet, blobencodings::SimpleArchive>(orphan.meta_handle)
                 .context("read duplicate branch metadata")?;
 
             let new_meta = rewrite_branch_meta(&meta, orphan.meta_entity, name_handle);

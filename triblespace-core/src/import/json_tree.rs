@@ -9,7 +9,7 @@
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
-use crate::blob::schemas::longstring::LongString;
+use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
@@ -18,10 +18,10 @@ use crate::metadata;
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::schemas::boolean::Boolean;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::{Blake3, Handle};
-use crate::value::schemas::iu256::U256BE;
+use crate::value::encodings::boolean::Boolean;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::hash::{Blake3, Handle};
+use crate::value::encodings::iu256::U256BE;
 use crate::value::Inline;
 use triblespace_core_macros::attributes;
 

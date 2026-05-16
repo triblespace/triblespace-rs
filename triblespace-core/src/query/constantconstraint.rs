@@ -13,7 +13,7 @@ pub struct ConstantConstraint {
 
 impl ConstantConstraint {
     /// Creates a constraint that binds `variable` to `constant`.
-    pub fn new<T: InlineSchema>(variable: Variable<T>, constant: Inline<T>) -> Self {
+    pub fn new<T: InlineEncoding>(variable: Variable<T>, constant: Inline<T>) -> Self {
         ConstantConstraint {
             variable: variable.index,
             constant: constant.raw,

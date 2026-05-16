@@ -1,7 +1,7 @@
 //! End-to-end smoke test: does a succinct index actually
 //! survive a real `BlobStore::put` / `BlobStoreGet::get` cycle?
 //!
-//! The in-crate BlobSchema tests exercise `to_blob` /
+//! The in-crate BlobEncoding tests exercise `to_blob` /
 //! `try_from_blob` directly. This test closes the last-mile
 //! loop: go through the triblespace repo traits so we know the
 //! handle-typed API works unmodified with SB25 + SH25 blobs.
@@ -14,7 +14,7 @@ use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::find;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 
 use triblespace_search::bm25::BM25Builder;

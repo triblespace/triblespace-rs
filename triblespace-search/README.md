@@ -93,7 +93,7 @@ remaining open items are perf/encoding refinements, not architecture.
   both single-word and phrase queries — `bigram_tokens("quick
   brown")` hashes only the ordered pair, so a doc matches iff
   the two words appear adjacently.
-* **`schemas::F32LE`**: `InlineSchema` for packing `f32` scores
+* **`schemas::F32LE`**: `InlineEncoding` for packing `f32` scores
   into 32-byte `Inline<F32LE>`s. Used by the scored BM25
   constraint.
 * Eight runnable examples:

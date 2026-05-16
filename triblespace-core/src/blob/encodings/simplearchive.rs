@@ -1,6 +1,6 @@
 use crate::value::Encodes;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -23,7 +23,7 @@ use anybytes::View;
 /// matters.
 pub struct SimpleArchive;
 
-impl BlobSchema for SimpleArchive {}
+impl BlobEncoding for SimpleArchive {}
 
 impl MetaDescribe for SimpleArchive {
     fn describe() -> Fragment {
@@ -37,14 +37,14 @@ impl MetaDescribe for SimpleArchive {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_BLOB_SCHEMA,
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
         tribles
     }
 }
 
 impl Encodes<TribleSet> for SimpleArchive
-where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<SimpleArchive>: crate::value::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
@@ -56,7 +56,7 @@ where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSc
 }
 
 impl Encodes<&TribleSet> for SimpleArchive
-where crate::value::schemas::hash::Handle<SimpleArchive>: crate::value::InlineSchema,
+where crate::value::encodings::hash::Handle<SimpleArchive>: crate::value::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {

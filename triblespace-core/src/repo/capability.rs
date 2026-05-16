@@ -45,10 +45,10 @@ pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
 /// Tag indicating a scope grants admin (delegation + revocation) authority.
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
-use crate::value::schemas::ed25519 as ed;
-use crate::blob::schemas::simplearchive::SimpleArchive;
-use crate::value::schemas::genid::GenId;
-use crate::value::schemas::hash::Handle;
+use crate::value::encodings::ed25519 as ed;
+use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::value::encodings::genid::GenId;
+use crate::value::encodings::hash::Handle;
 
 triblespace_core_macros::attributes! {
     // ── Cap blob ──────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ use ed25519::signature::Signer;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::blob::schemas::simplearchive::UnarchiveError;
+use crate::blob::encodings::simplearchive::UnarchiveError;
 use crate::id::ExclusiveId;
 use crate::macros::entity;
 use crate::macros::pattern;
@@ -135,7 +135,7 @@ use crate::query::find;
 use crate::trible::TribleSet;
 use crate::value::Inline;
 use crate::value::IntoInline;
-use crate::value::schemas::time::NsTAIInterval;
+use crate::value::encodings::time::NsTAIInterval;
 
 /// Errors returned by [`build_capability`].
 #[derive(Debug)]
@@ -991,13 +991,13 @@ struct CapFields {
 /// use ed25519_dalek::SigningKey;
 /// use std::collections::{HashMap, HashSet};
 /// use triblespace_core::blob::Blob;
-/// use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+/// use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 /// use triblespace_core::id::{ufoid, ExclusiveId};
 /// use triblespace_core::macros::entity;
 /// use triblespace_core::trible::TribleSet;
 /// use triblespace_core::value::TryToInline;
 /// use triblespace_core::value::Inline;
-/// use triblespace_core::value::schemas::hash::{Blake3, Handle};
+/// use triblespace_core::value::encodings::hash::{Blake3, Handle};
 /// use triblespace_core::repo::capability::{
 ///     build_capability, verify_chain, PERM_READ,
 /// };

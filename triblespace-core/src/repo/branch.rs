@@ -9,16 +9,16 @@ use ed25519_dalek::VerifyingKey;
 use hifitime::prelude::*;
 use itertools::Itertools;
 
-use crate::blob::schemas::longstring::LongString;
-use crate::blob::schemas::succinctarchive::SuccinctArchiveBlob;
+use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::Id;
 use crate::metadata;
-use crate::prelude::blobschemas::SimpleArchive;
+use crate::prelude::blobencodings::SimpleArchive;
 use crate::trible::TribleSet;
-use crate::value::schemas::hash::Handle;
-use crate::value::schemas::time::NsTAIInterval;
+use crate::value::encodings::hash::Handle;
+use crate::value::encodings::time::NsTAIInterval;
 use crate::value::TryToInline;
 use crate::value::Inline;
 

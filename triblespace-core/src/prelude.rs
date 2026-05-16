@@ -29,13 +29,13 @@
 //!
 
 /// Re-exports of blob schema types.
-pub mod blobschemas;
+pub mod blobencodings;
 /// Re-exports of inline schema types.
-pub mod inlineschemas;
+pub mod inlineencodings;
 
 pub use crate::attribute::Attribute;
 pub use crate::blob::Blob;
-pub use crate::blob::BlobSchema;
+pub use crate::blob::BlobEncoding;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::IntoBlob;
 pub use crate::blob::TryFromBlob;
@@ -89,13 +89,13 @@ pub use crate::trible::Spread;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
 pub use crate::trible::TribleSetFingerprint;
-pub use crate::value::schemas::UnknownInline;
+pub use crate::value::encodings::UnknownInline;
 pub use crate::value::IntoInline;
 pub use crate::value::ToValue;
 pub use crate::value::TryFromInline;
 pub use crate::value::TryToInline;
 pub use crate::value::Inline;
-pub use crate::value::InlineSchema;
+pub use crate::value::InlineEncoding;
 pub use crate::value::Value;
 pub use anybytes::View;
 // Re-export the pattern/entity procedural macros into the prelude so they can

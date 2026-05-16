@@ -7,7 +7,7 @@
 
 use triblespace_core::id::Id;
 use triblespace_core::macros::find;
-use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::encodings::genid::GenId;
 use triblespace_core::value::{IntoInline, Inline};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;

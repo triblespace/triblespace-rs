@@ -2,9 +2,9 @@
 
 Blobs are immutable sequences of bytes used whenever data no longer fits into
 the fixed 256‑bit value slot of a trible. Instead of treating these payloads as
-untyped binary blobs, Tribles keeps track of their structure via `BlobSchema`.
-Much like `InlineSchema` drives how values are serialized into a trible, a
-`BlobSchema` defines how to encode and decode rich data into a byte sequence.
+untyped binary blobs, Tribles keeps track of their structure via `BlobEncoding`.
+Much like `InlineEncoding` drives how values are serialized into a trible, a
+`BlobEncoding` defines how to encode and decode rich data into a byte sequence.
 
 ## When to reach for blobs
 
@@ -24,7 +24,7 @@ Blobs live in a `BlobStore`. The store provides persistent storage and a
 content hash, determined by the selected `HashProtocol`, that acts as a stable
 handle. Handles can be embedded into tribles just like any other value so they
 benefit from the existing querying machinery. A handle couples the blob's hash
-with its `BlobSchema` so consumers always know how to deserialize the
+with its `BlobEncoding` so consumers always know how to deserialize the
 referenced bytes.
 
 Converting Rust types to blobs is infallible in practice, therefore the `ToBlob`
@@ -41,8 +41,8 @@ signing its contents:
 use triblespace::prelude::*;
 use triblespace::examples::literature;
 use triblespace::repo;
-use inlineschemas::{Handle, Blake3};
-use blobschemas::{SimpleArchive, LongString};
+use inlineencodings::{Handle, Blake3};
+use blobencodings::{SimpleArchive, LongString};
 use rand::rngs::OsRng;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 

@@ -14,7 +14,7 @@ use crate::value::IntoInline;
 use crate::value::TryFromInline;
 use crate::value::TryToInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 use crate::value::INLINE_LEN;
 
 use std::convert::TryInto;
@@ -43,7 +43,7 @@ impl MetaDescribe for GenId {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,
                 metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
+                metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
@@ -78,7 +78,7 @@ mod wasm_formatter {
         Ok(())
     }
 }
-impl InlineSchema for GenId {
+impl InlineEncoding for GenId {
     type ValidationError = ();
     type Encoding = Self;
     fn validate(value: Inline<Self>) -> Result<Inline<Self>, Self::ValidationError> {
@@ -355,7 +355,7 @@ mod tests {
     use crate::id::rngid;
     use crate::value::TryFromInline;
     use crate::value::TryToInline;
-    use crate::value::InlineSchema;
+    use crate::value::InlineEncoding;
 
     #[test]
     fn unique() {

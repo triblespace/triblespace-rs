@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::path::PathBuf;
 
-use triblespace::prelude::blobschemas::LongString;
+use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BranchStore;
@@ -12,14 +12,14 @@ use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Blake3;
-use triblespace_core::value::schemas::hash::Handle;
-use triblespace_core::value::schemas::hash::Hash;
+use triblespace_core::value::encodings::hash::Blake3;
+use triblespace_core::value::encodings::hash::Handle;
+use triblespace_core::value::encodings::hash::Hash;
 use triblespace_core::value::Inline;
 
 use super::signing::load_signing_key;
 
-type CommitHandle = Inline<Handle<triblespace::prelude::blobschemas::SimpleArchive>>;
+type CommitHandle = Inline<Handle<triblespace::prelude::blobencodings::SimpleArchive>>;
 
 #[derive(Debug, Clone)]
 struct BranchInfo {
@@ -44,7 +44,7 @@ fn parse_branch_id_hex(raw: &str) -> Result<Id> {
 }
 
 fn read_branch_info(pile: &mut Pile, branch_id: Id) -> Result<BranchInfo> {
-    use triblespace::prelude::blobschemas::SimpleArchive;
+    use triblespace::prelude::blobencodings::SimpleArchive;
 
     let reader = pile
         .reader()

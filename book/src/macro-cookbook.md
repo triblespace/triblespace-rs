@@ -22,7 +22,7 @@ use triblespace::prelude::*;
 
 mod social {
     use triblespace::prelude::*;
-    use triblespace::prelude::inlineschemas::{GenId, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, ShortString};
 
     attributes! {
         /// A person's display name.
@@ -54,7 +54,7 @@ entity.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::ShortString;
+#     use triblespace::prelude::inlineencodings::ShortString;
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #     }
@@ -75,7 +75,7 @@ attribute/value pairs.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::ShortString;
+#     use triblespace::prelude::inlineencodings::ShortString;
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #     }
@@ -116,7 +116,7 @@ query constraint.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::{GenId, ShortString};
+#     use triblespace::prelude::inlineencodings::{GenId, ShortString};
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #         "B74AA63539354CDA47F387A4C3A8D54C" as pub friend: GenId;
@@ -155,7 +155,7 @@ Use [`find!`](triblespace::core::macros::find) when you want rows back.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::ShortString;
+#     use triblespace::prelude::inlineencodings::ShortString;
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #     }
@@ -184,7 +184,7 @@ Typed projections happen in the head:
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::ShortString;
+#     use triblespace::prelude::inlineencodings::ShortString;
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #     }
@@ -211,7 +211,7 @@ Use [`exists!`](triblespace::core::prelude::exists) when you only need yes/no.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineschemas::ShortString;
+#     use triblespace::prelude::inlineencodings::ShortString;
 #     attributes! {
 #         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
 #     }
@@ -274,7 +274,7 @@ variable-length.
 # mod social {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "B74AA63539354CDA47F387A4C3A8D54C" as pub friend: inlineschemas::GenId;
+#         "B74AA63539354CDA47F387A4C3A8D54C" as pub friend: inlineencodings::GenId;
 #     }
 # }
 # let mut kb = TribleSet::new();

@@ -21,18 +21,18 @@ use url::Url;
 
 use hex::FromHex;
 
-use crate::blob::schemas::UnknownBlob;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::blob::BlobSchema;
+use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
-use crate::prelude::blobschemas::SimpleArchive;
-use crate::value::schemas::hash::Handle;
+use crate::prelude::blobencodings::SimpleArchive;
+use crate::value::encodings::hash::Handle;
 use crate::value::RawInline;
 use crate::value::Inline;
-use crate::value::InlineSchema;
+use crate::value::InlineEncoding;
 
 use super::BlobStore;
 use super::BlobStoreGet;
@@ -147,9 +147,9 @@ impl BlobStorePut for ObjectStoreRemote
 
     fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: IntoBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         let blob = item.to_blob();
         let handle = blob.get_handle();
@@ -437,9 +437,9 @@ impl BlobStoreGet for ObjectStoreReader
         handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: BlobSchema + 'static,
+        S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
-        Handle<S>: InlineSchema,
+        Handle<S>: InlineEncoding,
     {
         let path = self.blob_path(hex::encode(handle.raw));
         let object = self.rt.block_on(async { self.store.get(&path).await })?;
@@ -573,8 +573,8 @@ impl crate::repo::BlobStoreMeta for ObjectStoreReader
         handle: Inline<Handle<S>>,
     ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
     where
-        S: BlobSchema + 'static,
-        Handle<S>: InlineSchema,
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);
@@ -600,8 +600,8 @@ impl crate::repo::BlobStoreForget for ObjectStoreRemote
 
     fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
     where
-        S: BlobSchema + 'static,
-        Handle<S>: InlineSchema,
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
     {
         let handle_hex = hex::encode(handle.raw);
         let path = self.prefix.child(BLOB_INFIX).child(handle_hex);

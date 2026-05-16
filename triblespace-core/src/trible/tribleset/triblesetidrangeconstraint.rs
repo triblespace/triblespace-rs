@@ -9,7 +9,7 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::schemas::genid::GenId;
+use crate::value::encodings::genid::GenId;
 use crate::value::RawInline;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
@@ -178,7 +178,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::inlineschemas::R256BE;
+    use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
 
     attributes! {

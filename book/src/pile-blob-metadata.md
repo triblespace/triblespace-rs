@@ -57,7 +57,7 @@ type is [`Infallible`](core::convert::Infallible).
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anybytes::Bytes;
-use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::Blob;
 use triblespace::core::repo::pile::Pile;
 

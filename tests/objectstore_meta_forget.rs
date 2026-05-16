@@ -6,7 +6,7 @@ use url::Url;
 fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::error::Error>> {
     use tempfile::tempdir;
 
-    use triblespace::core::blob::schemas::UnknownBlob;
+    use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Blob;
     use triblespace::core::blob::Bytes;
     use triblespace::core::repo::objectstore::ObjectStoreRemote;

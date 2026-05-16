@@ -36,11 +36,11 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
-use triblespace_core::value::schemas::hash::Handle;
+use triblespace_core::value::encodings::hash::Handle;
 use triblespace_core::value::Inline;
 use anybytes::View;
 use triblespace_core::macros::{entity, pattern};
-use triblespace_core::prelude::blobschemas;
+use triblespace_core::prelude::blobencodings;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
@@ -54,9 +54,9 @@ mod wiki {
 
     attributes! {
         "F27792C7AF218F1BAE047650DF560B95"
-            as pub title: inlineschemas::ShortString;
+            as pub title: inlineencodings::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
-            as pub body: inlineschemas::Handle<blobschemas::LongString>;
+            as pub body: inlineencodings::Handle<blobencodings::LongString>;
         // `index` rotated 2026-05-05 alongside the
         // `SuccinctBM25Blob` schema id rotation
         // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
@@ -69,7 +69,7 @@ mod wiki {
         // `docs/FACULTY_INTEGRATION.md` § "What the caller has to
         // rotate" for the migration recipe.
         "EBDECCC621ABA8DA8C81D48A9B19347C"
-            as pub index: inlineschemas::Handle<SuccinctBM25Blob>;
+            as pub index: inlineencodings::Handle<SuccinctBM25Blob>;
     }
 
     // Single stable id every faculty reader agrees on as the
@@ -120,7 +120,7 @@ fn seed(
 
     let mut kb = TribleSet::new();
     for (id, title, body) in &docs {
-        let body_handle = pile.put::<blobschemas::LongString, _>(body.to_string())?;
+        let body_handle = pile.put::<blobencodings::LongString, _>(body.to_string())?;
         kb += entity! { ExclusiveId::force_ref(id) @
             wiki::title: *title,
             wiki::body: body_handle,
@@ -136,8 +136,8 @@ fn refresh(
     pile: &mut Pile,
     kb: &mut TribleSet,
 ) -> Result<Inline<Handle<SuccinctBM25Blob>>, Box<dyn Error>> {
-    let body_handles: Vec<(Id, Inline<Handle<blobschemas::LongString>>)> = find!(
-        (id: Id, body: Inline<Handle<blobschemas::LongString>>),
+    let body_handles: Vec<(Id, Inline<Handle<blobencodings::LongString>>)> = find!(
+        (id: Id, body: Inline<Handle<blobencodings::LongString>>),
         pattern!(&*kb, [{ ?id @ wiki::body: ?body }])
     )
     .collect();
@@ -146,7 +146,7 @@ fn refresh(
     let mut builder: BM25Builder = BM25Builder::new();
     for (id, handle) in &body_handles {
         let body: View<str> =
-            reader.get::<View<str>, blobschemas::LongString>(*handle)?;
+            reader.get::<View<str>, blobencodings::LongString>(*handle)?;
         builder.insert(*id, hash_tokens(body.as_ref()));
     }
     let idx: SuccinctBM25Index = builder.build();
@@ -216,7 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut kb = seed(&mut pile)?;
     let n_seeded = find!(
-        (id: Id, h: Inline<Handle<blobschemas::LongString>>),
+        (id: Id, h: Inline<Handle<blobencodings::LongString>>),
         pattern!(&kb, [{ ?id @ wiki::body: ?h }])
     )
     .count();
