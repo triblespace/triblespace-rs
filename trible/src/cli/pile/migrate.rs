@@ -18,7 +18,7 @@ mod legacy_branch_metadata {
 
     // Legacy branch-name attribute (ShortString) used by older triblespace versions.
     attributes! {
-        "2E26F8BA886495A8DF04ACF0ED3ACBD4" as legacy_name: valueschemas::ShortString;
+        "2E26F8BA886495A8DF04ACF0ED3ACBD4" as legacy_name: inlineschemas::ShortString;
     }
 }
 

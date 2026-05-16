@@ -191,7 +191,7 @@ use triblespace::core::blob::schemas::iri::IRI;
 use triblespace::core::blob::ToBlob;
 use triblespace::core::macros::entity;
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::prelude::valueschemas::{Blake3, Handle, I256BE};
+use triblespace::prelude::inlineschemas::{Blake3, Handle, I256BE};
 use triblespace::prelude::Inline;
 
 let birthyear = Attribute::<I256BE>::from(entity! {

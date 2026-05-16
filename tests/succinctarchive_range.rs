@@ -7,7 +7,7 @@ use triblespace::core::blob::schemas::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::schemas::succinctarchive::SuccinctArchive;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::VariableContext;
-use triblespace::prelude::valueschemas::R256BE;
+use triblespace::prelude::inlineschemas::R256BE;
 use triblespace::prelude::*;
 
 attributes! {

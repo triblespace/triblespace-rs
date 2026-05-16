@@ -792,9 +792,9 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "328edd7583de04e2bedd6bd4fd50e651" as loves: valueschemas::GenId;
-            "328147856cc1984f0806dbb824d2b4cb" as name: valueschemas::ShortString;
-            "328f2c33d2fdd675e733388770b2d6c4" as title: valueschemas::ShortString;
+            "328edd7583de04e2bedd6bd4fd50e651" as loves: inlineschemas::GenId;
+            "328147856cc1984f0806dbb824d2b4cb" as name: inlineschemas::ShortString;
+            "328f2c33d2fdd675e733388770b2d6c4" as title: inlineschemas::ShortString;
         }
     }
 

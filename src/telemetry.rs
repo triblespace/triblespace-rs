@@ -7,7 +7,7 @@ use crate::core::metadata;
 use crate::core::repo::pile::Pile;
 use crate::core::repo::{Repository, Workspace};
 use crate::prelude::blobschemas::LongString;
-use crate::prelude::valueschemas::{Blake3, GenId, Handle, ShortString, U256BE};
+use crate::prelude::inlineschemas::{Blake3, GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;

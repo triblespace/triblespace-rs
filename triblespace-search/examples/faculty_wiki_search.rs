@@ -54,9 +54,9 @@ mod wiki {
 
     attributes! {
         "F27792C7AF218F1BAE047650DF560B95"
-            as pub title: valueschemas::ShortString;
+            as pub title: inlineschemas::ShortString;
         "512F2ABC687A4E42916C19E6A552B285"
-            as pub body: valueschemas::Handle<blobschemas::LongString>;
+            as pub body: inlineschemas::Handle<blobschemas::LongString>;
         // `index` rotated 2026-05-05 alongside the
         // `SuccinctBM25Blob` schema id rotation
         // (`5A1EF3FFD638B15E3EBEAA1E92660441` →
@@ -69,7 +69,7 @@ mod wiki {
         // `docs/FACULTY_INTEGRATION.md` § "What the caller has to
         // rotate" for the migration recipe.
         "EBDECCC621ABA8DA8C81D48A9B19347C"
-            as pub index: valueschemas::Handle<SuccinctBM25Blob>;
+            as pub index: inlineschemas::Handle<SuccinctBM25Blob>;
     }
 
     // Single stable id every faculty reader agrees on as the

@@ -36,7 +36,7 @@ mod instrumentation_attributes {
     /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
         use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::valueschemas::{Handle, ShortString};
+        use triblespace_core::prelude::inlineschemas::{Handle, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
@@ -49,7 +49,7 @@ mod instrumentation_attributes {
 
     pub(crate) mod invocation {
         use triblespace_core::blob::schemas::longstring::LongString;
-        use triblespace_core::prelude::valueschemas::{Handle, LineLocation, ShortString};
+        use triblespace_core::prelude::inlineschemas::{Handle, LineLocation, ShortString};
         use triblespace_core_macros::attributes;
 
         attributes! {
@@ -299,7 +299,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
 /// ```rust,ignore
 /// mod social {
 ///     use triblespace::prelude::*;
-///     use triblespace::prelude::valueschemas::{GenId, ShortString};
+///     use triblespace::prelude::inlineschemas::{GenId, ShortString};
 ///
 ///     attributes! {
 ///         /// A person's display name.

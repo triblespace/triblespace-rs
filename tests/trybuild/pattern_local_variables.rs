@@ -4,8 +4,8 @@ mod names {
     use triblespace::prelude::*;
 
     attributes! {
-        "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: valueschemas::ShortString;
-        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" as last: valueschemas::ShortString;
+        "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: inlineschemas::ShortString;
+        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" as last: inlineschemas::ShortString;
     }
 }
 

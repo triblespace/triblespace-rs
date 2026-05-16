@@ -354,8 +354,8 @@ Parenthesised expressions remain supported for explicit literals.
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: valueschemas::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: valueschemas::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineschemas::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineschemas::ShortString;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -376,8 +376,8 @@ scoped to the pattern:
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: valueschemas::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: valueschemas::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineschemas::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineschemas::ShortString;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -403,8 +403,8 @@ To share a hidden binding across multiple patterns, declare it once with
 # mod social {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: valueschemas::ShortString;
-#         "C21DE0AA5BA3446AB886C9640BA60244" as friend: valueschemas::GenId;
+#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineschemas::ShortString;
+#         "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineschemas::GenId;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -458,7 +458,7 @@ into a [`TribleSet`](triblespace::core::trible::TribleSet).
 use std::collections::HashSet;
 
 use triblespace::prelude::*;
-use triblespace::prelude::valueschemas::ShortString;
+use triblespace::prelude::inlineschemas::ShortString;
 use triblespace::core::query::hashsetconstraint::SetConstraint;
 
 struct ExternalTags<'a> {
@@ -517,7 +517,7 @@ use triblespace::prelude::*;
 
 mod social {
   use triblespace::prelude::*;
-  use triblespace::prelude::valueschemas::*;
+  use triblespace::prelude::inlineschemas::*;
   attributes! {
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: GenId;
     "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: GenId;

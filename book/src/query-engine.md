@@ -117,7 +117,7 @@ use std::collections::HashSet;
 use triblespace::core::examples::literature;
 use triblespace::core::query::ContainsConstraint;
 use triblespace::prelude::*;
-use triblespace::prelude::valueschemas::ShortString;
+use triblespace::prelude::inlineschemas::ShortString;
 
 fn main() {
     let mut kb = TribleSet::new();

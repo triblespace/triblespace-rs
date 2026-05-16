@@ -115,7 +115,7 @@ pub type RawInline = [u8; INLINE_LEN];
 ///
 /// ```
 /// use triblespace_core::prelude::*;
-/// use valueschemas::R256;
+/// use inlineschemas::R256;
 /// use num_rational::Ratio;
 ///
 /// let ratio = Ratio::new(1, 2);
@@ -215,7 +215,7 @@ impl<S: InlineSchema> Inline<S> {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::F64;
+    /// use inlineschemas::F64;
     ///
     /// let value: Inline<F64> = (3.14f64).to_inline();
     /// let concrete: f64 = value.from_inline();
@@ -243,7 +243,7 @@ impl<S: InlineSchema> Inline<S> {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::R256;
+    /// use inlineschemas::R256;
     /// use num_rational::Ratio;
     ///
     /// let value: Inline<R256> = R256::inline_from(Ratio::new(1, 2));

@@ -4,8 +4,8 @@ pub mod social {
     use triblespace::prelude::*;
 
     attributes! {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: valueschemas::GenId;
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: valueschemas::GenId;
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineschemas::GenId;
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: inlineschemas::GenId;
     }
 }
 

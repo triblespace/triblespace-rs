@@ -14,8 +14,8 @@ use triblespace_core::value::schemas::UnknownInline;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "BB00000000000000BB00000000000001" as pub link: valueschemas::GenId;
-        "BB00000000000000BB00000000000002" as pub label: valueschemas::ShortString;
+        "BB00000000000000BB00000000000001" as pub link: inlineschemas::GenId;
+        "BB00000000000000BB00000000000002" as pub label: inlineschemas::ShortString;
     }
 }
 

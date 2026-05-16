@@ -82,7 +82,7 @@ impl<'a> Constraint<'a> for InlineRange {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::valueschemas::R256;
+    use crate::prelude::inlineschemas::R256;
     use crate::prelude::*;
 
     attributes! {

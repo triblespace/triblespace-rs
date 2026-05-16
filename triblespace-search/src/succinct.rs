@@ -1335,7 +1335,7 @@ pub struct SuccinctBM25Meta {
 /// // blob, so this is an O(1) refcounted handover of the
 /// // canonical bytes.
 /// use triblespace_core::blob::IntoBlob;
-/// let blob = (&idx).to_blob();
+/// let blob: triblespace_core::blob::Blob<triblespace_search::succinct::SuccinctBM25Blob> = (&idx).to_blob();
 /// assert!(blob.bytes.len() > 0);
 /// ```
 pub struct SuccinctBM25Index<

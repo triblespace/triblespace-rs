@@ -14,7 +14,7 @@ use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id, uri_to_id_p
 use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::prelude::valueschemas::{self, Handle};
+use triblespace_core::prelude::inlineschemas::{self, Handle};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
@@ -53,9 +53,9 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert!(uri_count >= 2, "at least frank and dune carry rdf_uri");
 
     // The integer literal lands as I256BE under an IRI-rooted attribute.
-    let birthyear = Attribute::<valueschemas::I256BE>::from(entity! {
+    let birthyear = Attribute::<inlineschemas::I256BE>::from(entity! {
         metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::I256BE as MetaDescribe>::id(),
     });
     let (year,) = find!(
         (year: i128),
@@ -79,9 +79,9 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(firstname_count, 1, "one firstname triple");
 
     // The URI-valued triple lands as a GenId pointing frank → dune.
-    let wrote = Attribute::<valueschemas::GenId>::from(entity! {
+    let wrote = Attribute::<inlineschemas::GenId>::from(entity! {
         metadata::iri:          "http://example.org/wrote".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::GenId as MetaDescribe>::id(),
     });
     let link_count = find!(
         (src: Id, dst: Id),
@@ -148,9 +148,9 @@ fn xsd_datatypes_map_to_native_schemas() {
     let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 4);
 
-    let i_attr = Attribute::<valueschemas::I256BE>::from(entity! {
+    let i_attr = Attribute::<inlineschemas::I256BE>::from(entity! {
         metadata::iri:          "http://ex/i".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::I256BE as MetaDescribe>::id(),
     });
     let (i_val,) = find!(
         (v: i128),
@@ -160,9 +160,9 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(i_val, 42);
 
-    let u_attr = Attribute::<valueschemas::U256BE>::from(entity! {
+    let u_attr = Attribute::<inlineschemas::U256BE>::from(entity! {
         metadata::iri:          "http://ex/u".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::U256BE as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::U256BE as MetaDescribe>::id(),
     });
     let (u_val,) = find!(
         (v: u128),
@@ -172,9 +172,9 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(u_val, 100);
 
-    let b_attr = Attribute::<valueschemas::Boolean>::from(entity! {
+    let b_attr = Attribute::<inlineschemas::Boolean>::from(entity! {
         metadata::iri:          "http://ex/b".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::Boolean as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::Boolean as MetaDescribe>::id(),
     });
     let (b_val,) = find!(
         (v: bool),
@@ -184,9 +184,9 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert!(b_val);
 
-    let f_attr = Attribute::<valueschemas::F64>::from(entity! {
+    let f_attr = Attribute::<inlineschemas::F64>::from(entity! {
         metadata::iri:          "http://ex/f".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::F64 as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::F64 as MetaDescribe>::id(),
     });
     let (f_val,) = find!(
         (v: f64),
@@ -300,9 +300,9 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // anyURI → GenId via uri_to_id (same path as `<...>` objects).
-    let homepage = Attribute::<valueschemas::GenId>::from(entity! {
+    let homepage = Attribute::<inlineschemas::GenId>::from(entity! {
         metadata::iri:          "http://ex/homepage".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::GenId as MetaDescribe>::id(),
     });
     assert_eq!(
         find!(
@@ -333,9 +333,9 @@ fn lang_tagged_literals_reify_into_entities() {
     assert_eq!(count, 3);
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
-    let label_attr = Attribute::<valueschemas::GenId>::from(entity! {
+    let label_attr = Attribute::<inlineschemas::GenId>::from(entity! {
         metadata::iri:          "http://ex/label".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::GenId as MetaDescribe>::id(),
     });
 
     // Two distinct subjects, two label entities for them, but the
@@ -399,9 +399,9 @@ _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
 
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
-    let age = Attribute::<valueschemas::I256BE>::from(entity! {
+    let age = Attribute::<inlineschemas::I256BE>::from(entity! {
         metadata::iri:          "http://ex/age".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::I256BE as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::I256BE as MetaDescribe>::id(),
     });
     let subjects: std::collections::HashSet<_> = find!(
         (e: Id),
@@ -433,9 +433,9 @@ _:b1 <http://ex/q> "x" .
     let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(count, 2);
 
-    let p = Attribute::<valueschemas::GenId>::from(entity! {
+    let p = Attribute::<inlineschemas::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::GenId as MetaDescribe>::id(),
     });
     let q = Attribute::<Handle<LongString>>::from(entity! {
         metadata::iri:          "http://ex/q".to_blob().get_handle(),
@@ -501,9 +501,9 @@ fn orphan_bnode_skolemizes_per_import() {
     let (facts_b, _) =
         ingest_ntriples(&mut ws_b, Cursor::new(&data[..])).expect("clean ntriples");
 
-    let p = Attribute::<valueschemas::GenId>::from(entity! {
+    let p = Attribute::<inlineschemas::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
-        metadata::value_schema: <valueschemas::GenId as MetaDescribe>::id(),
+        metadata::value_schema: <inlineschemas::GenId as MetaDescribe>::id(),
     });
     let (id_a,) = find!(
         (id: Id),

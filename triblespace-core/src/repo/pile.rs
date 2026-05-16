@@ -50,7 +50,7 @@ use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobschemas::SimpleArchive;
-use crate::prelude::valueschemas::Handle;
+use crate::prelude::inlineschemas::Handle;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::hash::Hash;
 use crate::value::RawInline;

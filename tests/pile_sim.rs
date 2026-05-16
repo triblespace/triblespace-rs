@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use triblespace::core::blob::schemas::UnknownBlob;
 use triblespace::core::repo::PushResult;
 use triblespace::prelude::blobschemas::SimpleArchive;
-use triblespace::prelude::valueschemas::Handle;
+use triblespace::prelude::inlineschemas::Handle;
 use triblespace::prelude::*;
 
 #[derive(Debug, Clone)]

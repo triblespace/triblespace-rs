@@ -73,7 +73,7 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::R256;
+    /// use inlineschemas::R256;
     ///
     /// let e = fucid();
     /// let a = fucid();
@@ -111,7 +111,7 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::R256;
+    /// use inlineschemas::R256;
     ///
     /// let e = fucid();
     /// let a = fucid();
@@ -275,7 +275,7 @@ impl Trible {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::R256;
+    /// use inlineschemas::R256;
     ///
     /// let data = [
     ///   // Entity

@@ -17,7 +17,7 @@ use triblespace_core::trible::TribleSet;
 use triblespace_core::value::schemas::time::NsTAIInterval;
 use triblespace_core::value::Inline;
 use triblespace_core::value::schemas::hash::Handle;
-use triblespace_core::prelude::valueschemas::{GenId, ED25519PublicKey};
+use triblespace_core::prelude::inlineschemas::{GenId, ED25519PublicKey};
 use triblespace_core::prelude::attributes;
 use triblespace_core::macros::{find, pattern, entity};
 

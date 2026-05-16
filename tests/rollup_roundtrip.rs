@@ -19,7 +19,7 @@ use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{Repository, RollupError};
 use triblespace::core::value::schemas::hash::Handle;
 use triblespace::core::value::Inline;
-use triblespace::prelude::valueschemas::GenId;
+use triblespace::prelude::inlineschemas::GenId;
 use triblespace::prelude::TribleSet;
 
 attributes! {

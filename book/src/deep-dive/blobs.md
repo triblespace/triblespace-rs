@@ -41,7 +41,7 @@ signing its contents:
 use triblespace::prelude::*;
 use triblespace::examples::literature;
 use triblespace::repo;
-use valueschemas::{Handle, Blake3};
+use inlineschemas::{Handle, Blake3};
 use blobschemas::{SimpleArchive, LongString};
 use rand::rngs::OsRng;
 use ed25519_dalek::{Signature, Signer, SigningKey};

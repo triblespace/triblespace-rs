@@ -3,9 +3,9 @@ use triblespace::prelude::*;
 mod ns {
     use triblespace::prelude::*;
     attributes! {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as name: valueschemas::ShortString;
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as score: valueschemas::U256BE;
-        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" as friend: valueschemas::GenId;
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as name: inlineschemas::ShortString;
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as score: inlineschemas::U256BE;
+        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" as friend: inlineschemas::GenId;
     }
 }
 
@@ -16,7 +16,7 @@ fn bare_single_variable_returns_value() {
     set += entity! { &e @ ns::name: "alice" };
 
     let names: Vec<Inline<_>> = find!(
-        v: Inline<valueschemas::ShortString>,
+        v: Inline<inlineschemas::ShortString>,
         pattern!(&set, [{ e.id @ ns::name: ?v }])
     )
     .collect();

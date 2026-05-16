@@ -178,7 +178,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::valueschemas::R256BE;
+    use crate::prelude::inlineschemas::R256BE;
     use crate::prelude::*;
 
     attributes! {

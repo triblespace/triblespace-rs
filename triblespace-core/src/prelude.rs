@@ -30,8 +30,8 @@
 
 /// Re-exports of blob schema types.
 pub mod blobschemas;
-/// Re-exports of value schema types.
-pub mod valueschemas;
+/// Re-exports of inline schema types.
+pub mod inlineschemas;
 
 pub use crate::attribute::Attribute;
 pub use crate::blob::Blob;

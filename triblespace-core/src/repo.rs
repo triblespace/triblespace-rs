@@ -27,7 +27,7 @@
 //! use ed25519_dalek::SigningKey;
 //! use rand::rngs::OsRng;
 //! use triblespace::prelude::*;
-//! use triblespace::prelude::valueschemas::{GenId, ShortString};
+//! use triblespace::prelude::inlineschemas::{GenId, ShortString};
 //! use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
 //!
 //! let storage = MemoryRepo::default();
@@ -178,7 +178,7 @@ use crate::id::Id;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::prelude::valueschemas::GenId;
+use crate::prelude::inlineschemas::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::Handle;

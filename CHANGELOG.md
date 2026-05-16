@@ -947,7 +947,7 @@ surface-level details. Highlights:
   and nested objects to `GenId` links, hashing attribute/value pairs (with an
   optional 32-byte salt) to derive stable entity ids, while streaming blobs into
   a caller-provided store and exposing data/metadata separately.
-- `valueschemas::Boolean` for encoding `false` as all-zero bytes and `true` as
+- `inlineschemas::Boolean` for encoding `false` as all-zero bytes and `true` as
   all ones, providing an unambiguous target for JSON boolean importers.
 - `RangeU128` and `RangeInclusiveU128` value schemas for encoding pairs of
   packed `u128` values, enabling compact storage of start/end markers such as
@@ -1424,7 +1424,7 @@ surface-level details. Highlights:
   examples. Book snippets now rely on type inference for `to_blob()` to match
   idiomatic usage.
 - Corrected the JSON import benchmark to use the re-exported
-  `valueschemas::Blake3` handle schema so it compiles again.
+  `inlineschemas::Blake3` handle schema so it compiles again.
 - Added the missing `serde_json` and `f256` dev-dependencies so the JSON import
   benchmark builds successfully.
 - Buffered the JSON importers so encoding errors roll back an entire import

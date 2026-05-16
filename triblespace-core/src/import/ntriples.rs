@@ -85,7 +85,7 @@ use crate::blob::schemas::rawbytes::RawBytes;
 use crate::blob::{Blob, IntoBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
 use crate::macros::entity;
-use crate::prelude::valueschemas;
+use crate::prelude::inlineschemas;
 use crate::repo::{BlobStore, Workspace};
 use crate::trible::{Trible, TribleSet};
 use crate::value::schemas::genid::GenId;
@@ -1019,9 +1019,9 @@ impl NTriplesAttrCache {
         *self.genid.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::GenId>::from(entity! {
+            Attribute::<inlineschemas::GenId>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::GenId as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::GenId as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1052,9 +1052,9 @@ impl NTriplesAttrCache {
         *self.i256be.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::I256BE>::from(entity! {
+            Attribute::<inlineschemas::I256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::I256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::I256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1063,9 +1063,9 @@ impl NTriplesAttrCache {
         *self.u256be.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::U256BE>::from(entity! {
+            Attribute::<inlineschemas::U256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::U256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::U256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1074,9 +1074,9 @@ impl NTriplesAttrCache {
         *self.r256be.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::R256BE>::from(entity! {
+            Attribute::<inlineschemas::R256BE>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::R256BE as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::R256BE as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1085,9 +1085,9 @@ impl NTriplesAttrCache {
         *self.f64.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::F64>::from(entity! {
+            Attribute::<inlineschemas::F64>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::F64 as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::F64 as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1096,9 +1096,9 @@ impl NTriplesAttrCache {
         *self.boolean.entry(iri.to_string()).or_insert_with(|| {
             let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
                 String::from(iri).to_blob().get_handle();
-            Attribute::<valueschemas::Boolean>::from(entity! {
+            Attribute::<inlineschemas::Boolean>::from(entity! {
                 crate::metadata::iri:          h,
-                crate::metadata::value_schema: <valueschemas::Boolean as crate::metadata::MetaDescribe>::id(),
+                crate::metadata::value_schema: <inlineschemas::Boolean as crate::metadata::MetaDescribe>::id(),
             })
             .id()
         })
@@ -1440,7 +1440,7 @@ fn emit_typed_literal<Blobs>(
             | "nonPositiveInteger" => {
                 if let Ok(val) = text.parse::<i128>() {
                     let attr_id = attr_cache.i256be(predicate);
-                    let v: Inline<valueschemas::I256BE> = val.to_inline();
+                    let v: Inline<inlineschemas::I256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
@@ -1449,7 +1449,7 @@ fn emit_typed_literal<Blobs>(
             | "unsignedShort" | "unsignedByte" => {
                 if let Ok(val) = text.parse::<u128>() {
                     let attr_id = attr_cache.u256be(predicate);
-                    let v: Inline<valueschemas::U256BE> = val.to_inline();
+                    let v: Inline<inlineschemas::U256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
@@ -1457,7 +1457,7 @@ fn emit_typed_literal<Blobs>(
             "decimal" => {
                 if let Some(val) = parse_decimal(text.as_ref()) {
                     let attr_id = attr_cache.r256be(predicate);
-                    let v: Inline<valueschemas::R256BE> = val.to_inline();
+                    let v: Inline<inlineschemas::R256BE> = val.to_inline();
                     facts.insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }

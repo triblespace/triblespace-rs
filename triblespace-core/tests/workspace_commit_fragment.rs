@@ -21,7 +21,7 @@ use triblespace_core::value::schemas::hash::Handle;
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000010" as pub note: valueschemas::Handle<blobschemas::LongString>;
+        "DD00000000000000DD00000000000010" as pub note: inlineschemas::Handle<blobschemas::LongString>;
     }
 }
 

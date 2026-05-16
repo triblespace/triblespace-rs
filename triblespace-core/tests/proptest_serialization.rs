@@ -210,7 +210,7 @@ proptest! {
         let entity_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first_trible.data[0..16]);
-            Inline::<valueschemas::GenId>::new(v)
+            Inline::<inlineschemas::GenId>::new(v)
         };
 
         let mut set_results: Vec<_> = find!(
@@ -243,7 +243,7 @@ proptest! {
         let attr_val = {
             let mut v = [0u8; 32];
             v[16..32].copy_from_slice(&first.data[16..32]);
-            Inline::<valueschemas::GenId>::new(v)
+            Inline::<inlineschemas::GenId>::new(v)
         };
 
         // Query with bound attribute

@@ -13,7 +13,7 @@ use ed25519::signature::Signer;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::simplearchive::SimpleArchive;
 use crate::blob::Blob;
-use crate::prelude::valueschemas::Handle;
+use crate::prelude::inlineschemas::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
 use crate::value::Inline;

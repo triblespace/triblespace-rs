@@ -396,7 +396,7 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Inspect { pile, branch } => {
             use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::valueschemas::Handle;
+            use triblespace::prelude::inlineschemas::Handle;
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
@@ -501,7 +501,7 @@ pub fn run(cmd: Command) -> Result<()> {
             expected,
         } => {
             use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::valueschemas::Handle;
+            use triblespace::prelude::inlineschemas::Handle;
             use triblespace_core::repo::pile::Pile;
             
             use triblespace_core::value::Inline;
@@ -717,7 +717,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Stats { pile, branch, full } => {
             use std::collections::{BTreeSet, HashSet};
             use triblespace::prelude::blobschemas::SimpleArchive;
-            use triblespace::prelude::valueschemas::Handle;
+            use triblespace::prelude::inlineschemas::Handle;
 
             use triblespace_core::repo::pile::Pile;
             use triblespace_core::trible::TribleSet;
@@ -1577,7 +1577,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             let mut usage_entities: HashSet<Id> = HashSet::new();
                             for t in meta_set.iter() {
                                 if t.a() == &tag_attr {
-                                    let v: Inline<triblespace::prelude::valueschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::inlineschemas::GenId> =
                                         *t.v();
                                     if let Ok(gid) =
                                         v.try_from_inline::<triblespace_core::id::Id>()
@@ -1595,7 +1595,7 @@ pub fn run(cmd: Command) -> Result<()> {
                                     continue;
                                 }
                                 if t.a() == &attr_attr {
-                                    let v: Inline<triblespace::prelude::valueschemas::GenId> =
+                                    let v: Inline<triblespace::prelude::inlineschemas::GenId> =
                                         *t.v();
                                     if let Ok(described_id) =
                                         v.try_from_inline::<triblespace_core::id::Id>()
@@ -1938,7 +1938,7 @@ fn blob_padding(len: u64) -> u64 {
 
 fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> {
     use triblespace::prelude::blobschemas::SimpleArchive;
-    use triblespace::prelude::valueschemas::Handle;
+    use triblespace::prelude::inlineschemas::Handle;
     use triblespace_core::repo;
     
     use triblespace_core::value::Inline;

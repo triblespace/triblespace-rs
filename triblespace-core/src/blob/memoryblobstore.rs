@@ -348,7 +348,7 @@ mod tests {
     use fake::Fake;
 
     use blobschemas::LongString;
-    use valueschemas::Handle;
+    use inlineschemas::Handle;
 
     attributes! {
         "5AD0FAFB1FECBC197A385EC20166899E" as description: Handle<LongString>;

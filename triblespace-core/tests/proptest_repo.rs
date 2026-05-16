@@ -10,7 +10,7 @@ use triblespace_core::repo::Repository;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000001" as pub label: valueschemas::ShortString;
+        "DD00000000000000DD00000000000001" as pub label: inlineschemas::ShortString;
     }
 }
 

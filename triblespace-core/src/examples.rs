@@ -8,11 +8,11 @@ pub mod literature {
     use super::*;
     use crate::prelude::*;
     use blobschemas::LongString;
-    use valueschemas::Blake3;
-    use valueschemas::GenId;
-    use valueschemas::Handle;
-    use valueschemas::ShortString;
-    use valueschemas::R256;
+    use inlineschemas::Blake3;
+    use inlineschemas::GenId;
+    use inlineschemas::Handle;
+    use inlineschemas::ShortString;
+    use inlineschemas::R256;
 
     attributes! {
         /// The title of a work.

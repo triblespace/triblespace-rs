@@ -4,7 +4,7 @@
 //!
 //! ```
 //! # use triblespace_core::prelude::*;
-//! # use triblespace_core::prelude::valueschemas::ShortString;
+//! # use triblespace_core::prelude::inlineschemas::ShortString;
 //! let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 //! ```
 //!
@@ -930,7 +930,7 @@ mod parallel {
 ///
 /// ```
 /// # use triblespace_core::prelude::*;
-/// # use triblespace_core::prelude::valueschemas::ShortString;
+/// # use triblespace_core::prelude::inlineschemas::ShortString;
 /// // Filter semantics — rows where conversion fails are skipped:
 /// let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
 /// ```
@@ -1023,10 +1023,10 @@ pub use temp;
 
 #[cfg(test)]
 mod tests {
-    use valueschemas::ShortString;
+    use inlineschemas::ShortString;
 
     use crate::ignore;
-    use crate::prelude::valueschemas::*;
+    use crate::prelude::inlineschemas::*;
     use crate::prelude::*;
 
     use crate::examples::literature;
@@ -1045,8 +1045,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "8143F46E812E88C4544E7094080EC523" as loves: valueschemas::GenId;
-            "D6E0F2A6E5214E1330565B4D4138E55C" as name: valueschemas::ShortString;
+            "8143F46E812E88C4544E7094080EC523" as loves: inlineschemas::GenId;
+            "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineschemas::ShortString;
         }
     }
 
@@ -1054,8 +1054,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "A19EC1D9DD534BA9896223A457A6B9C9" as name: valueschemas::ShortString;
-            "C21DE0AA5BA3446AB886C9640BA60244" as friend: valueschemas::GenId;
+            "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineschemas::ShortString;
+            "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineschemas::GenId;
         }
     }
 

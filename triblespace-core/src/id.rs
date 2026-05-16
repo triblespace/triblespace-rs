@@ -37,7 +37,7 @@ pub use ufoid::ufoid;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::prelude::valueschemas::GenId;
+use crate::prelude::inlineschemas::GenId;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
@@ -491,7 +491,7 @@ impl IdOwner {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::ShortString;
+    /// use inlineschemas::ShortString;
     /// use triblespace_core::id_hex;
     ///
     /// let mut owner = IdOwner::new();
