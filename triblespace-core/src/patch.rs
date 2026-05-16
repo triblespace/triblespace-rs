@@ -42,6 +42,14 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
+/// Minimum `other.leaf_count` at which [`Head::union`] takes the
+/// scatter-pair + `par_iter_mut` path on the equal-depth-branch arm.
+/// Below this, the per-key `modify_child` loop wins because asymmetric
+/// merges only touch a handful of slots. Tuned for the `entities/union*`
+/// bench family.
+#[cfg(feature = "parallel")]
+const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
+
 /// Initializes the SIP key used for key hashing.
 /// This function is called automatically when a new PATCH is created.
 fn init_sip_key() {
@@ -706,15 +714,75 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return other.with_key(old_key);
         }
 
-        // both depths are equal and the hashes differ: merge children
+        // Both depths are equal and the hashes differ: merge children.
+        //
+        // For small `other` (the common case in serial folds where each
+        // `+=` adds a handful of tribles) the existing `modify_child`
+        // loop wins: it only touches keys present in `other`, with one
+        // cuckoo lookup + drain + closure-resolve + install per key.
+        //
+        // When `other` is large (e.g. final pair-merges in a parallel
+        // reduce, where both sides hold millions of tribles), we
+        // amortise the scatter overhead and `par_iter_mut` across
+        // rayon: scatter both child tables into a 256-slot pair array
+        // keyed by byte, parallel-resolve, install all results, then
+        // recompute aggregates in one pass at the end.
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
+
+        #[cfg(feature = "parallel")]
+        if other_branch_ref.leaf_count >= PARALLEL_PATCH_UNION_THRESHOLD as u64 {
+            use rayon::iter::{
+                IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+            };
+
+            {
+                let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+                let end_depth = ed.end_depth as usize;
+
+                #[allow(clippy::type_complexity)]
+                let mut pairs: [(Option<Head<KEY_LEN, O, V>>, Option<Head<KEY_LEN, O, V>>); 256] =
+                    std::array::from_fn(|_| (None, None));
+
+                for slot in ed.child_table.iter_mut() {
+                    if let Some(head) = slot.take() {
+                        let key = head.key() as usize;
+                        pairs[key].0 = Some(head);
+                    }
+                }
+                for slot in other_branch_ref.child_table.iter_mut() {
+                    if let Some(head) = slot.take() {
+                        let head = head.with_start(end_depth);
+                        let key = head.key() as usize;
+                        pairs[key].1 = Some(head);
+                    }
+                }
+
+                let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] =
+                    std::array::from_fn(|_| None);
+                pairs[..]
+                    .par_iter_mut()
+                    .zip(resolved[..].par_iter_mut())
+                    .for_each(|(pair, out)| {
+                        let (t, o) = std::mem::take(pair);
+                        *out = match (t, o) {
+                            (None, None) => None,
+                            (Some(t), None) | (None, Some(t)) => Some(t),
+                            (Some(t), Some(o)) => Some(Head::union(t, o, this_depth)),
+                        };
+                    });
+
+                for head in resolved.into_iter().flatten() {
+                    ed.install_child_growing(head);
+                }
+                ed.recompute_aggregates();
+            }
+            return this;
+        }
+
+        // Serial path — small `other`; per-key modify_child wins here.
         {
-            // Editable branch view: construct a BranchMut from the owned `this`
-            // head and perform all mutations via that editor. The editor
-            // performs COW up-front and writes the final pointer back into
-            // `this` when it is dropped.
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             for other_child in other_branch_ref
                 .child_table

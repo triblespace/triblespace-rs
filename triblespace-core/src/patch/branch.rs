@@ -64,6 +64,24 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         // update the pointer in-place.
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
+
+    /// Insert `head` into the child table, growing the allocation if cuckoo
+    /// placement fails. Does *not* update the branch's aggregates —
+    /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
+    pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
+        unsafe {
+            Branch::install_child_growing(&mut self.branch_nn, head);
+        }
+    }
+
+    /// Rebuild aggregates (hash/leaf_count/segment_count/childleaf) in one
+    /// linear pass over `child_table`. Call once after a batch of
+    /// [`Self::install_child_growing`] mutations.
+    pub fn recompute_aggregates(&mut self) {
+        unsafe {
+            Branch::recompute_aggregates(&mut self.branch_nn);
+        }
+    }
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Deref for BranchMut<'a, KEY_LEN, O, V> {
@@ -382,6 +400,55 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     // `modify_child` which accepts an Option<Head> and handles insert/update/remove
     // uniformly. The thin adapter was removed to centralize behavior; callers
     // should use `modify_child` or BranchMut::modify_child.
+
+    /// Insert `head` into the child table, growing if cuckoo placement
+    /// fails. Does NOT touch aggregates — used by bulk-rewrite paths
+    /// that recompute aggregates in one pass at the end via
+    /// [`recompute_aggregates`](Self::recompute_aggregates).
+    pub(crate) unsafe fn install_child_growing(
+        branch_nn: &mut NonNull<Self>,
+        head: Head<KEY_LEN, O, V>,
+    ) {
+        let mut to_insert = head;
+        let mut branch_ptr = branch_nn.as_ptr();
+        while let Some(displaced) = (*branch_ptr).child_table.table_insert(to_insert) {
+            to_insert = displaced;
+            Self::grow(branch_nn);
+            branch_ptr = branch_nn.as_ptr();
+        }
+    }
+
+    /// Rebuild aggregate fields (`hash`, `leaf_count`, `segment_count`,
+    /// `childleaf`) from the current child table in one linear pass.
+    /// Cheaper than paying `modify_child`'s per-call accounting when
+    /// many children are being installed in bulk.
+    pub(crate) unsafe fn recompute_aggregates(branch_nn: &mut NonNull<Self>) {
+        let branch = branch_nn.as_ptr();
+        let end_depth = (*branch).end_depth as usize;
+        let mut agg_leaf_count: u64 = 0;
+        let mut agg_segment_count: u64 = 0;
+        let mut agg_hash: u128 = 0;
+        let mut first_childleaf: *const Leaf<KEY_LEN, V> = std::ptr::null();
+
+        for child in (*branch).child_table.iter().flatten() {
+            agg_leaf_count += child.count();
+            agg_segment_count += child.count_segment(end_depth);
+            agg_hash ^= child.hash();
+            if first_childleaf.is_null() {
+                first_childleaf = child.childleaf_ptr();
+            }
+        }
+
+        (*branch).leaf_count = agg_leaf_count;
+        (*branch).segment_count = agg_segment_count;
+        (*branch).hash = agg_hash;
+        if !first_childleaf.is_null() {
+            (*branch).childleaf = first_childleaf;
+        }
+
+        #[cfg(debug_assertions)]
+        branch_nn.as_ref().debug_check_invariants();
+    }
 
     pub fn count_segment(&self, at_depth: usize) -> u64 {
         let node_end = self.end_depth as usize;
