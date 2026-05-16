@@ -7,36 +7,171 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Conversion-system rewrite
 
-- **`Encoded<S>` is now a sum, not a struct.** The 32-byte stored
-  payload became `Inline<S>`; `Encoded<V>` is the new
-  `Inline(Inline<V>) | Blob(Blob<UnknownBlob>)` enum that
-  `entity!{}` builds. The handle is no longer carried twice — for
-  `Encoded::Blob`, it lives inside the blob's cached digest and is
-  recovered via `Encoded::inline()` (phantom recast, no rehash).
-- **Workspace-wide rename**: `ValueSchema` → `InlineEncoding`,
-  `IntoValue` → `IntoInline`, `TryToValue` → `TryToInline`,
-  `TryFromValue` → `TryFromInline`, `ValueRange` → `InlineRange`,
-  `UnknownValue` → `UnknownInline`, `RawValue` → `RawInline`,
-  `VALUE_LEN` → `INLINE_LEN`, plus the matching `*_value` →
-  `*_inline` method renames (`to_encoded`/`from_value`/etc.).
-- **New dispatch trait**: `ToEncoded<V>` (formerly `FieldFormFor<V>`)
-  lifts an `IntoEncoded::Output` into a `Encoded<V>`. The trait's two
-  blanket impls delegate to schema-level `InlineEncoding::to_encoded`
-  and `BlobEncoding::to_encoded`, so users (and schemas with unusual
-  storage semantics) can call the conversion directly without going
-  through the shim.
-- **Attribute helpers** rename to match `<destination>_from(v)`
-  shape: `Attribute::encoded_from(v) -> Encoded<S>` replaces
-  `into_field_value`, parallel to `Attribute::inline_from(v) ->
-  Inline<S>`.
-- `value_range`, `value_in_range`, `metadata::value_*` attribute
-  ids, `WasmValueFormatter`, and third-party `Encoded`-named items
-  (`clap::ValueEnum`, `proptest::strategy::ValueTree`,
-  `Strategy::Encoded`, `serde_json::Value`) are intentionally
-  unchanged — they refer to the V-slot in (E, A, V) or to
-  out-of-tree concepts.
+A multi-step refactor of the value/blob conversion machinery
+landed across 2026-05-14 → 2026-05-16. The user-facing surface is
+now consistent under a single `Inline`/`Encoded`/`Encoding`/
+`Encodes` vocabulary. On-disk format is unchanged — every
+constant and metadata-attribute identifier that moved kept its
+hex id.
+
+#### Storage form: `Value<S>` → `Inline<S>`
+
+The 32-byte stored payload is now `Inline<S>`. The name `Value`
+is gone; `Encoded<V>` (below) is the higher-level sum that takes
+its place.
+
+- `Value<S>` (the 32-byte struct) → `Inline<S>`
+- `RawValue` → `RawInline`
+- `VALUE_LEN` → `INLINE_LEN`
+- `UnknownValue` → `UnknownInline`
+- `ValueRange` → `InlineRange`
+- Method renames: `to_value` → `to_inline`, `from_value` →
+  `from_inline`, `value_from` → `inline_from`,
+  `try_to_value` → `try_to_inline`, `try_from_value` →
+  `try_from_inline`.
+
+#### Sum: `(Inline, Option<Blob>)` → `Encoded<V>`
+
+The macro pipeline previously returned an `(Inline<V>,
+Option<Blob<UnknownBlob>>)` tuple whose `Option` was `Some` iff
+`V` was a `Handle` schema — an implicit invariant. Replaced with
+a sum:
+
+```rust
+pub enum Encoded<V: InlineEncoding> {
+    Inline(Inline<V>),
+    Blob(Blob<UnknownBlob>),
+}
+```
+
+`Encoded::inline()` rederives the typed handle from the blob's
+cached Blake3 (phantom recast, no rehash). `into_parts()` yields
+the old tuple for the macro consumer in one call. Initially named
+`Value<V>`, renamed to `Encoded<V>` for vocabulary coherence.
+
+#### Conversion: From-direction with blanket-derived ergonomics
+
+Conversion is implemented schema-side (mirroring std's `From<T>`)
+and source-side ergonomic methods are auto-derived:
+
+```rust
+pub trait Encodes<Source> {
+    type Output;
+    fn encode(source: Source) -> Self::Output;
+}
+
+pub trait IntoEncoded<S> {
+    type Output;
+    fn into_encoded(self) -> Self::Output;
+}
+impl<S, T> IntoEncoded<S> for T where S: Encodes<T> { ... }
+```
+
+Downstream impls no longer require "local type at trait position 0"
+juggling — the schema sits at the impl-target, satisfying Rust's
+orphan rule trivially.
+
+- `ToValue` (old) → `IntoInline` (supertrait alias over `IntoEncoded`)
+- `ToBlob` → `IntoBlob` (supertrait alias)
+- `IntoValue` (interim) → `IntoInline`
+- `IntoSchema` → `IntoEncoded`
+- `into_schema` → `into_encoded`
+- `IntoSchema::Form` → `IntoEncoded::Output`
+- `FieldFormFor<V>` → `ToEncoded<V>` (the sum-lift dispatch shim)
+- `ToValue` (the dispatch shim trait) → `ToEncoded`
+- `to_value` (the dispatch shim method) → `to_encoded`
+- `Attribute::into_field_value(v)` → `Attribute::encoded_from(v) ->
+  Encoded<S>`, parallel to `Attribute::inline_from(v) -> Inline<S>`.
+
+#### Trait family: `Schema` → `Encoding`
+
+After removing semantic-marking schemas (Schema removals below)
+the trait family genuinely describes encodings — byte format plus
+validity plus identity. The name follows the role.
+
+- `ValueSchema` → `InlineSchema` → `InlineEncoding`
+- `BlobSchema` → `BlobEncoding`
+- `InlineSchema::FieldKind` → `InlineEncoding::Encoding` (dispatch
+  projection)
+- Module renames:
+  - `crate::value::*` → `crate::inline::*`
+  - `value::schemas/` directory → `inline/encodings/`
+  - `blob::schemas/` directory → `blob/encodings/`
+  - `prelude::valueschemas` → `prelude::inlineencodings`
+  - `prelude::blobschemas` → `prelude::blobencodings`
+- Constants (Rust identifiers; hex ids unchanged):
+  - `KIND_VALUE_SCHEMA` → `KIND_INLINE_ENCODING`
+  - `KIND_BLOB_SCHEMA` → `KIND_BLOB_ENCODING`
+- Attribute identifiers (Rust names; hex ids unchanged):
+  - `metadata::value_schema` → `metadata::value_encoding`
+  - `metadata::blob_schema` → `metadata::blob_encoding`
+
+#### Schema removals
+
+Two encodings whose distinction was *semantic* rather than
+*structural* were removed. Semantic distinctions belong at the
+attribute level, not the encoding level:
+
+- `IRI` removed. Encoding is byte-identical to `LongString`; the
+  semantic "this is an IRI" lives at the attribute. Removing it
+  unlocks query unification (`Variable<Handle<IRI>>` and
+  `Variable<Handle<LongString>>` couldn't unify before despite
+  representing identical bytes) and ingestion robustness
+  (validation at encoding boundary rejected mistyped IRIs;
+  validation now lives at application boundary).
+- `FileBytes` collapsed into `RawBytes`. Same decode target
+  (`Bytes`), same validity (none); two ids labeling identical
+  behavior. The "file-provenance" semantic lives at the attribute
+  level.
+
+`WasmCode` is kept distinct — its decode target is `WasmModule`
+(structured type with its own validation), not just `Bytes`. The
+schema label genuinely gates "safe to attempt WASM decode" and
+prevents structural-but-garbage decodes (e.g. a PNG handle
+decoded as `WasmModule`).
+
+#### Eager handle caching (perf)
+
+`Blob<S>` now caches its Blake3 handle at construction. This
+eliminates a double-hash that surfaced at every
+`MemoryBlobStore::insert` site in the `entity!{}` pipeline.
+`Blob::with_handle` is the explicit "trust me" constructor for
+read paths where the handle is already known. See commit
+`536c364d`.
+
+#### `entity!{}` auto-puts `Blob<T>` for `Handle<T>` fields
+
+Passing a `Blob<T>` (or any blob-source like `&str`) as the value
+for a `Handle<T>`-typed field absorbs the bytes into the
+fragment's local blob store and uses the derived handle as the
+trible's value. Replaces the explicit `ws.put(blob)` + handle
+dance for the common case. See commit `8b8e7c0a`.
+
+#### Items intentionally NOT renamed
+
+- `value_range`, `value_in_range`, `entity_in_range`,
+  `attribute_in_range` (query helpers; "value" refers to the V
+  slot in (E, A, V) tribles, the slot name).
+- `metadata::value_encoding` / `metadata::blob_encoding`
+  (attribute identifiers; "value_" / "blob_" are part of the
+  attribute name).
+- `WasmValueFormatter`, `value_formatter` module/attribute (the
+  "Value" here is generic "rendered value", not our Rust type).
+- 3rd-party `Value`-named items: `clap::ValueEnum`,
+  `proptest::strategy::ValueTree`, `Strategy::Value`,
+  `serde_json::Value`.
+
+#### Documentation
+
+- `book/src/schemas.md` renamed to `book/src/encodings.md` with
+  chapter title + intro rewrite.
+- Doc-comment and prose updates across ~80 files to use the
+  current Encoding vocabulary.
+- README quickstart now demonstrates the `entity!{ note: "hi" }`
+  auto-put pattern instead of the explicit `ws.put(...)` form for
+  the canonical case.
 
 ## [0.39.0] - 2026-05-13
 
