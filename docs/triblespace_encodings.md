@@ -1,4 +1,4 @@
-# Triblespace Schemas (Quick Notes)
+# Triblespace Encodings (Quick Notes)
 
 ## Built-in blob encodings
 
