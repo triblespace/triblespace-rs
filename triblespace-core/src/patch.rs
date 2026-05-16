@@ -43,12 +43,121 @@ static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
 /// Minimum `other.leaf_count` at which [`Head::union`] takes the
-/// scatter-pair + `par_iter_mut` path on the equal-depth-branch arm.
-/// Below this, the per-key `modify_child` loop wins because asymmetric
-/// merges only touch a handful of slots. Tuned for the `entities/union*`
-/// bench family.
+/// scatter-pair + bitset + adaptive-rayon path on the equal-depth-
+/// branch arm. Below this, the per-key `modify_child` loop wins
+/// because asymmetric merges only touch a handful of slots. Tuned
+/// for the `entities/union*` bench family.
 #[cfg(feature = "parallel")]
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
+
+/// Adaptive parallel resolver for the equal-depth-branch arm of
+/// [`Head::union`]. Plugs into rayon's `UnindexedProducer` plumbing so
+/// the work list of (key, this, other) pairs is split *only when
+/// workers actually steal*, rather than always-bisecting up-front.
+///
+/// Child count is a poor proxy for cost — the actual cost of a
+/// recursive `Head::union` depends on how much the two subtrees
+/// overlap, which we can't cheaply measure ahead of time. Letting
+/// rayon's work-stealing demand drive splits sidesteps the heuristic
+/// entirely.
+#[cfg(feature = "parallel")]
+mod parallel_union {
+    use super::{Head, KeySchema};
+    use rayon::iter::plumbing::{
+        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
+    };
+    use rayon::iter::ParallelIterator;
+
+    pub(crate) struct UnionProducer<const KEY_LEN: usize, O, V>
+    where
+        O: KeySchema<KEY_LEN> + Send + Sync,
+        V: Send + Sync,
+    {
+        work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)>,
+        depth: usize,
+        split_budget: usize,
+    }
+
+    impl<const KEY_LEN: usize, O, V> UnionProducer<KEY_LEN, O, V>
+    where
+        O: KeySchema<KEY_LEN> + Send + Sync,
+        V: Send + Sync,
+    {
+        pub(crate) fn new(
+            work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)>,
+            depth: usize,
+        ) -> Self {
+            // num_threads² split budget — same heuristic as
+            // `QueryParIter`. Caps split tree depth at ~2·log₂(N)
+            // even under sustained stealing pressure.
+            let n = rayon::current_num_threads();
+            let split_budget = n.saturating_mul(n).max(2);
+            Self {
+                work,
+                depth,
+                split_budget,
+            }
+        }
+    }
+
+    impl<const KEY_LEN: usize, O, V> UnindexedProducer for UnionProducer<KEY_LEN, O, V>
+    where
+        O: KeySchema<KEY_LEN> + Send + Sync,
+        V: Send + Sync,
+    {
+        type Item = (u8, Head<KEY_LEN, O, V>);
+
+        fn split(mut self) -> (Self, Option<Self>) {
+            // Rayon only calls this when a worker is ready to steal.
+            // Returning `(self, None)` says "I'm a leaf — fold me
+            // sequentially."
+            if self.split_budget == 0 || self.work.len() < 2 {
+                return (self, None);
+            }
+            self.split_budget -= 1;
+            let mid = self.work.len() / 2;
+            let right_work = self.work.split_off(mid);
+            let left_budget = self.split_budget / 2;
+            let right_budget = self.split_budget - left_budget;
+            self.split_budget = left_budget;
+            let depth = self.depth;
+            (
+                self,
+                Some(Self {
+                    work: right_work,
+                    depth,
+                    split_budget: right_budget,
+                }),
+            )
+        }
+
+        fn fold_with<F: Folder<Self::Item>>(self, mut folder: F) -> F {
+            let depth = self.depth;
+            for (k, t, o) in self.work.into_iter() {
+                if folder.full() {
+                    break;
+                }
+                folder = folder.consume((k, Head::union(t, o, depth)));
+            }
+            folder
+        }
+    }
+
+    impl<const KEY_LEN: usize, O, V> ParallelIterator for UnionProducer<KEY_LEN, O, V>
+    where
+        O: KeySchema<KEY_LEN> + Send + Sync,
+        V: Send + Sync,
+    {
+        type Item = (u8, Head<KEY_LEN, O, V>);
+
+        fn drive_unindexed<Con>(self, consumer: Con) -> Con::Result
+        where
+            Con: UnindexedConsumer<Self::Item>,
+        {
+            bridge_unindexed(self, consumer)
+        }
+    }
+}
 
 /// Initializes the SIP key used for key hashing.
 /// This function is called automatically when a new PATCH is created.
@@ -665,7 +774,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
+    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
         if this.hash() == other.hash() {
             return this;
         }
@@ -733,49 +846,72 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
         #[cfg(feature = "parallel")]
         if other_branch_ref.leaf_count >= PARALLEL_PATCH_UNION_THRESHOLD as u64 {
-            use rayon::iter::{
-                IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
-            };
+            use rayon::iter::ParallelIterator;
 
             {
                 let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
                 let end_depth = ed.end_depth as usize;
 
-                #[allow(clippy::type_complexity)]
-                let mut pairs: [(Option<Head<KEY_LEN, O, V>>, Option<Head<KEY_LEN, O, V>>); 256] =
-                    std::array::from_fn(|_| (None, None));
+                // Scatter both child tables into key-indexed 256-slot
+                // arrays plus `present` bitsets. The bitsets identify
+                // which keys actually need a recursive union
+                // (intersection) vs simple pass-through (symmetric
+                // difference), so the parallel work list is sized to
+                // popcount(both) rather than the full 256.
+                let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
+                    std::array::from_fn(|_| None);
+                let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
+                    std::array::from_fn(|_| None);
+                let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
+                let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
 
                 for slot in ed.child_table.iter_mut() {
                     if let Some(head) = slot.take() {
-                        let key = head.key() as usize;
-                        pairs[key].0 = Some(head);
+                        let key = head.key();
+                        this_present.insert(key);
+                        this_arr[key as usize] = Some(head);
                     }
                 }
                 for slot in other_branch_ref.child_table.iter_mut() {
                     if let Some(head) = slot.take() {
                         let head = head.with_start(end_depth);
-                        let key = head.key() as usize;
-                        pairs[key].1 = Some(head);
+                        let key = head.key();
+                        other_present.insert(key);
+                        other_arr[key as usize] = Some(head);
                     }
                 }
 
-                let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] =
-                    std::array::from_fn(|_| None);
-                pairs[..]
-                    .par_iter_mut()
-                    .zip(resolved[..].par_iter_mut())
-                    .for_each(|(pair, out)| {
-                        let (t, o) = std::mem::take(pair);
-                        *out = match (t, o) {
-                            (None, None) => None,
-                            (Some(t), None) | (None, Some(t)) => Some(t),
-                            (Some(t), Some(o)) => Some(Head::union(t, o, this_depth)),
-                        };
-                    });
+                let mut both = this_present.intersect(&other_present);
+                let mut only = this_present.symmetric_difference(&other_present);
 
-                for head in resolved.into_iter().flatten() {
+                // Build owned (key, this, other) work tuples.
+                let mut work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)> =
+                    Vec::with_capacity(both.popcount() as usize);
+                while let Some(k) = both.drain_next_ascending() {
+                    let i = k as usize;
+                    let t = this_arr[i].take().expect("both ⇒ this present");
+                    let o = other_arr[i].take().expect("both ⇒ other present");
+                    work.push((k, t, o));
+                }
+
+                // Adaptive rayon: split happens on stealing demand, not
+                // up-front chunking. For idle thread pools the producer
+                // folds entirely sequentially.
+                let resolved: Vec<(u8, Head<KEY_LEN, O, V>)> =
+                    parallel_union::UnionProducer::new(work, this_depth).collect();
+
+                for (_, head) in resolved {
                     ed.install_child_growing(head);
                 }
+                while let Some(k) = only.drain_next_ascending() {
+                    let i = k as usize;
+                    let head = this_arr[i]
+                        .take()
+                        .or_else(|| other_arr[i].take())
+                        .expect("only ⇒ exactly one side present");
+                    ed.install_child_growing(head);
+                }
+
                 ed.recompute_aggregates();
             }
             return this;
@@ -1369,7 +1505,11 @@ where
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
-    pub fn union(&mut self, other: Self) {
+    pub fn union(&mut self, other: Self)
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
         if let Some(other) = other.root {
             if self.root.is_some() {
                 let this = self.root.take().expect("root should not be empty");

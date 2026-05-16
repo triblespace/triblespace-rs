@@ -117,27 +117,63 @@ fn compress_hash(slot_count: usize, hash: u8) -> u8 {
     hash & mask
 }
 
-#[derive(Clone, Copy)]
-struct ByteSet([u128; 2]);
+/// A 256-bit set indexed by byte. Two `u128` words give one bit per
+/// possible byte value, so `insert`/`remove`/`contains` are O(1) bit
+/// ops and `drain_next_ascending` walks set bits via `trailing_zeros`
+/// (cost proportional to popcount, not the 256-bit width).
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ByteSet([u128; 2]);
 
 impl ByteSet {
-    fn new_empty() -> Self {
+    pub(crate) fn new_empty() -> Self {
         ByteSet([0, 0])
     }
 
-    fn insert(&mut self, idx: u8) {
+    pub(crate) fn insert(&mut self, idx: u8) {
         let bit = (idx & 0b0111_1111) as u32;
         self.0[(idx >> 7) as usize] |= 1u128 << bit;
     }
 
-    fn remove(&mut self, idx: u8) {
+    pub(crate) fn remove(&mut self, idx: u8) {
         let bit = (idx & 0b0111_1111) as u32;
         self.0[(idx >> 7) as usize] &= !(1u128 << bit);
     }
 
-    fn contains(&self, idx: u8) -> bool {
+    pub(crate) fn contains(&self, idx: u8) -> bool {
         let bit = (idx & 0b0111_1111) as u32;
         (self.0[(idx >> 7) as usize] & (1u128 << bit)) != 0
+    }
+
+    /// Element-wise intersection — keys present in both sets.
+    pub(crate) fn intersect(&self, other: &ByteSet) -> ByteSet {
+        ByteSet([self.0[0] & other.0[0], self.0[1] & other.0[1]])
+    }
+
+    /// Element-wise symmetric difference (XOR) — keys in exactly one set.
+    pub(crate) fn symmetric_difference(&self, other: &ByteSet) -> ByteSet {
+        ByteSet([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
+    }
+
+    /// Number of set bits.
+    pub(crate) fn popcount(&self) -> u32 {
+        self.0[0].count_ones() + self.0[1].count_ones()
+    }
+
+    /// Returns the lowest set byte (ascending order) and clears it;
+    /// `None` when empty. Walks set bits via `trailing_zeros` so the
+    /// cost is proportional to popcount, not 256.
+    pub(crate) fn drain_next_ascending(&mut self) -> Option<u8> {
+        if self.0[0] != 0 {
+            let bit = self.0[0].trailing_zeros();
+            self.0[0] &= !(1u128 << bit);
+            Some(bit as u8)
+        } else if self.0[1] != 0 {
+            let bit = self.0[1].trailing_zeros();
+            self.0[1] &= !(1u128 << bit);
+            Some(128 + bit as u8)
+        } else {
+            None
+        }
     }
 }
 
