@@ -1,28 +1,28 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Inline]s.
 
-/// Boolean inline encoding (all-zero / all-one encoding).
+/// Boolean inline encoding (all-zero / all-one).
 pub mod boolean;
-/// Ed25519 signature component and public key schemas.
+/// Ed25519 signature component and public key encodings.
 pub mod ed25519;
-/// 256-bit IEEE-like floating point schemas (little-endian and big-endian).
+/// 256-bit IEEE-like floating point encodings (little-endian and big-endian).
 pub mod f256;
-/// IEEE-754 double-precision floating point schema.
+/// IEEE-754 double-precision floating point encoding.
 pub mod f64;
-/// Opaque 128-bit identifier schema.
+/// Opaque 128-bit identifier encoding.
 pub mod genid;
-/// Cryptographic hash and typed blob handle schemas.
+/// Cryptographic hash and typed blob handle encodings.
 pub mod hash;
-/// 256-bit signed and unsigned integer schemas (little-endian and big-endian).
+/// 256-bit signed and unsigned integer encodings (little-endian and big-endian).
 pub mod iu256;
-/// Line/column source location schema.
+/// Line/column source location encoding.
 pub mod linelocation;
-/// 256-bit rational number schemas (little-endian and big-endian).
+/// 256-bit rational number encodings (little-endian and big-endian).
 pub mod r256;
-/// Range schemas for pairs of `u128` values.
+/// Range encodings for pairs of `u128` values.
 pub mod range;
-/// Inline UTF-8 short string schema (up to 32 bytes).
+/// Inline UTF-8 short string encoding (up to 32 bytes).
 pub mod shortstring;
-/// TAI nanosecond interval schema.
+/// TAI nanosecond interval encoding.
 pub mod time;
 
 use crate::id::ExclusiveId;
@@ -36,12 +36,12 @@ use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
-/// A inline encoding for an unknown value.
-/// This inline encoding is used as a fallback when the inline encoding is not known.
-/// It is not recommended to use this inline encoding in practice.
-/// Instead, use a specific inline encoding.
+/// An inline encoding for unknown values.
 ///
-/// Any bit pattern can be a valid value of this schema.
+/// Fallback when the encoding of an inline value isn't known. Not
+/// recommended for everyday use — prefer a specific encoding.
+///
+/// Any bit pattern is a valid `Inline<UnknownInline>`.
 pub struct UnknownInline {}
 
 impl MetaDescribe for UnknownInline {

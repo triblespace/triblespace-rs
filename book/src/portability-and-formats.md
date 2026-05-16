@@ -18,9 +18,9 @@ is always the same size regardless of its schema.
 ## Schemas as Contracts
 
 A schema describes which bit patterns are meaningful for a particular value. The
-[`Inline`](../../src/value.rs) type is parameterised by such a schema and remains
+[`Inline`](../../src/inline.rs) type is parameterised by such a schema and remains
 agnostic about whether the underlying bytes currently satisfy the contract.
-Validation lives in the schema through the [`InlineEncoding`](../../src/value.rs)
+Validation lives in the schema through the [`InlineEncoding`](../../src/inline.rs)
 trait. Conversions go through [`Encodes`] (schema-side, the `From`-direction),
 [`TryToInline`], and [`TryFromInline`]. Because `Encodes` is implemented *on* the
 schema (the schema is the impl target; the source is the trait parameter), Rust's
@@ -54,7 +54,7 @@ When you define a new schema:
 With those pieces in place, values can round-trip between storage and strongly
 typed Rust code while remaining portable and future-proof.
 
-[`InlineEncoding`]: ../../src/value.rs
-[`Encodes`]: ../../src/value.rs
-[`TryToInline`]: ../../src/value.rs
-[`TryFromInline`]: ../../src/value.rs
+[`InlineEncoding`]: ../../src/inline.rs
+[`Encodes`]: ../../src/inline.rs
+[`TryToInline`]: ../../src/inline.rs
+[`TryFromInline`]: ../../src/inline.rs

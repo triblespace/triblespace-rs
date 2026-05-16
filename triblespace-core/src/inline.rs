@@ -390,8 +390,8 @@ pub trait TryToInline<S: InlineEncoding> {
 /// ```
 ///
 /// This is the canonical orphan-rule shape (mirroring `From<T>` in
-/// std): downstream that defines a local `MyBlobSchema` writes
-/// `impl Encodes<ForeignType> for MyBlobSchema` — the local schema
+/// std): downstream that defines a local `MyBlobEncoding` writes
+/// `impl Encodes<ForeignType> for MyBlobEncoding` — the local encoding
 /// sits at the impl-target position so Rust's orphan checker
 /// trivially accepts the impl, no matter how foreign the source
 /// type is.
@@ -401,7 +401,7 @@ pub trait TryToInline<S: InlineEncoding> {
 /// from this trait via [`IntoEncoded`].
 pub trait Encodes<Source> {
     /// The concrete form this source produces when encoded for this
-    /// schema. `Inline<Self>` for inline schemas, `Blob<Self>` for
+    /// schema. `Inline<Self>` for inline encodings, `Blob<Self>` for
     /// blob encodings, or `Inline<Handle<Self>>` for the
     /// precomputed-handle case where `Self: BlobEncoding`.
     type Output;

@@ -68,14 +68,14 @@ mod literature {
         /// A pen name or alternate spelling for an author.
         "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
 
-        /// A throwaway prototype field; omit the id to derive it from the name and schema.
+        /// A throwaway prototype field; omit the id to derive it from the name and encoding.
         pub prototype_note: Handle<LongString>;
     }
 }
 
-// The examples pin explicit ids for shared schemas. For quick prototypes you
+// The examples pin explicit ids for shared encodings. For quick prototypes you
 // can omit the hex literal and `attributes!` will derive a deterministic id
-// from the attribute name and schema via the entity-core mechanism —
+// from the attribute name and encoding via the entity-core mechanism —
 // `Attribute::<S>::from(entity!{ metadata::name: <name handle>,
 // metadata::value_encoding: <S as MetaDescribe>::id() })`.
 
@@ -201,7 +201,7 @@ The [Tribles Book](https://triblespace.github.io/triblespace-rs/) is the best pl
 3. [Architecture](https://triblespace.github.io/triblespace-rs/architecture.html)
 4. [Query Language](https://triblespace.github.io/triblespace-rs/query-language.html)
 5. [Incremental Queries](https://triblespace.github.io/triblespace-rs/incremental-queries.html)
-6. [Schemas](https://triblespace.github.io/triblespace-rs/schemas.html)
+6. [Encodings](https://triblespace.github.io/triblespace-rs/encodings.html)
 7. [Repository Workflows](https://triblespace.github.io/triblespace-rs/repository-workflows.html)
 8. [Commit Selectors](https://triblespace.github.io/triblespace-rs/commit-selectors.html)
 9. [Philosophy](https://triblespace.github.io/triblespace-rs/deep-dive/philosophy.html)

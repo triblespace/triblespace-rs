@@ -6,14 +6,14 @@ relate to one another in TribleSpace.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
-middle position in a trible and carry the `InlineEncoding` (or blob-handle schema)
-that interprets and validates the value. Modules mint them with the
+middle position in a trible and carry the `InlineEncoding` (or blob-handle
+encoding) that interprets and validates the value. Modules mint them with the
 `attributes!` macro, so they behave like detached struct fields: each attribute
 remains independently typed even when many are combined to describe the same
 entity, preserving its individual semantics. Provide an explicit 128-bit id in
 the macro when you need a canonical column shared across crates or languages;
-omit the literal to derive a deterministic id from the attribute name and value
-schema (the macro wraps the name + schema id in an `entity!{}` fragment and
+omit the literal to derive a deterministic id from the attribute name and
+encoding (the macro wraps the name + encoding id in an `entity!{}` fragment and
 takes the root for you), which is handy for short-lived or internal attributes.
 
 ### Blob
@@ -114,14 +114,14 @@ The durable record that ties blob storage, branch metadata, and namespaces
 together. A repository coordinates synchronization, replication, and history
 traversal across commits while enforcing signatures and branch ownership.
 
-### Schema
-The set of attribute declarations and codecs that document and enforce the shape
-of data in TribleSpace. Schemas assign language-agnostic meaning to the raw
-bytes—they are not the concrete Rust types—so any implementation that
-understands the schema can interpret the payloads consistently. Inline schemas
-map the fixed 32-byte payload of a trible to native types, while blob encodings
-describe arbitrarily long payloads so tribles referencing those blobs stay
-portable.
+### Encoding
+The byte-layout contract for a typed value. Encodings assign language-agnostic
+meaning to the raw bytes — they are not the concrete Rust types — so any
+implementation that understands the encoding can interpret the payloads
+consistently. **Inline encodings** map the fixed 32-byte payload of a trible to
+native types; **blob encodings** describe arbitrarily long payloads so tribles
+referencing those blobs stay portable. The corresponding traits are
+`InlineEncoding` and `BlobEncoding`.
 
 ### Scope
 The set of permissions a [Capability](#capability) grants. Output as tribles

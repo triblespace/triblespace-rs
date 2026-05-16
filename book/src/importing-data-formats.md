@@ -1,7 +1,7 @@
 # Importing Other Data Formats
 
 Import pipelines let you bring external datasets into a tribles repository without
-hand-writing schemas or entity identifiers every time. This chapter introduces the
+hand-writing encodings or entity identifiers every time. This chapter introduces the
 `import` namespace, explains how the JSON importers map foreign fields onto
 attributes, and outlines how you can extend the same patterns to new formats.
 
@@ -66,7 +66,7 @@ entity id(s) for the imported document and containing the emitted facts; call
 ids and containing attribute descriptors plus multi-value hints (via
 `metadata::tag` pointing to `metadata::KIND_MULTI`). Merge those descriptors
 into your repository alongside the imported facts when you want queries to
-discover the original JSON field names or project datasets by schema without
+discover the original JSON field names or project datasets by encoding without
 repeating the derivation logic. Field names are stored as `metadata::name`
 handles to
 LongString blobs so arbitrarily long keys survive roundtrips; `metadata::name`
@@ -91,7 +91,7 @@ instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:
 `ShortString` → JSON string, `Handle<LongString>` → JSON string (via
 blob lookup), `Boolean` → JSON bool, `F64` → JSON number, `GenId` → inlined
-object (unless already visited). Attributes that use other schemas are ignored
+object (unless already visited). Attributes that use other encodings are ignored
 so JSON roundtrips stay predictable even when the dataset mixes in
 format-specific extensions.
 
@@ -119,7 +119,7 @@ still layer semantic projections on top.
 
 Each `import_*` call returns a rooted `Fragment` containing the JSON AST facts.
 Merge fragments when you ingest multiple documents. `metadata()` returns a
-fixed `Fragment` exporting the schema ids for the `json_tree::*` attributes and
+fixed `Fragment` exporting the encoding ids for the `json_tree::*` attributes and
 kinds. You typically merge it once alongside your lossless archive.
 
 ## Importing N-Triples (RDF)
@@ -168,7 +168,7 @@ same-spelled IRIs.)
 **Literal → native value.** XSD datatypes map into the appropriate
 triblespace inline encodings:
 
-| XSD datatype | triblespace schema |
+| XSD datatype | triblespace encoding |
 |---|---|
 | `xsd:integer`, `xsd:long`, `xsd:int`, `xsd:short`, `xsd:byte`, `xsd:negativeInteger`, `xsd:nonPositiveInteger` | `I256BE` |
 | `xsd:nonNegativeInteger`, `xsd:positiveInteger`, `xsd:unsignedInt`, `xsd:unsignedLong`, `xsd:unsignedShort`, `xsd:unsignedByte` | `U256BE` |

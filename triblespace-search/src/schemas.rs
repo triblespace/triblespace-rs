@@ -15,7 +15,7 @@
 //! The built-in tokenizers in [`crate::tokens`] return
 //! `Inline<Handle<LongString>>` — the hash bytes are
 //! valid LongString-blob handles by construction, so there's
-//! no need for a bespoke "token hash" schema.
+//! no need for a bespoke "token hash" encoding.
 
 use triblespace_core::inline::Encodes;
 use std::convert::Infallible;

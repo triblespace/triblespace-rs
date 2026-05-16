@@ -58,14 +58,14 @@ mod literature {
         /// A pen name or alternate spelling for an author.
         "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
 
-        /// A throwaway prototype field; omit the id to derive it from the name and schema.
+        /// A throwaway prototype field; omit the id to derive it from the name and encoding.
         pub prototype_note: Handle<LongString>;
     }
 }
 
-// The examples pin explicit ids for shared schemas. For quick prototypes you
+// The examples pin explicit ids for shared encodings. For quick prototypes you
 // can omit the hex literal and `attributes!` will derive a deterministic id
-// from the attribute name and schema via the entity-core mechanism.
+// from the attribute name and encoding via the entity-core mechanism.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory

@@ -30,7 +30,7 @@
 
 /// Re-exports of blob encoding types.
 pub mod blobencodings;
-/// Re-exports of inline schema types.
+/// Re-exports of inline encoding types.
 pub mod inlineencodings;
 
 pub use crate::attribute::Attribute;

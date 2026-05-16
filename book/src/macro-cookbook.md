@@ -7,7 +7,7 @@ the deeper chapters, but to make the everyday question easy:
 
 The macros fall into three layers:
 
-- **Schema definition**: `attributes!`
+- **Encoding definition**: `attributes!`
 - **Fact construction**: `entity!`
 - **Query construction**: `find!`, `exists!`, `pattern!`, `pattern_changes!`,
   `path!`, `and!`, `or!`, `temp!`, `ignore!`
@@ -38,7 +38,7 @@ assert_ne!(social::name.id(), social::friend.id());
 
 Reach for this macro when:
 
-- you are defining a namespace or schema module
+- you are defining a namespace or encoding module
 - you want attributes with stable ids and inline encodings
 - you want doc comments to become attribute metadata
 
@@ -381,7 +381,7 @@ hide them from the outer query.
 
 If you are:
 
-- defining a schema: use `attributes!`
+- defining encodings: use `attributes!`
 - building facts for one entity: use `entity!`
 - matching trible structure: use `pattern!`
 - matching only newly added results: use `pattern_changes!`

@@ -20,7 +20,7 @@ Reading the chapter sequentially should equip you to:
 - Attributes are typed fields (unlike untyped RDF predicates).
 - An entity in tribles is a structural record: a bag of typed fields.
 - `attributes!` accepts explicit ids for shared columns and can derive
-  deterministic ids from a name + schema when you omit the hex literal; use the
+  deterministic ids from a name + encoding when you omit the hex literal; use the
   derived form for quick, local attributes and reserve explicit ids for
   published protocols.
 - find! patterns are descriptive type checks / projections: they select
@@ -28,7 +28,7 @@ Reading the chapter sequentially should equip you to:
 - entity! constructs ad‑hoc entities (like struct literals).
 - Reified kinds/tags are attached via metadata::tag (GenId); projects often
   export canonical KIND_* constants you can pattern-match directly against.
-- Inline schema entities are tagged with metadata::KIND_INLINE_ENCODING; blob encoding
+- Inline encoding entities are tagged with metadata::KIND_INLINE_ENCODING; blob encoding
   entities with metadata::KIND_BLOB_ENCODING.
 - Prefer passing the Workspace + the checkout result (TribleSet) and an
   entity id around — only materialize a concrete Rust view when required.

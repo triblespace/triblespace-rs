@@ -60,7 +60,7 @@ compressed or cached `Universe` implementations. A dedicated section should walk
 through building an archive from a set, choosing a universe, storing it as a
 blob, and querying it directly through `SuccinctArchiveConstraint` so readers
 can reuse the on-disk index without round-tripping through `TribleSet`
-conversions. 【F:src/blob/schemas/succinctarchive.rs†L100-L529】 【F:src/blob/schemas/succinctarchive/universe.rs†L16-L265】 【F:src/blob/schemas/succinctarchive/succinctarchiveconstraint.rs†L9-L200】
+conversions. 【F:src/blob/encodings/succinctarchive.rs†L100-L529】 【F:src/blob/encodings/succinctarchive/universe.rs†L16-L265】 【F:src/blob/encodings/succinctarchive/succinctarchiveconstraint.rs†L9-L200】
 
 ### Extensible path engines
 Regular path queries run through `RegularPathConstraint`, which delegates edge

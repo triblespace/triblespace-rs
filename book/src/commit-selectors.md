@@ -224,7 +224,7 @@ Only a subset of Git's revision grammar will likely be supported. Selectors rely
 ## TimeRange
 
 Commits record when they were made via a `timestamp` attribute of type
-[`NsTAIInterval`](../src/value/schemas/time.rs). When creating a commit this
+[`NsTAIInterval`](../src/inline/encodings/time.rs). When creating a commit this
 interval defaults to `(now, now)` but other tools could provide a wider range
 if the clock precision is uncertain. The `TimeRange` selector uses this interval
 to gather commits whose timestamps fall between two `Epoch` values:

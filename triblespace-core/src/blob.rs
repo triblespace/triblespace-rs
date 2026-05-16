@@ -263,9 +263,9 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
 /// convenience method.
 ///
 /// The trait parameter is the [`BlobEncoding`] directly (not
-/// `Handle<S>`) — this is what makes `impl IntoBlob<MyBlobSchema>
+/// `Handle<S>`) — this is what makes `impl IntoBlob<MyBlobEncoding>
 /// for MyForeignType` legal for downstream crates: the local
-/// `MyBlobSchema` sits at trait position 0, satisfying Rust's
+/// `MyBlobEncoding` sits at trait position 0, satisfying Rust's
 /// orphan rule.
 pub trait IntoBlob<S: BlobEncoding>:
     crate::inline::IntoEncoded<S, Output = Blob<S>>
