@@ -29,6 +29,7 @@
 //! Attribute::<S>::from(Fragment::rooted(id, TribleSet::new()))
 //! ```
 
+use crate::id::Id;
 use crate::id::RawId;
 use crate::trible::Fragment;
 use crate::inline::InlineEncoding;
@@ -37,8 +38,14 @@ use core::marker::PhantomData;
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
 /// marker.
+///
+/// The root id is cached alongside the fragment so `.id()` is a field
+/// read — `entity!{}` codegen calls it once per attribute per fact,
+/// and walking the fragment's exports PATCH each time dominated the
+/// pre-0.40 entities/union benches.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Attribute<S: InlineEncoding> {
+    id: Id,
     fragment: Fragment,
     _schema: PhantomData<S>,
 }
@@ -50,6 +57,7 @@ impl<S: InlineEncoding> Clone for Attribute<S> {
     // `Attribute<Boolean>` etc. without needing `Boolean: Clone`.
     fn clone(&self) -> Self {
         Self {
+            id: self.id,
             fragment: self.fragment.clone(),
             _schema: PhantomData,
         }
@@ -58,10 +66,8 @@ impl<S: InlineEncoding> Clone for Attribute<S> {
 
 impl<S: InlineEncoding> Attribute<S> {
     /// The attribute's id, equal to the wrapped fragment's root.
-    pub fn id(&self) -> crate::id::Id {
-        self.fragment
-            .root()
-            .expect("Attribute fragment must be rooted")
+    pub fn id(&self) -> Id {
+        self.id
     }
 
     /// Return the underlying raw id bytes.
@@ -132,10 +138,11 @@ impl<S: InlineEncoding> Attribute<S> {
 /// explicit hex literals there.
 impl<S: InlineEncoding> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
-        fragment
+        let id = fragment
             .root()
             .expect("Attribute::from(Fragment) requires a rooted fragment");
         Self {
+            id,
             fragment,
             _schema: PhantomData,
         }
