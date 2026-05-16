@@ -6,7 +6,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::TryToInline;
@@ -33,18 +32,12 @@ pub struct NsTAIInterval;
 impl MetaDescribe for NsTAIInterval {
     fn describe() -> Fragment {
         let id: Id = id_hex!("2170014368272A2B1B18B86B1F1F1CB5");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Inclusive TAI interval encoded as two offset-big-endian i128 nanosecond bounds. Each i128 is XOR'd with i128::MIN then stored big-endian, so byte-lexicographic order matches numeric order. This enables efficient range scans on ordered indexes.\n\nSemantically identical to the legacy LE encoding — same inclusive bounds, same TAI monotonic time.",
-        );
-        let name = tribles.put("nstai_interval_be");
-        tribles += entity! {
+        entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "nstai_interval_be",
+                metadata::description: "Inclusive TAI interval encoded as two offset-big-endian i128 nanosecond bounds. Each i128 is XOR'd with i128::MIN then stored big-endian, so byte-lexicographic order matches numeric order. This enables efficient range scans on ordered indexes.\n\nSemantically identical to the legacy LE encoding — same inclusive bounds, same TAI monotonic time.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
-        };
-        tribles
+        }
     }
 }
 
@@ -211,18 +204,12 @@ pub struct NsDuration;
 impl MetaDescribe for NsDuration {
     fn describe() -> Fragment {
         let id: Id = id_hex!("951D5249DB193D3B3F208B994B1072C4");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Signed nanosecond duration delta encoded as an offset-big-endian i128 in the upper 16 bytes; the lower 16 bytes are reserved (zero today, sub-nanosecond precision in the future). XOR'ing the i128 with i128::MIN before big-endian write makes byte-lexicographic order match numeric order across the full i128 range, so range scans on a sorted trie work natively.",
-        );
-        let name = tribles.put("ns_duration");
-        tribles += entity! {
+        entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "ns_duration",
+                metadata::description: "Signed nanosecond duration delta encoded as an offset-big-endian i128 in the upper 16 bytes; the lower 16 bytes are reserved (zero today, sub-nanosecond precision in the future). XOR'ing the i128 with i128::MIN before big-endian write makes byte-lexicographic order match numeric order across the full i128 range, so range scans on a sorted trie work natively.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
-        };
-        tribles
+        }
     }
 }
 

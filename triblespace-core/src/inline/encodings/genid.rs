@@ -9,7 +9,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::TryToInline;
@@ -34,23 +33,18 @@ pub struct GenId;
 impl MetaDescribe for GenId {
     fn describe() -> Fragment {
         let id: Id = id_hex!("B08EE1D45EB081E8C47618178AFE0D81");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example by wrapping the inputs in `entity!{}` and taking its `root()`, or by hashing them directly).",
-        );
-        let name = tribles.put("genid");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "genid",
+                metadata::description: "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example by wrapping the inputs in `entity!{}` and taking its `root()`, or by hashing them directly).",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::GENID_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::GENID_WASM,
             };
         }
         tribles

@@ -28,18 +28,12 @@ impl BlobEncoding for SimpleArchive {}
 impl MetaDescribe for SimpleArchive {
     fn describe() -> Fragment {
         let id: Id = id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Canonical trible sequence stored as raw 64-byte entries. This is the simplest portable archive format and preserves the exact trible ordering expected by the canonicalization rules.\n\nUse SimpleArchive for export, import, streaming, hashing, or audit trails where you want a byte-for-byte stable representation. Prefer SuccinctArchiveBlob when you need compact indexed storage and fast offline queries, and keep a SimpleArchive around if you want a source of truth that can be re-indexed or validated.",
-        );
-        let name = tribles.put("simplearchive");
-        tribles += entity! {
+        entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "simplearchive",
+                metadata::description: "Canonical trible sequence stored as raw 64-byte entries. This is the simplest portable archive format and preserves the exact trible ordering expected by the canonicalization rules.\n\nUse SimpleArchive for export, import, streaming, hashing, or audit trails where you want a byte-for-byte stable representation. Prefer SuccinctArchiveBlob when you need compact indexed storage and fast offline queries, and keep a SimpleArchive around if you want a source of truth that can be re-indexed or validated.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
-        };
-        tribles
+        }
     }
 }
 

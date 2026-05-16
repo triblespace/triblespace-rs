@@ -6,7 +6,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::TryToInline;
@@ -30,23 +29,18 @@ pub type F256 = F256LE;
 impl MetaDescribe for F256LE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("D9A419D3CAA0D8E05D8DAB950F5E80F2");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "High-precision f256 float stored in little-endian byte order. The format preserves far more precision than f64 and can round-trip large JSON numbers.\n\nUse when precision or exact decimal import matters more than storage or compute cost. Choose the big-endian variant if you need lexicographic ordering or network byte order.\n\nF256 values are heavier to parse and compare than f64. If you only need standard double precision, prefer F64 for faster operations.",
-        );
-        let name = tribles.put("f256le");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "f256le",
+                metadata::description: "High-precision f256 float stored in little-endian byte order. The format preserves far more precision than f64 and can round-trip large JSON numbers.\n\nUse when precision or exact decimal import matters more than storage or compute cost. Choose the big-endian variant if you need lexicographic ordering or network byte order.\n\nF256 values are heavier to parse and compare than f64. If you only need standard double precision, prefer F64 for faster operations.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::F256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::F256_LE_WASM,
             };
         }
         tribles
@@ -59,23 +53,18 @@ impl InlineEncoding for F256LE {
 impl MetaDescribe for F256BE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("A629176D4656928D96B155038F9F2220");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "High-precision f256 float stored in big-endian byte order. This variant is convenient for bytewise ordering or wire formats that expect network order.\n\nUse for high-precision metrics or lossless JSON import when ordering matters across systems. For everyday numeric values, F64 is smaller and faster.\n\nAs with all floats, rounding can still occur at the chosen precision. If you need exact fractions, use R256 instead.",
-        );
-        let name = tribles.put("f256be");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "f256be",
+                metadata::description: "High-precision f256 float stored in big-endian byte order. This variant is convenient for bytewise ordering or wire formats that expect network order.\n\nUse for high-precision metrics or lossless JSON import when ordering matters across systems. For everyday numeric values, F64 is smaller and faster.\n\nAs with all floats, rounding can still occur at the chosen precision. If you need exact fractions, use R256 instead.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::F256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::F256_BE_WASM,
             };
         }
         tribles

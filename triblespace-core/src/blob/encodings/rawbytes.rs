@@ -9,7 +9,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 
 use anybytes::Bytes;
 
@@ -33,18 +32,12 @@ impl BlobEncoding for RawBytes {}
 impl MetaDescribe for RawBytes {
     fn describe() -> Fragment {
         let id: Id = id_hex!("4C1BA1EB2FDCC637C2F269A46FCA2398");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Opaque raw bytes with no further structural interpretation. Used for any payload whose decode target is Bytes/Vec<u8>: XSD hexBinary / base64Binary literals, file contents, inline digests, key material. Distinct from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
-        );
-        let name = tribles.put("rawbytes");
-        tribles += entity! {
+        entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "rawbytes",
+                metadata::description: "Opaque raw bytes with no further structural interpretation. Used for any payload whose decode target is Bytes/Vec<u8>: XSD hexBinary / base64Binary literals, file contents, inline digests, key material. Distinct from UnknownBlob (the 'unknown schema' fallback): RawBytes is a positive choice meaning the schema *is* raw bytes.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
-        };
-        tribles
+        }
     }
 }
 

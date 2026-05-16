@@ -6,7 +6,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::TryToInline;
@@ -22,23 +21,18 @@ pub struct F64;
 impl MetaDescribe for F64 {
     fn describe() -> Fragment {
         let id: Id = id_hex!("C80A60F4A6F2FBA5A8DB2531A923EC70");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "IEEE-754 double stored in the first 8 bytes (little-endian); remaining bytes are zero. This matches the standard host representation while preserving the 32-byte value width.\n\nUse for typical metrics, measurements, and calculations where floating-point rounding is acceptable. Choose F256 for higher precision or lossless JSON number import, and R256 for exact rational values.\n\nNaN and infinity can be represented; decide whether your application accepts them. If you need deterministic ordering or exact comparisons, prefer integer or rational schemas.",
-        );
-        let name = tribles.put("f64");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "f64",
+                metadata::description: "IEEE-754 double stored in the first 8 bytes (little-endian); remaining bytes are zero. This matches the standard host representation while preserving the 32-byte value width.\n\nUse for typical metrics, measurements, and calculations where floating-point rounding is acceptable. Choose F256 for higher precision or lossless JSON number import, and R256 for exact rational values.\n\nNaN and infinity can be represented; decide whether your application accepts them. If you need deterministic ordering or exact comparisons, prefer integer or rational schemas.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::F64_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::F64_WASM,
             };
         }
         tribles

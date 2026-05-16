@@ -6,7 +6,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::TryFromInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
@@ -38,23 +37,18 @@ pub type U256 = U256BE;
 impl MetaDescribe for U256LE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("49E70B4DBD84DC7A3E0BDDABEC8A8C6E");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Unsigned 256-bit integer stored in little-endian byte order. The full 32 bytes are dedicated to the magnitude.\n\nUse for large counters, identifiers, or domain-specific fixed-width numbers that exceed u128. Prefer U256BE when bytewise ordering or protocol encoding matters.\n\nIf a smaller width suffices, prefer U64 or U128 in your schema to reduce storage and improve readability.",
-        );
-        let name = tribles.put("u256le");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "u256le",
+                metadata::description: "Unsigned 256-bit integer stored in little-endian byte order. The full 32 bytes are dedicated to the magnitude.\n\nUse for large counters, identifiers, or domain-specific fixed-width numbers that exceed u128. Prefer U256BE when bytewise ordering or protocol encoding matters.\n\nIf a smaller width suffices, prefer U64 or U128 in your schema to reduce storage and improve readability.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::U256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::U256_LE_WASM,
             };
         }
         tribles
@@ -67,23 +61,18 @@ impl InlineEncoding for U256LE {
 impl MetaDescribe for U256BE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("DC3CFB719B05F019FB8101A6F471A982");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Unsigned 256-bit integer stored in big-endian byte order. Bytewise comparisons align with numeric order.\n\nUse when ordering or network serialization matters. Prefer U256LE for local storage or interop with little-endian APIs.\n\nIf you do not need the full 256-bit range, smaller integer schemas are easier to handle and faster to encode.",
-        );
-        let name = tribles.put("u256be");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "u256be",
+                metadata::description: "Unsigned 256-bit integer stored in big-endian byte order. Bytewise comparisons align with numeric order.\n\nUse when ordering or network serialization matters. Prefer U256LE for local storage or interop with little-endian APIs.\n\nIf you do not need the full 256-bit range, smaller integer schemas are easier to handle and faster to encode.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::U256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::U256_BE_WASM,
             };
         }
         tribles
@@ -96,23 +85,18 @@ impl InlineEncoding for U256BE {
 impl MetaDescribe for I256LE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("DB94325A37D96037CBFC6941A4C3B66D");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Signed 256-bit integer stored in little-endian twos-complement. This enables extremely large signed ranges in a fixed width.\n\nUse for large signed quantities such as balances or offsets beyond i128. Prefer I256BE when bytewise ordering or external protocols require big-endian.\n\nIf values fit within i64 or i128, smaller schemas are more compact and easier to interoperate with.",
-        );
-        let name = tribles.put("i256le");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "i256le",
+                metadata::description: "Signed 256-bit integer stored in little-endian twos-complement. This enables extremely large signed ranges in a fixed width.\n\nUse for large signed quantities such as balances or offsets beyond i128. Prefer I256BE when bytewise ordering or external protocols require big-endian.\n\nIf values fit within i64 or i128, smaller schemas are more compact and easier to interoperate with.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::I256_LE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::I256_LE_WASM,
             };
         }
         tribles
@@ -125,23 +109,18 @@ impl InlineEncoding for I256LE {
 impl MetaDescribe for I256BE {
     fn describe() -> Fragment {
         let id: Id = id_hex!("CE3A7839231F1EB390E9E8E13DAED782");
-        let mut tribles = Fragment::rooted(id, TribleSet::new());
-        let description = tribles.put(
-            "Signed 256-bit integer stored in big-endian twos-complement. This variant is convenient for protocol encoding and deterministic ordering.\n\nUse for interoperability or stable bytewise comparisons across systems. Prefer I256LE for local storage or when endianness does not matter.\n\nAs with any signed integer, consider whether the sign bit has semantic meaning and avoid mixing signed and unsigned ranges.",
-        );
-        let name = tribles.put("i256be");
-        tribles += entity! {
+        #[allow(unused_mut)]
+        let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: name,
-                metadata::description: description,
+                metadata::name: "i256be",
+                metadata::description: "Signed 256-bit integer stored in big-endian twos-complement. This variant is convenient for protocol encoding and deterministic ordering.\n\nUse for interoperability or stable bytewise comparisons across systems. Prefer I256LE for local storage or when endianness does not matter.\n\nAs with any signed integer, consider whether the sign bit has semantic meaning and avoid mixing signed and unsigned ranges.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::I256_BE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::I256_BE_WASM,
             };
         }
         tribles
