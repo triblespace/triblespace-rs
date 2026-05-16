@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+- **TLS roots now come from the OS trust store** via
+  `rustls-platform-verifier`, instead of the compiled-in Mozilla
+  `webpki-roots` bundle. The `platform-verifier` feature on the
+  iroh dep is enabled, and `host.rs` calls
+  `Endpoint::builder(...).ca_roots_config(CaRootsConfig::system())`.
+
+  Why: corporate-proxy / sandbox environments (e.g. Anthropic
+  web-sandbox egress) present a custom CA at TLS interception.
+  webpki-roots is a frozen Mozilla snapshot and ignores the OS
+  store, so iroh's relay HTTPS probes and pkarr publish/lookup
+  fail with `invalid peer certificate: UnknownIssuer`, discovery
+  dies silently, and the QUIC peer handshake never starts.
+  Reading the OS store at runtime lets admin-installed roots
+  (and the sandbox CA) participate. macOS uses the Security
+  framework, Linux reads `/etc/ssl/certs`, Windows reads the
+  certificate store. Standard Mozilla roots remain trusted on
+  all three since they're already in the OS store.
+
+  Reported and diagnosed by another Claude instance running in
+  the Anthropic web sandbox after seeing the
+  `WARN [...] UnknownIssuer` lines from the new tracing
+  surface — exactly the kind of failure the previous
+  Unreleased tracing-instrumentation work was supposed to
+  surface, and did.
+
 ### Added
 - **Tracing instrumentation across the auth handshake and op
   surface.** `SnapshotHandler::accept` opens an `info`-level

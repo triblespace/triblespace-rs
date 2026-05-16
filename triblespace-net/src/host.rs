@@ -368,7 +368,22 @@ async fn host_loop(
     use iroh_gossip::api::GossipSender;
     use futures::TryStreamExt;
 
-    let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
+    // Use the OS trust store (via rustls-platform-verifier) rather
+    // than the compiled-in Mozilla webpki-roots bundle. The default
+    // (webpki-roots) breaks when running inside corporate-proxy /
+    // sandbox environments that present a custom CA at egress: iroh's
+    // relay HTTPS probes and pkarr publish/lookup over HTTPS get
+    // `invalid peer certificate: UnknownIssuer`, discovery dies
+    // silently, and the QUIC handshake never starts. Reading the OS
+    // store at runtime lets the sandbox CA (or any admin-installed
+    // root) participate. macOS uses the Security framework; Linux
+    // reads /etc/ssl/certs; Windows reads the certificate store.
+    let ep = match Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .ca_roots_config(iroh::tls::CaRootsConfig::system())
+        .bind()
+        .await
+    {
         Ok(ep) => ep,
         Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
     };
