@@ -1017,7 +1017,7 @@ struct NTriplesAttrCache {
 impl NTriplesAttrCache {
     fn genid(&mut self, iri: &str) -> Id {
         *self.genid.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::GenId>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1028,7 +1028,7 @@ impl NTriplesAttrCache {
     }
     fn longstring(&mut self, iri: &str) -> Id {
         *self.longstring.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<Handle<LongString>>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1039,7 +1039,7 @@ impl NTriplesAttrCache {
     }
     fn rawbytes(&mut self, iri: &str) -> Id {
         *self.rawbytes.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<Handle<RawBytes>>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1050,7 +1050,7 @@ impl NTriplesAttrCache {
     }
     fn i256be(&mut self, iri: &str) -> Id {
         *self.i256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::I256BE>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1061,7 +1061,7 @@ impl NTriplesAttrCache {
     }
     fn u256be(&mut self, iri: &str) -> Id {
         *self.u256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::U256BE>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1072,7 +1072,7 @@ impl NTriplesAttrCache {
     }
     fn r256be(&mut self, iri: &str) -> Id {
         *self.r256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::R256BE>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1083,7 +1083,7 @@ impl NTriplesAttrCache {
     }
     fn f64(&mut self, iri: &str) -> Id {
         *self.f64.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::F64>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1094,7 +1094,7 @@ impl NTriplesAttrCache {
     }
     fn boolean(&mut self, iri: &str) -> Id {
         *self.boolean.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<inlineschemas::Boolean>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1105,7 +1105,7 @@ impl NTriplesAttrCache {
     }
     fn nsduration(&mut self, iri: &str) -> Id {
         *self.nsduration.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<NsDuration>::from(entity! {
                 crate::metadata::iri:          h,
@@ -1116,7 +1116,7 @@ impl NTriplesAttrCache {
     }
     fn nstai(&mut self, iri: &str) -> Id {
         *self.nstai.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::schemas::iri::IRI>> =
+            let h: Inline<Handle<crate::blob::schemas::longstring::LongString>> =
                 String::from(iri).to_blob().get_handle();
             Attribute::<NsTAIInterval>::from(entity! {
                 crate::metadata::iri:          h,

@@ -6,8 +6,6 @@ pub use crate::blob::schemas::array::elements;
 pub use crate::blob::schemas::array::{Array, ArrayElement};
 /// Re-export of [`FileBytes`].
 pub use crate::blob::schemas::filebytes::FileBytes;
-/// Re-export of [`IRI`].
-pub use crate::blob::schemas::iri::IRI;
 /// Re-export of [`LongString`].
 pub use crate::blob::schemas::longstring::LongString;
 /// Re-export of [`RawBytes`].

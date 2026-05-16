@@ -187,8 +187,7 @@ schema:
 
 ```rust,ignore
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::schemas::iri::IRI;
-use triblespace::core::blob::ToBlob;
+use triblespace::core::blob::IntoBlob;
 use triblespace::core::macros::entity;
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::prelude::inlineschemas::{Blake3, Handle, I256BE};

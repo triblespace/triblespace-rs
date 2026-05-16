@@ -224,10 +224,8 @@ mod tests {
 
     #[test]
     fn describe_preserves_identity_iri() {
-        use crate::blob::schemas::iri::IRI;
-
-        let iri = "http://example.org/foo";
-        let iri_handle: Inline<Handle<IRI>> = iri.to_blob().get_handle();
+        let iri = "http://example.org/foo".to_string();
+        let iri_handle: Inline<Handle<LongString>> = iri.to_blob().get_handle();
         let attr = Attribute::<ShortString>::from(entity! {
             metadata::iri:          iri_handle,
             metadata::value_schema: <ShortString as crate::metadata::MetaDescribe>::id(),

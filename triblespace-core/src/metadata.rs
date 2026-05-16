@@ -3,7 +3,6 @@
 //! This namespace is used to bootstrap the meaning of other namespaces.
 //! It defines meta attributes that are used to describe other attributes.
 
-use crate::blob::schemas::iri::IRI;
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::wasmcode::WasmCode;
 use crate::id::Id;
@@ -137,7 +136,14 @@ attributes! {
     /// collide: the (attr_id, value) pair that participates in
     /// entity-intrinsic-id derivation differs in the attr_id, even when the
     /// raw value bytes are identical.
-    "325F05DB88184B4540AAEEFAE1E9667F" as iri: inlineschemas::Handle<IRI>;
+    ///
+    /// The value is stored as a `Handle<LongString>` — IRI-ness is a
+    /// semantic property of *this attribute*, not a structural property of
+    /// the bytes. Callers that need IRI-shape validation can apply
+    /// it at the application boundary; the storage layer doesn't enforce
+    /// it, so mistyped or placeholder IRIs ingest without rejection and
+    /// queries can unify across "any string this entity has."
+    "325F05DB88184B4540AAEEFAE1E9667F" as iri: inlineschemas::Handle<LongString>;
     /// Link a usage annotation entity to the attribute it describes.
     "F10DE6D8E60E0E86013F1B867173A85C" as attribute: inlineschemas::GenId;
     /// Optional provenance string for a usage annotation.
