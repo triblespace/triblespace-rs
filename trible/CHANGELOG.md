@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.3] - 2026-05-16
+
+### Fixed
+- **Ship `Cargo.lock` in the published crate** so
+  `cargo install trible --locked` resolves a known-good
+  transitive dependency tree. The 0.40.2 publish accidentally
+  omitted the lockfile (workspace gitignores it; the publish
+  clone had none); fresh resolution then picked
+  `ed25519 v3.0.0` (released 2026-05-03) against
+  `ed25519-dalek 3.0.0-pre.1` (hard-pinned by
+  `iroh-base 0.97` via `=3.0.0-pre.1`), and the pair don't
+  compile together — `ed25519::pkcs8::Error::KeyMalformed`
+  became a tuple variant in `ed25519 3.0.0` but
+  `ed25519-dalek 3.0.0-pre.1` still uses it as a unit
+  variant. The shipped lockfile pins a working combination.
+- `trible 0.40.2` is yanked from crates.io.
+
+No source changes from 0.40.2 — same TLS-platform-verifier
+fix carries through. The iroh upstream pin will eventually be
+fixed by a `triblespace-net` bump to `iroh 0.98` or later
+(both `iroh-base 0.98` and `1.0.0-rc.0` pin pre.6/pre.7,
+which compile against `ed25519 3.0.0`). Deferred since the
+lockfile fix is the minimum-disruption resolution.
+
 ## [0.40.2] - 2026-05-16
 
 ### Added
