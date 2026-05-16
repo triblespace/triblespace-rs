@@ -115,14 +115,10 @@ pub fn build_json_tree_metadata() -> Fragment {
 }
 
 fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
-    let mut fragment = Fragment::rooted(kind_id, TribleSet::new());
-    let name_handle = fragment.put(name.to_owned());
-    let description_handle = fragment.put(description.to_owned());
-    fragment += entity! { ExclusiveId::force_ref(&kind_id) @
-        metadata::name: name_handle,
-        metadata::description: description_handle,
-    };
-    fragment
+    entity! { ExclusiveId::force_ref(&kind_id) @
+        metadata::name:        name.to_owned(),
+        metadata::description: description.to_owned(),
+    }
 }
 
 #[derive(Clone)]
