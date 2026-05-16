@@ -25,10 +25,11 @@
 
 use std::convert::Infallible;
 
+use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::trible::Fragment;
 use triblespace_core::inline::{Inline, InlineEncoding};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
@@ -40,21 +41,12 @@ pub enum WordHash {}
 
 impl MetaDescribe for WordHash {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("8868FA39C4CDA947DD4CAA1652C30D06"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("WordHash");
-        let description = fragment.put(
-            "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_INLINE_ENCODING,
-            }
-        })
+        let id = id_hex!("8868FA39C4CDA947DD4CAA1652C30D06");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "WordHash",
+            metadata::description: "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
+            metadata::tag:         metadata::KIND_INLINE_ENCODING,
+        }
     }
 }
 
@@ -72,21 +64,12 @@ pub enum BigramHash {}
 
 impl MetaDescribe for BigramHash {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("2EC1CAAD948B959D32023EF32D500148"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("BigramHash");
-        let description = fragment.put(
-            "Term schema for bigram_tokens — Blake3 hash of a pair of adjacent lowercased words, NUL-delimited.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_INLINE_ENCODING,
-            }
-        })
+        let id = id_hex!("2EC1CAAD948B959D32023EF32D500148");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "BigramHash",
+            metadata::description: "Term schema for bigram_tokens — Blake3 hash of a pair of adjacent lowercased words, NUL-delimited.",
+            metadata::tag:         metadata::KIND_INLINE_ENCODING,
+        }
     }
 }
 
@@ -106,21 +89,12 @@ pub enum NgramHash {}
 
 impl MetaDescribe for NgramHash {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("52472B53D201532D7FAA7D89AE80A6ED"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("NgramHash");
-        let description = fragment.put(
-            "Term schema for ngram_tokens — Blake3 hash of a character n-gram window, with the n-size prefixed into the hash input so different n values don't collide within the same schema.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_INLINE_ENCODING,
-            }
-        })
+        let id = id_hex!("52472B53D201532D7FAA7D89AE80A6ED");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "NgramHash",
+            metadata::description: "Term schema for ngram_tokens — Blake3 hash of a character n-gram window, with the n-size prefixed into the hash input so different n values don't collide within the same schema.",
+            metadata::tag:         metadata::KIND_INLINE_ENCODING,
+        }
     }
 }
 

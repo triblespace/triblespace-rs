@@ -49,23 +49,21 @@ impl<T: ArrayElement> MetaDescribe for Array<T> {
         // schema discriminates `Array<u8>` from `Array<f32>` etc.;
         // element schemas aren't themselves `BlobEncoding`s, so they
         // get their own attribute (not `metadata::blob_encoding`).
-        // `annotated` layers the human-facing annotations under the
-        // derived root.
+        // Annotations share the derived root so `+=` is idempotent on
+        // exports and folds facts + auto-put blobs into the core.
         let mut core = entity! {
             metadata::array_item_schema*: T::describe(),
             metadata::tag: metadata::KIND_BLOB_ENCODING,
         };
-        let name = core.put("array");
-        let description = core.put(
-            "Flat array of typed values in native byte order. \
-             Shape is stored externally in TribleSpace triples.",
-        );
-        core.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name: name,
-                metadata::description: description,
-            }
-        })
+        let id = core.root().expect("rooted");
+        let id_ref = crate::id::ExclusiveId::force_ref(&id);
+        core += entity! { id_ref @
+            metadata::name: "array",
+            metadata::description:
+                "Flat array of typed values in native byte order. \
+                 Shape is stored externally in TribleSpace triples.",
+        };
+        core
     }
 }
 
@@ -95,7 +93,7 @@ pub mod elements {
     use super::ArrayElement;
     use crate::macros::entity;
     use crate::metadata::{self, MetaDescribe};
-    use crate::trible::{Fragment, TribleSet};
+    use crate::trible::Fragment;
 
     macro_rules! impl_array_element {
         ($marker:ident, $native:ty, $id:expr, $doc:expr) => {
@@ -105,23 +103,17 @@ pub mod elements {
             impl MetaDescribe for $marker {
                 fn describe() -> Fragment {
                     // Fixed-id schema: root is the hex id, no derived
-                    // facts contribute to identity. `annotated` layers
-                    // the rust marker name + doc-comment description
-                    // under the root so a consumer querying
-                    // `Array<F32>`'s metadata can resolve the element
-                    // schema id to a human-readable name.
-                    let mut fragment = Fragment::rooted(
-                        crate::id_hex!($id),
-                        TribleSet::new(),
-                    );
-                    let name = fragment.put(stringify!($marker));
-                    let description = fragment.put($doc);
-                    fragment.annotated(|id_ref| {
-                        entity! { id_ref @
-                            metadata::name:        name,
-                            metadata::description: description,
-                        }
-                    })
+                    // facts contribute to identity. The entity!{}
+                    // form auto-puts the name + doc-comment bytes
+                    // into the fragment's local blob store so a
+                    // consumer querying `Array<F32>`'s metadata can
+                    // resolve the element schema id to a human-
+                    // readable name.
+                    let id = crate::id_hex!($id);
+                    entity! { crate::id::ExclusiveId::force_ref(&id) @
+                        metadata::name:        stringify!($marker),
+                        metadata::description: $doc,
+                    }
                 }
             }
 

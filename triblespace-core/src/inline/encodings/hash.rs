@@ -311,34 +311,31 @@ where
         // root becomes the value of `metadata::blob_encoding` and its
         // facts + blobs fold in automatically. With the hash protocol
         // fixed to Blake3, only the blob encoding parameter distinguishes
-        // one `Handle<T>` monomorphization from another; `annotated`
-        // layers the human-facing annotations under the derived root.
+        // one `Handle<T>` monomorphization from another. Annotations
+        // share the derived root, so merging them with `+=` re-unions
+        // the same id into exports (idempotent) and folds their facts +
+        // auto-put blobs into the core.
         let mut core = entity! {
             metadata::blob_encoding*: T::describe(),
             metadata::hash_schema*: Blake3::describe(),
             metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
         let name = Blake3::NAME;
-        let description_handle = core.put(format!(
-            "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob encoding. The schema id is derived from the hash and blob encoding.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
-        ));
-        let name_handle = core.put("handle");
+        let id = core.root().expect("rooted");
+        let id_ref = ExclusiveId::force_ref(&id);
+        core += entity! { id_ref @
+            metadata::name: "handle",
+            metadata::description: format!(
+                "Typed handle for blobs hashed with {name}; the value stores the digest and metadata points at the referenced blob encoding. The schema id is derived from the hash and blob encoding.\n\nUse when referencing blobs from tribles without embedding data; the blob store holds the payload. For untyped content hashes, use the hash schema directly.\n\nHandles assume the blob store is available and consistent with the digest. If the blob is missing, the handle still validates but dereferencing will fail."
+            ),
+        };
         #[cfg(feature = "wasm")]
-        let wasm_handle = core.put(wasm_formatter::HASH_HEX_WASM);
-        core.annotated(|id_ref| {
-            #[allow(unused_mut)]
-            let mut annotations = entity! { id_ref @
-                metadata::name: name_handle,
-                metadata::description: description_handle,
+        {
+            core += entity! { id_ref @
+                metadata::value_formatter: wasm_formatter::HASH_HEX_WASM,
             };
-            #[cfg(feature = "wasm")]
-            {
-                annotations += entity! { id_ref @
-                    metadata::value_formatter: wasm_handle,
-                };
-            }
-            annotations
-        })
+        }
+        core
     }
 }
 

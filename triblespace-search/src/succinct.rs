@@ -41,11 +41,12 @@ use triblespace_core::blob::encodings::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
+use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::query::Variable;
-use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::trible::Fragment;
 use triblespace_core::inline::{RawInline, Inline, InlineEncoding};
 
 use crate::schemas::{EmbHandle, Embedding};
@@ -1738,21 +1739,12 @@ impl BlobEncoding for SuccinctBM25Blob {}
 // that the schema can't describe itself.
 impl MetaDescribe for SuccinctBM25Blob {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("SuccinctBM25Blob");
-        let description = fragment.put(
-            "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: term-id table, postings, document-frequency table, and an `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_ENCODING,
-            }
-        })
+        let id = id_hex!("DA527A8FF09A3709B2AC6425CD5AF7A8");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "SuccinctBM25Blob",
+            metadata::description: "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: term-id table, postings, document-frequency table, and an `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",
+            metadata::tag:         metadata::KIND_BLOB_ENCODING,
+        }
     }
 }
 
@@ -1821,21 +1813,12 @@ impl BlobEncoding for SuccinctHNSWBlob {}
 
 impl MetaDescribe for SuccinctHNSWBlob {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("8DF997D25C15B73EDCEE9E08076F251E"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("SuccinctHNSWBlob");
-        let description = fragment.put(
-            "Canonical-bytes blob format for the succinct HNSW vector index. Handles + graph live in one shared `anybytes::ByteArea` with a suffix `SuccinctHNSWMeta`; embeddings themselves live as separate blobs in the pile referenced by handle.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_ENCODING,
-            }
-        })
+        let id = id_hex!("8DF997D25C15B73EDCEE9E08076F251E");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "SuccinctHNSWBlob",
+            metadata::description: "Canonical-bytes blob format for the succinct HNSW vector index. Handles + graph live in one shared `anybytes::ByteArea` with a suffix `SuccinctHNSWMeta`; embeddings themselves live as separate blobs in the pile referenced by handle.",
+            metadata::tag:         metadata::KIND_BLOB_ENCODING,
+        }
     }
 }
 

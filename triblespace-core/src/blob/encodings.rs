@@ -38,21 +38,12 @@ impl MetaDescribe for UnknownBlob {
         // Fixed-id fallback schema. Even though it's discouraged in
         // practice, the metadata should still self-describe so a
         // consumer encountering this id can recognise it.
-        let mut fragment = crate::trible::Fragment::rooted(
-            id_hex!("EAB14005141181B0C10C4B5DD7985F8D"),
-            crate::trible::TribleSet::new(),
-        );
-        let name = fragment.put("UnknownBlob");
-        let description = fragment.put(
-            "Fallback blob encoding for byte payloads with no known type. Discouraged in practice — use a specific blob encoding (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_ENCODING,
-            }
-        })
+        let id = id_hex!("EAB14005141181B0C10C4B5DD7985F8D");
+        entity! { crate::id::ExclusiveId::force_ref(&id) @
+            metadata::name:        "UnknownBlob",
+            metadata::description: "Fallback blob encoding for byte payloads with no known type. Discouraged in practice — use a specific blob encoding (e.g. `LongString`, `Array<T>`, `SimpleArchive`) instead.",
+            metadata::tag:         metadata::KIND_BLOB_ENCODING,
+        }
     }
 }
 

@@ -196,52 +196,44 @@ pub fn attributes_impl(
     // calls directly with our `base_path` — no sibling proc-macro
     // shim is invoked, so these inner expansions never trip the
     // metadata-emission wrapper that the outer `attributes!{}`
-    // shim already applied. The two-step "derive root from core,
-    // then annotate under it" pattern collapses through
-    // `Fragment::try_annotated` so there's no temp root extraction
-    // in the generated code.
+    // shim already applied.
     let per_attr_blocks = per_attr.into_iter().map(|(name, name_lit, description)| -> syn::Result<TokenStream2> {
         let usage_core_tokens = crate::entity_impl(
             quote! {
                 #base_path::metadata::attribute:     __attr_id,
-                #base_path::metadata::source_module: __usage_module_h,
+                #base_path::metadata::source_module: module_path!(),
             },
             base_path,
         )?;
 
-        // Annotation closure body for `Fragment::annotated`. The
-        // closure receives `__usage_ref: &ExclusiveId` (the derived
-        // usage id) and returns a Fragment. We expand `entity_impl`
-        // directly with our `base_path` so the `entity!{}` inside
-        // resolves the same way the outer `attributes!{}` does.
-        // Doc-comments split the body so the description blob put
-        // only happens when the source had one.
-        let annotation_body = if let Some(desc_lit) = description {
-            let annotation_tokens = crate::entity_impl(
+        // Annotation entity (rust-identifier name + KIND_ATTRIBUTE_USAGE
+        // tag + optional doc-comment description) rooted under the
+        // derived usage id. `entity_impl` (same crate as us) expands
+        // the inner `entity!{}` directly with our `base_path` so the
+        // expansion resolves the same way the outer `attributes!{}`
+        // does. Doc-comments and string literals auto-put through
+        // `entity!{}`'s blob-source machinery, so merging the
+        // annotation into the usage core folds its facts + blobs in
+        // and re-unions the same root id idempotently into exports.
+        let annotation_tokens = if let Some(desc_lit) = description {
+            crate::entity_impl(
                 quote! {
                     __usage_ref @
-                    #base_path::metadata::name:        __usage_name_h,
+                    #base_path::metadata::name:        #name_lit,
                     #base_path::metadata::tag:         #base_path::metadata::KIND_ATTRIBUTE_USAGE,
-                    #base_path::metadata::description: __desc_h,
+                    #base_path::metadata::description: #desc_lit,
                 },
                 base_path,
-            )?;
-            quote! {
-                let __desc_h = __fragment.put(#desc_lit);
-                #annotation_tokens
-            }
+            )?
         } else {
-            let annotation_tokens = crate::entity_impl(
+            crate::entity_impl(
                 quote! {
                     __usage_ref @
-                    #base_path::metadata::name: __usage_name_h,
+                    #base_path::metadata::name: #name_lit,
                     #base_path::metadata::tag:  #base_path::metadata::KIND_ATTRIBUTE_USAGE,
                 },
                 base_path,
-            )?;
-            quote! {
-                #annotation_tokens
-            }
+            )?
         };
 
         Ok(quote! {
@@ -257,24 +249,22 @@ pub fn attributes_impl(
                     &*#name,
                 );
 
-                // Annotations: the codebase-local usage entity. Its
-                // id derives from `(metadata::attribute,
-                // metadata::source_module)` so multiple usages of
-                // the same attribute (different modules, different
-                // crates) coexist without clobbering each other.
-                // `annotated` layers the rust-identifier name, the
-                // KIND_ATTRIBUTE_USAGE tag, and the optional
-                // doc-comment description under that derived usage
-                // id. Blob bytes flow into the parent `__fragment`'s
-                // local blob store via `__fragment.put(...)` —
-                // making the whole describe self-contained.
+                // Usage entity: a codebase-local annotation tagged
+                // with `KIND_ATTRIBUTE_USAGE`. Its id derives from
+                // `(metadata::attribute, metadata::source_module)` so
+                // multiple usages of the same attribute (different
+                // modules, different crates) coexist without
+                // clobbering each other. Rust-identifier name and the
+                // optional doc-comment description ride along under
+                // that derived id — the annotation entity!{} is
+                // rooted at the same id, so `+=` re-unions it
+                // idempotently into the usage core's exports and
+                // folds the annotation's facts + auto-put blobs in.
                 let __attr_id = #name.id();
-                let __usage_name_h = __fragment.put(#name_lit);
-                let __usage_module_h = __fragment.put(module_path!());
-                let __usage = (#usage_core_tokens)
-                    .annotated(|__usage_ref| {
-                        #annotation_body
-                    });
+                let mut __usage = #usage_core_tokens;
+                let __usage_id = __usage.root().expect("usage core must be rooted");
+                let __usage_ref = #base_path::id::ExclusiveId::force_ref(&__usage_id);
+                __usage += #annotation_tokens;
                 __fragment += __usage;
             }
         })

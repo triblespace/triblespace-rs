@@ -22,10 +22,11 @@ use std::convert::Infallible;
 
 use anybytes::View;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
+use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::trible::Fragment;
 use triblespace_core::inline::{IntoInline, TryFromInline, Inline, InlineEncoding};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
@@ -44,21 +45,12 @@ pub enum F32LE {}
 
 impl MetaDescribe for F32LE {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("816B4751EA8C12644CCB572F36188EBA"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("F32LE");
-        let description = fragment.put(
-            "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Inline, with the rest zero-padded.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_INLINE_ENCODING,
-            }
-        })
+        let id = id_hex!("816B4751EA8C12644CCB572F36188EBA");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "F32LE",
+            metadata::description: "32-bit IEEE-754 float stored little-endian in the first 4 bytes of the 32-byte Inline, with the rest zero-padded.",
+            metadata::tag:         metadata::KIND_INLINE_ENCODING,
+        }
     }
 }
 
@@ -125,21 +117,12 @@ impl BlobEncoding for Embedding {}
 
 impl MetaDescribe for Embedding {
     fn describe() -> Fragment {
-        let mut fragment = Fragment::rooted(
-            id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B"),
-            TribleSet::new(),
-        );
-        let name = fragment.put("Embedding");
-        let description = fragment.put(
-            "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
-        );
-        fragment.annotated(|id_ref| {
-            entity! { id_ref @
-                metadata::name:        name,
-                metadata::description: description,
-                metadata::tag:         metadata::KIND_BLOB_ENCODING,
-            }
-        })
+        let id = id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name:        "Embedding",
+            metadata::description: "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
+            metadata::tag:         metadata::KIND_BLOB_ENCODING,
+        }
     }
 }
 

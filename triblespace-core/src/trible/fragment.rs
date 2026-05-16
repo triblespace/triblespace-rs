@@ -1,7 +1,6 @@
 use std::ops::{Add, AddAssign, Deref};
 
 use crate::blob::{BlobEncoding, MemoryBlobStore, IntoBlob};
-use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::patch::Entry;
@@ -165,75 +164,6 @@ impl Fragment {
         (self.exports, self.facts, self.blobs)
     }
 
-    /// Merge annotation facts under this fragment's existing root,
-    /// without changing the root.
-    ///
-    /// `f` receives a borrowed [`ExclusiveId`] for the current root
-    /// and returns an annotation fragment — typically built via
-    /// `entity!{ id_ref @ … }` so its own root is the same id. Only
-    /// the annotation's *facts* are merged in; **all exports from
-    /// the returned fragment are dropped**, so `self.root()` still
-    /// returns the pre-annotation id after the call regardless of
-    /// what the closure exported.
-    ///
-    /// This collapses the recurring three-step pattern
-    ///
-    /// ```ignore
-    /// let mut frag = entity!{ <core facts> };
-    /// let id = frag.root().expect("rooted");
-    /// frag += entity!{ &ExclusiveId::force_ref(&id) @ <annotations> }.into_facts();
-    /// ```
-    ///
-    /// down to a single chained call.
-    ///
-    /// Panics if `self` is not rooted (multi-root fragments have no
-    /// single id to anchor the annotations under). In debug builds
-    /// also panics if the returned fragment is rooted at a different
-    /// id — a typo like `entity!{ &some_other_id @ … }` inside the
-    /// closure would otherwise silently merge facts under the wrong
-    /// entity. Release builds skip this check so the API stays
-    /// branch-free in hot paths.
-    pub fn annotated<F>(mut self, f: F) -> Self
-    where
-        F: FnOnce(&ExclusiveId) -> Fragment,
-    {
-        let id = self
-            .root()
-            .expect("Fragment::annotated requires a rooted fragment");
-        let id_ref = ExclusiveId::force_ref(&id);
-        let annotations = f(id_ref);
-        debug_assert!(
-            annotations.root().map(|r| r == id).unwrap_or(true),
-            "Fragment::annotated: returned fragment is rooted at a different id ({:?}) than self ({:?})",
-            annotations.root(),
-            id,
-        );
-        self += annotations.into_facts();
-        self
-    }
-
-    /// Fallible variant of [`annotated`](Self::annotated) for closures that
-    /// need to put blobs / propagate errors while building the
-    /// annotation fragment. Same root-discard semantics and debug
-    /// assertion.
-    pub fn try_annotated<F, E>(mut self, f: F) -> Result<Self, E>
-    where
-        F: FnOnce(&ExclusiveId) -> Result<Fragment, E>,
-    {
-        let id = self
-            .root()
-            .expect("Fragment::try_annotated requires a rooted fragment");
-        let id_ref = ExclusiveId::force_ref(&id);
-        let annotations = f(id_ref)?;
-        debug_assert!(
-            annotations.root().map(|r| r == id).unwrap_or(true),
-            "Fragment::try_annotated: returned fragment is rooted at a different id ({:?}) than self ({:?})",
-            annotations.root(),
-            id,
-        );
-        self += annotations.into_facts();
-        Ok(self)
-    }
 }
 
 impl Deref for Fragment {
@@ -262,9 +192,7 @@ impl AddAssign for Fragment {
 }
 
 impl AddAssign<TribleSet> for Fragment {
-    /// Facts-only merge — does not touch exports or blobs. Used by
-    /// `Fragment::annotated` to land annotation facts under self's
-    /// root without exposing the annotation's own exports.
+    /// Facts-only merge — does not touch exports or blobs.
     fn add_assign(&mut self, rhs: TribleSet) {
         self.facts += rhs;
     }
