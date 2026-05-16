@@ -1,4 +1,6 @@
 use crate::id::Id;
+use crate::id::RawId;
+use crate::patch::{IdentitySchema, PATCHIntoOrderedIterator};
 
 use super::Fragment;
 
@@ -29,18 +31,25 @@ impl<I: IntoIterator> Spread for I {
     }
 }
 
+/// Free function (not a closure) so `Map`'s type is nameable in
+/// `Spread::Iter` below — keeps `Fragment::spread` allocation-free.
+fn raw_to_id(raw: RawId) -> Id {
+    Id::new(raw).expect("export ids are non-nil")
+}
+
 impl Spread for Fragment {
     type Item = Id;
-    type Iter = std::vec::IntoIter<Id>;
+    type Iter = std::iter::Map<
+        PATCHIntoOrderedIterator<16, IdentitySchema, ()>,
+        fn(RawId) -> Id,
+    >;
     fn spread(self) -> (Self::Iter, Fragment) {
         let (exports, facts, blobs) = self.into_parts();
-        let ids: Vec<Id> = exports
-            .iter_ordered()
-            .map(|raw| Id::new(*raw).expect("export ids are non-nil"))
-            .collect();
         // Wrap the remaining facts + blobs as an extras fragment with
-        // no exports — the exports were consumed as the spread values.
+        // no exports — the exports are consumed lazily as the spread
+        // values via the mapping iterator below.
         let extras = Fragment::from_facts_and_blobs(facts, blobs);
-        (ids.into_iter(), extras)
+        let iter = exports.into_iter_ordered().map(raw_to_id as fn(_) -> _);
+        (iter, extras)
     }
 }
