@@ -87,11 +87,69 @@ pub struct TribleSetIterator<'a> {
     inner: TribleSetInner<'a>,
 }
 
+/// Minimum `other.len()` at which [`TribleSet::union`] fans out across
+/// rayon. Below this, the nested-join overhead dominates the saved
+/// per-index work. Tuned for the `entities/union*/5M` bench family.
+#[cfg(feature = "parallel")]
+pub const PARALLEL_UNION_THRESHOLD: usize = 4096;
+
 impl TribleSet {
     /// Union of two [`TribleSet`]s.
     ///
-    /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated in place.
+    /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated
+    /// in place.
+    ///
+    /// With the `parallel` feature enabled and `other` above
+    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index unions
+    /// (`eav`/`eva`/`aev`/`ave`/`vea`/`vae`) fan out via nested
+    /// [`rayon::join`] — they touch disjoint memory so there's no
+    /// contention. The threshold gates on `other.len()` because PATCH
+    /// union work is bounded by the smaller side (each key from `other`
+    /// is inserted into `self`); when `other` is tiny (e.g. the per-
+    /// `entity!{}` `+=` in a serial fold) the rayon overhead would
+    /// dominate even at large `self`.
     pub fn union(&mut self, other: Self) {
+        #[cfg(feature = "parallel")]
+        {
+            if other.len() >= PARALLEL_UNION_THRESHOLD {
+                let Self {
+                    eav,
+                    eva,
+                    aev,
+                    ave,
+                    vea,
+                    vae,
+                } = self;
+                let Self {
+                    eav: oeav,
+                    eva: oeva,
+                    aev: oaev,
+                    ave: oave,
+                    vea: ovea,
+                    vae: ovae,
+                } = other;
+                // Nested join trees the six tasks across rayon workers
+                // with much lower per-call overhead than `scope`.
+                rayon::join(
+                    || rayon::join(
+                        || eav.union(oeav),
+                        || eva.union(oeva),
+                    ),
+                    || rayon::join(
+                        || rayon::join(
+                            || aev.union(oaev),
+                            || ave.union(oave),
+                        ),
+                        || rayon::join(
+                            || vea.union(ovea),
+                            || vae.union(ovae),
+                        ),
+                    ),
+                );
+                return;
+            }
+        }
+
         self.eav.union(other.eav);
         self.eva.union(other.eva);
         self.aev.union(other.aev);

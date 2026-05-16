@@ -7,3 +7,4 @@ proptest-regressions
 /papers
 flamegraph*
 triblespace-net/img/
+self.key
