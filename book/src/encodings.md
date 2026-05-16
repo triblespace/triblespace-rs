@@ -1,17 +1,17 @@
-# Schemas
+# Encodings
 
-TribleSpace stores data in strongly typed values and blobs. A *schema*
+TribleSpace stores data in strongly typed values and blobs. An *encoding*
 describes the language‑agnostic byte layout for these types: [`Inline`]s always
-occupy exactly 32&nbsp;bytes while [`Blob`]s may be any length. Schemas translate
+occupy exactly 32&nbsp;bytes while [`Blob`]s may be any length. Encodings translate
 those raw bytes to concrete application types and decouple persisted data from a
 particular implementation. This separation lets you refactor to new libraries or
 frameworks without rewriting what's already stored or coordinating live
-migrations. The crate ships with a collection of ready‑made schemas located in
+migrations. The crate ships with a collection of ready‑made encodings located in
 [`triblespace::core::inline::encodings`](https://docs.rs/triblespace/latest/triblespace/core/inline/encodings/index.html) and
 [`triblespace::core::blob::encodings`](https://docs.rs/triblespace/latest/triblespace/core/blob/encodings/index.html).
 
 When data crosses the FFI boundary or is consumed by a different language, the
-schema is the contract both sides agree on. Consumers only need to understand
+encoding is the contract both sides agree on. Consumers only need to understand
 the byte layout and identifier to read the data—they never have to link against
 your Rust types. Likewise, the Rust side can evolve its internal
 representations—add helper methods, change struct layouts, or introduce new
@@ -29,10 +29,10 @@ encoding concerns and makes it easy to reason about memory usage.
 ### Conversion traits
 
 Conversion goes through the `Encodes<Source>` trait, which lives **on the
-schema** (the schema is the impl target; the source is the trait parameter).
+encoding** (the encoding is the impl target; the source is the trait parameter).
 This is the same direction as std's `From<T>` — and for the same reason: it
 trivially satisfies Rust's orphan rule, so you can write
-`impl Encodes<SomeForeignType> for MyLocalSchema` without any "trait
+`impl Encodes<SomeForeignType> for MyLocalEncoding` without any "trait
 position 0" gymnastics.
 
 The ergonomic source-side methods `.to_inline()` / `.to_blob()` /
@@ -81,25 +81,25 @@ impl TryFromInline<'_, ShortString> for Username {
 }
 ```
 
-### Schema identifiers
+### Encoding identifiers
 
-Every schema declares a unique 128‑bit identifier, accessible via the
+Every encoding declares a unique 128‑bit identifier, accessible via the
 `MetaDescribe::id` method (for example, `ShortString::id()`).
 Persisting these IDs keeps serialized data self describing so other tooling can
 make sense of the payload without linking against your Rust types. Dynamic
-language bindings (like the Python crate) inspect the stored schema identifier
+language bindings (like the Python crate) inspect the stored encoding identifier
 to choose the correct decoder, while internal metadata stored inside Trible
-Space can use the same IDs to describe which schema governs a value, blob, or
+Space can use the same IDs to describe which encoding governs a value, blob, or
 hash protocol.
 
 Identifiers also make it possible to derive deterministic attribute IDs when you
 ingest external formats. Wrap the source field name in an entity-core fragment —
 `Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })` —
-to combine the schema ID with the source field name and produce a stable
+to combine the encoding ID with the source field name and produce a stable
 attribute so re-importing the same data always targets the same column.
 The `attributes!` macro applies the same derivation when you omit the 128-bit id
 literal, which is useful for quick experiments or internal attributes; for
-schema that will be shared across binaries or languages prefer explicit ids so
+encodings that will be shared across binaries or languages prefer explicit ids so
 the column remains stable even if the attribute name later changes.
 
 ## Built‑in inline encodings
@@ -112,14 +112,14 @@ The crate provides the following inline encodings out of the box:
 - `R256BE` / `R256LE` &ndash; 256-bit rational numbers.
 - `F64` &ndash; IEEE-754 double-precision floating point number (little-endian).
 - `F256BE` / `F256LE` &ndash; 256-bit floating point numbers.
-- `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/value/schemas/hash.rs)).
+- `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/inline/encodings/hash.rs)).
 - `ED25519RComponent`, `ED25519SComponent` and `ED25519PublicKey` &ndash; signature fields and keys.
 - `NsTAIInterval` to encode time intervals.
 - `Boolean` &ndash; all-zero for false, all-0xFF for true.
 - `LineLocation` &ndash; a `(start_line, start_col, end_line, end_col)` span encoded as four big-endian u64 values.
 - `RangeU128` &ndash; a half-open `(start, end)` range of two big-endian u128 values.
 - `RangeInclusiveU128` &ndash; an inclusive `(start, end)` range of two big-endian u128 values.
-- `UnknownInline` as a fallback when no specific schema is known.
+- `UnknownInline` as a fallback when no specific encoding is known.
 
 ```rust
 # use triblespace::prelude::*;
@@ -128,8 +128,8 @@ use triblespace::core::inline::encodings::shortstring::ShortString;
 use triblespace::core::inline::{IntoInline, InlineEncoding};
 
 let v: Inline<ShortString> = "hi".to_inline();
-let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
-let schema_id = ShortString::id(); // derived via describe(&mut scratch).root()
+let raw_bytes = v.raw; // Persist alongside the encoding's metadata id.
+let encoding_id = ShortString::id(); // derived via describe(&mut scratch).root()
 ```
 
 ## Built‑in blob encodings
@@ -140,9 +140,9 @@ The crate also ships with these blob encodings:
 - `RawBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
-  type](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/succinctarchive/struct.SuccinctArchive.html)
+  type](https://docs.rs/triblespace/latest/triblespace/core/blob/encodings/succinctarchive/struct.SuccinctArchive.html)
   for offline queries. The `SuccinctArchive` helper exposes high-level
-  iterators while the `SuccinctArchiveBlob` schema is responsible for the
+  iterators while the `SuccinctArchiveBlob` encoding is responsible for the
   serialized byte layout.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
@@ -153,19 +153,19 @@ use triblespace::core::blob::encodings::longstring::LongString;
 use triblespace::core::blob::{Blob, BlobEncoding, IntoBlob};
 
 let b: Blob<LongString> = "example".to_blob();
-let schema_id = LongString::id(); // derived via describe(&mut scratch).root()
+let encoding_id = LongString::id(); // derived via describe(&mut scratch).root()
 ```
 
 Both value and blob encodings can emit optional discovery metadata. Calling
-`MetaDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
-whose facts tag the schema entity with `metadata::KIND_INLINE_ENCODING` or
+`MetaDescribe::describe` returns a rooted `Fragment` (exporting the encoding id)
+whose facts tag the encoding entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::KIND_BLOB_ENCODING` and may attach a `metadata::name` and
 `metadata::description` (LongString handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
 
-## Choosing the right schema
+## Choosing the right encoding
 
-When defining an attribute, the schema determines how the 32-byte value slot is
+When defining an attribute, the encoding determines how the 32-byte value slot is
 interpreted. Use this decision tree to pick the right one:
 
 ```text
@@ -188,7 +188,7 @@ What are you storing?
 │
 ├─ A number?
 │  ├─ Integer
-│  │  ├─ Fits in 64 bits? → U256BE (zero-extended) or custom u64 schema
+│  │  ├─ Fits in 64 bits? → U256BE (zero-extended) or custom u64 encoding
 │  │  └─ Needs full 256 bits? → U256BE / I256BE
 │  ├─ Floating point
 │  │  ├─ Standard double? → F64
@@ -216,20 +216,20 @@ What are you storing?
 
 **Rules of thumb:**
 - If two values should be joinable (appear in the same query variable), they must
-  share a schema. Choose the most specific schema that covers both uses.
+  share an encoding. Choose the most specific encoding that covers both uses.
 - Prefer `ShortString` over `LongString` when the text fits — inline values avoid
   a blob lookup.
 - Use `GenId` for relationships between entities. Never store entity references as
   strings.
-- When in doubt between a inline encoding and a blob, ask: "will I ever want to
-  query or join on this directly?" If yes, it should be a value. If it's opaque
+- When in doubt between an inline encoding and a blob, ask: "will I ever want to
+  query or join on this directly?" If yes, it should be inline. If it's opaque
   content you just retrieve, use a blob handle.
 
-## Defining new schemas
+## Defining new encodings
 
-Custom formats implement [`InlineEncoding`] or [`BlobEncoding`].  A unique identifier
-serves as the schema ID.  The example below defines a little-endian `u64` value
-schema and a simple blob encoding for arbitrary bytes.
+Custom formats implement [`InlineEncoding`] or [`BlobEncoding`]. A unique identifier
+serves as the encoding ID. The example below defines a little-endian `u64`
+inline encoding and a simple blob encoding for arbitrary bytes.
 
 ```rust,ignore
 {{#include ../../examples/custom_schema.rs:custom_schema}}
@@ -243,31 +243,31 @@ source.
 Schemas form part of your persistence contract. When evolving them consider the
 following guidelines:
 
-1. **Prefer additive changes.** Introduce a new schema identifier when breaking
+1. **Prefer additive changes.** Introduce a new encoding identifier when breaking
    compatibility. Consumers can continue to read the legacy data while new
    writers use the replacement ID.
-2. **Annotate data with migration paths.** Store both the schema ID and a
+2. **Annotate data with migration paths.** Store both the encoding ID and a
    logical version number if the consumer needs to know which rules to apply.
    `UnknownInline`/`UnknownBlob` allow you to safely defer decoding until a newer
    binary is available.
-3. **Keep validation centralized.** Place invariants in your schema
+3. **Keep validation centralized.** Place invariants in your encoding
    conversions so migrations cannot accidentally create invalid values.
 
-By keeping schema identifiers alongside stored values and blobs you can roll out
+By keeping encoding identifiers alongside stored values and blobs you can roll out
 new representations incrementally: ship readers that understand both IDs, update
 your import pipelines, and finally switch writers once everything recognizes the
-replacement schema.
+replacement encoding.
 
 ## Inline formatters (WASM)
 
 Binary formats are great for portability and performance, but they can be
-painful to inspect if you don’t know the schema ahead of time. TribleSpace
-supports an optional schema-level formatter mechanism: a inline encoding can point
+painful to inspect if you don’t know the encoding ahead of time. TribleSpace
+supports an optional encoding-level formatter mechanism: an inline encoding can point
 to a small sandboxed WebAssembly module that turns its raw 32 bytes into a
 human-readable string.
 
 The formatter is stored as a blob (`blobencodings::WasmCode`) and referenced from
-the schema identifier entity via the metadata attribute `metadata::value_formatter`.
+the encoding identifier entity via the metadata attribute `metadata::value_formatter`.
 
 The built-in runner lives behind the `wasm` feature flag (enabled by default in
 the `triblespace` facade crate) and uses `wasmi` with tight limits (fuel, memory
@@ -284,8 +284,8 @@ The `format` arguments are the raw 32 bytes split into 4×8-byte chunks
 - Failure returns `(error_code << 32) | 0` (i.e. `output_ptr == 0`).
 
 The core crate can optionally ship built-in formatters for its built-in value
-schemas. Enable the `wasm` feature to have
+encodings. Enable the `wasm` feature to have
 `MetaDescribe::describe` (which is fallible) attach `metadata::value_formatter` entries for the
-standard schemas. This feature requires the `wasm32-unknown-unknown` Rust
+standard encodings. This feature requires the `wasm32-unknown-unknown` Rust
 target at build time because the bundled formatters are compiled to WebAssembly
 via the `#[value_formatter]` proc macro.

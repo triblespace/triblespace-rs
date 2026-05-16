@@ -13,7 +13,7 @@
 
 - [Query Language](query-language.md)
 - [Macro Cookbook](macro-cookbook.md)
-- [Schemas](schemas.md)
+- [Encodings](encodings.md)
 - [Incremental Queries](incremental-queries.md)
 - [Deep Dive: Query Engine](query-engine.md)
 - [Deep Dive: Atreides Join](atreides-join.md)

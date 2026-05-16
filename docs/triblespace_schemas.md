@@ -9,7 +9,7 @@
 - `WasmCode` — WebAssembly modules stored as blobs.
 - `UnknownBlob` — fallback when the blob encoding is not known.
 
-For details, see `triblespace-rs/book/src/schemas.md`.
+For details, see `triblespace-rs/book/src/encodings.md`.
 
 ## Metadata usage annotations
 

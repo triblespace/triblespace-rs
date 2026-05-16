@@ -45,7 +45,7 @@ mod book_doctests {
     pub struct MacroCookbook;
     #[doc = include_str!("../book/src/patterns-and-recipes.md")]
     pub struct PatternsAndRecipes;
-    #[doc = include_str!("../book/src/schemas.md")]
+    #[doc = include_str!("../book/src/encodings.md")]
     pub struct Schemas;
     #[doc = include_str!("../book/src/commit-selectors.md")]
     pub struct CommitSelectors;
