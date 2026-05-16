@@ -48,7 +48,7 @@ pub mod literature {
         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
         "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineencodings::ShortString;
         "FCCE870BECA333D059D5CD68C43B98F0" as page_count: inlineencodings::R256;
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineencodings::Handle<inlineencodings::Blake3, blobencodings::LongString>;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 
@@ -70,7 +70,8 @@ fn random_tribles(length: usize) -> Vec<Trible> {
         }
 
         let v = fucid();
-        vec.push(Trible::new(&e, &a, &v.to_inline()))
+        let v_inline: Inline<triblespace::prelude::inlineencodings::GenId> = v.to_inline();
+        vec.push(Trible::new(&e, &a, &v_inline))
     }
     return vec;
 }
@@ -753,7 +754,8 @@ fn pile_benchmark(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile = Pile::open(&tmp_pile).unwrap();
                 data.iter().for_each(|data| {
-                    pile.put(UnknownBlob::blob_from(data.clone())).unwrap();
+                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone()))
+                        .unwrap();
                 });
                 pile.close().unwrap();
             },
@@ -783,7 +785,7 @@ fn pile_benchmark(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile = Pile::open(&tmp_pile).unwrap();
                 data.iter().for_each(|data| {
-                    pile.put(UnknownBlob::blob_from(data.clone())).unwrap();
+                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone())).unwrap();
                     pile.flush().unwrap();
                 });
                 pile.close().unwrap();
@@ -806,7 +808,7 @@ fn pile_benchmark(c: &mut Criterion) {
                     rng.fill_bytes(&mut record);
 
                     let data = Bytes::from_source(record);
-                    pile.put(UnknownBlob::blob_from(data.clone())).unwrap();
+                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone())).unwrap();
                 });
 
                 pile.flush().unwrap();
