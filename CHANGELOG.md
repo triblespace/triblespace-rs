@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-05-16
+
+### Attribute id cache (perf)
+
+`Attribute::id()` now reads from a cached `Id` field on `Attribute<S>`
+instead of walking the wrapped Fragment's exports PATCH on every
+call. The `From<Fragment>` impl captures the root id once at
+construction. `entity!{}` codegen calls `.id()` once per attribute
+per fact, so the pre-cache cost dominated the entities/union
+benches:
+
+| bench                     | size | pre-0.40 | 0.40   | delta vs pre |
+|---------------------------|------|----------|--------|--------------|
+| `entities`                | 5    | 2.88 µs  | 2.36 µs | recovered    |
+| `union/5M`                |      | 9.00 s   | 7.94 s  | recovered    |
+| `union_parallel/5M`       |      | 8.38 s   | 2.44 s  | recovered    |
+| `union_prealloc/5M`       |      | 6.15 s   | 5.55 s  | recovered    |
+
+(post-0.40 vs pre-conversion-arc baseline; full regression details
+in commit `666e4764`.)
+
+### Fragment annotation API simplification
+
+- **`Fragment::annotated` and `Fragment::try_annotated` removed.**
+  Saved 2-3 lines per call site at the cost of a closure
+  indirection that obscured what was happening. The replacement
+  pattern is `parent += entity!{ &id @ ... }` — when the
+  annotation shares the parent's root (the common case),
+  `Fragment += Fragment` re-unions the same id idempotently and
+  folds facts + auto-put blobs through.
+- **Schema describe collapse.** Every built-in `MetaDescribe::describe()`
+  impl now reduces to a single `entity!{ ExclusiveId::force_ref(&id) @
+  metadata::name: "...", metadata::description: "...", metadata::tag: ... }`
+  expression. Auto-put through `entity!{}`'s blob-source machinery
+  handles the string blobs; no more `Fragment::rooted + put + put +
+  tribles += entity!{...}` dance. Net deletion of ~600 lines across
+  the schema crate.
+- **`Spread for Fragment` is allocation-free.** Replaced the
+  `Vec<Id>` collect with `iter_ordered().map(raw_to_id)` using a
+  free function pointer (so `Map`'s type is nameable in
+  `Spread::Iter`). One fewer allocation per
+  `Fragment::spread()` invocation.
+
 ### Conversion-system rewrite
 
 A multi-step refactor of the value/blob conversion machinery
