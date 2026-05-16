@@ -236,20 +236,20 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
         t.to_blob()
     }
 
-    /// Lift a `Blob<Self>` into the [`Value`](crate::value::Value)
+    /// Lift a `Blob<Self>` into the [`Encoded`](crate::value::Encoded)
     /// sum `entity!{}` consumes — yields
-    /// `Value::Blob(blob.transmute())`. The handle lives inside the
+    /// `Encoded::Blob(blob.transmute())`. The handle lives inside the
     /// blob; consumers recover it via
-    /// [`Value::inline`](crate::value::Value::inline).
+    /// [`Encoded::inline`](crate::value::Encoded::inline).
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// inline-path counterpart lives on
-    /// [`InlineEncoding::to_value`].
-    fn to_value(blob: Blob<Self>) -> crate::value::Value<Handle<Self>>
+    /// [`InlineEncoding::to_encoded`].
+    fn to_encoded(blob: Blob<Self>) -> crate::value::Encoded<Handle<Self>>
     where
         Handle<Self>: InlineEncoding,
     {
-        crate::value::Value::Blob(blob.transmute::<crate::blob::encodings::UnknownBlob>())
+        crate::value::Encoded::Blob(blob.transmute::<crate::blob::encodings::UnknownBlob>())
     }
 }
 
@@ -320,18 +320,18 @@ where
     }
 }
 
-/// `Blob<T>` is the `ToValue<Handle<T>>` expander: it delegates to
-/// [`BlobEncoding::to_value`] for the actual blob-to-Value lift. The
+/// `Blob<T>` is the `ToEncoded<Handle<T>>` expander: it delegates to
+/// [`BlobEncoding::to_encoded`] for the actual blob-to-Encoded lift. The
 /// trait is the macro-side dispatch shim; the logic lives on
 /// `BlobEncoding` so users (and schemas that need custom storage
 /// semantics) can call or override it directly.
-impl<T> crate::value::ToValue<Handle<T>> for Blob<T>
+impl<T> crate::value::ToEncoded<Handle<T>> for Blob<T>
 where
     T: BlobEncoding,
     Handle<T>: InlineEncoding,
 {
-    fn to_value(self) -> crate::value::Value<Handle<T>> {
-        <T as BlobEncoding>::to_value(self)
+    fn to_encoded(self) -> crate::value::Encoded<Handle<T>> {
+        <T as BlobEncoding>::to_encoded(self)
     }
 }
 

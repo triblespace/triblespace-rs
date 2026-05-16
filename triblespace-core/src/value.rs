@@ -1,4 +1,4 @@
-//! `Inline<S>` (32-byte stored payload), `Value<V>` (the
+//! `Inline<S>` (32-byte stored payload), `Encoded<V>` (the
 //! Inline-or-Blob sum that `entity!{}` builds), and the conversion
 //! traits between them. For a deeper look at portability goals,
 //! common formats, and schema design, refer to the "Portability &
@@ -353,15 +353,15 @@ pub trait InlineEncoding: MetaDescribe + Sized + 'static {
         t.try_to_inline()
     }
 
-    /// Lift an already-encoded `Inline<Self>` into the [`Value`] sum
-    /// `entity!{}` consumes — yields `Value::Inline(form)`, no
+    /// Lift an already-encoded `Inline<Self>` into the [`Encoded`] sum
+    /// `entity!{}` consumes — yields `Encoded::Inline(form)`, no
     /// side-blob.
     ///
     /// Overridable if a schema has unusual storage semantics. The
     /// blob-path counterpart lives on
-    /// [`BlobEncoding::to_value`](crate::blob::BlobEncoding::to_value).
-    fn to_value(form: Inline<Self>) -> Value<Self> {
-        Value::Inline(form)
+    /// [`BlobEncoding::to_encoded`](crate::blob::BlobEncoding::to_encoded).
+    fn to_encoded(form: Inline<Self>) -> Encoded<Self> {
+        Encoded::Inline(form)
     }
 }
 
@@ -463,11 +463,11 @@ where
 /// Replaces the older `(Inline<V>, Option<Blob>)` pair that carried
 /// an implicit "Option is Some iff V is a Handle schema" invariant.
 /// Encoding the split as a sum makes the invariant structural — a
-/// `Value::Inline` never has a stored blob; a `Value::Blob` always
+/// `Encoded::Inline` never has a stored blob; a `Encoded::Blob` always
 /// does — and drops the redundant handle that used to be carried
 /// alongside its own blob.
 #[derive(Debug, Clone)]
-pub enum Value<V: InlineEncoding> {
+pub enum Encoded<V: InlineEncoding> {
     /// 32-byte payload stored directly in the trible.
     Inline(Inline<V>),
     /// Bytes resolvable via a content-addressed handle. The handle
@@ -476,21 +476,21 @@ pub enum Value<V: InlineEncoding> {
     Blob(crate::blob::Blob<crate::blob::encodings::UnknownBlob>),
 }
 
-impl<V: InlineEncoding> Value<V> {
+impl<V: InlineEncoding> Encoded<V> {
     /// The 32-byte form that goes into the trible. For
-    /// [`Value::Blob`], this rederives the handle from the cached
+    /// [`Encoded::Blob`], this rederives the handle from the cached
     /// hash in the blob (no rehash) and recasts the phantom.
     pub fn inline(&self) -> Inline<V> {
         match self {
-            Value::Inline(i) => *i,
-            Value::Blob(b) => b.get_handle().transmute(),
+            Encoded::Inline(i) => *i,
+            Encoded::Blob(b) => b.get_handle().transmute(),
         }
     }
 
     /// Yield the inline form alongside the side-blob (if any). This
     /// is the macro consumer's destructuring entry point — it gets
     /// both pieces in one call without losing the structural
-    /// guarantee from [`Value`].
+    /// guarantee from [`Encoded`].
     pub fn into_parts(
         self,
     ) -> (
@@ -498,8 +498,8 @@ impl<V: InlineEncoding> Value<V> {
         Option<crate::blob::Blob<crate::blob::encodings::UnknownBlob>>,
     ) {
         match self {
-            Value::Inline(i) => (i, None),
-            Value::Blob(b) => {
+            Encoded::Inline(i) => (i, None),
+            Encoded::Blob(b) => {
                 let h = b.get_handle().transmute();
                 (h, Some(b))
             }
@@ -507,29 +507,29 @@ impl<V: InlineEncoding> Value<V> {
     }
 }
 
-/// Lift an [`IntoEncoded::Output`] into the [`Value`] sum the
+/// Lift an [`IntoEncoded::Output`] into the [`Encoded`] sum the
 /// `entity!{}` macro folds into a Fragment.
 ///
 /// `V` is the *attribute's* value schema. Two impls cover everything:
-/// - `Inline<V>` delegates to [`InlineEncoding::to_value`] — inline
-///   path, yields `Value::Inline(form)`.
+/// - `Inline<V>` delegates to [`InlineEncoding::to_encoded`] — inline
+///   path, yields `Encoded::Inline(form)`.
 /// - `Blob<T>` targeting `Handle<T>` delegates to
-///   [`BlobEncoding::to_value`](crate::blob::BlobEncoding::to_value) —
-///   handle path, yields `Value::Blob(form.transmute())`.
+///   [`BlobEncoding::to_encoded`](crate::blob::BlobEncoding::to_encoded) —
+///   handle path, yields `Encoded::Blob(form.transmute())`.
 ///
 /// This trait is the **dispatch shim** for the macro layer; the
 /// actual logic lives on the schema traits so users (and overriding
 /// schemas) can call it directly without going through the trait.
-/// `to_value` matches the `to_inline`/`to_blob` style of the
+/// `to_encoded` matches the `to_inline`/`to_blob` style of the
 /// supertrait aliases.
-pub trait ToValue<V: InlineEncoding> {
-    /// Produce the [`Value`] the macro absorbs.
-    fn to_value(self) -> Value<V>;
+pub trait ToEncoded<V: InlineEncoding> {
+    /// Produce the [`Encoded`] the macro absorbs.
+    fn to_encoded(self) -> Encoded<V>;
 }
 
-impl<V: InlineEncoding> ToValue<V> for Inline<V> {
-    fn to_value(self) -> Value<V> {
-        <V as InlineEncoding>::to_value(self)
+impl<V: InlineEncoding> ToEncoded<V> for Inline<V> {
+    fn to_encoded(self) -> Encoded<V> {
+        <V as InlineEncoding>::to_encoded(self)
     }
 }
 

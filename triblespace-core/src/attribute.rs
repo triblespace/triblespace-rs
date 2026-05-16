@@ -82,28 +82,28 @@ impl<S: InlineEncoding> Attribute<S> {
         crate::value::IntoInline::to_inline(v)
     }
 
-    /// Macro-side entry point: produce the [`Value<S>`] the
+    /// Macro-side entry point: produce the [`Encoded<S>`] the
     /// `entity!{}` codegen folds into a Fragment.
     ///
     /// Dispatches via [`IntoEncoded`], parameterised by the schema's
     /// [`Encoding`](crate::value::InlineEncoding::Encoding) — `S`
     /// itself for inline schemas, the inner `BlobEncoding` for
-    /// `Handle<T>`. The resulting `Output` is lifted into a [`Value`]
-    /// via [`ToValue`].
+    /// `Handle<T>`. The resulting `Output` is lifted into a [`Encoded`]
+    /// via [`ToEncoded`].
     ///
     /// [`IntoEncoded`]: crate::value::IntoEncoded
-    /// [`ToValue`]: crate::value::ToValue
-    /// [`Value`]: crate::value::Value
-    /// [`Value<S>`]: crate::value::Value
-    pub fn value_from<V>(&self, v: V) -> crate::value::Value<S>
+    /// [`ToEncoded`]: crate::value::ToEncoded
+    /// [`Encoded`]: crate::value::Encoded
+    /// [`Encoded<S>`]: crate::value::Encoded
+    pub fn encoded_from<V>(&self, v: V) -> crate::value::Encoded<S>
     where
         V: crate::value::IntoEncoded<<S as crate::value::InlineEncoding>::Encoding>,
         <V as crate::value::IntoEncoded<
             <S as crate::value::InlineEncoding>::Encoding,
-        >>::Output: crate::value::ToValue<S>,
+        >>::Output: crate::value::ToEncoded<S>,
     {
-        use crate::value::ToValue;
-        v.into_encoded().to_value()
+        use crate::value::ToEncoded;
+        v.into_encoded().to_encoded()
     }
 
     /// Coerce an existing variable of any schema into a variable typed with

@@ -9,32 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`Value<S>` is now a sum, not a struct.** The 32-byte stored
-  payload became `Inline<S>`; `Value<V>` is the new
+- **`Encoded<S>` is now a sum, not a struct.** The 32-byte stored
+  payload became `Inline<S>`; `Encoded<V>` is the new
   `Inline(Inline<V>) | Blob(Blob<UnknownBlob>)` enum that
   `entity!{}` builds. The handle is no longer carried twice — for
-  `Value::Blob`, it lives inside the blob's cached digest and is
-  recovered via `Value::inline()` (phantom recast, no rehash).
+  `Encoded::Blob`, it lives inside the blob's cached digest and is
+  recovered via `Encoded::inline()` (phantom recast, no rehash).
 - **Workspace-wide rename**: `ValueSchema` → `InlineEncoding`,
   `IntoValue` → `IntoInline`, `TryToValue` → `TryToInline`,
   `TryFromValue` → `TryFromInline`, `ValueRange` → `InlineRange`,
   `UnknownValue` → `UnknownInline`, `RawValue` → `RawInline`,
   `VALUE_LEN` → `INLINE_LEN`, plus the matching `*_value` →
-  `*_inline` method renames (`to_value`/`from_value`/etc.).
-- **New dispatch trait**: `ToValue<V>` (formerly `FieldFormFor<V>`)
-  lifts an `IntoEncoded::Output` into a `Value<V>`. The trait's two
-  blanket impls delegate to schema-level `InlineEncoding::to_value`
-  and `BlobEncoding::to_value`, so users (and schemas with unusual
+  `*_inline` method renames (`to_encoded`/`from_value`/etc.).
+- **New dispatch trait**: `ToEncoded<V>` (formerly `FieldFormFor<V>`)
+  lifts an `IntoEncoded::Output` into a `Encoded<V>`. The trait's two
+  blanket impls delegate to schema-level `InlineEncoding::to_encoded`
+  and `BlobEncoding::to_encoded`, so users (and schemas with unusual
   storage semantics) can call the conversion directly without going
   through the shim.
 - **Attribute helpers** rename to match `<destination>_from(v)`
-  shape: `Attribute::value_from(v) -> Value<S>` replaces
+  shape: `Attribute::encoded_from(v) -> Encoded<S>` replaces
   `into_field_value`, parallel to `Attribute::inline_from(v) ->
   Inline<S>`.
 - `value_range`, `value_in_range`, `metadata::value_*` attribute
-  ids, `WasmValueFormatter`, and third-party `Value`-named items
+  ids, `WasmValueFormatter`, and third-party `Encoded`-named items
   (`clap::ValueEnum`, `proptest::strategy::ValueTree`,
-  `Strategy::Value`, `serde_json::Value`) are intentionally
+  `Strategy::Encoded`, `serde_json::Value`) are intentionally
   unchanged — they refer to the V-slot in (E, A, V) or to
   out-of-tree concepts.
 
@@ -1213,7 +1213,7 @@ surface-level details. Highlights:
   introduction back to the broader worst-case optimal join literature.
 - Macro instrumentation now records the entire span of each invocation in a
   single `source_range` attribute instead of separate line and column values.
-- Implemented `ToValue<LineLocation>` for `proc_macro::Span` so metadata
+- Implemented `ToEncoded<LineLocation>` for `proc_macro::Span` so metadata
   wrappers can hand spans directly to `entity!` without manual tuple
   construction.
 - Attribute metadata emission no longer attempts to resolve value/blob schema

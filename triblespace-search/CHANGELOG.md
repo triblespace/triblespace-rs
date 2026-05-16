@@ -448,7 +448,7 @@ re-shaped around the new pattern.
 `BM25Builder::new` was a sibling only on `<GenId, WordHash>`
 that called `typed()` internally. In practice, both `D` and `T`
 are almost always inferred from downstream `insert` calls
-(`&Id → ToValue<GenId>` pins `D`, `hash_tokens → Vec<Inline<WordHash>>`
+(`&Id → ToEncoded<GenId>` pins `D`, `hash_tokens → Vec<Inline<WordHash>>`
 pins `T`), so the specific-shape `new` was just sugar for the
 common case.
 
@@ -642,13 +642,13 @@ TribleSpace taste:
   are now generic over the doc-key schema `D` and the term
   schema `T`. Default struct types are `<GenId, WordHash>` —
   `BM25Builder::new()` works bare when the type parameters are
-  inferrable from later `insert` calls (`&Id → ToValue<GenId>` /
+  inferrable from later `insert` calls (`&Id → ToEncoded<GenId>` /
   `hash_tokens → Vec<Inline<WordHash>>`). For other shapes,
   spell the schemas with a turbofish:
   `BM25Builder::<ShortString, WordHash>::new()` for a title-keyed
   index or `BM25Builder::<GenId, GenId>::new()` for
   entity-citation search.
-- `insert` accepts anything that `ToValue<D>`-converts — pass a
+- `insert` accepts anything that `ToEncoded<D>`-converts — pass a
   typed `Inline<D>` directly, or `&id` for the common GenId case.
   `insert_id` / `insert_value` don't exist; the single `insert`
   covers both.
