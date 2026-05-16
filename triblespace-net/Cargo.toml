@@ -1,19 +1,19 @@
 [package]
 name = "triblespace-net"
-version = "0.40.2"
+version = "0.41.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Distributed sync protocol for triblespace piles over iroh"
 repository = "https://github.com/triblespace/triblespace-net"
 
 [dependencies]
-triblespace-core = { version = "0.40.2", path = "../triblespace-core", default-features = false }
-iroh = { version = "0.97", features = ["platform-verifier"] }
-iroh-base = "0.97"
-iroh-blobs = { version = "0.99", default-features = false, features = ["rpc"] }
-iroh-gossip = { version = "0.97", features = ["net"] }
-irpc = "0.13.0"
-irpc-iroh = "0.13.0"
+triblespace-core = { version = "0.41.0", path = "../triblespace-core", default-features = false }
+iroh = { version = "0.98", features = ["platform-verifier"] }
+iroh-base = "0.98"
+iroh-blobs = { version = "0.100", default-features = false, features = ["rpc"] }
+iroh-gossip = { version = "0.98", features = ["net"] }
+irpc = "0.14.0"
+irpc-iroh = "0.14.0"
 anyhow = "1"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
 arrayvec = "0.7.6"
@@ -41,6 +41,6 @@ hifitime = "4.1.2"
 # behind `unstable-custom-transports` because the custom-transport
 # API isn't stable yet — we only depend on it for the auth-handshake
 # e2e test, which is fine.
-iroh = { version = "0.97", features = ["test-utils", "unstable-custom-transports"] }
+iroh = { version = "0.98", features = ["test-utils", "unstable-custom-transports"] }
 
 

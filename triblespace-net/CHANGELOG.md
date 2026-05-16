@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-05-16
+
+### Changed (breaking — transitive)
+- **Iroh family bumped 0.97 → 0.98** (`iroh`, `iroh-base`,
+  `iroh-gossip`) plus `iroh-blobs` 0.99 → 0.100, `irpc` 0.13
+  → 0.14, `irpc-iroh` 0.13 → 0.14.
+
+  Replaces the 0.40.3 Cargo.lock-shipping workaround with a
+  real fix: `iroh-base 0.97`'s `=3.0.0-pre.1` pin on
+  `ed25519-dalek` no longer compiles against
+  `ed25519 v3.0.0` (released 2026-05-03 — `KeyMalformed`
+  changed from unit to tuple variant). `iroh-base 0.98`
+  re-pins to `=3.0.0-pre.6`, which is API-compatible.
+
+  No surface API changes for consumers — `PeerConfig`, the
+  `Peer` type, and the protocol handler stay the same.
+  Iroh's `Endpoint::builder`, `presets::N0`,
+  `CaRootsConfig::system()`, and `ProtocolHandler` all kept
+  their shape across the iroh minor bump.
+
+  Verified: 17 lib + 2 + 3 integration tests + the e2e auth
+  handshake suite over `TestNetwork` all pass; `cargo install
+  trible --locked` from the 0.41.0 workspace succeeds without
+  the lockfile workaround.
+
 ## [0.40.2] - 2026-05-16
 
 ### Fixed

@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-05-16
+
+The iroh-0.98 release. Replaces the 0.40.3 Cargo.lock workaround
+for the upstream ed25519-dalek mess with a proper resolution.
+
+### Changed
+- **`triblespace-net` upgraded to the iroh 0.98 family.**
+  - `iroh` 0.97 → 0.98 (still with `platform-verifier`)
+  - `iroh-base` 0.97 → 0.98
+  - `iroh-gossip` 0.97 → 0.98
+  - `iroh-blobs` 0.99 → 0.100
+  - `irpc` 0.13 → 0.14, `irpc-iroh` 0.13 → 0.14 (lock-step
+    iroh-family bump)
+
+  Upstream had pinned `ed25519-dalek = "=3.0.0-pre.1"` in
+  `iroh-base 0.97`, which stopped compiling against
+  `ed25519 v3.0.0` (released 2026-05-03) because
+  `pkcs8::Error::KeyMalformed` changed from a unit variant to
+  a tuple variant. `iroh-base 0.98` re-pins to
+  `=3.0.0-pre.6`, which is API-compatible with current
+  `ed25519`. Fresh `cargo install trible --locked` now
+  resolves cleanly without needing the lockfile-shipping
+  workaround that 0.40.3 used as a stopgap.
+
+  No surface API changes in `triblespace-net` itself —
+  iroh's `Endpoint::builder`, `presets::N0`,
+  `CaRootsConfig::system()`, and the `ProtocolHandler`
+  trait all kept their shape across 0.97 → 0.98. All 17 lib
+  tests + 2 + 3 integration + 1 doctest pass.
+
+- **Lock-step 0.40.x → 0.41.0 across all 8 workspace
+  crates.** No source changes to `triblespace-core`,
+  `triblespace-search`, `triblespace-macros{,-common}`,
+  `triblespace-core-macros`, or the `triblespace` facade;
+  versions bump to keep workspace alignment.
+
+### Notes
+- `trible 0.40.2` is yanked. `trible 0.40.3` (the Cargo.lock
+  fix from earlier today) is left in place; it works but is
+  obsoleted by 0.41.0. Downstream users on caret-permissive
+  pins (`trible = "0.40"` will fall through to 0.40.3;
+  `trible = "0.41"` picks up the proper fix).
+
 ## [0.40.2] - 2026-05-16
 
 The TLS-roots-from-OS-store release. Patches one specific

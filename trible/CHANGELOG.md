@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] - 2026-05-16
+
+### Changed
+- **Iroh family bumped 0.97 → 0.98** via `triblespace-net`
+  0.41.0. Replaces the 0.40.3 Cargo.lock-shipping workaround
+  with a real upstream resolution: `iroh-base 0.98` no longer
+  pins to the broken `ed25519-dalek 3.0.0-pre.1`. See
+  `triblespace-net/CHANGELOG.md` for details.
+
+No surface CLI changes; same commands, same env vars, same
+output.
+
 ## [0.40.3] - 2026-05-16
 
 ### Fixed
