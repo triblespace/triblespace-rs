@@ -53,9 +53,8 @@ impl MetaDescribe for UnknownInline {
         };
         #[cfg(feature = "wasm")]
         {
-            let formatter = tribles.put(wasm_formatter::UNKNOWN_VALUE_WASM);
             tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: formatter,
+                metadata::value_formatter: wasm_formatter::UNKNOWN_VALUE_WASM,
             };
         }
         tribles

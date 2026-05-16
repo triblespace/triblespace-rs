@@ -26,7 +26,10 @@
 //! })
 //!
 //! // Explicit hex id (pinned attribute namespace):
-//! Attribute::<S>::from(Fragment::rooted(id, TribleSet::new()))
+//! Attribute::<S>::from(entity! {
+//!     ExclusiveId::force_ref(&id) @
+//!         metadata::value_encoding: <S as MetaDescribe>::id(),
+//! })
 //! ```
 
 use crate::id::Id;

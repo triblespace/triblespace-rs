@@ -8,9 +8,10 @@
 //!
 //! ```
 //! use triblespace_core::inline::{Inline, InlineEncoding, IntoInline, TryFromInline};
-//! use triblespace_core::metadata::MetaDescribe;
-//! use triblespace_core::trible::{Fragment, TribleSet};
-//! use triblespace_core::macros::id_hex;
+//! use triblespace_core::metadata::{self, MetaDescribe};
+//! use triblespace_core::trible::Fragment;
+//! use triblespace_core::id::{ExclusiveId, Id};
+//! use triblespace_core::macros::{id_hex, entity};
 //! use std::convert::{TryInto, Infallible};
 //!
 //! // Define a new schema type.
@@ -20,9 +21,17 @@
 //!
 //! // The schema's identity hex lives inline in its describe body — that's
 //! // the only place it appears; callers reach the id via MyNumber::id().
+//! // `entity!{ &id @ ... }` returns a Fragment already rooted at `id` with
+//! // the listed facts; auto-puts any blob-source values into its local
+//! // store. The `metadata::tag` annotation lets schema registries discover
+//! // this entity as an inline encoding.
 //! impl MetaDescribe for MyNumber {
 //!    fn describe() -> Fragment {
-//!        Fragment::rooted(id_hex!("345EAC0C5B5D7D034C87777280B88AE2"), TribleSet::new())
+//!        let id: Id = id_hex!("345EAC0C5B5D7D034C87777280B88AE2");
+//!        entity! { ExclusiveId::force_ref(&id) @
+//!            metadata::name: "my_number",
+//!            metadata::tag:  metadata::KIND_INLINE_ENCODING,
+//!        }
 //!    }
 //! }
 //! impl InlineEncoding for MyNumber {

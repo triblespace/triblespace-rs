@@ -6,7 +6,6 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::RawInline;
 use crate::inline::TryFromInline;
 use crate::inline::TryToInline;
@@ -204,21 +203,18 @@ impl<H: HashProtocol> TryToInline<Hash<H>> for String {
 
 fn describe_hash<H: HashProtocol>(id: Id) -> Fragment {
     let name = H::NAME;
-    let mut tribles = Fragment::rooted(id, TribleSet::new());
-    let description = tribles.put(format!(
-        "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
-    ));
-    let name_handle = tribles.put(name);
-    tribles += entity! { ExclusiveId::force_ref(&id) @
-        metadata::name: name_handle,
-        metadata::description: description,
+    #[allow(unused_mut)]
+    let mut tribles = entity! { ExclusiveId::force_ref(&id) @
+        metadata::name: name,
+        metadata::description: format!(
+            "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
+        ),
         metadata::tag: metadata::KIND_INLINE_ENCODING,
     };
     #[cfg(feature = "wasm")]
     {
-        let formatter = tribles.put(wasm_formatter::HASH_HEX_WASM);
         tribles += entity! { ExclusiveId::force_ref(&id) @
-            metadata::value_formatter: formatter,
+            metadata::value_formatter: wasm_formatter::HASH_HEX_WASM,
         };
     }
     tribles

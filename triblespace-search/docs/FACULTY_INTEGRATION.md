@@ -297,10 +297,12 @@ our blob encodings — e.g.
 ```rust
 struct WikiBm25Handle;
 impl MetaDescribe for WikiBm25Handle {
-    fn describe<B>(_: &mut B) -> Result<Fragment, B::PutError>
-    where B: BlobStore<Blake3>,
-    {
-        Ok(Fragment::rooted(id_hex!("…"), TribleSet::new()))
+    fn describe() -> Fragment {
+        let id: Id = id_hex!("…");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "wiki_bm25_handle",
+            metadata::tag:  metadata::KIND_INLINE_ENCODING,
+        }
     }
 }
 // value type: Handle<SuccinctBM25Blob>
