@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-05-16
+
+### Changed
+
+- **`parallel` is now a default feature.** The workspace `triblespace` crate
+  and `triblespace-core` enable it out of the box, so consumers get rayon
+  transparently — no `--features parallel` needed to pick up the parallel
+  query iterators and the `TribleSet::union` fan-out. WASM / embedded
+  callers can still opt out via `--no-default-features`.
+
+### Added
+
+- **`TribleSet::union` 6-way rayon fan-out** (when `parallel` is on, which
+  is now the default). The six trible indexes (`eav`/`eva`/`aev`/`ave`/
+  `vea`/`vae`) touch disjoint memory during a union, so the per-index
+  unions parallelise via nested `rayon::join` once `other.len()` clears
+  `PARALLEL_UNION_THRESHOLD` (4096 tribles). Wins on the parallel
+  `entities` bench family:
+
+  | bench                       | 0.40.0   | 0.40.1   | delta   |
+  |-----------------------------|----------|----------|---------|
+  | union_parallel/5M           |  2.44 s  |  1.79 s  | -26.5%  |
+  | union_parallel_chunked/2    |  224 ms  |  113 ms  | -49.5%  |
+  | union_parallel_chunked/10   |  583 ms  |  247 ms  | -57.7%  |
+  | union_parallel_chunked/100  |  1.75 s  |  794 ms  | -54.6%  |
+  | union_parallel_chunked/1000 |  3.03 s  |  1.35 s  | -55.4%  |
+
+  Serial fold (`union/5M`) sees ~5% feature-dispatch overhead because the
+  per-`+=` `other` is too small to clear the threshold; small unions stay
+  on the serial path.
+
 ## [0.40.0] - 2026-05-16
 
 ### Attribute id cache (perf)
