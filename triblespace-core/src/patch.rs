@@ -1063,6 +1063,246 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
+    /// Parallel-aware top-level intersect entry. Allocates a fresh
+    /// [`parallel_union::ParUnionCtx`] (shared budget across the
+    /// descent) and delegates to [`Self::par_intersect_with_ctx`].
+    /// Intersect builds a fresh tree, so there is no in-place
+    /// target — the parallel work is purely "compute per-pair
+    /// intersections in parallel, then collect into a new Branch."
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_intersect(&self, other: &Self, at_depth: usize) -> Option<Self>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let ctx = parallel_union::ParUnionCtx::new();
+        self.par_intersect_with_ctx(other, at_depth, &ctx)
+    }
+
+    /// Recursive parallel-aware intersect. At the equal-depth-branch
+    /// arm, scatter-spawns one task per matching `(self_child,
+    /// other_child)` pair (under budget), then collects results
+    /// into a fresh `Branch`. Hash-equal / divergence / asymmetric-
+    /// depth arms delegate to serial [`Self::intersect`] — they
+    /// don't generate fan-out work.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_intersect_with_ctx(
+        &self,
+        other: &Self,
+        at_depth: usize,
+        ctx: &parallel_union::ParUnionCtx,
+    ) -> Option<Self>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        if self.hash() == other.hash() {
+            return Some(self.clone());
+        }
+        if self.first_divergence(other, at_depth).is_some() {
+            return None;
+        }
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth != other_depth {
+            return self.intersect(other, at_depth);
+        }
+
+        let BodyRef::Branch(self_branch) = self.body_ref() else {
+            unreachable!();
+        };
+        let BodyRef::Branch(other_branch) = other.body_ref() else {
+            unreachable!();
+        };
+
+        // Intersect work is bounded by the smaller side — pairs only
+        // exist where keys appear in both branches.
+        let min_leaves = self_branch.leaf_count.min(other_branch.leaf_count) as usize;
+        if min_leaves < PARALLEL_PATCH_UNION_THRESHOLD {
+            return self.intersect(other, at_depth);
+        }
+
+        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] =
+            std::array::from_fn(|_| None);
+        let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
+
+        // `in_place_scope` runs the outer closure on the calling
+        // thread (no `Send` bound), which lets us hold `&Branch`
+        // borrows across the spawn loop. `Branch` is `!Sync` due
+        // to its raw `*const Leaf` pointer field, so a regular
+        // `rayon::scope` would reject the captures.
+        rayon::in_place_scope(|s| {
+            for slot in self_branch.child_table.iter() {
+                let Some(self_child) = slot.as_ref() else {
+                    continue;
+                };
+                let key = self_child.key();
+                let Some(other_child) = other_branch.child_table.table_get(key) else {
+                    continue;
+                };
+
+                if ctx.try_claim() {
+                    s.spawn(move |_| {
+                        let result =
+                            self_child.par_intersect_with_ctx(other_child, self_depth, ctx);
+                        // SAFETY: distinct keys → disjoint slots.
+                        unsafe {
+                            resolved_ptr.write_at(key as usize, result);
+                        }
+                    });
+                } else {
+                    let result = self_child.intersect(other_child, self_depth);
+                    unsafe {
+                        resolved_ptr.write_at(key as usize, result);
+                    }
+                }
+            }
+        });
+
+        // Collect non-None results into a fresh Branch.
+        let mut iter = resolved.into_iter().flatten();
+        let first = iter.next()?;
+        let Some(second) = iter.next() else {
+            return Some(first);
+        };
+        let new_branch = Branch::new(
+            self_depth,
+            first.with_start(self_depth),
+            second.with_start(self_depth),
+        );
+        let mut head_for_branch = Head::new(0, new_branch);
+        {
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            for child in iter {
+                let inserted = child.with_start(self_depth);
+                let k = inserted.key();
+                ed.modify_child(k, |_opt| Some(inserted));
+            }
+        }
+        Some(head_for_branch)
+    }
+
+    /// Parallel-aware top-level difference entry. Allocates a fresh
+    /// [`parallel_union::ParUnionCtx`] and delegates to
+    /// [`Self::par_difference_with_ctx`].
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_difference(&self, other: &Self, at_depth: usize) -> Option<Self>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let ctx = parallel_union::ParUnionCtx::new();
+        self.par_difference_with_ctx(other, at_depth, &ctx)
+    }
+
+    /// Recursive parallel-aware difference. Same scatter-and-spawn
+    /// shape as `par_intersect_with_ctx`, plus the "no match in
+    /// other" branch where we clone `self_child` unchanged into
+    /// the resolved array (no recursive work).
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_difference_with_ctx(
+        &self,
+        other: &Self,
+        at_depth: usize,
+        ctx: &parallel_union::ParUnionCtx,
+    ) -> Option<Self>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        if self.hash() == other.hash() {
+            return None;
+        }
+        if self.first_divergence(other, at_depth).is_some() {
+            return Some(self.clone());
+        }
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth != other_depth {
+            return self.difference(other, at_depth);
+        }
+
+        let BodyRef::Branch(self_branch) = self.body_ref() else {
+            unreachable!();
+        };
+        let BodyRef::Branch(other_branch) = other.body_ref() else {
+            unreachable!();
+        };
+
+        // Difference work is bounded by `self` (every key in self is
+        // either kept or filtered against other).
+        if (self_branch.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD {
+            return self.difference(other, at_depth);
+        }
+
+        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] =
+            std::array::from_fn(|_| None);
+        let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
+
+        // See `par_intersect_with_ctx` for why this is
+        // `in_place_scope` rather than `scope`.
+        rayon::in_place_scope(|s| {
+            for slot in self_branch.child_table.iter() {
+                let Some(self_child) = slot.as_ref() else {
+                    continue;
+                };
+                let key = self_child.key();
+
+                match other_branch.child_table.table_get(key) {
+                    Some(other_child) => {
+                        if ctx.try_claim() {
+                            s.spawn(move |_| {
+                                let result = self_child.par_difference_with_ctx(
+                                    other_child,
+                                    self_depth,
+                                    ctx,
+                                );
+                                unsafe {
+                                    resolved_ptr.write_at(key as usize, result);
+                                }
+                            });
+                        } else {
+                            let result = self_child.difference(other_child, self_depth);
+                            unsafe {
+                                resolved_ptr.write_at(key as usize, result);
+                            }
+                        }
+                    }
+                    None => {
+                        // No match in other ⇒ keep `self_child`
+                        // unchanged. Clone is cheap (Arc-style rc
+                        // bump on Branch, leaf is small).
+                        let cloned = self_child.clone();
+                        unsafe {
+                            resolved_ptr.write_at(key as usize, Some(cloned));
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut iter = resolved.into_iter().flatten();
+        let first = iter.next()?;
+        let Some(second) = iter.next() else {
+            return Some(first);
+        };
+        let new_branch = Branch::new(
+            self_depth,
+            first.with_start(self_depth),
+            second.with_start(self_depth),
+        );
+        let mut head_for_branch = Head::new(0, new_branch);
+        {
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            for child in iter {
+                let inserted = child.with_start(self_depth);
+                let k = inserted.key();
+                ed.modify_child(k, |_opt| Some(inserted));
+            }
+        }
+        Some(head_for_branch)
+    }
+
     pub(crate) fn infixes<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -1654,11 +1894,19 @@ where
     /// Intersects this PATCH with another PATCH.
     ///
     /// Returns a new PATCH that contains only the keys that are present in both PATCHes.
-    pub fn intersect(&self, other: &Self) -> Self {
+    pub fn intersect(&self, other: &Self) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
+                #[cfg(feature = "parallel")]
+                let result = root.par_intersect(other_root, 0);
+                #[cfg(not(feature = "parallel"))]
+                let result = root.intersect(other_root, 0);
                 return Self {
-                    root: root.intersect(other_root, 0).map(|root| root.with_start(0)),
+                    root: result.map(|root| root.with_start(0)),
                 };
             }
         }
@@ -1669,12 +1917,18 @@ where
     ///
     /// Returns a new PATCH that contains only the keys that are present in this PATCH,
     /// but not in the other PATCH.
-    pub fn difference(&self, other: &Self) -> Self {
+    pub fn difference(&self, other: &Self) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
         if let Some(root) = &self.root {
             if let Some(other_root) = &other.root {
-                Self {
-                    root: root.difference(other_root, 0),
-                }
+                #[cfg(feature = "parallel")]
+                let result = root.par_difference(other_root, 0);
+                #[cfg(not(feature = "parallel"))]
+                let result = root.difference(other_root, 0);
+                Self { root: result }
             } else {
                 (*self).clone()
             }
