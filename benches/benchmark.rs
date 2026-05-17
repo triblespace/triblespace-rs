@@ -595,6 +595,52 @@ fn entities_benchmark(c: &mut Criterion) {
         );
     }
 
+    // Intersect / difference benches. Build two ~1M-trible sets with
+    // ~50% overlap; the second half of each side shares authors with
+    // the first half of the other so the intersection isn't trivially
+    // empty or trivially identical.
+    {
+        let half = 500_000;
+        let owner = IdOwner::new();
+        let shared_authors: Vec<_> = (0..half).map(|_| owner.defer_insert(fucid())).collect();
+        let mut left = TribleSet::new();
+        let mut right = TribleSet::new();
+        for author in &shared_authors {
+            left += entity! { author @
+                literature::firstname: FirstName(EN).fake::<String>(),
+                literature::lastname: LastName(EN).fake::<String>(),
+            };
+            right += entity! { author @
+                literature::firstname: FirstName(EN).fake::<String>(),
+                literature::lastname: LastName(EN).fake::<String>(),
+            };
+        }
+        for _ in 0..half {
+            let author = owner.defer_insert(fucid());
+            left += entity! { &author @
+                literature::firstname: FirstName(EN).fake::<String>(),
+                literature::lastname: LastName(EN).fake::<String>(),
+            };
+        }
+        for _ in 0..half {
+            let author = owner.defer_insert(fucid());
+            right += entity! { &author @
+                literature::firstname: FirstName(EN).fake::<String>(),
+                literature::lastname: LastName(EN).fake::<String>(),
+            };
+        }
+
+        let total = (left.len() + right.len()) as u64;
+        group.sample_size(10);
+        group.throughput(Throughput::Elements(total));
+        group.bench_function(BenchmarkId::new("intersect", total), |b| {
+            b.iter(|| left.intersect(&right));
+        });
+        group.bench_function(BenchmarkId::new("difference", total), |b| {
+            b.iter(|| left.difference(&right));
+        });
+    }
+
     group.finish();
 }
 

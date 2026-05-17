@@ -159,7 +159,50 @@ impl TribleSet {
     }
 
     /// Returns a new set containing only tribles present in both sets.
+    ///
+    /// With the `parallel` feature enabled and either side above
+    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index intersects
+    /// fan out via nested [`rayon::join`] on the same disjoint-memory
+    /// property as `union`. Threshold gates on `min(self, other)`
+    /// because intersect work is bounded by the smaller side.
     pub fn intersect(&self, other: &Self) -> Self {
+        #[cfg(feature = "parallel")]
+        {
+            if self.len().min(other.len()) >= PARALLEL_UNION_THRESHOLD {
+                let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
+                    || {
+                        rayon::join(
+                            || self.eav.intersect(&other.eav),
+                            || self.eva.intersect(&other.eva),
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || self.aev.intersect(&other.aev),
+                                    || self.ave.intersect(&other.ave),
+                                )
+                            },
+                            || {
+                                rayon::join(
+                                    || self.vea.intersect(&other.vea),
+                                    || self.vae.intersect(&other.vae),
+                                )
+                            },
+                        )
+                    },
+                );
+                return Self {
+                    eav,
+                    eva,
+                    aev,
+                    ave,
+                    vea,
+                    vae,
+                };
+            }
+        }
         Self {
             eav: self.eav.intersect(&other.eav),
             eva: self.eva.intersect(&other.eva),
@@ -171,7 +214,50 @@ impl TribleSet {
     }
 
     /// Returns a new set containing tribles in `self` but not in `other`.
+    ///
+    /// With the `parallel` feature enabled and `self` above
+    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index differences
+    /// fan out via nested [`rayon::join`]. Threshold gates on
+    /// `self.len()` because difference work is bounded by the left
+    /// side (each key from `self` is either kept or filtered).
     pub fn difference(&self, other: &Self) -> Self {
+        #[cfg(feature = "parallel")]
+        {
+            if self.len() >= PARALLEL_UNION_THRESHOLD {
+                let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
+                    || {
+                        rayon::join(
+                            || self.eav.difference(&other.eav),
+                            || self.eva.difference(&other.eva),
+                        )
+                    },
+                    || {
+                        rayon::join(
+                            || {
+                                rayon::join(
+                                    || self.aev.difference(&other.aev),
+                                    || self.ave.difference(&other.ave),
+                                )
+                            },
+                            || {
+                                rayon::join(
+                                    || self.vea.difference(&other.vea),
+                                    || self.vae.difference(&other.vae),
+                                )
+                            },
+                        )
+                    },
+                );
+                return Self {
+                    eav,
+                    eva,
+                    aev,
+                    ave,
+                    vea,
+                    vae,
+                };
+            }
+        }
         Self {
             eav: self.eav.difference(&other.eav),
             eva: self.eva.difference(&other.eva),
