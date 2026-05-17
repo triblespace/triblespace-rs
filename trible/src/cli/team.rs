@@ -580,12 +580,31 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
 
         // Sig blobs reference the cap blob they sign via `sig_signs`.
         // Record the back-edge so we can attach a sig handle to each
-        // cap entry below.
-        for (_sig, signed_cap) in find!(
-            (sig: Id, h: Inline<Handle<SimpleArchive>>),
-            pattern!(&set, [{ ?sig @ capability::sig_signs: ?h }])
-        ) {
-            sig_by_cap.insert(signed_cap.raw, handle.raw);
+        // cap entry below — but ONLY when this blob is a standalone
+        // sig blob, not a cap blob with an embedded parent sig.
+        //
+        // Cap blobs carry an embedded sig sub-entity (with the same
+        // `sig_signs` attribute pointing at the parent cap), and a
+        // naive scan would mis-identify the cap blob's handle as
+        // the parent's sig handle. That bit us once — feeding the
+        // wrong handle into `team invite` produced a cap blob with
+        // two cap entities embedded, MalformedCap at OP_AUTH time.
+        //
+        // Discriminator: a standalone sig blob has no `cap_subject`
+        // anywhere; a cap-with-embedded-sig does (the cap entity).
+        let has_cap_subject = find!(
+            (e: Id, s: VerifyingKey),
+            pattern!(&set, [{ ?e @ capability::cap_subject: ?s }])
+        )
+        .next()
+        .is_some();
+        if !has_cap_subject {
+            for (_sig, signed_cap) in find!(
+                (sig: Id, h: Inline<Handle<SimpleArchive>>),
+                pattern!(&set, [{ ?sig @ capability::sig_signs: ?h }])
+            ) {
+                sig_by_cap.insert(signed_cap.raw, handle.raw);
+            }
         }
 
         // Each cap blob has exactly one entity carrying these
