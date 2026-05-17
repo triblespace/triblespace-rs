@@ -7,7 +7,7 @@
 //!
 //! Async is jailed inside the spawned thread.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -22,8 +22,6 @@ use crate::protocol::*;
 fn op_name(op: u8) -> &'static str {
     match op {
         OP_AUTH => "AUTH",
-        OP_LIST => "LIST",
-        OP_HEAD => "HEAD",
         OP_GET_BLOB => "GET_BLOB",
         OP_CHILDREN => "CHILDREN",
         _ => "UNKNOWN",
@@ -150,6 +148,36 @@ pub struct PeerConfig {
     /// authorise us. Required — protocol v4 has mandatory auth on both
     /// directions of a connection.
     pub self_cap: RawHash,
+    /// Direction of participation in the team swarm. Controls whether
+    /// this node publishes its own HEADs (write side) and/or reacts to
+    /// incoming HEADs from peers (read side). Default is
+    /// `Bidirectional`. Use [`SyncDirection::ReadOnly`] for follower /
+    /// catch-up workflows; use [`SyncDirection::WriteOnly`] for
+    /// pure-publisher workflows where the local node has nothing to
+    /// learn from the swarm.
+    pub direction: SyncDirection,
+}
+
+/// Which directions of the team swarm this node participates in.
+///
+/// The wire protocol is symmetric — every peer runs the same code path
+/// — but locally we can choose to suppress one side of the data flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SyncDirection {
+    /// Subscribe to gossip + fetch closures AND publish our own
+    /// HEADs. Default behaviour.
+    #[default]
+    Bidirectional,
+    /// Subscribe to gossip + fetch closures, but suppress local
+    /// HEAD publishes. Useful for follower / leecher workflows
+    /// where the local node is catching up to the swarm and has
+    /// no canonical state to contribute.
+    ReadOnly,
+    /// Publish local HEADs to gossip, but ignore incoming HEAD
+    /// events from peers. Useful for pure-publisher workflows
+    /// (e.g. an importer feeding the swarm) where the local node
+    /// has nothing to learn from the swarm.
+    WriteOnly,
 }
 
 // No `Default` impl: every PeerConfig must specify a team root because
@@ -189,7 +217,6 @@ pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
     fn list_branches(&self) -> &[(RawBranchId, RawHash)];
-    fn head(&self, branch: &RawBranchId) -> Option<RawHash>;
     /// Enumerate every blob in this snapshot, viewed as a
     /// `Blob<SimpleArchive>`. Blobs whose backing bytes don't even fit
     /// the `SimpleArchive` schema (e.g. arbitrary binary payloads) are
@@ -227,10 +254,6 @@ where
 
     fn list_branches(&self) -> &[(RawBranchId, RawHash)] {
         &self.branches
-    }
-
-    fn head(&self, branch: &RawBranchId) -> Option<RawHash> {
-        self.branches.iter().find(|(b, _)| b == branch).map(|(_, h)| *h)
     }
 
     fn all_simple_archive_blobs(
@@ -281,58 +304,6 @@ impl NetSender {
 
     pub fn gossip(&self, branch: RawBranchId, head: RawHash) {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
-    }
-
-    /// Track a remote branch. `peer` accepts anything convertible
-    /// into `EndpointAddr` — a bare `EndpointId` works (discovery
-    /// resolves the addresses) and a full `EndpointAddr` skips
-    /// discovery by carrying relay URL + direct addresses through.
-    /// The latter is the path for environments where pkarr publish
-    /// / relay probes are blocked (corporate proxies, shared-IP
-    /// sandboxes that get rate-limited by iroh-canary, etc.).
-    pub fn track(&self, peer: impl Into<EndpointAddr>, branch: RawBranchId) {
-        let _ = self.cmd_tx.send(NetCommand::Track { peer: peer.into(), branch });
-    }
-
-    /// RPC: list a remote peer's branches. Blocks the calling thread until
-    /// the network thread completes one protocol round trip.
-    pub fn list_remote_branches(
-        &self,
-        peer: impl Into<EndpointAddr>,
-    ) -> anyhow::Result<Vec<(triblespace_core::id::Id, RawHash)>> {
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(NetCommand::ListBranches { peer: peer.into(), reply: tx })
-            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
-        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
-    }
-
-    /// RPC: query a remote peer for its current head of one branch.
-    pub fn head_of_remote(
-        &self,
-        peer: impl Into<EndpointAddr>,
-        branch: RawBranchId,
-    ) -> anyhow::Result<Option<RawHash>> {
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(NetCommand::HeadOfRemote { peer: peer.into(), branch, reply: tx })
-            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
-        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
-    }
-
-    /// RPC: fetch a single blob's bytes from a remote peer. Returns the
-    /// raw bytes (or `None` if the remote doesn't have the blob); the
-    /// caller is responsible for putting them into a local store.
-    pub fn fetch(
-        &self,
-        peer: impl Into<EndpointAddr>,
-        hash: RawHash,
-    ) -> anyhow::Result<Option<Vec<u8>>> {
-        let (tx, rx) = mpsc::channel();
-        self.cmd_tx
-            .send(NetCommand::Fetch { peer: peer.into(), hash, reply: tx })
-            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
-        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
     }
 
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
@@ -646,6 +617,28 @@ async fn host_loop(
 
     let _router = router_builder.spawn();
 
+    /// Build the gossip wire frame for a (branch, head) pair.
+    /// 0x01 | branch(16) | head(32) | publisher(32) = 81 bytes.
+    fn gossip_frame(branch: &RawBranchId, head: &RawHash, publisher: &EndpointId) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(81);
+        msg.push(0x01);
+        msg.extend_from_slice(branch);
+        msg.extend_from_slice(head);
+        msg.extend_from_slice(publisher.as_bytes());
+        msg
+    }
+
+    // Last published HEAD per branch. Lets the periodic
+    // re-broadcast tick replay our state without callers
+    // having to drive it. iroh-gossip dedupes identical
+    // frames, so replaying the same set every 30s is cheap
+    // for neighbors who've already seen it, while giving
+    // newly-joined neighbors a chance to discover our HEADs
+    // without a JOIN message (which would add a DOS surface).
+    let mut last_published: HashMap<RawBranchId, RawHash> = HashMap::new();
+    let rebroadcast_period = std::time::Duration::from_secs(30);
+    let mut last_rebroadcast = std::time::Instant::now();
+
     // Command loop.
     loop {
         while let Ok(cmd) = commands.try_recv() {
@@ -660,180 +653,86 @@ async fn host_loop(
                     }
                 }
                 NetCommand::Gossip { branch, head } => {
+                    last_published.insert(branch, head);
                     if let Some(sender) = &gossip_sender {
-                        let mut msg = Vec::with_capacity(81);
-                        msg.push(0x01);
-                        msg.extend_from_slice(&branch);
-                        msg.extend_from_slice(&head);
-                        msg.extend_from_slice(my_id.as_bytes());
+                        let msg = gossip_frame(&branch, &head, &my_id);
                         let sender = sender.clone();
                         tokio::spawn(async move {
                             let _ = sender.broadcast(msg.into()).await;
                         });
                     }
                 }
-                NetCommand::Track { peer, branch } => {
-                    let ep = ep.clone();
-                    let events_tx = events.clone();
-                    let dht = dht_api.clone();
-                    let self_cap = self_cap;
+            }
+        }
+
+        if last_rebroadcast.elapsed() >= rebroadcast_period {
+            if let Some(sender) = &gossip_sender {
+                for (branch, head) in &last_published {
+                    let msg = gossip_frame(branch, head, &my_id);
+                    let sender = sender.clone();
                     tokio::spawn(async move {
-                        let peer_id = peer.id;
-                        // Discover the remote HEAD (gossip would have it for
-                        // free; explicit track has to ask).
-                        let conn = match connect_authed(&ep, peer.clone(), &self_cap).await {
-                            Ok(c) => c,
-                            Err(e) => { warn!(error = %e, peer = %peer_id.fmt_short(), "track: connect failed"); return; }
-                        };
-                        let head = match op_head(&conn, &branch).await {
-                            Ok(Some(h)) => h,
-                            Ok(None) => { debug!(branch = %hex::encode(&branch[..4]), "track: remote has no head"); return; }
-                            Err(e) => { warn!(error = %e, "track: op_head failed"); return; }
-                        };
-                        conn.close(0u32.into(), b"ok");
-                        // For explicit track, the publisher is the peer
-                        // we asked (they vouched for this head).
-                        let mut publisher = [0u8; 32];
-                        publisher.copy_from_slice(peer_id.as_bytes());
-                        track_known_head(&ep, peer, branch, head, publisher, &dht, &events_tx, &self_cap).await;
-                    });
-                }
-                NetCommand::ListBranches { peer, reply } => {
-                    let ep = ep.clone();
-                    let self_cap = self_cap;
-                    tokio::spawn(async move {
-                        let result = async {
-                            let conn = connect_authed(&ep, peer, &self_cap).await?;
-                            let pairs = op_list(&conn).await?;
-                            conn.close(0u32.into(), b"ok");
-                            let out: Vec<(triblespace_core::id::Id, RawHash)> = pairs
-                                .into_iter()
-                                .filter_map(|(bid, head)| {
-                                    triblespace_core::id::Id::new(bid).map(|id| (id, head))
-                                })
-                                .collect();
-                            Ok(out)
-                        }.await;
-                        let _ = reply.send(result);
-                    });
-                }
-                NetCommand::HeadOfRemote { peer, branch, reply } => {
-                    let ep = ep.clone();
-                    let self_cap = self_cap;
-                    tokio::spawn(async move {
-                        let result = async {
-                            let conn = connect_authed(&ep, peer, &self_cap).await?;
-                            let head = op_head(&conn, &branch).await?;
-                            conn.close(0u32.into(), b"ok");
-                            Ok(head)
-                        }.await;
-                        let _ = reply.send(result);
-                    });
-                }
-                NetCommand::Fetch { peer, hash, reply } => {
-                    let ep = ep.clone();
-                    let dht = dht_api.clone();
-                    let self_cap = self_cap;
-                    tokio::spawn(async move {
-                        let result = fetch_blob(&ep, &hash, &dht, peer, &self_cap).await;
-                        let _ = reply.send(result);
+                        let _ = sender.broadcast(msg.into()).await;
                     });
                 }
             }
+            last_rebroadcast = std::time::Instant::now();
         }
+
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
-/// Fetch a single blob by hash from any available source.
-/// Tries DHT providers, then the hint peer. Verifies blake3 hash before returning.
-async fn fetch_blob(
-    ep: &iroh::Endpoint,
-    hash: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
-    hint_peer: EndpointAddr,
-    self_cap: &RawHash,
-) -> anyhow::Result<Option<Vec<u8>>> {
-    let verify = |data: &[u8]| -> bool {
-        let computed = blake3::hash(data);
-        computed.as_bytes() == hash
-    };
-
-    // DHT: ask the network who has this blob.
-    if let Some(api) = dht {
-        let blake3_hash = blake3::Hash::from_bytes(*hash);
-        if let Ok(providers) = api.find_providers(blake3_hash).await {
-            for provider in providers {
-                let provider_addr: EndpointAddr = EndpointId::from(provider).into();
-                if let Ok(conn) = connect_authed(ep, provider_addr, self_cap).await {
-                    if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
-                        conn.close(0u32.into(), b"ok");
-                        if verify(&data) {
-                            return Ok(Some(data));
-                        }
-                        warn!(provider = %provider.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from DHT provider");
-                    }
-                }
-            }
-        }
-    }
-
-    // Hint peer: the gossip sender likely has it.
-    let hint_id = hint_peer.id;
-    if let Ok(conn) = connect_authed(ep, hint_peer, self_cap).await {
-        if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
-            conn.close(0u32.into(), b"ok");
-            if verify(&data) {
-                return Ok(Some(data));
-            }
-            warn!(peer = %hint_id.fmt_short(), hash = %hex::encode(&hash[..4]), "hash mismatch from hint peer");
-        }
-    }
-
-    Ok(None)
-}
-
-/// Fetch all blobs reachable from a remote HEAD.
+/// Fetch all blobs reachable from a HEAD, swarm-distributed.
 ///
-/// Opens a single authed connection to the peer and reuses it for
-/// every OP_CHILDREN + OP_GET_BLOB call along the BFS. iroh's QUIC
-/// transport multiplexes streams cheaply, and our server-side
-/// SnapshotHandler already accepts multiple sequential bi-streams
-/// per connection (auth state is per-connection, set on the first
-/// OP_AUTH stream and reused on every subsequent stream). Earlier
-/// versions opened a fresh `connect_authed` per blob and per
-/// CHILDREN call, paying ~600ms of auth+handshake overhead each
-/// time — a BFS over even a small graph would exhaust the
-/// `pull_branch` 30s deadline. With reuse, a single auth covers
-/// the whole walk.
+/// For each blob along the BFS, asks the DHT for providers and
+/// fans the fetch across whoever's reachable; falls back to the
+/// gossip publisher if DHT lookup is empty. A per-pull connection
+/// pool keyed on `EndpointId` ensures we only auth once per
+/// provider — subsequent ops to the same provider reuse the
+/// connection through iroh's QUIC stream multiplexing (our
+/// `SnapshotHandler` already accepts unbounded sequential
+/// bi-streams per connection; auth state is per-connection, set
+/// on the first OP_AUTH stream).
 ///
-/// The DHT-blob-discovery path that lived in the previous
-/// `fetch_blob` helper is dropped from this hot path; for now the
-/// hint peer is the only source. DHT reachability hasn't been
-/// load-bearing for any current use case and added a per-blob
-/// connect to a different peer that would defeat the reuse here.
-/// We can layer a DHT fallback back in once it's actually needed.
+/// Earlier versions opened one fresh `connect_authed` per blob,
+/// paying ~600ms of auth handshake each. A BFS over even a small
+/// graph would exhaust an outer deadline before the walk
+/// completed. With the pool, one auth per provider covers any
+/// number of ops; with DHT-driven provider selection, the walk
+/// fans out across multiple caching peers in parallel hops
+/// rather than funnelling everything through the publisher.
 async fn fetch_reachable(
     ep: &iroh::Endpoint,
-    peer: EndpointAddr,
+    publisher: EndpointAddr,
     head: &RawHash,
-    _dht: &Option<crate::dht::api::ApiClient>,
+    dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
 ) -> anyhow::Result<()> {
     let mut seen: HashSet<RawHash> = HashSet::new();
     seen.insert(*head);
 
-    // One auth'd connection for the entire walk.
-    let conn = connect_authed(ep, peer, self_cap).await?;
+    // Per-pull connection pool. Keyed on EndpointId; iroh
+    // Connection is Clone-cheap (refcounted handle), so the
+    // map holds owned copies and lookups are zero-copy.
+    let mut pool: HashMap<EndpointId, iroh::endpoint::Connection> = HashMap::new();
+    let publisher_id = publisher.id;
+
+    // Seed the pool with the publisher's connection — they're the
+    // most likely to have the head + closure since they just
+    // announced it. Future ops fall through to other DHT providers
+    // if the publisher misses or errors.
+    if let Ok(conn) = connect_authed(ep, publisher, self_cap).await {
+        pool.insert(publisher_id, conn);
+    }
 
     let verify_hash = |data: &[u8], expected: &RawHash| -> bool {
         let computed = blake3::hash(data);
         computed.as_bytes() == expected
     };
 
-    // Fetch the head blob first.
-    if let Ok(Some(data)) = op_get_blob(&conn, head).await {
+    // Fetch the head blob first (kicks off the BFS frontier).
+    if let Some(data) = fetch_one(ep, head, dht, &mut pool, publisher_id, self_cap).await {
         if verify_hash(&data, head) {
             let _ = events.send(NetEvent::Blob(data));
         } else {
@@ -841,15 +740,15 @@ async fn fetch_reachable(
         }
     }
 
-    // BFS via CHILDREN + GET_BLOB on the same connection.
+    // BFS the closure via OP_CHILDREN + OP_GET_BLOB.
     let mut current_level = vec![*head];
     while !current_level.is_empty() {
         let mut next_level = Vec::new();
         for parent in &current_level {
-            let children = match op_children(&conn, parent).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, parent = %hex::encode(&parent[..4]), "op_children failed");
+            let children = match children_one(ep, parent, dht, &mut pool, publisher_id, self_cap).await {
+                Some(c) => c,
+                None => {
+                    warn!(parent = %hex::encode(&parent[..4]), "op_children: no provider could serve");
                     continue;
                 }
             };
@@ -857,29 +756,127 @@ async fn fetch_reachable(
                 if !seen.insert(hash) {
                     continue;
                 }
-                match op_get_blob(&conn, &hash).await {
-                    Ok(Some(data)) => {
-                        if verify_hash(&data, &hash) {
-                            let _ = events.send(NetEvent::Blob(data));
-                            next_level.push(hash);
-                        } else {
-                            warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
-                        }
-                    }
-                    Ok(None) => {
-                        debug!(hash = %hex::encode(&hash[..4]), "blob not available from hint peer");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, hash = %hex::encode(&hash[..4]), "op_get_blob failed");
-                    }
+                let Some(data) = fetch_one(ep, &hash, dht, &mut pool, publisher_id, self_cap).await else {
+                    debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
+                    continue;
+                };
+                if !verify_hash(&data, &hash) {
+                    warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
+                    continue;
                 }
+                let _ = events.send(NetEvent::Blob(data));
+                next_level.push(hash);
             }
         }
         current_level = next_level;
     }
 
-    conn.close(0u32.into(), b"ok");
+    // Close every pooled connection cleanly.
+    for (_, conn) in pool.drain() {
+        conn.close(0u32.into(), b"ok");
+    }
     Ok(())
+}
+
+/// Resolve providers for a hash via DHT, append the publisher as a
+/// fallback if it's not already in the set. Returns the ordered
+/// candidate list — DHT providers first (likely caching peers,
+/// closer in the swarm), publisher last (always-available fallback).
+async fn providers_for(
+    hash: &RawHash,
+    dht: &Option<crate::dht::api::ApiClient>,
+    publisher_id: EndpointId,
+) -> Vec<EndpointId> {
+    let mut providers: Vec<EndpointId> = if let Some(api) = dht {
+        let blake3_hash = blake3::Hash::from_bytes(*hash);
+        api.find_providers(blake3_hash).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !providers.contains(&publisher_id) {
+        providers.push(publisher_id);
+    }
+    providers
+}
+
+/// Ensure the pool has an authed connection to `provider`,
+/// returning it. Connect-and-auth on miss; cache on hit. None
+/// on connect or auth failure.
+async fn pool_get<'a>(
+    ep: &iroh::Endpoint,
+    pool: &'a mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    provider: EndpointId,
+    self_cap: &RawHash,
+) -> Option<&'a iroh::endpoint::Connection> {
+    if !pool.contains_key(&provider) {
+        let addr: EndpointAddr = provider.into();
+        match connect_authed(ep, addr, self_cap).await {
+            Ok(conn) => {
+                pool.insert(provider, conn);
+            }
+            Err(e) => {
+                debug!(error = %e, provider = %provider.fmt_short(), "could not auth alt provider");
+                return None;
+            }
+        }
+    }
+    pool.get(&provider)
+}
+
+/// Fetch a single blob via the swarm — DHT-resolved providers
+/// first, publisher as fallback. Returns the first successful
+/// fetch's bytes (caller verifies hash).
+async fn fetch_one(
+    ep: &iroh::Endpoint,
+    hash: &RawHash,
+    dht: &Option<crate::dht::api::ApiClient>,
+    pool: &mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    publisher_id: EndpointId,
+    self_cap: &RawHash,
+) -> Option<Vec<u8>> {
+    let providers = providers_for(hash, dht, publisher_id).await;
+    for provider in providers {
+        let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
+            continue;
+        };
+        match op_get_blob(conn, hash).await {
+            Ok(Some(data)) => return Some(data),
+            Ok(None) => {
+                debug!(hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "blob miss");
+                continue;
+            }
+            Err(e) => {
+                debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "op_get_blob errored, trying next provider");
+                continue;
+            }
+        }
+    }
+    None
+}
+
+/// Walk children of a parent blob via the swarm.
+async fn children_one(
+    ep: &iroh::Endpoint,
+    parent: &RawHash,
+    dht: &Option<crate::dht::api::ApiClient>,
+    pool: &mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    publisher_id: EndpointId,
+    self_cap: &RawHash,
+) -> Option<Vec<RawHash>> {
+    let providers = providers_for(parent, dht, publisher_id).await;
+    for provider in providers {
+        let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
+            continue;
+        };
+        match op_children(conn, parent).await {
+            Ok(c) => return Some(c),
+            Err(e) => {
+                debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "op_children errored, trying next provider");
+                continue;
+            }
+        }
+    }
+    None
 }
 
 /// Fetch the reachable closure from `head` on `fetch_peer` and, on
@@ -1093,48 +1090,6 @@ async fn serve_stream(
     // would be the obvious next optimisation.
 
     match op {
-        OP_LIST => {
-            let branches = snap_arc.lock().unwrap().as_ref()
-                .map(|s| s.list_branches().to_vec())
-                .unwrap_or_default();
-            let total = branches.len();
-            let mut visible = 0usize;
-            for (id_bytes, head) in &branches {
-                let Some(id) = triblespace_core::id::Id::new(*id_bytes) else {
-                    // Skip malformed branch ids (the all-zeros sentinel
-                    // value `NIL_BRANCH_ID` round-trips through this path
-                    // when the snapshot accidentally yields it).
-                    continue;
-                };
-                if !verified.grants_read_on(&id) {
-                    continue;
-                }
-                visible += 1;
-                send_branch_id(send, id_bytes).await?;
-                send_hash(send, head).await?;
-            }
-            send_branch_id(send, &NIL_BRANCH_ID).await?;
-            debug!(total = total, visible = visible, "OP_LIST served");
-        }
-
-        OP_HEAD => {
-            let id_bytes = recv_branch_id(recv).await?;
-            let allowed = triblespace_core::id::Id::new(id_bytes)
-                .is_some_and(|id| verified.grants_read_on(&id));
-            let hash = if allowed {
-                snap_arc.lock().unwrap().as_ref()
-                    .and_then(|s| s.head(&id_bytes))
-                    .unwrap_or(NIL_HASH)
-            } else {
-                NIL_HASH
-            };
-            if !allowed {
-                warn!(branch = %hex::encode(&id_bytes[..4]), "OP_HEAD denied: branch out of scope");
-            } else {
-                debug!(branch = %hex::encode(&id_bytes[..4]), found = (hash != NIL_HASH), "OP_HEAD served");
-            }
-            send_hash(send, &hash).await?;
-        }
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
@@ -1719,9 +1674,6 @@ mod tests {
         }
         fn list_branches(&self) -> &[(RawBranchId, RawHash)] {
             self.0.list_branches()
-        }
-        fn head(&self, branch: &RawBranchId) -> Option<RawHash> {
-            self.0.head(branch)
         }
         fn all_simple_archive_blobs(
             &self,

@@ -1,15 +1,11 @@
 //! Channel types bridging the async network thread and the sync store layer.
 //!
 //! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
-//! into the network thread. Most are fire-and-forget (announce, gossip,
-//! track). The "Rpc" variants carry a `Sender` for the network thread to
-//! reply on, which the calling Peer method blocks on.
+//! into the network thread. All fire-and-forget — there are no RPC
+//! variants because branch-state discovery is gossip-driven, not
+//! peer-targeted.
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
-
-use std::sync::mpsc::Sender;
-
-use triblespace_core::id::Id;
 
 use crate::protocol::{RawBranchId, RawHash};
 
@@ -17,44 +13,20 @@ use crate::protocol::{RawBranchId, RawHash};
 pub type PublisherKey = [u8; 32];
 
 /// Commands sent to the network thread.
+///
+/// The surface is minimal by design — branch-state discovery is
+/// gossip-driven (HEAD updates flood the team topic; the network
+/// thread autonomously walks reachable closures via the DHT-routed
+/// `OP_GET_BLOB` + `OP_CHILDREN` path). No peer-targeted RPCs.
 pub enum NetCommand {
-    /// Announce a blob hash to the DHT (fire-and-forget).
+    /// Announce a blob hash to the DHT (fire-and-forget). Local
+    /// puts trigger this; new providers improve the swarm's
+    /// content-distribution fan-out.
     Announce(RawHash),
-    /// Gossip a HEAD change for a branch (fire-and-forget).
+    /// Gossip a HEAD change for a branch (fire-and-forget). Local
+    /// branch updates trigger this; subscribers on the team topic
+    /// receive the flood message and walk the closure to catch up.
     Gossip { branch: RawBranchId, head: RawHash },
-    /// Start tracking a remote branch: recursively fetch the blobs
-    /// reachable from its head and materialize a tracking branch
-    /// (fire-and-forget — results arrive via `NetEvent`s).
-    ///
-    /// `peer` is an `EndpointAddr`, not just `EndpointId`, so a
-    /// relay URL and/or direct socket addresses can be carried
-    /// through to iroh's connect path without requiring
-    /// discovery — crucial for environments where pkarr publish
-    /// / relay probes are blocked.
-    Track { peer: iroh_base::EndpointAddr, branch: RawBranchId },
-
-    /// RPC: list a remote peer's branches. One protocol round trip.
-    /// Replies with the (branch_id, branch_metadata_blob_hash) pairs.
-    ListBranches {
-        peer: iroh_base::EndpointAddr,
-        reply: Sender<anyhow::Result<Vec<(Id, RawHash)>>>,
-    },
-    /// RPC: query a remote peer for its current head of one branch.
-    /// One protocol round trip.
-    HeadOfRemote {
-        peer: iroh_base::EndpointAddr,
-        branch: RawBranchId,
-        reply: Sender<anyhow::Result<Option<RawHash>>>,
-    },
-    /// RPC: fetch a single blob by hash from a remote peer. One protocol
-    /// round trip. Replies with the blob bytes (or `None` if the remote
-    /// doesn't have it). The Peer wrapper method is responsible for
-    /// putting the bytes into the local store.
-    Fetch {
-        peer: iroh_base::EndpointAddr,
-        hash: RawHash,
-        reply: Sender<anyhow::Result<Option<Vec<u8>>>>,
-    },
 }
 
 /// Events received from the network thread.

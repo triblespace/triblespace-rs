@@ -17,19 +17,27 @@
 //!
 //! Operations:
 //!   AUTH       cap_handle:32 → resp:u8                (0x00 = OK, 0x01 = REJECTED)
-//!   LIST       → (id:16 head:32)* nil_id:16         (48-byte aligned entries)
-//!   HEAD       id:16 → hash:32                      (nil = no head)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   (protocol is read-only — no remote writes)
+//!
+//! Branch-state discovery is gossip-driven, not ALPN-driven. HEAD
+//! updates flood the team topic (= team_root pubkey); subscribers
+//! receive them as gossip messages and walk the reachable closure
+//! via `GET_BLOB` + `CHILDREN`. Earlier protocol versions had an
+//! `OP_LIST` ("enumerate this peer's branches") and `OP_HEAD`
+//! ("what head does this peer have for branch X"), but those bake
+//! the wrong primitive into the wire: peers don't have authoritative
+//! views, the *team* does. The right discovery mechanism is "join
+//! the gossip topic and let heads arrive."
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/4";
 
 // Operation types — first byte on each stream.
-pub const OP_LIST: u8 = 0x01;
+// 0x01 was OP_LIST, retired in favour of gossip-driven head discovery.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_CHILDREN: u8 = 0x03;
-pub const OP_HEAD: u8 = 0x04;
+// 0x04 was OP_HEAD, retired alongside OP_LIST.
 /// First stream on every connection. Body: cap_handle:32. Response: u8
 /// status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
 /// verified scope; subsequent ops on the same connection inherit it.
@@ -123,33 +131,6 @@ pub async fn op_auth(conn: &Connection, cap_handle: &RawHash) -> Result<()> {
         AUTH_REJECTED => Err(anyhow!("server rejected capability")),
         other => Err(anyhow!("unknown auth response: {other:#x}")),
     }
-}
-
-/// LIST: get all (branch_id, head_hash) pairs. Nil branch_id terminates.
-pub async fn op_list(conn: &Connection) -> Result<Vec<(RawBranchId, RawHash)>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_LIST).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-
-    let mut branches = Vec::new();
-    loop {
-        let id = recv_branch_id(&mut recv).await?;
-        if id == NIL_BRANCH_ID { break; }
-        let head = recv_hash(&mut recv).await?;
-        branches.push((id, head));
-    }
-    Ok(branches)
-}
-
-/// HEAD: query head hash for a specific branch. Nil hash = no head.
-pub async fn op_head(conn: &Connection, branch_id: &RawBranchId) -> Result<Option<RawHash>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_HEAD).await?;
-    send_branch_id(&mut send, branch_id).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-
-    let hash = recv_hash(&mut recv).await?;
-    if hash == NIL_HASH { Ok(None) } else { Ok(Some(hash)) }
 }
 
 /// GET_BLOB: fetch a single blob by hash.

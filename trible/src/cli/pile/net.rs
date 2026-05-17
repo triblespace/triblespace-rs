@@ -8,7 +8,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 
-use triblespace_net::peer::{Peer, PeerConfig};
+use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::identity::load_or_create_key;
 
 use triblespace_core::repo::pile::Pile;
@@ -123,15 +123,26 @@ pub enum Command {
         peers: Vec<String>,
         #[arg(long)]
         key: Option<PathBuf>,
-    },
-    /// One-shot pull a branch from a remote peer.
-    Pull {
-        pile: PathBuf,
-        remote: String,
-        #[arg(long)]
-        branch: String,
-        #[arg(long)]
-        key: Option<PathBuf>,
+        /// Don't publish our own HEADs — fetch only. Useful for
+        /// follower / leecher workflows where we're catching up.
+        #[arg(long, conflicts_with = "write_only")]
+        read_only: bool,
+        /// Don't react to incoming HEADs — publish only. Useful for
+        /// pure-publisher workflows (importers, archives) where the
+        /// local pile has nothing to learn from the swarm.
+        #[arg(long, conflicts_with = "read_only")]
+        write_only: bool,
+        /// Stop after at most N seconds. Without this flag (and without
+        /// `--quiescent-for`), sync runs until interrupted with Ctrl-C —
+        /// "done" isn't a knowable state in a team swarm (two-generals).
+        #[arg(long, value_name = "SECS")]
+        duration: Option<u64>,
+        /// Stop after N seconds without any network event (no incoming
+        /// HEAD, no incoming blob). Best-effort "we appear to have
+        /// caught up" signal — useful for bounded sync in scripts where
+        /// you accept the two-generals caveat.
+        #[arg(long, value_name = "SECS")]
+        quiescent_for: Option<u64>,
     },
 }
 
@@ -139,11 +150,15 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
         Command::Status { key } => run_status(key),
-        Command::Sync { pile, peers, key } => {
-            run_sync(pile, peers, key)
-        }
-        Command::Pull { pile, remote, branch, key } => {
-            run_pull(pile, remote, branch, key)
+        Command::Sync { pile, peers, key, read_only, write_only, duration, quiescent_for } => {
+            let direction = if read_only {
+                SyncDirection::ReadOnly
+            } else if write_only {
+                SyncDirection::WriteOnly
+            } else {
+                SyncDirection::Bidirectional
+            };
+            run_sync(pile, peers, key, direction, duration, quiescent_for)
         }
     }
 }
@@ -206,7 +221,14 @@ fn run_status(sk: Option<PathBuf>) -> Result<()> {
 
 // ── Sync ─────────────────────────────────────────────────────────────
 
-fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf>) -> Result<()> {
+fn run_sync(
+    pile_path: PathBuf,
+    peer_strs: Vec<String>,
+    key_path: Option<PathBuf>,
+    direction: SyncDirection,
+    duration: Option<u64>,
+    quiescent_for: Option<u64>,
+) -> Result<()> {
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
@@ -231,102 +253,89 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf
         team_root,
         revoked: std::collections::HashSet::new(),
         self_cap,
+        direction,
     });
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
 
     eprintln!("node: {}", repo.storage().id());
     eprintln!("team_root: {}  (gossip topic)", hex::encode(team_root.to_bytes()));
+    let dir_label = match direction {
+        SyncDirection::Bidirectional => "bidirectional",
+        SyncDirection::ReadOnly => "read-only (no publish)",
+        SyncDirection::WriteOnly => "write-only (no fetch)",
+    };
+    eprintln!("direction: {dir_label}");
+    if let Some(d) = duration {
+        eprintln!("stop after: {d}s");
+    }
+    if let Some(q) = quiescent_for {
+        eprintln!("quiescent stop: {q}s without events");
+    }
     eprintln!("live sync active. (Ctrl-C to stop)\n");
 
     // Initial broadcast so peers connecting later can learn our state.
+    // republish_branches itself is direction-aware (no-op in ReadOnly).
     repo.storage_mut().republish_branches();
-    let mut last_announce = std::time::Instant::now();
+
+    let started = std::time::Instant::now();
+    let duration_limit = duration.map(std::time::Duration::from_secs);
+    let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
 
     loop {
-        // Periodic re-broadcast: helps newly-joined gossip neighbors learn
-        // about us. iroh-gossip dedupes identical messages so re-publishing
-        // the same state is cheap.
-        if last_announce.elapsed() > std::time::Duration::from_secs(10) {
-            repo.storage_mut().republish_branches();
-            last_announce = std::time::Instant::now();
+        // Bounded run-time. The host_loop also does periodic re-broadcasts
+        // (30s) of its own cache, so the CLI no longer needs to drive a
+        // republish_branches tick.
+        if let Some(limit) = duration_limit {
+            if started.elapsed() >= limit {
+                eprintln!("\nreached --duration limit ({}s); stopping", limit.as_secs());
+                break;
+            }
+        }
+        // Quiescence stop: no NetEvent absorbed for the configured window.
+        // The two-generals caveat applies — "looks idle" isn't "synced" —
+        // but for bounded sync in scripts the caller has explicitly opted
+        // into this trade-off.
+        if let Some(limit) = quiescent_limit {
+            if repo.storage().last_event_at().elapsed() >= limit {
+                eprintln!("\nquiescent for {}s; stopping", limit.as_secs());
+                break;
+            }
         }
 
         // Auto-merge: walk the tracking branches in the pile and merge each
         // into its same-named local branch. The Peer auto-refreshes on every
         // read (drains gossip + diffs external writes), so list_tracking_branches
-        // always sees the latest state.
-        let tracks = triblespace_net::tracking::list_tracking_branches(repo.storage_mut());
-        for info in tracks {
-            let triblespace_net::tracking::TrackingBranchInfo {
-                local_id: tracking_id,
-                remote_name: name,
-                ..
-            } = info;
+        // always sees the latest state. Skipped under WriteOnly — we don't
+        // pull tracking state down in that mode.
+        if direction != SyncDirection::WriteOnly {
+            let tracks = triblespace_net::tracking::list_tracking_branches(repo.storage_mut());
+            for info in tracks {
+                let triblespace_net::tracking::TrackingBranchInfo {
+                    local_id: tracking_id,
+                    remote_name: name,
+                    ..
+                } = info;
 
-            match triblespace_net::tracking::merge_tracking_into_local(&mut repo, tracking_id, &name) {
-                Ok(triblespace_net::tracking::MergeOutcome::Merged { .. }) => {
-                    eprintln!("  merged '{name}'");
+                match triblespace_net::tracking::merge_tracking_into_local(
+                    &mut repo, tracking_id, &name,
+                ) {
+                    Ok(triblespace_net::tracking::MergeOutcome::Merged { .. }) => {
+                        eprintln!("  merged '{name}'");
+                    }
+                    Ok(_) => { /* up-to-date or empty, no-op */ }
+                    Err(e) => eprintln!("  merge error '{name}': {e}"),
                 }
-                Ok(_) => { /* up-to-date or empty, no-op */ }
-                Err(e) => eprintln!("  merge error '{name}': {e}"),
             }
+        } else {
+            // Still need to drive refresh() so the network thread's event
+            // channel doesn't back up (and so last_event_at() updates for
+            // quiescence). refresh() is no-op-cheap and direction-aware.
+            repo.storage_mut().refresh();
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-}
-
-// ── Pull ─────────────────────────────────────────────────────────────
-
-fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option<PathBuf>) -> Result<()> {
-    let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
-
-    // Accept either an EndpointTicket (rich form — carries relay
-    // URL + direct addresses; skips iroh discovery, works in
-    // sandbox/proxy environments) or a bare hex pubkey (legacy
-    // form — needs iroh discovery to find the addresses).
-    let remote_addr: EndpointAddr = if let Ok(ticket) = remote.parse::<EndpointTicket>() {
-        ticket.endpoint_addr().clone()
-    } else {
-        let pk: iroh_base::PublicKey = remote.parse()
-            .map_err(|e| anyhow!("bad remote: not an EndpointTicket and not a hex pubkey ({e})"))?;
-        EndpointAddr::from(EndpointId::from(pk))
-    };
-    // Normalize trailing FQDN dots in any embedded relay URLs.
-    let remote_addr = triblespace_net::dot_stripped_endpoint_addr(remote_addr);
-    let remote_short = remote_addr.id.fmt_short();
-
-    // Spin up the Peer — pull-only mode (gossip: false), no flood
-    // subscription, just direct fetch + DHT.
-    use triblespace_core::repo::Repository;
-    let pile = open_pile(&pile_path)?;
-    let team_root = team_root_from_env(&key)?;
-    let self_cap = self_cap_from_env()?;
-    let peer = Peer::new(pile, key.clone(), PeerConfig {
-        peers: Vec::new(),
-        gossip: false,
-        team_root,
-        revoked: std::collections::HashSet::new(),
-        self_cap,
-    });
-    let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
-        .map_err(|e| anyhow!("repo: {e:?}"))?;
-
-    eprintln!("connecting to {remote_short}...");
-    eprintln!("syncing...");
-    let tracking_id = repo.storage_mut().pull_branch(remote_addr, &branch)?;
-
-    use triblespace_net::tracking::MergeOutcome;
-    let outcome = triblespace_net::tracking::merge_tracking_into_local(
-        &mut repo, tracking_id, &branch,
-    )?;
-    let _ = repo.into_storage().into_store().close();
-
-    match outcome {
-        MergeOutcome::Empty => return Err(anyhow!("remote has no commit")),
-        MergeOutcome::UpToDate => eprintln!("up to date '{branch}'"),
-        MergeOutcome::Merged { .. } => eprintln!("merged '{branch}'"),
-    }
     Ok(())
 }
+

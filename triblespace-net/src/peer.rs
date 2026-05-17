@@ -13,16 +13,19 @@
 //!   the DHT and gossip branch updates over the topic mesh, all via the
 //!   network thread.
 //!
-//! Use [`track`](Peer::track) to start tracking a remote branch from a
-//! specific peer (the `pile net pull` workflow), and [`fetch`](Peer::fetch)
-//! for single-blob pulls. Set `gossip: false` in [`PeerConfig`] for
-//! pull-only mode where the peer doesn't subscribe to a flood mesh.
+//! Branch-state discovery is gossip-driven: HEAD updates for the
+//! team's branches flood the team topic and arrive via the
+//! [`NetEvent`] channel; the network thread autonomously walks
+//! reachable closures via DHT-routed blob fetches. There are no
+//! peer-targeted RPCs on the public surface — peers serve content
+//! but don't get asked "what branches do you have." That question
+//! is asked of the team, via the topic, not of any individual peer.
 
 use std::collections::HashMap;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
-use iroh_base::{EndpointAddr, EndpointId};
+use iroh_base::EndpointId;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -36,9 +39,9 @@ use triblespace_core::inline::encodings::hash::Handle;
 
 use crate::channel::NetEvent;
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
-use crate::protocol::{RawBranchId, RawHash};
+use crate::protocol::RawHash;
 
-pub use crate::host::PeerConfig;
+pub use crate::host::{PeerConfig, SyncDirection};
 
 /// A store wrapped in distributed network sync.
 ///
@@ -67,7 +70,7 @@ pub use crate::host::PeerConfig;
 /// use rand::rngs::OsRng;
 /// use triblespace_core::repo::pile::Pile;
 /// use triblespace_core::inline::encodings::hash::Blake3;
-/// use triblespace_net::peer::{Peer, PeerConfig};
+/// use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 ///
 /// let key = SigningKey::generate(&mut OsRng);
 /// let pile: Pile = Pile::open(Path::new("./team.pile")).unwrap();
@@ -77,6 +80,7 @@ pub use crate::host::PeerConfig;
 ///     team_root: key.verifying_key(),      // single-user fallback
 ///     revoked: HashSet::new(),
 ///     self_cap: [0u8; 32],
+///     direction: SyncDirection::Bidirectional,
 /// });
 /// // From here `peer` is just a `BlobStore + BlobStorePut +
 /// // BranchStore` — wrap it in `Repository::new` and use it like
@@ -100,6 +104,15 @@ where
     /// Baseline branch heads for diff-and-publish on `refresh`. Updated on
     /// every Peer-driven write so we don't double-gossip our own changes.
     last_branches: HashMap<Id, RawHash>,
+
+    /// Direction of swarm participation — controls whether we publish
+    /// local HEADs and/or react to remote HEADs.
+    direction: SyncDirection,
+
+    /// Wall-clock time of the most recent NetEvent absorbed in
+    /// [`refresh`](Peer::refresh). Drives quiescence-based stopping
+    /// in long-running sync drivers.
+    last_event_at: std::time::Instant,
 }
 
 impl<S> Peer<S>
@@ -111,6 +124,7 @@ where
     /// The thread lives for the Peer's lifetime and shuts down when the
     /// Peer drops.
     pub fn new(mut store: S, key: SigningKey, config: PeerConfig) -> Self {
+        let direction = config.direction;
         let (sender, receiver) = host::spawn(key, config);
 
         // Seed the snapshot served by the network thread so peers
@@ -129,128 +143,30 @@ where
             receiver,
             last_blob_reader,
             last_branches: HashMap::new(),
+            direction,
+            last_event_at: std::time::Instant::now(),
         }
+    }
+
+    /// Wall-clock time of the most recent network event absorbed by
+    /// [`refresh`](Self::refresh). Useful for quiescence-based stopping:
+    /// long-running sync drivers can poll `peer.last_event_at().elapsed()`
+    /// and shut down once the swarm goes silent.
+    ///
+    /// Constructed-at-`Peer::new` initial value, so the first quiescence
+    /// window starts at construction rather than at the first event.
+    pub fn last_event_at(&self) -> std::time::Instant {
+        self.last_event_at
+    }
+
+    /// Direction of swarm participation. See [`SyncDirection`].
+    pub fn direction(&self) -> SyncDirection {
+        self.direction
     }
 
     /// This peer's network identity (the iroh node id).
     pub fn id(&self) -> EndpointId {
         self.sender.id()
-    }
-
-    /// Start tracking a remote branch: recursively fetch the blobs
-    /// reachable from its head and materialize a local tracking branch.
-    ///
-    /// Used by `pile net pull` and other "go get this from over there"
-    /// workflows. Does not require `gossip = true` — works in pull-
-    /// only mode too. The fetched data lands in the wrapped store
-    /// via the same auto-drain path that `refresh` uses.
-    ///
-    /// Fire-and-forget: returns immediately. Use [`pull_branch`](Self::pull_branch)
-    /// if you want to block until the tracking branch is materialized.
-    pub fn track(&self, peer: impl Into<EndpointAddr>, branch: RawBranchId) {
-        self.sender.track(peer, branch);
-    }
-
-    /// High-level pull: resolve a branch by *name* on a remote peer,
-    /// kick off a reachable-closure fetch, and block until the local
-    /// tracking branch is materialized. Returns the local tracking
-    /// branch id — feed it straight into `Repository::pull` to get a
-    /// workspace that merges via `merge_commit`.
-    ///
-    /// Composes [`list_remote_branches`](Self::list_remote_branches),
-    /// [`fetch`](Self::fetch), [`track`](Self::track), and the tracking
-    /// auto-drain on reads. Times out at 30 s if the remote never sends
-    /// the HEAD.
-    pub fn pull_branch(
-        &mut self,
-        remote: impl Into<EndpointAddr>,
-        name: &str,
-    ) -> anyhow::Result<Id> {
-        let remote: EndpointAddr = remote.into();
-        let (remote_id, _head) = resolve_branch_name(self, remote.clone(), name)?
-            .ok_or_else(|| anyhow::anyhow!("branch '{name}' not found on remote"))?;
-
-        let branch_bytes: [u8; 16] = remote_id.into();
-        self.track(remote, branch_bytes);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if let Some(id) = crate::tracking::find_tracking_branch(self, remote_id) {
-                return Ok(id);
-            }
-            if std::time::Instant::now() > deadline {
-                return Err(anyhow::anyhow!("timed out waiting for remote HEAD"));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-
-    /// RPC: list a remote peer's branches. One protocol round trip.
-    ///
-    /// Primitive for building branch-discovery workflows (e.g. resolving
-    /// a branch name to its ID before calling [`track`](Self::track)).
-    pub fn list_remote_branches(
-        &self,
-        peer: impl Into<EndpointAddr>,
-    ) -> anyhow::Result<Vec<(Id, RawHash)>> {
-        self.sender.list_remote_branches(peer)
-    }
-
-    /// RPC: query a remote peer for its current head of one branch.
-    /// One protocol round trip.
-    pub fn head_of_remote(
-        &mut self,
-        peer: impl Into<EndpointAddr>,
-        branch: RawBranchId,
-    ) -> anyhow::Result<Option<RawHash>> {
-        self.sender.head_of_remote(peer, branch)
-    }
-
-    /// RPC: fetch a single blob from a remote peer, insert it into the
-    /// local store, and decode it to `T`. Returns `None` if the remote
-    /// didn't have it.
-    ///
-    /// Mirrors [`BlobStoreGet::get`][bsg] in shape — pass a typed handle,
-    /// pick what you want out the other side. Request `Blob<Sch>` for
-    /// "just the bytes" with zero decode cost; request `TribleSet`,
-    /// `anybytes::View<str>`, etc. for the decoded value.
-    ///
-    /// Unlike [`track`](Self::track), this is a single blob (no
-    /// reachable closure traversal) and blocks until the round trip
-    /// completes.
-    ///
-    /// [bsg]: triblespace_core::repo::BlobStoreGet::get
-    pub fn fetch<T, Sch>(
-        &mut self,
-        peer: impl Into<EndpointAddr>,
-        handle: Inline<Handle<Sch>>,
-    ) -> anyhow::Result<Option<T>>
-    where
-        Sch: BlobEncoding + 'static,
-        T: triblespace_core::blob::TryFromBlob<Sch>,
-        Handle<Sch>: InlineEncoding,
-    {
-        let Some(bytes) = self.sender.fetch(peer, handle.raw)? else {
-            return Ok(None);
-        };
-        let data: Bytes = bytes.into();
-        // Persist locally under UnknownBlob — blobs are keyed by raw
-        // hash, so the schema tag at put time doesn't affect what you
-        // can get back out.
-        self.store
-            .put::<UnknownBlob, Bytes>(data.clone())
-            .map_err(|_| anyhow::anyhow!("store put failed"))?;
-        // Keep the blob diff baseline current so refresh doesn't
-        // re-announce this blob we just pulled.
-        self.last_blob_reader = self.store.reader().ok();
-
-        // Decode directly from the bytes we already have in hand — no
-        // second trip through the store needed.
-        let blob: triblespace_core::blob::Blob<Sch> =
-            triblespace_core::blob::Blob::new(data);
-        T::try_from_blob(blob)
-            .map(Some)
-            .map_err(|_| anyhow::anyhow!("blob decode failed"))
     }
 
     /// Reconcile this peer with the latest external state.
@@ -271,7 +187,15 @@ where
     /// "do it now" semantics or tight loops with no read activity.
     pub fn refresh(&mut self) {
         // ── Phase 1: drain incoming events ────────────────────────────
+        // WriteOnly suppresses incoming-event handling: we always
+        // drain the channel to keep it from filling, but skip the
+        // store mutation. The local node has nothing to learn from
+        // the swarm.
         while let Some(event) = self.receiver.try_recv() {
+            self.last_event_at = std::time::Instant::now();
+            if self.direction == SyncDirection::WriteOnly {
+                continue;
+            }
             match event {
                 NetEvent::Blob(data) => {
                     let bytes: Bytes = data.into();
@@ -294,32 +218,40 @@ where
         }
 
         // ── Phase 2: diff-and-publish blob deltas ─────────────────────
+        // ReadOnly skips the publish: we still update the baseline
+        // reader so we don't accumulate a publish backlog if the
+        // direction later changes.
         if let Ok(current) = self.store.reader() {
             if let Some(baseline) = self.last_blob_reader.as_ref() {
-                for handle in current.blobs_diff(baseline).flatten() {
-                    self.sender.announce(handle.raw);
+                if self.direction != SyncDirection::ReadOnly {
+                    for handle in current.blobs_diff(baseline).flatten() {
+                        self.sender.announce(handle.raw);
+                    }
                 }
             }
             self.last_blob_reader = Some(current);
         }
 
         // ── Phase 3: diff-and-publish branch deltas ───────────────────
-        let bids: Vec<Id> = match self.store.branches() {
-            Ok(it) => it.filter_map(|r| r.ok()).collect(),
-            Err(_) => return,
-        };
-        for bid in bids {
-            if crate::tracking::is_tracking_branch(&mut self.store, bid) {
-                continue;
-            }
-            let head = match self.store.head(bid) {
-                Ok(Some(h)) => h,
-                _ => continue,
+        // ReadOnly skips this entire phase — followers don't gossip.
+        if self.direction != SyncDirection::ReadOnly {
+            let bids: Vec<Id> = match self.store.branches() {
+                Ok(it) => it.filter_map(|r| r.ok()).collect(),
+                Err(_) => return,
             };
-            if self.last_branches.get(&bid) != Some(&head.raw) {
-                let bid_bytes: [u8; 16] = bid.into();
-                self.sender.gossip(bid_bytes, head.raw);
-                self.last_branches.insert(bid, head.raw);
+            for bid in bids {
+                if crate::tracking::is_tracking_branch(&mut self.store, bid) {
+                    continue;
+                }
+                let head = match self.store.head(bid) {
+                    Ok(Some(h)) => h,
+                    _ => continue,
+                };
+                if self.last_branches.get(&bid) != Some(&head.raw) {
+                    let bid_bytes: [u8; 16] = bid.into();
+                    self.sender.gossip(bid_bytes, head.raw);
+                    self.last_branches.insert(bid, head.raw);
+                }
             }
         }
 
@@ -343,6 +275,10 @@ where
     /// the deltas it detects against its diff baselines. This method
     /// republishes everything unconditionally.
     pub fn republish_branches(&mut self) {
+        // ReadOnly suppresses publishing entirely — even republish.
+        if self.direction == SyncDirection::ReadOnly {
+            return;
+        }
         let bids: Vec<Id> = match self.store.branches() {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => return,
@@ -406,7 +342,9 @@ where
         Handle<Sch>: InlineEncoding,
     {
         let handle = self.store.put(item)?;
-        self.sender.announce(handle.raw);
+        if self.direction != SyncDirection::ReadOnly {
+            self.sender.announce(handle.raw);
+        }
         // Update the blob baseline so refresh doesn't double-announce.
         self.last_blob_reader = self.store.reader().ok();
         Ok(handle)
@@ -461,7 +399,9 @@ where
                 // re-gossiped — otherwise the publisher would receive its
                 // own tracking branch back and create a tracking-of-the-
                 // tracking, ad infinitum.
-                if !crate::tracking::is_tracking_branch(&mut self.store, id) {
+                if !crate::tracking::is_tracking_branch(&mut self.store, id)
+                    && self.direction != SyncDirection::ReadOnly
+                {
                     let bid_bytes: [u8; 16] = id.into();
                     self.sender.gossip(bid_bytes, head.raw);
                     self.last_branches.insert(id, head.raw);
@@ -474,55 +414,6 @@ where
         }
         Ok(result)
     }
-}
-
-/// Resolve a branch *name* on a remote peer to its `(Id, head)`.
-///
-/// Composes [`Peer::list_remote_branches`] and [`Peer::fetch`]:
-/// lists the remote's branches, pulls each metadata blob into the local
-/// store, queries for `metadata::name`, fetches the name string blob, and
-/// matches against the requested name. Returns `Ok(None)` if no branch
-/// matches.
-///
-/// This is the name-lookup half of the `pile net pull` workflow — the
-/// caller then hands the resolved `Id` to [`Peer::track`] to pull the
-/// branch's reachable blob closure.
-pub fn resolve_branch_name<S>(
-    peer: &mut Peer<S>,
-    remote: impl Into<EndpointAddr>,
-    name: &str,
-) -> anyhow::Result<Option<(Id, RawHash)>>
-where
-    S: BlobStore + BlobStorePut + BranchStore,
-{
-    use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::macros::{find, pattern};
-    use triblespace_core::trible::TribleSet;
-
-    let remote: EndpointAddr = remote.into();
-    let branches = peer.list_remote_branches(remote.clone())?;
-    for (id, head) in branches {
-        let meta_handle = Inline::<Handle<SimpleArchive>>::new(head);
-        let Some(meta) = peer.fetch::<TribleSet, _>(remote.clone(), meta_handle)? else {
-            continue;
-        };
-
-        let name_handles: Vec<Inline<Handle<LongString>>> = find!(
-            h: Inline<Handle<LongString>>,
-            pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
-        )
-        .collect();
-
-        for name_handle in name_handles {
-            let Some(name_view) = peer.fetch::<anybytes::View<str>, _>(remote.clone(), name_handle)? else {
-                continue;
-            };
-            if name_view.as_ref() == name {
-                return Ok(Some((id, head)));
-            }
-        }
-    }
-    Ok(None)
 }
 
 /// Read the branch name from a branch metadata blob. Tries `metadata::name`
