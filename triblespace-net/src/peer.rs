@@ -133,8 +133,29 @@ where
             sender.update_snapshot(snap);
         }
 
-        // Take an initial blob baseline so refresh()'s first call doesn't
-        // re-announce every blob we already had on disk.
+        // Announce every blob already in the pile to the DHT. Without
+        // this, only blobs added *after* startup (via the refresh
+        // diff loop) become discoverable as `find_providers` hits —
+        // pre-existing content is invisible to the swarm, even though
+        // we'd happily serve it. That silently breaks the
+        // swarm-fan-out story for any peer opening an existing pile,
+        // including the auth-cap-fetch path (cap blobs are orphan
+        // content not reachable from any branch HEAD's closure).
+        //
+        // ReadOnly direction suppresses all outbound publishes; the
+        // initial announce sweep follows the same rule.
+        if direction != SyncDirection::ReadOnly {
+            if let Ok(reader) = store.reader() {
+                use triblespace_core::repo::BlobStoreList;
+                for handle in reader.blobs().filter_map(Result::ok) {
+                    sender.announce(handle.raw);
+                }
+            }
+        }
+
+        // Capture the post-announce baseline. The refresh diff loop
+        // only fires for blobs added *after* this point, so we don't
+        // re-announce blobs the startup sweep just covered.
         let last_blob_reader = store.reader().ok();
 
         Peer {
