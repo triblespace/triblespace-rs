@@ -378,14 +378,16 @@ impl<const KEY_LEN: usize> KeySegmentation<KEY_LEN> for SingleSegmentation {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 #[repr(u8)]
 pub(crate) enum HeadTag {
     // Stored in the low 4 bits of `Head::tptr` (see Head::new).
     //
     // Branch values encode log2(branch_size) (i.e. `Branch2 == 1`, `Branch256
     // == 8`). `0` is reserved for leaf nodes, which lets us compute the branch
-    // size as `1 << tag` without any offset.
+    // size as `1 << tag` without any offset. The derived `Ord` therefore
+    // compares branch sizes — `tag_a > tag_b` ⟺ `size_a > size_b`, and the
+    // 2× swap threshold reduces to a single tag-byte compare.
     Leaf = 0,
     Branch2 = 1,
     Branch4 = 2,
@@ -822,17 +824,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // semantically equivalent. Swap when `other`'s child_table
         // is at least 2× larger than `this`'s — start with the
         // bigger capacity so cuckoo grows are mostly avoided during
-        // insert. Both sides are Branch here (the divergence /
-        // asymmetric arms handled all other cases above).
-        let (this_size, other_size) = {
-            let (BodyRef::Branch(t), BodyRef::Branch(o)) =
-                (this.body_ref(), other.body_ref())
-            else {
-                unreachable!();
-            };
-            (t.child_table.len(), o.child_table.len())
-        };
-        if other_size >= this_size * 2 {
+        // insert. Branch tags encode `log2(child_table_size)`, so
+        // the 2× ratio reduces to `other_tag > this_tag` (no body
+        // deref needed; the tag bits live in the head's pointer).
+        if other.tag() > this.tag() {
             std::mem::swap(&mut this, &mut other);
         }
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
@@ -915,18 +910,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // `other`'s child_table is ≥2× `this`'s so the in-place
         // target starts with the bigger capacity (fewer cuckoo
         // grows when scattering children back via
-        // `install_child_growing`). Done before the threshold
-        // check / `body_mut` so we don't trigger any CoW copy
-        // on the eventual iterate side.
-        let (this_size, other_size) = {
-            let (BodyRef::Branch(t), BodyRef::Branch(o)) =
-                (this.body_ref(), other.body_ref())
-            else {
-                unreachable!();
-            };
-            (t.child_table.len(), o.child_table.len())
-        };
-        if other_size >= this_size * 2 {
+        // `install_child_growing`). Branch tags encode
+        // `log2(child_table_size)`, so the 2× ratio reduces to
+        // `other_tag > this_tag` — single byte compare from the
+        // head pointer, no body deref / CoW risk.
+        if other.tag() > this.tag() {
             std::mem::swap(&mut this, &mut other);
         }
 
