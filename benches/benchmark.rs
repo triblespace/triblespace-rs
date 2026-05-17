@@ -15,10 +15,15 @@ use triblespace::core::blob::encodings::succinctarchive::CachedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::CompressedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::BlobStorePut;
+use triblespace::core::repo::Repository;
 
 use triblespace::prelude::blobencodings::*;
 use triblespace::prelude::*;
+
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 
 use triblespace::core::patch::Entry;
 use triblespace::core::patch::IdentitySchema;
@@ -939,6 +944,60 @@ fn pile_benchmark(c: &mut Criterion) {
     */
 }
 
+fn checkout_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checkout");
+    group.sample_size(10);
+
+    // Build a repo with N commits, each carrying ~1000 entities-worth
+    // of tribles. Each commit lives in storage as a separate
+    // SimpleArchive blob, so `checkout(..)` does N independent
+    // fetch+unarchive+union operations — the parallel target.
+    for &n_commits in &[10usize, 100, 1000] {
+        let entities_per_commit = 100;
+        let storage = MemoryRepo::default();
+        let mut repo = Repository::new(
+            storage,
+            SigningKey::generate(&mut OsRng),
+            TribleSet::new(),
+        )
+        .expect("repo");
+        let branch_id = repo.create_branch("bench", None).expect("create branch");
+        let mut ws = repo.pull(*branch_id).expect("pull");
+
+        let mut total_tribles: u64 = 0;
+        for _ in 0..n_commits {
+            let owner = IdOwner::new();
+            let mut commit_data = TribleSet::new();
+            for _ in 0..entities_per_commit {
+                let author = owner.defer_insert(fucid());
+                let book = owner.defer_insert(fucid());
+                commit_data += entity! { &author @
+                    literature::firstname: FirstName(EN).fake::<String>(),
+                    literature::lastname: LastName(EN).fake::<String>(),
+                };
+                commit_data += entity! { &book @
+                    literature::author: &author,
+                    literature::title: Words(1..3).fake::<Vec<String>>().join(" "),
+                    literature::quote: Sentence(5..25).fake::<String>().to_blob().get_handle()
+                };
+            }
+            total_tribles += commit_data.len() as u64;
+            ws.commit(commit_data, "bench commit");
+        }
+        repo.push(&mut ws).expect("push");
+
+        group.throughput(Throughput::Elements(total_tribles));
+        group.bench_function(BenchmarkId::new("checkout", n_commits), |b| {
+            b.iter(|| {
+                let mut ws = repo.pull(*branch_id).expect("pull");
+                ws.checkout(..).expect("checkout")
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     std_benchmark,
@@ -949,6 +1008,7 @@ criterion_group!(
     entities_benchmark,
     query_benchmark,
     pile_benchmark,
+    checkout_benchmark,
 );
 
 criterion_main!(benches);
