@@ -2056,6 +2056,14 @@ where
     }
 }
 
+/// Minimum number of commits at which `checkout_commits*` switches
+/// from the serial loop to a `rayon::par_iter().try_reduce()` over
+/// the commits. Each commit involves one (or two) blob fetches plus
+/// an unarchive — independent work per commit — so the crossover is
+/// small. Below this the rayon overhead dominates.
+#[cfg(feature = "parallel")]
+const PARALLEL_CHECKOUT_THRESHOLD: usize = 8;
+
 impl<Blobs: BlobStore> Workspace<Blobs> {
     /// Returns the branch id associated with this workspace.
     pub fn branch_id(&self) -> Id {
@@ -2350,6 +2358,49 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         I: IntoIterator<Item = CommitHandle>,
     {
         let local = self.staged.reader().unwrap();
+        let commits: Vec<CommitHandle> = commits.into_iter().collect();
+
+        #[cfg(feature = "parallel")]
+        {
+            if commits.len() >= PARALLEL_CHECKOUT_THRESHOLD {
+                use rayon::prelude::*;
+                let base = self.base_blobs.clone();
+                return commits
+                    .into_par_iter()
+                    .map_with(
+                        (local, base),
+                        |(local, base), commit| -> Result<TribleSet, _> {
+                            let meta: TribleSet = local
+                                .get(commit)
+                                .or_else(|_| base.get(commit))
+                                .map_err(WorkspaceCheckoutError::Storage)?;
+                            let content_opt = match find!(
+                                (c: Inline<_>),
+                                pattern!(&meta, [{ content: ?c }])
+                            )
+                            .at_most_one()
+                            {
+                                Ok(Some((c,))) => Some(c),
+                                Ok(None) => None,
+                                Err(_) => {
+                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
+                                }
+                            };
+                            if let Some(c) = content_opt {
+                                let set: TribleSet = local
+                                    .get(c)
+                                    .or_else(|_| base.get(c))
+                                    .map_err(WorkspaceCheckoutError::Storage)?;
+                                Ok(set)
+                            } else {
+                                Ok(TribleSet::new())
+                            }
+                        },
+                    )
+                    .try_reduce(TribleSet::new, |a, b| Ok(a + b));
+            }
+        }
+
         let mut result = TribleSet::new();
         for commit in commits {
             let meta: TribleSet = local
@@ -2393,6 +2444,49 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         I: IntoIterator<Item = CommitHandle>,
     {
         let local = self.staged.reader().unwrap();
+        let commits: Vec<CommitHandle> = commits.into_iter().collect();
+
+        #[cfg(feature = "parallel")]
+        {
+            if commits.len() >= PARALLEL_CHECKOUT_THRESHOLD {
+                use rayon::prelude::*;
+                let base = self.base_blobs.clone();
+                return commits
+                    .into_par_iter()
+                    .map_with(
+                        (local, base),
+                        |(local, base), commit| -> Result<TribleSet, _> {
+                            let meta: TribleSet = local
+                                .get(commit)
+                                .or_else(|_| base.get(commit))
+                                .map_err(WorkspaceCheckoutError::Storage)?;
+                            let metadata_opt = match find!(
+                                (c: Inline<_>),
+                                pattern!(&meta, [{ metadata: ?c }])
+                            )
+                            .at_most_one()
+                            {
+                                Ok(Some((c,))) => Some(c),
+                                Ok(None) => None,
+                                Err(_) => {
+                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
+                                }
+                            };
+                            if let Some(c) = metadata_opt {
+                                let set: TribleSet = local
+                                    .get(c)
+                                    .or_else(|_| base.get(c))
+                                    .map_err(WorkspaceCheckoutError::Storage)?;
+                                Ok(set)
+                            } else {
+                                Ok(TribleSet::new())
+                            }
+                        },
+                    )
+                    .try_reduce(TribleSet::new, |a, b| Ok(a + b));
+            }
+        }
+
         let mut result = TribleSet::new();
         for commit in commits {
             let meta: TribleSet = local
@@ -2429,6 +2523,74 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         I: IntoIterator<Item = CommitHandle>,
     {
         let local = self.staged.reader().unwrap();
+        let commits: Vec<CommitHandle> = commits.into_iter().collect();
+
+        #[cfg(feature = "parallel")]
+        {
+            if commits.len() >= PARALLEL_CHECKOUT_THRESHOLD {
+                use rayon::prelude::*;
+                let base = self.base_blobs.clone();
+                return commits
+                    .into_par_iter()
+                    .map_with(
+                        (local, base),
+                        |(local, base), commit| -> Result<(TribleSet, TribleSet), _> {
+                            let meta: TribleSet = local
+                                .get(commit)
+                                .or_else(|_| base.get(commit))
+                                .map_err(WorkspaceCheckoutError::Storage)?;
+                            let content_opt = match find!(
+                                (c: Inline<_>),
+                                pattern!(&meta, [{ content: ?c }])
+                            )
+                            .at_most_one()
+                            {
+                                Ok(Some((c,))) => Some(c),
+                                Ok(None) => None,
+                                Err(_) => {
+                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
+                                }
+                            };
+                            let data_set = if let Some(c) = content_opt {
+                                local
+                                    .get(c)
+                                    .or_else(|_| base.get(c))
+                                    .map_err(WorkspaceCheckoutError::Storage)?
+                            } else {
+                                TribleSet::new()
+                            };
+                            let metadata_opt = match find!(
+                                (c: Inline<_>),
+                                pattern!(&meta, [{ metadata: ?c }])
+                            )
+                            .at_most_one()
+                            {
+                                Ok(Some((c,))) => Some(c),
+                                Ok(None) => None,
+                                Err(_) => {
+                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
+                                }
+                            };
+                            let metadata_set = if let Some(c) = metadata_opt {
+                                local
+                                    .get(c)
+                                    .or_else(|_| base.get(c))
+                                    .map_err(WorkspaceCheckoutError::Storage)?
+                            } else {
+                                TribleSet::new()
+                            };
+                            Ok((data_set, metadata_set))
+                        },
+                    )
+                    .try_reduce(
+                        || (TribleSet::new(), TribleSet::new()),
+                        |(a_data, a_meta), (b_data, b_meta)| {
+                            Ok((a_data + b_data, a_meta + b_meta))
+                        },
+                    );
+            }
+        }
+
         let mut data = TribleSet::new();
         let mut metadata_set = TribleSet::new();
         for commit in commits {
