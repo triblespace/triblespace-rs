@@ -605,16 +605,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    /// Snapshot `child_table.len()` for the equal-depth-branch
-    /// union swap heuristic. Returns `None` for `Leaf` (the caller
-    /// short-circuits before reaching the symmetric branch arm).
-    fn union_swap_stats(&self) -> Option<usize> {
-        match self.body_ref() {
-            BodyRef::Leaf(_) => None,
-            BodyRef::Branch(branch) => Some(branch.child_table.len()),
-        }
-    }
-
     // Slot wrapper defined at module level (moved to below the impl block)
 
     /// Find the first depth in [start_depth, limit) where the tree-ordered
@@ -829,11 +819,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // `modify_child`'s per-call accounting.
         //
         // Union is commutative; mutating either side in place is
-        // semantically equivalent. Pick the side that's cheaper to
-        // mutate: prefer rc==1 (skips rc_cow) and a bigger child
-        // table (fewer cuckoo grows when inserting the other side's
-        // children).
-        if Self::union_swap_preferred(&this, &other) {
+        // semantically equivalent. Swap when `other`'s child_table
+        // is at least 2× larger than `this`'s — start with the
+        // bigger capacity so cuckoo grows are mostly avoided during
+        // insert. Both sides are Branch here (the divergence /
+        // asymmetric arms handled all other cases above).
+        let (this_size, other_size) = {
+            let (BodyRef::Branch(t), BodyRef::Branch(o)) =
+                (this.body_ref(), other.body_ref())
+            else {
+                unreachable!();
+            };
+            (t.child_table.len(), o.child_table.len())
+        };
+        if other_size >= this_size * 2 {
             std::mem::swap(&mut this, &mut other);
         }
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
@@ -854,38 +853,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
         drop(ed);
         this
-    }
-
-    /// Returns `true` when `Head::union` (or `par_union_with_ctx`)
-    /// should swap `this` and `other` before mutating in-place in
-    /// the equal-depth-branch arm.
-    ///
-    /// The heuristic is purely size-based: swap when `other`'s
-    /// child_table is at least 2× larger than `this`'s, so the
-    /// mutate target starts with the bigger capacity and avoids
-    /// most cuckoo grows when absorbing the smaller side's keys.
-    /// Aggressive `>` swap-on-any-difference regressed
-    /// `chunked/1000` parallel reduce (orientation thrash across
-    /// deep reduction trees) while 2×-gated wins both the
-    /// serial-fold case and the parallel-reduce case.
-    ///
-    /// We do **not** consider refcounts here: the equal-depth arm
-    /// calls `body_mut` on both sides (one to drain children, one
-    /// to install merged results), so `rc_cow` runs on whichever
-    /// side is `rc > 1` regardless of orientation. Switching the
-    /// roles via swap can't avoid that allocation.
-    ///
-    /// `Leaf` heads short-circuit earlier (divergence /
-    /// asymmetric-depth arms), so this is only consulted for
-    /// branch–branch merges.
-    fn union_swap_preferred(this: &Self, other: &Self) -> bool {
-        let Some(this_size) = this.union_swap_stats() else {
-            return false;
-        };
-        let Some(other_size) = other.union_swap_stats() else {
-            return false;
-        };
-        other_size >= this_size.saturating_mul(2)
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -944,11 +911,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        // Equal depth, hashes differ → branch merge. Pick the side
-        // that's cheaper to mutate (rc==1 over rc>1, larger table
-        // over smaller) before triggering the threshold check or
-        // any `body_mut` that would force a CoW copy.
-        if Self::union_swap_preferred(&this, &other) {
+        // Equal depth, hashes differ → branch merge. Swap when
+        // `other`'s child_table is ≥2× `this`'s so the in-place
+        // target starts with the bigger capacity (fewer cuckoo
+        // grows when scattering children back via
+        // `install_child_growing`). Done before the threshold
+        // check / `body_mut` so we don't trigger any CoW copy
+        // on the eventual iterate side.
+        let (this_size, other_size) = {
+            let (BodyRef::Branch(t), BodyRef::Branch(o)) =
+                (this.body_ref(), other.body_ref())
+            else {
+                unreachable!();
+            };
+            (t.child_table.len(), o.child_table.len())
+        };
+        if other_size >= this_size * 2 {
             std::mem::swap(&mut this, &mut other);
         }
 
