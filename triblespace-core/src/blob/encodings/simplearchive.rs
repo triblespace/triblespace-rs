@@ -91,33 +91,92 @@ impl std::fmt::Display for UnarchiveError {
 
 impl std::error::Error for UnarchiveError {}
 
+/// Below this many tribles, serial unarchive wins (rayon overhead
+/// dominates).
+#[cfg(feature = "parallel")]
+const PARALLEL_UNARCHIVE_THRESHOLD: usize = 4096;
+
 impl TryFromBlob<SimpleArchive> for TribleSet {
     type Error = UnarchiveError;
 
     fn try_from_blob(blob: Blob<SimpleArchive>) -> Result<Self, Self::Error> {
-        let mut tribles = TribleSet::new();
-
-        let mut prev_trible = None;
         let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
             return Err(UnarchiveError::BadArchive);
         };
-        for t in packed_tribles.iter() {
-            if let Some(trible) = Trible::as_transmute_force_raw(t) {
-                if let Some(prev) = prev_trible {
-                    if prev == t {
-                        return Err(UnarchiveError::BadCanonicalizationRedundancy);
-                    }
-                    if prev > t {
-                        return Err(UnarchiveError::BadCanonicalizationOrdering);
-                    }
-                }
-                prev_trible = Some(t);
-                tribles.insert(trible);
-            } else {
-                return Err(UnarchiveError::BadTrible);
+        let slice: &[[u8; 64]] = &packed_tribles;
+
+        #[cfg(feature = "parallel")]
+        {
+            if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
+                return parallel_unarchive(slice);
             }
         }
 
-        Ok(tribles)
+        serial_unarchive(slice)
     }
+}
+
+/// Serial fallback. Validates ordering + redundancy inline with
+/// insertion — every byte read once.
+fn serial_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
+    let mut tribles = TribleSet::new();
+    let mut prev_trible: Option<&[u8; 64]> = None;
+    for t in slice.iter() {
+        let Some(trible) = Trible::as_transmute_force_raw(t) else {
+            return Err(UnarchiveError::BadTrible);
+        };
+        if let Some(prev) = prev_trible {
+            if prev == t {
+                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+            }
+            if prev > t {
+                return Err(UnarchiveError::BadCanonicalizationOrdering);
+            }
+        }
+        prev_trible = Some(t);
+        tribles.insert(trible);
+    }
+    Ok(tribles)
+}
+
+/// Parallel unarchive: chunk the blob, validate internal ordering
+/// per chunk in parallel, build per-chunk `TribleSet`s, verify
+/// boundary ordering between adjacent chunks, then reduce via
+/// `TribleSet::union` (which itself fans out across the six
+/// indexes — three levels of parallelism stacked).
+#[cfg(feature = "parallel")]
+fn parallel_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
+    use rayon::prelude::*;
+
+    let n_threads = rayon::current_num_threads().max(1);
+    // Aim for ~1 chunk per worker so each thread gets a clean slice
+    // to crunch with maximal cache locality. Round up.
+    let chunk_size = slice.len().div_ceil(n_threads).max(1);
+    let chunks: Vec<&[[u8; 64]]> = slice.chunks(chunk_size).collect();
+
+    // Phase 1: validate boundary ordering (sequential, but it's a
+    // tiny O(num_chunks) scan over already-cache-hot slice ends).
+    for w in chunks.windows(2) {
+        let last_a = w[0].last().expect("non-empty chunk");
+        let first_b = w[1].first().expect("non-empty chunk");
+        if last_a == first_b {
+            return Err(UnarchiveError::BadCanonicalizationRedundancy);
+        }
+        if last_a > first_b {
+            return Err(UnarchiveError::BadCanonicalizationOrdering);
+        }
+    }
+
+    // Phase 2: per-chunk serial unarchive in parallel.
+    let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
+        .par_iter()
+        .map(|chunk| serial_unarchive(chunk))
+        .collect();
+
+    // Phase 3: reduce the per-chunk sets via TribleSet::union (the
+    // 6-way index fan-out kicks in for any chunk pair above its
+    // own threshold).
+    Ok(chunk_sets?
+        .into_par_iter()
+        .reduce(TribleSet::new, |a, b| a + b))
 }
