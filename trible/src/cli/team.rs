@@ -500,6 +500,7 @@ fn run_revoke(
 
 /// Describe a single capability for the `team list` audit view.
 struct CapSummary {
+    cap_handle: [u8; 32],
     subject: VerifyingKey,
     issuer: VerifyingKey,
     perms: Vec<Id>,
@@ -551,6 +552,11 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     // Buffer all SimpleArchive-decodable blobs so we can pair revocation
     // (rev, sig) blobs after the scan.
     let mut all_blobs: Vec<Blob<SimpleArchive>> = Vec::new();
+    // Reverse index: cap_blob_handle → sig_blob_handle that signs it.
+    // Built during the scan by inspecting any blob carrying a `sig_signs`
+    // trible. Used when `--show-handles` prints the pair on each cap line.
+    let mut sig_by_cap: std::collections::HashMap<[u8; 32], [u8; 32]> =
+        std::collections::HashMap::new();
 
     use triblespace_core::blob::TryFromBlob;
     for handle_result in reader.blobs() {
@@ -571,6 +577,16 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        // Sig blobs reference the cap blob they sign via `sig_signs`.
+        // Record the back-edge so we can attach a sig handle to each
+        // cap entry below.
+        for (_sig, signed_cap) in find!(
+            (sig: Id, h: Inline<Handle<SimpleArchive>>),
+            pattern!(&set, [{ ?sig @ capability::sig_signs: ?h }])
+        ) {
+            sig_by_cap.insert(signed_cap.raw, handle.raw);
+        }
 
         // Each cap blob has exactly one entity carrying these
         // attributes (the cap itself); embedded parent sigs are
@@ -614,6 +630,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             .map(|(b,)| b)
             .collect();
             caps.push(CapSummary {
+                cap_handle: handle.raw,
                 subject,
                 issuer,
                 perms,
@@ -667,11 +684,8 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                     .branches
                     .iter()
                     .map(|b| {
-                        // Branch ids are 16 bytes; show the first 8
-                        // hex chars so the line stays readable when
-                        // a cap covers multiple branches.
                         let bytes: [u8; 16] = (*b).into();
-                        hex::encode(&bytes[..4])
+                        hex::encode(bytes)
                     })
                     .collect();
                 bs.sort();
@@ -683,13 +697,21 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 .map(format_expiry)
                 .unwrap_or_else(|| "<no expiry>".to_string());
             println!(
-                "    {} → {} ({}{}, expires {})",
-                hex::encode(&cap.issuer.to_bytes()[..4]),
-                hex::encode(&cap.subject.to_bytes()[..4]),
-                perm_str,
-                branch_str,
-                expiry_str,
+                "    issuer:  {}",
+                hex::encode(cap.issuer.to_bytes()),
             );
+            println!(
+                "    subject: {}",
+                hex::encode(cap.subject.to_bytes()),
+            );
+            println!("    scope:   {perm_str}{branch_str}");
+            println!("    expires: {expiry_str}");
+            println!("    cap:     {}", hex::encode(cap.cap_handle));
+            match sig_by_cap.get(&cap.cap_handle) {
+                Some(sig) => println!("    sig:     {}", hex::encode(sig)),
+                None => println!("    sig:     <not found — pile missing sig blob>"),
+            }
+            println!();
         }
     }
 
@@ -706,7 +728,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                         println!(
                             "    {}  (revoked by {})",
                             hex::encode(target.to_bytes()),
-                            hex::encode(&revoker.to_bytes()[..4]),
+                            hex::encode(revoker.to_bytes()),
                         );
                     }
                     Err(_) => {
@@ -840,7 +862,7 @@ fn run_show(
                 .iter()
                 .map(|b| {
                     let bytes: [u8; 16] = (*b).into();
-                    hex::encode(&bytes[..4])
+                    hex::encode(bytes)
                 })
                 .collect();
             bs.sort();
@@ -848,11 +870,9 @@ fn run_show(
         };
         let signer_matches_issuer = if signer == issuer { "✓" } else { "✗ MISMATCH" };
 
-        println!(
-            "level {depth}: {} → {}",
-            hex::encode(&issuer.to_bytes()[..4]),
-            hex::encode(&subject.to_bytes()[..4]),
-        );
+        println!("level {depth}:");
+        println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
+        println!("  subject:  {}", hex::encode(subject.to_bytes()));
         println!("  scope:    {perm_str}{branch_str}");
         println!("  expires:  {}", format_expiry(&expiry));
         println!("  sig blob: {current_sig_label}");
