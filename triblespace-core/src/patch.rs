@@ -42,119 +42,110 @@ compile_error!("PATCH tagged pointers require 64-bit targets");
 static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
-/// Minimum `other.leaf_count` at which [`Head::union`] takes the
-/// scatter-pair + bitset + adaptive-rayon path on the equal-depth-
+/// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
+/// scatter + bitset + rayon::scope-spawn path on the equal-depth-
 /// branch arm. Below this, the per-key `modify_child` loop wins
-/// because asymmetric merges only touch a handful of slots. Tuned
-/// for the `entities/union*` bench family.
+/// because asymmetric merges only touch a handful of slots.
 #[cfg(feature = "parallel")]
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 
-/// Adaptive parallel resolver for the equal-depth-branch arm of
-/// [`Head::union`]. Plugs into rayon's `UnindexedProducer` plumbing so
-/// the work list of (key, this, other) pairs is split *only when
-/// workers actually steal*, rather than always-bisecting up-front.
+/// Parallel-aware PATCH union, with a shared work-stealing budget
+/// carried across the entire recursive descent.
 ///
-/// Child count is a poor proxy for cost — the actual cost of a
-/// recursive `Head::union` depends on how much the two subtrees
-/// overlap, which we can't cheaply measure ahead of time. Letting
-/// rayon's work-stealing demand drive splits sidesteps the heuristic
-/// entirely.
+/// Two-phase model per parallel call:
+///   1. Spawn phase (collect sequentially, dispatch per child):
+///      drain "both" pairs, for each: claim 1 unit from the
+///      shared budget — if successful, spawn the child union as
+///      a `rayon::scope` task; if budget is exhausted, run the
+///      child serially via `Head::union`.
+///   2. Install phase (purely serial): scatter-collected resolved
+///      heads + single-side pass-throughs land in the parent
+///      branch, then `recompute_aggregates` rebuilds the
+///      hash/leaf_count/segment_count/childleaf in one pass.
+///
+/// The budget is a single shared atomic — `num_threads²` total
+/// spawns across the entire descent, after which everything is
+/// sequential. This caps overhead without restricting the depth
+/// at which parallelism is reached: a heavy subtree near the
+/// root claims many units; a balanced descent spreads them.
 #[cfg(feature = "parallel")]
 mod parallel_union {
-    use super::{Head, KeySchema};
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
-    };
-    use rayon::iter::ParallelIterator;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
-    pub(crate) struct UnionProducer<const KEY_LEN: usize, O, V>
-    where
-        O: KeySchema<KEY_LEN> + Send + Sync,
-        V: Send + Sync,
-    {
-        work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)>,
-        depth: usize,
-        split_budget: usize,
+    /// Carries the shared spawn budget across recursive
+    /// `par_union_with_ctx` calls.
+    pub(crate) struct ParUnionCtx {
+        pub(crate) budget: AtomicUsize,
     }
 
-    impl<const KEY_LEN: usize, O, V> UnionProducer<KEY_LEN, O, V>
-    where
-        O: KeySchema<KEY_LEN> + Send + Sync,
-        V: Send + Sync,
-    {
-        pub(crate) fn new(
-            work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)>,
-            depth: usize,
-        ) -> Self {
-            // num_threads² split budget — same heuristic as
-            // `QueryParIter`. Caps split tree depth at ~2·log₂(N)
-            // even under sustained stealing pressure.
+    impl ParUnionCtx {
+        pub(crate) fn new() -> Self {
             let n = rayon::current_num_threads();
-            let split_budget = n.saturating_mul(n).max(2);
             Self {
-                work,
-                depth,
-                split_budget,
+                budget: AtomicUsize::new(n.saturating_mul(n).max(2)),
             }
         }
-    }
 
-    impl<const KEY_LEN: usize, O, V> UnindexedProducer for UnionProducer<KEY_LEN, O, V>
-    where
-        O: KeySchema<KEY_LEN> + Send + Sync,
-        V: Send + Sync,
-    {
-        type Item = (u8, Head<KEY_LEN, O, V>);
-
-        fn split(mut self) -> (Self, Option<Self>) {
-            // Rayon only calls this when a worker is ready to steal.
-            // Returning `(self, None)` says "I'm a leaf — fold me
-            // sequentially."
-            if self.split_budget == 0 || self.work.len() < 2 {
-                return (self, None);
-            }
-            self.split_budget -= 1;
-            let mid = self.work.len() / 2;
-            let right_work = self.work.split_off(mid);
-            let left_budget = self.split_budget / 2;
-            let right_budget = self.split_budget - left_budget;
-            self.split_budget = left_budget;
-            let depth = self.depth;
-            (
-                self,
-                Some(Self {
-                    work: right_work,
-                    depth,
-                    split_budget: right_budget,
-                }),
-            )
-        }
-
-        fn fold_with<F: Folder<Self::Item>>(self, mut folder: F) -> F {
-            let depth = self.depth;
-            for (k, t, o) in self.work.into_iter() {
-                if folder.full() {
-                    break;
+        /// Try to claim one spawn unit. Returns `true` if a unit was
+        /// claimed (caller should spawn), `false` if the budget was
+        /// already exhausted (caller should run serially).
+        ///
+        /// A naive `fetch_sub(1)` would wrap `0 → usize::MAX` on
+        /// over-subtract, briefly letting other threads see a huge
+        /// budget — so we use compare-exchange to refuse the claim
+        /// without ever observing the underflow.
+        pub(crate) fn try_claim(&self) -> bool {
+            let mut current = self.budget.load(Ordering::Relaxed);
+            loop {
+                if current == 0 {
+                    return false;
                 }
-                folder = folder.consume((k, Head::union(t, o, depth)));
+                match self.budget.compare_exchange_weak(
+                    current,
+                    current - 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(observed) => current = observed,
+                }
             }
-            folder
         }
     }
 
-    impl<const KEY_LEN: usize, O, V> ParallelIterator for UnionProducer<KEY_LEN, O, V>
-    where
-        O: KeySchema<KEY_LEN> + Send + Sync,
-        V: Send + Sync,
-    {
-        type Item = (u8, Head<KEY_LEN, O, V>);
+    /// Raw-pointer wrapper for the scatter-write target. Each
+    /// spawned task writes to `resolved[k]` for its specific key
+    /// byte `k`; keys are pairwise distinct by construction (each
+    /// "both" bit in the partition uniquely identifies a slot), so
+    /// the writes are non-aliasing despite sharing a `*mut` across
+    /// threads.
+    ///
+    /// `write_at` exists as an inherent method (rather than callers
+    /// reading the `*mut` field directly) so that move closures
+    /// capture the whole wrapper — Rust 2021 precise-capture would
+    /// otherwise grab the raw pointer field, dropping the manual
+    /// `Send`/`Sync` impls and triggering a Send error.
+    pub(crate) struct ScatterPtr<T>(pub *mut T);
 
-        fn drive_unindexed<Con>(self, consumer: Con) -> Con::Result
-        where
-            Con: UnindexedConsumer<Self::Item>,
-        {
-            bridge_unindexed(self, consumer)
+    // Manual `Copy`/`Clone` impls so `T` doesn't get a spurious
+    // `T: Copy` / `T: Clone` bound from derive — the wrapper holds a
+    // raw pointer, which is always `Copy` regardless of `T`.
+    impl<T> Clone for ScatterPtr<T> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<T> Copy for ScatterPtr<T> {}
+
+    unsafe impl<T> Send for ScatterPtr<T> {}
+    unsafe impl<T> Sync for ScatterPtr<T> {}
+
+    impl<T> ScatterPtr<T> {
+        /// SAFETY: `i` must be in-bounds of the underlying buffer,
+        /// and the caller must guarantee no other thread is writing
+        /// to slot `i` concurrently.
+        pub(crate) unsafe fn write_at(self, i: usize, v: T) {
+            self.0.add(i).write(v);
         }
     }
 }
@@ -774,11 +765,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
-    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self
-    where
-        O: Send + Sync,
-        V: Send + Sync,
-    {
+    /// Sequential PATCH-trie union. Always serial; the parallel
+    /// dispatch lives in [`Self::par_union`] which calls back into
+    /// `union` once budget is exhausted.
+    pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
         if this.hash() == other.hash() {
             return this;
         }
@@ -799,7 +789,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
         if this_depth < other_depth {
-            // Use BranchMut to edit `this` safely and avoid pointer juggling.
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
@@ -807,7 +796,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 Some(old) => Some(Head::union(old, inserted, this_depth)),
                 None => Some(inserted),
             });
-
             drop(ed);
             return this;
         }
@@ -823,115 +811,193 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 None => Some(inserted),
             });
             drop(ed);
-
             return other.with_key(old_key);
         }
 
-        // Both depths are equal and the hashes differ: merge children.
-        //
-        // For small `other` (the common case in serial folds where each
-        // `+=` adds a handful of tribles) the existing `modify_child`
-        // loop wins: it only touches keys present in `other`, with one
-        // cuckoo lookup + drain + closure-resolve + install per key.
-        //
-        // When `other` is large (e.g. final pair-merges in a parallel
-        // reduce, where both sides hold millions of tribles), we
-        // amortise the scatter overhead and `par_iter_mut` across
-        // rayon: scatter both child tables into a 256-slot pair array
-        // keyed by byte, parallel-resolve, install all results, then
-        // recompute aggregates in one pass at the end.
+        // Equal depth, hashes differ → walk `other`'s children,
+        // resolving collisions via recursive `Head::union` and the
+        // `modify_child`'s per-call accounting.
+        let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
+            unreachable!();
+        };
+        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        for other_child in other_branch_ref
+            .child_table
+            .iter_mut()
+            .filter_map(Option::take)
+        {
+            let inserted = other_child.with_start(ed.end_depth as usize);
+            let key = inserted.key();
+            ed.modify_child(key, |opt| match opt {
+                Some(old) => Some(Head::union(old, inserted, this_depth)),
+                None => Some(inserted),
+            });
+        }
+        drop(ed);
+        this
+    }
+
+    /// Parallel-aware top-level union entry. Allocates a fresh
+    /// [`parallel_union::ParUnionCtx`] with a budget of
+    /// `num_threads²` shared spawns, then delegates to
+    /// [`Self::par_union_with_ctx`]. The budget persists across the
+    /// entire recursive descent — once exhausted, the rest is
+    /// sequential.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_union(this: Self, other: Self, at_depth: usize) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        let ctx = parallel_union::ParUnionCtx::new();
+        Self::par_union_with_ctx(this, other, at_depth, &ctx)
+    }
+
+    /// Recursive parallel-aware union: at the equal-depth-branch
+    /// arm, drains the "both" pairs and, for each pair, either
+    /// claims a budget unit and spawns a parallel task or falls
+    /// back to serial `Self::union`. All other arms (hash-equal,
+    /// divergence, asymmetric depth) delegate to `Self::union` —
+    /// they don't generate fan-out work for the budget to spend.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn par_union_with_ctx(
+        mut this: Self,
+        mut other: Self,
+        at_depth: usize,
+        ctx: &parallel_union::ParUnionCtx,
+    ) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        if this.hash() == other.hash() {
+            return this;
+        }
+
+        if let Some((depth, this_byte_key, other_byte_key)) =
+            this.first_divergence(&other, at_depth)
+        {
+            let old_key = this.key();
+            let new_body = Branch::new(
+                depth,
+                this.with_key(this_byte_key),
+                other.with_key(other_byte_key),
+            );
+            return Head::new(old_key, new_body);
+        }
+
+        let this_depth = this.end_depth();
+        let other_depth = other.end_depth();
+        if this_depth != other_depth {
+            // Asymmetric — no fan-out opportunity, serial path wins.
+            return Self::union(this, other, at_depth);
+        }
+
+        // Equal depth, hashes differ → branch merge.
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
 
-        #[cfg(feature = "parallel")]
-        if other_branch_ref.leaf_count >= PARALLEL_PATCH_UNION_THRESHOLD as u64 {
-            use rayon::iter::ParallelIterator;
-
-            {
-                let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-                let end_depth = ed.end_depth as usize;
-
-                // Scatter both child tables into key-indexed 256-slot
-                // arrays plus `present` bitsets. The bitsets identify
-                // which keys actually need a recursive union
-                // (intersection) vs simple pass-through (symmetric
-                // difference), so the parallel work list is sized to
-                // popcount(both) rather than the full 256.
-                let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
-                    std::array::from_fn(|_| None);
-                let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
-                    std::array::from_fn(|_| None);
-                let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
-                let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
-
-                for slot in ed.child_table.iter_mut() {
-                    if let Some(head) = slot.take() {
-                        let key = head.key();
-                        this_present.insert(key);
-                        this_arr[key as usize] = Some(head);
-                    }
-                }
-                for slot in other_branch_ref.child_table.iter_mut() {
-                    if let Some(head) = slot.take() {
-                        let head = head.with_start(end_depth);
-                        let key = head.key();
-                        other_present.insert(key);
-                        other_arr[key as usize] = Some(head);
-                    }
-                }
-
-                let mut both = this_present.intersect(&other_present);
-                let mut only = this_present.symmetric_difference(&other_present);
-
-                // Build owned (key, this, other) work tuples.
-                let mut work: Vec<(u8, Head<KEY_LEN, O, V>, Head<KEY_LEN, O, V>)> =
-                    Vec::with_capacity(both.popcount() as usize);
-                while let Some(k) = both.drain_next_ascending() {
-                    let i = k as usize;
-                    let t = this_arr[i].take().expect("both ⇒ this present");
-                    let o = other_arr[i].take().expect("both ⇒ other present");
-                    work.push((k, t, o));
-                }
-
-                // Adaptive rayon: split happens on stealing demand, not
-                // up-front chunking. For idle thread pools the producer
-                // folds entirely sequentially.
-                let resolved: Vec<(u8, Head<KEY_LEN, O, V>)> =
-                    parallel_union::UnionProducer::new(work, this_depth).collect();
-
-                for (_, head) in resolved {
-                    ed.install_child_growing(head);
-                }
-                while let Some(k) = only.drain_next_ascending() {
-                    let i = k as usize;
-                    let head = this_arr[i]
-                        .take()
-                        .or_else(|| other_arr[i].take())
-                        .expect("only ⇒ exactly one side present");
-                    ed.install_child_growing(head);
-                }
-
-                ed.recompute_aggregates();
-            }
-            return this;
+        if (other_branch_ref.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD {
+            // Small merge — modify_child loop wins. Reconstruct
+            // `other` and delegate.
+            return Self::union(this, other, at_depth);
         }
 
-        // Serial path — small `other`; per-key modify_child wins here.
         {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-            for other_child in other_branch_ref
-                .child_table
-                .iter_mut()
-                .filter_map(Option::take)
-            {
-                let inserted = other_child.with_start(ed.end_depth as usize);
-                let key = inserted.key();
-                ed.modify_child(key, |opt| match opt {
-                    Some(old) => Some(Head::union(old, inserted, this_depth)),
-                    None => Some(inserted),
-                });
+            let end_depth = ed.end_depth as usize;
+
+            // Scatter both child tables into key-indexed 256-slot
+            // arrays + present bitsets. The bitset partition tells us
+            // which keys need a recursive union ("both") vs which are
+            // simple pass-throughs ("only").
+            let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
+                std::array::from_fn(|_| None);
+            let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] =
+                std::array::from_fn(|_| None);
+            let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
+            let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
+
+            for slot in ed.child_table.iter_mut() {
+                if let Some(head) = slot.take() {
+                    let key = head.key();
+                    this_present.insert(key);
+                    this_arr[key as usize] = Some(head);
+                }
             }
+            for slot in other_branch_ref.child_table.iter_mut() {
+                if let Some(head) = slot.take() {
+                    let head = head.with_start(end_depth);
+                    let key = head.key();
+                    other_present.insert(key);
+                    other_arr[key as usize] = Some(head);
+                }
+            }
+
+            let mut both = this_present.intersect(&other_present);
+            let mut only = this_present.symmetric_difference(&other_present);
+
+            // Pre-allocated scatter-write target. Each spawned task
+            // writes to `resolved[k]` for its specific key byte —
+            // disjoint by construction. The raw pointer wrapper
+            // (`ScatterPtr`) makes the cross-thread sharing explicit.
+            let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] =
+                std::array::from_fn(|_| None);
+            let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
+
+            rayon::scope(|s| {
+                // Drain `both` pairs serially in the parent; per
+                // pair, either claim a spawn unit and dispatch as a
+                // task, or run serially via `Head::union` here on
+                // the parent thread. The atomic budget is shared
+                // with all nested `par_union_with_ctx` calls.
+                while let Some(k) = both.drain_next_ascending() {
+                    let i = k as usize;
+                    let t = this_arr[i].take().expect("both ⇒ this");
+                    let o = other_arr[i].take().expect("both ⇒ other");
+                    if ctx.try_claim() {
+                        s.spawn(move |_| {
+                            let head = Self::par_union_with_ctx(t, o, this_depth, ctx);
+                            // SAFETY: each task has a distinct
+                            // key `k`, so the writes to
+                            // `resolved[i]` are non-aliasing.
+                            unsafe {
+                                resolved_ptr.write_at(i, Some(head));
+                            }
+                        });
+                    } else {
+                        // Budget exhausted — fall back to fully
+                        // serial union on this pair, then scatter
+                        // the result. SAFETY: same disjointness
+                        // invariant; the parent thread races only
+                        // with tasks targeting distinct keys.
+                        let head = Self::union(t, o, this_depth);
+                        unsafe {
+                            resolved_ptr.write_at(i, Some(head));
+                        }
+                    }
+                }
+            });
+            // After scope: all spawned tasks have completed; the
+            // scatter writes to `resolved` are all sequenced-before
+            // here by rayon's join semantics.
+
+            for slot in resolved.iter_mut() {
+                if let Some(head) = slot.take() {
+                    ed.install_child_growing(head);
+                }
+            }
+            while let Some(k) = only.drain_next_ascending() {
+                let i = k as usize;
+                let head = this_arr[i]
+                    .take()
+                    .or_else(|| other_arr[i].take())
+                    .expect("only ⇒ exactly one side");
+                ed.install_child_growing(head);
+            }
+
+            ed.recompute_aggregates();
         }
         this
     }
@@ -1513,6 +1579,9 @@ where
         if let Some(other) = other.root {
             if self.root.is_some() {
                 let this = self.root.take().expect("root should not be empty");
+                #[cfg(feature = "parallel")]
+                let merged = Head::par_union(this, other, 0);
+                #[cfg(not(feature = "parallel"))]
                 let merged = Head::union(this, other, 0);
                 self.root.replace(merged);
             } else {

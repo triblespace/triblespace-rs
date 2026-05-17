@@ -68,6 +68,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
         unsafe {
             Branch::install_child_growing(&mut self.branch_nn, head);
@@ -77,6 +78,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// Rebuild aggregates (hash/leaf_count/segment_count/childleaf) in one
     /// linear pass over `child_table`. Call once after a batch of
     /// [`Self::install_child_growing`] mutations.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub fn recompute_aggregates(&mut self) {
         unsafe {
             Branch::recompute_aggregates(&mut self.branch_nn);
@@ -405,6 +407,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// fails. Does NOT touch aggregates — used by bulk-rewrite paths
     /// that recompute aggregates in one pass at the end via
     /// [`recompute_aggregates`](Self::recompute_aggregates).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn install_child_growing(
         branch_nn: &mut NonNull<Self>,
         head: Head<KEY_LEN, O, V>,
@@ -422,6 +425,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// `childleaf`) from the current child table in one linear pass.
     /// Cheaper than paying `modify_child`'s per-call accounting when
     /// many children are being installed in bulk.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn recompute_aggregates(branch_nn: &mut NonNull<Self>) {
         let branch = branch_nn.as_ptr();
         let end_depth = (*branch).end_depth as usize;

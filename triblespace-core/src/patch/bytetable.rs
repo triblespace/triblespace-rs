@@ -145,16 +145,19 @@ impl ByteSet {
     }
 
     /// Element-wise intersection — keys present in both sets.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn intersect(&self, other: &ByteSet) -> ByteSet {
         ByteSet([self.0[0] & other.0[0], self.0[1] & other.0[1]])
     }
 
     /// Element-wise symmetric difference (XOR) — keys in exactly one set.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn symmetric_difference(&self, other: &ByteSet) -> ByteSet {
         ByteSet([self.0[0] ^ other.0[0], self.0[1] ^ other.0[1]])
     }
 
     /// Number of set bits.
+    #[allow(dead_code)]
     pub(crate) fn popcount(&self) -> u32 {
         self.0[0].count_ones() + self.0[1].count_ones()
     }
@@ -162,6 +165,7 @@ impl ByteSet {
     /// Returns the lowest set byte (ascending order) and clears it;
     /// `None` when empty. Walks set bits via `trailing_zeros` so the
     /// cost is proportional to popcount, not 256.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn drain_next_ascending(&mut self) -> Option<u8> {
         if self.0[0] != 0 {
             let bit = self.0[0].trailing_zeros();
