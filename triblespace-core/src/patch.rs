@@ -883,7 +883,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // untouched.
             return other_unique;
         }
-        other_size > this_size
+        // Same uniqueness status (both rc==1 in fold/reduce
+        // patterns). Swap only when `other`'s table is at least
+        // 2× larger — the cuckoo-grow savings clearly dominate
+        // any orientation-flip cost. Aggressive `>` swap-on-any-
+        // difference regressed `chunked/1000` parallel reduce
+        // (orientation thrash across deep reduction trees) while
+        // 2×-gated wins both the serial-fold case (patch/union/1000:
+        // −5%) and chunked/1000 (−7%) vs the always-swap variant.
+        other_size >= this_size.saturating_mul(2)
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
