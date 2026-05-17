@@ -605,6 +605,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Snapshot `(rc, child_table_size)` for the equal-depth-branch
+    /// union swap heuristic. Returns `None` for `Leaf` (the caller
+    /// short-circuits before reaching the symmetric branch arm).
+    fn union_swap_stats(&self) -> Option<(u32, usize)> {
+        match self.body_ref() {
+            BodyRef::Leaf(_) => None,
+            BodyRef::Branch(branch) => Some((branch.rc_relaxed(), branch.child_table.len())),
+        }
+    }
+
     // Slot wrapper defined at module level (moved to below the impl block)
 
     /// Find the first depth in [start_depth, limit) where the tree-ordered
@@ -817,6 +827,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // Equal depth, hashes differ → walk `other`'s children,
         // resolving collisions via recursive `Head::union` and the
         // `modify_child`'s per-call accounting.
+        //
+        // Union is commutative; mutating either side in place is
+        // semantically equivalent. Pick the side that's cheaper to
+        // mutate: prefer rc==1 (skips rc_cow) and a bigger child
+        // table (fewer cuckoo grows when inserting the other side's
+        // children).
+        if Self::union_swap_preferred(&this, &other) {
+            std::mem::swap(&mut this, &mut other);
+        }
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
@@ -835,6 +854,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
         drop(ed);
         this
+    }
+
+    /// Returns `true` when `Head::union` (or `par_union_with_ctx`)
+    /// should swap `this` and `other` before mutating in-place in
+    /// the equal-depth-branch arm. The heuristic is:
+    /// 1. Prefer the side with `rc == 1` — a shared branch forces
+    ///    `rc_cow` to allocate + memcpy the entire child table.
+    /// 2. Among sides with the same uniqueness status, prefer the
+    ///    one with the larger child_table — cuckoo grows are
+    ///    quadratic-ish in inserts and avoided entirely when the
+    ///    target table already has the capacity.
+    /// `Leaf` heads short-circuit earlier (divergence /
+    /// asymmetric-depth arms), so this is only consulted for
+    /// branch–branch merges.
+    fn union_swap_preferred(this: &Self, other: &Self) -> bool {
+        let Some((this_rc, this_size)) = this.union_swap_stats() else {
+            return false;
+        };
+        let Some((other_rc, other_size)) = other.union_swap_stats() else {
+            return false;
+        };
+        let this_unique = this_rc == 1;
+        let other_unique = other_rc == 1;
+        if this_unique != other_unique {
+            // Swap iff `other` is the unique one — we want to
+            // mutate the unique side and leave the shared side
+            // untouched.
+            return other_unique;
+        }
+        other_size > this_size
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -893,16 +942,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return Self::union(this, other, at_depth);
         }
 
-        // Equal depth, hashes differ → branch merge.
+        // Equal depth, hashes differ → branch merge. Pick the side
+        // that's cheaper to mutate (rc==1 over rc>1, larger table
+        // over smaller) before triggering the threshold check or
+        // any `body_mut` that would force a CoW copy.
+        if Self::union_swap_preferred(&this, &other) {
+            std::mem::swap(&mut this, &mut other);
+        }
+
+        // Threshold check via `body_ref` (no CoW); fall back to
+        // serial when the source side is too small to amortise the
+        // scatter machinery.
+        let small = match other.body_ref() {
+            BodyRef::Branch(b) => (b.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD,
+            BodyRef::Leaf(_) => unreachable!(),
+        };
+        if small {
+            return Self::union(this, other, at_depth);
+        }
+
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
-
-        if (other_branch_ref.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD {
-            // Small merge — modify_child loop wins. Reconstruct
-            // `other` and delegate.
-            return Self::union(this, other, at_depth);
-        }
 
         {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);

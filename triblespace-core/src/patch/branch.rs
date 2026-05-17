@@ -185,6 +185,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Snapshot the current refcount with `Relaxed` ordering.
+    /// Heuristic-only: callers use this to choose between in-place
+    /// mutation (rc == 1, no copy) and copy-on-write (rc > 1) when
+    /// picking sides in a symmetric operation like `Head::union`.
+    /// Not for safety-critical decisions.
+    pub(super) fn rc_relaxed(&self) -> u32 {
+        self.rc.load(Relaxed)
+    }
+
     pub(super) unsafe fn rc_inc(branch: NonNull<Self>) -> NonNull<Self> {
         unsafe {
             let branch = branch.as_ptr();
