@@ -568,6 +568,11 @@ async fn host_loop(
             let events_tx = events.clone();
             let ep2 = ep.clone();
             let dht_api2 = dht_api.clone();
+            // Local snapshot handle — used by fetch_reachable's
+            // discovery phase to skip subtrees we already have.
+            // Same Arc the protocol server uses to answer
+            // OP_CHILDREN / OP_GET_BLOB to remote peers.
+            let snapshot_for_fetch = snapshot.clone();
             tokio::spawn(async move {
                 let mut receiver = receiver;
                 while let Ok(Some(event)) = receiver.try_next().await {
@@ -586,6 +591,7 @@ async fn host_loop(
                                 let events_tx2 = events_tx.clone();
                                 let dht2 = dht_api2.clone();
                                 let self_cap2 = self_cap;
+                                let snap2 = snapshot_for_fetch.clone();
                                 // Use publisher key to connect for fetch (they're the source).
                                 let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
                                     pk.into()
@@ -598,7 +604,7 @@ async fn host_loop(
                                         publisher = %hex::encode(&publisher[..4]),
                                         "gossip head update; fetching"
                                     );
-                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2).await;
+                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2).await;
                                 });
                             }
                         }
@@ -708,9 +714,29 @@ async fn fetch_reachable(
     dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
+    local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
 ) -> anyhow::Result<()> {
-    let mut seen: HashSet<RawHash> = HashSet::new();
-    seen.insert(*head);
+    // Local-presence check against the same snapshot the server
+    // uses to answer remote OP_CHILDREN / OP_GET_BLOB. Closure
+    // (rather than inline lookups) so the lock-and-snap-deref
+    // dance lives in one place.
+    let have_local = |hash: &RawHash| -> bool {
+        local
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.has_blob(hash))
+            .unwrap_or(false)
+    };
+
+    // Short-circuit: if the HEAD is already local, the bottom-up
+    // insertion invariant guarantees its whole closure is local
+    // too (Phase 2 writes children before parents; a stored blob
+    // implies stored children). Caught-up gossip rebroadcasts hit
+    // this case and incur zero wire bytes.
+    if have_local(head) {
+        return Ok(());
+    }
 
     // Per-pull connection pool. Keyed on EndpointId; iroh
     // Connection is Clone-cheap (refcounted handle), so the
@@ -726,25 +752,22 @@ async fn fetch_reachable(
         pool.insert(publisher_id, conn);
     }
 
-    let verify_hash = |data: &[u8], expected: &RawHash| -> bool {
-        let computed = blake3::hash(data);
-        computed.as_bytes() == expected
-    };
+    // ── Phase 1: discovery (OP_CHILDREN only) ──
+    //
+    // Walk the closure top-down via OP_CHILDREN. For each child,
+    // skip if already local (the subtree is guaranteed present by
+    // the bottom-up insertion invariant; descending would be
+    // wasted wire bytes). Build `to_fetch` in BFS order so reverse
+    // iteration in Phase 2 gives bottom-up arrival to the store.
+    let mut seen: HashSet<RawHash> = HashSet::new();
+    let mut to_fetch: Vec<RawHash> = Vec::new();
+    let mut frontier: Vec<RawHash> = vec![*head];
+    seen.insert(*head);
+    to_fetch.push(*head);
 
-    // Fetch the head blob first (kicks off the BFS frontier).
-    if let Some(data) = fetch_one(ep, head, dht, &mut pool, publisher_id, self_cap).await {
-        if verify_hash(&data, head) {
-            let _ = events.send(NetEvent::Blob(data));
-        } else {
-            warn!(hash = %hex::encode(&head[..4]), "hash mismatch on head blob");
-        }
-    }
-
-    // BFS the closure via OP_CHILDREN + OP_GET_BLOB.
-    let mut current_level = vec![*head];
-    while !current_level.is_empty() {
-        let mut next_level = Vec::new();
-        for parent in &current_level {
+    while !frontier.is_empty() {
+        let mut next: Vec<RawHash> = Vec::new();
+        for parent in &frontier {
             let children = match children_one(ep, parent, dht, &mut pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => {
@@ -756,19 +779,40 @@ async fn fetch_reachable(
                 if !seen.insert(hash) {
                     continue;
                 }
-                let Some(data) = fetch_one(ep, &hash, dht, &mut pool, publisher_id, self_cap).await else {
-                    debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
-                    continue;
-                };
-                if !verify_hash(&data, &hash) {
-                    warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
+                // The first time we see a hash determines whether
+                // it ends up in to_fetch. If we already have it
+                // locally, the closure below it is also local
+                // (invariant), so don't enqueue or descend.
+                if have_local(&hash) {
                     continue;
                 }
-                let _ = events.send(NetEvent::Blob(data));
-                next_level.push(hash);
+                to_fetch.push(hash);
+                next.push(hash);
             }
         }
-        current_level = next_level;
+        frontier = next;
+    }
+
+    // ── Phase 2: transfer (OP_GET_BLOB, deepest-first) ──
+    //
+    // Reverse BFS order = bottom-up: emit children before parents.
+    // Peer's mpsc receiver preserves order, so by the time it puts
+    // any parent into the store, its missing-and-discovered
+    // children are already in (those that aren't were local before
+    // Phase 1 even started — already in). The store sees a parent
+    // only when its full closure is satisfied; the invariant
+    // "stored blob ⇒ closure stored" holds across interrupted
+    // walks too.
+    for hash in to_fetch.iter().rev() {
+        let Some(data) = fetch_one(ep, hash, dht, &mut pool, publisher_id, self_cap).await else {
+            debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
+            continue;
+        };
+        if blake3::hash(&data).as_bytes() != hash {
+            warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
+            continue;
+        }
+        let _ = events.send(NetEvent::Blob(data));
     }
 
     // Close every pooled connection cleanly.
@@ -896,9 +940,10 @@ async fn track_known_head(
     dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
+    local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
 ) {
     let fetch_id = fetch_peer.id;
-    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap).await {
+    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local).await {
         warn!(error = %e, peer = %fetch_id.fmt_short(), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
