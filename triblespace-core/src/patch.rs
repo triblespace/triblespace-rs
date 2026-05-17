@@ -605,13 +605,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    /// Snapshot `(rc, child_table_size)` for the equal-depth-branch
+    /// Snapshot `child_table.len()` for the equal-depth-branch
     /// union swap heuristic. Returns `None` for `Leaf` (the caller
     /// short-circuits before reaching the symmetric branch arm).
-    fn union_swap_stats(&self) -> Option<(u32, usize)> {
+    fn union_swap_stats(&self) -> Option<usize> {
         match self.body_ref() {
             BodyRef::Leaf(_) => None,
-            BodyRef::Branch(branch) => Some((branch.rc_relaxed(), branch.child_table.len())),
+            BodyRef::Branch(branch) => Some(branch.child_table.len()),
         }
     }
 
@@ -858,39 +858,33 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     /// Returns `true` when `Head::union` (or `par_union_with_ctx`)
     /// should swap `this` and `other` before mutating in-place in
-    /// the equal-depth-branch arm. The heuristic is:
-    /// 1. Prefer the side with `rc == 1` — a shared branch forces
-    ///    `rc_cow` to allocate + memcpy the entire child table.
-    /// 2. Among sides with the same uniqueness status, prefer the
-    ///    one with the larger child_table — cuckoo grows are
-    ///    quadratic-ish in inserts and avoided entirely when the
-    ///    target table already has the capacity.
+    /// the equal-depth-branch arm.
+    ///
+    /// The heuristic is purely size-based: swap when `other`'s
+    /// child_table is at least 2× larger than `this`'s, so the
+    /// mutate target starts with the bigger capacity and avoids
+    /// most cuckoo grows when absorbing the smaller side's keys.
+    /// Aggressive `>` swap-on-any-difference regressed
+    /// `chunked/1000` parallel reduce (orientation thrash across
+    /// deep reduction trees) while 2×-gated wins both the
+    /// serial-fold case and the parallel-reduce case.
+    ///
+    /// We do **not** consider refcounts here: the equal-depth arm
+    /// calls `body_mut` on both sides (one to drain children, one
+    /// to install merged results), so `rc_cow` runs on whichever
+    /// side is `rc > 1` regardless of orientation. Switching the
+    /// roles via swap can't avoid that allocation.
+    ///
     /// `Leaf` heads short-circuit earlier (divergence /
     /// asymmetric-depth arms), so this is only consulted for
     /// branch–branch merges.
     fn union_swap_preferred(this: &Self, other: &Self) -> bool {
-        let Some((this_rc, this_size)) = this.union_swap_stats() else {
+        let Some(this_size) = this.union_swap_stats() else {
             return false;
         };
-        let Some((other_rc, other_size)) = other.union_swap_stats() else {
+        let Some(other_size) = other.union_swap_stats() else {
             return false;
         };
-        let this_unique = this_rc == 1;
-        let other_unique = other_rc == 1;
-        if this_unique != other_unique {
-            // Swap iff `other` is the unique one — we want to
-            // mutate the unique side and leave the shared side
-            // untouched.
-            return other_unique;
-        }
-        // Same uniqueness status (both rc==1 in fold/reduce
-        // patterns). Swap only when `other`'s table is at least
-        // 2× larger — the cuckoo-grow savings clearly dominate
-        // any orientation-flip cost. Aggressive `>` swap-on-any-
-        // difference regressed `chunked/1000` parallel reduce
-        // (orientation thrash across deep reduction trees) while
-        // 2×-gated wins both the serial-fold case (patch/union/1000:
-        // −5%) and chunked/1000 (−7%) vs the always-swap variant.
         other_size >= this_size.saturating_mul(2)
     }
 
