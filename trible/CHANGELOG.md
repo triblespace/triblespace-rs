@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.2] - 2026-05-17
+
+### Fixed
+- **`pile net sync --peers <EndpointTicket>` now actually
+  bypasses discovery** for the supplied tickets. Previously
+  (0.41.1) the sync command parsed tickets and threaded
+  their `EndpointAddr` through to `PeerConfig.peers`, but
+  the gossip / DHT bootstrap path inside `triblespace-net`
+  used only the bare `EndpointId` for connect, falling back
+  to iroh's discovery to find the addresses. As of 0.41.2,
+  the ticket addresses are seeded into iroh's address
+  lookup via `triblespace-net`'s new
+  `StaticAddressLookup`, so the bootstrap connect resolves
+  locally — no pkarr publish or DNS roundtrip needed.
+
+### Notes
+- This closes the "tickets work for pull but not sync"
+  asymmetry from 0.41.1. Both commands now behave the same
+  way w.r.t. ticket addresses.
+
 ## [0.41.1] - 2026-05-17
 
 ### Added

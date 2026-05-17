@@ -38,7 +38,16 @@ fn op_name(op: u8) -> &'static str {
 /// see the `Peer` struct's doctest for the full pattern.
 pub struct PeerConfig {
     /// Peers to connect to (used for both gossip and DHT bootstrap).
-    pub peers: Vec<EndpointId>,
+    /// Bootstrap peers — for both the gossip mesh and the DHT. Carry
+    /// `EndpointAddr` (not just `EndpointId`) so callers passing an
+    /// `EndpointTicket` through `--peers` can seed iroh's address
+    /// lookup with the known relay URL + direct addresses; gossip's
+    /// bootstrap connect then skips discovery for these peers.
+    /// Callers with only a pubkey can pass `EndpointId::from(...)`
+    /// or `pk.into()` — the resulting `EndpointAddr` carries no
+    /// addresses and falls back to iroh's standard discovery
+    /// services (pkarr/DNS via `presets::N0`).
+    pub peers: Vec<EndpointAddr>,
     /// Whether to subscribe to live HEAD-update gossip. The topic id
     /// is the team root pubkey's 32 bytes — every team has exactly
     /// one gossip mesh, derived from its identity. `false` = serve-
@@ -385,9 +394,20 @@ async fn host_loop(
     // store at runtime lets the sandbox CA (or any admin-installed
     // root) participate. macOS uses the Security framework; Linux
     // reads /etc/ssl/certs; Windows reads the certificate store.
+    // Seed iroh's address lookup with the bootstrap peers' known
+    // addresses (from EndpointTickets). When gossip/DHT later try
+    // to connect by EndpointId, our static lookup yields the
+    // pre-known EndpointAddr immediately — no pkarr publish or
+    // DNS roundtrip needed. The N0 preset's pkarr+DNS lookup
+    // services stay layered alongside as fallbacks for unknown
+    // peers (the lookup services are additive on the builder).
+    let static_lookup =
+        crate::address_lookup::StaticAddressLookup::new(config.peers.iter().cloned());
+
     let ep = match Endpoint::builder(presets::N0)
         .secret_key(secret)
         .ca_roots_config(iroh::tls::CaRootsConfig::system())
+        .address_lookup(static_lookup)
         .bind()
         .await
     {
@@ -436,8 +456,13 @@ async fn host_loop(
         },
     );
     let iroh_pool = crate::dht::pool::IrohPool::new(ep.clone(), pool);
+    // Gossip + DHT bootstrap want bare EndpointIds; the addresses
+    // attached to each peer were seeded into the address lookup
+    // service above, so iroh will resolve them locally on connect.
+    let bootstrap_ids: Vec<EndpointId> =
+        config.peers.iter().map(|addr| addr.id).collect();
     let (rpc, dht_api) = crate::dht::create_node(
-        my_id, iroh_pool.clone(), config.peers.clone(), Default::default(),
+        my_id, iroh_pool.clone(), bootstrap_ids.clone(), Default::default(),
     );
     iroh_pool.set_self_client(Some(rpc.downgrade()));
     let dht_sender = rpc.inner().as_local().expect("local sender");
@@ -459,7 +484,7 @@ async fn host_loop(
         // Always use subscribe (non-blocking). The join happens in the background
         // as peers come online. subscribe_and_join blocks until at least one peer
         // is reachable, which causes hangs if peers start at different times.
-        let topic = gossip.subscribe(topic_id, config.peers.clone()).await;
+        let topic = gossip.subscribe(topic_id, bootstrap_ids.clone()).await;
         if let Ok(topic) = topic {
             let (sender, receiver) = topic.split();
             gossip_sender = Some(sender);

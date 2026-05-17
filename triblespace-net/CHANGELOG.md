@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.2] - 2026-05-17
+
+### Added
+- **`address_lookup::StaticAddressLookup`** — an
+  `iroh::address_lookup::AddressLookup` impl backed by a
+  fixed `HashMap<EndpointId, EndpointAddr>`. Plugged into
+  the endpoint builder via `address_lookup(static_lookup)`
+  so iroh's connect path (gossip + DHT bootstrap +
+  arbitrary `connect(id, ALPN)` calls) resolves bootstrap
+  peers locally — no pkarr publish, no DNS roundtrip — when
+  the caller supplied a full `EndpointAddr` (typically via
+  an `EndpointTicket`). Layered on top of the N0 preset's
+  pkarr+DNS providers, which still cover unknown peers.
+
+### Changed (breaking — public API)
+- **`PeerConfig.peers`** is now `Vec<EndpointAddr>` (was
+  `Vec<EndpointId>`). Source-compatible for existing
+  callers via `EndpointId: Into<EndpointAddr>`. Lets ticket
+  addresses flow through to the static address-lookup
+  provider above.
+
+### Fixed
+- The "sync needs discovery even when `--peers
+  <EndpointTicket>`" gap from 0.41.1. Both `pile net pull`
+  and `pile net sync` now bypass discovery for known
+  ticket peers; unknown peers still fall through to the
+  standard pkarr+DNS path.
+
 ## [0.41.1] - 2026-05-17
 
 ### Changed (breaking — public API)

@@ -8,6 +8,7 @@
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
+mod address_lookup;
 mod channel;
 pub mod dht;
 mod host;

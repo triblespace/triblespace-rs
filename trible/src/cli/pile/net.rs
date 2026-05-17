@@ -205,14 +205,13 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, key_path: Option<PathBuf
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
-    // parse_peers handles EndpointTicket + bare-pubkey. For sync we
-    // pass through the ids — gossip + DHT bootstrap take EndpointId,
-    // and ticket address info (relay URL / direct addrs) is the
-    // bigger story for the `pile net pull` path. The richer story
-    // for sync (seeding iroh's address cache from ticket addresses
-    // so gossip can connect without discovery) is a follow-up.
-    let parsed_peers = parse_peers(&peer_strs);
-    let peers: Vec<EndpointId> = parsed_peers.iter().map(|a| a.id).collect();
+    // parse_peers handles EndpointTicket + bare-pubkey, yielding
+    // Vec<EndpointAddr>. Both feed through to host_loop, where the
+    // ticket addresses seed iroh's StaticAddressLookup so gossip
+    // + DHT bootstrap can dial those peers directly without
+    // discovery; the ids are also extracted for the bare-pubkey
+    // bootstrap-by-id surface of gossip/DHT.
+    let peers = parse_peers(&peer_strs);
 
     // Single pile handle, wrapped in a Peer (which spawns the iroh thread)
     // and then a Repository for the workspace/commit API. Reads on the Peer

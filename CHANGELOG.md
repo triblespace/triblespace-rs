@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-05-17
+
+The address-symmetry release. Closes the
+"tickets-work-for-pull-but-not-sync" asymmetry from 0.41.1
+by seeding iroh's address lookup with bootstrap-peer
+addresses, so the gossip mesh / DHT bootstrap path can dial
+ticket peers directly — no pkarr/DNS roundtrip.
+
+### Added
+- **`triblespace-net::address_lookup::StaticAddressLookup`**:
+  an `iroh::address_lookup::AddressLookup` implementation
+  seeded with a fixed `EndpointId → EndpointAddr` map at
+  construction. Hooked into the endpoint via
+  `Builder::address_lookup(static_lookup)`; layered alongside
+  the `presets::N0` pkarr+DNS lookups (lookup services are
+  additive on the iroh builder). For known peers, returns
+  the cached `EndpointAddr` immediately; for unknown peers,
+  yields an empty stream so the other registered lookup
+  services get their turn.
+
+### Changed (breaking — public API)
+- **`triblespace_net::peer::PeerConfig.peers`** is now
+  `Vec<EndpointAddr>` (was `Vec<EndpointId>`).
+  Source-compatible for `EndpointId` callers via the
+  standard `EndpointId: Into<EndpointAddr>` impl
+  (`peers: vec![id.into()]`).
+
+  Callers passing an `EndpointTicket` through
+  `pile net sync --peers <STR>` now get a real address
+  benefit on the gossip + DHT bootstrap path:
+  iroh-gossip's `JoinOptions::bootstrap` still takes
+  `Vec<EndpointId>`, but iroh's connect goes through
+  `AddressLookup` to resolve the id, and our static
+  provider answers immediately with the ticket's addresses.
+
+### Fixed
+- **`pile net sync` direct-dial in sandbox / restricted-
+  network environments.** Previously the gossip mesh
+  bootstrap path needed iroh discovery to resolve peer
+  addresses; in environments where pkarr publish or DNS
+  are blocked (Anthropic web sandbox, corporate proxies,
+  etc.) gossip silently couldn't connect even when
+  `--peers <EndpointTicket>` carried the addresses. With
+  the static lookup seeded from `PeerConfig.peers`, gossip
+  bootstrap now succeeds.
+
 ## [0.41.1] - 2026-05-17
 
 The `EndpointTicket`-everywhere release. Makes sandbox /
