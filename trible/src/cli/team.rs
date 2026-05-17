@@ -500,7 +500,6 @@ fn run_revoke(
 
 /// Describe a single capability for the `team list` audit view.
 struct CapSummary {
-    cap_handle: [u8; 32],
     subject: VerifyingKey,
     issuer: VerifyingKey,
     perms: Vec<Id>,
@@ -552,11 +551,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     // Buffer all SimpleArchive-decodable blobs so we can pair revocation
     // (rev, sig) blobs after the scan.
     let mut all_blobs: Vec<Blob<SimpleArchive>> = Vec::new();
-    // Reverse index: cap_blob_handle → sig_blob_handle that signs it.
-    // Built during the scan by inspecting any blob carrying a `sig_signs`
-    // trible. Used when `--show-handles` prints the pair on each cap line.
-    let mut sig_by_cap: std::collections::HashMap<[u8; 32], [u8; 32]> =
-        std::collections::HashMap::new();
 
     use triblespace_core::blob::TryFromBlob;
     for handle_result in reader.blobs() {
@@ -577,35 +571,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(s) => s,
             Err(_) => continue,
         };
-
-        // Sig blobs reference the cap blob they sign via `sig_signs`.
-        // Record the back-edge so we can attach a sig handle to each
-        // cap entry below — but ONLY when this blob is a standalone
-        // sig blob, not a cap blob with an embedded parent sig.
-        //
-        // Cap blobs carry an embedded sig sub-entity (with the same
-        // `sig_signs` attribute pointing at the parent cap), and a
-        // naive scan would mis-identify the cap blob's handle as
-        // the parent's sig handle. That bit us once — feeding the
-        // wrong handle into `team invite` produced a cap blob with
-        // two cap entities embedded, MalformedCap at OP_AUTH time.
-        //
-        // Discriminator: a standalone sig blob has no `cap_subject`
-        // anywhere; a cap-with-embedded-sig does (the cap entity).
-        let has_cap_subject = find!(
-            (e: Id, s: VerifyingKey),
-            pattern!(&set, [{ ?e @ capability::cap_subject: ?s }])
-        )
-        .next()
-        .is_some();
-        if !has_cap_subject {
-            for (_sig, signed_cap) in find!(
-                (sig: Id, h: Inline<Handle<SimpleArchive>>),
-                pattern!(&set, [{ ?sig @ capability::sig_signs: ?h }])
-            ) {
-                sig_by_cap.insert(signed_cap.raw, handle.raw);
-            }
-        }
 
         // Each cap blob has exactly one entity carrying these
         // attributes (the cap itself); embedded parent sigs are
@@ -649,7 +614,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             .map(|(b,)| b)
             .collect();
             caps.push(CapSummary {
-                cap_handle: handle.raw,
                 subject,
                 issuer,
                 perms,
@@ -725,11 +689,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             );
             println!("    scope:   {perm_str}{branch_str}");
             println!("    expires: {expiry_str}");
-            println!("    cap:     {}", hex::encode(cap.cap_handle));
-            match sig_by_cap.get(&cap.cap_handle) {
-                Some(sig) => println!("    sig:     {}", hex::encode(sig)),
-                None => println!("    sig:     <not found — pile missing sig blob>"),
-            }
             println!();
         }
     }
