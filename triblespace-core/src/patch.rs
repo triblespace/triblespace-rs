@@ -1167,7 +1167,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
         });
 
-        // Collect non-None results into a fresh Branch.
+        // Collect non-None results into a fresh Branch. Stick with
+        // per-key `modify_child` here — intersect's collection
+        // phase typically has FEW children (heavy filtering kept
+        // only the matching subset), so the per-call aggregate
+        // updates beat the fixed `recompute_aggregates` cost. Bench
+        // sanity-checked: install+recompute regressed intersect
+        // +18% on the 4M/50%-overlap dataset.
         let mut iter = resolved.into_iter().flatten();
         let first = iter.next()?;
         let Some(second) = iter.next() else {
@@ -1289,6 +1295,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
         });
 
+        // Collect non-None results into a fresh Branch. Difference's
+        // collection phase typically has MANY children (most keys
+        // in `self` survive — only matching+empty subtrees get
+        // filtered), so `install_child_growing` + one
+        // `recompute_aggregates` pass wins handily over per-call
+        // `modify_child`. Mirror of the union pattern; intersect
+        // uses `modify_child` because its collection phase has
+        // far fewer children (heavy filtering).
         let mut iter = resolved.into_iter().flatten();
         let first = iter.next()?;
         let Some(second) = iter.next() else {
@@ -1303,10 +1317,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
             for child in iter {
-                let inserted = child.with_start(self_depth);
-                let k = inserted.key();
-                ed.modify_child(k, |_opt| Some(inserted));
+                ed.install_child_growing(child.with_start(self_depth));
             }
+            ed.recompute_aggregates();
         }
         Some(head_for_branch)
     }
