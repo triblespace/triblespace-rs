@@ -78,6 +78,42 @@ fn dot_stripped_default_relay_map() -> iroh::RelayMap {
         .expect("stripped relay URLs are valid (transformed from valid input)")
 }
 
+/// Normalises an [`EndpointAddr`] by stripping trailing FQDN dots
+/// from any relay URLs it carries. Companion to
+/// [`dot_stripped_default_relay_map`]: even with the outbound
+/// `RelayMap` dot-free, iroh's own `Endpoint::addr()` can return an
+/// EndpointAddr whose `TransportAddr::Relay` entry has a dotted URL
+/// (presumably because the relay server reports its canonical URL
+/// back to the client with the dot, and iroh stores that for its
+/// own-address reporting). When we serialize that EndpointAddr into
+/// a ticket — or hand it to a peer over any other channel — the
+/// dotted URL propagates and trips WAFs on the receiving side.
+/// Normalising at the channel boundary fixes the leak.
+///
+/// Idempotent for dot-free addresses; preserves the rest of the
+/// EndpointAddr (id, IP transport entries) unchanged.
+pub fn dot_stripped_endpoint_addr(mut addr: EndpointAddr) -> EndpointAddr {
+    use iroh_base::TransportAddr;
+    addr.addrs = addr
+        .addrs
+        .into_iter()
+        .map(|t| match t {
+            TransportAddr::Relay(relay_url) => {
+                let mut url: url::Url = relay_url.clone().into();
+                if let Some(host) = url.host_str() {
+                    if let Some(trimmed) = host.strip_suffix('.') {
+                        let trimmed = trimmed.to_string();
+                        let _ = url.set_host(Some(&trimmed));
+                    }
+                }
+                TransportAddr::Relay(iroh_base::RelayUrl::from(url))
+            }
+            other => other,
+        })
+        .collect();
+    addr
+}
+
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
 /// `Default` impl — auth is mandatory in protocol v4 so every peer
 /// construction site must explicitly choose a team root. For solo
@@ -486,7 +522,15 @@ async fn host_loop(
     // at default log levels — this is operator-facing info.
     {
         use iroh_tickets::endpoint::EndpointTicket;
-        let local_addr = ep.addr();
+        // Strip trailing dots from relay URLs in the local addr
+        // before encoding — iroh's `ep.addr()` can include the
+        // dotted form even when our outbound RelayMap is dot-free
+        // (the relay server reports its canonical URL back with
+        // the dot). Without normalising here, the ticket would
+        // leak the dot to the receiving peer, who then tries to
+        // dial us using the dotted URL and trips strict WAFs on
+        // the way out.
+        let local_addr = dot_stripped_endpoint_addr(ep.addr());
         let ticket: EndpointTicket = local_addr.into();
         eprintln!("ticket: {ticket}");
     }
@@ -750,44 +794,91 @@ async fn fetch_blob(
 }
 
 /// Fetch all blobs reachable from a remote HEAD.
-/// Uses DHT for blob discovery when available, falls back to direct peer.
+///
+/// Opens a single authed connection to the peer and reuses it for
+/// every OP_CHILDREN + OP_GET_BLOB call along the BFS. iroh's QUIC
+/// transport multiplexes streams cheaply, and our server-side
+/// SnapshotHandler already accepts multiple sequential bi-streams
+/// per connection (auth state is per-connection, set on the first
+/// OP_AUTH stream and reused on every subsequent stream). Earlier
+/// versions opened a fresh `connect_authed` per blob and per
+/// CHILDREN call, paying ~600ms of auth+handshake overhead each
+/// time — a BFS over even a small graph would exhaust the
+/// `pull_branch` 30s deadline. With reuse, a single auth covers
+/// the whole walk.
+///
+/// The DHT-blob-discovery path that lived in the previous
+/// `fetch_blob` helper is dropped from this hot path; for now the
+/// hint peer is the only source. DHT reachability hasn't been
+/// load-bearing for any current use case and added a per-blob
+/// connect to a different peer that would defeat the reuse here.
+/// We can layer a DHT fallback back in once it's actually needed.
 async fn fetch_reachable(
     ep: &iroh::Endpoint,
     peer: EndpointAddr,
     head: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
+    _dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
 ) -> anyhow::Result<()> {
     let mut seen: HashSet<RawHash> = HashSet::new();
     seen.insert(*head);
 
-    // Fetch head blob.
-    if let Some(data) = fetch_blob(ep, head, dht, peer.clone(), self_cap).await? {
-        let _ = events.send(NetEvent::Blob(data));
+    // One auth'd connection for the entire walk.
+    let conn = connect_authed(ep, peer, self_cap).await?;
+
+    let verify_hash = |data: &[u8], expected: &RawHash| -> bool {
+        let computed = blake3::hash(data);
+        computed.as_bytes() == expected
+    };
+
+    // Fetch the head blob first.
+    if let Ok(Some(data)) = op_get_blob(&conn, head).await {
+        if verify_hash(&data, head) {
+            let _ = events.send(NetEvent::Blob(data));
+        } else {
+            warn!(hash = %hex::encode(&head[..4]), "hash mismatch on head blob");
+        }
     }
 
-    // BFS: use CHILDREN from the peer for structure, DHT for blob data.
+    // BFS via CHILDREN + GET_BLOB on the same connection.
     let mut current_level = vec![*head];
     while !current_level.is_empty() {
         let mut next_level = Vec::new();
         for parent in &current_level {
-            // CHILDREN from the gossip sender (they know the structure).
-            let conn = connect_authed(ep, peer.clone(), self_cap).await?;
-            let children = op_children(&conn, parent).await?;
-            conn.close(0u32.into(), b"ok");
-
+            let children = match op_children(&conn, parent).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, parent = %hex::encode(&parent[..4]), "op_children failed");
+                    continue;
+                }
+            };
             for hash in children {
-                if !seen.insert(hash) { continue; }
-                if let Some(data) = fetch_blob(ep, &hash, dht, peer.clone(), self_cap).await? {
-                    let _ = events.send(NetEvent::Blob(data));
-                    next_level.push(hash);
+                if !seen.insert(hash) {
+                    continue;
+                }
+                match op_get_blob(&conn, &hash).await {
+                    Ok(Some(data)) => {
+                        if verify_hash(&data, &hash) {
+                            let _ = events.send(NetEvent::Blob(data));
+                            next_level.push(hash);
+                        } else {
+                            warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
+                        }
+                    }
+                    Ok(None) => {
+                        debug!(hash = %hex::encode(&hash[..4]), "blob not available from hint peer");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, hash = %hex::encode(&hash[..4]), "op_get_blob failed");
+                    }
                 }
             }
         }
         current_level = next_level;
     }
 
+    conn.close(0u32.into(), b"ok");
     Ok(())
 }
 

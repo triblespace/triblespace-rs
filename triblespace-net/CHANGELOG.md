@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.4] - 2026-05-17
+
+### Added
+- **`pub fn dot_stripped_endpoint_addr(EndpointAddr) -> EndpointAddr`**
+  re-exported at crate root. Strips trailing FQDN dots from
+  any `TransportAddr::Relay` entries; pass-through for
+  IP/custom entries. Idempotent. Apply at every channel
+  boundary that emits or consumes an `EndpointAddr`.
+
+### Fixed
+- **Trailing-dot leak in outbound tickets.** 0.41.3
+  stripped dots from the RelayMap iroh uses for its own
+  connect path, but `ep.addr()` could still return an
+  EndpointAddr whose `TransportAddr::Relay` had a dotted
+  URL (the relay server reports its canonical URL back
+  with the dot, and iroh stores that for self-address
+  reporting). The ticket printed by `pile net sync`
+  startup now normalises the addr first.
+
+- **`fetch_reachable` opens one connection for the whole
+  BFS** instead of one connection per CHILDREN / GET_BLOB
+  call. Each `connect_authed` was ~600ms (TLS + QUIC +
+  OP_AUTH + verify_chain), so a 30-blob walk hit the
+  `pull_branch` 30s deadline before completing. With reuse,
+  one auth covers the entire walk. iroh QUIC multiplexes
+  streams; our `SnapshotHandler` already accepts multiple
+  sequential bi-streams per connection (auth state is
+  per-connection). DHT-fallback path in the per-blob
+  `fetch_blob` helper is no longer on this hot path — it
+  remains available for the single-blob `NetCommand::Fetch`
+  RPC.
+
 ## [0.41.3] - 2026-05-17
 
 ### Fixed

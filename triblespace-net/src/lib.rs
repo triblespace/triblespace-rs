@@ -17,3 +17,13 @@ pub mod protocol;
 pub mod identity;
 pub mod tracking;
 
+/// Normalises an [`iroh_base::EndpointAddr`] by stripping trailing
+/// FQDN dots from any relay URLs it carries. See the implementation
+/// in `host` for the full rationale; the short version is that iroh
+/// 0.98's default relay hostnames are FQDN-absolute, the dot
+/// propagates through `Endpoint::addr()` even when our outbound
+/// RelayMap is dot-free, and the dotted URL trips WAFs on receiving
+/// peers. Apply at every channel boundary that emits or consumes an
+/// `EndpointAddr` (ticket encode/decode, etc.).
+pub use crate::host::dot_stripped_endpoint_addr;
+

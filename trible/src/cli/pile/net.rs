@@ -36,12 +36,17 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
 fn parse_peers(strs: &[String]) -> Vec<EndpointAddr> {
     strs.iter()
         .filter_map(|s| {
-            if let Ok(ticket) = s.parse::<EndpointTicket>() {
-                return Some(ticket.endpoint_addr().clone());
-            }
-            s.parse::<iroh_base::PublicKey>()
-                .ok()
-                .map(|pk| EndpointAddr::from(EndpointId::from(pk)))
+            let addr = if let Ok(ticket) = s.parse::<EndpointTicket>() {
+                ticket.endpoint_addr().clone()
+            } else {
+                let pk = s.parse::<iroh_base::PublicKey>().ok()?;
+                EndpointAddr::from(EndpointId::from(pk))
+            };
+            // Normalize trailing FQDN dots in any embedded relay
+            // URLs — tickets minted by older / unpatched peers
+            // can carry the dotted form, which our connect path
+            // would otherwise hand back to iroh and trip the WAF.
+            Some(triblespace_net::dot_stripped_endpoint_addr(addr))
         })
         .collect()
 }
@@ -288,6 +293,8 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
             .map_err(|e| anyhow!("bad remote: not an EndpointTicket and not a hex pubkey ({e})"))?;
         EndpointAddr::from(EndpointId::from(pk))
     };
+    // Normalize trailing FQDN dots in any embedded relay URLs.
+    let remote_addr = triblespace_net::dot_stripped_endpoint_addr(remote_addr);
     let remote_short = remote_addr.id.fmt_short();
 
     // Spin up the Peer — pull-only mode (gossip: false), no flood

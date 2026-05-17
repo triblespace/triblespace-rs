@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.4] - 2026-05-17
+
+### Fixed
+- **`parse_peers` and `pile net pull <REMOTE>` now normalise
+  inbound `EndpointAddr`s** via
+  `triblespace_net::dot_stripped_endpoint_addr`. Tickets
+  minted by older / unpatched peers can carry the dotted
+  FQDN form embedded in their relay URL; we'd otherwise
+  hand that dotted URL back to iroh's connect path and
+  trip the receiving-side WAF. Pre-strip at the CLI
+  boundary so the rest of the stack only ever sees
+  HTTP-canonical URLs.
+
+### Notes
+- The matching outbound fix (so tickets we *mint* are
+  dot-free) and the connection-reuse fix that resolves
+  the "connect-loop" perf issue in pulls live in
+  `triblespace-net 0.41.4`. See
+  `triblespace-net/CHANGELOG.md`.
+
 ## [0.41.3] - 2026-05-17
 
 ### Fixed

@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.4] - 2026-05-17
+
+The two follow-ons surfaced by the first successful sandbox sync.
+
+### Fixed
+- **Trailing-dot leak through `ep.addr()`.** 0.41.3 stripped
+  dots from the *outbound* RelayMap, so our local relay
+  connect path was clean. But iroh's `Endpoint::addr()` can
+  still return an `EndpointAddr` whose `TransportAddr::Relay`
+  carries the dotted form (the relay server reports its
+  canonical URL back to the client and iroh stores that for
+  its own-address reporting). When we serialise that
+  EndpointAddr into a ticket via `pile net sync` startup,
+  the dotted URL propagates to whoever consumes the ticket;
+  their iroh then dials us via the dotted URL and trips
+  WAFs on their egress.
+
+  Adds `triblespace_net::dot_stripped_endpoint_addr(addr)` —
+  a normaliser applied at every channel boundary that emits
+  or consumes an `EndpointAddr`. Used in
+  `triblespace-net`'s ticket print + in `trible`'s
+  `parse_peers` and `pile net pull <REMOTE>` parsing, so
+  outbound tickets are dot-free and inbound tickets get
+  normalised even when minted by an unpatched peer.
+
+- **Connection-per-RPC stall in `fetch_reachable`.**
+  Previously the BFS over a remote pile opened a fresh
+  `connect_authed` for every `op_children` parent and every
+  `op_get_blob` child. Each auth handshake costs roughly
+  600ms (TLS + QUIC + OP_AUTH round trip + `verify_chain`),
+  so even a small remote pile of ~30 blobs would exhaust
+  the `pull_branch` 30-second deadline before the walk
+  completed.
+
+  `fetch_reachable` now opens **one** authed connection at
+  the top of the function and reuses it for every
+  `op_children` and `op_get_blob` call along the BFS.
+  iroh's QUIC multiplexes streams cheaply, and our
+  `SnapshotHandler::accept` already accepts multiple
+  sequential bi-streams per connection — auth state is
+  per-connection, set on the first OP_AUTH stream, and
+  reused on every subsequent stream.
+
+  The previous DHT-fallback path that lived in the
+  per-blob `fetch_blob` helper is dropped from this hot
+  path; DHT reachability hasn't been load-bearing for any
+  current use case and adding a per-blob connect to a
+  different peer would defeat the reuse. The standalone
+  `fetch_blob` helper is still used by the single-blob
+  `NetCommand::Fetch` RPC path.
+
+  Net effect: a remote-pull walk that took 39+ connections
+  on 0.41.3 now takes 1. The previously-observed "connect
+  → auth_ok → LocallyClosed → reconnect" cycle disappears.
+
+### Notes
+- Diagnosed by the same other-Claude instance — the
+  diagnostic surface from the tracing instrumentation
+  continues to pay off.
+- File-upstream candidate: iroh's `RelayUrl::parse` could
+  normalise trailing dots, which would let us drop both
+  workarounds. The full-completeness fix is in iroh.
+
 ## [0.41.3] - 2026-05-17
 
 The trailing-dot fix. The reason iroh's HTTPS probes to the
