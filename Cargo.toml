@@ -1,6 +1,6 @@
 [package]
 name = "triblespace"
-version = "0.41.2"
+version = "0.41.3"
 authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
 edition = "2021"
 description = "The Triblespace: A lightweight knowledge base for rust."
@@ -30,10 +30,10 @@ members = [
 resolver = "2"
 
 [dependencies]
-triblespace-core = { version = "0.41.2", path = "./triblespace-core", default-features = false }
-triblespace-macros = { version = "0.41.2", path = "./triblespace-macros" }
-triblespace-net = { version = "0.41.2", path = "./triblespace-net", optional = true }
-triblespace-search = { version = "0.41.2", path = "./triblespace-search", optional = true }
+triblespace-core = { version = "0.41.3", path = "./triblespace-core", default-features = false }
+triblespace-macros = { version = "0.41.3", path = "./triblespace-macros" }
+triblespace-net = { version = "0.41.3", path = "./triblespace-net", optional = true }
+triblespace-search = { version = "0.41.3", path = "./triblespace-search", optional = true }
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"], optional = true }
 log = { version = "0.4.26", optional = true }
 rand_core06 = { package = "rand_core", version = "0.6.4", optional = true }

@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.3] - 2026-05-17
+
+### Fixed
+- **Strip trailing dot from default relay hostnames.** iroh's
+  `iroh::defaults::prod::default_relay_map()` ships URLs in
+  FQDN-absolute form (`"euc1-1.relay.n0.iroh-canary.iroh.link."`)
+  which propagates into reqwest's HTTP `Host` header on
+  every relay probe. Strict WAFs (Anthropic's web-sandbox
+  egress proxy, and likely others) 503 those requests,
+  jamming `net_report`. `host.rs` now wraps the default map
+  with `dot_stripped_default_relay_map()` and passes via
+  `RelayMode::Custom(...)` instead of the preset's
+  `RelayMode::Default`. Same upstream relays, HTTP-canonical
+  request shape on the wire.
+
+### Added
+- `url = "2"` dep (for the host-rewrite transform).
+
 ## [0.41.2] - 2026-05-17
 
 ### Added

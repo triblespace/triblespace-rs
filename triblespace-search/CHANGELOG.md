@@ -4,6 +4,13 @@ All notable changes to `triblespace-search`.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.41.3] - 2026-05-17
+
+Lock-step bump alongside the trailing-dot relay-URL fix in
+`triblespace-net` / `trible`. No source changes in
+`triblespace-search`. See the workspace
+[`../CHANGELOG.md`](../CHANGELOG.md) for the full release notes.
+
 ## [0.41.2] - 2026-05-17
 
 Lock-step bump alongside the address-symmetry work in

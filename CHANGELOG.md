@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.3] - 2026-05-17
+
+The trailing-dot fix. The reason iroh's HTTPS probes to the
+default relays were getting 503'd from the Anthropic web
+sandbox — and likely from any other corporate environment
+fronted by a strict WAF.
+
+### Fixed
+- **iroh default relay hostnames had a trailing FQDN dot** —
+  `iroh-0.98.2/src/defaults.rs` ships e.g.
+  `"use1-1.relay.n0.iroh-canary.iroh.link."` (note the
+  trailing dot, the DNS absolute-form marker). When iroh
+  builds an HTTPS probe URL from those, the dot propagates
+  into reqwest's `Host` header. WAFs that treat trailing-dot
+  Host as a known bypass-attempt signature reject those
+  requests with synthetic 503s, leaving iroh's `net_report`
+  cycle permanently stuck and — in iroh's current connect
+  design — preventing direct-dial attempts that would
+  otherwise honor a ticket's pre-known addresses.
+
+  triblespace-net now transforms iroh's prod default relay
+  map at endpoint-build time, stripping the trailing dot from
+  each relay's hostname before iroh constructs the `RelayUrl`s.
+  Same upstream relay (DNS doesn't care about
+  absolute/relative-form distinction); HTTP-canonical Host
+  header on the wire.
+
+  Diagnosed by another Claude instance in the web sandbox via
+  an exhaustive narrowing experiment that ruled out User-Agent
+  (`reqwest/0.12.x` works), TLS fingerprint (vanilla rustls
+  +reqwest+native-roots works), burst rate (20× concurrent
+  curls all 200), HTTP version, and headers — then nailed it
+  with a side-by-side comparison: identical rustls-reqwest
+  probes succeeded 20/20 in the same second iroh's own
+  probes got 12/12 503'd. The smoking gun was the URL form
+  iroh logged: `https://...iroh.link./` (dot before slash).
+
+  Fix transforms `iroh::defaults::prod::default_relay_map()`
+  rather than hardcoding hostnames, so we stay in sync with
+  whatever n0 ships. Filed upstream-fix candidate: have iroh
+  normalize trailing dots in `RelayUrl::parse` or its
+  hostname constants. Until that lands, this is the
+  triblespace-side workaround.
+
 ## [0.41.2] - 2026-05-17
 
 The address-symmetry release. Closes the

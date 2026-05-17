@@ -30,6 +30,54 @@ fn op_name(op: u8) -> &'static str {
     }
 }
 
+/// Builds a [`RelayMap`] mirroring iroh's prod default but with
+/// trailing dots stripped from each relay's hostname.
+///
+/// Iroh's `iroh::defaults::prod` ships FQDN-absolute hostnames
+/// (e.g. `"euc1-1.relay.n0.iroh-canary.iroh.link."` — note the
+/// trailing dot, which is the DNS-absolute marker). When iroh
+/// constructs HTTPS probe URLs via `Url::parse(...)`, the dot
+/// rides through into reqwest's `Host` header. WAFs that treat
+/// trailing-dot Host as a known bypass-attempt signature
+/// (Anthropic's web-sandbox egress proxy is one) reject those
+/// requests with synthetic 503s, which permanently jams iroh's
+/// `net_report` cycle and prevents any relay session — and,
+/// in iroh's current connect-path design, prevents direct-dial
+/// attempts that would otherwise honor a ticket's pre-known
+/// addresses.
+///
+/// Stripping the trailing dot before iroh constructs its
+/// `RelayUrl`s produces an HTTP-canonical Host header that the
+/// WAFs pass through unmolested. Resolves to the same upstream
+/// relay (DNS resolution doesn't care about the absolute/relative
+/// distinction); just a different on-the-wire request shape.
+///
+/// We transform the upstream default rather than hardcoding
+/// hostnames, so we stay in sync with whatever n0 ships in
+/// `iroh::defaults::prod::default_relay_map()`.
+fn dot_stripped_default_relay_map() -> iroh::RelayMap {
+    let original = iroh::defaults::prod::default_relay_map();
+    let stripped_urls: Vec<String> = original
+        .urls::<Vec<_>>()
+        .into_iter()
+        .map(|relay_url| {
+            let mut url: url::Url = relay_url.into();
+            if let Some(host) = url.host_str() {
+                if let Some(trimmed) = host.strip_suffix('.') {
+                    // `set_host` re-validates; on failure (which
+                    // shouldn't happen for a valid relay URL with
+                    // a trimmable host) we keep the original.
+                    let trimmed = trimmed.to_string();
+                    let _ = url.set_host(Some(&trimmed));
+                }
+            }
+            url.to_string()
+        })
+        .collect();
+    iroh::RelayMap::try_from_iter(stripped_urls.iter().map(|s| s.as_str()))
+        .expect("stripped relay URLs are valid (transformed from valid input)")
+}
+
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
 /// `Default` impl — auth is mandatory in protocol v4 so every peer
 /// construction site must explicitly choose a team root. For solo
@@ -404,10 +452,24 @@ async fn host_loop(
     let static_lookup =
         crate::address_lookup::StaticAddressLookup::new(config.peers.iter().cloned());
 
+    // Strip trailing dots from default relay hostnames. iroh's
+    // defaults ship FQDN-absolute form (`*.iroh-canary.iroh.link.`
+    // — note trailing dot), which is technically RFC-correct but
+    // propagates into reqwest's HTTP `Host` header. Many WAFs
+    // (notably the one fronting Anthropic's web sandbox egress)
+    // treat trailing-dot Host as a known bypass-attempt
+    // signature and 503 the request, leaving iroh's net_report
+    // permanently stuck. Stripping the dot before iroh constructs
+    // its RelayUrls produces an HTTP-canonical Host header that
+    // passes through unmolested. Same upstream relay, just
+    // friendlier URL shape.
+    let relay_map = dot_stripped_default_relay_map();
+
     let ep = match Endpoint::builder(presets::N0)
         .secret_key(secret)
         .ca_roots_config(iroh::tls::CaRootsConfig::system())
         .address_lookup(static_lookup)
+        .relay_mode(iroh::RelayMode::Custom(relay_map))
         .bind()
         .await
     {

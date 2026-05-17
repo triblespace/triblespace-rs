@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.3] - 2026-05-17
+
+### Fixed
+- **Inherits trailing-dot fix from triblespace-net 0.41.3.**
+  iroh's default relay hostnames were getting WAF-rejected
+  because the trailing FQDN dot propagated into reqwest's
+  `Host` header. Sandboxed `pile net sync` / `pile net pull`
+  invocations now talk to iroh's default relay infrastructure
+  without tripping WAF deny rules. See
+  `triblespace-net/CHANGELOG.md` for the full story.
+
 ## [0.41.2] - 2026-05-17
 
 ### Fixed
