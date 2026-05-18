@@ -421,13 +421,38 @@ async fn host_loop(
     // friendlier URL shape.
     let relay_map = dot_stripped_default_relay_map();
 
-    let ep = match Endpoint::builder(presets::N0)
-        .secret_key(secret)
+    // Discovery is layered. `presets::N0` gives us pkarr publish +
+    // DNS lookup via n0.computer. On top of that:
+    //
+    // - `MdnsAddressLookup` adds local-network discovery (zero-conf,
+    //   no internet needed). Two peers on the same LAN find each
+    //   other without pkarr/DNS roundtrips. Works on home WiFi,
+    //   conference rooms, sneakernet; subject to whether the network
+    //   permits client-to-client multicast (some hostile APs filter
+    //   mDNS).
+    //
+    // - `DhtAddressLookup` (pkarr-over-BitTorrent-DHT) gives a third
+    //   discovery path that doesn't depend on n0.computer's DNS
+    //   server being reachable. Default filter is `relay_only`, so
+    //   we don't leak direct-IP addresses to the public DHT.
+    //
+    // All three providers run in parallel; lookup results are
+    // unioned. If any one path is reachable, peers can find each
+    // other.
+    let mdns = match iroh::address_lookup::MdnsAddressLookup::builder().build(EndpointId::from(secret.public())) {
+        Ok(m) => Some(m),
+        Err(e) => { warn!(error = %e, "mDNS discovery init failed; continuing without LAN discovery"); None }
+    };
+
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret.clone())
         .ca_roots_config(iroh::tls::CaRootsConfig::system())
         .relay_mode(iroh::RelayMode::Custom(relay_map))
-        .bind()
-        .await
-    {
+        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
+    if let Some(m) = mdns {
+        builder = builder.address_lookup(m);
+    }
+    let ep = match builder.bind().await {
         Ok(ep) => ep,
         Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
     };

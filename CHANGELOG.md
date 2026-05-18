@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-05-18
+
+### Added
+- **mDNS local-network discovery** (`address-lookup-mdns` feature on
+  iroh). Peers on the same LAN find each other without any internet
+  roundtrip — useful for home WiFi, conference rooms, sneakernet, or
+  any environment where pkarr/DNS isn't reliably reachable. Subject
+  to the network permitting client-to-client multicast (some hostile
+  APs filter mDNS).
+- **pkarr-over-BitTorrent-DHT discovery** (`address-lookup-pkarr-dht`
+  feature on iroh). Adds a third discovery path that doesn't depend
+  on n0.computer's DNS server being reachable. Default `relay_only`
+  filter — no direct-IP leakage to the public DHT.
+
+Both layer onto the existing `presets::N0` pkarr+DNS path. All three
+providers run in parallel; lookup results union. If any one path is
+reachable, peers can find each other.
+
+Pulls in `mainline` (BitTorrent DHT) and `swarm-discovery` (mDNS) as
+transitive deps via the iroh feature flags.
+
 ## [0.43.0] - 2026-05-18
 
 Two correctness fixes for the sync protocol's chain-integrity story,
