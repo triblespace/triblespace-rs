@@ -510,17 +510,6 @@ async fn host_loop(
     let self_cap: RawHash = config.self_cap;
     let mut router_builder = Router::builder(ep.clone());
 
-    // Protocol handler. The `revoked` Arc is shared with `NetSender`
-    // so `update_snapshot` can extend it from sync code (revocations
-    // gossiped into the pile) and the handler reads the latest value
-    // on every OP_AUTH.
-    let handler = SnapshotHandler {
-        snapshot: snapshot.clone(),
-        team_root: config.team_root,
-        revoked: revoked.clone(),
-    };
-    router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
-
     // DHT — always on. Peers bootstrap the routing table.
     let dht_alpn = crate::dht::rpc::ALPN;
     let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
@@ -546,6 +535,25 @@ async fn host_loop(
     router_builder = router_builder
         .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
     let dht_api = Some(dht_api);
+
+    // Protocol handler. The `revoked` Arc is shared with `NetSender`
+    // so `update_snapshot` can extend it from sync code (revocations
+    // gossiped into the pile) and the handler reads the latest value
+    // on every OP_AUTH. ep + dht + self_cap + events are threaded
+    // through so the OP_AUTH path can fall back to a swarm fetch
+    // when the presented cap chain references blobs we don't have
+    // locally (caps are orphan blobs that don't ride along with
+    // normal branch syncs).
+    let handler = SnapshotHandler {
+        snapshot: snapshot.clone(),
+        team_root: config.team_root,
+        revoked: revoked.clone(),
+        ep: ep.clone(),
+        dht: dht_api.clone(),
+        self_cap,
+        events: events.clone(),
+    };
+    router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
     // Gossip.
     let mut gossip_sender: Option<GossipSender> = None;
@@ -898,6 +906,98 @@ async fn fetch_one(
     None
 }
 
+/// Convert the connecting peer's verified pubkey into an EndpointAddr
+/// suitable for `connect_authed`. Carries no relay/direct addrs — iroh's
+/// discovery layer resolves them on dial. Used by the OP_AUTH swarm-
+/// fetch fallback to seed the publisher slot of the fetch pool with
+/// the very peer that just initiated the OP_AUTH (they have their
+/// own cap by construction).
+fn peer_endpoint_for_dialer(peer_pubkey: ed25519_dalek::VerifyingKey) -> EndpointAddr {
+    // iroh's PublicKey wraps the same 32 ed25519 bytes.
+    let pk = iroh_base::PublicKey::from_bytes(peer_pubkey.as_bytes())
+        .expect("ed25519 VerifyingKey is a valid iroh PublicKey");
+    EndpointAddr::from(EndpointId::from(pk))
+}
+
+/// Swarm-fetch the closure rooted at `head` (a cap sig handle, in the
+/// OP_AUTH context) and return it as a `HashMap<RawHash, Vec<u8>>`.
+/// Mirrors `fetch_reachable`'s two-phase walk (Phase 1 OP_CHILDREN
+/// discovery, Phase 2 OP_GET_BLOB in reverse-BFS order) but writes
+/// the results to a map instead of emitting `NetEvent::Blob`. The
+/// caller decides whether to cache the bytes into the local store
+/// after using them.
+async fn swarm_fetch_chain(
+    ep: &iroh::Endpoint,
+    publisher: EndpointAddr,
+    head: &RawHash,
+    dht: &Option<crate::dht::api::ApiClient>,
+    self_cap: &RawHash,
+) -> HashMap<RawHash, Vec<u8>> {
+    let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+    let mut pool: HashMap<EndpointId, iroh::endpoint::Connection> = HashMap::new();
+    let publisher_id = publisher.id;
+
+    // Seed pool with the publisher (the peer that just sent us the
+    // cap_handle via OP_AUTH). They have the cap by construction.
+    // The whole recursion bottoms out here for typical two-level
+    // chains: their server, when verifying our chain, has our cap
+    // in their pile because our cap was issued to them or chained
+    // through them at some point.
+    if let Ok(conn) = connect_authed(ep, publisher, self_cap).await {
+        pool.insert(publisher_id, conn);
+    } else {
+        // Couldn't even auth to the dialer. Give up — there's no
+        // realistic path to fetch the chain without them.
+        return fetched;
+    }
+
+    // Phase 1: discovery via OP_CHILDREN. BFS order; stop when
+    // every frontier blob is either no-children (root cap) or
+    // unreachable.
+    let mut seen: HashSet<RawHash> = HashSet::new();
+    let mut to_fetch: Vec<RawHash> = Vec::new();
+    let mut frontier: Vec<RawHash> = vec![*head];
+    seen.insert(*head);
+    to_fetch.push(*head);
+
+    while !frontier.is_empty() {
+        let mut next: Vec<RawHash> = Vec::new();
+        for parent in &frontier {
+            let children = match children_one(ep, parent, dht, &mut pool, publisher_id, self_cap).await {
+                Some(c) => c,
+                None => continue,
+            };
+            for hash in children {
+                if !seen.insert(hash) {
+                    continue;
+                }
+                to_fetch.push(hash);
+                next.push(hash);
+            }
+        }
+        frontier = next;
+    }
+
+    // Phase 2: deepest-first fetch. Order matters for the caller's
+    // cache-write step: emitting children before parents keeps the
+    // bottom-up insertion invariant when the events get drained.
+    for hash in to_fetch.iter().rev() {
+        let Some(data) = fetch_one(ep, hash, dht, &mut pool, publisher_id, self_cap).await else {
+            continue;
+        };
+        if blake3::hash(&data).as_bytes() != hash {
+            warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on swarm-fetched cap blob");
+            continue;
+        }
+        fetched.insert(*hash, data);
+    }
+
+    for (_, conn) in pool.drain() {
+        conn.close(0u32.into(), b"ok");
+    }
+    fetched
+}
+
 /// Walk children of a parent blob via the swarm.
 async fn children_one(
     ep: &iroh::Endpoint,
@@ -966,6 +1066,23 @@ struct SnapshotHandler {
     /// added at runtime by `update_snapshot`'s rescan, so the handler
     /// always sees the latest set without a restart.
     revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
+    /// Our endpoint for opening outbound connections during the
+    /// swarm-fetch fallback in OP_AUTH (when an incoming cap chain
+    /// references blobs we don't have locally).
+    ep: iroh::Endpoint,
+    /// DHT client for resolving "who has this cap blob?" during the
+    /// swarm-fetch fallback. `None` only in test setups that don't
+    /// bring up a DHT — production always has one.
+    dht: Option<crate::dht::api::ApiClient>,
+    /// Our own cap handle, presented at OP_AUTH when we dial peers
+    /// to fetch missing cap chain blobs.
+    self_cap: RawHash,
+    /// Channel back to the Peer for caching fetched cap blobs. After
+    /// a successful swarm-fetch + verify_chain, we emit NetEvent::Blob
+    /// for each fetched cap so the Peer puts them in the local store —
+    /// next OP_AUTH involving the same chain hits local instead of
+    /// re-walking the swarm.
+    events: mpsc::Sender<NetEvent>,
 }
 
 impl std::fmt::Debug for SnapshotHandler {
@@ -979,6 +1096,10 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
         let snap = self.snapshot.clone();
         let team_root = self.team_root;
         let revoked = self.revoked.clone();
+        let ep = self.ep.clone();
+        let dht = self.dht.clone();
+        let self_cap = self.self_cap;
+        let events = self.events.clone();
 
         let peer_endpoint = connection.remote_id();
         let span = info_span!(
@@ -1019,6 +1140,9 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                 let snap = snap.clone();
                 let auth_state = auth_state.clone();
                 let revoked = revoked.clone();
+                let ep = ep.clone();
+                let dht = dht.clone();
+                let events = events.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = serve_stream(
@@ -1027,6 +1151,10 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                             peer_pubkey,
                             auth_state,
                             revoked,
+                            &ep,
+                            &dht,
+                            &self_cap,
+                            &events,
                             &mut send,
                             &mut recv,
                         ).await {
@@ -1044,6 +1172,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_stream(
     snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     team_root: ed25519_dalek::VerifyingKey,
@@ -1052,6 +1181,10 @@ async fn serve_stream(
         Option<triblespace_core::repo::capability::VerifiedCapability>,
     >>,
     revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
+    ep: &iroh::Endpoint,
+    dht: &Option<crate::dht::api::ApiClient>,
+    self_cap: &RawHash,
+    events: &mpsc::Sender<NetEvent>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
@@ -1073,21 +1206,57 @@ async fn serve_stream(
         // Brief sync read inside async — guard is dropped before any
         // .await runs so this never blocks an async worker.
         let revoked_snapshot = revoked.read().unwrap().clone();
-        let snap_for_fetch = snap_arc.clone();
-        let result = triblespace_core::repo::capability::verify_chain(
-            team_root,
-            cap_handle,
-            peer_pubkey,
-            &revoked_snapshot,
-            move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-                let bytes = snap_for_fetch
-                    .lock()
-                    .unwrap()
-                    .as_ref()?
-                    .get_blob(&h.raw)?;
-                Some(Blob::new(anybytes::Bytes::from_source(bytes)))
-            },
-        );
+
+        // First-pass verify with local-only lookup. The common case is
+        // "we already have the whole chain"; only retry with a swarm
+        // fetch on the specific "missing blob" failure mode.
+        let verify_once = |fetched: &HashMap<RawHash, Vec<u8>>| {
+            let snap_for_fetch = snap_arc.clone();
+            let fetched_for_lookup = fetched.clone();
+            triblespace_core::repo::capability::verify_chain(
+                team_root,
+                cap_handle,
+                peer_pubkey,
+                &revoked_snapshot,
+                move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                    if let Some(bytes) = snap_for_fetch
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|s| s.get_blob(&h.raw))
+                    {
+                        return Some(Blob::new(anybytes::Bytes::from_source(bytes)));
+                    }
+                    let bytes = fetched_for_lookup.get(&h.raw)?.clone();
+                    Some(Blob::new(anybytes::Bytes::from_source(bytes)))
+                },
+            )
+        };
+
+        let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+        let mut result = verify_once(&fetched);
+
+        // Swarm fetch + retry on missing-blob. Caps are orphan blobs
+        // (not reachable from any branch HEAD), so they don't ride
+        // along with normal sync. On first auth from a peer whose
+        // chain we haven't cached, this walks the chain via OP_CHILDREN
+        // and pulls the cap blobs into a local HashMap. Sending peers
+        // verify our chain when we dial them (mutual recursion that
+        // terminates because the union of all members' piles holds
+        // every cap that's been issued).
+        if matches!(
+            result,
+            Err(triblespace_core::repo::capability::VerifyError::Fetch),
+        ) {
+            debug!(
+                cap_handle = %hex::encode(&cap_handle_raw[..4]),
+                "auth: chain incomplete locally, swarm-fetching",
+            );
+            let publisher_addr: EndpointAddr = peer_endpoint_for_dialer(peer_pubkey);
+            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap).await;
+            debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
+            result = verify_once(&fetched);
+        }
 
         match result {
             Ok(verified) => {
@@ -1097,6 +1266,15 @@ async fn serve_stream(
                     .unwrap_or(0);
                 let unrestricted = verified.granted_branches().is_none();
                 info!(branches = granted, unrestricted = unrestricted, "auth ok");
+                // Cache the swarm-fetched blobs into the local store so
+                // the next AUTH involving the same chain finds them
+                // locally. mpsc preserves order; child-before-parent
+                // ordering doesn't matter here because the chain is
+                // already self-consistent (every parent referenced by
+                // every fetched cap is also in `fetched`).
+                for (_, bytes) in fetched.drain() {
+                    let _ = events.send(NetEvent::Blob(bytes));
+                }
                 *auth_state.write().await = Some(verified);
                 send_u8(send, AUTH_OK).await?;
             }
@@ -1856,10 +2034,19 @@ mod tests {
         let revoked: Arc<
             std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>,
         > = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        // Tests don't exercise the OP_AUTH swarm-fetch fallback —
+        // their snapshots are pre-loaded with whatever caps they need.
+        // ep is the server's own endpoint, dht is None, events is a
+        // dropped receiver, self_cap is the all-zero sentinel.
+        let (events_tx, _events_rx) = mpsc::channel::<NetEvent>();
         let handler = SnapshotHandler {
             snapshot: snap_arc,
             team_root,
             revoked,
+            ep: server_ep.clone(),
+            dht: None,
+            self_cap: [0u8; 32],
+            events: events_tx,
         };
         let router = iroh::protocol::Router::builder(server_ep)
             .accept(PILE_SYNC_ALPN, handler)
