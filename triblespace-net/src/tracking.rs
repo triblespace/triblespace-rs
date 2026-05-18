@@ -7,7 +7,6 @@
 //! The tracking branch has its own local ID. Repository can pull/merge
 //! it like any other branch.
 
-use tracing::debug;
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -148,19 +147,6 @@ fn read_updated_at<S: BlobStore>(
     ).next()
 }
 
-/// Compare two `NsTAIInterval` values by their lower bound (both bounds
-/// are identical for point-in-time timestamps). Returns true iff `new` is
-/// strictly newer than `current`.
-fn is_newer(new: Inline<NsTAIInterval>, current: Inline<NsTAIInterval>) -> bool {
-    let Ok((new_ns, _)): Result<(i128, i128), _> = new.try_from_inline() else {
-        return false;
-    };
-    let Ok((current_ns, _)): Result<(i128, i128), _> = current.try_from_inline() else {
-        return false;
-    };
-    new_ns > current_ns
-}
-
 /// Create a new tracking branch. Returns the local tracking branch ID.
 ///
 /// `remote_head_hash` is the branch metadata blob hash gossiped over the
@@ -225,22 +211,15 @@ where
 {
     let old_meta = store.head(tracking_branch_id).ok()??;
 
-    // Reject stale updates: if we can read a timestamp from both the
-    // currently-stored tracking metadata and the incoming remote metadata,
-    // require the incoming one to be strictly newer. This prevents a
-    // late-finishing fetch for an older HEAD from overwriting a
-    // newer HEAD that already advanced the tracking branch.
+    // No wall-clock gate here. Idempotency on no-op updates lives at
+    // the storage layer (`Pile::update` short-circuits when
+    // `new == current`), so a repeated identical gossip just resolves
+    // to the same meta_handle and is dropped by Pile without writing.
+    // Out-of-order semantically different heads are handled correctly
+    // downstream by `merge_commit`'s ancestry check (no-op if remote
+    // is already in local's ancestry; fast-forward if local is in
+    // remote's ancestry; merge commit otherwise).
     let new_ts = read_updated_at(store, new_head_hash);
-    let current_ts = read_updated_at(store, &old_meta.raw);
-    if let (Some(current), Some(new)) = (current_ts, new_ts) {
-        if !is_newer(new, current) {
-            debug!(
-                branch = %hex::encode(&remote_branch_id.raw()[..4]),
-                "tracking: skip stale update (incoming ts ≤ current)"
-            );
-            return None;
-        }
-    }
 
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 

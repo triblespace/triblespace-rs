@@ -1035,6 +1035,17 @@ impl BranchStore for Pile
                 return Ok(PushResult::Conflict(current_hash));
             }
 
+            // No-op short-circuit: if the requested head is already
+            // what we have, return success without appending a record.
+            // The branch table is logically a (id → head) map; a write
+            // where new == current carries no information and would
+            // just churn the append-only file. Steady-state gossip
+            // rebroadcasts of unchanged heads (e.g. tracking-branch
+            // re-publication at 30s ticks) hit this path heavily.
+            if current_hash == new {
+                return Ok(PushResult::Success());
+            }
+
             let (expected, write_res) = match new {
                 Some(new) => {
                     let header = BranchHeader::new(id, new);
@@ -1866,6 +1877,36 @@ mod tests {
             other => panic!("expected conflict, got {other:?}"),
         }
         assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn branch_update_noop_does_not_grow_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![7u8; 8]));
+        let h = pile.put::<UnknownBlob, _>(blob).unwrap();
+        pile.flush().unwrap();
+
+        let branch_id = Id::new([4u8; 16]).unwrap();
+        pile.update(branch_id, None, Some(h.transmute())).unwrap();
+        pile.flush().unwrap();
+        let len_after_first = std::fs::metadata(&path).unwrap().len();
+
+        match pile.update(branch_id, Some(h.transmute()), Some(h.transmute())) {
+            Ok(PushResult::Success()) => {}
+            other => panic!("expected no-op success, got {other:?}"),
+        }
+        pile.flush().unwrap();
+        let len_after_noop = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(
+            len_after_first, len_after_noop,
+            "no-op branch update must not append a new record"
+        );
+        assert_eq!(pile.head(branch_id).unwrap(), Some(h.transmute()));
         pile.close().unwrap();
     }
 

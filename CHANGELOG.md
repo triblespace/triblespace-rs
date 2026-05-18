@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.4] - 2026-05-18
+
+Stale-update gate replaced by storage-layer idempotency.
+
+### Changed
+- **`Pile::update` short-circuits no-op writes.** When the
+  requested head equals the current head, `Pile::update`
+  returns `PushResult::Success` without appending a record.
+  The branch table is logically an `(id → head)` map; a write
+  where `new == current` carries no information and would
+  just churn the append-only file. Steady-state gossip
+  rebroadcasts of unchanged heads (tracking-branch
+  re-publication at 30s ticks) hit this path heavily.
+
+### Removed
+- **Wall-clock stale-update gate in
+  `triblespace_net::tracking::update_tracking_branch`.** The
+  gate compared `metadata::updated_at` of the incoming
+  gossip to the tracking branch's stamp and rejected
+  not-strictly-newer updates. With the storage-layer
+  idempotency above, identical heads collapse to a no-op
+  inside `Pile::update`; semantically different out-of-order
+  heads are reconciled downstream by `Workspace::merge_commit`'s
+  ancestry check (no-op if remote is already in local's
+  ancestry, fast-forward if local is in remote's ancestry,
+  merge commit otherwise). The wall-clock comparison was
+  redundant.
+
 ## [0.41.4] - 2026-05-17
 
 The two follow-ons surfaced by the first successful sandbox sync.
