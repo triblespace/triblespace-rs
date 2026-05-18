@@ -650,6 +650,17 @@ impl<BlobErr: Error + Debug + Send + Sync + 'static> Error for CreateCommitError
 pub enum MergeError {
     /// The merge failed because the workspaces have different base repos.
     DifferentRepos(),
+    /// The ancestry walk failed because one or more commit blobs along the
+    /// chain weren't readable from the workspace's view. The merge refuses
+    /// to fall through to a divergent-merge in this case — creating a merge
+    /// commit referencing an unknown chain would leave a dangling parent in
+    /// the resulting branch, and the append-only pile keeps that corruption
+    /// forever.
+    ///
+    /// Callers should ensure both heads' full closures are locally present
+    /// (e.g. via `fetch_reachable`) before retrying. The contained string
+    /// is a human-readable description of the underlying read failure.
+    AncestryWalkFailed(String),
 }
 
 /// Error returned by [`Repository::push`] and [`Repository::try_push`].
@@ -2294,13 +2305,18 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             Some(h) => h,
         };
 
-        // Best-effort ancestry checks. If the walks fail (missing blobs,
-        // unreadable metadata), fall through to the always-correct merge.
+        // Walk both ancestry chains. If either walk fails because a commit
+        // blob is missing locally, refuse to merge — falling through to a
+        // divergent-merge here would write a new commit referencing an
+        // unknown parent, which `pile diagnose check` would later report as
+        // a chain break and which `fetch_reachable`'s Phase-1
+        // `have_local` short-circuit would never re-fetch. Better to fail
+        // loudly so the caller can re-sync the missing closure and retry.
         let remote_in_local = ancestors(local_head)
             .select(self)
-            .ok()
-            .map(|set| set.get(&other.raw).is_some())
-            .unwrap_or(false);
+            .map_err(|e| MergeError::AncestryWalkFailed(format!("walking local ancestry: {e:?}")))?
+            .get(&other.raw)
+            .is_some();
         if remote_in_local {
             // `other` is already in our history → no-op.
             return Ok(local_head);
@@ -2308,9 +2324,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
 
         let local_in_remote = ancestors(other)
             .select(self)
-            .ok()
-            .map(|set| set.get(&local_head.raw).is_some())
-            .unwrap_or(false);
+            .map_err(|e| MergeError::AncestryWalkFailed(format!("walking remote ancestry: {e:?}")))?
+            .get(&local_head.raw)
+            .is_some();
         if local_in_remote {
             // We're behind `other` → fast-forward.
             self.head = Some(other);

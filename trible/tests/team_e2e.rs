@@ -386,13 +386,12 @@ fn invite_with_branch_restriction_renders_in_list() {
         list_out.contains("capabilities in pile:  2"),
         "post-invite has two caps; got:\n{list_out}"
     );
-    // The branches list shows the first 4 bytes (8 hex chars) of
-    // the branch id. `team list`'s formatter calls `hex::encode`
-    // on a 4-byte slice so the substring lookup is direct.
-    let short_branch = &branch_id.to_lowercase()[..8];
+    // `team list` prints the full branch id (commit c8aec6b6: full
+    // pubkeys + sig handles always shown).
+    let full_branch = branch_id.to_lowercase();
     assert!(
-        list_out.contains(&format!("branches=[{short_branch}]")),
-        "invitee cap shows branches=[{short_branch}]; got:\n{list_out}",
+        list_out.contains(&format!("branches=[{full_branch}]")),
+        "invitee cap shows branches=[{full_branch}]; got:\n{list_out}",
     );
     // PERM_READ should appear on the invitee line; PERM_ADMIN on
     // the founder line.

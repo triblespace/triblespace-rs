@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-05-18
+
+Two correctness fixes for the sync protocol's chain-integrity story,
+plus a CLI surface simplification that drops the EndpointTicket form.
+
+### Fixed
+- **`fetch_reachable` Phase 2 aborts on first fetch failure.** The
+  old skip-and-continue path violated the bottom-up "stored blob ⇒
+  closure stored" invariant: if a deeper blob couldn't be fetched
+  but Phase 2 kept going on its siblings and parents, the parents
+  got written without their full closure. `fetch_reachable`'s own
+  Phase 1 `have_local` short-circuit then trusted that invariant
+  on every subsequent sync, so the gap became permanent — `pile
+  diagnose check` would report a chain break that no amount of
+  re-gossiping could heal. The fix: any single fetch failure aborts
+  the whole walk and returns `Err`, so the tracking branch isn't
+  advanced and the next gossip rebroadcast retries from a clean
+  state. Anything written before the failure is deeper in BFS
+  order and therefore complete; Phase 1 short-circuits on those
+  next time and only the still-missing ancestors get re-walked.
+- **`Workspace::merge_commit` propagates ancestry walk errors
+  instead of silently falling through to a divergent-merge commit.**
+  The old code's `.ok().unwrap_or(false)` pattern treated "couldn't
+  walk the chain because a blob is missing" as "not an ancestor,"
+  then wrote a brand-new merge commit recording the missing handle
+  as a parent. Pile is append-only, so the dangling reference stays
+  forever, and the chain-integrity break hides itself from future
+  syncs (Phase 1 short-circuits on the merge commit, never re-fetches
+  the missing parent). New `MergeError::AncestryWalkFailed(String)`
+  variant lets callers retry once the closure is repaired.
+
+### Removed
+- **`--peers` only accepts bare hex pubkeys.** The `EndpointTicket`
+  form is gone; iroh's standard discovery (pkarr + DNS via
+  `presets::N0`) handles all address lookup. The id-only ticket
+  form was equivalent to a bare pubkey anyway, and the address-
+  bundled form encoded ephemeral relay/direct addrs that were a
+  source of bugs (the trailing-dot relay leak in 0.41.4 was one).
+- **`pile net identity` drops the `ticket:` output line** — prints
+  only `node: <pubkey>`. Use the pubkey hex with `--peers`.
+- **`triblespace_net::dot_stripped_endpoint_addr` public fn removed.**
+  It existed to normalise ticket-encoded relay URLs at the channel
+  boundary; with tickets gone, the only remaining dot-strip site is
+  the outbound RelayMap construction inside `host_loop`, which
+  doesn't need a public helper.
+- **`triblespace_net::address_lookup::StaticAddressLookup` removed,
+  module deleted.** Seeded iroh's address lookup from ticket-encoded
+  addresses; no longer needed.
+- **`iroh-tickets` dependency dropped** from `triblespace-net` and
+  `trible`.
+
 ## [0.42.5] - 2026-05-18
 
 ### Fixed

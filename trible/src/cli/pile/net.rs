@@ -6,7 +6,6 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::{EndpointAddr, EndpointId};
-use iroh_tickets::endpoint::EndpointTicket;
 
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::identity::load_or_create_key;
@@ -17,36 +16,17 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
     Pile::open(path).map_err(|e| anyhow!("open pile: {e:?}"))
 }
 
-/// Parse a `--peers` argument. Accepts two formats:
+/// Parse a `--peers` argument. Each entry is a bare 64-char hex pubkey;
+/// iroh's discovery layer (pkarr + relay) handles the address lookup.
 ///
-/// 1. **`EndpointTicket`** (iroh-tickets `endpoint…` base32 form) —
-///    carries the peer's id plus relay URL and direct socket
-///    addresses. Lets the dialer skip iroh's discovery layer
-///    entirely, which is the working path in sandbox / corporate-
-///    proxy environments where pkarr publish and relay HTTPS
-///    probes are blocked.
-/// 2. **Bare hex pubkey** (32 bytes / 64 hex chars) — the legacy
-///    form. Iroh still needs discovery to find the addresses, so
-///    this only works in environments where discovery is healthy.
-///    Backward-compatible with prior trible versions.
-///
-/// Skips entries that don't parse as either; intentionally permissive
-/// so the CLI doesn't bail when an arg is mistyped — the missing-peers
-/// surface in the resulting tracing output makes the error obvious.
+/// Skips entries that don't parse, intentionally permissive so the CLI
+/// doesn't bail on a mistyped arg — missing-peers surfaces in the
+/// resulting trace output instead.
 fn parse_peers(strs: &[String]) -> Vec<EndpointAddr> {
     strs.iter()
         .filter_map(|s| {
-            let addr = if let Ok(ticket) = s.parse::<EndpointTicket>() {
-                ticket.endpoint_addr().clone()
-            } else {
-                let pk = s.parse::<iroh_base::PublicKey>().ok()?;
-                EndpointAddr::from(EndpointId::from(pk))
-            };
-            // Normalize trailing FQDN dots in any embedded relay
-            // URLs — tickets minted by older / unpatched peers
-            // can carry the dotted form, which our connect path
-            // would otherwise hand back to iroh and trip the WAF.
-            Some(triblespace_net::dot_stripped_endpoint_addr(addr))
+            let pk = s.parse::<iroh_base::PublicKey>().ok()?;
+            Some(EndpointAddr::from(EndpointId::from(pk)))
         })
         .collect()
 }
@@ -169,15 +149,7 @@ fn run_identity(sk: Option<PathBuf>) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let key = load_or_create_key(&sk, &cwd)?;
     let public = triblespace_net::identity::iroh_secret(&key).public();
-    println!("node:   {public}");
-    // EndpointTicket form (just the id — no relay or direct addrs
-    // known at identity-time; those require a running endpoint).
-    // Paste this into another peer's `--peers` to dial this node;
-    // the receiving end still needs discovery to resolve the
-    // addresses, so for sandbox/restricted-network use, also share
-    // the richer ticket printed by `pile net sync` at startup.
-    let ticket = EndpointTicket::from(EndpointAddr::from(EndpointId::from(public)));
-    println!("ticket: {ticket}  (id only — no relay/direct addrs)");
+    println!("node: {public}");
     Ok(())
 }
 
@@ -232,12 +204,10 @@ fn run_sync(
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
-    // parse_peers handles EndpointTicket + bare-pubkey, yielding
-    // Vec<EndpointAddr>. Both feed through to host_loop, where the
-    // ticket addresses seed iroh's StaticAddressLookup so gossip
-    // + DHT bootstrap can dial those peers directly without
-    // discovery; the ids are also extracted for the bare-pubkey
-    // bootstrap-by-id surface of gossip/DHT.
+    // parse_peers takes a list of bare 64-char hex pubkeys and yields
+    // address-less `EndpointAddr`s. iroh's standard discovery layer
+    // (pkarr + DNS via the N0 preset) resolves the actual relay URL
+    // and direct addrs at dial time.
     let peers = parse_peers(&peer_strs);
 
     // Single pile handle, wrapped in a Peer (which spawns the iroh thread)

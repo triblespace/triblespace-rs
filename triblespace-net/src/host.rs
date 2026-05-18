@@ -76,42 +76,6 @@ fn dot_stripped_default_relay_map() -> iroh::RelayMap {
         .expect("stripped relay URLs are valid (transformed from valid input)")
 }
 
-/// Normalises an [`EndpointAddr`] by stripping trailing FQDN dots
-/// from any relay URLs it carries. Companion to
-/// [`dot_stripped_default_relay_map`]: even with the outbound
-/// `RelayMap` dot-free, iroh's own `Endpoint::addr()` can return an
-/// EndpointAddr whose `TransportAddr::Relay` entry has a dotted URL
-/// (presumably because the relay server reports its canonical URL
-/// back to the client with the dot, and iroh stores that for its
-/// own-address reporting). When we serialize that EndpointAddr into
-/// a ticket — or hand it to a peer over any other channel — the
-/// dotted URL propagates and trips WAFs on the receiving side.
-/// Normalising at the channel boundary fixes the leak.
-///
-/// Idempotent for dot-free addresses; preserves the rest of the
-/// EndpointAddr (id, IP transport entries) unchanged.
-pub fn dot_stripped_endpoint_addr(mut addr: EndpointAddr) -> EndpointAddr {
-    use iroh_base::TransportAddr;
-    addr.addrs = addr
-        .addrs
-        .into_iter()
-        .map(|t| match t {
-            TransportAddr::Relay(relay_url) => {
-                let mut url: url::Url = relay_url.clone().into();
-                if let Some(host) = url.host_str() {
-                    if let Some(trimmed) = host.strip_suffix('.') {
-                        let trimmed = trimmed.to_string();
-                        let _ = url.set_host(Some(&trimmed));
-                    }
-                }
-                TransportAddr::Relay(iroh_base::RelayUrl::from(url))
-            }
-            other => other,
-        })
-        .collect();
-    addr
-}
-
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
 /// `Default` impl — auth is mandatory in protocol v4 so every peer
 /// construction site must explicitly choose a team root. For solo
@@ -119,16 +83,10 @@ pub fn dot_stripped_endpoint_addr(mut addr: EndpointAddr) -> EndpointAddr {
 /// (the user is the team root and the founder of a team-of-one);
 /// see the `Peer` struct's doctest for the full pattern.
 pub struct PeerConfig {
-    /// Peers to connect to (used for both gossip and DHT bootstrap).
-    /// Bootstrap peers — for both the gossip mesh and the DHT. Carry
-    /// `EndpointAddr` (not just `EndpointId`) so callers passing an
-    /// `EndpointTicket` through `--peers` can seed iroh's address
-    /// lookup with the known relay URL + direct addresses; gossip's
-    /// bootstrap connect then skips discovery for these peers.
-    /// Callers with only a pubkey can pass `EndpointId::from(...)`
-    /// or `pk.into()` — the resulting `EndpointAddr` carries no
-    /// addresses and falls back to iroh's standard discovery
-    /// services (pkarr/DNS via `presets::N0`).
+    /// Bootstrap peers — for both the gossip mesh and the DHT.
+    /// `EndpointAddr` here carries only an `EndpointId`; iroh's
+    /// standard discovery (pkarr / DNS via `presets::N0`) resolves
+    /// the actual relay URL and direct addresses at dial time.
     pub peers: Vec<EndpointAddr>,
     /// Whether to subscribe to live HEAD-update gossip. The topic id
     /// is the team root pubkey's 32 bytes — every team has exactly
@@ -449,15 +407,6 @@ async fn host_loop(
     // store at runtime lets the sandbox CA (or any admin-installed
     // root) participate. macOS uses the Security framework; Linux
     // reads /etc/ssl/certs; Windows reads the certificate store.
-    // Seed iroh's address lookup with the bootstrap peers' known
-    // addresses (from EndpointTickets). When gossip/DHT later try
-    // to connect by EndpointId, our static lookup yields the
-    // pre-known EndpointAddr immediately — no pkarr publish or
-    // DNS roundtrip needed. The N0 preset's pkarr+DNS lookup
-    // services stay layered alongside as fallbacks for unknown
-    // peers (the lookup services are additive on the builder).
-    let static_lookup =
-        crate::address_lookup::StaticAddressLookup::new(config.peers.iter().cloned());
 
     // Strip trailing dots from default relay hostnames. iroh's
     // defaults ship FQDN-absolute form (`*.iroh-canary.iroh.link.`
@@ -475,7 +424,6 @@ async fn host_loop(
     let ep = match Endpoint::builder(presets::N0)
         .secret_key(secret)
         .ca_roots_config(iroh::tls::CaRootsConfig::system())
-        .address_lookup(static_lookup)
         .relay_mode(iroh::RelayMode::Custom(relay_map))
         .bind()
         .await
@@ -484,27 +432,6 @@ async fn host_loop(
         Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
     };
     ep.online().await;
-
-    // Print the rich ticket (id + relay URL + direct addrs) once
-    // the endpoint is up. This is the form to paste into another
-    // peer's `--peers` or `pile net pull <REMOTE>` for sandbox /
-    // restricted-network environments where iroh discovery isn't
-    // reachable. Use `eprintln` (not just tracing) so it shows up
-    // at default log levels — this is operator-facing info.
-    {
-        use iroh_tickets::endpoint::EndpointTicket;
-        // Strip trailing dots from relay URLs in the local addr
-        // before encoding — iroh's `ep.addr()` can include the
-        // dotted form even when our outbound RelayMap is dot-free
-        // (the relay server reports its canonical URL back with
-        // the dot). Without normalising here, the ticket would
-        // leak the dot to the receiving peer, who then tries to
-        // dial us using the dotted URL and trips strict WAFs on
-        // the way out.
-        let local_addr = dot_stripped_endpoint_addr(ep.addr());
-        let ticket: EndpointTicket = local_addr.into();
-        eprintln!("ticket: {ticket}");
-    }
 
     let my_id = ep.id();
     let self_cap: RawHash = config.self_cap;
@@ -820,20 +747,50 @@ async fn fetch_reachable(
     //
     // Reverse BFS order = bottom-up: emit children before parents.
     // Peer's mpsc receiver preserves order, so by the time it puts
-    // any parent into the store, its missing-and-discovered
-    // children are already in (those that aren't were local before
-    // Phase 1 even started — already in). The store sees a parent
-    // only when its full closure is satisfied; the invariant
-    // "stored blob ⇒ closure stored" holds across interrupted
-    // walks too.
+    // any parent into the store, its discovered-and-fetched children
+    // are already in; blobs that *weren't* discovered (have_local
+    // short-circuited them in Phase 1) were already locally present
+    // before Phase 1 started — and the same invariant said their
+    // closures were too.
+    //
+    // **Abort on first fetch failure.** If we can't fetch a child,
+    // we must NOT proceed to fetch its parents — writing a parent
+    // whose closure is incomplete would break the "stored blob ⇒
+    // closure stored" invariant that the have_local short-circuit
+    // relies on. Worse, append-only storage means any incomplete
+    // parent we wrote stays in the pile forever; Phase 1 would then
+    // short-circuit on that broken parent on every future sync, so
+    // the gap becomes permanent.
+    //
+    // Aborting drops the current walk's tracking-branch update too
+    // (the caller only emits NetEvent::Head on Ok), so on the next
+    // gossip rebroadcast Phase 1 re-walks from the head. Whatever
+    // descendants we *did* successfully write before the failure
+    // remain valid (they're deeper in the BFS, so by reverse-order
+    // they were completed before we hit the failure); Phase 1 will
+    // short-circuit on them and only re-fetch the still-missing
+    // ancestors.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await else {
-            debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
-            continue;
+        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await
+        else {
+            warn!(
+                hash = %hex::encode(&hash[..4]),
+                "fetch aborted: blob unavailable; head not advanced (will retry on next gossip)"
+            );
+            return Err(anyhow::anyhow!(
+                "blob unavailable from all known providers: {}",
+                hex::encode(hash)
+            ));
         };
         if blake3::hash(&data).as_bytes() != hash {
-            warn!(hash = %hex::encode(&hash[..4]), "hash mismatch on fetched blob");
-            continue;
+            warn!(
+                hash = %hex::encode(&hash[..4]),
+                "fetch aborted: hash mismatch; head not advanced"
+            );
+            return Err(anyhow::anyhow!(
+                "hash mismatch on fetched blob: expected {}",
+                hex::encode(hash)
+            ));
         }
         let _ = events.send(NetEvent::Blob(data));
     }
