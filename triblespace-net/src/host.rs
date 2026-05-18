@@ -561,6 +561,7 @@ async fn host_loop(
         self_cap,
         events: events.clone(),
         pool: conn_pool.clone(),
+        my_id,
     };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
@@ -591,6 +592,7 @@ async fn host_loop(
             // OP_CHILDREN / OP_GET_BLOB to remote peers.
             let snapshot_for_fetch = snapshot.clone();
             let pool_for_fetch = conn_pool.clone();
+            let my_id_for_fetch = my_id;
             tokio::spawn(async move {
                 let mut receiver = receiver;
                 while let Ok(Some(event)) = receiver.try_next().await {
@@ -611,6 +613,7 @@ async fn host_loop(
                                 let self_cap2 = self_cap;
                                 let snap2 = snapshot_for_fetch.clone();
                                 let pool2 = pool_for_fetch.clone();
+                                let my_id2 = my_id_for_fetch;
                                 // Use publisher key to connect for fetch (they're the source).
                                 let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
                                     pk.into()
@@ -623,7 +626,7 @@ async fn host_loop(
                                         publisher = %hex::encode(&publisher[..4]),
                                         "gossip head update; fetching"
                                     );
-                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2, &pool2).await;
+                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2, &pool2, my_id2).await;
                                 });
                             }
                         }
@@ -726,6 +729,7 @@ async fn host_loop(
 /// number of ops; with DHT-driven provider selection, the walk
 /// fans out across multiple caching peers in parallel hops
 /// rather than funnelling everything through the publisher.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_reachable(
     ep: &iroh::Endpoint,
     publisher: EndpointAddr,
@@ -735,6 +739,7 @@ async fn fetch_reachable(
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     pool: &SharedPool,
+    my_id: EndpointId,
 ) -> anyhow::Result<()> {
     // Local-presence check against the same snapshot the server
     // uses to answer remote OP_CHILDREN / OP_GET_BLOB. Closure
@@ -786,7 +791,7 @@ async fn fetch_reachable(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
-            let children = match children_one(ep, parent, dht, pool, publisher_id, self_cap).await {
+            let children = match children_one(ep, parent, dht, pool, publisher_id, my_id, self_cap).await {
                 Some(c) => c,
                 None => {
                     warn!(parent = %hex::encode(&parent[..4]), "op_children: no provider could serve");
@@ -822,7 +827,7 @@ async fn fetch_reachable(
     // "stored blob ⇒ closure stored" holds across interrupted
     // walks too.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, self_cap).await else {
+        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await else {
             debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
             continue;
         };
@@ -842,10 +847,18 @@ async fn fetch_reachable(
 /// fallback if it's not already in the set. Returns the ordered
 /// candidate list — DHT providers first (likely caching peers,
 /// closer in the swarm), publisher last (always-available fallback).
+///
+/// Self is filtered out — `find_providers` will list us as a
+/// provider for any blob we've announced, and trying to dial
+/// ourselves trips iroh's "Connecting to ourself is not supported"
+/// error. If we have the blob, we'd have hit the `have_local`
+/// short-circuit upstream; if we're being asked to fetch, by
+/// definition we don't have it (yet) — so self is never useful here.
 async fn providers_for(
     hash: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     publisher_id: EndpointId,
+    my_id: EndpointId,
 ) -> Vec<EndpointId> {
     let mut providers: Vec<EndpointId> = if let Some(api) = dht {
         let blake3_hash = blake3::Hash::from_bytes(*hash);
@@ -853,7 +866,8 @@ async fn providers_for(
     } else {
         Vec::new()
     };
-    if !providers.contains(&publisher_id) {
+    providers.retain(|id| *id != my_id);
+    if publisher_id != my_id && !providers.contains(&publisher_id) {
         providers.push(publisher_id);
     }
     providers
@@ -940,15 +954,17 @@ async fn pool_evict(pool: &SharedPool, provider: EndpointId) {
 /// Fetch a single blob via the swarm — DHT-resolved providers
 /// first, publisher as fallback. Returns the first successful
 /// fetch's bytes (caller verifies hash).
+#[allow(clippy::too_many_arguments)]
 async fn fetch_one(
     ep: &iroh::Endpoint,
     hash: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     pool: &SharedPool,
     publisher_id: EndpointId,
+    my_id: EndpointId,
     self_cap: &RawHash,
 ) -> Option<Vec<u8>> {
-    let providers = providers_for(hash, dht, publisher_id).await;
+    let providers = providers_for(hash, dht, publisher_id, my_id).await;
     for provider in providers {
         let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
             continue;
@@ -991,6 +1007,7 @@ fn peer_endpoint_for_dialer(peer_pubkey: ed25519_dalek::VerifyingKey) -> Endpoin
 /// the results to a map instead of emitting `NetEvent::Blob`. The
 /// caller decides whether to cache the bytes into the local store
 /// after using them.
+#[allow(clippy::too_many_arguments)]
 async fn swarm_fetch_chain(
     ep: &iroh::Endpoint,
     publisher: EndpointAddr,
@@ -998,6 +1015,7 @@ async fn swarm_fetch_chain(
     dht: &Option<crate::dht::api::ApiClient>,
     self_cap: &RawHash,
     pool: &SharedPool,
+    my_id: EndpointId,
 ) -> HashMap<RawHash, Vec<u8>> {
     let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
     let publisher_id = publisher.id;
@@ -1026,7 +1044,7 @@ async fn swarm_fetch_chain(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
-            let children = match children_one(ep, parent, dht, pool, publisher_id, self_cap).await {
+            let children = match children_one(ep, parent, dht, pool, publisher_id, my_id, self_cap).await {
                 Some(c) => c,
                 None => continue,
             };
@@ -1045,7 +1063,7 @@ async fn swarm_fetch_chain(
     // cache-write step: emitting children before parents keeps the
     // bottom-up insertion invariant when the events get drained.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, self_cap).await else {
+        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await else {
             continue;
         };
         if blake3::hash(&data).as_bytes() != hash {
@@ -1059,15 +1077,17 @@ async fn swarm_fetch_chain(
 }
 
 /// Walk children of a parent blob via the swarm.
+#[allow(clippy::too_many_arguments)]
 async fn children_one(
     ep: &iroh::Endpoint,
     parent: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     pool: &SharedPool,
     publisher_id: EndpointId,
+    my_id: EndpointId,
     self_cap: &RawHash,
 ) -> Option<Vec<RawHash>> {
-    let providers = providers_for(parent, dht, publisher_id).await;
+    let providers = providers_for(parent, dht, publisher_id, my_id).await;
     for provider in providers {
         let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
             continue;
@@ -1092,6 +1112,7 @@ async fn children_one(
 /// both know (fetch_peer, branch, head, publisher) by the time they
 /// get here. Gossip gets the head directly from the broadcast message;
 /// `Track` asks the peer via `op_head` first.
+#[allow(clippy::too_many_arguments)]
 async fn track_known_head(
     ep: &iroh::Endpoint,
     fetch_peer: EndpointAddr,
@@ -1103,9 +1124,10 @@ async fn track_known_head(
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     pool: &SharedPool,
+    my_id: EndpointId,
 ) {
     let fetch_id = fetch_peer.id;
-    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local, pool).await {
+    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local, pool, my_id).await {
         warn!(error = %e, peer = %fetch_id.fmt_short(), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
@@ -1149,6 +1171,11 @@ struct SnapshotHandler {
     /// fetch path. The OP_AUTH swarm-fetch and the gossip-driven
     /// fetch end up using the same authed connection per peer.
     pool: SharedPool,
+    /// Our own endpoint id. Used to filter self out of provider
+    /// lists during swarm-fetch (find_providers may list us as a
+    /// provider for blobs we've announced, but we'd hit the local
+    /// cache instead of dialing — and iroh refuses self-connect).
+    my_id: EndpointId,
 }
 
 impl std::fmt::Debug for SnapshotHandler {
@@ -1167,6 +1194,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
         let self_cap = self.self_cap;
         let events = self.events.clone();
         let pool = self.pool.clone();
+        let my_id = self.my_id;
 
         let peer_endpoint = connection.remote_id();
         let span = info_span!(
@@ -1224,6 +1252,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                             &self_cap,
                             &events,
                             &pool,
+                            my_id,
                             &mut send,
                             &mut recv,
                         ).await {
@@ -1255,6 +1284,7 @@ async fn serve_stream(
     self_cap: &RawHash,
     events: &mpsc::Sender<NetEvent>,
     pool: &SharedPool,
+    my_id: EndpointId,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
@@ -1323,7 +1353,7 @@ async fn serve_stream(
                 "auth: chain incomplete locally, swarm-fetching",
             );
             let publisher_addr: EndpointAddr = peer_endpoint_for_dialer(peer_pubkey);
-            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap, pool).await;
+            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap, pool, my_id).await;
             debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
             result = verify_once(&fetched);
         }
@@ -2118,6 +2148,7 @@ mod tests {
             self_cap: [0u8; 32],
             events: events_tx,
             pool: new_shared_pool(),
+            my_id: server_id.into(),
         };
         let router = iroh::protocol::Router::builder(server_ep)
             .accept(PILE_SYNC_ALPN, handler)
