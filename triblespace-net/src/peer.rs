@@ -133,40 +133,29 @@ where
             sender.update_snapshot(snap);
         }
 
-        // Announce every blob already in the pile to the DHT. Without
-        // this, only blobs added *after* startup (via the refresh
-        // diff loop) become discoverable as `find_providers` hits —
-        // pre-existing content is invisible to the swarm, even though
-        // we'd happily serve it. That silently breaks the
-        // swarm-fan-out story for any peer opening an existing pile,
-        // including the auth-cap-fetch path (cap blobs are orphan
-        // content not reachable from any branch HEAD's closure).
-        //
-        // ReadOnly direction suppresses all outbound publishes; the
-        // initial announce sweep follows the same rule.
-        if direction != SyncDirection::ReadOnly {
-            if let Ok(reader) = store.reader() {
-                use triblespace_core::repo::BlobStoreList;
-                for handle in reader.blobs().filter_map(Result::ok) {
-                    sender.announce(handle.raw);
-                }
-            }
-        }
-
-        // Capture the post-announce baseline. The refresh diff loop
-        // only fires for blobs added *after* this point, so we don't
-        // re-announce blobs the startup sweep just covered.
-        let last_blob_reader = store.reader().ok();
-
-        Peer {
+        // Baseline starts as None. The first `refresh` will diff the
+        // store against this and announce every existing blob to the
+        // DHT — same outcome as a dedicated startup sweep, but with no
+        // race between sweep and baseline capture (a previous design
+        // ran both as separate `reader()` calls; an external append
+        // landing between them would slip into the baseline without
+        // ever being announced).
+        let mut peer = Peer {
             store,
             sender,
             receiver,
-            last_blob_reader,
+            last_blob_reader: None,
             last_branches: HashMap::new(),
             direction,
             last_event_at: std::time::Instant::now(),
-        }
+        };
+
+        // Drive the first refresh synchronously so the DHT learns
+        // about pre-existing blobs before `Peer::new` returns and the
+        // first incoming AUTH can land.
+        peer.refresh();
+
+        peer
     }
 
     /// Wall-clock time of the most recent network event absorbed by
@@ -241,12 +230,24 @@ where
         // ── Phase 2: diff-and-publish blob deltas ─────────────────────
         // ReadOnly skips the publish: we still update the baseline
         // reader so we don't accumulate a publish backlog if the
-        // direction later changes.
+        // direction later changes. On the first refresh the baseline
+        // is `None`, so we announce every blob currently in the store —
+        // covers the initial pile contents without a separate startup
+        // sweep (and without the race that two separate `reader()`
+        // calls introduced).
         if let Ok(current) = self.store.reader() {
-            if let Some(baseline) = self.last_blob_reader.as_ref() {
-                if self.direction != SyncDirection::ReadOnly {
-                    for handle in current.blobs_diff(baseline).flatten() {
-                        self.sender.announce(handle.raw);
+            if self.direction != SyncDirection::ReadOnly {
+                match self.last_blob_reader.as_ref() {
+                    Some(baseline) => {
+                        for handle in current.blobs_diff(baseline).flatten() {
+                            self.sender.announce(handle.raw);
+                        }
+                    }
+                    None => {
+                        use triblespace_core::repo::BlobStoreList;
+                        for handle in current.blobs().filter_map(Result::ok) {
+                            self.sender.announce(handle.raw);
+                        }
                     }
                 }
             }
