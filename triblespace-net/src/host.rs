@@ -510,6 +510,14 @@ async fn host_loop(
     let self_cap: RawHash = config.self_cap;
     let mut router_builder = Router::builder(ep.clone());
 
+    // Host-wide singleflight connection pool — one authed
+    // connection per remote peer, reused across all concurrent
+    // fetch_reachable / swarm_fetch_chain calls. See `SharedPool`
+    // docs for the OnceCell-based dial deduplication. Named
+    // `conn_pool` to avoid shadowing the unrelated iroh_blobs
+    // ConnectionPool that gets initialized below for the DHT.
+    let conn_pool: SharedPool = new_shared_pool();
+
     // DHT — always on. Peers bootstrap the routing table.
     let dht_alpn = crate::dht::rpc::ALPN;
     let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
@@ -552,6 +560,7 @@ async fn host_loop(
         dht: dht_api.clone(),
         self_cap,
         events: events.clone(),
+        pool: conn_pool.clone(),
     };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
@@ -581,6 +590,7 @@ async fn host_loop(
             // Same Arc the protocol server uses to answer
             // OP_CHILDREN / OP_GET_BLOB to remote peers.
             let snapshot_for_fetch = snapshot.clone();
+            let pool_for_fetch = conn_pool.clone();
             tokio::spawn(async move {
                 let mut receiver = receiver;
                 while let Ok(Some(event)) = receiver.try_next().await {
@@ -600,6 +610,7 @@ async fn host_loop(
                                 let dht2 = dht_api2.clone();
                                 let self_cap2 = self_cap;
                                 let snap2 = snapshot_for_fetch.clone();
+                                let pool2 = pool_for_fetch.clone();
                                 // Use publisher key to connect for fetch (they're the source).
                                 let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
                                     pk.into()
@@ -612,7 +623,7 @@ async fn host_loop(
                                         publisher = %hex::encode(&publisher[..4]),
                                         "gossip head update; fetching"
                                     );
-                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2).await;
+                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2, &pool2).await;
                                 });
                             }
                         }
@@ -723,6 +734,7 @@ async fn fetch_reachable(
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    pool: &SharedPool,
 ) -> anyhow::Result<()> {
     // Local-presence check against the same snapshot the server
     // uses to answer remote OP_CHILDREN / OP_GET_BLOB. Closure
@@ -746,19 +758,17 @@ async fn fetch_reachable(
         return Ok(());
     }
 
-    // Per-pull connection pool. Keyed on EndpointId; iroh
-    // Connection is Clone-cheap (refcounted handle), so the
-    // map holds owned copies and lookups are zero-copy.
-    let mut pool: HashMap<EndpointId, iroh::endpoint::Connection> = HashMap::new();
     let publisher_id = publisher.id;
 
-    // Seed the pool with the publisher's connection — they're the
-    // most likely to have the head + closure since they just
-    // announced it. Future ops fall through to other DHT providers
-    // if the publisher misses or errors.
-    if let Ok(conn) = connect_authed(ep, publisher, self_cap).await {
-        pool.insert(publisher_id, conn);
-    }
+    // Seed the pool with the publisher's connection on first encounter.
+    // pool_get is singleflight-on-dial via OnceCell, so concurrent
+    // fetch_reachable calls targeting the same publisher share one
+    // dial and one OP_AUTH; the resulting connection serves every
+    // op_children/op_get_blob on this and all other walks.
+    // Note we pass the *fully-addressed* publisher only to seed the
+    // cell with a known-good address; subsequent pool_get calls fall
+    // through to iroh's address lookup if needed.
+    let _ = pool_get(ep, pool, publisher_id, self_cap).await;
 
     // ── Phase 1: discovery (OP_CHILDREN only) ──
     //
@@ -776,7 +786,7 @@ async fn fetch_reachable(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
-            let children = match children_one(ep, parent, dht, &mut pool, publisher_id, self_cap).await {
+            let children = match children_one(ep, parent, dht, pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => {
                     warn!(parent = %hex::encode(&parent[..4]), "op_children: no provider could serve");
@@ -812,7 +822,7 @@ async fn fetch_reachable(
     // "stored blob ⇒ closure stored" holds across interrupted
     // walks too.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, &mut pool, publisher_id, self_cap).await else {
+        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, self_cap).await else {
             debug!(hash = %hex::encode(&hash[..4]), "blob unavailable from all known providers");
             continue;
         };
@@ -823,10 +833,8 @@ async fn fetch_reachable(
         let _ = events.send(NetEvent::Blob(data));
     }
 
-    // Close every pooled connection cleanly.
-    for (_, conn) in pool.drain() {
-        conn.close(0u32.into(), b"ok");
-    }
+    // No close: connections live in the shared pool for the
+    // host_loop's lifetime, reused by subsequent walks.
     Ok(())
 }
 
@@ -851,28 +859,82 @@ async fn providers_for(
     providers
 }
 
-/// Ensure the pool has an authed connection to `provider`,
-/// returning it. Connect-and-auth on miss; cache on hit. None
-/// on connect or auth failure.
-async fn pool_get<'a>(
+/// Host-wide connection pool: one authed `iroh::endpoint::Connection`
+/// per remote peer, shared across all concurrent `fetch_reachable` /
+/// `swarm_fetch_chain` invocations.
+///
+/// `OnceCell` per peer provides automatic singleflight: the first
+/// task to encounter a missing entry runs the dial; concurrent tasks
+/// await the same `OnceCell` and reuse the resulting connection. No
+/// dial-storm when a gossip rebroadcast fans 5+ heads into 5+ parallel
+/// fetch tasks targeting the same peer.
+///
+/// iroh QUIC multiplexes streams cheaply on a single connection; our
+/// `serve_stream` accepts unbounded sequential bi-streams per
+/// connection (auth state set on the first OP_AUTH stream, reused on
+/// every subsequent stream). So one connection per peer is enough.
+pub(crate) type SharedPool = Arc<tokio::sync::Mutex<
+    HashMap<EndpointId, Arc<tokio::sync::OnceCell<iroh::endpoint::Connection>>>,
+>>;
+
+fn new_shared_pool() -> SharedPool {
+    Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Get-or-dial an authed connection to `provider` from the shared
+/// pool. `OnceCell::get_or_try_init` runs the dial exactly once even
+/// if many tasks race here concurrently; the rest await the same
+/// initialization. Returns `None` if the dial fails (the cell stays
+/// uninitialized so a later call can retry).
+async fn pool_get(
     ep: &iroh::Endpoint,
-    pool: &'a mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    pool: &SharedPool,
     provider: EndpointId,
     self_cap: &RawHash,
-) -> Option<&'a iroh::endpoint::Connection> {
-    if !pool.contains_key(&provider) {
+) -> Option<iroh::endpoint::Connection> {
+    let cell = {
+        let mut guard = pool.lock().await;
+        guard
+            .entry(provider)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone()
+    };
+    let init = || async {
         let addr: EndpointAddr = provider.into();
-        match connect_authed(ep, addr, self_cap).await {
-            Ok(conn) => {
-                pool.insert(provider, conn);
+        connect_authed(ep, addr, self_cap).await
+    };
+    match cell.get_or_try_init(init).await {
+        Ok(conn) => Some(conn.clone()),
+        Err(e) => {
+            debug!(error = %e, provider = %provider.fmt_short(), "pool dial failed");
+            // Drop the cell so the next caller can retry. Use a fresh
+            // entry: if anyone awaited the original cell while we were
+            // in get_or_try_init, they all got the same Err — they'll
+            // retry through their own entries below.
+            let mut guard = pool.lock().await;
+            if let Some(existing) = guard.get(&provider) {
+                if std::ptr::eq(Arc::as_ptr(existing), Arc::as_ptr(&cell)) {
+                    guard.remove(&provider);
+                }
             }
-            Err(e) => {
-                debug!(error = %e, provider = %provider.fmt_short(), "could not auth alt provider");
-                return None;
-            }
+            None
         }
     }
-    pool.get(&provider)
+}
+
+/// Evict a connection from the pool. Called when an op on the pooled
+/// connection errors (peer may have closed, network changed, etc.)
+/// so the next access re-dials.
+async fn pool_evict(pool: &SharedPool, provider: EndpointId) {
+    let removed = {
+        let mut guard = pool.lock().await;
+        guard.remove(&provider)
+    };
+    if let Some(cell) = removed {
+        if let Some(conn) = cell.get() {
+            conn.close(0u32.into(), b"pool evict");
+        }
+    }
 }
 
 /// Fetch a single blob via the swarm — DHT-resolved providers
@@ -882,7 +944,7 @@ async fn fetch_one(
     ep: &iroh::Endpoint,
     hash: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
-    pool: &mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    pool: &SharedPool,
     publisher_id: EndpointId,
     self_cap: &RawHash,
 ) -> Option<Vec<u8>> {
@@ -891,14 +953,17 @@ async fn fetch_one(
         let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
             continue;
         };
-        match op_get_blob(conn, hash).await {
+        match op_get_blob(&conn, hash).await {
             Ok(Some(data)) => return Some(data),
             Ok(None) => {
                 debug!(hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "blob miss");
                 continue;
             }
             Err(e) => {
-                debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "op_get_blob errored, trying next provider");
+                debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "op_get_blob errored, evicting and trying next provider");
+                // Connection-level error: pooled connection may be
+                // dead. Evict so subsequent ops to this peer re-dial.
+                pool_evict(pool, provider).await;
                 continue;
             }
         }
@@ -932,20 +997,18 @@ async fn swarm_fetch_chain(
     head: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     self_cap: &RawHash,
+    pool: &SharedPool,
 ) -> HashMap<RawHash, Vec<u8>> {
     let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
-    let mut pool: HashMap<EndpointId, iroh::endpoint::Connection> = HashMap::new();
     let publisher_id = publisher.id;
 
-    // Seed pool with the publisher (the peer that just sent us the
-    // cap_handle via OP_AUTH). They have the cap by construction.
-    // The whole recursion bottoms out here for typical two-level
-    // chains: their server, when verifying our chain, has our cap
-    // in their pile because our cap was issued to them or chained
-    // through them at some point.
-    if let Ok(conn) = connect_authed(ep, publisher, self_cap).await {
-        pool.insert(publisher_id, conn);
-    } else {
+    // Ensure we have an authed connection to the publisher (the
+    // peer that just sent us the cap_handle via OP_AUTH). pool_get
+    // is singleflight, so concurrent swarm_fetch_chain calls in
+    // the parallel-OP_AUTH-burst case share one dial + one OP_AUTH.
+    // The whole recursion bottoms out at the publisher for typical
+    // two-level chains.
+    if pool_get(ep, pool, publisher_id, self_cap).await.is_none() {
         // Couldn't even auth to the dialer. Give up — there's no
         // realistic path to fetch the chain without them.
         return fetched;
@@ -963,7 +1026,7 @@ async fn swarm_fetch_chain(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
-            let children = match children_one(ep, parent, dht, &mut pool, publisher_id, self_cap).await {
+            let children = match children_one(ep, parent, dht, pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => continue,
             };
@@ -982,7 +1045,7 @@ async fn swarm_fetch_chain(
     // cache-write step: emitting children before parents keeps the
     // bottom-up insertion invariant when the events get drained.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, &mut pool, publisher_id, self_cap).await else {
+        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, self_cap).await else {
             continue;
         };
         if blake3::hash(&data).as_bytes() != hash {
@@ -992,9 +1055,6 @@ async fn swarm_fetch_chain(
         fetched.insert(*hash, data);
     }
 
-    for (_, conn) in pool.drain() {
-        conn.close(0u32.into(), b"ok");
-    }
     fetched
 }
 
@@ -1003,7 +1063,7 @@ async fn children_one(
     ep: &iroh::Endpoint,
     parent: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
-    pool: &mut HashMap<EndpointId, iroh::endpoint::Connection>,
+    pool: &SharedPool,
     publisher_id: EndpointId,
     self_cap: &RawHash,
 ) -> Option<Vec<RawHash>> {
@@ -1012,10 +1072,11 @@ async fn children_one(
         let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
             continue;
         };
-        match op_children(conn, parent).await {
+        match op_children(&conn, parent).await {
             Ok(c) => return Some(c),
             Err(e) => {
-                debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "op_children errored, trying next provider");
+                debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "op_children errored, evicting and trying next provider");
+                pool_evict(pool, provider).await;
                 continue;
             }
         }
@@ -1041,9 +1102,10 @@ async fn track_known_head(
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    pool: &SharedPool,
 ) {
     let fetch_id = fetch_peer.id;
-    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local).await {
+    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local, pool).await {
         warn!(error = %e, peer = %fetch_id.fmt_short(), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
@@ -1083,6 +1145,10 @@ struct SnapshotHandler {
     /// next OP_AUTH involving the same chain hits local instead of
     /// re-walking the swarm.
     events: mpsc::Sender<NetEvent>,
+    /// Host-wide connection pool. Shared with the gossip-arrival
+    /// fetch path. The OP_AUTH swarm-fetch and the gossip-driven
+    /// fetch end up using the same authed connection per peer.
+    pool: SharedPool,
 }
 
 impl std::fmt::Debug for SnapshotHandler {
@@ -1100,6 +1166,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
         let dht = self.dht.clone();
         let self_cap = self.self_cap;
         let events = self.events.clone();
+        let pool = self.pool.clone();
 
         let peer_endpoint = connection.remote_id();
         let span = info_span!(
@@ -1143,6 +1210,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                 let ep = ep.clone();
                 let dht = dht.clone();
                 let events = events.clone();
+                let pool = pool.clone();
                 tokio::spawn(
                     async move {
                         if let Err(e) = serve_stream(
@@ -1155,6 +1223,7 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                             &dht,
                             &self_cap,
                             &events,
+                            &pool,
                             &mut send,
                             &mut recv,
                         ).await {
@@ -1185,6 +1254,7 @@ async fn serve_stream(
     dht: &Option<crate::dht::api::ApiClient>,
     self_cap: &RawHash,
     events: &mpsc::Sender<NetEvent>,
+    pool: &SharedPool,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
@@ -1253,7 +1323,7 @@ async fn serve_stream(
                 "auth: chain incomplete locally, swarm-fetching",
             );
             let publisher_addr: EndpointAddr = peer_endpoint_for_dialer(peer_pubkey);
-            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap).await;
+            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap, pool).await;
             debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
             result = verify_once(&fetched);
         }
@@ -2047,6 +2117,7 @@ mod tests {
             dht: None,
             self_cap: [0u8; 32],
             events: events_tx,
+            pool: new_shared_pool(),
         };
         let router = iroh::protocol::Router::builder(server_ep)
             .accept(PILE_SYNC_ALPN, handler)
