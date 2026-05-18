@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.5] - 2026-05-18
+
+### Fixed
+- **`Peer::new` startup-sweep race.** The sweep iterated blobs from
+  one `store.reader()` snapshot and captured the diff baseline from
+  a second `store.reader()` call. An external append (e.g. `trible
+  team invite` writing a cap blob to the pile file) landing between
+  the two reads slipped into the baseline without ever being
+  announced — the blob then was locally present but invisible to
+  `find_providers` DHT lookups. Symptom: cap-chain swarm-fetch
+  fallback failing because the cap-holder appeared to be the only
+  provider in the DHT (the actual minter never announced).
+
+  Fix: start with `last_blob_reader = None`. The first refresh
+  announces every blob in `current` directly (no diff), then
+  captures baseline. Single `reader()` call, no race. `Peer::new`
+  drives one synchronous refresh before returning so the DHT
+  learns about pre-existing blobs before the first incoming AUTH
+  can land.
+
 ## [0.42.4] - 2026-05-18
 
 Stale-update gate replaced by storage-layer idempotency.

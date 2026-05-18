@@ -1,13 +1,13 @@
 [package]
 name = "triblespace-net"
-version = "0.42.4"
+version = "0.42.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Distributed sync protocol for triblespace piles over iroh"
 repository = "https://github.com/triblespace/triblespace-net"
 
 [dependencies]
-triblespace-core = { version = "0.42.4", path = "../triblespace-core", default-features = false }
+triblespace-core = { version = "0.42.5", path = "../triblespace-core", default-features = false }
 iroh = { version = "0.98", features = ["platform-verifier"] }
 iroh-base = "0.98"
 iroh-tickets = "0.5"
