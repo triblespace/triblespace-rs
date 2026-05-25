@@ -37,6 +37,7 @@ staging, queries, and pushing commits to a repository.
 ```rust
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 mod literature {
@@ -79,8 +80,18 @@ mod literature {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
     // for quick experiments. Swap in a `Pile` when you need durable storage.
+    //
+    // The third argument is a repo-wide metadata `TribleSet` that gets
+    // attached to *every* commit this repo's workspaces produce — typically
+    // the committing identity. `ws.checkout_metadata(..)` retrieves it
+    // later, so downstream readers can identify the source of any commit
+    // they pull.
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
+    let repo_metadata = entity! { ufoid() @
+        metadata::name: "Dune fan-club library",
+    }
+    .into_facts();
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), repo_metadata)?;
     let branch_id = repo
         .create_branch("main", None)
         .expect("create branch");
