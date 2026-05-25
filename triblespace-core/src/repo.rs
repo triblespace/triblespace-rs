@@ -835,16 +835,37 @@ impl<Storage> Repository<Storage>
 where
     Storage: BlobStore + BranchStore,
 {
-    /// Creates a new repository with the given storage, signing key, and commit metadata.
+    /// Creates a new repository with the given storage, signing key, and
+    /// repo-wide commit metadata.
     ///
-    /// The `commit_metadata` TribleSet is stored as a blob in the repository and attached
-    /// to every commit created through this repository's workspaces.
-    pub fn new(
+    /// `commit_metadata` accepts anything convertible into a [`Fragment`] —
+    /// either a raw [`TribleSet`] (auto-promoted with empty blob store via
+    /// `impl From<TribleSet> for Fragment`), or a Fragment built up via
+    /// `entity!{}` / `attributes!::describe()` that carries auxiliary blobs
+    /// (e.g. `Handle<LongString>` doc strings). The Fragment's blobs are
+    /// absorbed into storage so handles referenced by the metadata facts
+    /// stay resolvable for any downstream reader that pulls a commit and
+    /// calls [`Workspace::checkout_metadata`].
+    ///
+    /// The resulting metadata blob is referenced from every commit produced
+    /// by workspaces of this repository.
+    pub fn new<F: Into<crate::trible::Fragment>>(
         mut storage: Storage,
         signing_key: SigningKey,
-        commit_metadata: TribleSet,
+        commit_metadata: F,
     ) -> Result<Self, <Storage as BlobStorePut>::PutError> {
-        let commit_metadata = storage.put(commit_metadata)?;
+        let (facts, mut blobs) = commit_metadata.into().into_facts_and_blobs();
+        // Persist any blobs the Fragment carried — typically `Handle<LongString>`
+        // doc strings or other handle-referenced payloads. They're stored as
+        // `UnknownBlob` (raw bytes) because the storage layer is encoding-agnostic;
+        // readers recover the schema via the handle's declared encoding.
+        let reader = blobs
+            .reader()
+            .expect("MemoryBlobStore::reader is infallible");
+        for (_handle, blob) in reader {
+            storage.put::<UnknownBlob, _>(blob)?;
+        }
+        let commit_metadata = storage.put(facts)?;
         Ok(Self {
             storage,
             signing_key,
