@@ -80,18 +80,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
     // for quick experiments. Swap in a `Pile` when you need durable storage.
     //
-    // The third argument is a repo-wide metadata `TribleSet` attached to
+    // The third argument is a repo-wide metadata `Fragment` attached to
     // *every* commit this repo's workspaces produce — `ws.checkout_metadata(..)`
     // retrieves it later. `attributes! { … }` synthesises a `describe()`
     // function that returns a Fragment describing the schema (attribute
-    // ids, names, doc strings, encodings); attaching it as commit metadata
-    // means downstream readers receive the schema for the facts they're
-    // pulling, automatically.
+    // ids, names, doc strings, encodings); passing it directly means the
+    // schema's facts *and* its handle-referenced doc-string blobs both
+    // travel with every commit, so downstream readers can pull the
+    // schema along with the data.
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(
         storage,
         SigningKey::generate(&mut OsRng),
-        literature::describe().into_facts(),
+        literature::describe(),
     )?;
     let branch_id = repo
         .create_branch("main", None)
