@@ -37,7 +37,6 @@ staging, queries, and pushing commits to a repository.
 ```rust
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::metadata;
 use triblespace::prelude::*;
 
 mod literature {
@@ -81,17 +80,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
     // for quick experiments. Swap in a `Pile` when you need durable storage.
     //
-    // The third argument is a repo-wide metadata `TribleSet` that gets
-    // attached to *every* commit this repo's workspaces produce — typically
-    // the committing identity. `ws.checkout_metadata(..)` retrieves it
-    // later, so downstream readers can identify the source of any commit
-    // they pull.
+    // The third argument is a repo-wide metadata `TribleSet` attached to
+    // *every* commit this repo's workspaces produce — `ws.checkout_metadata(..)`
+    // retrieves it later. `attributes! { … }` synthesises a `describe()`
+    // function that returns a Fragment describing the schema (attribute
+    // ids, names, doc strings, encodings); attaching it as commit metadata
+    // means downstream readers receive the schema for the facts they're
+    // pulling, automatically.
     let storage = MemoryRepo::default();
-    let repo_metadata = entity! { ufoid() @
-        metadata::name: "Dune fan-club library",
-    }
-    .into_facts();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), repo_metadata)?;
+    let mut repo = Repository::new(
+        storage,
+        SigningKey::generate(&mut OsRng),
+        literature::describe().into_facts(),
+    )?;
     let branch_id = repo
         .create_branch("main", None)
         .expect("create branch");
