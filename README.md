@@ -42,7 +42,7 @@ use triblespace::prelude::*;
 mod literature {
     use triblespace::prelude::*;
     use triblespace::prelude::blobencodings::LongString;
-    use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, Handle, R256, ShortString};
 
     attributes! {
         /// The title of a work.
@@ -64,9 +64,6 @@ mod literature {
 
         /// The number of pages in the work.
         "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
-
-        /// A pen name or alternate spelling for an author.
-        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
 
         /// A throwaway prototype field; omit the id to derive it from the name and encoding.
         pub prototype_note: Handle<LongString>;
@@ -138,48 +135,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     repo.push(&mut ws).expect("publish initial library");
 
-    // ── Conflict resolution ────────────────────────────────────────
-    // We rename the author; a collaborator independently records a
-    // different name. try_push detects the conflict.
+    // ── Concurrent commits ─────────────────────────────────────────
+    // We stage a new author; a collaborator independently stages a
+    // different new author. The writes don't overlap semantically,
+    // but they both started from the same head — try_push detects
+    // the lineage divergence so we can fold the collaborator's
+    // history in.
 
+    let butler = ufoid();
     ws.commit(
-        entity! { &herbert @ literature::firstname: "Francis" },
-        "use pen name",
+        entity! { &butler @
+            literature::firstname: "Octavia",
+            literature::lastname: "Butler",
+        },
+        "add Butler",
     );
 
     let mut collaborator = repo.pull(*branch_id).expect("pull");
+    let leguin = ufoid();
     collaborator.commit(
-        entity! { &herbert @ literature::firstname: "Franklin" },
-        "record legal first name",
+        entity! { &leguin @
+            literature::firstname: "Ursula",
+            literature::lastname: "Le Guin",
+        },
+        "add Le Guin",
     );
     repo.push(&mut collaborator).expect("publish collaborator");
 
-    // try_push fails because the branch advanced. The returned
-    // workspace carries the collaborator's history.
+    // Our push fails because the branch advanced while we were
+    // working. The returned workspace carries the collaborator's
+    // history; we replay our pending addition on top of it.
     if let Some(mut conflict_ws) = repo
         .try_push(&mut ws)
         .expect("attempt push")
     {
-        // Inspect what the collaborator wrote.
-        let their_catalog = conflict_ws.checkout(..)?;
-        for first in find!(
-            first: String,
-            pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
-        ) {
-            println!("Collaborator recorded: '{first}'.");
-        }
-
-        // Accept their history — abandon our conflicting firstname
-        // commit and continue from the collaborator's state instead.
-        ws = conflict_ws;
-
-        // Record our preferred name as an alias rather than overwriting.
-        ws.commit(
-            entity! { &herbert @ literature::alias: "Francis" },
-            "keep pen-name as alias",
+        conflict_ws.commit(
+            entity! { &butler @
+                literature::firstname: "Octavia",
+                literature::lastname: "Butler",
+            },
+            "add Butler (rebased)",
         );
+        repo.push(&mut conflict_ws).expect("publish resolution");
+        ws = conflict_ws;
+    }
 
-        repo.push(&mut ws).expect("publish resolution");
+    // Final catalog: all three authors present, no overwrites.
+    let catalog = ws.checkout(..)?;
+    let mut names: Vec<(String, String)> = find!(
+        (first: String, last: String),
+        pattern!(&catalog, [
+            { _?author @
+                literature::firstname: ?first,
+                literature::lastname: ?last
+            }
+        ])
+    ).collect();
+    names.sort();
+    println!("Catalog after merge ({} authors):", names.len());
+    for (f, l) in names {
+        println!("  - {f} {l}");
     }
 
     Ok(())
