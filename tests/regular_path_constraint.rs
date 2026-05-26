@@ -57,3 +57,25 @@ fn repetition() {
     .collect();
     assert!(results.contains(&(start_val, end_val)));
 }
+
+#[test]
+fn optional_question_mark() {
+    // `social::follows?` — zero or one hop. With kb containing
+    // a single A→B edge, the bound-start form should reach both
+    // A (zero-step reflexive) and B (one-step).
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    kb += entity! { &a @ social::follows: &b };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(a_val), path!(kb.clone(), s social::follows? e)))
+    .map(|(_, e)| e)
+    .collect();
+
+    assert!(results.contains(&a_val), "0-hop reflexive should include start");
+    assert!(results.contains(&b_val), "1-hop should include neighbor");
+    assert_eq!(results.len(), 2, "exactly 2 destinations: {:?}", results);
+}

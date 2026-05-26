@@ -72,6 +72,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
         Or,
         Star,
         Plus,
+        Question,
         LParen,
         RParen,
     }
@@ -116,6 +117,10 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     out.push(Tok::Plus);
                     i += 1;
                 }
+                TokenTree::Punct(p) if p.as_char() == '?' => {
+                    out.push(Tok::Question);
+                    i += 1;
+                }
                 TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
                     i += 1;
                     out.push(Tok::LParen);
@@ -140,13 +145,16 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
         Concat,
         Star,
         Plus,
+        Question,
         LParen,
         RParen,
     }
 
     fn needs_concat(a: &Tok, b: &Tok) -> bool {
-        matches!(a, Tok::Sym(_) | Tok::RParen | Tok::Star | Tok::Plus)
-            && matches!(b, Tok::Sym(_) | Tok::LParen)
+        matches!(
+            a,
+            Tok::Sym(_) | Tok::RParen | Tok::Star | Tok::Plus | Tok::Question
+        ) && matches!(b, Tok::Sym(_) | Tok::LParen)
     }
 
     let lexed = lex(regex_tokens)?;
@@ -158,6 +166,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
             Tok::Or => infix.push(OpTok::Or),
             Tok::Star => infix.push(OpTok::Star),
             Tok::Plus => infix.push(OpTok::Plus),
+            Tok::Question => infix.push(OpTok::Question),
             Tok::LParen => infix.push(OpTok::LParen),
             Tok::RParen => infix.push(OpTok::RParen),
         }
@@ -168,7 +177,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
 
     fn prec(t: &OpTok) -> u8 {
         match t {
-            OpTok::Star | OpTok::Plus => 3,
+            OpTok::Star | OpTok::Plus | OpTok::Question => 3,
             OpTok::Concat => 2,
             OpTok::Or => 1,
             _ => 0,
@@ -176,7 +185,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     }
 
     fn right_assoc(t: &OpTok) -> bool {
-        matches!(t, OpTok::Star | OpTok::Plus)
+        matches!(t, OpTok::Star | OpTok::Plus | OpTok::Question)
     }
 
     let mut output = Vec::<OpTok>::new();
@@ -194,7 +203,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     }
                 }
             }
-            OpTok::Or | OpTok::Concat | OpTok::Star | OpTok::Plus => {
+            OpTok::Or | OpTok::Concat | OpTok::Star | OpTok::Plus | OpTok::Question => {
                 while let Some(op) = stack.last() {
                     if matches!(op, OpTok::LParen) {
                         break;
@@ -224,6 +233,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
             OpTok::Concat => quote! { PathOp::Concat },
             OpTok::Star => quote! { PathOp::Star },
             OpTok::Plus => quote! { PathOp::Plus },
+            OpTok::Question => quote! { PathOp::Optional },
             _ => panic!(),
         })
         .collect();
