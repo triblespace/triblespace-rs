@@ -212,15 +212,6 @@ fn parse_pubkey_hex(s: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&raw).map_err(|e| anyhow!("bad pubkey: {e}"))
 }
 
-fn parse_secret_hex(s: &str) -> Result<SigningKey> {
-    let bytes = hex::decode(s).map_err(|e| anyhow!("decode secret hex: {e}"))?;
-    let raw: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow!("secret must be 32 bytes"))?;
-    Ok(SigningKey::from_bytes(&raw))
-}
-
 fn parse_handle_hex(s: &str) -> Result<Inline<Handle<SimpleArchive>>> {
     let bytes = hex::decode(s).map_err(|e| anyhow!("decode handle hex: {e}"))?;
     let raw: [u8; 32] = bytes

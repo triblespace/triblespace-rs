@@ -98,9 +98,6 @@ pub struct PeerConfig {
     /// chains back to this key. See `triblespace_core::repo::capability`.
     /// When `gossip = true`, also serves as the gossip topic id.
     pub team_root: ed25519_dalek::VerifyingKey,
-    /// Pubkeys whose capabilities are revoked. Cascades transitively
-    /// through the chain.
-    pub revoked: std::collections::HashSet<ed25519_dalek::VerifyingKey>,
     /// This node's own capability sig handle. Presented to remote peers
     /// as the first stream on every outgoing connection so they can
     /// authorise us. Required — protocol v4 has mandatory auth on both
@@ -171,25 +168,17 @@ impl StoreSnapshot<()> {
 }
 
 /// Type-erased snapshot for the host thread.
+///
+/// Carries just enough of the pile for the network thread to serve
+/// peer requests: per-hash blob fetch, branch head listing, and a
+/// quick presence check. The descriptive-caps refactor removed the
+/// `all_simple_archive_blobs` method that previously fed
+/// `extract_revocation_pairs` — there's no revocation rescan to
+/// support anymore.
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
     fn list_branches(&self) -> &[(RawBranchId, RawHash)];
-    /// Enumerate every blob in this snapshot, viewed as a
-    /// `Blob<SimpleArchive>`. Blobs whose backing bytes don't even fit
-    /// the `SimpleArchive` schema (e.g. arbitrary binary payloads) are
-    /// silently skipped at the decode boundary by callers — this method
-    /// only produces the typed view, parsing happens in the consumer.
-    ///
-    /// Used by the relay's `update_snapshot` path to rescan for
-    /// revocation blob pairs after every snapshot refresh, so live
-    /// revocations gossiped into the pile take effect without a
-    /// restart. See [`triblespace_core::repo::capability::extract_revocation_pairs`].
-    fn all_simple_archive_blobs(
-        &self,
-    ) -> Vec<triblespace_core::blob::Blob<
-        triblespace_core::blob::encodings::simplearchive::SimpleArchive,
-    >>;
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -213,43 +202,21 @@ where
     fn list_branches(&self) -> &[(RawBranchId, RawHash)] {
         &self.branches
     }
-
-    fn all_simple_archive_blobs(
-        &self,
-    ) -> Vec<triblespace_core::blob::Blob<
-        triblespace_core::blob::encodings::simplearchive::SimpleArchive,
-    >> {
-        use triblespace_core::blob::Blob;
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::inline::Inline;
-        use triblespace_core::inline::encodings::hash::Handle;
-        let mut out = Vec::new();
-        for handle_result in self.reader.blobs() {
-            let Ok(handle) = handle_result else { continue };
-            let typed: Inline<Handle<SimpleArchive>> = Inline::new(handle.raw);
-            if let Ok(blob) = self.reader.get::<Blob<SimpleArchive>, SimpleArchive>(typed) {
-                out.push(blob);
-            }
-        }
-        out
-    }
 }
 
 // ── Outgoing half ────────────────────────────────────────────────────
 
 /// Send commands to the host thread + update the serving snapshot.
 ///
-/// `team_root` and `revoked` are carried alongside the snapshot so
-/// `update_snapshot` can rescan for new revocation blob pairs and
-/// extend the live revoked set in lockstep with the snapshot it
-/// publishes to peers. The `Arc<RwLock<...>>` is shared with the
-/// protocol handler so handler reads see the latest revocations.
+/// In the descriptive-caps model `update_snapshot` is now a pure
+/// snapshot refresh — there's no revocation rescan to thread state
+/// through. The handler doesn't need any cross-thread policy view
+/// either, so this struct holds only the snapshot and the command
+/// channel.
 #[derive(Clone)]
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>>,
-    team_root: ed25519_dalek::VerifyingKey,
     id: EndpointId,
 }
 
@@ -302,11 +269,7 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
         Arc::new(Mutex::new(None));
-    let revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>> =
-        Arc::new(std::sync::RwLock::new(config.revoked.clone()));
-    let team_root = config.team_root;
     let thread_snapshot = snapshot.clone();
-    let thread_revoked = revoked.clone();
 
     let _thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -316,15 +279,12 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
             cmd_rx,
             evt_tx,
             thread_snapshot,
-            thread_revoked,
         ));
     });
 
     let sender = NetSender {
         cmd_tx,
         snapshot,
-        revoked,
-        team_root,
         id,
     };
     let receiver = NetReceiver { evt_rx };
@@ -366,7 +326,6 @@ async fn host_loop(
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>>,
 ) {
     use iroh::endpoint::presets;
     use iroh::protocol::Router;
@@ -474,10 +433,7 @@ async fn host_loop(
         .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
     let dht_api = Some(dht_api);
 
-    // Protocol handler. The `revoked` Arc is shared with `NetSender`
-    // so `update_snapshot` can extend it from sync code (revocations
-    // gossiped into the pile) and the handler reads the latest value
-    // on every OP_AUTH. ep + dht + self_cap + events are threaded
+    // Protocol handler. ep + dht + self_cap + events are threaded
     // through so the OP_AUTH path can fall back to a swarm fetch
     // when the presented cap chain references blobs we don't have
     // locally (caps are orphan blobs that don't ride along with
@@ -485,7 +441,6 @@ async fn host_loop(
     let handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         team_root: config.team_root,
-        revoked: revoked.clone(),
         ep: ep.clone(),
         dht: dht_api.clone(),
         self_cap,
@@ -1102,14 +1057,6 @@ struct SnapshotHandler {
     /// Verifies all incoming capability chains. Required — protocol v4
     /// has mandatory auth.
     team_root: ed25519_dalek::VerifyingKey,
-    /// Pubkeys whose capabilities are revoked. Cascades transitively.
-    /// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) because
-    /// the lock is also written from the sync `NetSender::update_snapshot`
-    /// path and the read inside the async `serve_stream` is brief
-    /// (read-clone-drop, no guard held across await). Revocations are
-    /// added at runtime by `update_snapshot`'s rescan, so the handler
-    /// always sees the latest set without a restart.
-    revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
     /// Our endpoint for opening outbound connections during the
     /// swarm-fetch fallback in OP_AUTH (when an incoming cap chain
     /// references blobs we don't have locally).
@@ -1148,7 +1095,6 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
         let snap = self.snapshot.clone();
         let team_root = self.team_root;
-        let revoked = self.revoked.clone();
         let ep = self.ep.clone();
         let dht = self.dht.clone();
         let self_cap = self.self_cap;
@@ -1194,7 +1140,6 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                 };
                 let snap = snap.clone();
                 let auth_state = auth_state.clone();
-                let revoked = revoked.clone();
                 let ep = ep.clone();
                 let dht = dht.clone();
                 let events = events.clone();
@@ -1206,7 +1151,6 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                             team_root,
                             peer_pubkey,
                             auth_state,
-                            revoked,
                             &ep,
                             &dht,
                             &self_cap,
@@ -1238,7 +1182,6 @@ async fn serve_stream(
     auth_state: Arc<tokio::sync::RwLock<
         Option<triblespace_core::repo::capability::VerifiedCapability>,
     >>,
-    revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
     ep: &iroh::Endpoint,
     dht: &Option<crate::dht::api::ApiClient>,
     self_cap: &RawHash,

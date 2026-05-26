@@ -221,7 +221,6 @@ fn run_sync(
         peers,
         gossip: true,
         team_root,
-        revoked: std::collections::HashSet::new(),
         self_cap,
         direction,
     });

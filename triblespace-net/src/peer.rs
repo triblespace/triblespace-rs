@@ -64,12 +64,10 @@ pub use crate::host::{PeerConfig, SyncDirection};
 /// [Capability Auth]: https://docs.rs/triblespace/latest/triblespace/book/capability-auth/index.html
 ///
 /// ```rust,no_run
-/// use std::collections::HashSet;
 /// use std::path::Path;
 /// use ed25519_dalek::SigningKey;
 /// use rand::rngs::OsRng;
 /// use triblespace_core::repo::pile::Pile;
-/// use triblespace_core::inline::encodings::hash::Blake3;
 /// use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 ///
 /// let key = SigningKey::generate(&mut OsRng);
@@ -78,7 +76,6 @@ pub use crate::host::{PeerConfig, SyncDirection};
 ///     peers: vec![],                       // bootstrap nodes
 ///     gossip: true,                        // false = serve/pull-only
 ///     team_root: key.verifying_key(),      // single-user fallback
-///     revoked: HashSet::new(),
 ///     self_cap: [0u8; 32],
 ///     direction: SyncDirection::Bidirectional,
 /// });
