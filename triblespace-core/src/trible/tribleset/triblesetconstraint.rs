@@ -185,14 +185,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 // a == v, entity free.
                 self.set.aev.segmented_len(&[0; 0])
             }
-            // All three positions share the same Variable — extremely
-            // rare; not yet handled natively.
-            (_, _, _, true, true, true) => panic!(
-                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
-                 three positions sharing one Variable. Use distinct Variables \
-                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
-                 item 2)."
-            ),
+            (_, _, _, true, true, true) => {
+                // pattern(x, x, x) — all three positions share one
+                // Variable. Conservative upper bound: distinct
+                // entities in the set.
+                self.set.eav.segmented_len(&[0; 0])
+            }
             _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
         } as usize)
     }
@@ -374,12 +372,20 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     }
                 });
             }
-            (_, _, _, true, true, true) => panic!(
-                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
-                 three positions sharing one Variable. Use distinct Variables \
-                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
-                 item 2)."
-            ),
+            (_, _, _, true, true, true) => {
+                // pattern(x, x, x) — all three positions share one
+                // Variable. Enumerate distinct entities; keep those
+                // with (e, e, id_into_value(e)) in the set.
+                self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(e);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(e);
+                    prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
+                    if self.set.eav.has_prefix(&prefix) {
+                        proposals.push(id_into_value(e));
+                    }
+                });
+            }
             _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
         }
     }
@@ -558,12 +564,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.ave.has_prefix(&prefix)
             }),
-            (_, _, _, true, true, true) => panic!(
-                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
-                 three positions sharing one Variable. Use distinct Variables \
-                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
-                 item 2)."
-            ),
+            (_, _, _, true, true, true) => proposals.retain(|value| {
+                // pattern(x, x, x): proposal plays all three roles.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
+                self.set.eav.has_prefix(&prefix)
+            }),
             _ => panic!("invalid trible constraint state"),
         }
     }
@@ -742,5 +751,44 @@ mod tests {
         };
         let r: Vec<_> = q.collect();
         assert_eq!(2, r.len(), "expected 2 attr-value dups, got {}", r.len());
+    }
+
+    #[test]
+    fn all_three_same_pattern() {
+        // `pattern(x, x, x)` — entity, attribute, and value all
+        // share one Variable. The natural Wikidata meta-class
+        // example: Q35120 (entity) is itself, instances-of itself.
+        // Here: 2 entities that fully self-assert (e == a, value
+        // encodes e) and several near-misses that share two of
+        // the three roles.
+        use crate::inline::encodings::genid::GenId;
+
+        fn id_as_inline(id: &[u8; 16]) -> Inline<GenId> {
+            let mut bytes = [0u8; 32];
+            bytes[16..32].copy_from_slice(id);
+            Inline::<GenId>::new(bytes)
+        }
+
+        let mut set = TribleSet::new();
+        let xxx1 = rngid();
+        let xxx2 = rngid();
+        let other = rngid();
+
+        // 2 full triples: (x, x, x)
+        set.insert(&Trible::new(&xxx1, &xxx1, &id_as_inline(&xxx1)));
+        set.insert(&Trible::new(&xxx2, &xxx2, &id_as_inline(&xxx2)));
+        // Near-miss: e == a but value differs
+        set.insert(&Trible::new(&xxx1, &xxx1, &id_as_inline(&other)));
+        // Near-miss: e == v but attribute differs
+        set.insert(&Trible::new(&xxx2, &other, &id_as_inline(&xxx2)));
+        // Near-miss: a == v but entity differs
+        set.insert(&Trible::new(&other, &xxx1, &id_as_inline(&xxx1)));
+
+        let q = find! {
+            (x: Inline<GenId>),
+            set.pattern(x, x, x)
+        };
+        let r: Vec<_> = q.collect();
+        assert_eq!(2, r.len(), "expected 2 self-self-self triples, got {}", r.len());
     }
 }

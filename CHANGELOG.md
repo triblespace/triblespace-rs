@@ -20,18 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cover the exclusion semantics, the positive case via a different
   attribute, and the closure interaction.
 - **Same-Variable handling in `TribleSetConstraint`.** All
-  duplicate-position cases are now arms in the existing match
-  dispatch in each of `estimate` / `propose` / `confirm`:
-  `pattern(x, a, x)` (self-edge, e==v), `pattern(x, x, v)`
-  (entity-equals-attribute, e==a), `pattern(e, x, x)`
-  (attribute-equals-value, a==v), plus the three free-position
-  variants. Each arm enumerates from the most selective covering
-  index (AEV/VAE/EAV) and checks `EAV.has_prefix` on a fully
-  constructed trible key — the position-equality IS the prefix
-  match. No HashSet, no parallel code path, no allocation per
-  candidate. `pattern(x, x, x)` (all three positions sharing one
-  Variable) still panics with a message pointing at the
-  EqualityConstraint workaround.
+  duplicate-position cases — including the full triple-share
+  `pattern(x, x, x)` — are arms in the existing match dispatch
+  in each of `estimate` / `propose` / `confirm`:
+  `pattern(x, a, x)` (e==v), `pattern(x, x, v)` (e==a),
+  `pattern(e, x, x)` (a==v), the three free-position variants,
+  and `pattern(x, x, x)` (e==a==v). Each arm enumerates from
+  the most selective covering index and checks
+  `EAV.has_prefix` on a fully constructed trible key — the
+  position-equality IS the prefix match. No HashSet, no
+  parallel code path, no allocation per candidate. All six
+  legal same-Variable shapes are now native; the engine no
+  longer rejects any well-formed `pattern(...)` call.
 - **Same-Variable handling in `RegularPathConstraint`.** When
   `start == end`, propose enumerates `all_nodes()` filtered by
   `has_path(id, id)` — only nodes with a self-loop via the path
