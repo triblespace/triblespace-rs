@@ -16,6 +16,7 @@ mod test_ns {
     attributes! {
         "BB00000000000000BB00000000000001" as pub link: inlineencodings::GenId;
         "BB00000000000000BB00000000000002" as pub label: inlineencodings::ShortString;
+        "BB00000000000000BB00000000000003" as pub other_link: inlineencodings::GenId;
     }
 }
 
@@ -1198,6 +1199,47 @@ proptest! {
         binding.unset(i);
         prop_assert_eq!(binding.get(i), None);
         prop_assert_eq!(binding.get(j), Some(&vj)); // j unaffected
+    }
+
+    #[test]
+    fn path_not_attr_reaches_via_other_attribute(
+        n_other in 1..5usize,
+    ) {
+        // NotAttr(link) should yield destinations reachable via
+        // any *other* GenId-valued attribute. Build outgoing
+        // edges via `other_link`; verify they appear in the
+        // result while `link` targets do not.
+        let mut set = TribleSet::new();
+        let start = rngid();
+        let t_link = rngid();
+        set += entity! { &start @ test_ns::link: &t_link };
+
+        let mut other_targets: HashSet<Inline<GenId>> = HashSet::new();
+        for _ in 0..n_other {
+            let t = rngid();
+            set += entity! { &start @ test_ns::other_link: &t };
+            other_targets.insert((&t).to_inline());
+        }
+        let link_attr_id = test_ns::link.raw();
+
+        let dests: HashSet<_> = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is((&start).to_inline()),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[PathOp::NotAttr(link_attr_id)],
+                ),
+            )
+        ).map(|(_, d)| d).collect();
+
+        prop_assert!(!dests.contains(&(&t_link).to_inline()),
+            "NotAttr(link) must exclude link's target");
+        for t in &other_targets {
+            prop_assert!(dests.contains(t),
+                "NotAttr(link) must include other_link's targets");
+        }
+        prop_assert_eq!(dests.len(), n_other,
+            "NotAttr(link) yields exactly other_link targets");
     }
 
     #[test]
