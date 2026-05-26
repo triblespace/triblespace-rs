@@ -600,6 +600,12 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        // Same-Variable case: rough upper bound is set size; the
+        // exact count requires scanning self-loops. Conservative
+        // estimate avoids the O(N) scan on every call.
+        if self.start == self.end && variable == self.start {
+            return Some(self.set.len());
+        }
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
@@ -616,6 +622,18 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        // Same-Variable case: `?x P+ ?x` (start and end map to
+        // the same VariableId). Enumerate only nodes with a
+        // self-loop via the path, rather than the cross-product
+        // of all reachable (start, end) pairs.
+        if self.start == self.end && variable == self.start {
+            let candidates = self.all_nodes();
+            proposals.extend(candidates.into_iter().filter(|v| {
+                id_from_value(v)
+                    .map_or(false, |id| has_path(&self.set, &self.expr, &id, &id))
+            }));
+            return;
+        }
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
@@ -659,6 +677,15 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        // Same-Variable case: filter proposals to those with a
+        // self-loop via the path expression.
+        if self.start == self.end && variable == self.start {
+            proposals.retain(|v| {
+                id_from_value(v)
+                    .map_or(false, |id| has_path(&self.set, &self.expr, &id, &id))
+            });
+            return;
+        }
         if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
                 if let Some(end_id) = id_from_value(end_val) {
