@@ -145,7 +145,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
                 self.set.eav.segmented_len(&prefix)
             }
-            _ => panic!(),
+            _ => panic!(
+                "TribleSetConstraint does not handle same-Variable in multiple \
+                 trible positions (e/a, e/v, or a/v). Use distinct Variables for \
+                 each position and join them with EqualityConstraint::new(a.index, \
+                 b.index). See wd_bench/docs/GAPS.md item 2 for the workaround."
+            ),
         } as usize)
     }
 
@@ -248,7 +253,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     .eav
                     .infixes(&prefix, &mut |&v: &[u8; 32]| proposals.push(v));
             }
-            _ => panic!(),
+            _ => panic!(
+                "TribleSetConstraint does not handle same-Variable in multiple \
+                 trible positions (e/a, e/v, or a/v). Use distinct Variables for \
+                 each position and join them with EqualityConstraint::new(a.index, \
+                 b.index). See wd_bench/docs/GAPS.md item 2 for the workaround."
+            ),
         }
     }
 
