@@ -11,7 +11,7 @@
 //! and revocation blobs so they're retrievable for verification when
 //! peers connect.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::PathBuf;
@@ -398,9 +398,6 @@ fn run_invite(
     // Verify the issuer's cap chain first — we don't sign delegations
     // off invalid/expired caps. This also confirms the cap blobs are
     // present locally so `fetch_cap_blob_pair` will succeed below.
-    use std::collections::HashSet;
-    let revoked: HashSet<VerifyingKey> = HashSet::new();
-
     let mut pile_for_fetch: PileBlake3 = open_pile(&pile_path)?;
     let issuer_pubkey = issuer_key.verifying_key();
     let snap_reader = {
@@ -413,7 +410,6 @@ fn run_invite(
         team_root,
         issuer_cap_sig_handle,
         issuer_pubkey,
-        &revoked,
         |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
             use triblespace_core::repo::BlobStoreGet;
             snap_reader
@@ -476,26 +472,21 @@ fn run_invite(
 }
 
 fn run_revoke(
-    pile_path: PathBuf,
-    team_root_secret_hex: String,
-    target_hex: String,
+    _pile_path: PathBuf,
+    _team_root_secret_hex: String,
+    _target_hex: String,
 ) -> Result<()> {
-    let mut pile = open_pile(&pile_path)?;
-    let team_root = parse_secret_hex(&team_root_secret_hex)?;
-    let target = parse_pubkey_hex(&target_hex)?;
-
-    let (rev_blob, sig_blob) = capability::build_revocation(&team_root, target);
-
-    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-    store_blob(&mut pile, rev_blob)?;
-    store_blob(&mut pile, sig_blob)?;
-
-    let _ = pile.close();
-
-    println!("revocation (sig): {}", hex::encode(sig_handle.raw));
-    println!("(propagate via gossip; team peers will pick it up next sync)");
-
-    Ok(())
+    // Revocation blobs no longer exist in the descriptive-caps model
+    // (see decide#4b321c47 / decide#4b59ce27). Eviction = local
+    // retraction of auto-renewal + natural cap expiry. The `team
+    // revoke` subcommand will be replaced by `team retract` once the
+    // local retraction-policy branch is wired in.
+    bail!(
+        "`team revoke` is removed in the descriptive-caps model. \
+         Eviction is now local per-issuer non-renewal — see \
+         decide#4b59ce27. The replacement `team retract` subcommand \
+         is not yet implemented."
+    )
 }
 
 /// Describe a single capability for the `team list` audit view.
@@ -547,10 +538,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
     let mut caps: Vec<CapSummary> = Vec::new();
-    let mut revocations_found = 0usize;
-    // Buffer all SimpleArchive-decodable blobs so we can pair revocation
-    // (rev, sig) blobs after the scan.
-    let mut all_blobs: Vec<Blob<SimpleArchive>> = Vec::new();
 
     use triblespace_core::blob::TryFromBlob;
     for handle_result in reader.blobs() {
@@ -566,7 +553,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(b) => b,
             Err(_) => continue,
         };
-        all_blobs.push(blob.clone());
         let set: TribleSet = match TryFromBlob::try_from_blob(blob) {
             Ok(s) => s,
             Err(_) => continue,
@@ -622,20 +608,11 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             });
         }
 
-        let rev_count = find!(
-            (e: Id, target: VerifyingKey),
-            pattern!(&set, [{ ?e @ capability::rev_target: ?target }])
-        )
-        .count();
-        if rev_count > 0 {
-            revocations_found += rev_count;
-        }
     }
 
     let _ = pile.close();
 
     println!("capabilities in pile:  {}", caps.len());
-    println!("revocations in pile:   {revocations_found}");
 
     if !caps.is_empty() {
         // Sort by expiry ascending (soonest-to-expire first), so
@@ -693,32 +670,10 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
         }
     }
 
-    if revocations_found > 0 {
-        // Pair rev+sig blobs and surface the (revoker, target) tuples.
-        // No authorisation policy applied here — `team list` is a
-        // pile-wide audit view, not a relay-policy view.
-        let pairs = capability::extract_revocation_pairs(all_blobs);
-        if !pairs.is_empty() {
-            println!("  revoked pubkeys:");
-            for (rev_blob, sig_blob) in pairs {
-                match capability::verify_revocation(rev_blob, sig_blob) {
-                    Ok((revoker, target)) => {
-                        println!(
-                            "    {}  (revoked by {})",
-                            hex::encode(target.to_bytes()),
-                            hex::encode(revoker.to_bytes()),
-                        );
-                    }
-                    Err(_) => {
-                        // Pair didn't verify (e.g. tampered blob); skip
-                        // the line. The structural count above already
-                        // reported the rev_target, so absence here is a
-                        // useful signal something is off.
-                    }
-                }
-            }
-        }
-    }
+    // Revocation enumeration removed — revocations no longer exist
+    // in the descriptive-caps model. See decide#4b321c47. A future
+    // `team list-issued` / `team list-pending` will show A's local
+    // auto-renew branch.
     Ok(())
 }
 
@@ -740,22 +695,20 @@ fn run_show(
         .reader()
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
-    // Walk the chain. State carried between iterations:
-    //   current_sig_label: the sig blob handle we displayed for
-    //     the current level (only meaningful at depth 0; beyond
-    //     that the sig is embedded in the previous cap and has
-    //     no standalone handle — we display "(embedded)").
+    // Walk the chain via the leaf sig blob's recursive embedded
+    // proofs. In the new (descriptive-caps) model, all chain
+    // references live in the sig blob — cap blobs are pure
+    // declarations. State carried between iterations:
+    //   current_outer_id: the entity in `sig_set` whose attached
+    //     signature attests to the cap we're about to print. Starts
+    //     at the leaf-outer entity (the one carrying `sig_signs`);
+    //     advances to embedded sub-entities via
+    //     `sig_embedded_parent_proof` as we walk upward.
     //   current_cap_handle: cap blob to decode + print this iter.
-    //   current_signer: pubkey whose signature attests to that
-    //     cap's bytes (from the leaf sig blob at depth 0, from
-    //     the previous cap's embedded parent sig at depth N>0).
-    //
-    // Resolve the leaf-level state by loading the leaf sig blob
-    // once, before the loop.
     let leaf_sig_blob: Blob<SimpleArchive> = reader
         .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
         .map_err(|e| anyhow!("fetch sig blob {}: {e:?}", hex::encode(leaf_sig.raw)))?;
-    let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
+    let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
         .map_err(|e| anyhow!("parse sig blob: {e:?}"))?;
     let mut leaf_iter = find!(
         (
@@ -763,17 +716,19 @@ fn run_show(
             signed: Inline<Handle<SimpleArchive>>,
             signer: VerifyingKey
         ),
-        pattern!(&leaf_sig_set, [{
+        pattern!(&sig_set, [{
             ?sig @
             capability::sig_signs: ?signed,
             triblespace_core::repo::signed_by: ?signer,
         }])
     );
-    let (_, mut current_cap_handle, mut current_signer) = match (leaf_iter.next(), leaf_iter.next()) {
-        (Some(row), None) => row,
-        _ => return Err(anyhow!("malformed sig blob — expected exactly one (sig_signs, signed_by) tuple")),
-    };
-    let mut current_sig_label: String = hex::encode(leaf_sig.raw);
+    let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
+        match (leaf_iter.next(), leaf_iter.next()) {
+            (Some(row), None) => row,
+            _ => return Err(anyhow!(
+                "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
+            )),
+        };
     let mut depth = 0usize;
     const MAX_DEPTH: usize = 32;
 
@@ -853,57 +808,54 @@ fn run_show(
         println!("  subject:  {}", hex::encode(subject.to_bytes()));
         println!("  scope:    {perm_str}{branch_str}");
         println!("  expires:  {}", format_expiry(&expiry));
-        println!("  sig blob: {current_sig_label}");
         println!("  cap blob: {}", hex::encode(cap_handle.raw));
         println!("  signer matches cap_issuer: {signer_matches_issuer}");
 
-        // Find parent cap_parent + cap_embedded_parent_sig handles
-        // to walk one level up. If absent, this is the root link.
+        // Look for sig_parent_cap + sig_embedded_parent_proof on the
+        // CURRENT outer entity inside the SIG blob's tribleset (these
+        // live in the sig blob, not the cap blob, in the new model).
         let parent_pair = find!(
             (
-                e: Id,
                 parent_cap: Inline<Handle<SimpleArchive>>,
-                parent_sig_id: Id,
+                parent_proof_id: Id,
             ),
-            pattern!(&cap_set, [{
-                ?e @
-                capability::cap_parent: ?parent_cap,
-                capability::cap_embedded_parent_sig: ?parent_sig_id,
+            pattern!(&sig_set, [{
+                current_outer_id @
+                capability::sig_parent_cap: ?parent_cap,
+                capability::sig_embedded_parent_proof: ?parent_proof_id,
             }])
         )
         .next();
 
         match parent_pair {
             None => {
-                println!("  ↳ root link (no cap_parent — signer should be team root)");
+                println!("  ↳ root link (no sig_parent_cap — signer should be team root)");
                 println!();
                 break;
             }
-            Some((_, parent_cap, parent_sig_id)) => {
-                // Embedded parent sig: a sub-entity in this cap
-                // blob carrying signed_by (the next-level signer).
-                // Pull it out so we can keep walking without
-                // needing a separate sig blob.
+            Some((parent_cap, parent_proof_id)) => {
+                // Pull the next-level signer out of the embedded
+                // parent proof sub-entity.
                 let mut iter = find!(
                     (next_signer: VerifyingKey),
-                    pattern!(&cap_set, [{
-                        parent_sig_id @
+                    pattern!(&sig_set, [{
+                        parent_proof_id @
                         triblespace_core::repo::signed_by: ?next_signer
                     }])
                 );
                 let next_signer = match iter.next() {
                     Some((s,)) => s,
                     None => {
-                        println!("  ⚠ embedded parent sig missing signed_by — chain broken");
+                        println!("  ⚠ embedded parent proof missing signed_by — chain broken");
                         println!();
                         break;
                     }
                 };
-                println!("  ↳ chained from parent");
+                println!("  ↳ chained from parent (embedded proof)");
                 println!();
+                current_outer_id = parent_proof_id;
                 current_cap_handle = parent_cap;
                 current_signer = next_signer;
-                current_sig_label = "(embedded in level above)".to_string();
                 depth += 1;
             }
         }
@@ -972,14 +924,11 @@ fn run_show(
                 .get::<Blob<SimpleArchive>, SimpleArchive>(h)
                 .ok()
         };
-        let revoked: std::collections::HashSet<VerifyingKey> =
-            std::collections::HashSet::new();
 
         match capability::verify_chain(
             team_root,
             leaf_sig,
             leaf_subject,
-            &revoked,
             fetch,
         ) {
             Ok(verified) => {

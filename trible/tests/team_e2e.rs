@@ -90,10 +90,6 @@ fn team_full_lifecycle() {
         list1_out.contains("capabilities in pile:  1"),
         "post-create has one cap; got:\n{list1_out}"
     );
-    assert!(
-        list1_out.contains("revocations in pile:   0"),
-        "post-create has zero revocations; got:\n{list1_out}"
-    );
     // The capability detail line lists the founder cap with
     // PERM_ADMIN scope. Format: `<short-hex> → <short-hex> (PERM_ADMIN, expires …)`.
     assert!(
@@ -167,10 +163,6 @@ fn team_full_lifecycle() {
         list2_out.contains("capabilities in pile:  2"),
         "post-invite has two caps; got:\n{list2_out}"
     );
-    assert!(
-        list2_out.contains("revocations in pile:   0"),
-        "still zero revocations; got:\n{list2_out}"
-    );
     // The invitee was issued a PERM_READ scope cap; both that and
     // the founder's PERM_ADMIN cap should appear in the detail.
     assert!(
@@ -178,49 +170,13 @@ fn team_full_lifecycle() {
         "post-invite lists both PERM_ADMIN (founder) and PERM_READ (invitee); got:\n{list2_out}"
     );
 
-    Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "revoke",
-            "--pile",
-            pile_path.to_str().unwrap(),
-            "--team-root-secret",
-            &team_root_secret,
-            "--target",
-            &invitee_pubkey,
-        ])
-        .assert()
-        .success();
-
-    let list3 = Command::cargo_bin("trible")
-        .unwrap()
-        .args([
-            "team",
-            "list",
-            "--pile",
-            pile_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let list3_out =
-        String::from_utf8(list3.get_output().stdout.clone()).unwrap();
-    assert!(
-        list3_out.contains("revocations in pile:   1"),
-        "post-revoke has one revocation; got:\n{list3_out}"
-    );
-    // The revoked-pubkey breakdown surfaces the invitee's full pubkey,
-    // demonstrating that the (rev, sig) pairing + verify_revocation
-    // round-trip works on a real pile.
-    assert!(
-        list3_out.contains("revoked pubkeys:"),
-        "list output includes the revoked-pubkey section; got:\n{list3_out}"
-    );
-    assert!(
-        list3_out.contains(&invitee_pubkey),
-        "invitee pubkey {} appears in revoked list; got:\n{list3_out}",
-        invitee_pubkey,
-    );
+    // Revocation step removed — descriptive-caps model evicts via
+    // per-issuer non-renewal (decide#4b59ce27), not by issuing
+    // revocation blobs. `team revoke` now bails with a migration
+    // notice; the replacement `team retract` operation acts on a
+    // local-only renewal-policy branch (not yet implemented).
+    let _ = &team_root_secret; // silence unused-variable for now
+    let _ = &invitee_pubkey;
 }
 
 #[test]
@@ -504,9 +460,10 @@ fn show_walks_chain_end_to_end() {
         chain_out.contains("PERM_READ") && chain_out.contains("PERM_ADMIN"),
         "invitee show shows both PERM_READ and PERM_ADMIN; got:\n{chain_out}"
     );
-    // Level 1's sig is embedded — the label should reflect that.
+    // Level 1's sig is embedded in the leaf sig blob now (sig-blob
+    // chain proof), and the chain still bottoms out at root.
     assert!(
-        chain_out.contains("(embedded in level above)"),
+        chain_out.contains("embedded proof") || chain_out.contains("chained from parent"),
         "level 1 marks its sig as embedded; got:\n{chain_out}"
     );
     // Level 1 should also be flagged as root.
