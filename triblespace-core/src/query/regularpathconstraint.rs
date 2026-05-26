@@ -638,8 +638,13 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                     // itself is a valid start for reflexive paths
                     // (`(p)*`, `(p)?`) per SPARQL semantics, even if
                     // it doesn't otherwise appear in the graph.
-                    let mut candidates = self.all_nodes();
-                    candidates.push(id_into_value(&end_id));
+                    // Dedup via HashSet — `end_id` is usually already
+                    // in `all_nodes()` (as a value of some trible),
+                    // and a duplicated candidate would propagate as a
+                    // duplicate row through `proposals`.
+                    let mut candidates: HashSet<RawInline> =
+                        self.all_nodes().into_iter().collect();
+                    candidates.insert(id_into_value(&end_id));
                     proposals.extend(candidates.into_iter().filter(|v| {
                         id_from_value(v)
                             .map_or(false, |sid| has_path(&self.set, &self.expr, &sid, &end_id))
