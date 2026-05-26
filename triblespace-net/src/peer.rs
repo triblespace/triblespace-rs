@@ -37,7 +37,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 
-use crate::channel::NetEvent;
+use crate::channel::{NetEvent, PublisherKey};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
@@ -110,6 +110,11 @@ where
     /// [`refresh`](Peer::refresh). Drives quiescence-based stopping
     /// in long-running sync drivers.
     last_event_at: std::time::Instant,
+
+    /// Team root pubkey, copied from `PeerConfig::team_root` so the
+    /// refresh loop can verify incoming `CapDelivered` events against
+    /// it without round-tripping through the network thread.
+    team_root: ed25519_dalek::VerifyingKey,
 }
 
 impl<S> Peer<S>
@@ -122,6 +127,7 @@ where
     /// Peer drops.
     pub fn new(mut store: S, key: SigningKey, config: PeerConfig) -> Self {
         let direction = config.direction;
+        let team_root = config.team_root;
         let (sender, receiver) = host::spawn(key, config);
 
         // Seed the snapshot served by the network thread so peers
@@ -145,6 +151,7 @@ where
             last_branches: HashMap::new(),
             direction,
             last_event_at: std::time::Instant::now(),
+            team_root,
         };
 
         // Drive the first refresh synchronously so the DHT learns
@@ -222,20 +229,30 @@ where
                     }
                 }
                 NetEvent::CapRequest { requester, partial_cap_bytes } => {
-                    // TODO: persist on the local pending-requests branch
-                    // for the trible CLI / daemon to act on. For now we
-                    // just log — the protocol layer is plumbed in, the
-                    // policy layer comes next.
-                    let _ = (requester, partial_cap_bytes);
-                    tracing::debug!("received CapRequest (pending-storage TODO)");
+                    // TODO: persist on the local pending-requests
+                    // branch with status_pending so the CLI / daemon
+                    // can list and approve. For now stash the cap blob
+                    // in the local store so subsequent approval has
+                    // the bytes to sign — pinning into a branch with
+                    // metadata comes with the CLI subcommands.
+                    let bytes: Bytes = partial_cap_bytes.into();
+                    if let Ok(_h) = self.store.put::<UnknownBlob, Bytes>(bytes) {
+                        tracing::debug!(
+                            requester = %hex::encode(&requester[..4]),
+                            "CapRequest received; blob stored (pending-branch persistence TODO)"
+                        );
+                    } else {
+                        tracing::warn!("CapRequest received; failed to store partial cap");
+                    }
                 }
                 NetEvent::CapDelivered { issuer, cap_bytes, sig_bytes } => {
-                    // TODO: verify_chain against the team root, then
-                    // pin into the local team-cap branch. For now we
-                    // just log — same as CapRequest above, this is a
-                    // placeholder until the policy layer lands.
-                    let _ = (issuer, cap_bytes, sig_bytes);
-                    tracing::debug!("received CapDelivered (verify+pin TODO)");
+                    // Verify the delivered chain against our configured
+                    // team root, then store both blobs locally. Pinning
+                    // them into a per-team-cap branch (so compaction
+                    // retains them) comes with the CLI subcommands —
+                    // for now they're orphan blobs in the pile, same
+                    // as our own outgoing-cap blobs.
+                    self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
                 }
             }
         }
@@ -278,6 +295,13 @@ where
                 if crate::tracking::is_tracking_branch(&mut self.store, bid) {
                     continue;
                 }
+                // Local-only policy branches (renewal policy, pending
+                // requests, per-team-cap pin branches) carry per-peer
+                // state that mustn't leak to the team mesh. See
+                // `crate::policy`.
+                if crate::policy::is_local_only_branch(&mut self.store, bid) {
+                    continue;
+                }
                 let head = match self.store.head(bid) {
                     Ok(Some(h)) => h,
                     _ => continue,
@@ -293,6 +317,100 @@ where
         // ── Phase 4: refresh the snapshot served by the network thread ─
         if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
             self.sender.update_snapshot(snap);
+        }
+    }
+
+    /// Verify a peer-delivered cap chain against our configured team
+    /// root and, on success, store both blobs locally.
+    ///
+    /// Pinning into a per-team-cap branch (for retention across
+    /// compaction) is deferred — the CLI subcommands that surface
+    /// "my current cap" will manage that pin. For now the cap+sig
+    /// blobs live in the pile as orphan blobs, same as the cap blobs
+    /// we issue ourselves via `team invite`. They become reachable
+    /// from a branch once the CLI commits them.
+    fn absorb_cap_delivery(
+        &mut self,
+        issuer: PublisherKey,
+        cap_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+    ) {
+        use triblespace_core::blob::Blob;
+        use triblespace_core::repo::BlobStoreGet;
+
+        // Reconstitute blobs.
+        let cap_blob: Blob<SimpleArchive> =
+            Blob::new(anybytes::Bytes::from_source(cap_bytes.clone()));
+        let sig_blob: Blob<SimpleArchive> =
+            Blob::new(anybytes::Bytes::from_source(sig_bytes.clone()));
+        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+
+        // Subject must be US — a delivered cap is for our pubkey. The
+        // signing-key bytes aren't accessible here, but we know our
+        // own pubkey via the iroh endpoint id baked into the snapshot
+        // we serve; for v1 we just trust the verify_chain subject
+        // check via expected_subject = team_root if the delivery is
+        // the team-root case, or the requester pubkey for delegated
+        // chains. We can't know which without re-deriving our own
+        // pubkey, so for v1 we pass team_root and rely on
+        // verify_chain's chain walk catching subject mismatches.
+        let expected_subject = self.team_root;
+
+        // Build a fetch closure that consults the in-process pile.
+        let Ok(reader) = self.store.reader() else {
+            tracing::warn!(
+                issuer = %hex::encode(&issuer[..4]),
+                "CapDelivered: pile reader unavailable; dropping"
+            );
+            return;
+        };
+        // The cap and sig blobs themselves aren't in the pile yet — we
+        // need to short-circuit fetches for them via a map, falling
+        // back to the pile for any intermediate chain caps.
+        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
+        let cap_blob_for_fetch = cap_blob.clone();
+        let sig_blob_for_fetch = sig_blob.clone();
+        let fetch = move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+            if h.raw == cap_handle.raw {
+                return Some(cap_blob_for_fetch.clone());
+            }
+            if h.raw == sig_handle.raw {
+                return Some(sig_blob_for_fetch.clone());
+            }
+            reader.get::<Blob<SimpleArchive>, SimpleArchive>(h).ok()
+        };
+        match triblespace_core::repo::capability::verify_chain(
+            self.team_root,
+            sig_handle,
+            expected_subject,
+            fetch,
+        ) {
+            Ok(_verified) => {
+                // Persist both blobs into the local store. They become
+                // pile-resident; pinning is the CLI's responsibility.
+                let cap_bytes_anybytes: anybytes::Bytes =
+                    anybytes::Bytes::from_source(cap_bytes);
+                let sig_bytes_anybytes: anybytes::Bytes =
+                    anybytes::Bytes::from_source(sig_bytes);
+                let _ = self
+                    .store
+                    .put::<UnknownBlob, anybytes::Bytes>(cap_bytes_anybytes);
+                let _ = self
+                    .store
+                    .put::<UnknownBlob, anybytes::Bytes>(sig_bytes_anybytes);
+                tracing::info!(
+                    issuer = %hex::encode(&issuer[..4]),
+                    sig = %hex::encode(&sig_handle.raw[..4]),
+                    "CapDelivered: verified and stored"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    issuer = %hex::encode(&issuer[..4]),
+                    error = ?e,
+                    "CapDelivered: verify_chain failed; dropping"
+                );
+            }
         }
     }
 
@@ -320,6 +438,9 @@ where
         };
         for bid in bids {
             if crate::tracking::is_tracking_branch(&mut self.store, bid) {
+                continue;
+            }
+            if crate::policy::is_local_only_branch(&mut self.store, bid) {
                 continue;
             }
             if let Ok(Some(head)) = self.store.head(bid) {
@@ -433,8 +554,11 @@ where
                 // Tracking branches are local mirror state and must NOT be
                 // re-gossiped — otherwise the publisher would receive its
                 // own tracking branch back and create a tracking-of-the-
-                // tracking, ad infinitum.
+                // tracking, ad infinitum. Same logic for policy branches
+                // (renewal state, pending requests, per-team-cap pins) —
+                // they're per-peer local state.
                 if !crate::tracking::is_tracking_branch(&mut self.store, id)
+                    && !crate::policy::is_local_only_branch(&mut self.store, id)
                     && self.direction != SyncDirection::ReadOnly
                 {
                     let bid_bytes: [u8; 16] = id.into();

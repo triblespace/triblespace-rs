@@ -13,6 +13,7 @@ pub mod dht;
 pub mod handshake;
 mod host;
 pub mod peer;
+pub mod policy;
 pub mod protocol;
 pub mod identity;
 pub mod tracking;
