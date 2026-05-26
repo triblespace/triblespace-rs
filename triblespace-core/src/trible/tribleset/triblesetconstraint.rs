@@ -49,6 +49,42 @@ impl TribleSetConstraint {
             set,
         }
     }
+
+    /// Enumerates the set of entity ids `x` for which a self-edge
+    /// `(x, a, x)` exists in the underlying [`TribleSet`]. Used to
+    /// support `source.pattern(x, _, x)` where the same `Variable` is
+    /// passed in both the entity and value position.
+    ///
+    /// If `a_bound` is `Some`, only self-edges with the bound
+    /// attribute are returned. Otherwise self-edges across all
+    /// attributes are included.
+    ///
+    /// Returns deduplicated ids; the same entity with multiple
+    /// self-edge attributes appears once.
+    fn self_edge_entities(&self, a_bound: Option<&[u8; ID_LEN]>) -> std::collections::HashSet<[u8; ID_LEN]> {
+        let mut result = std::collections::HashSet::new();
+        for t in self.set.iter() {
+            // Self-edge requires the value to be a `GenId`-encoded
+            // entity reference (upper 16 bytes zero), with the
+            // remaining 16 id-bytes matching the entity.
+            let v_bytes = &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN];
+            if v_bytes[..ID_LEN] != [0u8; ID_LEN] {
+                continue;
+            }
+            let e_bytes: [u8; ID_LEN] = t.data[..ID_LEN].try_into().unwrap();
+            if e_bytes[..] != v_bytes[ID_LEN..] {
+                continue;
+            }
+            if let Some(a) = a_bound {
+                let a_bytes = &t.data[ID_LEN..ID_LEN + ID_LEN];
+                if a_bytes != a.as_slice() {
+                    continue;
+                }
+            }
+            result.insert(e_bytes);
+        }
+        result
+    }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
@@ -92,6 +128,16 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             None
         };
         let v_bound = binding.get(self.variable_v);
+
+        // Same-Variable in entity and value positions (self-edge
+        // pattern `pattern(x, a, x)`). When the queried variable
+        // occupies both slots, fall back to a scan-and-count over
+        // self-edges in the underlying set.
+        if e_var && v_var && !a_var {
+            // The queried variable is free in this branch (otherwise
+            // the planner would not call `estimate` for it).
+            return Some(self.self_edge_entities(a_bound.as_ref()).len());
+        }
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => self.set.eav.segmented_len(&[0; 0]),
@@ -179,6 +225,17 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             None
         };
         let v_bound = binding.get(self.variable_v);
+
+        // Same-Variable case (`pattern(x, a, x)` — entity equals
+        // value). Enumerate self-edge entities from the underlying
+        // set, filtering by the attribute if it's bound. See
+        // [`Self::self_edge_entities`] for the scan logic.
+        if e_var && v_var && !a_var {
+            for e_id in self.self_edge_entities(a_bound.as_ref()) {
+                proposals.push(id_into_value(&e_id));
+            }
+            return;
+        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -288,6 +345,20 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             None
         };
         let v_bound = binding.get(self.variable_v);
+
+        // Same-Variable case: keep only proposals that correspond to
+        // self-edge entities. Look up the self-edge set once and
+        // retain proposals that hit it.
+        if e_var && v_var && !a_var {
+            let self_edges = self.self_edge_entities(a_bound.as_ref());
+            proposals.retain(|value| {
+                match id_from_value(value) {
+                    Some(id) => self_edges.contains(&id),
+                    None => false,
+                }
+            });
+            return;
+        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => proposals.retain(|value| {
@@ -437,5 +508,58 @@ mod tests {
         let r: Vec<_> = q.collect();
 
         assert_eq!(1, r.len())
+    }
+
+    #[test]
+    fn self_edge_pattern_e_eq_v() {
+        // Verify `pattern(x, a, x)` (same Variable in entity and
+        // value positions) enumerates self-edge entities without
+        // panicking. Adds 3 self-edges and 2 non-self tribles for
+        // the same attribute; the query should return exactly 3.
+        use crate::inline::encodings::genid::GenId;
+        use crate::and;
+
+        // Helper: encode a 16-byte id as a GenId-style Inline value
+        // (32 bytes: upper 16 zero, lower 16 = id).
+        fn id_as_inline(id: &[u8; 16]) -> Inline<GenId> {
+            let mut bytes = [0u8; 32];
+            bytes[16..32].copy_from_slice(id);
+            Inline::<GenId>::new(bytes)
+        }
+
+        let mut set = TribleSet::new();
+        let a = rngid();
+        let self1 = rngid();
+        let self2 = rngid();
+        let self3 = rngid();
+        let other = rngid();
+
+        // 3 self-edges: x has attribute a with value x
+        for x in [&self1, &self2, &self3] {
+            set.insert(&Trible::new(x, &a, &id_as_inline(x)));
+        }
+        // 2 non-self tribles with the same attribute
+        set.insert(&Trible::new(&self1, &a, &id_as_inline(&other)));
+        set.insert(&Trible::new(&other, &a, &id_as_inline(&self2)));
+
+        // Free attribute: count all self-edges
+        let q = find! {
+            (x: Inline<GenId>, attr: Inline<GenId>),
+            set.pattern(x, attr, x)
+        };
+        let r: Vec<_> = q.collect();
+        assert_eq!(3, r.len(), "expected 3 self-edges, got {}", r.len());
+
+        // Bound attribute: should still be 3 since only attribute a
+        // appears in our self-edges
+        let q = find! {
+            (x: Inline<GenId>, attr: Inline<GenId>),
+            and!(
+                attr.is(id_as_inline(&a)),
+                set.pattern(x, attr, x)
+            )
+        };
+        let r: Vec<_> = q.collect();
+        assert_eq!(3, r.len(), "expected 3 self-edges with bound attr, got {}", r.len());
     }
 }
