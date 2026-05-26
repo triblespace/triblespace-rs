@@ -69,6 +69,10 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     #[derive(Clone)]
     enum Tok {
         Sym(Path),
+        /// `!p` — negated property set with a single attribute.
+        /// Lex-time prefix: `!` followed by a Sym collapses into
+        /// NotSym at the same precedence as Sym.
+        NotSym(Path),
         Or,
         Star,
         Plus,
@@ -80,6 +84,10 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     fn lex(ts: &[TokenTree]) -> syn::Result<Vec<Tok>> {
         let mut out = Vec::new();
         let mut i = 0usize;
+        // Track whether the previous output was `!` — if so, the
+        // next Sym should collapse into NotSym (negated property
+        // set on a single attribute). SPARQL 1.1 §17.5 PathPrimary.
+        let mut pending_not = false;
         while i < ts.len() {
             match &ts[i] {
                 TokenTree::Ident(_) => {
@@ -102,11 +110,20 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     let path: Path = syn::parse_str(&s).map_err(|e| {
                         syn::Error::new(ts[i].span(), format!("invalid path in regex: {}", e))
                     })?;
-                    out.push(Tok::Sym(path));
+                    if pending_not {
+                        out.push(Tok::NotSym(path));
+                        pending_not = false;
+                    } else {
+                        out.push(Tok::Sym(path));
+                    }
                     i = j;
                 }
                 TokenTree::Punct(p) if p.as_char() == '|' => {
                     out.push(Tok::Or);
+                    i += 1;
+                }
+                TokenTree::Punct(p) if p.as_char() == '!' => {
+                    pending_not = true;
                     i += 1;
                 }
                 TokenTree::Punct(p) if p.as_char() == '*' => {
@@ -122,6 +139,13 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     i += 1;
                 }
                 TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
+                    if pending_not {
+                        return Err(syn::Error::new(
+                            ts[i].span(),
+                            "multi-attribute negated property set `!{...}` is not yet \
+                             supported (single-attribute `!p` works)",
+                        ));
+                    }
                     i += 1;
                     out.push(Tok::LParen);
                     out.extend(lex(&g.stream().into_iter().collect::<Vec<_>>())?);
@@ -135,12 +159,19 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                 }
             }
         }
+        if pending_not {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "`!` must be followed by an attribute name",
+            ));
+        }
         Ok(out)
     }
 
     #[derive(Clone)]
     enum OpTok {
         Sym(Path),
+        NotSym(Path),
         Or,
         Concat,
         Star,
@@ -153,8 +184,13 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     fn needs_concat(a: &Tok, b: &Tok) -> bool {
         matches!(
             a,
-            Tok::Sym(_) | Tok::RParen | Tok::Star | Tok::Plus | Tok::Question
-        ) && matches!(b, Tok::Sym(_) | Tok::LParen)
+            Tok::Sym(_)
+                | Tok::NotSym(_)
+                | Tok::RParen
+                | Tok::Star
+                | Tok::Plus
+                | Tok::Question
+        ) && matches!(b, Tok::Sym(_) | Tok::NotSym(_) | Tok::LParen)
     }
 
     let lexed = lex(regex_tokens)?;
@@ -163,6 +199,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     for i in 0..lexed.len() {
         match &lexed[i] {
             Tok::Sym(p) => infix.push(OpTok::Sym(p.clone())),
+            Tok::NotSym(p) => infix.push(OpTok::NotSym(p.clone())),
             Tok::Or => infix.push(OpTok::Or),
             Tok::Star => infix.push(OpTok::Star),
             Tok::Plus => infix.push(OpTok::Plus),
@@ -192,7 +229,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     let mut stack = Vec::<OpTok>::new();
     for token in infix {
         match token {
-            OpTok::Sym(_) => output.push(token),
+            OpTok::Sym(_) | OpTok::NotSym(_) => output.push(token),
             OpTok::LParen => stack.push(OpTok::LParen),
             OpTok::RParen => {
                 while let Some(op) = stack.pop() {
@@ -228,6 +265,9 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
         .map(|t| match t {
             OpTok::Sym(path) => {
                 quote! { PathOp::Attr(#path.raw()) }
+            }
+            OpTok::NotSym(path) => {
+                quote! { PathOp::NotAttr(#path.raw()) }
             }
             OpTok::Or => quote! { PathOp::Union },
             OpTok::Concat => quote! { PathOp::Concat },

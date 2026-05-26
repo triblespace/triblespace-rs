@@ -59,6 +59,33 @@ fn repetition() {
 }
 
 #[test]
+fn not_attr_single_attribute() {
+    // `!social::follows` — any predicate other than `follows`.
+    // kb has A→B via follows and A→C via likes. NotAttr(follows)
+    // from A should yield C only.
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    let c = fucid();
+    kb += entity! { &a @ social::follows: &b };
+    kb += entity! { &a @ social::likes: &c };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let c_val = c.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(a_val), path!(kb.clone(), s !social::follows e)))
+    .map(|(_, e)| e)
+    .collect();
+
+    assert!(!results.contains(&b_val),
+        "!follows excludes the follows destination");
+    assert!(results.contains(&c_val),
+        "!follows includes the likes destination");
+    assert_eq!(results.len(), 1, "exactly one destination: {:?}", results);
+}
+
+#[test]
 fn optional_question_mark() {
     // `social::follows?` — zero or one hop. With kb containing
     // a single A→B edge, the bound-start form should reach both
