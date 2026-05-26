@@ -81,6 +81,38 @@ fn inverse_prefix_single() {
 }
 
 #[test]
+fn inverse_of_group() {
+    // `^(social::follows | social::likes)` — inverse applied
+    // to a parenthesised Union. kb has A→B via follows and
+    // A→C via likes. From B (bound end), ^(follows|likes)
+    // reaches A. From C, also reaches A.
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    let c = fucid();
+    kb += entity! { &a @ social::follows: &b };
+    kb += entity! { &a @ social::likes: &c };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let c_val = c.to_inline();
+
+    let from_b: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(b_val), path!(kb.clone(), s ^(social::follows | social::likes) e)))
+    .map(|(_, e)| e)
+    .collect();
+    assert!(from_b.contains(&a_val),
+        "^(follows|likes) from B reaches A");
+
+    let from_c: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(c_val), path!(kb.clone(), s ^(social::follows | social::likes) e)))
+    .map(|(_, e)| e)
+    .collect();
+    assert!(from_c.contains(&a_val),
+        "^(follows|likes) from C reaches A");
+}
+
+#[test]
 fn inverse_with_postfix_modifier() {
     // `^social::follows+` — SPARQL precedence: ^ applies to
     // the PathElt `follows+`. Postfix tape: [Attr, Plus, Inverse].
