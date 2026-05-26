@@ -221,6 +221,22 @@ where
                         }
                     }
                 }
+                NetEvent::CapRequest { requester, partial_cap_bytes } => {
+                    // TODO: persist on the local pending-requests branch
+                    // for the trible CLI / daemon to act on. For now we
+                    // just log — the protocol layer is plumbed in, the
+                    // policy layer comes next.
+                    let _ = (requester, partial_cap_bytes);
+                    tracing::debug!("received CapRequest (pending-storage TODO)");
+                }
+                NetEvent::CapDelivered { issuer, cap_bytes, sig_bytes } => {
+                    // TODO: verify_chain against the team root, then
+                    // pin into the local team-cap branch. For now we
+                    // just log — same as CapRequest above, this is a
+                    // placeholder until the policy layer lands.
+                    let _ = (issuer, cap_bytes, sig_bytes);
+                    tracing::debug!("received CapDelivered (verify+pin TODO)");
+                }
             }
         }
 

@@ -15,7 +15,7 @@ use iroh_base::{EndpointAddr, EndpointId};
 use ed25519_dalek::SigningKey;
 use tracing::{debug, debug_span, error, info, info_span, instrument, warn, Instrument};
 
-use crate::channel::{NetCommand, NetEvent};
+use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 
@@ -449,6 +449,17 @@ async fn host_loop(
         my_id,
     };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
+
+    // Auth-handshake ALPN (separate from PILE_SYNC because it's open
+    // to unauthenticated peers — a peer requesting their first cap
+    // has nothing to present at OP_AUTH yet). The handler forwards
+    // incoming requests/deliveries to the Peer's event channel; the
+    // Peer surfaces them via NetEvent::CapRequest / CapDelivered.
+    let handshake_handler = HandshakeHandler {
+        events: events.clone(),
+    };
+    router_builder = router_builder
+        .accept(crate::handshake::AUTH_HANDSHAKE_ALPN, handshake_handler);
 
     // Gossip.
     let mut gossip_sender: Option<GossipSender> = None;
@@ -1088,6 +1099,101 @@ struct SnapshotHandler {
 impl std::fmt::Debug for SnapshotHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotHandler").finish()
+    }
+}
+
+/// Protocol handler for `/triblespace/auth-handshake/1`. Accepts
+/// incoming `OP_REQUEST_CAP` and `OP_DELIVER_CAP` streams and
+/// forwards their payloads to the Peer's event channel. All policy
+/// (approve / queue / reject; verify / pin / drop) lives in the
+/// receiving Peer, not here — this handler just bridges the wire to
+/// the local event queue.
+#[derive(Clone)]
+struct HandshakeHandler {
+    events: mpsc::Sender<NetEvent>,
+}
+
+impl std::fmt::Debug for HandshakeHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeHandler").finish()
+    }
+}
+
+impl iroh::protocol::ProtocolHandler for HandshakeHandler {
+    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let peer_endpoint = connection.remote_id();
+        // PublisherKey is just the 32-byte pubkey representation;
+        // iroh's `EndpointId` is already an ed25519 pubkey so this
+        // is a direct byte extraction (matched against the type
+        // alias in channel.rs).
+        let peer_pubkey: PublisherKey = *peer_endpoint.as_bytes();
+        let events = self.events.clone();
+        let span = info_span!(
+            "auth-handshake",
+            peer = %peer_endpoint.fmt_short(),
+        );
+        async move {
+            // Each connection can carry multiple bi-streams (e.g. a
+            // request followed by a deliver). Loop until the peer
+            // closes the connection.
+            loop {
+                let (mut send, mut recv) = match connection.accept_bi().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        debug!(error = %e, "accept_bi ended; handshake connection closing");
+                        break;
+                    }
+                };
+                match crate::handshake::read_incoming(&mut recv).await {
+                    Ok(Some(crate::handshake::IncomingOp::Request {
+                        partial_cap_bytes,
+                    })) => {
+                        let _ = events.send(NetEvent::CapRequest {
+                            requester: peer_pubkey,
+                            partial_cap_bytes,
+                        });
+                        let _ = crate::handshake::respond(
+                            &mut send,
+                            crate::handshake::STATUS_OK,
+                        )
+                        .await;
+                    }
+                    Ok(Some(crate::handshake::IncomingOp::Deliver {
+                        cap_bytes,
+                        sig_bytes,
+                    })) => {
+                        let _ = events.send(NetEvent::CapDelivered {
+                            issuer: peer_pubkey,
+                            cap_bytes,
+                            sig_bytes,
+                        });
+                        let _ = crate::handshake::respond(
+                            &mut send,
+                            crate::handshake::STATUS_OK,
+                        )
+                        .await;
+                    }
+                    Ok(None) => {
+                        let _ = crate::handshake::respond(
+                            &mut send,
+                            crate::handshake::STATUS_MALFORMED,
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "handshake decode error; rejecting");
+                        let _ = crate::handshake::respond(
+                            &mut send,
+                            crate::handshake::STATUS_MALFORMED,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        .instrument(span)
+        .await;
+        Ok(())
     }
 }
 
