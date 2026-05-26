@@ -31,6 +31,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `has_path(id, id)` — only nodes with a self-loop via the path
   appear. Confirm retains via the same predicate; estimate
   returns a conservative `set.len()` upper bound.
+- **`path!` macro infix syntax for `?`, `!`, and `^` operators.**
+  Three formerly hand-built PathOp shapes now have macro support:
+  `?` (Optional, postfix unary at Star/Plus precedence), `!p`
+  (single-attribute negated property set, lex-time prefix
+  collapse into a NotSym variant), and `^` (Inverse prefix, with
+  a `resolve_inverse` pre-pass that moves each `^` past its
+  PathElt — PathPrimary + optional postfix — to match SPARQL
+  1.1 §17.5 precedence so `^p+` parses as `^(p+)`). Five new
+  tests in `tests/regular_path_constraint.rs`. Multi-attribute
+  negated property sets `!{p1, p2, ...}` still pending —
+  requires `PathOp::NotAttrSet` first; the lexer errors out
+  cleanly when it sees `!(...)`.
 
 ### Fixed
 
@@ -51,10 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this release added branches for all three duplicate-position
   cases.
 
-All four engine additions/fixes were surfaced and validated via
-the wd_bench cookbook recipes (paths/114, paths/307, paths/355,
-single_bgps/213). See `wd_bench/docs/GAPS.md` for the full
-narrative — items 2, 8, and 9 are now closed.
+All five engine additions/fixes plus the macro extensions
+were surfaced and validated via the wd_bench cookbook recipes
+(paths/114, paths/307, paths/355, single_bgps/213, and the
+five new path! macro tests). See `wd_bench/docs/GAPS.md` for
+the full narrative — items 2, 5, 8, and 9 are now closed.
 
 ## [0.43.1] - 2026-05-18
 
