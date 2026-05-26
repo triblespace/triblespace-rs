@@ -1199,4 +1199,75 @@ proptest! {
         prop_assert_eq!(binding.get(i), None);
         prop_assert_eq!(binding.get(j), Some(&vj)); // j unaffected
     }
+
+    #[test]
+    fn path_not_attr_excludes_named_attribute(
+        n_link in 1..5usize,
+    ) {
+        // PathOp::NotAttr(P) should enumerate destinations
+        // reachable from `start` via *any* attribute other than
+        // P. With every outgoing edge using `link` (the excluded
+        // attribute), no destinations should be reachable.
+        let mut set = TribleSet::new();
+        let start = rngid();
+        let mut link_targets: HashSet<Inline<GenId>> = HashSet::new();
+        for _ in 0..n_link {
+            let t = rngid();
+            set += entity! { &start @ test_ns::link: &t };
+            link_targets.insert((&t).to_inline());
+        }
+        let link_attr_id = test_ns::link.raw();
+        let dests: HashSet<_> = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is((&start).to_inline()),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[PathOp::NotAttr(link_attr_id)],
+                ),
+            )
+        ).map(|(_, d)| d).collect();
+
+        // None of the link_targets should appear (link is excluded).
+        for t in &link_targets {
+            prop_assert!(!dests.contains(t),
+                "NotAttr(link) should NOT yield link's targets");
+        }
+        // No spurious destinations either.
+        prop_assert!(dests.is_empty(),
+            "NotAttr(link) over link-only data should yield empty");
+    }
+
+    #[test]
+    fn path_not_attr_closure_reaches_via_non_excluded_edges(
+        chain_len in 2..5usize,
+    ) {
+        // (!link)+ should traverse a chain built from a DIFFERENT
+        // attribute. We build a chain via test_ns::link (the
+        // excluded one) and verify NotAttr(link) closure
+        // reaches *nothing* (every edge in the chain is via
+        // link, which is excluded).
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let link_id = test_ns::link.raw();
+        let start_val = (&entities[0]).to_inline();
+
+        // (!link)+ closure: every step excludes link. With chain
+        // built entirely from link edges, no destinations are
+        // reachable.
+        let dests: HashSet<_> = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is(start_val),
+                RegularPathConstraint::new(
+                    set.clone(), s, d,
+                    &[PathOp::NotAttr(link_id), PathOp::Plus],
+                ),
+            )
+        ).map(|(_, d)| d).collect();
+
+        prop_assert!(dests.is_empty(),
+            "(!link)+ over a link-only chain reaches no destinations");
+    }
 }
