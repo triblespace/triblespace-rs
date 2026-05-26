@@ -50,94 +50,6 @@ impl TribleSetConstraint {
         }
     }
 
-    /// Enumerates the set of entity ids `x` for which a self-edge
-    /// `(x, a, x)` exists in the underlying [`TribleSet`]. Used to
-    /// support `source.pattern(x, _, x)` where the same `Variable` is
-    /// passed in both the entity and value position.
-    ///
-    /// If `a_bound` is `Some`, only self-edges with the bound
-    /// attribute are returned. Otherwise self-edges across all
-    /// attributes are included.
-    ///
-    /// Returns deduplicated ids; the same entity with multiple
-    /// self-edge attributes appears once.
-    fn self_edge_entities(&self, a_bound: Option<&[u8; ID_LEN]>) -> std::collections::HashSet<[u8; ID_LEN]> {
-        let mut result = std::collections::HashSet::new();
-        for t in self.set.iter() {
-            // Self-edge requires the value to be a `GenId`-encoded
-            // entity reference (upper 16 bytes zero), with the
-            // remaining 16 id-bytes matching the entity.
-            let v_bytes = &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN];
-            if v_bytes[..ID_LEN] != [0u8; ID_LEN] {
-                continue;
-            }
-            let e_bytes: [u8; ID_LEN] = t.data[..ID_LEN].try_into().unwrap();
-            if e_bytes[..] != v_bytes[ID_LEN..] {
-                continue;
-            }
-            if let Some(a) = a_bound {
-                let a_bytes = &t.data[ID_LEN..ID_LEN + ID_LEN];
-                if a_bytes != a.as_slice() {
-                    continue;
-                }
-            }
-            result.insert(e_bytes);
-        }
-        result
-    }
-
-    /// Enumerates the set of ids `x` for which a trible `(x, x, v)`
-    /// exists — entity bytes equal attribute bytes. Used to support
-    /// `source.pattern(x, x, v)` (rare in practice; entity == attribute
-    /// is uncommon in normal SPARQL workloads).
-    ///
-    /// If `v_bound` is `Some`, only tribles with the bound value are
-    /// counted.
-    fn entity_attr_dup_ids(&self, v_bound: Option<&RawInline>) -> std::collections::HashSet<[u8; ID_LEN]> {
-        let mut result = std::collections::HashSet::new();
-        for t in self.set.iter() {
-            if t.data[..ID_LEN] != t.data[ID_LEN..ID_LEN + ID_LEN] {
-                continue;
-            }
-            if let Some(v) = v_bound {
-                if &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN] != v.as_slice() {
-                    continue;
-                }
-            }
-            let id: [u8; ID_LEN] = t.data[..ID_LEN].try_into().unwrap();
-            result.insert(id);
-        }
-        result
-    }
-
-    /// Enumerates the set of ids `x` for which a trible `(e, x, x)`
-    /// exists — attribute bytes equal value bytes (with the value
-    /// GenId-encoded). Used to support `source.pattern(e, x, x)` (rare).
-    ///
-    /// If `e_bound` is `Some`, only tribles with the bound entity are
-    /// counted.
-    fn attr_value_dup_ids(&self, e_bound: Option<&[u8; ID_LEN]>) -> std::collections::HashSet<[u8; ID_LEN]> {
-        let mut result = std::collections::HashSet::new();
-        for t in self.set.iter() {
-            let v_bytes = &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN];
-            // Value must be GenId-encoded to match the (16-byte) attribute.
-            if v_bytes[..ID_LEN] != [0u8; ID_LEN] {
-                continue;
-            }
-            // a == v[16..32]
-            if t.data[ID_LEN..ID_LEN + ID_LEN] != v_bytes[ID_LEN..] {
-                continue;
-            }
-            if let Some(e) = e_bound {
-                if &t.data[..ID_LEN] != e.as_slice() {
-                    continue;
-                }
-            }
-            let id: [u8; ID_LEN] = t.data[ID_LEN..ID_LEN + ID_LEN].try_into().unwrap();
-            result.insert(id);
-        }
-        result
-    }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
@@ -182,25 +94,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         };
         let v_bound = binding.get(self.variable_v);
 
-        // Same-Variable in entity and value positions (self-edge
-        // pattern `pattern(x, a, x)`). When the queried variable
-        // occupies both slots, fall back to a scan-and-count over
-        // self-edges in the underlying set.
-        if e_var && v_var && !a_var {
-            // The queried variable is free in this branch (otherwise
-            // the planner would not call `estimate` for it).
-            return Some(self.self_edge_entities(a_bound.as_ref()).len());
-        }
-        // Same-Variable in entity and attribute positions: `pattern(x, x, v)`.
-        if e_var && a_var && !v_var {
-            return Some(self.entity_attr_dup_ids(v_bound).len());
-        }
-        // Same-Variable in attribute and value positions: `pattern(e, x, x)`.
-        if a_var && v_var && !e_var {
-            return Some(self.attr_value_dup_ids(e_bound.as_ref()).len());
-        }
-
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            // Legal distinct-position combinations (queried var
+            // appears in exactly one trible position).
             (None, None, None, true, false, false) => self.set.eav.segmented_len(&[0; 0]),
             (None, None, None, false, true, false) => self.set.aev.segmented_len(&[0; 0]),
             (None, None, None, false, false, true) => self.set.vea.segmented_len(&[0; 0]),
@@ -252,12 +148,52 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
                 self.set.eav.segmented_len(&prefix)
             }
-            _ => panic!(
-                "TribleSetConstraint does not handle same-Variable in multiple \
-                 trible positions (e/a, e/v, or a/v). Use distinct Variables for \
-                 each position and join them with EqualityConstraint::new(a.index, \
-                 b.index). See wd_bench/docs/GAPS.md item 2 for the workaround."
+
+            // Same-Variable in two positions. Conservative upper
+            // bounds via covering-index `segmented_len` — the
+            // actual count would require a `has_prefix` check per
+            // candidate, which the planner doesn't need: any tight
+            // upper bound drives variable-ordering decisions just
+            // as well. `propose` does the real per-candidate work.
+            (_, Some(a), _, true, false, true) => {
+                // e == v (self-edge), attribute bound.
+                let mut prefix = [0u8; ID_LEN];
+                prefix.copy_from_slice(&a[..]);
+                self.set.aev.segmented_len(&prefix)
+            }
+            (_, None, _, true, false, true) => {
+                // e == v, attribute free.
+                self.set.eav.segmented_len(&[0; 0])
+            }
+            (_, _, Some(v), true, true, false) => {
+                // e == a, value bound.
+                let mut prefix = [0u8; INLINE_LEN];
+                prefix.copy_from_slice(&v[..]);
+                self.set.vae.segmented_len(&prefix)
+            }
+            (_, _, None, true, true, false) => {
+                // e == a, value free.
+                self.set.aev.segmented_len(&[0; 0])
+            }
+            (Some(e), _, _, false, true, true) => {
+                // a == v, entity bound.
+                let mut prefix = [0u8; ID_LEN];
+                prefix.copy_from_slice(&e[..]);
+                self.set.eav.segmented_len(&prefix)
+            }
+            (None, _, _, false, true, true) => {
+                // a == v, entity free.
+                self.set.aev.segmented_len(&[0; 0])
+            }
+            // All three positions share the same Variable — extremely
+            // rare; not yet handled natively.
+            (_, _, _, true, true, true) => panic!(
+                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
+                 three positions sharing one Variable. Use distinct Variables \
+                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
+                 item 2)."
             ),
+            _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
         } as usize)
     }
 
@@ -287,32 +223,10 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         };
         let v_bound = binding.get(self.variable_v);
 
-        // Same-Variable case (`pattern(x, a, x)` — entity equals
-        // value). Enumerate self-edge entities from the underlying
-        // set, filtering by the attribute if it's bound. See
-        // [`Self::self_edge_entities`] for the scan logic.
-        if e_var && v_var && !a_var {
-            for e_id in self.self_edge_entities(a_bound.as_ref()) {
-                proposals.push(id_into_value(&e_id));
-            }
-            return;
-        }
-        // `pattern(x, x, v)` — entity equals attribute.
-        if e_var && a_var && !v_var {
-            for id in self.entity_attr_dup_ids(v_bound) {
-                proposals.push(id_into_value(&id));
-            }
-            return;
-        }
-        // `pattern(e, x, x)` — attribute equals value.
-        if a_var && v_var && !e_var {
-            for id in self.attr_value_dup_ids(e_bound.as_ref()) {
-                proposals.push(id_into_value(&id));
-            }
-            return;
-        }
-
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            // Distinct-position combinations: the queried variable
+            // appears in exactly one trible slot. Drive enumeration
+            // from the most selective covering index.
             (None, None, None, true, false, false) => {
                 self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
                     proposals.push(id_into_value(e))
@@ -385,12 +299,88 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     .eav
                     .infixes(&prefix, &mut |&v: &[u8; 32]| proposals.push(v));
             }
-            _ => panic!(
-                "TribleSetConstraint does not handle same-Variable in multiple \
-                 trible positions (e/a, e/v, or a/v). Use distinct Variables for \
-                 each position and join them with EqualityConstraint::new(a.index, \
-                 b.index). See wd_bench/docs/GAPS.md item 2 for the workaround."
+
+            // Same-Variable arms. The covering indexes already
+            // dedup; the equality constraint between two positions
+            // is enforced inline via `has_prefix`. No HashSet — the
+            // index walk pays the dedup cost once.
+            (_, Some(a), _, true, false, true) => {
+                // pattern(x, a, x) — entity equals value, attr bound.
+                self.set.aev.infixes(&a, &mut |e: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(e);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
+                    prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
+                    if self.set.eav.has_prefix(&prefix) {
+                        proposals.push(id_into_value(e));
+                    }
+                });
+            }
+            (_, None, _, true, false, true) => {
+                // pattern(x, ?, x) — entity equals value, attr free.
+                // Enumerate distinct entities; keep those with ∃ a . (e, a, e).
+                self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(e);
+                    prefix[ID_LEN..].copy_from_slice(&id_into_value(e));
+                    if self.set.eva.has_prefix(&prefix) {
+                        proposals.push(id_into_value(e));
+                    }
+                });
+            }
+            (_, _, Some(v), true, true, false) => {
+                // pattern(x, x, v) — entity equals attribute, value bound.
+                self.set.vae.infixes(v, &mut |a: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(a);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
+                    prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
+                    if self.set.eav.has_prefix(&prefix) {
+                        proposals.push(id_into_value(a));
+                    }
+                });
+            }
+            (_, _, None, true, true, false) => {
+                // pattern(x, x, ?) — entity equals attribute, value free.
+                self.set.aev.infixes(&[0; 0], &mut |a: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(a);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
+                    if self.set.eav.has_prefix(&prefix) {
+                        proposals.push(id_into_value(a));
+                    }
+                });
+            }
+            (Some(e), _, _, false, true, true) => {
+                // pattern(e, x, x) — attribute equals value, entity bound.
+                self.set.eav.infixes(&e, &mut |a: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(&e[..]);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
+                    prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(a));
+                    if self.set.eav.has_prefix(&prefix) {
+                        proposals.push(id_into_value(a));
+                    }
+                });
+            }
+            (None, _, _, false, true, true) => {
+                // pattern(?, x, x) — attribute equals value, entity free.
+                self.set.aev.infixes(&[0; 0], &mut |a: &[u8; 16]| {
+                    let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(a);
+                    prefix[ID_LEN..].copy_from_slice(&id_into_value(a));
+                    if self.set.ave.has_prefix(&prefix) {
+                        proposals.push(id_into_value(a));
+                    }
+                });
+            }
+            (_, _, _, true, true, true) => panic!(
+                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
+                 three positions sharing one Variable. Use distinct Variables \
+                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
+                 item 2)."
             ),
+            _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
         }
     }
 
@@ -420,40 +410,6 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             None
         };
         let v_bound = binding.get(self.variable_v);
-
-        // Same-Variable case: keep only proposals that correspond to
-        // self-edge entities. Look up the self-edge set once and
-        // retain proposals that hit it.
-        if e_var && v_var && !a_var {
-            let self_edges = self.self_edge_entities(a_bound.as_ref());
-            proposals.retain(|value| {
-                match id_from_value(value) {
-                    Some(id) => self_edges.contains(&id),
-                    None => false,
-                }
-            });
-            return;
-        }
-        if e_var && a_var && !v_var {
-            let dups = self.entity_attr_dup_ids(v_bound);
-            proposals.retain(|value| {
-                match id_from_value(value) {
-                    Some(id) => dups.contains(&id),
-                    None => false,
-                }
-            });
-            return;
-        }
-        if a_var && v_var && !e_var {
-            let dups = self.attr_value_dup_ids(e_bound.as_ref());
-            proposals.retain(|value| {
-                match id_from_value(value) {
-                    Some(id) => dups.contains(&id),
-                    None => false,
-                }
-            });
-            return;
-        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => proposals.retain(|value| {
@@ -546,6 +502,68 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eav.has_prefix(&prefix)
             }),
+
+            // Same-Variable arms. The proposal value plays two roles
+            // (e and v, or e and a, or a and v); we build a full
+            // 64-byte trible key from each proposal and check
+            // `has_prefix` against the appropriate index.
+            (_, Some(a), _, true, false, true) => proposals.retain(|value| {
+                // pattern(x, a, x): proposal is both entity and value.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
+                self.set.eav.has_prefix(&prefix)
+            }),
+            (_, None, _, true, false, true) => proposals.retain(|value| {
+                // pattern(x, ?, x): proposal is entity == value, any attr.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
+                self.set.eva.has_prefix(&prefix)
+            }),
+            (_, _, Some(v), true, true, false) => proposals.retain(|value| {
+                // pattern(x, x, v): proposal is entity == attribute.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
+                self.set.eav.has_prefix(&prefix)
+            }),
+            (_, _, None, true, true, false) => proposals.retain(|value| {
+                // pattern(x, x, ?): proposal is entity == attribute, any v.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + ID_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
+                self.set.eav.has_prefix(&prefix)
+            }),
+            (Some(e), _, _, false, true, true) => proposals.retain(|value| {
+                // pattern(e, x, x): proposal is attribute == value.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
+                self.set.eav.has_prefix(&prefix)
+            }),
+            (None, _, _, false, true, true) => proposals.retain(|value| {
+                // pattern(?, x, x): proposal is attribute == value, any e.
+                let Some(id) = id_from_value(value) else { return false; };
+                let mut prefix = [0u8; ID_LEN + INLINE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&id);
+                prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
+                self.set.ave.has_prefix(&prefix)
+            }),
+            (_, _, _, true, true, true) => panic!(
+                "TribleSetConstraint does not handle `pattern(x, x, x)` — all \
+                 three positions sharing one Variable. Use distinct Variables \
+                 + EqualityConstraint to express it (see wd_bench/docs/GAPS.md \
+                 item 2)."
+            ),
             _ => panic!("invalid trible constraint state"),
         }
     }
