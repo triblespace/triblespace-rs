@@ -31,6 +31,12 @@ use crate::inline::IntoInline;
 pub enum PathOp {
     /// Single-attribute hop: traverse the given attribute.
     Attr(RawId),
+    /// **Negated** single-attribute hop: traverse *any* attribute
+    /// other than the given one (corresponds to SPARQL 1.1 §9.4's
+    /// negated property set `!p`). Used in `(!p)+` / `(!p)*` to
+    /// enumerate reachability under "anything but this predicate"
+    /// edges.
+    NotAttr(RawId),
     /// Concatenation: compose the two preceding sub-expressions.
     Concat,
     /// Alternation: match either of the two preceding sub-expressions.
@@ -61,6 +67,10 @@ enum PathExpr {
     /// Always a leaf after `from_postfix` normalisation; inverse over
     /// compound expressions is rewritten down to leaves.
     InverseAttr(RawId),
+    /// `!p` — any attribute other than `p` (forward direction).
+    NotAttr(RawId),
+    /// `^!p` — any attribute other than `p`, reversed.
+    InverseNotAttr(RawId),
     Concat(Box<PathExpr>, Box<PathExpr>),
     Union(Box<PathExpr>, Box<PathExpr>),
     Star(Box<PathExpr>),
@@ -74,6 +84,7 @@ impl PathExpr {
         for op in ops {
             match op {
                 PathOp::Attr(id) => stack.push(PathExpr::Attr(*id)),
+                PathOp::NotAttr(id) => stack.push(PathExpr::NotAttr(*id)),
                 PathOp::Concat => {
                     let b = stack.pop().unwrap();
                     let a = stack.pop().unwrap();
@@ -138,6 +149,16 @@ impl PathExpr {
                 constraints.push(Box::new(set.pattern(dest, a, start)));
                 dest
             }
+            PathExpr::NotAttr(_) | PathExpr::InverseNotAttr(_) => {
+                // Negated-attribute hops aren't expressible as a
+                // single TribleSet pattern constraint (the engine has
+                // no "attribute ≠ x" primitive). Treat them like
+                // closures: the caller wraps them in eval_from /
+                // has_path, which scans the set directly. The
+                // build_constraint path is only used for
+                // pure-Attr/InverseAttr Concat chains.
+                unreachable!("negated-attribute hops handled at eval_from level")
+            }
             PathExpr::Concat(lhs, rhs) => {
                 let mid = lhs.build_constraint(set, ctx, start, constraints);
                 rhs.build_constraint(set, ctx, mid, constraints)
@@ -161,6 +182,8 @@ fn invert(expr: PathExpr) -> PathExpr {
     match expr {
         PathExpr::Attr(a) => PathExpr::InverseAttr(a),
         PathExpr::InverseAttr(a) => PathExpr::Attr(a),
+        PathExpr::NotAttr(a) => PathExpr::InverseNotAttr(a),
+        PathExpr::InverseNotAttr(a) => PathExpr::NotAttr(a),
         // Sequence reverses: ^(a / b) = ^b / ^a
         PathExpr::Concat(lhs, rhs) => PathExpr::Concat(Box::new(invert(*rhs)), Box::new(invert(*lhs))),
         PathExpr::Union(lhs, rhs) => PathExpr::Union(Box::new(invert(*lhs)), Box::new(invert(*rhs))),
@@ -181,6 +204,8 @@ fn normalize(expr: PathExpr) -> PathExpr {
     match expr {
         PathExpr::Attr(a) => PathExpr::Attr(a),
         PathExpr::InverseAttr(a) => PathExpr::InverseAttr(a),
+        PathExpr::NotAttr(a) => PathExpr::NotAttr(a),
+        PathExpr::InverseNotAttr(a) => PathExpr::InverseNotAttr(a),
         PathExpr::Concat(lhs, rhs) => {
             let l = normalize(*lhs);
             let r = normalize(*rhs);
@@ -264,6 +289,71 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
     results
 }
 
+/// Negated-attribute hop: enumerate destinations reachable from
+/// `start` via any attribute other than `excluded`. Two-step scan
+/// because PATCH `infixes` requires whole-segment outputs:
+///   1. Enumerate attributes outgoing from `start` via EAV prefix
+///      `[start]`, filter out `excluded`.
+///   2. For each surviving attribute, enumerate GenId-encoded
+///      values via EAV prefix `[start, attr]` and collect their
+///      id-portion as the destination.
+fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<RawId> {
+    let mut results = HashSet::new();
+    let mut e_prefix = [0u8; ID_LEN];
+    e_prefix.copy_from_slice(start);
+    // Step 1: enumerate distinct attributes from this entity.
+    let mut attrs: Vec<RawId> = Vec::new();
+    set.eav.infixes::<{ ID_LEN }, ID_LEN, _>(&e_prefix, |a: &[u8; ID_LEN]| {
+        if a == excluded {
+            return;
+        }
+        attrs.push(*a);
+    });
+    // Step 2: enumerate values per surviving attribute.
+    for attr in attrs {
+        let mut ea_prefix = [0u8; ID_LEN * 2];
+        ea_prefix[..ID_LEN].copy_from_slice(start);
+        ea_prefix[ID_LEN..].copy_from_slice(&attr);
+        set.eav
+            .infixes::<{ ID_LEN * 2 }, 32, _>(&ea_prefix, |value: &[u8; 32]| {
+                if value[..ID_LEN] == [0; ID_LEN] {
+                    let dest: RawId = value[ID_LEN..].try_into().unwrap();
+                    results.insert(dest);
+                }
+            });
+    }
+    results
+}
+
+/// Inverse negated-attribute hop: enumerate subjects `s` such that
+/// `s attr start` holds for some `attr ≠ excluded`. Two-step scan
+/// using the VAE index: enumerate attributes via prefix
+/// `[start_as_value]`, then enumerate entities per surviving
+/// attribute via `[start_as_value, attr]`.
+fn eval_not_attr_inverse(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<RawId> {
+    let mut results = HashSet::new();
+    let start_value = id_into_value(start);
+    let mut v_prefix = [0u8; 32];
+    v_prefix.copy_from_slice(&start_value);
+    let mut attrs: Vec<RawId> = Vec::new();
+    set.vae.infixes::<32, ID_LEN, _>(&v_prefix, |a: &[u8; ID_LEN]| {
+        if a == excluded {
+            return;
+        }
+        attrs.push(*a);
+    });
+    for attr in attrs {
+        let mut va_prefix = [0u8; 32 + ID_LEN];
+        va_prefix[..32].copy_from_slice(&start_value);
+        va_prefix[32..].copy_from_slice(&attr);
+        set.vae
+            .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&va_prefix, |entity: &[u8; ID_LEN]| {
+                results.insert(*entity);
+            });
+    }
+    results
+}
+
 /// Inverse single-attribute hop: enumerate subjects `s` such that
 /// `s attr start` holds. Uses the VAE index (Inline, Attribute,
 /// Entity ordering) so the prefix `[start_as_value (32B), attr
@@ -285,9 +375,17 @@ fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<Ra
 /// anywhere in its subtree? Concat-with-closure can't go through the
 /// WCO sweep because `build_constraint` doesn't have a Plus/Star
 /// arm — we fall back to per-mid evaluation instead.
+/// Returns true if this subtree must be evaluated via the per-mid
+/// `eval_from` fallback rather than through the WCO sweep on a
+/// composed pattern constraint. Includes both unbounded closures
+/// (`Plus`/`Star` — the original reason for the fallback) and
+/// negated-attribute hops (which have no native pattern-constraint
+/// equivalent because triblespace lacks an "attribute ≠ x"
+/// primitive).
 fn has_unbounded_closure(expr: &PathExpr) -> bool {
     match expr {
         PathExpr::Plus(_) | PathExpr::Star(_) => true,
+        PathExpr::NotAttr(_) | PathExpr::InverseNotAttr(_) => true,
         PathExpr::Attr(_) | PathExpr::InverseAttr(_) => false,
         PathExpr::Concat(a, b) | PathExpr::Union(a, b) => {
             has_unbounded_closure(a) || has_unbounded_closure(b)
@@ -300,6 +398,8 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
+        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, start),
+        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, start),
         PathExpr::Concat(lhs, rhs) => {
             if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) {
                 // Per-mid fallback: eval lhs from start, then for
@@ -358,6 +458,8 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
+        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, from).contains(to),
+        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, from).contains(to),
         PathExpr::Concat(lhs, rhs) if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) => {
             // Per-mid fallback (matches eval_from arm).
             for mid in eval_from(set, lhs, from) {
@@ -435,6 +537,8 @@ fn bounded_eval_from(
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
+        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, start),
+        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, start),
         PathExpr::Concat(lhs, rhs) => {
             let mut results = HashSet::new();
             for mid in bounded_eval_from(set, lhs, start, depth) {
