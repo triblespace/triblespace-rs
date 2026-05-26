@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`PathOp::NotAttr(RawId)`** for SPARQL's negated property-set
+  operator `!p`. Combined with closures (`(!p)+` / `(!p)*`),
+  expresses "reachable via any edge that isn't `p`". New
+  `PathExpr::NotAttr` / `InverseNotAttr` variants route through
+  the existing per-mid `eval_from` fallback via `eval_not_attr` /
+  `eval_not_attr_inverse` helpers (two-step EAV/VAE infixes scans
+  that enumerate attributes, filter the excluded one, then
+  enumerate values per surviving attribute). Three new proptests
+  cover the exclusion semantics, the positive case via a different
+  attribute, and the closure interaction.
+- **Same-Variable handling in `TribleSetConstraint`.** Three
+  scan-and-filter branches cover all duplicate-position cases:
+  `pattern(x, a, x)` (self-edge, e==v), `pattern(x, x, v)`
+  (entity-equals-attribute, e==a), `pattern(e, x, x)`
+  (attribute-equals-value, a==v). Each branch builds a deduplicated
+  candidate set and routes through estimate/propose/confirm at
+  the top of the method.
+- **Same-Variable handling in `RegularPathConstraint`.** When
+  `start == end`, propose enumerates `all_nodes()` filtered by
+  `has_path(id, id)` — only nodes with a self-loop via the path
+  appear. Confirm retains via the same predicate; estimate
+  returns a conservative `set.len()` upper bound.
+
+### Fixed
+
+- **Duplicate proposal in `RegularPathConstraint::propose` for
+  reflexive paths.** When end was bound and start free, `end_id`
+  was pushed into the candidate list unconditionally even when
+  `all_nodes()` already covered it (true whenever end appears as a
+  value somewhere). The duplicate survived the filter and inflated
+  row counts by one for `?` and `*` paths. Now dedups via HashSet
+  before filtering.
+
+### Changed
+
+- **`TribleSetConstraint`'s catch-all `panic!()`** now carries a
+  message pointing at the workaround (distinct Variables +
+  EqualityConstraint) and the docs entry — still fires only for
+  edge cases that the same-Variable branches don't cover, since
+  this release added branches for all three duplicate-position
+  cases.
+
+All four engine additions/fixes were surfaced and validated via
+the wd_bench cookbook recipes (paths/114, paths/307, paths/355,
+single_bgps/213). See `wd_bench/docs/GAPS.md` for the full
+narrative — items 2, 8, and 9 are now closed.
+
 ## [0.43.1] - 2026-05-18
 
 ### Added
