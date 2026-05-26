@@ -299,6 +299,12 @@ The middle part is a small regular language over attributes:
 - `|` means alternation
 - `*` means zero or more
 - `+` means one or more
+- `?` means zero or one
+- `^p` reverses the direction of an attribute (or path-element) —
+  `^p` followed by `?`/`*`/`+` binds the modifier *inside* the
+  inversion: `^p+` is `^(p+)`, matching SPARQL 1.1 §17.5
+- `!p` matches any attribute *other than* `p` (negated
+  property set, single-attribute form)
 - parentheses group
 
 Example:
