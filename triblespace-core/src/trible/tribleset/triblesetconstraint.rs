@@ -85,6 +85,59 @@ impl TribleSetConstraint {
         }
         result
     }
+
+    /// Enumerates the set of ids `x` for which a trible `(x, x, v)`
+    /// exists — entity bytes equal attribute bytes. Used to support
+    /// `source.pattern(x, x, v)` (rare in practice; entity == attribute
+    /// is uncommon in normal SPARQL workloads).
+    ///
+    /// If `v_bound` is `Some`, only tribles with the bound value are
+    /// counted.
+    fn entity_attr_dup_ids(&self, v_bound: Option<&RawInline>) -> std::collections::HashSet<[u8; ID_LEN]> {
+        let mut result = std::collections::HashSet::new();
+        for t in self.set.iter() {
+            if t.data[..ID_LEN] != t.data[ID_LEN..ID_LEN + ID_LEN] {
+                continue;
+            }
+            if let Some(v) = v_bound {
+                if &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN] != v.as_slice() {
+                    continue;
+                }
+            }
+            let id: [u8; ID_LEN] = t.data[..ID_LEN].try_into().unwrap();
+            result.insert(id);
+        }
+        result
+    }
+
+    /// Enumerates the set of ids `x` for which a trible `(e, x, x)`
+    /// exists — attribute bytes equal value bytes (with the value
+    /// GenId-encoded). Used to support `source.pattern(e, x, x)` (rare).
+    ///
+    /// If `e_bound` is `Some`, only tribles with the bound entity are
+    /// counted.
+    fn attr_value_dup_ids(&self, e_bound: Option<&[u8; ID_LEN]>) -> std::collections::HashSet<[u8; ID_LEN]> {
+        let mut result = std::collections::HashSet::new();
+        for t in self.set.iter() {
+            let v_bytes = &t.data[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN];
+            // Value must be GenId-encoded to match the (16-byte) attribute.
+            if v_bytes[..ID_LEN] != [0u8; ID_LEN] {
+                continue;
+            }
+            // a == v[16..32]
+            if t.data[ID_LEN..ID_LEN + ID_LEN] != v_bytes[ID_LEN..] {
+                continue;
+            }
+            if let Some(e) = e_bound {
+                if &t.data[..ID_LEN] != e.as_slice() {
+                    continue;
+                }
+            }
+            let id: [u8; ID_LEN] = t.data[ID_LEN..ID_LEN + ID_LEN].try_into().unwrap();
+            result.insert(id);
+        }
+        result
+    }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
@@ -137,6 +190,14 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             // The queried variable is free in this branch (otherwise
             // the planner would not call `estimate` for it).
             return Some(self.self_edge_entities(a_bound.as_ref()).len());
+        }
+        // Same-Variable in entity and attribute positions: `pattern(x, x, v)`.
+        if e_var && a_var && !v_var {
+            return Some(self.entity_attr_dup_ids(v_bound).len());
+        }
+        // Same-Variable in attribute and value positions: `pattern(e, x, x)`.
+        if a_var && v_var && !e_var {
+            return Some(self.attr_value_dup_ids(e_bound.as_ref()).len());
         }
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
@@ -233,6 +294,20 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         if e_var && v_var && !a_var {
             for e_id in self.self_edge_entities(a_bound.as_ref()) {
                 proposals.push(id_into_value(&e_id));
+            }
+            return;
+        }
+        // `pattern(x, x, v)` — entity equals attribute.
+        if e_var && a_var && !v_var {
+            for id in self.entity_attr_dup_ids(v_bound) {
+                proposals.push(id_into_value(&id));
+            }
+            return;
+        }
+        // `pattern(e, x, x)` — attribute equals value.
+        if a_var && v_var && !e_var {
+            for id in self.attr_value_dup_ids(e_bound.as_ref()) {
+                proposals.push(id_into_value(&id));
             }
             return;
         }
@@ -354,6 +429,26 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             proposals.retain(|value| {
                 match id_from_value(value) {
                     Some(id) => self_edges.contains(&id),
+                    None => false,
+                }
+            });
+            return;
+        }
+        if e_var && a_var && !v_var {
+            let dups = self.entity_attr_dup_ids(v_bound);
+            proposals.retain(|value| {
+                match id_from_value(value) {
+                    Some(id) => dups.contains(&id),
+                    None => false,
+                }
+            });
+            return;
+        }
+        if a_var && v_var && !e_var {
+            let dups = self.attr_value_dup_ids(e_bound.as_ref());
+            proposals.retain(|value| {
+                match id_from_value(value) {
+                    Some(id) => dups.contains(&id),
                     None => false,
                 }
             });
@@ -561,5 +656,73 @@ mod tests {
         };
         let r: Vec<_> = q.collect();
         assert_eq!(3, r.len(), "expected 3 self-edges with bound attr, got {}", r.len());
+    }
+
+    #[test]
+    fn entity_attr_dup_pattern() {
+        // `pattern(x, x, v)` — entity equals attribute.
+        use crate::inline::encodings::genid::GenId;
+
+        fn id_as_inline(id: &[u8; 16]) -> Inline<GenId> {
+            let mut bytes = [0u8; 32];
+            bytes[16..32].copy_from_slice(id);
+            Inline::<GenId>::new(bytes)
+        }
+
+        let mut set = TribleSet::new();
+        // Two entities that double as their own attributes.
+        let dup1 = rngid();
+        let dup2 = rngid();
+        let other = rngid();
+        let v1 = rngid();
+        let v2 = rngid();
+
+        set.insert(&Trible::new(&dup1, &dup1, &id_as_inline(&v1)));
+        set.insert(&Trible::new(&dup2, &dup2, &id_as_inline(&v2)));
+        // Non-dup tribles
+        set.insert(&Trible::new(&dup1, &other, &id_as_inline(&v1)));
+        set.insert(&Trible::new(&other, &dup1, &id_as_inline(&v1)));
+
+        let q = find! {
+            (x: Inline<GenId>, val: Inline<GenId>),
+            set.pattern(x, x, val)
+        };
+        let r: Vec<_> = q.collect();
+        assert_eq!(2, r.len(), "expected 2 entity-attr dups, got {}", r.len());
+    }
+
+    #[test]
+    fn attr_value_dup_pattern() {
+        // `pattern(e, x, x)` — attribute equals value.
+        use crate::inline::encodings::genid::GenId;
+
+        fn id_as_inline(id: &[u8; 16]) -> Inline<GenId> {
+            let mut bytes = [0u8; 32];
+            bytes[16..32].copy_from_slice(id);
+            Inline::<GenId>::new(bytes)
+        }
+
+        let mut set = TribleSet::new();
+        let dup1 = rngid(); // attribute id (and value id)
+        let dup2 = rngid();
+        let other_attr = rngid();
+        let e1 = rngid();
+        let e2 = rngid();
+        let e3 = rngid();
+
+        // attribute equals value tribles
+        set.insert(&Trible::new(&e1, &dup1, &id_as_inline(&dup1)));
+        set.insert(&Trible::new(&e2, &dup2, &id_as_inline(&dup2)));
+        // Non-dup: different value
+        set.insert(&Trible::new(&e3, &dup1, &id_as_inline(&dup2)));
+        // Non-dup: attribute differs from value's id portion
+        set.insert(&Trible::new(&e3, &other_attr, &id_as_inline(&dup1)));
+
+        let q = find! {
+            (e: Inline<GenId>, x: Inline<GenId>),
+            set.pattern(e, x, x)
+        };
+        let r: Vec<_> = q.collect();
+        assert_eq!(2, r.len(), "expected 2 attr-value dups, got {}", r.len());
     }
 }
