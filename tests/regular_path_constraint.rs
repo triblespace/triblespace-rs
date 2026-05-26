@@ -59,6 +59,54 @@ fn repetition() {
 }
 
 #[test]
+fn inverse_prefix_single() {
+    // `^social::follows` — find subjects that follow the end
+    // node. kb has A→B via follows. From B (bound end),
+    // ^follows reaches A.
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    kb += entity! { &a @ social::follows: &b };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(b_val), path!(kb.clone(), s ^social::follows e)))
+    .map(|(_, e)| e)
+    .collect();
+
+    assert!(results.contains(&a_val),
+        "^follows from B should reach A (who follows B)");
+    assert_eq!(results.len(), 1, "exactly one source: {:?}", results);
+}
+
+#[test]
+fn inverse_with_postfix_modifier() {
+    // `^social::follows+` — SPARQL precedence: ^ applies to
+    // the PathElt `follows+`. Postfix tape: [Attr, Plus, Inverse].
+    // From B: walk inverse-follows transitively — reaches A
+    // (1 hop) plus anyone who follows A (none here).
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    let c = fucid();
+    kb += entity! { &a @ social::follows: &b };
+    kb += entity! { &c @ social::follows: &a };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let c_val = c.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(s.is(b_val), path!(kb.clone(), s ^social::follows+ e)))
+    .map(|(_, e)| e)
+    .collect();
+
+    assert!(results.contains(&a_val), "^follows+ from B reaches A");
+    assert!(results.contains(&c_val), "^follows+ from B reaches C (via A)");
+    assert_eq!(results.len(), 2, "exactly two ancestors: {:?}", results);
+}
+
+#[test]
 fn not_attr_single_attribute() {
     // `!social::follows` — any predicate other than `follows`.
     // kb has A→B via follows and A→C via likes. NotAttr(follows)

@@ -73,6 +73,12 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
         /// Lex-time prefix: `!` followed by a Sym collapses into
         /// NotSym at the same precedence as Sym.
         NotSym(Path),
+        /// Inverse marker inserted post-lex as a postfix unary
+        /// (after the PathElt it modifies, including any
+        /// `?`/`*`/`+` modifier). Emits `PathOp::Inverse` at
+        /// output. Surface syntax is the prefix `^` per SPARQL
+        /// 1.1 §17.5; lex-then-resolve converts it to postfix.
+        Inv,
         Or,
         Star,
         Plus,
@@ -126,6 +132,16 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     pending_not = true;
                     i += 1;
                 }
+                TokenTree::Punct(p) if p.as_char() == '^' => {
+                    // Surface syntax: `^` is a *prefix* unary on a
+                    // PathElt (PathPrimary + optional postfix). The
+                    // postfix tape needs `Inverse` to land AFTER the
+                    // operand's opcodes. Push Tok::Inv now; the
+                    // resolve_inverse pass below moves each Inv past
+                    // its operand to match SPARQL 1.1 §17.5 precedence.
+                    out.push(Tok::Inv);
+                    i += 1;
+                }
                 TokenTree::Punct(p) if p.as_char() == '*' => {
                     out.push(Tok::Star);
                     i += 1;
@@ -172,6 +188,8 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     enum OpTok {
         Sym(Path),
         NotSym(Path),
+        /// Postfix Inverse marker (lex-time rewrite from prefix `^`).
+        Inv,
         Or,
         Concat,
         Star,
@@ -190,16 +208,100 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                 | Tok::Star
                 | Tok::Plus
                 | Tok::Question
+                | Tok::Inv
         ) && matches!(b, Tok::Sym(_) | Tok::NotSym(_) | Tok::LParen)
     }
 
-    let lexed = lex(regex_tokens)?;
+    let raw_lexed = lex(regex_tokens)?;
+
+    // Move each `Tok::Inv` past its operand (PathPrimary +
+    // optional `?`/`*`/`+` postfix). Postfix tape needs Inverse
+    // AFTER the operand's opcodes — the surface-syntax prefix `^`
+    // is rewritten to a deferred postfix marker here.
+    fn resolve_inverse(toks: Vec<Tok>) -> syn::Result<Vec<Tok>> {
+        let mut out: Vec<Tok> = Vec::new();
+        let mut i = 0usize;
+        while i < toks.len() {
+            match &toks[i] {
+                Tok::Inv => {
+                    i += 1;
+                    if i >= toks.len() {
+                        return Err(syn::Error::new(
+                            Span::call_site(),
+                            "`^` must be followed by a path element",
+                        ));
+                    }
+                    // Collect the operand: Sym/NotSym, or balanced
+                    // `(...)` group. Then any postfix modifier.
+                    match &toks[i] {
+                        Tok::Sym(p) => {
+                            out.push(Tok::Sym(p.clone()));
+                            i += 1;
+                        }
+                        Tok::NotSym(p) => {
+                            out.push(Tok::NotSym(p.clone()));
+                            i += 1;
+                        }
+                        Tok::LParen => {
+                            out.push(Tok::LParen);
+                            i += 1;
+                            let mut depth = 1usize;
+                            while i < toks.len() && depth > 0 {
+                                match &toks[i] {
+                                    Tok::LParen => depth += 1,
+                                    Tok::RParen => depth -= 1,
+                                    _ => {}
+                                }
+                                out.push(toks[i].clone());
+                                i += 1;
+                            }
+                            if depth != 0 {
+                                return Err(syn::Error::new(
+                                    Span::call_site(),
+                                    "unbalanced `(` after `^`",
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(syn::Error::new(
+                                Span::call_site(),
+                                "`^` must be followed by an attribute name \
+                                 or parenthesised path",
+                            ));
+                        }
+                    }
+                    // Optional postfix modifier (`?`/`*`/`+`) is part
+                    // of the same PathElt and must come before the
+                    // Inverse marker.
+                    if i < toks.len()
+                        && matches!(toks[i], Tok::Star | Tok::Plus | Tok::Question)
+                    {
+                        out.push(toks[i].clone());
+                        i += 1;
+                    }
+                    // Now emit the Inverse marker as a postfix unary.
+                    // We re-use Tok::Inv here; the next phase treats
+                    // it as a unary operator with the same precedence
+                    // as Star/Plus/Question.
+                    out.push(Tok::Inv);
+                }
+                other => {
+                    out.push(other.clone());
+                    i += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    let lexed = resolve_inverse(raw_lexed)?;
 
     let mut infix = Vec::new();
     for i in 0..lexed.len() {
         match &lexed[i] {
             Tok::Sym(p) => infix.push(OpTok::Sym(p.clone())),
             Tok::NotSym(p) => infix.push(OpTok::NotSym(p.clone())),
+            Tok::Inv => infix.push(OpTok::Inv),
             Tok::Or => infix.push(OpTok::Or),
             Tok::Star => infix.push(OpTok::Star),
             Tok::Plus => infix.push(OpTok::Plus),
@@ -214,7 +316,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
 
     fn prec(t: &OpTok) -> u8 {
         match t {
-            OpTok::Star | OpTok::Plus | OpTok::Question => 3,
+            OpTok::Star | OpTok::Plus | OpTok::Question | OpTok::Inv => 3,
             OpTok::Concat => 2,
             OpTok::Or => 1,
             _ => 0,
@@ -222,7 +324,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
     }
 
     fn right_assoc(t: &OpTok) -> bool {
-        matches!(t, OpTok::Star | OpTok::Plus | OpTok::Question)
+        matches!(t, OpTok::Star | OpTok::Plus | OpTok::Question | OpTok::Inv)
     }
 
     let mut output = Vec::<OpTok>::new();
@@ -240,7 +342,12 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     }
                 }
             }
-            OpTok::Or | OpTok::Concat | OpTok::Star | OpTok::Plus | OpTok::Question => {
+            OpTok::Or
+            | OpTok::Concat
+            | OpTok::Star
+            | OpTok::Plus
+            | OpTok::Question
+            | OpTok::Inv => {
                 while let Some(op) = stack.last() {
                     if matches!(op, OpTok::LParen) {
                         break;
@@ -274,6 +381,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
             OpTok::Star => quote! { PathOp::Star },
             OpTok::Plus => quote! { PathOp::Plus },
             OpTok::Question => quote! { PathOp::Optional },
+            OpTok::Inv => quote! { PathOp::Inverse },
             _ => panic!(),
         })
         .collect();
