@@ -657,6 +657,13 @@ pub struct RegularPathConstraint {
     start: VariableId,
     end: VariableId,
     expr: PathExpr,
+    /// `invert(expr)` — cached so end-bound proposals can BFS
+    /// backward via `eval_from` symmetrically to start-bound
+    /// proposals. `invert` is pure and the constraint is reused
+    /// across many estimate/propose calls per query, so the
+    /// one-time clone-and-invert at construction pays for
+    /// itself.
+    inverse_expr: PathExpr,
     set: TribleSet,
 }
 
@@ -670,10 +677,12 @@ impl RegularPathConstraint {
         ops: &[PathOp],
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
+        let inverse_expr = invert(expr.clone());
         RegularPathConstraint {
             start: start.index,
             end: end.index,
             expr,
+            inverse_expr,
             set,
         }
     }
@@ -719,6 +728,16 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
             Some(self.set.len())
         } else if variable == self.start {
+            if let Some(end_val) = binding.get(self.end) {
+                if let Some(end_id) = id_from_value(end_val) {
+                    // Symmetric to the start-bound case: BFS
+                    // backward via the inverted expression from
+                    // end_id, giving a tight estimate instead of
+                    // the conservative set-len fallback.
+                    return Some(estimate_from(&self.set, &self.inverse_expr, &end_id).max(1));
+                }
+                return Some(0);
+            }
             Some(self.set.len())
         } else {
             None
@@ -750,27 +769,16 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
                 // End is bound; propose only those start nodes that
-                // actually reach `end` via `expr`. Without this
-                // filter, callers assuming the proposing constraint
-                // emits valid candidates (and skipping `confirm` on
-                // the same constraint) would see Cartesian-style
-                // results when no other constraint touches `start`.
+                // actually reach `end` via `expr`. Symmetric to the
+                // start-bound case: one BFS backward via the
+                // inverted expression from `end_id` enumerates
+                // every valid start, with dedup falling out of
+                // `eval_from`'s internal HashSet and the
+                // reflexive-path rule (`end_id` is a valid start
+                // for `(p)*` / `(p)?`) handled inside Star/Optional.
                 if let Some(end_id) = id_from_value(end_val) {
-                    // Candidates = all_nodes ∪ {end_id}. The end
-                    // itself is a valid start for reflexive paths
-                    // (`(p)*`, `(p)?`) per SPARQL semantics, even if
-                    // it doesn't otherwise appear in the graph.
-                    // Dedup via HashSet — `end_id` is usually already
-                    // in `all_nodes()` (as a value of some trible),
-                    // and a duplicated candidate would propagate as a
-                    // duplicate row through `proposals`.
-                    let mut candidates: HashSet<RawInline> =
-                        self.all_nodes().into_iter().collect();
-                    candidates.insert(id_into_value(&end_id));
-                    proposals.extend(candidates.into_iter().filter(|v| {
-                        id_from_value(v)
-                            .map_or(false, |sid| has_path(&self.set, &self.expr, &sid, &end_id))
-                    }));
+                    let reachable = eval_from(&self.set, &self.inverse_expr, &end_id);
+                    proposals.extend(reachable.iter().map(id_into_value));
                 }
                 return;
             }

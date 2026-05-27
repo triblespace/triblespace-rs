@@ -166,6 +166,65 @@ fn not_attr_single_attribute() {
 }
 
 #[test]
+fn end_bound_propose_start_via_inverse_bfs() {
+    // Bind the END variable; let the engine propose every start
+    // that reaches it. This exercises the case-B path that used
+    // to enumerate all_nodes and per-candidate has_path. The
+    // refactored implementation should BFS backward via
+    // invert(expr) and yield the same answers in O(graph).
+    //
+    // kb: A -> B -> C -> D (chain via follows).
+    // Query: `?s follows+ d` (end bound to D).
+    // Expected starts: A, B, C (everyone upstream of D).
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    let c = fucid();
+    let d = fucid();
+    kb += entity! { &a @ social::follows: &b };
+    kb += entity! { &b @ social::follows: &c };
+    kb += entity! { &c @ social::follows: &d };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let c_val = c.to_inline();
+    let d_val = d.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(e.is(d_val), path!(kb.clone(), s social::follows+ e)))
+    .map(|(s, _)| s)
+    .collect();
+
+    assert!(results.contains(&a_val), "A should reach D (3 hops)");
+    assert!(results.contains(&b_val), "B should reach D (2 hops)");
+    assert!(results.contains(&c_val), "C should reach D (1 hop)");
+    assert!(!results.contains(&d_val), "Plus excludes the start when no cycle");
+    assert_eq!(results.len(), 3, "exactly 3 upstream starts: {:?}", results);
+}
+
+#[test]
+fn end_bound_propose_start_reflexive() {
+    // Reflexive variant: with `follows*` (zero or more), the
+    // bound end itself is also a valid start. The case-B BFS
+    // via invert(Star(follows)) = Star(invert(follows)) should
+    // include end_id by the Star reflexivity rule.
+    let mut kb = TribleSet::new();
+    let a = fucid();
+    let b = fucid();
+    kb += entity! { &a @ social::follows: &b };
+
+    let a_val = a.to_inline();
+    let b_val = b.to_inline();
+    let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
+        and!(e.is(b_val), path!(kb.clone(), s social::follows* e)))
+    .map(|(s, _)| s)
+    .collect();
+
+    assert!(results.contains(&a_val), "A reaches B via 1 hop");
+    assert!(results.contains(&b_val), "B reaches itself via 0 hops (Star reflexive)");
+    assert_eq!(results.len(), 2, "exactly 2 starts: {:?}", results);
+}
+
+#[test]
 fn optional_question_mark() {
     // `social::follows?` — zero or one hop. With kb containing
     // a single A→B edge, the bound-start form should reach both

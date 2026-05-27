@@ -37,6 +37,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `has_path(id, id)` — only nodes with a self-loop via the path
   appear. Confirm retains via the same predicate; estimate
   returns a conservative `set.len()` upper bound.
+- **Symmetric end-bound proposal in `RegularPathConstraint`.**
+  Case B (start free, end bound) previously enumerated
+  `all_nodes()` and ran a per-candidate `has_path(c, end_id)`
+  — O(n × graph). It now BFS-walks the cached
+  `inverse_expr` from `end_id` via `eval_from`, mirroring
+  Case A (start bound, end free). O(graph), one traversal,
+  dedup built in. The HashSet that used to do `all_nodes ∪
+  {end_id}` set-union for the reflexive-path rule is gone:
+  `eval_from`'s Star/Optional arms already include the start
+  node by construction. `estimate` for the same case
+  similarly upgrades from a `set.len()` conservative bound
+  to `estimate_from(inverse_expr, end_id)` for a tight
+  estimate. Two new direct tests (`end_bound_propose_start_*`)
+  cover the case the existing tests didn't.
 - **`path!` macro infix syntax for `?`, `!`, and `^` operators.**
   Three formerly hand-built PathOp shapes now have macro support:
   `?` (Optional, postfix unary at Star/Plus precedence), `!p`
