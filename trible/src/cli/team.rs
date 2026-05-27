@@ -477,16 +477,45 @@ fn run_invite(
     )
     .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
 
+    let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
+
+    // Record on the renewal-policy branch so the running `pile net sync`
+    // daemon's renewal_tick takes over from here: once this cap nears
+    // expiry, the daemon signs a successor and dispatches via
+    // OP_DELIVER_CAP. The invitee experiences the issuance and every
+    // subsequent renewal as the same OP_DELIVER_CAP event — the first
+    // delivery (shaped by the printed handle below for v1) and the
+    // daemon's later renewals are indistinguishable on B's side.
+    let policy_entry = triblespace_net::policy::record_policy_entry(
+        &mut pile,
+        invitee,
+        scope_root,
+        expiry,
+        cap_handle,
+        sig_handle,
+    );
 
     let _ = pile_for_fetch.close();
     let _ = pile.close();
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
+    if let Some(entry_id) = policy_entry {
+        let entry_bytes: [u8; 16] = entry_id.into();
+        println!("renewal entry:     {}", hex::encode(entry_bytes));
+        println!(
+            "  the running sync daemon will auto-renew this cap until you `team retract {}`",
+            hex::encode(entry_bytes)
+        );
+    } else {
+        println!(
+            "(warning: failed to record renewal-policy entry; auto-renewal won't happen for this cap)"
+        );
+    }
     println!();
     println!("Share with the invitee:");
     println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
