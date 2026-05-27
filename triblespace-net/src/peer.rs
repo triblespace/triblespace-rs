@@ -115,6 +115,13 @@ where
     /// refresh loop can verify incoming `CapDelivered` events against
     /// it without round-tripping through the network thread.
     team_root: ed25519_dalek::VerifyingKey,
+
+    /// Cloned signing key. ed25519's SigningKey is 32 bytes of secret
+    /// scalar so cloning is cheap, but we keep it as an explicit
+    /// `Clone` instead of `Copy` so the surface area for accidental
+    /// duplication stays auditable. Used by `renewal_tick` to sign
+    /// fresh caps for entries on the renewal-policy branch.
+    signing_key: SigningKey,
 }
 
 impl<S> Peer<S>
@@ -128,6 +135,7 @@ where
     pub fn new(mut store: S, key: SigningKey, config: PeerConfig) -> Self {
         let direction = config.direction;
         let team_root = config.team_root;
+        let signing_key = key.clone();
         let (sender, receiver) = host::spawn(key, config);
 
         // Seed the snapshot served by the network thread so peers
@@ -152,6 +160,7 @@ where
             direction,
             last_event_at: std::time::Instant::now(),
             team_root,
+            signing_key,
         };
 
         // Drive the first refresh synchronously so the DHT learns
@@ -444,8 +453,13 @@ where
             fetch,
         ) {
             Ok(_verified) => {
-                // Persist both blobs into the local store. They become
-                // pile-resident; pinning is the CLI's responsibility.
+                // Persist both blobs into the local store, then pin
+                // them via the per-team-cap branch. The pin is a
+                // single-slot branch: each renewal overwrites the
+                // head, making old cap+sig blobs unreachable so the
+                // next compaction reclaims them. Forward security at
+                // the storage layer falls out naturally — only the
+                // current cap survives.
                 let cap_bytes_anybytes: anybytes::Bytes =
                     anybytes::Bytes::from_source(cap_bytes);
                 let sig_bytes_anybytes: anybytes::Bytes =
@@ -456,11 +470,26 @@ where
                 let _ = self
                     .store
                     .put::<UnknownBlob, anybytes::Bytes>(sig_bytes_anybytes);
-                tracing::info!(
-                    issuer = %hex::encode(&issuer[..4]),
-                    sig = %hex::encode(&sig_handle.raw[..4]),
-                    "CapDelivered: verified and stored"
-                );
+                match crate::policy::pin_team_cap(
+                    &mut self.store,
+                    self.team_root,
+                    cap_handle,
+                    sig_handle,
+                ) {
+                    Some(_bid) => {
+                        tracing::info!(
+                            issuer = %hex::encode(&issuer[..4]),
+                            sig = %hex::encode(&sig_handle.raw[..4]),
+                            "CapDelivered: verified and pinned on team-cap branch"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            issuer = %hex::encode(&issuer[..4]),
+                            "CapDelivered: verified but team-cap pin failed"
+                        );
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(

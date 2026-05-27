@@ -87,6 +87,14 @@ attributes! {
     "8CC3155E937E416C8CFDC11630E9789E" as pub request_received_at: NsTAIInterval;
     /// Current resolution status (one of the `STATUS_*` tags).
     "4D72D56FF30DA693679F08D629DA7574" as pub request_status: GenId;
+
+    // ── Per-team-cap pin ──────────────────────────────────────────────
+    /// Handle of the currently-pinned cap blob for a team. Overwritten
+    /// on each renewal so old caps become unreachable.
+    "A2BBD772754BBB8EAFD7479F5A1249FD" as pub team_cap_handle: Handle<SimpleArchive>;
+    /// Handle of the currently-pinned sig blob for a team. Updated in
+    /// lockstep with `team_cap_handle`.
+    "FAC14D0CAB23B1C7AC20D8CF1C843EBF" as pub team_sig_handle: Handle<SimpleArchive>;
 }
 
 // ── Branch kind tags ──────────────────────────────────────────────────
@@ -334,6 +342,87 @@ where
         PushResult::Success() => Some(*request_id),
         PushResult::Conflict(_) => None,
     }
+}
+
+// ── Per-team-cap pin ──────────────────────────────────────────────────
+
+/// Find or create the per-team-cap branch for `team_root`, then
+/// overwrite its head with a metadata blob pointing at the supplied
+/// `cap` and `sig` handles. Old metadata + old cap + old sig blobs
+/// become unreachable from any branch head; the next compaction
+/// reclaims them. This is the storage-layer expression of "the
+/// active cap is what's current; old caps don't accumulate".
+///
+/// Returns the branch id on success. `None` on a blob-write or
+/// branch-update failure (caller decides retry/log/drop).
+pub fn pin_team_cap<S>(
+    store: &mut S,
+    team_root: ed25519_dalek::VerifyingKey,
+    cap: Inline<Handle<SimpleArchive>>,
+    sig: Inline<Handle<SimpleArchive>>,
+) -> Option<Id>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    use triblespace_core::id::ExclusiveId;
+
+    let (bid, prev_head) = match find_team_cap_branch(store, team_root) {
+        Some(bid) => {
+            let head = store.head(bid).ok().flatten();
+            (bid, head)
+        }
+        None => (*genid(), None),
+    };
+
+    // Single-entity metadata blob: the branch-kind marker plus the
+    // two handles. Entity id is fresh on each overwrite — the entity
+    // doesn't need a stable identity since the branch head IS the
+    // pin.
+    let entity_id = genid();
+    let meta: TribleSet = entity! {
+        ExclusiveId::force_ref(&entity_id) @
+        local_only_branch: KIND_TEAM_CAP,
+        cap_for_team: team_root,
+        team_cap_handle: cap,
+        team_sig_handle: sig,
+    }
+    .into();
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, prev_head, Some(new_head)).ok()? {
+        PushResult::Success() => Some(bid),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+/// Read the currently-pinned (cap, sig) handle pair for a team, if
+/// any. Used by the auth flow at OP_AUTH time to find our own leaf
+/// cap to present.
+pub fn current_team_cap<S>(
+    store: &mut S,
+    team_root: ed25519_dalek::VerifyingKey,
+) -> Option<(Inline<Handle<SimpleArchive>>, Inline<Handle<SimpleArchive>>)>
+where
+    S: BlobStore + BranchStore,
+{
+    let bid = find_team_cap_branch(store, team_root)?;
+    let head = store.head(bid).ok()??;
+    let reader = store.reader().ok()?;
+    let meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(head).ok()?;
+    find!(
+        (
+            e: Id,
+            cap: Inline<Handle<SimpleArchive>>,
+            sig: Inline<Handle<SimpleArchive>>,
+        ),
+        pattern!(&meta, [{
+            ?e @
+            team_cap_handle: ?cap,
+            team_sig_handle: ?sig,
+        }])
+    )
+    .next()
+    .map(|(_, cap, sig)| (cap, sig))
 }
 
 /// A single renewal-policy entry as recorded on the renewal-policy

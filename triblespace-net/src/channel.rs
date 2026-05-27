@@ -27,6 +27,19 @@ pub enum NetCommand {
     /// branch updates trigger this; subscribers on the team topic
     /// receive the flood message and walk the closure to catch up.
     Gossip { branch: RawBranchId, head: RawHash },
+    /// Dispatch a freshly-signed cap+sig pair to `subject` via the
+    /// auth-handshake ALPN. Used by the renewal daemon (push-based
+    /// renewal) and by the `team approve` subcommand (response to a
+    /// pending request). The network thread opens a connection to
+    /// the subject's pubkey, sends `OP_DELIVER_CAP`, and closes —
+    /// no event is emitted back to the Peer on success or failure
+    /// (best-effort fire-and-forget; the recipient's ACK is observed
+    /// at the wire layer only).
+    DeliverCap {
+        subject: PublisherKey,
+        cap_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+    },
 }
 
 /// Events received from the network thread.

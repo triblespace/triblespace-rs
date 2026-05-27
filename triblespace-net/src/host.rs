@@ -231,6 +231,23 @@ impl NetSender {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
+    /// Dispatch a freshly-signed (cap, sig) blob pair to `subject`.
+    /// Fire-and-forget — the network thread handles the dial,
+    /// `OP_DELIVER_CAP`, and connection teardown. Used by the
+    /// renewal daemon and `team approve`.
+    pub fn deliver_cap(
+        &self,
+        subject: PublisherKey,
+        cap_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+    ) {
+        let _ = self.cmd_tx.send(NetCommand::DeliverCap {
+            subject,
+            cap_bytes,
+            sig_bytes,
+        });
+    }
+
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
         // Descriptive caps: eviction is per-issuer non-renewal, not
         // gossiped revocation blobs. So `update_snapshot` no longer
@@ -585,6 +602,69 @@ async fn host_loop(
                             let _ = sender.broadcast(msg.into()).await;
                         });
                     }
+                }
+                NetCommand::DeliverCap { subject, cap_bytes, sig_bytes } => {
+                    // Open a fresh connection on the auth-handshake
+                    // ALPN, send OP_DELIVER_CAP, close. The recipient's
+                    // ack byte is observed but not surfaced — the
+                    // command is fire-and-forget at the Peer API
+                    // level. Failure paths (connection refused, peer
+                    // unreachable, recipient rejected) just log; the
+                    // renewal-daemon retries on its next tick.
+                    let ep_for_deliver = ep.clone();
+                    tokio::spawn(async move {
+                        let subject_id = match iroh_base::EndpointId::from_bytes(&subject) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                warn!(error = %e, "DeliverCap: bad subject pubkey");
+                                return;
+                            }
+                        };
+                        let conn = match ep_for_deliver
+                            .connect(
+                                subject_id,
+                                crate::handshake::AUTH_HANDSHAKE_ALPN,
+                            )
+                            .await
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                debug!(
+                                    subject = %hex::encode(&subject[..4]),
+                                    error = %e,
+                                    "DeliverCap: connect failed"
+                                );
+                                return;
+                            }
+                        };
+                        match crate::handshake::send_deliver_cap(
+                            &conn, &cap_bytes, &sig_bytes,
+                        )
+                        .await
+                        {
+                            Ok(status) if status == crate::handshake::STATUS_OK => {
+                                debug!(
+                                    subject = %hex::encode(&subject[..4]),
+                                    "DeliverCap: recipient ack OK"
+                                );
+                            }
+                            Ok(status) => {
+                                debug!(
+                                    subject = %hex::encode(&subject[..4]),
+                                    status,
+                                    "DeliverCap: recipient returned non-OK status"
+                                );
+                            }
+                            Err(e) => {
+                                debug!(
+                                    subject = %hex::encode(&subject[..4]),
+                                    error = %e,
+                                    "DeliverCap: send failed"
+                                );
+                            }
+                        }
+                        conn.close(0u32.into(), b"ok");
+                    });
                 }
             }
         }
