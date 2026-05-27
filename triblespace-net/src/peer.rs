@@ -229,21 +229,7 @@ where
                     }
                 }
                 NetEvent::CapRequest { requester, partial_cap_bytes } => {
-                    // TODO: persist on the local pending-requests
-                    // branch with status_pending so the CLI / daemon
-                    // can list and approve. For now stash the cap blob
-                    // in the local store so subsequent approval has
-                    // the bytes to sign — pinning into a branch with
-                    // metadata comes with the CLI subcommands.
-                    let bytes: Bytes = partial_cap_bytes.into();
-                    if let Ok(_h) = self.store.put::<UnknownBlob, Bytes>(bytes) {
-                        tracing::debug!(
-                            requester = %hex::encode(&requester[..4]),
-                            "CapRequest received; blob stored (pending-branch persistence TODO)"
-                        );
-                    } else {
-                        tracing::warn!("CapRequest received; failed to store partial cap");
-                    }
+                    self.absorb_cap_request(requester, partial_cap_bytes);
                 }
                 NetEvent::CapDelivered { issuer, cap_bytes, sig_bytes } => {
                     // Verify the delivered chain against our configured
@@ -317,6 +303,78 @@ where
         // ── Phase 4: refresh the snapshot served by the network thread ─
         if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
             self.sender.update_snapshot(snap);
+        }
+    }
+
+    /// Persist an incoming join request: store the partial-cap blob,
+    /// then add a pending-request entity to the local pending-requests
+    /// branch. The entity id becomes the value `team approve <id>`
+    /// consumes; the partial-cap blob is recoverable from the entity's
+    /// `request_partial_cap` handle.
+    fn absorb_cap_request(
+        &mut self,
+        requester: PublisherKey,
+        partial_cap_bytes: Vec<u8>,
+    ) {
+        use triblespace_core::blob::Blob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::inline::TryToInline;
+
+        // Reconstitute the requester pubkey from bytes. If the bytes
+        // aren't a valid ed25519 pubkey, drop on the floor — only
+        // iroh-verified peers reach this code path, so this is
+        // defensive only.
+        let Ok(requester_pubkey) = ed25519_dalek::VerifyingKey::from_bytes(&requester) else {
+            tracing::warn!(
+                requester = %hex::encode(&requester[..4]),
+                "CapRequest: bad requester pubkey; dropping"
+            );
+            return;
+        };
+
+        // Store the partial cap blob so the approver can later read
+        // its declared subject/scope/expiry without B re-sending.
+        let blob: Blob<SimpleArchive> =
+            Blob::new(anybytes::Bytes::from_source(partial_cap_bytes));
+        let Ok(partial_cap_handle) = self
+            .store
+            .put::<SimpleArchive, Blob<SimpleArchive>>(blob)
+        else {
+            tracing::warn!("CapRequest: failed to store partial cap blob");
+            return;
+        };
+
+        // Point-interval at "now" — pending-requests timeline is
+        // just "this arrived at T".
+        let now = match hifitime::Epoch::now() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!("CapRequest: system time unavailable; dropping");
+                return;
+            }
+        };
+        let received_at = (now, now).try_to_inline().expect("point interval");
+
+        match crate::policy::record_pending_request(
+            &mut self.store,
+            requester_pubkey,
+            partial_cap_handle,
+            received_at,
+        ) {
+            Some(req_id) => {
+                let req_id_bytes: [u8; 16] = req_id.into();
+                tracing::info!(
+                    requester = %hex::encode(&requester[..4]),
+                    request_id = %hex::encode(req_id_bytes),
+                    "CapRequest recorded as pending"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    requester = %hex::encode(&requester[..4]),
+                    "CapRequest: failed to record on pending-requests branch"
+                );
+            }
         }
     }
 

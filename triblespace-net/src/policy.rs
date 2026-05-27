@@ -32,14 +32,14 @@
 //! the design rationale.
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::id::Id;
+use triblespace_core::id::{Id, genid};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
-use triblespace_core::macros::{find, pattern};
+use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BranchStore};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult};
 use triblespace_core::trible::TribleSet;
 
 attributes! {
@@ -182,4 +182,441 @@ where
         }
     }
     None
+}
+
+/// Find the local-only branch of a given kind (e.g.
+/// `KIND_RENEWAL_POLICY`, `KIND_PENDING_REQUESTS`). Branches of these
+/// kinds are singletons per peer, so the first match wins.
+pub fn find_local_only_branch_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
+where
+    S: BlobStore + BranchStore,
+{
+    let bids: Vec<Id> = store
+        .branches()
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+    for bid in bids {
+        let Ok(Some(head)) = store.head(bid) else { continue; };
+        let Ok(reader) = store.reader() else { continue; };
+        let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { continue; };
+        let matches = find!(
+            k: Id,
+            pattern!(&meta, [{ _?e @ local_only_branch: ?k }])
+        )
+        .any(|k| k == kind);
+        if matches {
+            return Some(bid);
+        }
+    }
+    None
+}
+
+/// A single pending request as recorded on the pending-requests branch.
+pub struct PendingRequest {
+    /// Entity id of this request inside the branch metadata blob.
+    /// Stable as long as the request isn't deleted; used as the
+    /// argument to `team approve <id>`.
+    pub id: Id,
+    pub requester: ed25519_dalek::VerifyingKey,
+    pub partial_cap: Inline<Handle<SimpleArchive>>,
+    pub received_at: Inline<NsTAIInterval>,
+    pub status: Id,
+}
+
+/// Snapshot of the current pending-requests set.
+///
+/// Branch metadata is "current state" rather than commit history —
+/// the head metadata blob holds all currently-known requests as
+/// distinct entities. This keeps the schema simple at low cardinality
+/// (a peer realistically has at most a handful of pending requests
+/// open at any time).
+pub fn list_pending_requests<S>(store: &mut S) -> Vec<PendingRequest>
+where
+    S: BlobStore + BranchStore,
+{
+    let Some(bid) = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS) else {
+        return Vec::new();
+    };
+    let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
+    let Ok(reader) = store.reader() else { return Vec::new(); };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { return Vec::new(); };
+
+    find!(
+        (
+            e: Id,
+            requester: ed25519_dalek::VerifyingKey,
+            partial_cap: Inline<Handle<SimpleArchive>>,
+            received_at: Inline<NsTAIInterval>,
+            status: Id,
+        ),
+        pattern!(&meta, [{
+            ?e @
+            request_requester: ?requester,
+            request_partial_cap: ?partial_cap,
+            request_received_at: ?received_at,
+            request_status: ?status,
+        }])
+    )
+    .map(|(id, requester, partial_cap, received_at, status)| PendingRequest {
+        id,
+        requester,
+        partial_cap,
+        received_at,
+        status,
+    })
+    .collect()
+}
+
+/// Record an incoming `OP_REQUEST_CAP` as a pending request entity on
+/// the local pending-requests branch.
+///
+/// Find-or-create the branch on first call; subsequent calls extend
+/// the head's metadata blob with one additional entity. The entity id
+/// is fresh and is the value the CLI's `team approve <id>` consumes.
+///
+/// Returns the entity id of the new request entry. Returns `None` if
+/// the underlying blob/branch writes fail (the caller decides whether
+/// to retry, log, or drop).
+pub fn record_pending_request<S>(
+    store: &mut S,
+    requester: ed25519_dalek::VerifyingKey,
+    partial_cap: Inline<Handle<SimpleArchive>>,
+    received_at: Inline<NsTAIInterval>,
+) -> Option<Id>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    // Find or create the pending-requests branch.
+    let (bid, prev_head) = match find_local_only_branch_of_kind(
+        store,
+        KIND_PENDING_REQUESTS,
+    ) {
+        Some(bid) => {
+            let head = store.head(bid).ok().flatten();
+            (bid, head)
+        }
+        None => (*genid(), None),
+    };
+
+    // Reconstitute the current metadata blob (if any), or start fresh
+    // with just the branch-kind marker.
+    let mut meta: TribleSet = match &prev_head {
+        Some(h) => {
+            let reader = store.reader().ok()?;
+            reader.get::<TribleSet, SimpleArchive>(*h).ok()?
+        }
+        None => {
+            use triblespace_core::id::ExclusiveId;
+            let marker_id = genid();
+            entity! { ExclusiveId::force_ref(&marker_id) @
+                local_only_branch: KIND_PENDING_REQUESTS,
+            }
+            .into()
+        }
+    };
+
+    // Add the new request entity. Its id is fresh — that's the value
+    // the CLI's `team approve` consumes.
+    let request_id = genid();
+    let request_set: TribleSet = entity! {
+        triblespace_core::id::ExclusiveId::force_ref(&request_id) @
+        request_requester: requester,
+        request_partial_cap: partial_cap,
+        request_received_at: received_at,
+        request_status: STATUS_PENDING,
+    }
+    .into();
+    meta += request_set;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, prev_head, Some(new_head)).ok()? {
+        PushResult::Success() => Some(*request_id),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+/// A single renewal-policy entry as recorded on the renewal-policy
+/// branch. The auto-renewal daemon enumerates these and re-issues a
+/// fresh cap for any whose `issued_at` upper bound is within the
+/// configured renewal window of `now` AND that don't carry a
+/// `retracted_at` attribute.
+pub struct PolicyEntry {
+    pub id: Id,
+    pub subject: ed25519_dalek::VerifyingKey,
+    pub scope: Id,
+    pub issued_at: Inline<NsTAIInterval>,
+    pub latest_cap: Inline<Handle<SimpleArchive>>,
+    pub latest_sig: Inline<Handle<SimpleArchive>>,
+    /// `Some(t)` if A has chosen to stop auto-renewing this entry;
+    /// the daemon must skip entries with this set.
+    pub retracted_at: Option<Inline<NsTAIInterval>>,
+}
+
+/// Enumerate the current renewal-policy entries.
+///
+/// Includes retracted entries (with `retracted_at` populated) so
+/// callers can render the full audit view; the daemon's renewal
+/// loop filters them out at action time.
+pub fn list_renewal_policy<S>(store: &mut S) -> Vec<PolicyEntry>
+where
+    S: BlobStore + BranchStore,
+{
+    let Some(bid) = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY) else {
+        return Vec::new();
+    };
+    let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
+    let Ok(reader) = store.reader() else { return Vec::new(); };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { return Vec::new(); };
+
+    // Required fields (issued_at, latest cap/sig, subject, scope).
+    let core: Vec<(
+        Id,
+        ed25519_dalek::VerifyingKey,
+        Id,
+        Inline<NsTAIInterval>,
+        Inline<Handle<SimpleArchive>>,
+        Inline<Handle<SimpleArchive>>,
+    )> = find!(
+        (
+            e: Id,
+            subject: ed25519_dalek::VerifyingKey,
+            scope: Id,
+            issued_at: Inline<NsTAIInterval>,
+            cap: Inline<Handle<SimpleArchive>>,
+            sig: Inline<Handle<SimpleArchive>>,
+        ),
+        pattern!(&meta, [{
+            ?e @
+            policy_subject: ?subject,
+            policy_scope: ?scope,
+            policy_issued_at: ?issued_at,
+            policy_latest_cap: ?cap,
+            policy_latest_sig: ?sig,
+        }])
+    )
+    .collect();
+
+    // Optional retraction lookup per entry (separate query — keeping
+    // `policy_retracted_at` in the main pattern would filter out
+    // non-retracted entries, which is the opposite of what we want).
+    core.into_iter()
+        .map(|(id, subject, scope, issued_at, latest_cap, latest_sig)| {
+            let retracted_at = find!(
+                t: Inline<NsTAIInterval>,
+                pattern!(&meta, [{ id @ policy_retracted_at: ?t }])
+            )
+            .next();
+            PolicyEntry {
+                id,
+                subject,
+                scope,
+                issued_at,
+                latest_cap,
+                latest_sig,
+                retracted_at,
+            }
+        })
+        .collect()
+}
+
+/// Filter `list_renewal_policy` to entries that are due for renewal:
+/// not retracted, and the upper bound of their `issued_at` interval
+/// falls within `renewal_window` of `now`.
+///
+/// The daemon's typical call: `renewable_within(store,
+/// Duration::from_secs(3600))` → entries whose current cap expires
+/// in the next hour or already has. The window should be > the
+/// daemon's tick cadence so a renewal isn't missed across one
+/// missed tick.
+pub fn renewable_within<S>(
+    store: &mut S,
+    renewal_window: hifitime::Duration,
+) -> Vec<PolicyEntry>
+where
+    S: BlobStore + BranchStore,
+{
+    let Ok(now) = hifitime::Epoch::now() else { return Vec::new(); };
+    let cutoff = now + renewal_window;
+    list_renewal_policy(store)
+        .into_iter()
+        .filter(|e| e.retracted_at.is_none())
+        .filter(|e| {
+            use triblespace_core::inline::TryFromInline;
+            match <(hifitime::Epoch, hifitime::Epoch)>::try_from_inline(&e.issued_at) {
+                // The current cap's upper bound has already passed
+                // `cutoff` — i.e. it expires sooner than the renewal
+                // window says we want, so it's due.
+                Ok((_lower, upper)) => upper <= cutoff,
+                // A malformed interval treats as overdue (defensive —
+                // re-issuing repairs the entry).
+                Err(_) => true,
+            }
+        })
+        .collect()
+}
+
+/// Mark a pending request as approved or rejected. The entity-level
+/// fact (request_status) is rewritten on the same branch's head blob.
+///
+/// This is what `team approve` and (eventually) `team reject` call
+/// after they've taken their respective external actions (e.g. for
+/// approve: signed + dispatched `OP_DELIVER_CAP`).
+pub fn set_request_status<S>(
+    store: &mut S,
+    request_id: Id,
+    new_status: Id,
+) -> Option<()>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    let bid = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS)?;
+    let prev_head = store.head(bid).ok()??;
+
+    let reader = store.reader().ok()?;
+    let mut meta: TribleSet = reader
+        .get::<TribleSet, SimpleArchive>(prev_head)
+        .ok()?;
+
+    // Find the existing status trible and remove it; insert a fresh
+    // one with the new status value. TribleSet is a set, so we
+    // construct a single-trible set and use the diff-and-merge
+    // primitives.
+    let current_status: Option<Id> = find!(
+        s: Id,
+        pattern!(&meta, [{ request_id @ request_status: ?s }])
+    )
+    .next();
+    if let Some(old) = current_status {
+        let old_trible: TribleSet = entity! {
+            triblespace_core::id::ExclusiveId::force_ref(&request_id) @
+            request_status: old,
+        }
+        .into();
+        // Set difference: remove the old trible.
+        meta = meta.difference(&old_trible);
+    }
+    let new_trible: TribleSet = entity! {
+        triblespace_core::id::ExclusiveId::force_ref(&request_id) @
+        request_status: new_status,
+    }
+    .into();
+    meta += new_trible;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+        PushResult::Success() => Some(()),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::inline::TryToInline;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::trible::TribleSet;
+
+    fn point_now() -> Inline<NsTAIInterval> {
+        let now = hifitime::Epoch::now().expect("system time");
+        (now, now).try_to_inline().expect("point interval")
+    }
+
+    fn empty_partial_cap_handle(
+        store: &mut MemoryRepo,
+    ) -> Inline<Handle<SimpleArchive>> {
+        let set = TribleSet::new();
+        let blob: Blob<SimpleArchive> = {
+            use triblespace_core::blob::IntoBlob;
+            set.to_blob()
+        };
+        store
+            .put::<SimpleArchive, Blob<SimpleArchive>>(blob)
+            .expect("put")
+    }
+
+    #[test]
+    fn record_then_list_pending_round_trip() {
+        let mut store = MemoryRepo::default();
+        let requester = SigningKey::generate(&mut OsRng).verifying_key();
+        let partial_cap = empty_partial_cap_handle(&mut store);
+
+        let received_at = point_now();
+        let id = record_pending_request(
+            &mut store,
+            requester,
+            partial_cap,
+            received_at,
+        )
+        .expect("record");
+
+        let listed = list_pending_requests(&mut store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].requester, requester);
+        assert_eq!(listed[0].status, STATUS_PENDING);
+        assert_eq!(listed[0].partial_cap.raw, partial_cap.raw);
+    }
+
+    #[test]
+    fn second_request_extends_pending_set() {
+        let mut store = MemoryRepo::default();
+        let req1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let req2 = SigningKey::generate(&mut OsRng).verifying_key();
+        let partial = empty_partial_cap_handle(&mut store);
+
+        let id1 = record_pending_request(&mut store, req1, partial, point_now())
+            .expect("record 1");
+        let id2 = record_pending_request(&mut store, req2, partial, point_now())
+            .expect("record 2");
+        assert_ne!(id1, id2);
+
+        let listed = list_pending_requests(&mut store);
+        assert_eq!(listed.len(), 2);
+        let ids: std::collections::HashSet<Id> =
+            listed.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+    }
+
+    #[test]
+    fn set_request_status_flips_one_entry() {
+        let mut store = MemoryRepo::default();
+        let requester = SigningKey::generate(&mut OsRng).verifying_key();
+        let partial = empty_partial_cap_handle(&mut store);
+
+        let id = record_pending_request(&mut store, requester, partial, point_now())
+            .expect("record");
+
+        // Initial status is PENDING.
+        let before = list_pending_requests(&mut store);
+        assert_eq!(before[0].status, STATUS_PENDING);
+
+        // Flip to APPROVED.
+        set_request_status(&mut store, id, STATUS_APPROVED).expect("set status");
+        let after = list_pending_requests(&mut store);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].status, STATUS_APPROVED);
+        assert_eq!(after[0].id, id);
+    }
+
+    #[test]
+    fn pending_branch_is_local_only() {
+        // Recording a request must produce a branch carrying the
+        // local-only marker so the gossip publisher skips it.
+        let mut store = MemoryRepo::default();
+        let requester = SigningKey::generate(&mut OsRng).verifying_key();
+        let partial = empty_partial_cap_handle(&mut store);
+
+        let _ = record_pending_request(&mut store, requester, partial, point_now())
+            .expect("record");
+
+        let bid = find_local_only_branch_of_kind(&mut store, KIND_PENDING_REQUESTS)
+            .expect("branch exists");
+        assert!(is_local_only_branch(&mut store, bid));
+    }
 }

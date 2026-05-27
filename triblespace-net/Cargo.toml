@@ -33,9 +33,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
+hifitime = "4.1.2"
 
 [dev-dependencies]
-hifitime = "4.1.2"
 # `test-utils` exposes `iroh::test_utils::test_transport::TestNetwork`,
 # the in-memory simulated transport that lets two endpoints talk
 # without DNS or relays. The mpsc-channel transport itself lives
