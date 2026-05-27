@@ -97,6 +97,36 @@ pub enum Command {
         #[arg(long)]
         pile: PathBuf,
     },
+    /// List incoming join requests awaiting approval. These are
+    /// peers that sent `OP_REQUEST_CAP` to this node while
+    /// `pile net sync` was running.
+    ListPending {
+        /// Path to the local pile file.
+        #[arg(long)]
+        pile: PathBuf,
+    },
+    /// List the renewal-policy entries on the local pile: caps this
+    /// node has issued (or auto-approved) that the daemon is
+    /// keeping renewed. Retracted entries are included with a
+    /// retraction marker.
+    ListIssued {
+        /// Path to the local pile file.
+        #[arg(long)]
+        pile: PathBuf,
+    },
+    /// Stop auto-renewing a specific (subject, scope) entry. The
+    /// corresponding peer's cap chain dies at its next natural
+    /// expiry — no revocation blob propagates anywhere. Pure local
+    /// decision, takes effect on the next daemon tick.
+    Retract {
+        /// Path to the local pile file.
+        #[arg(long)]
+        pile: PathBuf,
+        /// The renewal-policy entry id to retract (hex, from
+        /// `team list-issued`).
+        #[arg(long)]
+        entry: String,
+    },
     /// Walk the chain of one capability and print each level
     /// (subject, issuer, scope, expiry). Diagnostic deep-dive
     /// for "why is this cap rejected" — `team list` gives
@@ -165,6 +195,9 @@ pub fn run(cmd: Command) -> Result<()> {
             target,
         } => run_revoke(pile, team_root_secret, target),
         Command::List { pile } => run_list(pile),
+        Command::ListPending { pile } => run_list_pending(pile),
+        Command::ListIssued { pile } => run_list_issued(pile),
+        Command::Retract { pile, entry } => run_retract(pile, entry),
         Command::Show {
             pile,
             cap,
@@ -950,4 +983,104 @@ fn run_show(
 
     let _ = pile.close();
     Ok(())
+}
+
+// ── Descriptive-caps subcommands (decide#4b59ce27) ─────────────────────
+
+/// Print the pending join requests recorded on the local pending-
+/// requests branch. Each line shows the entry id (for `team approve`),
+/// requester pubkey, partial-cap handle, received-at instant, and
+/// status tag.
+fn run_list_pending(pile_path: PathBuf) -> Result<()> {
+    let mut pile = open_pile(&pile_path)?;
+    let pending = triblespace_net::policy::list_pending_requests(&mut pile);
+    let _ = pile.close();
+
+    if pending.is_empty() {
+        println!("(no pending requests)");
+        return Ok(());
+    }
+    println!("pending requests:  {}", pending.len());
+    for p in &pending {
+        let id_bytes: [u8; 16] = p.id.into();
+        let status_label = if p.status == triblespace_net::policy::STATUS_PENDING {
+            "PENDING"
+        } else if p.status == triblespace_net::policy::STATUS_APPROVED {
+            "APPROVED"
+        } else if p.status == triblespace_net::policy::STATUS_REJECTED {
+            "REJECTED"
+        } else {
+            "unknown"
+        };
+        println!("  entry:        {}", hex::encode(id_bytes));
+        println!("    requester:  {}", hex::encode(p.requester.to_bytes()));
+        println!("    partial:    {}", hex::encode(p.partial_cap.raw));
+        println!("    received:   {}", format_expiry(&p.received_at));
+        println!("    status:     {status_label}");
+        println!();
+    }
+    Ok(())
+}
+
+/// Print the renewal-policy entries on the local pile: caps this node
+/// is currently auto-renewing, plus any that have been retracted.
+fn run_list_issued(pile_path: PathBuf) -> Result<()> {
+    let mut pile = open_pile(&pile_path)?;
+    let entries = triblespace_net::policy::list_renewal_policy(&mut pile);
+    let _ = pile.close();
+
+    if entries.is_empty() {
+        println!("(no renewal-policy entries)");
+        return Ok(());
+    }
+    println!("renewal-policy entries:  {}", entries.len());
+    for e in &entries {
+        let id_bytes: [u8; 16] = e.id.into();
+        let scope_bytes: [u8; 16] = e.scope.into();
+        let status = if e.retracted_at.is_some() {
+            "RETRACTED"
+        } else {
+            "ACTIVE"
+        };
+        println!("  entry:      {}  [{status}]", hex::encode(id_bytes));
+        println!("    subject:  {}", hex::encode(e.subject.to_bytes()));
+        println!("    scope:    {}", hex::encode(scope_bytes));
+        println!("    issued:   {}", format_expiry(&e.issued_at));
+        println!("    cap:      {}", hex::encode(e.latest_cap.raw));
+        println!("    sig:      {}", hex::encode(e.latest_sig.raw));
+        if let Some(r) = &e.retracted_at {
+            println!("    retracted: {}", format_expiry(r));
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// Mark a renewal-policy entry as retracted. The next daemon tick
+/// will skip it; the corresponding subject's chain dies at its
+/// current cap's natural expiry.
+fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
+    let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
+        .map_err(|e| anyhow!("decode entry hex: {e}"))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
+    let entry_id = Id::new(entry_bytes)
+        .ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
+
+    let mut pile = open_pile(&pile_path)?;
+    let outcome = triblespace_net::policy::retract_policy_entry(&mut pile, entry_id);
+    let _ = pile.close();
+
+    match outcome {
+        Some(()) => {
+            println!("retracted entry {}", hex::encode(<[u8; 16]>::from(entry_id)));
+            println!("(the subject's cap chain will die at its current cap's expiry; no revocation propagates)");
+            Ok(())
+        }
+        None => bail!(
+            "retract failed: entry {} not found, or the renewal-policy branch is missing/locked",
+            hex::encode(<[u8; 16]>::from(entry_id))
+        ),
+    }
 }
