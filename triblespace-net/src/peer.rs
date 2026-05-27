@@ -501,6 +501,162 @@ where
         }
     }
 
+    /// Run one tick of the auto-renewal scan.
+    ///
+    /// Enumerates renewal-policy entries whose current cap expires
+    /// within `renewal_window` of now and aren't retracted, signs a
+    /// fresh cap+sig for each (using our team-cap as parent), and
+    /// dispatches via `OP_DELIVER_CAP`. The policy entry is updated
+    /// in lockstep so the next tick doesn't re-fire on the same entry.
+    ///
+    /// Returns the count of entries renewed this tick — useful for
+    /// observability and tests. `0` on every tick after the swarm
+    /// settles into steady state means the daemon is quiet.
+    ///
+    /// Designed to be called from `trible pile net sync`'s main loop
+    /// alongside `refresh`. The 1-hour default window assumes a tick
+    /// cadence well under that; tune both together for production
+    /// deployments.
+    pub fn renewal_tick(&mut self, renewal_window: hifitime::Duration) -> usize {
+        use triblespace_core::blob::{Blob, TryFromBlob};
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::inline::{Inline, TryToInline};
+        use triblespace_core::inline::encodings::hash::Handle;
+        use triblespace_core::repo::BlobStoreGet;
+
+        let entries = crate::policy::renewable_within(&mut self.store, renewal_window);
+        if entries.is_empty() {
+            return 0;
+        }
+
+        // Our own current cap is the parent for every renewal. If
+        // we don't have one, we can't sign — log and bail.
+        let Some((parent_cap_handle, parent_sig_handle)) =
+            crate::policy::current_team_cap(&mut self.store, self.team_root)
+        else {
+            tracing::warn!(
+                renewable = entries.len(),
+                "renewal_tick: no team-cap pinned; cannot issue successors"
+            );
+            return 0;
+        };
+
+        let Ok(reader) = self.store.reader() else {
+            tracing::warn!("renewal_tick: pile reader unavailable");
+            return 0;
+        };
+        let Ok(parent_cap_blob) = reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(parent_cap_handle)
+        else {
+            tracing::warn!("renewal_tick: parent cap blob missing");
+            return 0;
+        };
+        let Ok(parent_sig_blob) = reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(parent_sig_handle)
+        else {
+            tracing::warn!("renewal_tick: parent sig blob missing");
+            return 0;
+        };
+
+        let mut dispatched = 0usize;
+        for entry in entries {
+            // Re-derive scope_facts from the previous cap blob —
+            // policy entries carry only the scope_root id, not the
+            // facts hanging off it.
+            let Ok(prev_cap_blob) = reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
+            else {
+                tracing::warn!(
+                    entry = ?entry.id,
+                    "renewal_tick: previous cap blob missing; skipping entry"
+                );
+                continue;
+            };
+            let Ok(prev_set): Result<
+                triblespace_core::trible::TribleSet,
+                _,
+            > = TryFromBlob::try_from_blob(prev_cap_blob) else {
+                continue;
+            };
+            // Extract all tribles hanging off the scope_root entity.
+            // pattern!() over the cap blob restricted to entities
+            // whose entity-id == scope_root gives us the scope sub-graph.
+            let scope_facts = extract_scope_subgraph(&prev_set, entry.scope);
+
+            // Fresh expiry interval: [now, now + window * 2]. The
+            // factor-of-two is a heuristic — we want the cap to cover
+            // at least one more renewal cycle so missed ticks don't
+            // immediately break the chain.
+            let Ok(now) = hifitime::Epoch::now() else { continue };
+            let new_upper = now + renewal_window * 2;
+            let Ok(new_expiry) = (now, new_upper).try_to_inline() else {
+                continue;
+            };
+
+            // Sign.
+            let (new_cap, new_sig) = match triblespace_core::repo::capability::build_capability(
+                &self.signing_key,
+                entry.subject,
+                Some((parent_cap_blob.clone(), parent_sig_blob.clone())),
+                entry.scope,
+                scope_facts,
+                new_expiry,
+            ) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        entry = ?entry.id,
+                        error = ?e,
+                        "renewal_tick: build_capability failed; skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let new_cap_handle: Inline<Handle<SimpleArchive>> = (&new_cap).get_handle();
+            let new_sig_handle: Inline<Handle<SimpleArchive>> = (&new_sig).get_handle();
+
+            // Persist locally — the next tick's policy update points
+            // at these handles; the dispatch ships the bytes.
+            let cap_bytes = new_cap.bytes.to_vec();
+            let sig_bytes = new_sig.bytes.to_vec();
+            let _ = self
+                .store
+                .put::<SimpleArchive, Blob<SimpleArchive>>(new_cap);
+            let _ = self
+                .store
+                .put::<SimpleArchive, Blob<SimpleArchive>>(new_sig);
+
+            // Dispatch over the wire.
+            self.sender.deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
+
+            // Update the policy entry so we don't re-renew on the
+            // next tick.
+            if crate::policy::update_policy_entry(
+                &mut self.store,
+                entry.id,
+                new_expiry,
+                new_cap_handle,
+                new_sig_handle,
+            )
+            .is_some()
+            {
+                dispatched += 1;
+                tracing::info!(
+                    subject = %hex::encode(entry.subject.to_bytes()),
+                    entry = ?entry.id,
+                    "renewal_tick: re-issued and dispatched"
+                );
+            } else {
+                tracing::warn!(
+                    entry = ?entry.id,
+                    "renewal_tick: re-issued but policy update failed; will retry"
+                );
+            }
+        }
+        dispatched
+    }
+
     /// Force-republish all current non-tracking branches to the gossip
     /// topic, regardless of whether they appear changed since the last
     /// publish.
@@ -689,4 +845,23 @@ fn read_remote_name<S: BlobStore>(store: &mut S, head_hash: &RawHash) -> Option<
 
     let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
     Some(name_view.as_ref().to_string())
+}
+
+
+/// Extract every trible whose entity is `scope_root` from `set`,
+/// returning them as a fresh TribleSet. Used by `renewal_tick` to
+/// reconstruct the scope-facts argument to `build_capability` from
+/// the previous-cap blob — policy entries carry only the
+/// `scope_root` id, not the facts hanging off it.
+fn extract_scope_subgraph(
+    set: &triblespace_core::trible::TribleSet,
+    scope_root: triblespace_core::id::Id,
+) -> triblespace_core::trible::TribleSet {
+    let mut result = triblespace_core::trible::TribleSet::new();
+    for trible in set.iter() {
+        if *trible.e() == scope_root {
+            result.insert(trible);
+        }
+    }
+    result
 }

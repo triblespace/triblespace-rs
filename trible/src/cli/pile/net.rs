@@ -303,6 +303,23 @@ fn run_sync(
             repo.storage_mut().refresh();
         }
 
+        // Renewal-daemon tick: scan the renewal-policy branch for
+        // entries whose current cap is within the renewal window of
+        // expiry, sign a successor, and dispatch via OP_DELIVER_CAP.
+        // Quiet by default (returns 0 when nothing is due) so the
+        // overhead is dominated by the policy-branch read.
+        //
+        // The window is intentionally large relative to the tick
+        // cadence (1 hour vs 100 ms) so missed ticks don't break
+        // chains — entries become due well before the cap actually
+        // expires, giving the daemon multiple chances to land the
+        // successor.
+        if direction != SyncDirection::ReadOnly {
+            let _renewed = repo
+                .storage_mut()
+                .renewal_tick(hifitime::Duration::from_seconds(3600.0));
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(())

@@ -545,6 +545,191 @@ where
         .collect()
 }
 
+// ── Renewal-policy entry writes ───────────────────────────────────────
+
+/// Insert (or refresh) a renewal-policy entry. Find-or-create the
+/// renewal-policy branch on first call.
+///
+/// The entity id is fresh on each call — policy entries are keyed by
+/// `(subject, scope)`, not by their generated entity id, and the
+/// daemon's renewable-scan recomputes from the issued_at field rather
+/// than relying on entity stability. If an entry for the same
+/// `(subject, scope)` already exists, the caller should remove or
+/// supersede it before adding the new one (typically via the
+/// `update_policy_entry` helper below, which rewrites the issued_at
+/// + handles in place).
+///
+/// Returns the new entry's entity id.
+pub fn record_policy_entry<S>(
+    store: &mut S,
+    subject: ed25519_dalek::VerifyingKey,
+    scope: Id,
+    issued_at: Inline<NsTAIInterval>,
+    cap: Inline<Handle<SimpleArchive>>,
+    sig: Inline<Handle<SimpleArchive>>,
+) -> Option<Id>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    use triblespace_core::id::ExclusiveId;
+
+    let (bid, prev_head) = match find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY) {
+        Some(bid) => (bid, store.head(bid).ok().flatten()),
+        None => (*genid(), None),
+    };
+
+    let mut meta: TribleSet = match &prev_head {
+        Some(h) => {
+            let reader = store.reader().ok()?;
+            reader.get::<TribleSet, SimpleArchive>(*h).ok()?
+        }
+        None => {
+            let marker_id = genid();
+            entity! { ExclusiveId::force_ref(&marker_id) @
+                local_only_branch: KIND_RENEWAL_POLICY,
+            }
+            .into()
+        }
+    };
+
+    let entity_id = genid();
+    let entry_set: TribleSet = entity! {
+        ExclusiveId::force_ref(&entity_id) @
+        policy_subject: subject,
+        policy_scope: scope,
+        policy_issued_at: issued_at,
+        policy_latest_cap: cap,
+        policy_latest_sig: sig,
+    }
+    .into();
+    meta += entry_set;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, prev_head, Some(new_head)).ok()? {
+        PushResult::Success() => Some(*entity_id),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+/// Update an existing renewal-policy entry in place: rewrite its
+/// `policy_issued_at`, `policy_latest_cap`, and `policy_latest_sig`
+/// tribles. Called by the renewal daemon after each successful
+/// re-sign + dispatch.
+///
+/// The `(subject, scope)` keys remain stable; only the time and
+/// handle fields change.
+pub fn update_policy_entry<S>(
+    store: &mut S,
+    entry_id: Id,
+    new_issued_at: Inline<NsTAIInterval>,
+    new_cap: Inline<Handle<SimpleArchive>>,
+    new_sig: Inline<Handle<SimpleArchive>>,
+) -> Option<()>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    use triblespace_core::id::ExclusiveId;
+
+    let bid = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(bid).ok()??;
+    let reader = store.reader().ok()?;
+    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
+
+    // Remove the three existing tribles we're replacing.
+    let cur_issued_at: Option<Inline<NsTAIInterval>> = find!(
+        t: Inline<NsTAIInterval>,
+        pattern!(&meta, [{ entry_id @ policy_issued_at: ?t }])
+    )
+    .next();
+    let cur_cap: Option<Inline<Handle<SimpleArchive>>> = find!(
+        h: Inline<Handle<SimpleArchive>>,
+        pattern!(&meta, [{ entry_id @ policy_latest_cap: ?h }])
+    )
+    .next();
+    let cur_sig: Option<Inline<Handle<SimpleArchive>>> = find!(
+        h: Inline<Handle<SimpleArchive>>,
+        pattern!(&meta, [{ entry_id @ policy_latest_sig: ?h }])
+    )
+    .next();
+
+    if let Some(old) = cur_issued_at {
+        let t: TribleSet = entity! {
+            ExclusiveId::force_ref(&entry_id) @
+            policy_issued_at: old,
+        }
+        .into();
+        meta = meta.difference(&t);
+    }
+    if let Some(old) = cur_cap {
+        let t: TribleSet = entity! {
+            ExclusiveId::force_ref(&entry_id) @
+            policy_latest_cap: old,
+        }
+        .into();
+        meta = meta.difference(&t);
+    }
+    if let Some(old) = cur_sig {
+        let t: TribleSet = entity! {
+            ExclusiveId::force_ref(&entry_id) @
+            policy_latest_sig: old,
+        }
+        .into();
+        meta = meta.difference(&t);
+    }
+
+    let new_tribles: TribleSet = entity! {
+        ExclusiveId::force_ref(&entry_id) @
+        policy_issued_at: new_issued_at,
+        policy_latest_cap: new_cap,
+        policy_latest_sig: new_sig,
+    }
+    .into();
+    meta += new_tribles;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+        PushResult::Success() => Some(()),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+/// Mark a renewal-policy entry as retracted (sets `policy_retracted_at
+/// = now`). The daemon's `renewable_within` filter then skips it on
+/// subsequent ticks; the corresponding peer's chain dies naturally at
+/// the current cap's expiry.
+pub fn retract_policy_entry<S>(
+    store: &mut S,
+    entry_id: Id,
+) -> Option<()>
+where
+    S: BlobStore + BlobStorePut + BranchStore,
+{
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::inline::TryToInline;
+
+    let bid = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(bid).ok()??;
+    let reader = store.reader().ok()?;
+    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
+
+    let now = hifitime::Epoch::now().ok()?;
+    let retracted_at: Inline<NsTAIInterval> =
+        (now, now).try_to_inline().ok()?;
+
+    let trible: TribleSet = entity! {
+        ExclusiveId::force_ref(&entry_id) @
+        policy_retracted_at: retracted_at,
+    }
+    .into();
+    meta += trible;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+        PushResult::Success() => Some(()),
+        PushResult::Conflict(_) => None,
+    }
+}
+
 /// Mark a pending request as approved or rejected. The entity-level
 /// fact (request_status) is rewritten on the same branch's head blob.
 ///
