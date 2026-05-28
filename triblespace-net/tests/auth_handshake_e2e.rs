@@ -130,7 +130,7 @@ async fn op_request_cap_round_trips() {
         .expect("channel still open");
     match event {
         IncomingOp::Request { partial_cap_bytes } => {
-            assert_eq!(partial_cap_bytes, payload, "payload survives the wire");
+            assert_eq!(&partial_cap_bytes[..], &payload[..], "payload survives the wire");
         }
         IncomingOp::Deliver { .. } => panic!("got Deliver, expected Request"),
     }
@@ -174,8 +174,8 @@ async fn op_deliver_cap_round_trips() {
         .expect("channel still open");
     match event {
         IncomingOp::Deliver { cap_bytes: c, sig_bytes: s } => {
-            assert_eq!(c, cap_bytes, "cap payload survives the wire");
-            assert_eq!(s, sig_bytes, "sig payload survives the wire");
+            assert_eq!(&c[..], &cap_bytes[..], "cap payload survives the wire");
+            assert_eq!(&s[..], &sig_bytes[..], "sig payload survives the wire");
         }
         IncomingOp::Request { .. } => panic!("got Request, expected Deliver"),
     }

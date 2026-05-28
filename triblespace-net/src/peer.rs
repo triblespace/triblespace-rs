@@ -221,8 +221,9 @@ where
             }
             match event {
                 NetEvent::Blob(data) => {
-                    let bytes: Bytes = data.into();
-                    let _ = self.store.put::<UnknownBlob, Bytes>(bytes);
+                    // `data` is already an anybytes::Bytes (refcounted) —
+                    // pass it into the store without re-wrapping.
+                    let _ = self.store.put::<UnknownBlob, Bytes>(data);
                 }
                 NetEvent::Head { branch, head, publisher } => {
                     if let Some(remote_id) = Id::new(branch) {
@@ -323,7 +324,7 @@ where
     fn absorb_cap_request(
         &mut self,
         requester: PublisherKey,
-        partial_cap_bytes: Vec<u8>,
+        partial_cap_bytes: anybytes::Bytes,
     ) {
         use triblespace_core::blob::Blob;
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -343,8 +344,9 @@ where
 
         // Store the partial cap blob so the approver can later read
         // its declared subject/scope/expiry without B re-sending.
-        let blob: Blob<SimpleArchive> =
-            Blob::new(anybytes::Bytes::from_source(partial_cap_bytes));
+        // partial_cap_bytes is already an anybytes::Bytes — wrap it
+        // into a typed Blob without re-allocating.
+        let blob: Blob<SimpleArchive> = Blob::new(partial_cap_bytes);
         let Ok(partial_cap_handle) = self
             .store
             .put::<SimpleArchive, Blob<SimpleArchive>>(blob)
@@ -399,17 +401,18 @@ where
     fn absorb_cap_delivery(
         &mut self,
         issuer: PublisherKey,
-        cap_bytes: Vec<u8>,
-        sig_bytes: Vec<u8>,
+        cap_bytes: anybytes::Bytes,
+        sig_bytes: anybytes::Bytes,
     ) {
         use triblespace_core::blob::Blob;
         use triblespace_core::repo::BlobStoreGet;
 
-        // Reconstitute blobs.
-        let cap_blob: Blob<SimpleArchive> =
-            Blob::new(anybytes::Bytes::from_source(cap_bytes.clone()));
-        let sig_blob: Blob<SimpleArchive> =
-            Blob::new(anybytes::Bytes::from_source(sig_bytes.clone()));
+        // Reconstitute blobs. anybytes::Bytes is Arc-refcounted so
+        // `.clone()` here is a refcount bump, not a byte-copy — the
+        // same backing buffer flows through the verify path and into
+        // the pile put without re-allocating.
+        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes.clone());
+        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
         // Subject must be US — a delivered cap is for our pubkey. The
@@ -460,16 +463,12 @@ where
                 // next compaction reclaims them. Forward security at
                 // the storage layer falls out naturally — only the
                 // current cap survives.
-                let cap_bytes_anybytes: anybytes::Bytes =
-                    anybytes::Bytes::from_source(cap_bytes);
-                let sig_bytes_anybytes: anybytes::Bytes =
-                    anybytes::Bytes::from_source(sig_bytes);
                 let _ = self
                     .store
-                    .put::<UnknownBlob, anybytes::Bytes>(cap_bytes_anybytes);
+                    .put::<UnknownBlob, anybytes::Bytes>(cap_bytes);
                 let _ = self
                     .store
-                    .put::<UnknownBlob, anybytes::Bytes>(sig_bytes_anybytes);
+                    .put::<UnknownBlob, anybytes::Bytes>(sig_bytes);
                 match crate::policy::pin_team_cap(
                     &mut self.store,
                     self.team_root,
@@ -617,9 +616,12 @@ where
             let new_sig_handle: Inline<Handle<SimpleArchive>> = (&new_sig).get_handle();
 
             // Persist locally — the next tick's policy update points
-            // at these handles; the dispatch ships the bytes.
-            let cap_bytes = new_cap.bytes.to_vec();
-            let sig_bytes = new_sig.bytes.to_vec();
+            // at these handles; the dispatch ships the bytes. Both
+            // sites share the same refcounted `anybytes::Bytes`
+            // backing the freshly-signed blob (clones are refcount
+            // bumps, no byte-copy).
+            let cap_bytes = new_cap.bytes.clone();
+            let sig_bytes = new_sig.bytes.clone();
             let _ = self
                 .store
                 .put::<SimpleArchive, Blob<SimpleArchive>>(new_cap);

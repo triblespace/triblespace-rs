@@ -6,6 +6,14 @@
 //! peer-targeted.
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
+//!
+//! Byte payloads use [`anybytes::Bytes`] rather than `Vec<u8>`:
+//! Bytes is Arc-refcounted, so cloning across the channel boundary
+//! is a refcount bump instead of a full byte-copy. The same payload
+//! can flow into multiple onward sinks (wire write + local pin)
+//! without re-materialising the buffer.
+
+use anybytes::Bytes;
 
 use crate::protocol::{RawPinId, RawHash};
 
@@ -37,8 +45,8 @@ pub enum NetCommand {
     /// at the wire layer only).
     DeliverCap {
         subject: PublisherKey,
-        cap_bytes: Vec<u8>,
-        sig_bytes: Vec<u8>,
+        cap_bytes: Bytes,
+        sig_bytes: Bytes,
     },
 }
 
@@ -46,7 +54,7 @@ pub enum NetCommand {
 #[derive(Debug)]
 pub enum NetEvent {
     /// A blob was fetched from the network.
-    Blob(Vec<u8>),
+    Blob(Bytes),
     /// A remote branch HEAD was learned (via gossip or fetch).
     /// Includes the publisher's public key for provenance.
     Head { branch: RawPinId, head: RawHash, publisher: PublisherKey },
@@ -58,7 +66,7 @@ pub enum NetEvent {
     /// to auto-approve, queue for human review, or reject.
     CapRequest {
         requester: PublisherKey,
-        partial_cap_bytes: Vec<u8>,
+        partial_cap_bytes: Bytes,
     },
     /// A peer issued us a capability — either in response to a prior
     /// `CapRequest` we made, or as an unsolicited renewal push. The
@@ -66,7 +74,7 @@ pub enum NetEvent {
     /// local team-cap branch.
     CapDelivered {
         issuer: PublisherKey,
-        cap_bytes: Vec<u8>,
-        sig_bytes: Vec<u8>,
+        cap_bytes: Bytes,
+        sig_bytes: Bytes,
     },
 }

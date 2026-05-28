@@ -1237,7 +1237,6 @@ fn run_request_join(
     let mut cap_set = TribleSet::from(cap_fragment);
     cap_set += scope_facts;
     let partial_cap: Blob<SimpleArchive> = cap_set.to_blob();
-    let partial_bytes: Vec<u8> = partial_cap.bytes.to_vec();
 
     println!(
         "sending OP_REQUEST_CAP to admin {} (scope={:?})…",
@@ -1245,11 +1244,13 @@ fn run_request_join(
         scope,
     );
 
+    // partial_cap.bytes is already an anybytes::Bytes; pass it
+    // through as &[u8] (Deref) without re-allocating.
     let status = block_on(async {
         triblespace_net::handshake::one_shot_request_cap(
             signing_key.clone(),
             admin_pubkey,
-            &partial_bytes,
+            &partial_cap.bytes,
         )
         .await
     })?;
@@ -1410,8 +1411,11 @@ fn run_approve(
 
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-    let cap_bytes: Vec<u8> = cap_blob.bytes.to_vec();
-    let sig_bytes: Vec<u8> = sig_blob.bytes.to_vec();
+    // anybytes::Bytes is Arc-refcounted; clone is a refcount bump,
+    // not a byte-copy. We need the bytes after store_blob consumes
+    // the typed Blob wrapper.
+    let cap_bytes = cap_blob.bytes.clone();
+    let sig_bytes = sig_blob.bytes.clone();
 
     // Persist locally + record on the renewal-policy pin so the daemon
     // takes over future renewals.

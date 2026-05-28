@@ -143,13 +143,18 @@ pub async fn send_deliver_cap(
 // ── Server-side: parse incoming streams ───────────────────────────────
 
 /// Payload of a single incoming op, parsed but not yet acted on.
+/// Byte buffers use [`anybytes::Bytes`] — the iroh stream reads
+/// into a Vec via `read_exact`, but we wrap it immediately so
+/// every downstream consumer (the protocol handler, the
+/// `NetEvent` channel, and the policy / wire-re-send layers
+/// beyond) shares one refcount instead of copying.
 pub enum IncomingOp {
     Request {
-        partial_cap_bytes: Vec<u8>,
+        partial_cap_bytes: anybytes::Bytes,
     },
     Deliver {
-        cap_bytes: Vec<u8>,
-        sig_bytes: Vec<u8>,
+        cap_bytes: anybytes::Bytes,
+        sig_bytes: anybytes::Bytes,
     },
 }
 
@@ -178,7 +183,7 @@ pub async fn read_incoming(recv: &mut RecvStream) -> Result<Option<IncomingOp>> 
     }
 }
 
-async fn read_length_prefixed(recv: &mut RecvStream) -> Result<Vec<u8>> {
+async fn read_length_prefixed(recv: &mut RecvStream) -> Result<anybytes::Bytes> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -195,7 +200,9 @@ async fn read_length_prefixed(recv: &mut RecvStream) -> Result<Vec<u8>> {
     recv.read_exact(&mut buf)
         .await
         .map_err(|e| anyhow!("recv body: {e}"))?;
-    Ok(buf)
+    // Wrap the freshly-read Vec into a refcounted Bytes (zero-copy —
+    // anybytes::Bytes::from_source just takes ownership of the Vec).
+    Ok(anybytes::Bytes::from_source(buf))
 }
 
 /// Write a status byte and finish the stream.

@@ -238,8 +238,8 @@ impl NetSender {
     pub fn deliver_cap(
         &self,
         subject: PublisherKey,
-        cap_bytes: Vec<u8>,
-        sig_bytes: Vec<u8>,
+        cap_bytes: anybytes::Bytes,
+        sig_bytes: anybytes::Bytes,
     ) {
         let _ = self.cmd_tx.send(NetCommand::DeliverCap {
             subject,
@@ -841,7 +841,7 @@ async fn fetch_reachable(
                 hex::encode(hash)
             ));
         }
-        let _ = events.send(NetEvent::Blob(data));
+        let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(data)));
     }
 
     // No close: connections live in the shared pool for the
@@ -1459,7 +1459,7 @@ async fn serve_stream(
                 // already self-consistent (every parent referenced by
                 // every fetched cap is also in `fetched`).
                 for (_, bytes) in fetched.drain() {
-                    let _ = events.send(NetEvent::Blob(bytes));
+                    let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(bytes)));
                 }
                 *auth_state.write().await = Some(verified);
                 send_u8(send, AUTH_OK).await?;
