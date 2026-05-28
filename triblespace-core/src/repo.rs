@@ -401,21 +401,44 @@ pub enum PushResult {
     Conflict(Option<Inline<Handle<SimpleArchive>>>),
 }
 
-/// Storage backend for branch metadata (branch-id → commit-handle mapping).
+/// Storage backend for pins: named, atomically-updatable handles to
+/// SimpleArchive blobs.
 ///
-/// This is the stateful counterpart to [`BlobStore`]: blob stores are
-/// content-addressed and orderless, while branch stores track a single
-/// mutable pointer per branch. The update operation uses compare-and-swap
-/// semantics so multiple writers can coordinate without locks.
+/// A *pin* is the storage primitive — a named cell holding a single
+/// `Inline<Handle<SimpleArchive>>`, updated via compare-and-swap. The
+/// pile's compaction sweep treats every pin head as a reachability
+/// root: blobs reachable from a pin survive; the rest are reclaimed.
+///
+/// Pins back several specialized use patterns, distinguished at
+/// higher layers via metadata markers:
+/// - A **branch** is a pin whose value resolves to a commit-chain
+///   head (Repository's content abstraction). Branch metadata
+///   carries `metadata::name` for human-readable lookup.
+/// - A **tracking pin** mirrors a remote peer's branch head and
+///   carries `tracking_remote_pin` + `remote_name`.
+/// - A **local-only pin** (renewal policy, pending requests,
+///   per-team cap holdings) carries `local_only_pin: <kind>` and is
+///   excluded from gossip publication.
+///
+/// `PinStore` itself doesn't know about these distinctions — it just
+/// provides the primitive: enumerate ids, read the current head, CAS
+/// an update. The two-level taxonomy lives at higher layers
+/// (decide#6de2dd95).
+///
+/// This trait is the stateful counterpart to [`BlobStore`]: blob
+/// stores are content-addressed and orderless; pin stores track a
+/// single mutable pointer per pin. The update operation uses
+/// compare-and-swap semantics so multiple writers can coordinate
+/// without locks.
 pub trait PinStore {
-    /// Error type for listing branches.
+    /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
     /// Error type for head lookups.
     type HeadError: Error + Debug + Send + Sync + 'static;
     /// Error type for CAS updates.
     type UpdateError: Error + Debug + Send + Sync + 'static;
 
-    /// Iterator over branch IDs.
+    /// Iterator over pin IDs.
     type ListIter<'a>: Iterator<Item = Result<Id, Self::PinsError>>
     where
         Self: 'a;

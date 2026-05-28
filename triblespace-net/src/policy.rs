@@ -1,28 +1,32 @@
-//! Local-only policy branches: renewal state, pending join requests,
-//! and per-team cap holdings.
+//! Local-only policy pins: renewal state, pending join requests, and
+//! per-team cap holdings.
 //!
-//! These branches live on the peer's pile but are **not** gossiped —
-//! the implementation here mirrors the tracking-branch pattern from
-//! `crate::tracking`. The `is_local_only_pin` check is consulted
-//! by the gossip-publish loop in `Peer::refresh` to skip them.
+//! These pins live on the peer's pile but are **not** gossiped —
+//! the implementation here mirrors the tracking-pin pattern from
+//! `crate::tracking`. The `is_local_only_pin` check is consulted by
+//! the gossip-publish loop in `Peer::refresh` to skip them. Per the
+//! Pin/Branch taxonomy (decide#6de2dd95): these are pins, not
+//! branches — they hold typed bags of entities with no commit
+//! history.
 //!
 //! Three roles:
 //!
 //!   - **`KIND_RENEWAL_POLICY`** — A's per-issuer view: "I am willing
 //!     to auto-renew these (subject, scope) pairs; here's the latest
 //!     cap I issued to each; here are the ones I've retracted." The
-//!     auto-renewal daemon scans this branch each tick.
+//!     auto-renewal daemon scans this pin each tick.
 //!
 //!   - **`KIND_PENDING_REQUESTS`** — incoming `OP_REQUEST_CAP` payloads
 //!     waiting for human approval (or auto-approval if the requester
 //!     matches an existing renewal-policy entry). The CLI's
-//!     `team list-pending` reads this branch; `team approve` mutates
+//!     `team list-pending` reads this pin; `team approve` mutates
 //!     status entries on it.
 //!
-//!   - **`KIND_TEAM_CAP`** — one branch per team this peer is a
-//!     member of, pinning the peer's own current cap chain so the
-//!     pile retains it across compaction. Identified by
-//!     `cap_for_team: <team_root_pubkey>`.
+//!   - **`KIND_TEAM_CAP`** — one pin per team this peer is a
+//!     member of, holding the peer's own current cap chain so the
+//!     pile retains it across compaction (the single-slot pin
+//!     mechanism from decide#5ed64e57 — overwrite on renewal, old
+//!     caps auto-GC). Identified by `cap_for_team: <team_root_pubkey>`.
 //!
 //! All three are marked with the same `local_only_pin` attribute
 //! (value = the kind tag) so a single helper distinguishes them from

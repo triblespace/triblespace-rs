@@ -1,11 +1,19 @@
-//! Tracking branch management.
+//! Tracking pin management.
 //!
-//! A tracking branch is a local reification of a remote branch. It uses
-//! `remote_name` instead of `name` in its metadata, making it invisible
-//! to normal operations (ensure_branch, resolve_branch_name, faculties).
+//! A tracking pin is a local reification of a remote branch's head.
+//! It's a [`PinStore`] entry — a named, atomically-updatable handle —
+//! that mirrors what a remote peer reported their branch head was at
+//! the time of last sync. Per the Pin/Branch taxonomy (decide#6de2dd95):
+//! locally, the tracking entry has no commit history of its own, so
+//! it's a Pin, not a Branch. The thing it points at on the remote IS
+//! a Branch.
 //!
-//! The tracking branch has its own local ID. Repository can pull/merge
-//! it like any other branch.
+//! Tracking pins use `remote_name` instead of `metadata::name` in
+//! their pin metadata, making them invisible to normal content-branch
+//! operations (`ensure_branch`, `resolve_branch_name`, faculties).
+//!
+//! The tracking pin has its own local pin id. Repository can pull/merge
+//! it like any other commit-history pin (a Branch).
 
 
 use triblespace_core::blob::encodings::longstring::LongString;
