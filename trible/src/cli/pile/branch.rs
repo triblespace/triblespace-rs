@@ -324,15 +324,24 @@ pub fn run(cmd: Command) -> Result<()> {
                                     }
                                 }
 
-                                let name = match name_handle {
-                                    None => "<unnamed>".to_string(),
-                                    Some(handle) => match reader.get::<View<str>, _>(handle) {
-                                        Ok(view) => view.as_ref().to_string(),
-                                        Err(_) => format!(
-                                            "<name blob missing ({})>",
-                                            hex::encode_upper(&handle.raw[..4])
-                                        ),
-                                    },
+                                // Filter to content branches only:
+                                // a branch is, by the Pin/Branch
+                                // taxonomy, a pin that carries
+                                // metadata::name. Pins without a
+                                // name are tracking pins, local-
+                                // only policy pins, or anonymous —
+                                // none of which belong in
+                                // `branch list`. See `pile pin list`
+                                // for the generic all-pins view.
+                                let Some(name_h) = name_handle else {
+                                    continue;
+                                };
+                                let name = match reader.get::<View<str>, _>(name_h) {
+                                    Ok(view) => view.as_ref().to_string(),
+                                    Err(_) => format!(
+                                        "<name blob missing ({})>",
+                                        hex::encode_upper(&name_h.raw[..4])
+                                    ),
                                 };
 
                                 let head = match head_handle {
@@ -342,13 +351,12 @@ pub fn run(cmd: Command) -> Result<()> {
 
                                 (name, head)
                             }
-                            Err(_) => (
-                                format!(
-                                    "<metadata blob missing ({})>",
-                                    hex::encode_upper(&meta_handle.raw[..4])
-                                ),
-                                "-".to_string(),
-                            ),
+                            Err(_) => {
+                                // Couldn't decode pin head as a
+                                // TribleSet — probably a malformed
+                                // blob. Skip — not a content branch.
+                                continue;
+                            }
                         };
 
                         rows.push((name, id, head));

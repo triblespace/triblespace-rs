@@ -9,15 +9,28 @@ mod diagnose;
 mod merge;
 mod migrate;
 pub mod net;
+pub mod pin;
 mod signing;
 mod squash;
 
 #[derive(Parser)]
 pub enum PileCommand {
-    /// Operations on branches stored in a pile file.
+    /// Operations on branches stored in a pile file. Branches are
+    /// the named-pin specialization that holds a commit-chain head;
+    /// `branch list` filters to those and shows commit-aware info.
+    /// For the generic pin view (all pins regardless of role), see
+    /// `pile pin`.
     Branch {
         #[command(subcommand)]
         cmd: branch::Command,
+    },
+    /// Operations on the pin storage primitive (every named handle
+    /// in the pile, regardless of role). Branches, tracking mirrors,
+    /// and local-only policy pins all show up here. For the branch-
+    /// specific view, see `pile branch`.
+    Pin {
+        #[command(subcommand)]
+        cmd: pin::Command,
     },
     /// Operations on blobs stored in a pile file.
     Blob {
@@ -88,6 +101,7 @@ pub enum PileCommand {
 pub fn run(cmd: PileCommand) -> Result<()> {
     match cmd {
         PileCommand::Branch { cmd } => branch::run(cmd),
+        PileCommand::Pin { cmd } => pin::run(cmd),
         PileCommand::Blob { cmd } => blob::run(cmd),
         PileCommand::Merge {
             pile,
