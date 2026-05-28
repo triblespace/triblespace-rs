@@ -41,18 +41,26 @@ const RECORD_LEN: u64 = 64;
 
 #[derive(Parser)]
 pub enum Command {
-    /// List branches in a pile file (id + head + name).
+    /// List named content branches in a pile file (id + head + name).
+    /// Filters to pins carrying `metadata::name` — tracking pins
+    /// and local-only policy pins are excluded (see `pile pin list`
+    /// for the generic all-pins view).
     List {
         /// Path to the pile file to inspect
         path: PathBuf,
-        /// Include all branches ever seen (scans raw pile records, including deleted)
+        /// Include all pin records ever seen (scans raw pile records,
+        /// including tombstoned pins of every role). Useful for
+        /// forensics — surfaces tracking pins and policy pins
+        /// alongside content branches.
         #[arg(long)]
         all: bool,
-        /// Only show deleted/tombstoned branches (implies --all)
+        /// Only show deleted/tombstoned pins (implies --all)
         #[arg(long)]
         deleted: bool,
     },
-    /// Create a new branch in a pile file.
+    /// Create a new named content branch in a pile file. For the
+    /// raw "create a pin" primitive there's no CLI surface — pins
+    /// without a name are constructed by the daemon / library.
     Create {
         /// Path to the pile file to modify
         pile: PathBuf,
@@ -62,14 +70,18 @@ pub enum Command {
         #[arg(long)]
         signing_key: Option<PathBuf>,
     },
-    /// Inspect a branch in a pile and print its id, name, and current head handle.
+    /// Inspect a named content branch in a pile and print its id,
+    /// name, and current head commit handle. For role-agnostic pin
+    /// inspection (head handle + classification, any pin role) use
+    /// `pile pin inspect`.
     Inspect {
         /// Path to the pile file to inspect
         pile: PathBuf,
         /// Branch identifier to inspect (hex encoded)
         branch: String,
     },
-    /// Delete a branch in a pile (writes a tombstone).
+    /// Delete a named content branch (writes a tombstone). For the
+    /// generic "tombstone any pin" primitive use `pile pin delete`.
     Delete {
         /// Path to the pile file to modify
         pile: PathBuf,
