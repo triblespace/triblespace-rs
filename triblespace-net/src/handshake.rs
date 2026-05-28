@@ -206,3 +206,99 @@ pub async fn respond(send: &mut SendStream, status: u8) -> Result<()> {
     send.finish().map_err(|e| anyhow!("finish: {e}"))?;
     Ok(())
 }
+
+// ── One-shot endpoint helpers ─────────────────────────────────────────
+//
+// These wrap "spin up an iroh endpoint, dial target on the auth-
+// handshake ALPN, send one op, tear down" — the shape `team approve`
+// and `team request-join` need in the CLI process (which has no
+// long-lived daemon to dispatch through).
+//
+// The endpoint config mirrors the daemon's (`host::spawn`): same
+// dot-stripped relay map, same MdnsAddressLookup + DhtAddressLookup
+// providers so we can reach peers on LAN or via mainline DHT
+// regardless of whether n0.computer's DNS is reachable. Outbound-only
+// here — no incoming-stream router, no pkarr publish (we're not
+// long-lived and don't need to be findable).
+
+/// Build a one-shot outbound iroh Endpoint signed by `key`.
+///
+/// The endpoint goes online (`await ep.online()`), waits long enough
+/// for the relay handshake, and is ready to call `connect`. Caller is
+/// responsible for dropping it after use — endpoint drop cleans up
+/// the relay subscription.
+pub async fn one_shot_endpoint(
+    key: ed25519_dalek::SigningKey,
+) -> Result<iroh::Endpoint> {
+    use iroh::Endpoint;
+    use iroh::endpoint::presets;
+    use iroh_base::EndpointId;
+
+    let secret = crate::identity::iroh_secret(&key);
+    let relay_map = crate::host::dot_stripped_default_relay_map();
+    let mdns = iroh::address_lookup::MdnsAddressLookup::builder()
+        .build(EndpointId::from(secret.public()))
+        .ok();
+    let mut builder = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .ca_roots_config(iroh::tls::CaRootsConfig::system())
+        .relay_mode(iroh::RelayMode::Custom(relay_map))
+        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
+    if let Some(m) = mdns {
+        builder = builder.address_lookup(m);
+    }
+    let ep = builder
+        .bind()
+        .await
+        .map_err(|e| anyhow!("endpoint bind: {e}"))?;
+    ep.online().await;
+    Ok(ep)
+}
+
+/// One-shot OP_REQUEST_CAP: dial `target` and send the partial cap.
+/// Convenience wrapper around `one_shot_endpoint` +
+/// `Endpoint::connect` + `send_request_cap`.
+pub async fn one_shot_request_cap(
+    key: ed25519_dalek::SigningKey,
+    target: ed25519_dalek::VerifyingKey,
+    partial_cap_bytes: &[u8],
+) -> Result<u8> {
+    use iroh_base::EndpointId;
+    let ep = one_shot_endpoint(key).await?;
+    let target_id = EndpointId::from_bytes(&target.to_bytes())
+        .map_err(|e| anyhow!("target pubkey: {e}"))?;
+    let conn = ep
+        .connect(target_id, AUTH_HANDSHAKE_ALPN)
+        .await
+        .map_err(|e| anyhow!("connect: {e}"))?;
+    let status = send_request_cap(&conn, partial_cap_bytes).await;
+    conn.close(0u32.into(), b"ok");
+    // Drop the endpoint last so the connection's relay route stays
+    // alive through the close. iroh tears down a Connection's transport
+    // when its parent Endpoint is dropped.
+    drop(ep);
+    status
+}
+
+/// One-shot OP_DELIVER_CAP: dial `target` and ship a signed cap+sig
+/// pair. Used by `team approve` to deliver the first cap after
+/// approving a pending request.
+pub async fn one_shot_deliver_cap(
+    key: ed25519_dalek::SigningKey,
+    target: ed25519_dalek::VerifyingKey,
+    cap_bytes: &[u8],
+    sig_bytes: &[u8],
+) -> Result<u8> {
+    use iroh_base::EndpointId;
+    let ep = one_shot_endpoint(key).await?;
+    let target_id = EndpointId::from_bytes(&target.to_bytes())
+        .map_err(|e| anyhow!("target pubkey: {e}"))?;
+    let conn = ep
+        .connect(target_id, AUTH_HANDSHAKE_ALPN)
+        .await
+        .map_err(|e| anyhow!("connect: {e}"))?;
+    let status = send_deliver_cap(&conn, cap_bytes, sig_bytes).await;
+    conn.close(0u32.into(), b"ok");
+    drop(ep);
+    status
+}

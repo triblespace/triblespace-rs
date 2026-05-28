@@ -53,7 +53,7 @@ fn op_name(op: u8) -> &'static str {
 /// We transform the upstream default rather than hardcoding
 /// hostnames, so we stay in sync with whatever n0 ships in
 /// `iroh::defaults::prod::default_relay_map()`.
-fn dot_stripped_default_relay_map() -> iroh::RelayMap {
+pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
     let original = iroh::defaults::prod::default_relay_map();
     let stripped_urls: Vec<String> = original
         .urls::<Vec<_>>()
