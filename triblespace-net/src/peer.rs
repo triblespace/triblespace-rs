@@ -120,7 +120,7 @@ where
     /// scalar so cloning is cheap, but we keep it as an explicit
     /// `Clone` instead of `Copy` so the surface area for accidental
     /// duplication stays auditable. Used by `renewal_tick` to sign
-    /// fresh caps for entries on the renewal-policy branch.
+    /// fresh caps for entries on the renewal-policy pin.
     signing_key: SigningKey,
 }
 
@@ -198,7 +198,7 @@ where
     ///
     /// 1. **Drain incoming events** — pulls any pending gossip
     ///    `NetEvent`s from the network thread into the wrapped store
-    ///    (creating tracking branches as needed).
+    ///    (creating tracking pins as needed).
     /// 2. **Publish external writes** — diffs the wrapped store against
     ///    the last published baseline and gossips/announces any deltas
     ///    that didn't go through the Peer's own write path. Use this to
@@ -243,7 +243,7 @@ where
                 NetEvent::CapDelivered { issuer, cap_bytes, sig_bytes } => {
                     // Verify the delivered chain against our configured
                     // team root, then store both blobs locally. Pinning
-                    // them into a per-team-cap branch (so compaction
+                    // them into a per-team-cap pin (so compaction
                     // retains them) comes with the CLI subcommands —
                     // for now they're orphan blobs in the pile, same
                     // as our own outgoing-cap blobs.
@@ -290,8 +290,8 @@ where
                 if crate::tracking::is_tracking_pin(&mut self.store, bid) {
                     continue;
                 }
-                // Local-only policy branches (renewal policy, pending
-                // requests, per-team-cap pin branches) carry per-peer
+                // Local-only policy pins (renewal policy, pending
+                // requests, per-team-cap pins) carry per-peer
                 // state that mustn't leak to the team mesh. See
                 // `crate::policy`.
                 if crate::policy::is_local_only_pin(&mut self.store, bid) {
@@ -381,7 +381,7 @@ where
             None => {
                 tracing::warn!(
                     requester = %hex::encode(&requester[..4]),
-                    "CapRequest: failed to record on pending-requests branch"
+                    "CapRequest: failed to record on pending-requests pin"
                 );
             }
         }
@@ -390,7 +390,7 @@ where
     /// Verify a peer-delivered cap chain against our configured team
     /// root and, on success, store both blobs locally.
     ///
-    /// Pinning into a per-team-cap branch (for retention across
+    /// Pinning into a per-team-cap pin (for retention across
     /// compaction) is deferred — the CLI subcommands that surface
     /// "my current cap" will manage that pin. For now the cap+sig
     /// blobs live in the pile as orphan blobs, same as the cap blobs
@@ -454,7 +454,7 @@ where
         ) {
             Ok(_verified) => {
                 // Persist both blobs into the local store, then pin
-                // them via the per-team-cap branch. The pin is a
+                // them via the per-team-cap pin. The pin is a
                 // single-slot branch: each renewal overwrites the
                 // head, making old cap+sig blobs unreachable so the
                 // next compaction reclaims them. Forward security at
@@ -480,7 +480,7 @@ where
                         tracing::info!(
                             issuer = %hex::encode(&issuer[..4]),
                             sig = %hex::encode(&sig_handle.raw[..4]),
-                            "CapDelivered: verified and pinned on team-cap branch"
+                            "CapDelivered: verified and pinned on team-cap pin"
                         );
                     }
                     None => {

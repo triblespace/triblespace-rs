@@ -47,15 +47,15 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, Pu
 use triblespace_core::trible::TribleSet;
 
 attributes! {
-    // ── Branch markers ────────────────────────────────────────────────
-    /// Tags a branch as local-only (skip in gossip publish, skip in
-    /// branch-name lookups). Value is one of the `KIND_*` tags below
-    /// indicating the role.
+    // ── Pin role markers ──────────────────────────────────────────────
+    /// Tags a pin as local-only (skip in gossip publish, skip in
+    /// content-branch-name lookups). Value is one of the `KIND_*` tags
+    /// below indicating the role.
     "3361F2DE0BD68BA8712EC5B9CCC7EF2A" as pub local_only_pin: GenId;
 
-    // ── Per-team-cap branch ───────────────────────────────────────────
-    /// Names the team this branch holds cap state for. Set on the
-    /// branch metadata entity alongside `local_only_pin =
+    // ── Per-team-cap pin ──────────────────────────────────────────────
+    /// Names the team this pin holds cap state for. Set on the pin
+    /// head metadata entity alongside `local_only_pin =
     /// KIND_TEAM_CAP`.
     "E1EE471B597A4142AD26CA1FED368D2F" as pub cap_for_team: ED25519PublicKey;
 
@@ -101,20 +101,20 @@ attributes! {
     "FAC14D0CAB23B1C7AC20D8CF1C843EBF" as pub team_sig_handle: Handle<SimpleArchive>;
 }
 
-// ── Branch kind tags ──────────────────────────────────────────────────
+// ── Pin role kind tags ────────────────────────────────────────────────
 
-/// Branch holds A's renewal policy state. Each entity on the branch
-/// is one `(policy_subject, policy_scope)` pair with associated cap
-/// + sig handles and an optional retraction timestamp.
+/// Pin holds A's renewal policy state. Each entity on the pin head
+/// metadata blob is one `(policy_subject, policy_scope)` pair with
+/// associated cap + sig handles and an optional retraction timestamp.
 pub const KIND_RENEWAL_POLICY: Id =
     triblespace_core::id::id_hex!("914CFF7C82FDE32CB84D85CE98613E62");
 
-/// Branch holds incoming `OP_REQUEST_CAP` payloads waiting for
+/// Pin holds incoming `OP_REQUEST_CAP` payloads waiting for
 /// resolution.
 pub const KIND_PENDING_REQUESTS: Id =
     triblespace_core::id::id_hex!("A2010615F2E3B528B7069C761B38C102");
 
-/// Branch holds A's own cap chain for a specific team. The branch
+/// Pin holds A's own cap chain for a specific team. The pin head
 /// metadata also carries `cap_for_team: <team_root_pubkey>` so a
 /// peer with membership in multiple teams can distinguish them.
 pub const KIND_TEAM_CAP: Id =
@@ -138,9 +138,9 @@ pub const STATUS_REJECTED: Id =
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-/// Returns true if `branch_id`'s metadata carries the
+/// Returns true if the pin's head metadata carries the
 /// `local_only_pin` attribute. Used by the gossip-publish loop to
-/// skip policy branches (they mustn't leak A's renewal decisions or
+/// skip policy pins (they mustn't leak A's renewal decisions or
 /// pending-request queue to the team).
 pub fn is_local_only_pin<S>(store: &mut S, branch_id: Id) -> bool
 where
@@ -157,10 +157,10 @@ where
     .is_some()
 }
 
-/// Look up the local team-cap branch for a given team root pubkey,
-/// if one exists. Searches by branch metadata for
+/// Look up the local team-cap pin for a given team root pubkey,
+/// if one exists. Searches by pin head metadata for
 /// `local_only_pin = KIND_TEAM_CAP` + `cap_for_team =
-/// team_root`. Returns the branch id (caller can fetch the head or
+/// team_root`. Returns the pin id (caller can fetch the head or
 /// list commits as needed).
 pub fn find_team_cap_pin<S>(
     store: &mut S,
@@ -224,9 +224,9 @@ where
     None
 }
 
-/// A single pending request as recorded on the pending-requests branch.
+/// A single pending request as recorded on the pending-requests pin.
 pub struct PendingRequest {
-    /// Entity id of this request inside the branch metadata blob.
+    /// Entity id of this request inside the pin head metadata blob.
     /// Stable as long as the request isn't deleted; used as the
     /// argument to `team approve <id>`.
     pub id: Id,
@@ -281,9 +281,9 @@ where
 }
 
 /// Record an incoming `OP_REQUEST_CAP` as a pending request entity on
-/// the local pending-requests branch.
+/// the local pending-requests pin.
 ///
-/// Find-or-create the branch on first call; subsequent calls extend
+/// Find-or-create the pin on first call; subsequent calls extend
 /// the head's metadata blob with one additional entity. The entity id
 /// is fresh and is the value the CLI's `team approve <id>` consumes.
 ///
@@ -299,7 +299,7 @@ pub fn record_pending_request<S>(
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    // Find or create the pending-requests branch.
+    // Find or create the pending-requests pin.
     let (bid, prev_head) = match find_local_only_pin_of_kind(
         store,
         KIND_PENDING_REQUESTS,
@@ -312,7 +312,7 @@ where
     };
 
     // Reconstitute the current metadata blob (if any), or start fresh
-    // with just the branch-kind marker.
+    // with just the pin-kind marker.
     let mut meta: TribleSet = match &prev_head {
         Some(h) => {
             let reader = store.reader().ok()?;
@@ -350,14 +350,14 @@ where
 
 // ── Per-team-cap pin ──────────────────────────────────────────────────
 
-/// Find or create the per-team-cap branch for `team_root`, then
+/// Find or create the per-team-cap pin for `team_root`, then
 /// overwrite its head with a metadata blob pointing at the supplied
 /// `cap` and `sig` handles. Old metadata + old cap + old sig blobs
-/// become unreachable from any branch head; the next compaction
+/// become unreachable from any pin head; the next compaction
 /// reclaims them. This is the storage-layer expression of "the
 /// active cap is what's current; old caps don't accumulate".
 ///
-/// Returns the branch id on success. `None` on a blob-write or
+/// Returns the pin id on success. `None` on a blob-write or
 /// branch-update failure (caller decides retry/log/drop).
 pub fn pin_team_cap<S>(
     store: &mut S,
@@ -378,9 +378,9 @@ where
         None => (*genid(), None),
     };
 
-    // Single-entity metadata blob: the branch-kind marker plus the
+    // Single-entity metadata blob: the pin-kind marker plus the
     // two handles. Entity id is fresh on each overwrite — the entity
-    // doesn't need a stable identity since the branch head IS the
+    // doesn't need a stable identity since the pin head IS the
     // pin.
     let entity_id = genid();
     let meta: TribleSet = entity! {
@@ -552,7 +552,7 @@ where
 // ── Renewal-policy entry writes ───────────────────────────────────────
 
 /// Insert (or refresh) a renewal-policy entry. Find-or-create the
-/// renewal-policy branch on first call.
+/// renewal-policy pin on first call.
 ///
 /// The entity id is fresh on each call — policy entries are keyed by
 /// `(subject, scope)`, not by their generated entity id, and the

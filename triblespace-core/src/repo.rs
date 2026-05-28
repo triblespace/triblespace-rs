@@ -391,13 +391,15 @@ pub trait BlobChildren: BlobStoreGet {
 // optimized implementations (e.g. network stores with batch protocols).
 // Use `impl_blob_children_default!` for the scan-and-check fallback.
 
-/// Outcome of a compare-and-swap branch update.
+/// Outcome of a compare-and-swap pin update (used by both the
+/// primitive `PinStore::update` and the higher-level
+/// `Repository::push` for content branches).
 #[derive(Debug)]
 pub enum PushResult {
-    /// The CAS succeeded — the branch now points to the new commit.
+    /// The CAS succeeded — the pin now points to the new value.
     Success(),
-    /// The CAS failed — the branch had advanced. Contains the current
-    /// head, or `None` if the branch was deleted concurrently.
+    /// The CAS failed — the pin's head had advanced. Contains the
+    /// current head, or `None` if the pin was tombstoned concurrently.
     Conflict(Option<Inline<Handle<SimpleArchive>>>),
 }
 
@@ -443,37 +445,43 @@ pub trait PinStore {
     where
         Self: 'a;
 
-    /// Lists all branches in the repository.
-    /// This function returns a stream of branch ids.
+    /// Lists every pin in the store. Returns a fallible iterator over
+    /// pin ids (any role — branches, tracking pins, local-only pins).
+    /// Callers that want only content branches filter by checking for
+    /// the `metadata::name` attribute on each pin's head metadata.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
 
-    // NOTE: keep the API lean — callers may call `branches()` and handle the
-    // fallible iterator directly; we avoid adding an extra helper here.
+    // NOTE: keep the API lean — callers may call `pins()` and handle
+    // the fallible iterator directly; we avoid adding an extra helper
+    // here.
 
-    /// Retrieves a branch from the repository by its id.
-    /// The id is a unique identifier for the branch, and is used to retrieve it from the repository.
+    /// Retrieves the current head of a pin by its id.
     ///
-    /// # Errors
-    /// Returns an error if the branch could not be found in the repository.
+    /// Returns `Ok(Some(handle))` if the pin exists and has a head,
+    /// `Ok(None)` if the pin is tombstoned (deleted), and an error if
+    /// the underlying store failed to read.
     ///
     /// # Parameters
-    /// * `id` - The id of the branch to retrieve.
-    ///
-    /// # Returns
-    /// * A future that resolves to the handle of the branch.
-    /// * The handle is a unique identifier for the branch, and is used to retrieve it from the repository.
+    /// * `id` — The id of the pin to look up.
     fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>;
 
-    /// Puts a branch on the repository, creating or updating it.
+    /// Compare-and-swap update of a pin's head.
+    ///
+    /// Used to create a fresh pin, advance an existing one, or
+    /// tombstone (delete) one. The CAS guard (`old`) lets multiple
+    /// writers coordinate without locks: a stale writer's update
+    /// returns `PushResult::Conflict(current)` carrying the actual
+    /// current head for retry / merge.
     ///
     /// # Parameters
-    /// * `old` - Expected current value of the branch (None if creating new)
-    /// * `new` - Inline to update the branch to (None deletes the branch)
+    /// * `id` — The id of the pin to update.
+    /// * `old` — Expected current head (`None` when creating a fresh pin).
+    /// * `new` — New head (`None` tombstones the pin).
     ///
     /// # Returns
-    /// * `Success` - Push completed successfully
-    /// * `Conflict(current)` - Failed because the branch's current value doesn't match `old`
-    ///   (contains the actual current value for conflict resolution)
+    /// * `Success` — The pin now points at `new`.
+    /// * `Conflict(current)` — Some other writer advanced first; the
+    ///   pin's current head is `current`.
     fn update(
         &mut self,
         id: Id,

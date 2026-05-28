@@ -168,7 +168,7 @@ enum Applied {
 }
 
 #[derive(Debug)]
-/// A grow-only collection of blobs and branch pointers backed by a single file on disk.
+/// A grow-only collection of blobs and pin heads backed by a single file on disk.
 ///
 /// Branch updates do not verify that referenced blobs exist in the pile, allowing the
 /// pile to operate as a head-only store when blob data lives elsewhere.
@@ -385,7 +385,7 @@ impl From<ReadError> for InsertError {
     }
 }
 
-/// Error returned when updating a branch pointer in a [`Pile`].
+/// Error returned when updating a pin head in a [`Pile`].
 pub enum UpdateBranchError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
@@ -839,7 +839,7 @@ impl BlobStoreList for PileReader {
     }
 }
 
-/// Iterator over branch ids stored in the pile's PATCH, using the PATCH's
+/// Iterator over pin ids stored in the pile's PATCH, using the PATCH's
 /// built-in key iterator to avoid allocating a full Vec of ids.
 pub struct PileBranchStoreIter {
     inner:
@@ -851,11 +851,11 @@ impl Iterator for PileBranchStoreIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         // The owned ordered iterator yields key arrays ([u8; 16]) by value.
-        // The `apply_next` path guarantees that a nil (all-zero) branch id
+        // The `apply_next` path guarantees that a nil (all-zero) pin id
         // is never inserted into the PATCH; therefore we can safely `expect`
         // a valid `Id` here and treat a nil id as an invariant violation.
         let key = self.inner.next()?;
-        let id = Id::new(key).expect("nil branch id inserted into patch");
+        let id = Id::new(key).expect("nil pin id inserted into patch");
         Some(Ok(id))
     }
 }
@@ -1016,7 +1016,7 @@ impl PinStore for Pile
     ///
     /// The update is written to the pile but is **not durable** until
     /// [`Pile::flush`] is called. Callers must explicitly flush to ensure
-    /// branch updates survive crashes.
+    /// pin updates survive crashes.
     ///
     /// After the header is written, the record is read back with `apply_next`
     /// while still holding the lock, ensuring the update is applied without an
@@ -1037,10 +1037,10 @@ impl PinStore for Pile
 
             // No-op short-circuit: if the requested head is already
             // what we have, return success without appending a record.
-            // The branch table is logically a (id → head) map; a write
+            // The pin table is logically a (id → head) map; a write
             // where new == current carries no information and would
             // just churn the append-only file. Steady-state gossip
-            // rebroadcasts of unchanged heads (e.g. tracking-branch
+            // rebroadcasts of unchanged heads (e.g. tracking-pin
             // re-publication at 30s ticks) hit this path heavily.
             if current_hash == new {
                 return Ok(PushResult::Success());

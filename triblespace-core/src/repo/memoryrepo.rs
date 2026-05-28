@@ -21,7 +21,7 @@ use crate::inline::InlineEncoding;
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
-    /// Map from branch id to the handle of its current head commit.
+    /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
     pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
 }
 

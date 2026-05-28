@@ -483,7 +483,7 @@ fn run_invite(
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
 
-    // Record on the renewal-policy branch so the running `pile net sync`
+    // Record on the renewal-policy pin so the running `pile net sync`
     // daemon's renewal_tick takes over from here: once this cap nears
     // expiry, the daemon signs a successor and dispatches via
     // OP_DELIVER_CAP. The invitee experiences the issuance and every
@@ -533,7 +533,7 @@ fn run_revoke(
     // (see decide#4b321c47 / decide#4b59ce27). Eviction = local
     // retraction of auto-renewal + natural cap expiry. The `team
     // revoke` subcommand will be replaced by `team retract` once the
-    // local retraction-policy branch is wired in.
+    // local retraction-policy pin is wired in.
     bail!(
         "`team revoke` is removed in the descriptive-caps model. \
          Eviction is now local per-issuer non-renewal — see \
@@ -1108,7 +1108,7 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
             Ok(())
         }
         None => bail!(
-            "retract failed: entry {} not found, or the renewal-policy branch is missing/locked",
+            "retract failed: entry {} not found, or the renewal-policy pin is missing/locked",
             hex::encode(<[u8; 16]>::from(entry_id))
         ),
     }

@@ -811,7 +811,7 @@ async fn fetch_reachable(
     // short-circuit on that broken parent on every future sync, so
     // the gap becomes permanent.
     //
-    // Aborting drops the current walk's tracking-branch update too
+    // Aborting drops the current walk's tracking-pin update too
     // (the caller only emits NetEvent::Head on Ok), so on the next
     // gossip rebroadcast Phase 1 re-walks from the head. Whatever
     // descendants we *did* successfully write before the failure
@@ -1112,7 +1112,7 @@ async fn children_one(
 
 /// Fetch the reachable closure from `head` on `fetch_peer` and, on
 /// success, emit a [`NetEvent::Head`] so the Peer materializes a
-/// tracking branch.
+/// tracking pin.
 ///
 /// Shared tail of the gossip-arrival handler and the `Track` command:
 /// both know (fetch_peer, branch, head, publisher) by the time they
