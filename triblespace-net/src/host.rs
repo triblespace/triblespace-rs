@@ -143,16 +143,16 @@ pub enum SyncDirection {
 /// Snapshot of store state for serving protocol requests.
 pub struct StoreSnapshot<R> {
     pub reader: R,
-    pub branches: Vec<(RawBranchId, RawHash)>,
+    pub branches: Vec<(RawPinId, RawHash)>,
 }
 
 impl StoreSnapshot<()> {
     pub fn from_store<S>(store: &mut S) -> Option<StoreSnapshot<S::Reader>>
     where
         S: triblespace_core::repo::BlobStore
-            + triblespace_core::repo::BranchStore,
+            + triblespace_core::repo::PinStore,
     {
-        let ids: Vec<triblespace_core::id::Id> = store.branches().ok()?
+        let ids: Vec<triblespace_core::id::Id> = store.pins().ok()?
             .filter_map(|r| r.ok())
             .collect();
         let mut branches = Vec::new();
@@ -178,7 +178,7 @@ impl StoreSnapshot<()> {
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
-    fn list_branches(&self) -> &[(RawBranchId, RawHash)];
+    fn list_branches(&self) -> &[(RawPinId, RawHash)];
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -199,7 +199,7 @@ where
         self.get_blob(hash).is_some()
     }
 
-    fn list_branches(&self) -> &[(RawBranchId, RawHash)] {
+    fn list_branches(&self) -> &[(RawPinId, RawHash)] {
         &self.branches
     }
 }
@@ -227,7 +227,7 @@ impl NetSender {
         let _ = self.cmd_tx.send(NetCommand::Announce(hash));
     }
 
-    pub fn gossip(&self, branch: RawBranchId, head: RawHash) {
+    pub fn gossip(&self, branch: RawPinId, head: RawHash) {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
@@ -560,7 +560,7 @@ async fn host_loop(
 
     /// Build the gossip wire frame for a (branch, head) pair.
     /// 0x01 | branch(16) | head(32) | publisher(32) = 81 bytes.
-    fn gossip_frame(branch: &RawBranchId, head: &RawHash, publisher: &EndpointId) -> Vec<u8> {
+    fn gossip_frame(branch: &RawPinId, head: &RawHash, publisher: &EndpointId) -> Vec<u8> {
         let mut msg = Vec::with_capacity(81);
         msg.push(0x01);
         msg.extend_from_slice(branch);
@@ -576,7 +576,7 @@ async fn host_loop(
     // for neighbors who've already seen it, while giving
     // newly-joined neighbors a chance to discover our HEADs
     // without a JOIN message (which would add a DOS surface).
-    let mut last_published: HashMap<RawBranchId, RawHash> = HashMap::new();
+    let mut last_published: HashMap<RawPinId, RawHash> = HashMap::new();
     let rebroadcast_period = std::time::Duration::from_secs(30);
     let mut last_rebroadcast = std::time::Instant::now();
 
@@ -1122,7 +1122,7 @@ async fn children_one(
 async fn track_known_head(
     ep: &iroh::Endpoint,
     fetch_peer: EndpointAddr,
-    branch: RawBranchId,
+    branch: RawPinId,
     head: RawHash,
     publisher: crate::channel::PublisherKey,
     dht: &Option<crate::dht::api::ApiClient>,

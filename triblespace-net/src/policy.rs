@@ -39,7 +39,7 @@ use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult};
 use triblespace_core::trible::TribleSet;
 
 attributes! {
@@ -140,7 +140,7 @@ pub const STATUS_REJECTED: Id =
 /// pending-request queue to the team).
 pub fn is_local_only_branch<S>(store: &mut S, branch_id: Id) -> bool
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
     let Ok(reader) = store.reader() else { return false; };
@@ -163,12 +163,12 @@ pub fn find_team_cap_branch<S>(
     team_root: ed25519_dalek::VerifyingKey,
 ) -> Option<Id>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     use triblespace_core::inline::IntoInline;
     let team_root_inline: Inline<ED25519PublicKey> = team_root.to_inline();
     let bids: Vec<Id> = store
-        .branches()
+        .pins()
         .ok()?
         .filter_map(|r| r.ok())
         .collect();
@@ -197,10 +197,10 @@ where
 /// kinds are singletons per peer, so the first match wins.
 pub fn find_local_only_branch_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let bids: Vec<Id> = store
-        .branches()
+        .pins()
         .ok()?
         .filter_map(|r| r.ok())
         .collect();
@@ -241,7 +241,7 @@ pub struct PendingRequest {
 /// open at any time).
 pub fn list_pending_requests<S>(store: &mut S) -> Vec<PendingRequest>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let Some(bid) = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS) else {
         return Vec::new();
@@ -293,7 +293,7 @@ pub fn record_pending_request<S>(
     received_at: Inline<NsTAIInterval>,
 ) -> Option<Id>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     // Find or create the pending-requests branch.
     let (bid, prev_head) = match find_local_only_branch_of_kind(
@@ -362,7 +362,7 @@ pub fn pin_team_cap<S>(
     sig: Inline<Handle<SimpleArchive>>,
 ) -> Option<Id>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     use triblespace_core::id::ExclusiveId;
 
@@ -403,7 +403,7 @@ pub fn current_team_cap<S>(
     team_root: ed25519_dalek::VerifyingKey,
 ) -> Option<(Inline<Handle<SimpleArchive>>, Inline<Handle<SimpleArchive>>)>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let bid = find_team_cap_branch(store, team_root)?;
     let head = store.head(bid).ok()??;
@@ -449,7 +449,7 @@ pub struct PolicyEntry {
 /// loop filters them out at action time.
 pub fn list_renewal_policy<S>(store: &mut S) -> Vec<PolicyEntry>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let Some(bid) = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY) else {
         return Vec::new();
@@ -523,7 +523,7 @@ pub fn renewable_within<S>(
     renewal_window: hifitime::Duration,
 ) -> Vec<PolicyEntry>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let Ok(now) = hifitime::Epoch::now() else { return Vec::new(); };
     let cutoff = now + renewal_window;
@@ -569,7 +569,7 @@ pub fn record_policy_entry<S>(
     sig: Inline<Handle<SimpleArchive>>,
 ) -> Option<Id>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     use triblespace_core::id::ExclusiveId;
 
@@ -626,7 +626,7 @@ pub fn update_policy_entry<S>(
     new_sig: Inline<Handle<SimpleArchive>>,
 ) -> Option<()>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     use triblespace_core::id::ExclusiveId;
 
@@ -702,7 +702,7 @@ pub fn retract_policy_entry<S>(
     entry_id: Id,
 ) -> Option<()>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
@@ -742,7 +742,7 @@ pub fn set_request_status<S>(
     new_status: Id,
 ) -> Option<()>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     let bid = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS)?;
     let prev_head = store.head(bid).ok()??;

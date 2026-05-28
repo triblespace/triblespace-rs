@@ -152,7 +152,7 @@ fn consolidate_merges_branch_heads() {
 /// with subsumption detection.
 #[test]
 fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
-    use triblespace_core::repo::BranchStore;
+    use triblespace_core::repo::PinStore;
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-include-deleted.pile");
@@ -294,7 +294,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
     // Collect all branches by name.
     let mut found: std::collections::HashMap<String, Vec<triblespace_core::id::Id>> =
         std::collections::HashMap::new();
-    for branch_res in pile.branches().unwrap() {
+    for branch_res in pile.pins().unwrap() {
         let bid = branch_res.unwrap();
         let mh = pile.head(bid).unwrap().unwrap();
         let meta: TribleSet = reader.get(mh).unwrap();
@@ -381,7 +381,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
 /// group, only the descendant should be kept.
 #[test]
 fn consolidate_by_name_include_deleted_detects_subsumption() {
-    use triblespace_core::repo::BranchStore;
+    use triblespace_core::repo::PinStore;
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-subsumption.pile");
@@ -482,7 +482,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
     let name_attr = triblespace_core::metadata::name.id();
 
     let mut found_gamma = false;
-    for branch_res in pile.branches().unwrap() {
+    for branch_res in pile.pins().unwrap() {
         let bid = branch_res.unwrap();
         let mh = pile.head(bid).unwrap().unwrap();
         let meta: TribleSet = reader.get(mh).unwrap();
@@ -524,7 +524,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
 /// Test --by-name: consolidate active branches by name (no tombstone scanning).
 #[test]
 fn consolidate_by_name_merges_active_same_name_branches() {
-    use triblespace_core::repo::BranchStore;
+    use triblespace_core::repo::PinStore;
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-by-name.pile");
@@ -613,7 +613,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
     let name_attr = triblespace_core::metadata::name.id();
 
     let mut found_delta_merge = false;
-    for branch_res in pile.branches().unwrap() {
+    for branch_res in pile.pins().unwrap() {
         let bid = branch_res.unwrap();
         let mh = pile.head(bid).unwrap().unwrap();
         let meta: TribleSet = reader.get(mh).unwrap();

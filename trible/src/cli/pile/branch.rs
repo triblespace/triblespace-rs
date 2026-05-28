@@ -11,7 +11,7 @@ use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStorePut;
-use triblespace::prelude::BranchStore;
+use triblespace::prelude::PinStore;
 use triblespace::prelude::View;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::IntoBlob;
@@ -283,14 +283,14 @@ pub fn run(cmd: Command) -> Result<()> {
                 let close_res = pile.close().map_err(|e| anyhow::anyhow!("{e:?}"));
                 res.and(close_res)?;
             } else {
-                // Default mode: list active branches via pile.branches().
+                // Default mode: list active branches via pile.pins().
                 let mut pile: Pile = Pile::open(&path)?;
                 let res = (|| -> Result<(), anyhow::Error> {
                     pile.refresh()?;
                     let reader = pile
                         .reader()
                         .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                    let iter = pile.branches()?;
+                    let iter = pile.pins()?;
                     let head_attr = triblespace_core::repo::head.id();
                     let mut rows: Vec<(String, Id, String)> = Vec::new();
                     for branch in iter {
@@ -1081,7 +1081,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     // Iterate active branches, resolve names, group.
                     let mut groups: std::collections::BTreeMap<String, Vec<(Id, Option<Inline<Handle<SimpleArchive>>>)>> = std::collections::BTreeMap::new();
 
-                    let branch_ids: Vec<Id> = repo.storage_mut().branches()?
+                    let branch_ids: Vec<Id> = repo.storage_mut().pins()?
                         .collect::<Result<Vec<_>, _>>()?;
 
                     println!("found {} active branch(es)", branch_ids.len());

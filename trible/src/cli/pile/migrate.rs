@@ -77,7 +77,7 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
         let mut missing_name = 0usize;
         let mut duplicate_names: HashMap<String, usize> = HashMap::new();
 
-        for bid in pile.branches().context("list branches")? {
+        for bid in pile.pins().context("list branches")? {
             let bid = bid.context("branch id")?;
             let Some(meta_handle) = pile.head(bid).context("branch head")? else {
                 continue;
@@ -146,7 +146,7 @@ fn migrate_branch_metadata_name(
 
     let res = (|| -> Result<(), anyhow::Error> {
         let reader = pile.reader().context("pile reader")?;
-        let iter = pile.branches().context("list branches")?;
+        let iter = pile.pins().context("list branches")?;
 
         let mut branches: Vec<BranchInfo> = Vec::new();
         for bid in iter {

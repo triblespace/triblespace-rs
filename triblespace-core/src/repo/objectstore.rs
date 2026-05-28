@@ -38,7 +38,7 @@ use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;
 use super::BlobStorePut;
-use super::BranchStore;
+use super::PinStore;
 use super::PushResult;
 
 const BRANCH_INFIX: &str = "branches";
@@ -181,16 +181,16 @@ impl BlobStore for ObjectStoreRemote
     }
 }
 
-impl BranchStore for ObjectStoreRemote
+impl PinStore for ObjectStoreRemote
 {
 
-    type BranchesError = ListBranchesErr;
+    type PinsError = ListBranchesErr;
     type HeadError = PullBranchErr;
     type UpdateError = PushBranchErr;
 
-    type ListIter<'a> = BlockingIter<Result<Id, Self::BranchesError>>;
+    type ListIter<'a> = BlockingIter<Result<Id, Self::PinsError>>;
 
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         let prefix = self.prefix.child(BRANCH_INFIX);
         let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
             match r {

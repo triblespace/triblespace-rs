@@ -36,7 +36,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
-    use triblespace::prelude::{BlobStore, BlobStoreGet, BranchStore};
+    use triblespace::prelude::{BlobStore, BlobStoreGet, PinStore};
 
     use triblespace_core::id::id_hex;
     use triblespace_core::repo::BlobStoreMeta;
@@ -171,7 +171,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
 
                 // Ensure in-memory indices are loaded before enumerating branches.
                 pile.refresh()?;
-                let iter = pile.branches()?;
+                let iter = pile.pins()?;
                 for r in iter {
                     let bid = r?;
                     let meta_handle_opt = pile.head(bid)?;

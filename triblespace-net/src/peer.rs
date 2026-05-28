@@ -2,7 +2,7 @@
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
 //! and exposes the standard storage traits (`BlobStore + BlobStorePut +
-//! BranchStore`) with two layers of network behavior built in:
+//! PinStore`) with two layers of network behavior built in:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
 //!   incoming gossip events into the wrapped store and re-publishes any
@@ -31,7 +31,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreList, BlobStorePut, BranchStore, PushResult,
+    BlobStore, BlobStoreList, BlobStorePut, PinStore, PushResult,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -80,13 +80,13 @@ pub use crate::host::{PeerConfig, SyncDirection};
 ///     direction: SyncDirection::Bidirectional,
 /// });
 /// // From here `peer` is just a `BlobStore + BlobStorePut +
-/// // BranchStore` — wrap it in `Repository::new` and use it like
+/// // PinStore` — wrap it in `Repository::new` and use it like
 /// // any other triblespace storage.
 /// drop(peer);
 /// ```
 pub struct Peer<S>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     store: S,
     sender: NetSender,
@@ -126,7 +126,7 @@ where
 
 impl<S> Peer<S>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread internally.
     ///
@@ -204,7 +204,7 @@ where
     ///    that didn't go through the Peer's own write path. Use this to
     ///    catch writes from another process that touched the pile file.
     ///
-    /// Auto-called inside the BlobStore/BranchStore read methods, so
+    /// Auto-called inside the BlobStore/PinStore read methods, so
     /// callers using the storage normally don't need to invoke it.
     /// Mirrors `Pile::refresh` — the explicit method is available for
     /// "do it now" semantics or tight loops with no read activity.
@@ -282,7 +282,7 @@ where
         // ── Phase 3: diff-and-publish branch deltas ───────────────────
         // ReadOnly skips this entire phase — followers don't gossip.
         if self.direction != SyncDirection::ReadOnly {
-            let bids: Vec<Id> = match self.store.branches() {
+            let bids: Vec<Id> = match self.store.pins() {
                 Ok(it) => it.filter_map(|r| r.ok()).collect(),
                 Err(_) => return,
             };
@@ -675,7 +675,7 @@ where
         if self.direction == SyncDirection::ReadOnly {
             return;
         }
-        let bids: Vec<Id> = match self.store.branches() {
+        let bids: Vec<Id> = match self.store.pins() {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => return,
         };
@@ -699,7 +699,7 @@ where
     }
 
     /// Borrow the underlying store. Use for store-specific methods that
-    /// aren't part of the BlobStore/BranchStore traits (e.g. `Pile::flush`).
+    /// aren't part of the BlobStore/PinStore traits (e.g. `Pile::flush`).
     pub fn store(&self) -> &S {
         &self.store
     }
@@ -730,7 +730,7 @@ where
 
 impl<S> BlobStorePut for Peer<S>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     type PutError = S::PutError;
 
@@ -752,7 +752,7 @@ where
 
 impl<S> BlobStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     type Reader = S::Reader;
     type ReaderError = S::ReaderError;
@@ -763,18 +763,18 @@ where
     }
 }
 
-impl<S> BranchStore for Peer<S>
+impl<S> PinStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
-    type BranchesError = S::BranchesError;
+    type PinsError = S::PinsError;
     type HeadError = S::HeadError;
     type UpdateError = S::UpdateError;
     type ListIter<'a> = S::ListIter<'a> where S: 'a;
 
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         self.refresh();
-        self.store.branches()
+        self.store.pins()
     }
 
     fn head(

@@ -141,7 +141,7 @@ pub trait StorageClose {
 // Convenience impl for repositories whose storage supports explicit close.
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + BranchStore + StorageClose,
+    Storage: BlobStore + PinStore + StorageClose,
 {
     /// Close the repository's underlying storage if it supports explicit
     /// close operations.
@@ -407,22 +407,22 @@ pub enum PushResult {
 /// content-addressed and orderless, while branch stores track a single
 /// mutable pointer per branch. The update operation uses compare-and-swap
 /// semantics so multiple writers can coordinate without locks.
-pub trait BranchStore {
+pub trait PinStore {
     /// Error type for listing branches.
-    type BranchesError: Error + Debug + Send + Sync + 'static;
+    type PinsError: Error + Debug + Send + Sync + 'static;
     /// Error type for head lookups.
     type HeadError: Error + Debug + Send + Sync + 'static;
     /// Error type for CAS updates.
     type UpdateError: Error + Debug + Send + Sync + 'static;
 
     /// Iterator over branch IDs.
-    type ListIter<'a>: Iterator<Item = Result<Id, Self::BranchesError>>
+    type ListIter<'a>: Iterator<Item = Result<Id, Self::PinsError>>
     where
         Self: 'a;
 
     /// Lists all branches in the repository.
     /// This function returns a stream of branch ids.
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError>;
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
 
     // NOTE: keep the API lean — callers may call `branches()` and handle the
     // fallible iterator directly; we avoid adding an extra helper here.
@@ -666,7 +666,7 @@ pub enum MergeError {
 /// Error returned by [`Repository::push`] and [`Repository::try_push`].
 /// Error type for [`Repository::compute_rollup`].
 #[derive(Debug)]
-pub enum RollupError<Storage: BranchStore + BlobStore> {
+pub enum RollupError<Storage: PinStore + BlobStore> {
     /// The branch was not found in the underlying storage.
     UnknownBranch,
     /// The branch is empty — no HEAD to roll up.
@@ -687,9 +687,9 @@ pub enum RollupError<Storage: BranchStore + BlobStore> {
 }
 
 #[derive(Debug)]
-pub enum PushError<Storage: BranchStore + BlobStore> {
+pub enum PushError<Storage: PinStore + BlobStore> {
     /// An error occurred while enumerating the branch storage branches.
-    StorageBranches(Storage::BranchesError),
+    StorageBranches(Storage::PinsError),
     /// An error occurred while creating a blob reader.
     StorageReader(<Storage as BlobStore>::ReaderError),
     /// An error occurred while reading metadata blobs.
@@ -712,7 +712,7 @@ pub enum PushError<Storage: BranchStore + BlobStore> {
 // `.map_err(|e| PushError::MergeError(e))?`.
 impl<Storage> From<MergeError> for PushError<Storage>
 where
-    Storage: BranchStore + BlobStore,
+    Storage: PinStore + BlobStore,
 {
     fn from(e: MergeError) -> Self {
         PushError::MergeError(e)
@@ -729,7 +729,7 @@ where
 #[derive(Debug)]
 pub enum BranchError<Storage>
 where
-    Storage: BranchStore + BlobStore,
+    Storage: PinStore + BlobStore,
 {
     /// An error occurred while creating a blob reader.
     StorageReader(<Storage as BlobStore>::ReaderError),
@@ -753,10 +753,10 @@ where
 #[derive(Debug)]
 pub enum LookupError<Storage>
 where
-    Storage: BranchStore + BlobStore,
+    Storage: PinStore + BlobStore,
 {
     /// Failed to enumerate branches.
-    StorageBranches(Storage::BranchesError),
+    StorageBranches(Storage::PinsError),
     /// Failed to read a branch head.
     BranchHead(Storage::HeadError),
     /// Failed to create a blob reader.
@@ -775,7 +775,7 @@ where
 #[derive(Debug)]
 pub enum EnsureBranchError<Storage>
 where
-    Storage: BranchStore + BlobStore,
+    Storage: PinStore + BlobStore,
 {
     /// Failed to look up the branch.
     Lookup(LookupError<Storage>),
@@ -788,8 +788,8 @@ where
 ///
 /// The [`Repository`] type exposes convenience methods for creating branches,
 /// committing data and pushing changes while delegating actual storage to the
-/// given [`BlobStore`] and [`BranchStore`] implementations.
-pub struct Repository<Storage: BlobStore + BranchStore> {
+/// given [`BlobStore`] and [`PinStore`] implementations.
+pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,
     commit_metadata: MetadataHandle,
@@ -833,7 +833,7 @@ where
 
 impl<Storage> Repository<Storage>
 where
-    Storage: BlobStore + BranchStore,
+    Storage: BlobStore + PinStore,
 {
     /// Creates a new repository with the given storage, signing key, and
     /// repo-wide commit metadata.
@@ -979,7 +979,7 @@ where
     pub fn lookup_branch(&mut self, name: &str) -> Result<Option<Id>, LookupError<Storage>> {
         let branch_ids: Vec<Id> = self
             .storage
-            .branches()
+            .pins()
             .map_err(LookupError::StorageBranches)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(LookupError::StorageBranches)?;

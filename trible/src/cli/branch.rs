@@ -6,7 +6,7 @@ use std::path::PathBuf;
 // DEFAULT_MAX_PILE_SIZE removed; the new Pile API no longer uses a size const generic
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreList;
-use triblespace::prelude::BranchStore;
+use triblespace::prelude::PinStore;
 
 #[derive(Parser)]
 pub enum BranchCommand {

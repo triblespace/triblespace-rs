@@ -24,7 +24,7 @@
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::prelude::{BlobStore, BranchStore};
+use triblespace_core::prelude::{BlobStore, PinStore};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, Repository,

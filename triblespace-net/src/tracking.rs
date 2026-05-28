@@ -11,7 +11,7 @@
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult, Repository};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::Inline;
@@ -36,7 +36,7 @@ attributes! {
 /// Tracking branches are local-only state that should not be re-gossipped.
 pub fn is_tracking_branch<S>(store: &mut S, branch_id: Id) -> bool
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
     let Ok(reader) = store.reader() else { return false; };
@@ -66,10 +66,10 @@ pub struct TrackingBranchInfo {
 /// auto-merge loops, status displays, etc.
 pub fn list_tracking_branches<S>(store: &mut S) -> Vec<TrackingBranchInfo>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     let mut result = Vec::new();
-    let Ok(iter) = store.branches() else { return result; };
+    let Ok(iter) = store.pins() else { return result; };
     let bids: Vec<Id> = iter.filter_map(|r| r.ok()).collect();
 
     for bid in bids {
@@ -105,7 +105,7 @@ pub fn find_tracking_branch<S>(
     remote_branch_id: Id,
 ) -> Option<Id>
 where
-    S: BlobStore + BranchStore,
+    S: BlobStore + PinStore,
 {
     list_tracking_branches(store)
         .into_iter()
@@ -160,7 +160,7 @@ pub fn create_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<Id>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     // Resolve the gossiped branch metadata hash to the actual commit.
     let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash)?;
@@ -207,7 +207,7 @@ pub fn update_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<()>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     let old_meta = store.head(tracking_branch_id).ok()??;
 
@@ -258,7 +258,7 @@ pub fn ensure_tracking_branch<S>(
     publisher: &PublisherKey,
 ) -> Option<Id>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     if let Some(tracking_id) = find_tracking_branch(store, remote_branch_id) {
         update_tracking_branch(store, tracking_id, remote_branch_id, remote_head_hash, remote_name_str, publisher);
@@ -296,7 +296,7 @@ pub fn merge_tracking_into_local<S>(
     local_name: &str,
 ) -> anyhow::Result<MergeOutcome>
 where
-    S: BlobStore + BlobStorePut + BranchStore,
+    S: BlobStore + BlobStorePut + PinStore,
 {
     let local_id = repo
         .ensure_branch(local_name, None)

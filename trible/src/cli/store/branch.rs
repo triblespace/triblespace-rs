@@ -13,7 +13,7 @@ pub enum Command {
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::List { url } => {
-            use triblespace::prelude::BranchStore;
+            use triblespace::prelude::PinStore;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             
             use url::Url;
@@ -22,7 +22,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
             // Ensure remote listing is up-to-date when needed; callers can
             // refresh explicitly if they prefer.
-            let iter = remote.branches()?;
+            let iter = remote.pins()?;
             for branch_res in iter {
                 let id = branch_res?;
                 println!("{id:X}");

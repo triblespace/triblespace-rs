@@ -2,7 +2,7 @@
 //!
 //! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
 //! iroh network thread internally and exposes the standard storage traits
-//! (`BlobStore + BlobStorePut + BranchStore`). Reads auto-drain incoming
+//! (`BlobStore + BlobStorePut + PinStore`). Reads auto-drain incoming
 //! gossip; writes auto-publish to the gossip topic and DHT. The user thinks
 //! of it as "my store, but networked."
 //!

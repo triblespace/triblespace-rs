@@ -735,7 +735,7 @@ use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;
 use super::BlobStorePut;
-use super::BranchStore;
+use super::PinStore;
 use super::PushResult;
 
 /// Iterator returned by [`PileReader::iter`].
@@ -977,10 +977,10 @@ impl BlobStorePut for Pile {
     }
 }
 
-impl BranchStore for Pile
+impl PinStore for Pile
 {
 
-    type BranchesError = ReadError;
+    type PinsError = ReadError;
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
     type HeadError = ReadError;
@@ -988,7 +988,7 @@ impl BranchStore for Pile
 
     type ListIter<'a> = PileBranchStoreIter;
 
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         // Ensure newly appended records are applied before enumerating
         // branches so external writers are visible to callers.
         self.refresh()?;
@@ -1592,7 +1592,7 @@ mod tests {
         pile.flush().unwrap();
 
         assert_eq!(pile.head(branch_id).unwrap(), None);
-        let branches: HashSet<Id> = pile.branches().unwrap().map(|r| r.unwrap()).collect();
+        let branches: HashSet<Id> = pile.pins().unwrap().map(|r| r.unwrap()).collect();
         assert!(!branches.contains(&branch_id));
         pile.close().unwrap();
     }

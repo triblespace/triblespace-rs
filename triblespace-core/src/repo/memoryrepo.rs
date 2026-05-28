@@ -7,13 +7,13 @@ use crate::blob::MemoryBlobStore;
 use crate::blob::IntoBlob;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
-use crate::repo::BranchStore;
+use crate::repo::PinStore;
 use crate::repo::PushResult;
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 
-/// Simple in-memory implementation of [`BlobStore`] and [`BranchStore`].
+/// Simple in-memory implementation of [`BlobStore`] and [`PinStore`].
 ///
 /// Useful for unit tests or ephemeral repositories where persistence is not
 /// required.
@@ -54,14 +54,14 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     }
 }
 
-impl BranchStore for MemoryRepo {
-    type BranchesError = Infallible;
+impl PinStore for MemoryRepo {
+    type PinsError = Infallible;
     type HeadError = Infallible;
     type UpdateError = Infallible;
 
-    type ListIter<'a> = std::vec::IntoIter<Result<Id, Self::BranchesError>>;
+    type ListIter<'a> = std::vec::IntoIter<Result<Id, Self::PinsError>>;
 
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         Ok(self
             .branches
             .keys()

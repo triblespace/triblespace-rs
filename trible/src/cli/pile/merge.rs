@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreGet;
-use triblespace::prelude::BranchStore;
+use triblespace::prelude::PinStore;
 use triblespace::prelude::View;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;

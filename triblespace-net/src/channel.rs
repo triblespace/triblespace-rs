@@ -7,7 +7,7 @@
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
 
-use crate::protocol::{RawBranchId, RawHash};
+use crate::protocol::{RawPinId, RawHash};
 
 /// A 32-byte public key identifying a publisher.
 pub type PublisherKey = [u8; 32];
@@ -26,7 +26,7 @@ pub enum NetCommand {
     /// Gossip a HEAD change for a branch (fire-and-forget). Local
     /// branch updates trigger this; subscribers on the team topic
     /// receive the flood message and walk the closure to catch up.
-    Gossip { branch: RawBranchId, head: RawHash },
+    Gossip { branch: RawPinId, head: RawHash },
     /// Dispatch a freshly-signed cap+sig pair to `subject` via the
     /// auth-handshake ALPN. Used by the renewal daemon (push-based
     /// renewal) and by the `team approve` subcommand (response to a
@@ -49,7 +49,7 @@ pub enum NetEvent {
     Blob(Vec<u8>),
     /// A remote branch HEAD was learned (via gossip or fetch).
     /// Includes the publisher's public key for provenance.
-    Head { branch: RawBranchId, head: RawHash, publisher: PublisherKey },
+    Head { branch: RawPinId, head: RawHash, publisher: PublisherKey },
     /// A peer asked us to issue them a capability. The partial cap
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),

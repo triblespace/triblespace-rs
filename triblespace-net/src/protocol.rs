@@ -55,10 +55,10 @@ pub const AUTH_OK: u8 = 0x00;
 pub const AUTH_REJECTED: u8 = 0x01;
 
 pub const NIL_HASH: RawHash = [0u8; 32];
-pub const NIL_BRANCH_ID: RawBranchId = [0u8; 16];
+pub const NIL_BRANCH_ID: RawPinId = [0u8; 16];
 
 pub type RawHash = [u8; 32];
-pub type RawBranchId = [u8; 16];
+pub type RawPinId = [u8; 16];
 
 // ── Send/Recv helpers ────────────────────────────────────────────────
 
@@ -73,7 +73,7 @@ pub async fn send_hash(send: &mut SendStream, hash: &RawHash) -> Result<()> {
     send.write_all(hash).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn send_branch_id(send: &mut SendStream, id: &RawBranchId) -> Result<()> {
+pub async fn send_branch_id(send: &mut SendStream, id: &RawPinId) -> Result<()> {
     send.write_all(id).await.map_err(|e| anyhow!("send: {e}"))
 }
 
@@ -97,7 +97,7 @@ pub async fn recv_hash(recv: &mut RecvStream) -> Result<RawHash> {
     Ok(buf)
 }
 
-pub async fn recv_branch_id(recv: &mut RecvStream) -> Result<RawBranchId> {
+pub async fn recv_branch_id(recv: &mut RecvStream) -> Result<RawPinId> {
     let mut buf = [0u8; 16];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf)

@@ -4,7 +4,7 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreList;
-use triblespace::prelude::BranchStore;
+use triblespace::prelude::PinStore;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
@@ -154,7 +154,7 @@ fn create_initializes_empty_pile() {
     let mut pile: Pile = Pile::open(&path).unwrap();
     // Explicitly refresh after open to populate in-memory indices.
     pile.refresh().unwrap();
-    let mut iter = pile.branches().unwrap();
+    let mut iter = pile.pins().unwrap();
     assert!(iter.next().is_none());
     pile.close().unwrap();
 }

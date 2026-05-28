@@ -31,7 +31,7 @@ pub fn run(
 
     // Enumerate branches.
     let branch_ids: Vec<Id> = src_pile
-        .branches()
+        .pins()
         .map_err(|e| anyhow!("branches: {e:?}"))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| anyhow!("branch iter: {e:?}"))?;

@@ -4,7 +4,7 @@ use crate::id::Id;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
-use crate::repo::BranchStore;
+use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -57,11 +57,11 @@ where
     }
 }
 
-impl<B, R> BranchStore for HybridStore<B, R>
+impl<B, R> PinStore for HybridStore<B, R>
 where
-    R: BranchStore,
+    R: PinStore,
 {
-    type BranchesError = R::BranchesError;
+    type PinsError = R::PinsError;
     type HeadError = R::HeadError;
     type UpdateError = R::UpdateError;
 
@@ -71,8 +71,8 @@ where
         R: 'a,
         B: 'a;
 
-    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
-        self.branches.branches()
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
+        self.branches.pins()
     }
 
     fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {

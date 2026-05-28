@@ -162,7 +162,7 @@ proptest! {
                     }
                     Op::BranchList => {
                         piles[actor].refresh().unwrap();
-                        let iter = piles[actor].branches().unwrap();
+                        let iter = piles[actor].pins().unwrap();
                         let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
                         let expected_ids: HashSet<Id> = branches.keys().copied().collect();
                         prop_assert_eq!(found, expected_ids);
@@ -179,7 +179,7 @@ proptest! {
                                 prop_assert_eq!(blob.bytes.as_ref(), data.as_slice());
                             }
                         }
-                        let iter = pile.branches().unwrap();
+                        let iter = pile.pins().unwrap();
                         let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
                         let expected_ids: HashSet<Id> = branches.keys().copied().collect();
                         prop_assert_eq!(found, expected_ids);
@@ -206,7 +206,7 @@ proptest! {
             let blob = reader.get::<Blob<UnknownBlob>, _>(*handle).unwrap();
             assert_eq!(blob.bytes.as_ref(), data.as_slice());
         }
-        let iter = pile_final.branches().unwrap();
+        let iter = pile_final.pins().unwrap();
         let found: HashSet<Id> = iter.map(|r| r.unwrap()).collect();
         let expected_ids: HashSet<Id> = branches.keys().copied().collect();
         assert_eq!(found, expected_ids);
