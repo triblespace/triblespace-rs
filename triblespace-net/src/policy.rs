@@ -3,7 +3,7 @@
 //!
 //! These branches live on the peer's pile but are **not** gossiped —
 //! the implementation here mirrors the tracking-branch pattern from
-//! `crate::tracking`. The `is_local_only_branch` check is consulted
+//! `crate::tracking`. The `is_local_only_pin` check is consulted
 //! by the gossip-publish loop in `Peer::refresh` to skip them.
 //!
 //! Three roles:
@@ -24,7 +24,7 @@
 //!     pile retains it across compaction. Identified by
 //!     `cap_for_team: <team_root_pubkey>`.
 //!
-//! All three are marked with the same `local_only_branch` attribute
+//! All three are marked with the same `local_only_pin` attribute
 //! (value = the kind tag) so a single helper distinguishes them from
 //! gossipable team-data branches.
 //!
@@ -47,11 +47,11 @@ attributes! {
     /// Tags a branch as local-only (skip in gossip publish, skip in
     /// branch-name lookups). Value is one of the `KIND_*` tags below
     /// indicating the role.
-    "3361F2DE0BD68BA8712EC5B9CCC7EF2A" as pub local_only_branch: GenId;
+    "3361F2DE0BD68BA8712EC5B9CCC7EF2A" as pub local_only_pin: GenId;
 
     // ── Per-team-cap branch ───────────────────────────────────────────
     /// Names the team this branch holds cap state for. Set on the
-    /// branch metadata entity alongside `local_only_branch =
+    /// branch metadata entity alongside `local_only_pin =
     /// KIND_TEAM_CAP`.
     "E1EE471B597A4142AD26CA1FED368D2F" as pub cap_for_team: ED25519PublicKey;
 
@@ -135,10 +135,10 @@ pub const STATUS_REJECTED: Id =
 // ── Helpers ───────────────────────────────────────────────────────────
 
 /// Returns true if `branch_id`'s metadata carries the
-/// `local_only_branch` attribute. Used by the gossip-publish loop to
+/// `local_only_pin` attribute. Used by the gossip-publish loop to
 /// skip policy branches (they mustn't leak A's renewal decisions or
 /// pending-request queue to the team).
-pub fn is_local_only_branch<S>(store: &mut S, branch_id: Id) -> bool
+pub fn is_local_only_pin<S>(store: &mut S, branch_id: Id) -> bool
 where
     S: BlobStore + PinStore,
 {
@@ -147,7 +147,7 @@ where
     let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else { return false; };
     find!(
         kind: Id,
-        pattern!(&meta, [{ _?e @ local_only_branch: ?kind }])
+        pattern!(&meta, [{ _?e @ local_only_pin: ?kind }])
     )
     .next()
     .is_some()
@@ -155,10 +155,10 @@ where
 
 /// Look up the local team-cap branch for a given team root pubkey,
 /// if one exists. Searches by branch metadata for
-/// `local_only_branch = KIND_TEAM_CAP` + `cap_for_team =
+/// `local_only_pin = KIND_TEAM_CAP` + `cap_for_team =
 /// team_root`. Returns the branch id (caller can fetch the head or
 /// list commits as needed).
-pub fn find_team_cap_branch<S>(
+pub fn find_team_cap_pin<S>(
     store: &mut S,
     team_root: ed25519_dalek::VerifyingKey,
 ) -> Option<Id>
@@ -180,7 +180,7 @@ where
             (kind: Id, team: Inline<ED25519PublicKey>),
             pattern!(&meta, [{
                 _?e @
-                local_only_branch: ?kind,
+                local_only_pin: ?kind,
                 cap_for_team: ?team,
             }])
         )
@@ -195,7 +195,7 @@ where
 /// Find the local-only branch of a given kind (e.g.
 /// `KIND_RENEWAL_POLICY`, `KIND_PENDING_REQUESTS`). Branches of these
 /// kinds are singletons per peer, so the first match wins.
-pub fn find_local_only_branch_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
+pub fn find_local_only_pin_of_kind<S>(store: &mut S, kind: Id) -> Option<Id>
 where
     S: BlobStore + PinStore,
 {
@@ -210,7 +210,7 @@ where
         let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head) else { continue; };
         let matches = find!(
             k: Id,
-            pattern!(&meta, [{ _?e @ local_only_branch: ?k }])
+            pattern!(&meta, [{ _?e @ local_only_pin: ?k }])
         )
         .any(|k| k == kind);
         if matches {
@@ -243,7 +243,7 @@ pub fn list_pending_requests<S>(store: &mut S) -> Vec<PendingRequest>
 where
     S: BlobStore + PinStore,
 {
-    let Some(bid) = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS) else {
+    let Some(bid) = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS) else {
         return Vec::new();
     };
     let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
@@ -296,7 +296,7 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     // Find or create the pending-requests branch.
-    let (bid, prev_head) = match find_local_only_branch_of_kind(
+    let (bid, prev_head) = match find_local_only_pin_of_kind(
         store,
         KIND_PENDING_REQUESTS,
     ) {
@@ -318,7 +318,7 @@ where
             use triblespace_core::id::ExclusiveId;
             let marker_id = genid();
             entity! { ExclusiveId::force_ref(&marker_id) @
-                local_only_branch: KIND_PENDING_REQUESTS,
+                local_only_pin: KIND_PENDING_REQUESTS,
             }
             .into()
         }
@@ -366,7 +366,7 @@ where
 {
     use triblespace_core::id::ExclusiveId;
 
-    let (bid, prev_head) = match find_team_cap_branch(store, team_root) {
+    let (bid, prev_head) = match find_team_cap_pin(store, team_root) {
         Some(bid) => {
             let head = store.head(bid).ok().flatten();
             (bid, head)
@@ -381,7 +381,7 @@ where
     let entity_id = genid();
     let meta: TribleSet = entity! {
         ExclusiveId::force_ref(&entity_id) @
-        local_only_branch: KIND_TEAM_CAP,
+        local_only_pin: KIND_TEAM_CAP,
         cap_for_team: team_root,
         team_cap_handle: cap,
         team_sig_handle: sig,
@@ -405,7 +405,7 @@ pub fn current_team_cap<S>(
 where
     S: BlobStore + PinStore,
 {
-    let bid = find_team_cap_branch(store, team_root)?;
+    let bid = find_team_cap_pin(store, team_root)?;
     let head = store.head(bid).ok()??;
     let reader = store.reader().ok()?;
     let meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(head).ok()?;
@@ -451,7 +451,7 @@ pub fn list_renewal_policy<S>(store: &mut S) -> Vec<PolicyEntry>
 where
     S: BlobStore + PinStore,
 {
-    let Some(bid) = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY) else {
+    let Some(bid) = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) else {
         return Vec::new();
     };
     let Ok(Some(head)) = store.head(bid) else { return Vec::new(); };
@@ -573,7 +573,7 @@ where
 {
     use triblespace_core::id::ExclusiveId;
 
-    let (bid, prev_head) = match find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY) {
+    let (bid, prev_head) = match find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) {
         Some(bid) => (bid, store.head(bid).ok().flatten()),
         None => (*genid(), None),
     };
@@ -586,7 +586,7 @@ where
         None => {
             let marker_id = genid();
             entity! { ExclusiveId::force_ref(&marker_id) @
-                local_only_branch: KIND_RENEWAL_POLICY,
+                local_only_pin: KIND_RENEWAL_POLICY,
             }
             .into()
         }
@@ -630,7 +630,7 @@ where
 {
     use triblespace_core::id::ExclusiveId;
 
-    let bid = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
     let prev_head = store.head(bid).ok()??;
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
@@ -707,7 +707,7 @@ where
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
 
-    let bid = find_local_only_branch_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
     let prev_head = store.head(bid).ok()??;
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
@@ -744,7 +744,7 @@ pub fn set_request_status<S>(
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    let bid = find_local_only_branch_of_kind(store, KIND_PENDING_REQUESTS)?;
+    let bid = find_local_only_pin_of_kind(store, KIND_PENDING_REQUESTS)?;
     let prev_head = store.head(bid).ok()??;
 
     let reader = store.reader().ok()?;
@@ -889,8 +889,8 @@ mod tests {
         let _ = record_pending_request(&mut store, requester, partial, point_now())
             .expect("record");
 
-        let bid = find_local_only_branch_of_kind(&mut store, KIND_PENDING_REQUESTS)
+        let bid = find_local_only_pin_of_kind(&mut store, KIND_PENDING_REQUESTS)
             .expect("branch exists");
-        assert!(is_local_only_branch(&mut store, bid));
+        assert!(is_local_only_pin(&mut store, bid));
     }
 }

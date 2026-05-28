@@ -274,13 +274,13 @@ fn run_sync(
 
         // Auto-merge: walk the tracking branches in the pile and merge each
         // into its same-named local branch. The Peer auto-refreshes on every
-        // read (drains gossip + diffs external writes), so list_tracking_branches
+        // read (drains gossip + diffs external writes), so list_tracking_pins
         // always sees the latest state. Skipped under WriteOnly — we don't
         // pull tracking state down in that mode.
         if direction != SyncDirection::WriteOnly {
-            let tracks = triblespace_net::tracking::list_tracking_branches(repo.storage_mut());
+            let tracks = triblespace_net::tracking::list_tracking_pins(repo.storage_mut());
             for info in tracks {
-                let triblespace_net::tracking::TrackingBranchInfo {
+                let triblespace_net::tracking::TrackingPinInfo {
                     local_id: tracking_id,
                     remote_name: name,
                     ..

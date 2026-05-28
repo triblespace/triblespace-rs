@@ -227,7 +227,7 @@ where
                 NetEvent::Head { branch, head, publisher } => {
                     if let Some(remote_id) = Id::new(branch) {
                         if let Some(name) = read_remote_name(&mut self.store, &head) {
-                            crate::tracking::ensure_tracking_branch(
+                            crate::tracking::ensure_tracking_pin(
                                 &mut self.store,
                                 remote_id,
                                 &head,
@@ -287,14 +287,14 @@ where
                 Err(_) => return,
             };
             for bid in bids {
-                if crate::tracking::is_tracking_branch(&mut self.store, bid) {
+                if crate::tracking::is_tracking_pin(&mut self.store, bid) {
                     continue;
                 }
                 // Local-only policy branches (renewal policy, pending
                 // requests, per-team-cap pin branches) carry per-peer
                 // state that mustn't leak to the team mesh. See
                 // `crate::policy`.
-                if crate::policy::is_local_only_branch(&mut self.store, bid) {
+                if crate::policy::is_local_only_pin(&mut self.store, bid) {
                     continue;
                 }
                 let head = match self.store.head(bid) {
@@ -680,10 +680,10 @@ where
             Err(_) => return,
         };
         for bid in bids {
-            if crate::tracking::is_tracking_branch(&mut self.store, bid) {
+            if crate::tracking::is_tracking_pin(&mut self.store, bid) {
                 continue;
             }
-            if crate::policy::is_local_only_branch(&mut self.store, bid) {
+            if crate::policy::is_local_only_pin(&mut self.store, bid) {
                 continue;
             }
             if let Ok(Some(head)) = self.store.head(bid) {
@@ -800,8 +800,8 @@ where
                 // tracking, ad infinitum. Same logic for policy branches
                 // (renewal state, pending requests, per-team-cap pins) —
                 // they're per-peer local state.
-                if !crate::tracking::is_tracking_branch(&mut self.store, id)
-                    && !crate::policy::is_local_only_branch(&mut self.store, id)
+                if !crate::tracking::is_tracking_pin(&mut self.store, id)
+                    && !crate::policy::is_local_only_pin(&mut self.store, id)
                     && self.direction != SyncDirection::ReadOnly
                 {
                     let bid_bytes: [u8; 16] = id.into();

@@ -33,7 +33,7 @@ use triblespace_core::trible::TribleSet;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_net::tracking::{
-    ensure_tracking_branch, merge_tracking_into_local, MergeOutcome,
+    ensure_tracking_pin, merge_tracking_into_local, MergeOutcome,
 };
 
 fn new_repo(seed: u8) -> Repository<MemoryRepo> {
@@ -93,7 +93,7 @@ fn sync_round(
     copy_all_blobs(remote, local);
     let remote_branch_id = lookup_id(remote, branch_name);
     let remote_head = remote_head_hash(remote, branch_name);
-    let tracking_id = ensure_tracking_branch(
+    let tracking_id = ensure_tracking_pin(
         local.storage_mut(),
         remote_branch_id,
         &remote_head,
@@ -207,11 +207,11 @@ fn parallel_merges_produce_identical_commits() {
     let a_head = remote_head_hash(&mut a, "main");
     let b_head = remote_head_hash(&mut b, "main");
 
-    let tracking_in_a = ensure_tracking_branch(
+    let tracking_in_a = ensure_tracking_pin(
         a.storage_mut(), b_branch_id, &b_head, "main", &pub_b,
     )
     .unwrap();
-    let tracking_in_b = ensure_tracking_branch(
+    let tracking_in_b = ensure_tracking_pin(
         b.storage_mut(), a_branch_id, &a_head, "main", &pub_a,
     )
     .unwrap();
