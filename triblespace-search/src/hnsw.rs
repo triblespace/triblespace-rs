@@ -276,6 +276,7 @@ impl HNSWBuilder {
     /// the production path — the naive in-memory [`HNSWIndex`]
     /// is kept only as a reference oracle (see
     /// [`build_naive`][Self::build_naive]).
+    #[cfg(feature = "succinct")]
     pub fn build(self) -> crate::succinct::SuccinctHNSWIndex {
         crate::succinct::SuccinctHNSWIndex::from_naive(&self.build_naive())
             .expect("from_naive cannot fail on a valid HNSWIndex built by HNSWBuilder")

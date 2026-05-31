@@ -7,8 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-05-31
+
 ### Added
 
+- **`triblespace-net` descriptive-capabilities substrate.** Caps are past-tense
+  `K_A authorised K_B for scope S during interval [t0, t1]` statements with
+  chain proofs carried in sig blobs (parallel cap fetch + multi-path
+  resilience). Verification asks "is this statement covering wall-clock now?";
+  eviction = non-renewal. New `/triblespace/auth-handshake/1` ALPN with
+  `OP_REQUEST_CAP` / `OP_DELIVER_CAP`, plus a renewal daemon in `pile net sync`
+  that signs successors and dispatches them. Schema for local-only pins
+  (renewal policy, pending requests, team cap). See wiki:8766B938... in the
+  Liora pile for the architecture writeup.
+- **`trible` CLI: `pile pin list/inspect/delete`** as generic primitive ops
+  on the pin namespace. `pile branch list` now filters to pins carrying
+  `metadata::name` (the named content-branch view) while `pile pin list`
+  exposes all roles (BRANCH / TRACKING / POLICY / UNNAMED).
+- **`trible team` subcommands**: `approve`, `request-join`, `list-pending`,
+  `list-issued`, `retract` — drive the cap-issuance workflow end-to-end via
+  the one-shot iroh CLI helpers in `triblespace_net::handshake`.
 - **`PathOp::NotAttr(RawId)`** for SPARQL's negated property-set
   operator `!p`. Combined with closures (`(!p)+` / `(!p)*`),
   expresses "reachable via any edge that isn't `p`". New
@@ -76,6 +94,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`BranchStore` trait renamed to `PinStore`.** Branch is now the
+  specialization of pin that carries a commit chain and a `metadata::name`;
+  unnamed / non-commit-chain pins (tracking pins, local-only policy pins)
+  share the storage primitive. Downstream code should rename imports.
+- **`Repository::new` signature** widened to `F: Into<crate::trible::Fragment>`
+  (was `commit_metadata: TribleSet`). Existing TribleSet callers continue to
+  work via `impl Into<Fragment> for TribleSet`; the new signature lets callers
+  pass schema metadata + auxiliary blobs (handle-referenced doc strings,
+  etc.) in a single self-contained Fragment. Repository absorbs the
+  Fragment's blobs into storage.
+- **`NetEvent` / `NetCommand` / `IncomingOp` payloads** switched from
+  `Vec<u8>` to `anybytes::Bytes` for cap and blob payloads. Arc-refcounted
+  zero-copy along the cap delivery path.
 - **`TribleSetConstraint`'s catch-all `panic!()`** now carries a
   message pointing at the workaround (distinct Variables +
   EqualityConstraint) and the docs entry — still fires only for

@@ -180,6 +180,7 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     /// production path — the naive in-memory [`BM25Index`] is
     /// kept only as a reference oracle (see
     /// [`build_naive`][Self::build_naive]).
+    #[cfg(feature = "succinct")]
     pub fn build(self) -> crate::succinct::SuccinctBM25Index<D, T> {
         crate::succinct::SuccinctBM25Index::from_builder(self)
     }
