@@ -816,64 +816,34 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 // machinery requires the value type to be zero-sized so reification
 // (constructing a heap Leaf with `()` as the value) is well-defined.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
-    /// Insertion variant that threads owner state alongside the inserted
-    /// leaf so `LocalLeaf` children land inside Branches whose `owner`
-    /// matches. On owner mismatch the new leaf is reified into a heap
-    /// `Leaf`.
+    /// Inserts a new leaf into a PATCH while keeping owner-aware
+    /// invariants intact. `this` is guaranteed by the call protocol
+    /// to be a heap `Leaf` or a `Branch` — never a `LocalLeaf`,
+    /// because LocalLeaf children are handled inline by their parent
+    /// Branch's `modify_child` closure (the only level where the
+    /// LocalLeaf's owner identity is locally known).
     ///
-    /// - `this_localleaf_owner`: the owner backing `this` IF `this` is a
-    ///   LocalLeaf passed in from the caller's context. The caller knows
-    ///   this from the surrounding Branch's `owner`. `None` when `this`
-    ///   is a heap Leaf or a Branch (Branches manage their own owner via
-    ///   the `owner` field).
-    /// - `leaf_owner`: the owner backing the new leaf. `Some(arc)` for
-    ///   archive-backed entries, `None` for heap-allocated.
+    /// `leaf_owner` is `Some(arc)` when the new leaf is an archive
+    /// `LocalLeaf` backed by that owner Arc, and `None` for plain
+    /// heap leaves.
     pub(crate) fn insert_leaf_with_owner(
         mut this: Self,
         mut leaf: Self,
-        this_localleaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
         mut leaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
         start_depth: usize,
     ) -> Self {
+        // Top-level divergence: `this` is a heap Leaf or a Branch
+        // (never LocalLeaf per the protocol above). The only side
+        // that can be a LocalLeaf at this level is `leaf` — so the
+        // new parent Branch only needs to host whatever owner backs
+        // it. A `this = Branch` keeps its own owner field for its
+        // own subtree; the new parent doesn't inherit responsibility
+        // for that.
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
             let old_key = this.key();
-
-            // Each side's localleaf owner at this Branch level. For
-            // `this`: if it's a LocalLeaf, the caller's context owner
-            // backs it; if it's a Branch, the branch's `owner` field
-            // wins for the new Branch's interpretation. Heap Leaves
-            // carry no owner.
-            //
-            // Borrow rather than clone — the Arc only gets bumped when
-            // we actually decide to store it in the new Branch below.
-            let branch_owner_ref = match this.body_ref() {
-                BodyRef::Branch(branch) => branch.owner.as_ref(),
-                _ => None,
-            };
-            let this_side_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>> =
-                match this.body_ref() {
-                    BodyRef::Leaf(_) => None,
-                    BodyRef::LocalLeaf(_) => this_localleaf_owner,
-                    BodyRef::Branch(_) => branch_owner_ref,
-                };
-
-            // Pick an owner that keeps both sides' LocalLeaves alive.
-            // On mismatch reify the new leaf (the easier side to
-            // reify since `this` may already be a deep subtree).
-            let new_branch_owner = match (this_side_owner, leaf_owner) {
-                (None, None) => None,
-                (None, Some(lo)) => Some(lo.clone()),
-                (Some(to), None) => Some(to.clone()),
-                (Some(to), Some(lo)) if std::sync::Arc::ptr_eq(to, lo) => Some(to.clone()),
-                (Some(to), Some(_)) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
-                    leaf_owner = None;
-                    Some(to.clone())
-                }
-            };
-
+            let new_branch_owner = leaf_owner.map(|a| a.clone());
             let new_body = crate::patch::branch::Branch::new_with_owner(
                 depth,
                 this.with_key(this_byte_key),
@@ -887,10 +857,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         if end_depth != KEY_LEN {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
 
-            // Owner reconciliation: when this Branch has no owner and
-            // the new leaf brings one, adopt the new leaf's owner;
-            // when they conflict, reify the new leaf so it can live
-            // independently. Matching or both-None is a no-op.
+            // Owner reconciliation at this Branch — adopt if empty,
+            // reify the incoming leaf on conflict, no-op when matched
+            // or both `None`.
             let needs_adopt = matches!((ed.owner.as_ref(), leaf_owner),
                 (None, Some(_)));
             let needs_reify = matches!((ed.owner.as_ref(), leaf_owner),
@@ -902,29 +871,50 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                 leaf_owner = None;
             }
 
-            // Child context is this Branch's (post-adoption) owner —
-            // it backs any LocalLeaf grandchildren at the next level.
-            // We use a raw pointer to elide a lifetime that would
-            // collide with the unique-borrow `ed` holds on `this`.
-            // SAFETY: the Arc stays alive on the Branch for the
-            // entire descend; we only read through this pointer
-            // before the closure body returns.
-            let next_context_ptr: *const Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>> =
-                &ed.owner;
+            // Raw pointer into `ed.owner` so the inline-LocalLeaf
+            // closure path can clone the Arc without re-borrowing
+            // `ed` (which is uniquely held by `modify_child`).
+            // SAFETY: the Arc lives on the Branch for the whole
+            // descent; we read through this pointer only inside the
+            // closure body before it returns.
+            let branch_owner_ptr: *const Option<
+                std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>,
+            > = &ed.owner;
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
-                Some(old) => {
-                    let next_ctx = unsafe { (*next_context_ptr).as_ref() };
-                    Some(Head::insert_leaf_with_owner(
-                        old,
-                        inserted,
-                        next_ctx,
-                        leaf_owner,
-                        end_depth,
-                    ))
-                }
                 None => Some(inserted),
+                Some(old) => Some(match old.body_ref() {
+                    BodyRef::LocalLeaf(_) => {
+                        // Direct-child LocalLeaf: its owner is THIS
+                        // Branch's owner. Build the divergence
+                        // sub-Branch inline and stop the recursion —
+                        // the deeper levels of the new sub-Branch
+                        // can host whatever the post-reconcile owner
+                        // backs.
+                        let (depth, old_byte_key, leaf_byte_key) = old
+                            .first_divergence(&inserted, end_depth)
+                            .expect(
+                                "LocalLeaf and the inserted leaf must \
+                                 diverge at some depth — equal keys \
+                                 would have been a no-op upstream",
+                            );
+                        let old_top_key = old.key();
+                        let sub_owner = unsafe { (*branch_owner_ptr).clone() };
+                        let new_body = crate::patch::branch::Branch::new_with_owner(
+                            depth,
+                            old.with_key(old_byte_key),
+                            inserted.with_key(leaf_byte_key),
+                            sub_owner,
+                        );
+                        Head::new(old_top_key, new_body)
+                    }
+                    BodyRef::Leaf(_) | BodyRef::Branch(_) => {
+                        // `old` is a heap Leaf or a Branch — recurse
+                        // with the protocol-conforming shape.
+                        Head::insert_leaf_with_owner(old, inserted, leaf_owner, end_depth)
+                    }
+                }),
             });
         }
         this
@@ -2251,7 +2241,6 @@ where
             let new_head = Head::insert_leaf_with_owner(
                 this,
                 leaf_head,
-                None,
                 Some(&leaf_owner),
                 0,
             );
