@@ -21,7 +21,7 @@ use arrayvec::ArrayVec;
 
 use branch::*;
 /// Re-export of [`Entry`](entry::Entry).
-pub use entry::Entry;
+pub use entry::{ArchiveEntry, Entry};
 use leaf::*;
 
 /// Re-export of all byte table utilities.
@@ -796,7 +796,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             this.first_divergence(&leaf, start_depth)
         {
             let old_key = this.key();
-            let new_body = Branch::new(
+            let new_body = crate::patch::branch::Branch::new(
                 depth,
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
@@ -806,8 +806,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
         let end_depth = this.end_depth();
         if end_depth != KEY_LEN {
-            // Use the editable BranchMut view to perform mutations without
-            // exposing pointer juggling at the call site.
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
@@ -818,7 +816,144 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
         this
     }
+}
 
+// Archive-aware insertion path, available only when V = (). LocalLeaf
+// machinery requires the value type to be zero-sized so reification
+// (constructing a heap Leaf with `()` as the value) is well-defined.
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
+    /// Insertion variant that threads owner state alongside the inserted
+    /// leaf so `LocalLeaf` children land inside Branches whose `owner`
+    /// matches. On owner mismatch the new leaf is reified into a heap
+    /// `Leaf`.
+    ///
+    /// - `this_localleaf_owner`: the owner backing `this` IF `this` is a
+    ///   LocalLeaf passed in from the caller's context. The caller knows
+    ///   this from the surrounding Branch's `owner`. `None` when `this`
+    ///   is a heap Leaf or a Branch (Branches manage their own owner via
+    ///   the `owner` field).
+    /// - `leaf_owner`: the owner backing the new leaf. `Some(arc)` for
+    ///   archive-backed entries, `None` for heap-allocated.
+    pub(crate) fn insert_leaf_with_owner(
+        mut this: Self,
+        mut leaf: Self,
+        this_localleaf_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        mut leaf_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        start_depth: usize,
+    ) -> Self {
+        if let Some((depth, this_byte_key, leaf_byte_key)) =
+            this.first_divergence(&leaf, start_depth)
+        {
+            let old_key = this.key();
+
+            // Determine each side's localleaf owner at this Branch level.
+            // For `this`: if it's a LocalLeaf, the caller's context owner
+            // backs it; if it's a Branch with its own owner, that wins
+            // for the new Branch's interpretation of the subtree.
+            let this_side_owner = match this.body_ref() {
+                BodyRef::Leaf(_) => None,
+                BodyRef::LocalLeaf(_) => this_localleaf_owner.clone(),
+                BodyRef::Branch(branch) => branch.owner.clone(),
+            };
+
+            // New Branch's owner: pick whichever owner can keep both
+            // sides' LocalLeaves alive. If they match, adopt it. If
+            // they don't, reify the new leaf (it's the easier side to
+            // reify since `this` may already contain a deep subtree).
+            let new_branch_owner = match (&this_side_owner, &leaf_owner) {
+                (None, None) => None,
+                (None, Some(lo)) => Some(lo.clone()),
+                (Some(to), None) => Some(to.clone()),
+                (Some(to), Some(lo)) if std::sync::Arc::ptr_eq(to, lo) => Some(to.clone()),
+                (Some(to), Some(_)) => {
+                    leaf = Self::reify_local_leaf_unit(leaf);
+                    leaf_owner = None;
+                    Some(to.clone())
+                }
+            };
+
+            let new_body = crate::patch::branch::Branch::new_with_owner(
+                depth,
+                this.with_key(this_byte_key),
+                leaf.with_key(leaf_byte_key),
+                new_branch_owner,
+            );
+            return Head::new(old_key, new_body);
+        }
+
+        let end_depth = this.end_depth();
+        if end_depth != KEY_LEN {
+            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+
+            // Owner reconciliation at this Branch. If the Branch has no
+            // owner and the new leaf brings one, adopt it. If the Branch
+            // has an owner that matches the new leaf's, fine — insert
+            // as LocalLeaf. If they conflict, reify the new leaf to a
+            // heap Leaf so it can live independently of the Branch's
+            // owner.
+            let branch_owner_snapshot = ed.owner.clone();
+            match (&branch_owner_snapshot, &leaf_owner) {
+                (None, None) => {}
+                (None, Some(lo)) => {
+                    ed.owner = Some(lo.clone());
+                }
+                (Some(_), None) => {}
+                (Some(bo), Some(lo)) if std::sync::Arc::ptr_eq(bo, lo) => {}
+                (Some(_), Some(_)) => {
+                    leaf = Self::reify_local_leaf_unit(leaf);
+                    leaf_owner = None;
+                }
+            }
+
+            // When descending into a child, the context_owner for the
+            // child is this Branch's owner (which now reflects any
+            // adoption above). This is the owner that backs any
+            // LocalLeaf children at the next recursion level.
+            let next_context = ed.owner.clone();
+            let inserted = leaf.with_start(ed.end_depth as usize);
+            let key = inserted.key();
+            let descend_leaf_owner = leaf_owner.clone();
+            ed.modify_child(key, move |opt| match opt {
+                Some(old) => Some(Head::insert_leaf_with_owner(
+                    old,
+                    inserted,
+                    next_context.clone(),
+                    descend_leaf_owner.clone(),
+                    end_depth,
+                )),
+                None => Some(inserted),
+            });
+        }
+        this
+    }
+
+    /// Reifies a LocalLeaf head into a heap `Leaf<KEY_LEN, ()>` head.
+    /// Leaf and Branch heads pass through unchanged. Specialized to
+    /// V = () so no `V: Default` bound leaks into generic call sites.
+    fn reify_local_leaf_unit(head: Self) -> Self {
+        match head.body_ref() {
+            BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
+            BodyRef::LocalLeaf(bytes) => {
+                let key_byte = head.key();
+                let key_copy = *bytes;
+                drop(head);
+                let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
+                unsafe { Head::new(key_byte, new_leaf) }
+            }
+        }
+    }
+
+    /// Public re-export for the root-reification path used by
+    /// `PATCH::insert_archive` when the PATCH is empty.
+    pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
+        Self::reify_local_leaf_unit(head)
+    }
+}
+
+// Resume generic-V `Head` impl for the remaining methods (replace_leaf,
+// union, intersect, query operations, etc.) which don't care about V
+// shape and so remain in the V-generic impl block.
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
@@ -2092,6 +2227,34 @@ where
             }
         }
         avg
+    }
+}
+
+/// Archive-backed insertion path, available only for `V = ()` because
+/// [`ArchiveEntry`] does not carry a value. The leaf appears as a
+/// `LocalLeaf` head if the receiving Branch's `owner` matches the
+/// entry's; otherwise it is reified into a heap-allocated `Leaf<KEY_LEN,
+/// ()>` automatically.
+impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
+where
+    O: KeySchema<KEY_LEN>,
+{
+    /// Inserts an archive-backed key. See [`ArchiveEntry`] for the
+    /// owner semantics and the materialization rule for owner
+    /// mismatches.
+    pub fn insert_archive(&mut self, entry: &ArchiveEntry<KEY_LEN>) {
+        let (leaf_head, leaf_owner) = entry.leaf::<O>();
+        if let Some(this) = self.root.take() {
+            let new_head =
+                Head::insert_leaf_with_owner(this, leaf_head, None, Some(leaf_owner), 0);
+            self.root.replace(new_head);
+        } else {
+            // Empty PATCH: the standalone root can't host an owner field
+            // (only Branches carry `owner`), so reify the single entry
+            // into a heap Leaf. The next insertion creates a Branch
+            // which can adopt the owner cleanly.
+            self.root.replace(Head::reify_local_leaf_unit_for_root(leaf_head));
+        }
     }
 }
 

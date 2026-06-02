@@ -195,6 +195,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
     ) -> NonNull<Self> {
+        Self::new_with_owner(end_depth, lchild, rchild, None)
+    }
+
+    /// Like [`Self::new`] but sets the branch's `owner` field — used by
+    /// the archive-leaf-elimination path so that a Branch created when
+    /// inserting a `LocalLeaf` adopts the entry's archive owner.
+    pub(super) fn new_with_owner(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        owner: Option<Arc<dyn ArchiveOwner>>,
+    ) -> NonNull<Self> {
         unsafe {
             let size = 2;
             // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
@@ -216,7 +228,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
             addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild.hash());
-            addr_of_mut!((*ptr.as_ptr()).owner).write(None);
+            addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
