@@ -59,7 +59,9 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
                     branch_nn: nn,
                 }
             }
-            BodyMut::Leaf(_) => panic!("BranchMut requires a Branch body"),
+            BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => {
+                panic!("BranchMut requires a Branch body")
+            }
         }
     }
 
