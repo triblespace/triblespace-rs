@@ -70,10 +70,18 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 
 #[test]
 fn simplearchive_decode_uses_archive_owner() {
-    // 4095 stays just under the rayon threshold (4096) so we get a
-    // serial-only signal even at meaningful N. Above that the
-    // parallel reduce kicks in and we currently see a regression
-    // (LocalLeaf-aware union work to be revisited).
+    // Both paths share the same parallel-reduce gate, so at small N
+    // they're naturally serial. At large N the heap path goes parallel
+    // via rayon while the archive path stays serial (LocalLeaf-aware
+    // `union` not yet implemented). To keep the *per-trible* signal
+    // comparable across scales, set `RAYON_NUM_THREADS=1` when running
+    // this test:
+    //
+    //     RAYON_NUM_THREADS=1 cargo test --release --test simplearchive_localleaf
+    //
+    // Otherwise expect the archive vs heap ratio to widen as N
+    // crosses the rayon threshold purely due to thread count, not
+    // per-insert cost.
     measure_at(1_024);
     measure_at(4_095);
     measure_at(10_000);
