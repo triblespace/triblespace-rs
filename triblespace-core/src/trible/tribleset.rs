@@ -8,6 +8,7 @@ use crate::query::TriblePattern;
 use crate::inline::Inline;
 
 use crate::id::Id;
+use crate::patch::ArchiveEntry;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::query::Variable;
@@ -307,6 +308,20 @@ impl TribleSet {
         self.ave.insert(&key);
         self.vea.insert(&key);
         self.vae.insert(&key);
+    }
+
+    /// Inserts an archive-backed trible into all six covering indexes
+    /// using [`PATCH::insert_archive`], so each index may land the new
+    /// entry as a `LocalLeaf` instead of a freshly allocated heap
+    /// `Leaf`. The receiving Branches' `owner` fields keep the
+    /// underlying archive bytes alive.
+    pub fn insert_archive(&mut self, entry: &ArchiveEntry<TRIBLE_LEN>) {
+        self.eav.insert_archive(entry);
+        self.eva.insert_archive(entry);
+        self.aev.insert_archive(entry);
+        self.ave.insert_archive(entry);
+        self.vea.insert_archive(entry);
+        self.vae.insert_archive(entry);
     }
 
     /// Returns `true` when the exact trible is present in the set.

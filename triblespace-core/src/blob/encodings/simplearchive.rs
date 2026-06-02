@@ -8,12 +8,16 @@ use crate::id_hex;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
+use crate::patch::ArchiveEntry;
+use crate::patch::ArchiveOwner;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
 
 use anybytes::Bytes;
 use anybytes::View;
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 /// Canonical trible sequence stored as raw 64-byte entries.
 ///
@@ -105,20 +109,37 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
         };
         let slice: &[[u8; 64]] = &packed_tribles;
 
+        // ArchiveEntry / LocalLeaf require the trible pointer to be
+        // 16-byte aligned (the low 4 bits encode `HeadTag::LocalLeaf`).
+        // Every 64-byte stride preserves alignment, so it's enough to
+        // check the slice base. Modern allocators (and mmap'd files)
+        // satisfy this; the heap-Leaf fallback handles the rare miss.
+        let owner: Option<Arc<dyn ArchiveOwner>> =
+            if (slice.as_ptr() as usize) & 0x0f == 0 {
+                Some(Arc::new(blob.bytes.clone()))
+            } else {
+                None
+            };
+
         #[cfg(feature = "parallel")]
         {
             if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
-                return parallel_unarchive(slice);
+                return parallel_unarchive(slice, owner);
             }
         }
 
-        serial_unarchive(slice)
+        serial_unarchive(slice, owner.as_ref())
     }
 }
 
 /// Serial fallback. Validates ordering + redundancy inline with
-/// insertion — every byte read once.
-fn serial_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
+/// insertion — every byte read once. When `owner` is `Some`, each
+/// trible is inserted as an `ArchiveEntry` (LocalLeaf-backed); when
+/// `None`, the heap-Leaf path is taken.
+fn serial_unarchive(
+    slice: &[[u8; 64]],
+    owner: Option<&Arc<dyn ArchiveOwner>>,
+) -> Result<TribleSet, UnarchiveError> {
     let mut tribles = TribleSet::new();
     let mut prev_trible: Option<&[u8; 64]> = None;
     for t in slice.iter() {
@@ -134,7 +155,17 @@ fn serial_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
             }
         }
         prev_trible = Some(t);
-        tribles.insert(trible);
+        match owner {
+            Some(owner_arc) => {
+                // SAFETY: `t` points into the archive bytes kept alive
+                // by `owner_arc`, and base-alignment + 64-byte stride
+                // guarantees this element is 16-byte aligned.
+                let ptr = NonNull::from(t);
+                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc.clone()) };
+                tribles.insert_archive(&entry);
+            }
+            None => tribles.insert(trible),
+        }
     }
     Ok(tribles)
 }
@@ -145,7 +176,10 @@ fn serial_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
 /// `TribleSet::union` (which itself fans out across the six
 /// indexes — three levels of parallelism stacked).
 #[cfg(feature = "parallel")]
-fn parallel_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
+fn parallel_unarchive(
+    slice: &[[u8; 64]],
+    owner: Option<Arc<dyn ArchiveOwner>>,
+) -> Result<TribleSet, UnarchiveError> {
     use rayon::prelude::*;
 
     let n_threads = rayon::current_num_threads().max(1);
@@ -167,10 +201,12 @@ fn parallel_unarchive(slice: &[[u8; 64]]) -> Result<TribleSet, UnarchiveError> {
         }
     }
 
-    // Phase 2: per-chunk serial unarchive in parallel.
+    // Phase 2: per-chunk serial unarchive in parallel. Every chunk
+    // shares the same archive owner, so `union` later sees identical
+    // owner Arcs and can adopt LocalLeaves wholesale.
     let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
         .par_iter()
-        .map(|chunk| serial_unarchive(chunk))
+        .map(|chunk| serial_unarchive(chunk, owner.as_ref()))
         .collect();
 
     // Phase 3: reduce the per-chunk sets via TribleSet::union (the

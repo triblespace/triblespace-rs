@@ -21,6 +21,7 @@ use arrayvec::ArrayVec;
 
 use branch::*;
 /// Re-export of [`Entry`](entry::Entry).
+pub use branch::ArchiveOwner;
 pub use entry::{ArchiveEntry, Entry};
 use leaf::*;
 
@@ -662,22 +663,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
-    /// Return the raw pointer to the child leaf for use in low-level
-    /// operations (for example when constructing a Branch). Prefer
-    /// `childleaf_key()` or other safe accessors when you only need the
-    /// key or value; those avoid unsafe dereferences.
-    pub(crate) fn childleaf_ptr(&self) -> *const Leaf<KEY_LEN, V> {
+    /// Returns the raw key-bytes pointer of the representative child
+    /// leaf for use in low-level operations (Branch construction,
+    /// invariant checks). For heap `Leaf`, that's `&leaf.key`; for
+    /// `LocalLeaf`, the archive-resident bytes pointer; for `Branch`,
+    /// the branch's already-computed childleaf pointer.
+    pub(crate) fn childleaf_ptr(&self) -> *const [u8; KEY_LEN] {
         match self.body_ref() {
-            BodyRef::Leaf(leaf) => leaf as *const Leaf<KEY_LEN, V>,
-            BodyRef::LocalLeaf(_) => {
-                // A LocalLeaf has no `Leaf` struct backing it — just bytes
-                // in archive memory. Callers that need a `*const Leaf` for
-                // a Branch's `childleaf` field must instead allocate a
-                // representative `Leaf` (step 3 will rework the
-                // `childleaf` representation; for now this path is
-                // unreachable until SimpleArchive ingestion exercises it).
-                unreachable!("LocalLeaf has no backing Leaf — childleaf rep needs rework")
-            }
+            BodyRef::Leaf(leaf) => &leaf.key as *const [u8; KEY_LEN],
+            BodyRef::LocalLeaf(bytes) => bytes as *const [u8; KEY_LEN],
             BodyRef::Branch(branch) => branch.childleaf_ptr(),
         }
     }
@@ -686,7 +680,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => &leaf.key,
             BodyRef::LocalLeaf(bytes) => bytes,
-            BodyRef::Branch(branch) => &branch.childleaf().key,
+            BodyRef::Branch(branch) => branch.childleaf_key(),
         }
     }
 
@@ -1141,7 +1135,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // scatter machinery.
         let small = match other.body_ref() {
             BodyRef::Branch(b) => (b.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD,
-            BodyRef::Leaf(_) => unreachable!(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
         };
         if small {
             return Self::union(this, other, at_depth);

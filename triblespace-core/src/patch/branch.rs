@@ -126,10 +126,22 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for BranchMut<'a, 
 pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> {
     key_ordering: PhantomData<O>,
     key_segments: PhantomData<O::Segmentation>,
+    /// Phantom `V`: the value type is no longer stored on the branch
+    /// itself (the childleaf is just `*const [u8; KEY_LEN]`), but it
+    /// stays carried so child `Head<KEY_LEN, O, V>` slots in
+    /// `child_table` and the `Body` impl for the concrete child-table
+    /// shape stay generic in `V`.
+    _value: PhantomData<fn() -> V>,
 
     rc: atomic::AtomicU32,
     pub end_depth: u32,
-    pub childleaf: *const Leaf<KEY_LEN, V>,
+    /// Thin pointer to the key bytes of a representative descendant
+    /// leaf, used for prefix-matching shortcuts. Points either into a
+    /// heap [`Leaf`]'s inline `key` field (offset 0 thanks to
+    /// `#[repr(C)]`) or into archive memory referenced by a
+    /// `LocalLeaf`. The unified `*const [u8; KEY_LEN]` representation
+    /// lets both leaf flavors serve as the childleaf.
+    pub childleaf: *const [u8; KEY_LEN],
     pub leaf_count: u64,
     pub segment_count: u64,
     pub hash: u128,
@@ -161,15 +173,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized + core::fmt::Deb
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_LEN, O, Table, V> {
-    /// Returns a shared reference to the child leaf referenced by this
-    /// branch's `childleaf` pointer. This centralizes the unsafe pointer
-    /// dereference in one place so callers can use a safe reference.
-    pub fn childleaf(&self) -> &Leaf<KEY_LEN, V> {
+    /// Returns the key bytes of the representative child leaf. The
+    /// pointer is set to a heap `Leaf`'s `key` field (offset 0) or to
+    /// a `LocalLeaf`'s archive-resident bytes; both yield the same
+    /// reference shape.
+    pub fn childleaf_key(&self) -> &[u8; KEY_LEN] {
         unsafe { &*self.childleaf }
     }
 
-    /// Returns the raw pointer to the child leaf.
-    pub fn childleaf_ptr(&self) -> *const Leaf<KEY_LEN, V> {
+    /// Returns the raw key-bytes pointer of the representative child
+    /// leaf. Used for pointer-identity comparisons during invariant
+    /// checks and for propagating the representative through
+    /// branch-construction paths.
+    pub fn childleaf_ptr(&self) -> *const [u8; KEY_LEN] {
         self.childleaf
     }
 }
@@ -485,7 +501,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
         let mut agg_hash: u128 = 0;
-        let mut first_childleaf: *const Leaf<KEY_LEN, V> = std::ptr::null();
+        let mut first_childleaf: *const [u8; KEY_LEN] = std::ptr::null();
 
         for child in (*branch).child_table.iter().flatten() {
             agg_leaf_count += child.count();
@@ -575,14 +591,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // provided prefix then no child in this branch can match and we can
         // early-return. The previous logic inverted this check which caused
         // branches to be pruned incorrectly.
-        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
             return;
         }
 
         // The infix ends within the current node.
         if PREFIX_LEN + INFIX_LEN <= node_end_depth {
             let infix: [u8; INFIX_LEN] =
-                core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             f(&infix);
             return;
         }
@@ -618,14 +634,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
             return;
         }
 
         // Case 1: infix ends within this node — extract and range-check.
         if PREFIX_LEN + INFIX_LEN <= node_end_depth {
             let infix: [u8; INFIX_LEN] =
-                core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             if &infix >= min_infix && &infix <= max_infix {
                 f(&infix);
             }
@@ -647,7 +663,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut min_tight = true; // still on the min boundary
         let mut max_tight = true; // still on the max boundary
         for i in 0..infix_byte_idx {
-            let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
+            let path_byte = self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]];
             if min_tight {
                 if path_byte < min_infix[i] {
                     return;
@@ -699,7 +715,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) -> u64 {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
             return 0;
         }
 
@@ -708,7 +724,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // shares it — exactly one distinct infix value exists under self.
         if PREFIX_LEN + INFIX_LEN <= node_end_depth {
             let infix: [u8; INFIX_LEN] =
-                core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+                core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             return if &infix >= min_infix && &infix <= max_infix {
                 1
             } else {
@@ -730,7 +746,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         let mut min_tight = true;
         let mut max_tight = true;
         for i in 0..infix_byte_idx {
-            let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
+            let path_byte = self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]];
             if min_tight {
                 if path_byte < min_infix[i] {
                     return 0;
@@ -778,7 +794,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
             return false;
         }
 
@@ -799,11 +815,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(KEY_LEN, node_end_depth);
-        if !self.childleaf().has_prefix::<O>(at_depth, &key[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &key[..limit]) {
             return None;
         }
         if node_end_depth >= KEY_LEN {
-            return Some(&self.childleaf().value);
+            // Childleaf prefix matched and end_depth == KEY_LEN means the
+            // representative IS the lookup target. For ZST `V` (the only
+            // shape compatible with `LocalLeaf`-backed childleaves) we
+            // synthesize a reference from a dangling pointer; otherwise
+            // the childleaf points at a heap `Leaf<KEY_LEN, V>` whose
+            // `key` field is at offset 0, so casting recovers the Leaf.
+            if std::mem::size_of::<V>() == 0 {
+                return Some(unsafe { std::ptr::NonNull::<V>::dangling().as_ref() });
+            }
+            let leaf_ptr = self.childleaf as *const Leaf<KEY_LEN, V>;
+            return Some(unsafe { &(*leaf_ptr).value });
         }
 
         if let Some(child) = self.child_table.table_get(key[node_end_depth]) {
@@ -819,7 +845,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) -> u64 {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
             return 0;
         }
         if PREFIX_LEN <= node_end_depth {
