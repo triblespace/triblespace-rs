@@ -97,12 +97,17 @@ impl<const KEY_LEN: usize> ArchiveEntry<KEY_LEN> {
         Self { ptr, owner }
     }
 
-    /// Returns a `LocalLeaf` head for this entry, plus a clone of the
-    /// owner Arc so it can be threaded into the receiving Branch.
+    /// Returns a `LocalLeaf` head for this entry plus a borrow of the
+    /// owner Arc. The caller threads the borrow down the insertion
+    /// recursion and only clones when actually storing into a Branch's
+    /// `owner` field. Avoids one atomic ref-count increment per
+    /// `insert_archive` call (6× per trible across the indexes), which
+    /// matters during parallel decode where many workers contend on
+    /// the same shared archive Arc.
     pub(super) fn leaf<O: KeySchema<KEY_LEN>>(
         &self,
-    ) -> (Head<KEY_LEN, O, ()>, Arc<dyn ArchiveOwner>) {
-        unsafe { (Head::new_local_leaf(0, self.ptr), self.owner.clone()) }
+    ) -> (Head<KEY_LEN, O, ()>, &Arc<dyn ArchiveOwner>) {
+        unsafe { (Head::new_local_leaf(0, self.ptr), &self.owner) }
     }
 
     /// Borrows the owner Arc without cloning.

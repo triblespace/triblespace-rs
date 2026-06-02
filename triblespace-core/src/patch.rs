@@ -2241,7 +2241,7 @@ where
             let new_head = Head::insert_leaf_with_owner(
                 this,
                 leaf_head,
-                Some(&leaf_owner),
+                Some(leaf_owner),
                 0,
             );
             self.root.replace(new_head);

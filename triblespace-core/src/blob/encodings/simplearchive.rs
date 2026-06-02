@@ -141,15 +141,7 @@ fn try_from_blob_inner(
 
     #[cfg(feature = "parallel")]
     {
-        // The parallel path reduces per-chunk TribleSets via `union`,
-        // which currently has no LocalLeaf-aware short-circuit: every
-        // archive-backed Branch produced per-chunk gets recombined as
-        // if its children were arbitrary heap leaves, undoing most of
-        // the ingest savings and adding a hefty time cost. Until union
-        // learns about matching `Arc`-owner branches, force the serial
-        // path whenever we're ingesting through LocalLeaf. Heap-Leaf
-        // ingest keeps the parallel reduce.
-        if owner.is_none() && slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
+        if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
             return parallel_unarchive(slice, owner);
         }
     }
