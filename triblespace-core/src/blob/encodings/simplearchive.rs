@@ -104,32 +104,57 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
     type Error = UnarchiveError;
 
     fn try_from_blob(blob: Blob<SimpleArchive>) -> Result<Self, Self::Error> {
-        let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
-            return Err(UnarchiveError::BadArchive);
-        };
-        let slice: &[[u8; 64]] = &packed_tribles;
-
-        // ArchiveEntry / LocalLeaf require the trible pointer to be
-        // 16-byte aligned (the low 4 bits encode `HeadTag::LocalLeaf`).
-        // Every 64-byte stride preserves alignment, so it's enough to
-        // check the slice base. Modern allocators (and mmap'd files)
-        // satisfy this; the heap-Leaf fallback handles the rare miss.
-        let owner: Option<Arc<dyn ArchiveOwner>> =
-            if (slice.as_ptr() as usize) & 0x0f == 0 {
-                Some(Arc::new(blob.bytes.clone()))
-            } else {
-                None
-            };
-
-        #[cfg(feature = "parallel")]
-        {
-            if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
-                return parallel_unarchive(slice, owner);
-            }
-        }
-
-        serial_unarchive(slice, owner.as_ref())
+        try_from_blob_inner(blob, /*archive_backed:*/ true)
     }
+}
+
+/// Decode a [`SimpleArchive`] blob into a [`TribleSet`] forcing the
+/// heap-`Leaf` ingest path (no `LocalLeaf`). Exposed for measurement
+/// so the LocalLeaf path can be compared against the legacy heap
+/// behaviour on identical input.
+pub fn try_from_blob_heap_only(
+    blob: Blob<SimpleArchive>,
+) -> Result<TribleSet, UnarchiveError> {
+    try_from_blob_inner(blob, /*archive_backed:*/ false)
+}
+
+fn try_from_blob_inner(
+    blob: Blob<SimpleArchive>,
+    archive_backed: bool,
+) -> Result<TribleSet, UnarchiveError> {
+    let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
+        return Err(UnarchiveError::BadArchive);
+    };
+    let slice: &[[u8; 64]] = &packed_tribles;
+
+    // ArchiveEntry / LocalLeaf require the trible pointer to be
+    // 16-byte aligned (the low 4 bits encode `HeadTag::LocalLeaf`).
+    // Every 64-byte stride preserves alignment, so it's enough to
+    // check the slice base. Modern allocators (and mmap'd files)
+    // satisfy this; the heap-Leaf fallback handles the rare miss.
+    let owner: Option<Arc<dyn ArchiveOwner>> =
+        if archive_backed && (slice.as_ptr() as usize) & 0x0f == 0 {
+            Some(Arc::new(blob.bytes.clone()))
+        } else {
+            None
+        };
+
+    #[cfg(feature = "parallel")]
+    {
+        // The parallel path reduces per-chunk TribleSets via `union`,
+        // which currently has no LocalLeaf-aware short-circuit: every
+        // archive-backed Branch produced per-chunk gets recombined as
+        // if its children were arbitrary heap leaves, undoing most of
+        // the ingest savings and adding a hefty time cost. Until union
+        // learns about matching `Arc`-owner branches, force the serial
+        // path whenever we're ingesting through LocalLeaf. Heap-Leaf
+        // ingest keeps the parallel reduce.
+        if owner.is_none() && slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
+            return parallel_unarchive(slice, owner);
+        }
+    }
+
+    serial_unarchive(slice, owner.as_ref())
 }
 
 /// Serial fallback. Validates ordering + redundancy inline with

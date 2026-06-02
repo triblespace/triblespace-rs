@@ -13,7 +13,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use std::time::Instant;
+use triblespace::core::blob::encodings::simplearchive::{
+    try_from_blob_heap_only, SimpleArchive,
+};
 use triblespace::core::blob::Blob;
 use triblespace::core::inline::Encodes;
 use triblespace::core::trible::Trible;
@@ -67,7 +70,12 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 
 #[test]
 fn simplearchive_decode_uses_archive_owner() {
+    // 4095 stays just under the rayon threshold (4096) so we get a
+    // serial-only signal even at meaningful N. Above that the
+    // parallel reduce kicks in and we currently see a regression
+    // (LocalLeaf-aware union work to be revisited).
     measure_at(1_024);
+    measure_at(4_095);
     measure_at(10_000);
     measure_at(100_000);
 }
@@ -85,38 +93,69 @@ fn measure_at(n: usize) {
     let archive: Blob<SimpleArchive> = SimpleArchive::encode(&source);
     assert_eq!(archive.bytes.len(), N * 64);
 
-    // Baseline: rebuild the same TribleSet via the heap-Leaf path by
-    // re-inserting each trible. The archive's `Bytes` view still
-    // exists, but every Leaf hitting the PATCH is freshly allocated.
-    let (heap_set, heap_allocs, heap_bytes) = measure(|| {
-        let mut s = TribleSet::new();
-        for i in 0..N as u64 {
-            s.insert(&make_trible(i));
-        }
-        s
+    // Heap-Leaf baseline: same SimpleArchive ingest pipeline, but the
+    // owner Arc is forced to None so every trible allocates a fresh
+    // heap `Leaf`. This isolates the cost of the per-trible Leaf
+    // alloc from any unrelated validation/iteration overhead.
+    let (heap_set, heap_allocs, heap_bytes) = measure(|| -> TribleSet {
+        try_from_blob_heap_only(archive.clone()).unwrap()
     });
     assert_eq!(heap_set.len(), N);
 
-    // Decode through the archive ingest path; LocalLeaf eliminates the
-    // per-trible heap Leaf allocation, leaving only Branch overhead.
+    // LocalLeaf archive ingest: identical validation/iteration, but
+    // each trible lands as a LocalLeaf backed by the shared owner Arc.
     let (archive_set, archive_allocs, archive_bytes) =
-        measure(|| -> TribleSet { archive.try_from_blob().unwrap() });
+        measure(|| -> TribleSet { archive.clone().try_from_blob().unwrap() });
     assert_eq!(archive_set.len(), N);
+
+    // Wall-clock timing: warm up once, then take a min-of-3 to filter
+    // GC/allocator noise. Min beats mean for tight ingest loops where
+    // the floor is the signal and the tail is OS jitter.
+    let iters = 3usize;
+    let _ = try_from_blob_heap_only(archive.clone()).unwrap();
+    let heap_time = (0..iters)
+        .map(|_| {
+            let t = Instant::now();
+            let s = try_from_blob_heap_only(archive.clone()).unwrap();
+            let d = t.elapsed();
+            drop(s);
+            d
+        })
+        .min()
+        .unwrap();
+    let _ = archive.clone().try_from_blob::<TribleSet>().unwrap();
+    let archive_time = (0..iters)
+        .map(|_| {
+            let t = Instant::now();
+            let s: TribleSet = archive.clone().try_from_blob().unwrap();
+            let d = t.elapsed();
+            drop(s);
+            d
+        })
+        .min()
+        .unwrap();
 
     let heap_per = heap_bytes as f64 / N as f64;
     let archive_per = archive_bytes as f64 / N as f64;
     let savings_pct = (1.0 - archive_per / heap_per) * 100.0;
+    let speedup = heap_time.as_nanos() as f64 / archive_time.as_nanos() as f64;
+    let time_savings = (1.0 - 1.0 / speedup) * 100.0;
 
     eprintln!("--- N={N} ---");
     eprintln!(
         "heap path:    allocs={heap_allocs}, alloc_bytes={heap_bytes}, \
-         bytes/trible={heap_per:.2}"
+         bytes/trible={heap_per:.2}, time={:?}",
+        heap_time
     );
     eprintln!(
         "archive path: allocs={archive_allocs}, alloc_bytes={archive_bytes}, \
-         bytes/trible={archive_per:.2}"
+         bytes/trible={archive_per:.2}, time={:?}",
+        archive_time
     );
-    eprintln!("savings: {savings_pct:.1}%");
+    eprintln!(
+        "memory savings: {savings_pct:.1}%, time speedup: {speedup:.2}× \
+         ({time_savings:.1}% faster)"
+    );
 
     assert!(
         archive_bytes < heap_bytes,

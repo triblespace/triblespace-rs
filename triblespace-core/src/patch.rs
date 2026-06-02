@@ -831,8 +831,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     pub(crate) fn insert_leaf_with_owner(
         mut this: Self,
         mut leaf: Self,
-        this_localleaf_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
-        mut leaf_owner: Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        this_localleaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        mut leaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
         start_depth: usize,
     ) -> Self {
         if let Some((depth, this_byte_key, leaf_byte_key)) =
@@ -840,21 +840,29 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         {
             let old_key = this.key();
 
-            // Determine each side's localleaf owner at this Branch level.
-            // For `this`: if it's a LocalLeaf, the caller's context owner
-            // backs it; if it's a Branch with its own owner, that wins
-            // for the new Branch's interpretation of the subtree.
-            let this_side_owner = match this.body_ref() {
-                BodyRef::Leaf(_) => None,
-                BodyRef::LocalLeaf(_) => this_localleaf_owner.clone(),
-                BodyRef::Branch(branch) => branch.owner.clone(),
+            // Each side's localleaf owner at this Branch level. For
+            // `this`: if it's a LocalLeaf, the caller's context owner
+            // backs it; if it's a Branch, the branch's `owner` field
+            // wins for the new Branch's interpretation. Heap Leaves
+            // carry no owner.
+            //
+            // Borrow rather than clone — the Arc only gets bumped when
+            // we actually decide to store it in the new Branch below.
+            let branch_owner_ref = match this.body_ref() {
+                BodyRef::Branch(branch) => branch.owner.as_ref(),
+                _ => None,
             };
+            let this_side_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>> =
+                match this.body_ref() {
+                    BodyRef::Leaf(_) => None,
+                    BodyRef::LocalLeaf(_) => this_localleaf_owner,
+                    BodyRef::Branch(_) => branch_owner_ref,
+                };
 
-            // New Branch's owner: pick whichever owner can keep both
-            // sides' LocalLeaves alive. If they match, adopt it. If
-            // they don't, reify the new leaf (it's the easier side to
-            // reify since `this` may already contain a deep subtree).
-            let new_branch_owner = match (&this_side_owner, &leaf_owner) {
+            // Pick an owner that keeps both sides' LocalLeaves alive.
+            // On mismatch reify the new leaf (the easier side to
+            // reify since `this` may already be a deep subtree).
+            let new_branch_owner = match (this_side_owner, leaf_owner) {
                 (None, None) => None,
                 (None, Some(lo)) => Some(lo.clone()),
                 (Some(to), None) => Some(to.clone()),
@@ -879,42 +887,43 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         if end_depth != KEY_LEN {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
 
-            // Owner reconciliation at this Branch. If the Branch has no
-            // owner and the new leaf brings one, adopt it. If the Branch
-            // has an owner that matches the new leaf's, fine — insert
-            // as LocalLeaf. If they conflict, reify the new leaf to a
-            // heap Leaf so it can live independently of the Branch's
-            // owner.
-            let branch_owner_snapshot = ed.owner.clone();
-            match (&branch_owner_snapshot, &leaf_owner) {
-                (None, None) => {}
-                (None, Some(lo)) => {
-                    ed.owner = Some(lo.clone());
-                }
-                (Some(_), None) => {}
-                (Some(bo), Some(lo)) if std::sync::Arc::ptr_eq(bo, lo) => {}
-                (Some(_), Some(_)) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
-                    leaf_owner = None;
-                }
+            // Owner reconciliation: when this Branch has no owner and
+            // the new leaf brings one, adopt the new leaf's owner;
+            // when they conflict, reify the new leaf so it can live
+            // independently. Matching or both-None is a no-op.
+            let needs_adopt = matches!((ed.owner.as_ref(), leaf_owner),
+                (None, Some(_)));
+            let needs_reify = matches!((ed.owner.as_ref(), leaf_owner),
+                (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo));
+            if needs_adopt {
+                ed.owner = leaf_owner.map(|a| a.clone());
+            } else if needs_reify {
+                leaf = Self::reify_local_leaf_unit(leaf);
+                leaf_owner = None;
             }
 
-            // When descending into a child, the context_owner for the
-            // child is this Branch's owner (which now reflects any
-            // adoption above). This is the owner that backs any
-            // LocalLeaf children at the next recursion level.
-            let next_context = ed.owner.clone();
+            // Child context is this Branch's (post-adoption) owner —
+            // it backs any LocalLeaf grandchildren at the next level.
+            // We use a raw pointer to elide a lifetime that would
+            // collide with the unique-borrow `ed` holds on `this`.
+            // SAFETY: the Arc stays alive on the Branch for the
+            // entire descend; we only read through this pointer
+            // before the closure body returns.
+            let next_context_ptr: *const Option<std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>> =
+                &ed.owner;
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            let descend_leaf_owner = leaf_owner.clone();
-            ed.modify_child(key, move |opt| match opt {
-                Some(old) => Some(Head::insert_leaf_with_owner(
-                    old,
-                    inserted,
-                    next_context.clone(),
-                    descend_leaf_owner.clone(),
-                    end_depth,
-                )),
+            ed.modify_child(key, |opt| match opt {
+                Some(old) => {
+                    let next_ctx = unsafe { (*next_context_ptr).as_ref() };
+                    Some(Head::insert_leaf_with_owner(
+                        old,
+                        inserted,
+                        next_ctx,
+                        leaf_owner,
+                        end_depth,
+                    ))
+                }
                 None => Some(inserted),
             });
         }
@@ -2239,8 +2248,13 @@ where
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<KEY_LEN>) {
         let (leaf_head, leaf_owner) = entry.leaf::<O>();
         if let Some(this) = self.root.take() {
-            let new_head =
-                Head::insert_leaf_with_owner(this, leaf_head, None, Some(leaf_owner), 0);
+            let new_head = Head::insert_leaf_with_owner(
+                this,
+                leaf_head,
+                None,
+                Some(&leaf_owner),
+                0,
+            );
             self.root.replace(new_head);
         } else {
             // Empty PATCH: the standalone root can't host an owner field
