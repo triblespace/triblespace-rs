@@ -11,10 +11,23 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
+use std::sync::Arc;
 
 const BRANCH_ALIGN: usize = 16;
-const BRANCH_BASE_SIZE: usize = 48;
+const BRANCH_BASE_SIZE: usize = 64;
 const TABLE_ENTRY_SIZE: usize = 8;
+
+/// Marker trait for opaque owners of bytes referenced by archive-backed
+/// PATCH nodes. An `Option<Arc<dyn ArchiveOwner>>` lives on each
+/// [`Branch`]; when `Some(arc)`, the Arc keeps the underlying bytes
+/// (typically a memory-mapped archive blob) alive so that any
+/// `LocalLeaf` children — which are thin pointers into those bytes —
+/// remain valid for the Branch's lifetime. The trait is intentionally
+/// empty: the owner's only job is to drop the bytes when its refcount
+/// hits zero.
+pub trait ArchiveOwner: Send + Sync + 'static {}
+
+impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
 
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
@@ -107,7 +120,6 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for BranchMut<'a, 
     }
 }
 
-#[derive(Debug)]
 #[repr(C, align(16))]
 pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> {
     key_ordering: PhantomData<O>,
@@ -119,7 +131,31 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     pub leaf_count: u64,
     pub segment_count: u64,
     pub hash: u128,
+    /// Owner reference keeping `LocalLeaf` children's underlying bytes alive.
+    /// `None` for pure-memory branches; `Some(arc)` for archive-backed
+    /// branches. Niche-optimized to 16 bytes via the inner Arc's `NonNull`
+    /// data pointer — no discriminator byte. See [`ArchiveOwner`].
+    pub owner: Option<Arc<dyn ArchiveOwner>>,
     pub child_table: Table,
+}
+
+// Manual Debug since `Option<Arc<dyn ArchiveOwner>>` doesn't impl Debug
+// (the trait is intentionally minimal — no Debug bound).
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized + core::fmt::Debug, V: core::fmt::Debug>
+    core::fmt::Debug for Branch<KEY_LEN, O, Table, V>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Branch")
+            .field("rc", &self.rc)
+            .field("end_depth", &self.end_depth)
+            .field("childleaf", &self.childleaf)
+            .field("leaf_count", &self.leaf_count)
+            .field("segment_count", &self.segment_count)
+            .field("hash", &self.hash)
+            .field("owner", &self.owner.as_ref().map(|_| "<archive owner>"))
+            .field("child_table", &&self.child_table)
+            .finish()
+    }
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V> Branch<KEY_LEN, O, Table, V> {
@@ -178,6 +214,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
             addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild.hash());
+            addr_of_mut!((*ptr.as_ptr()).owner).write(None);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
 
@@ -254,6 +291,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                     addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                     addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
+                    addr_of_mut!((*ptr.as_ptr()).owner).write((*branch).owner.clone());
                     (*ptr.as_ptr())
                         .child_table
                         .clone_from_slice(&(*branch).child_table);
@@ -297,6 +335,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                 addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                 addr_of_mut!((*ptr.as_ptr()).hash).write((*branch).hash);
+                addr_of_mut!((*ptr.as_ptr()).owner).write((*branch).owner.clone());
                 // Note that the child_table is already zeroed by the allocator and therefore None initialized.
 
                 (*branch)
@@ -787,4 +826,26 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     // required unsafe access (childleaf deref) locally and avoid forwarding
     // through more wrappers. This keeps the call graph minimal and makes the
     // logic easier to maintain.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole archive-leaf-elimination design depends on
+    /// `Option<Arc<dyn ArchiveOwner>>` niche-optimizing to exactly 16
+    /// bytes (no discriminator byte added). The inner `Arc<dyn Trait>`
+    /// is a fat pointer (data + vtable) whose data pointer is `NonNull`,
+    /// so `None` is represented by a null data pointer — same width as
+    /// `Some`. If this size ever increases, the Branch struct grows
+    /// silently and the design's cost analysis no longer holds; surface
+    /// the regression here.
+    #[test]
+    fn option_arc_dyn_archive_owner_is_sixteen_bytes() {
+        assert_eq!(
+            std::mem::size_of::<Option<Arc<dyn ArchiveOwner>>>(),
+            16,
+            "Option<Arc<dyn ArchiveOwner>> must niche-optimize to 16 bytes"
+        );
+    }
 }

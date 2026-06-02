@@ -2486,50 +2486,52 @@ mod tests {
 
     #[test]
     fn branch_size() {
+        // Base = 64 bytes (was 48; +16 for `Option<Arc<dyn ArchiveOwner>>`).
+        // Each child is an 8-byte tagged Head.
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 2], ()>>(
             ),
-            64
+            64 + 8 * 2
         );
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 4], ()>>(
             ),
-            48 + 16 * 2
+            64 + 8 * 4
         );
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 8], ()>>(
             ),
-            48 + 16 * 4
+            64 + 8 * 8
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 16], ()>,
             >(),
-            48 + 16 * 8
+            64 + 8 * 16
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<32, IdentitySchema, ()>>; 32], ()>,
             >(),
-            48 + 16 * 16
+            64 + 8 * 32
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 64], ()>,
             >(),
-            48 + 16 * 32
+            64 + 8 * 64
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 128], ()>,
             >(),
-            48 + 16 * 64
+            64 + 8 * 128
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 256], ()>,
             >(),
-            48 + 16 * 128
+            64 + 8 * 256
         );
     }
 
