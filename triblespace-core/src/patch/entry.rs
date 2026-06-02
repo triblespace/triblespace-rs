@@ -64,21 +64,27 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 
 /// Insertion entry for archive-backed PATCHes (`V = ()` only).
 ///
-/// Holds a thin pointer into an archive's bytes plus an
-/// `Arc<dyn ArchiveOwner>` that keeps those bytes alive. When inserted
-/// via [`PATCH::insert_archive`], the entry's key becomes a
+/// Holds a thin pointer into an archive's bytes plus a *borrow* of
+/// the `Arc<dyn ArchiveOwner>` that keeps those bytes alive. When
+/// inserted via [`PATCH::insert_archive`], the entry's key becomes a
 /// [`Head::new_local_leaf`] under a Branch whose `owner` matches; on
 /// owner mismatch the leaf is automatically reified into a heap-
 /// allocated `Leaf<KEY_LEN, ()>` so the result is owner-consistent.
 ///
+/// The owner is borrowed (not owned) so the ingest hot loop pays
+/// **zero** atomic ref-count traffic per trible — the only clones
+/// happen lazily inside the receiving PATCH when a Branch actually
+/// adopts the owner. The caller (typically a chunked-archive
+/// decoder) keeps one `Arc` alive on the stack for the whole batch.
+///
 /// Only valid for `V = ()` because archive bytes don't carry a value
 /// field — the constructor's type parameter enforces this.
-pub struct ArchiveEntry<const KEY_LEN: usize> {
+pub struct ArchiveEntry<'a, const KEY_LEN: usize> {
     pub(super) ptr: NonNull<[u8; KEY_LEN]>,
-    pub(super) owner: Arc<dyn ArchiveOwner>,
+    pub(super) owner: &'a Arc<dyn ArchiveOwner>,
 }
 
-impl<const KEY_LEN: usize> ArchiveEntry<KEY_LEN> {
+impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     /// Creates an `ArchiveEntry` referencing a `[u8; KEY_LEN]` trible
     /// inside an archive's bytes.
     ///
@@ -88,7 +94,10 @@ impl<const KEY_LEN: usize> ArchiveEntry<KEY_LEN> {
     ///   tagged-pointer encoding has room for the `LocalLeaf` tag in
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
     ///   multiple of 16 from a 16-byte aligned base satisfies this.
-    pub unsafe fn new(ptr: NonNull<[u8; KEY_LEN]>, owner: Arc<dyn ArchiveOwner>) -> Self {
+    pub unsafe fn new(
+        ptr: NonNull<[u8; KEY_LEN]>,
+        owner: &'a Arc<dyn ArchiveOwner>,
+    ) -> Self {
         debug_assert_eq!(
             ptr.as_ptr() as usize & 0x0f,
             0,
@@ -97,35 +106,34 @@ impl<const KEY_LEN: usize> ArchiveEntry<KEY_LEN> {
         Self { ptr, owner }
     }
 
-    /// Returns a `LocalLeaf` head for this entry plus a borrow of the
+    /// Returns a `LocalLeaf` head for this entry plus the borrowed
     /// owner Arc. The caller threads the borrow down the insertion
-    /// recursion and only clones when actually storing into a Branch's
-    /// `owner` field. Avoids one atomic ref-count increment per
-    /// `insert_archive` call (6× per trible across the indexes), which
-    /// matters during parallel decode where many workers contend on
-    /// the same shared archive Arc.
+    /// recursion and only clones when actually storing into a
+    /// Branch's `owner` field.
     pub(super) fn leaf<O: KeySchema<KEY_LEN>>(
         &self,
-    ) -> (Head<KEY_LEN, O, ()>, &Arc<dyn ArchiveOwner>) {
-        unsafe { (Head::new_local_leaf(0, self.ptr), &self.owner) }
+    ) -> (Head<KEY_LEN, O, ()>, &'a Arc<dyn ArchiveOwner>) {
+        unsafe { (Head::new_local_leaf(0, self.ptr), self.owner) }
     }
 
     /// Borrows the owner Arc without cloning.
-    pub fn owner(&self) -> &Arc<dyn ArchiveOwner> {
-        &self.owner
+    pub fn owner(&self) -> &'a Arc<dyn ArchiveOwner> {
+        self.owner
     }
 }
 
-impl<const KEY_LEN: usize> Clone for ArchiveEntry<KEY_LEN> {
+impl<'a, const KEY_LEN: usize> Clone for ArchiveEntry<'a, KEY_LEN> {
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr,
-            owner: self.owner.clone(),
+            owner: self.owner,
         }
     }
 }
 
-impl<const KEY_LEN: usize> core::fmt::Debug for ArchiveEntry<KEY_LEN> {
+impl<'a, const KEY_LEN: usize> Copy for ArchiveEntry<'a, KEY_LEN> {}
+
+impl<'a, const KEY_LEN: usize> core::fmt::Debug for ArchiveEntry<'a, KEY_LEN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ArchiveEntry")
             .field("ptr", &self.ptr)

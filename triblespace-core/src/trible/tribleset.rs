@@ -315,7 +315,7 @@ impl TribleSet {
     /// entry as a `LocalLeaf` instead of a freshly allocated heap
     /// `Leaf`. The receiving Branches' `owner` fields keep the
     /// underlying archive bytes alive.
-    pub fn insert_archive(&mut self, entry: &ArchiveEntry<TRIBLE_LEN>) {
+    pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
         self.eav.insert_archive(entry);
         self.eva.insert_archive(entry);
         self.aev.insert_archive(entry);

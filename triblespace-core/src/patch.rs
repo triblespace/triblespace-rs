@@ -2235,7 +2235,7 @@ where
     /// Inserts an archive-backed key. See [`ArchiveEntry`] for the
     /// owner semantics and the materialization rule for owner
     /// mismatches.
-    pub fn insert_archive(&mut self, entry: &ArchiveEntry<KEY_LEN>) {
+    pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
         let (leaf_head, leaf_owner) = entry.leaf::<O>();
         if let Some(this) = self.root.take() {
             let new_head = Head::insert_leaf_with_owner(

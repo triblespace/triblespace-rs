@@ -178,7 +178,7 @@ fn serial_unarchive(
                 // by `owner_arc`, and base-alignment + 64-byte stride
                 // guarantees this element is 16-byte aligned.
                 let ptr = NonNull::from(t);
-                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc.clone()) };
+                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
                 tribles.insert_archive(&entry);
             }
             None => tribles.insert(trible),
