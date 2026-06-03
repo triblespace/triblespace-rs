@@ -25,6 +25,9 @@ use triblespace::core::trible::TribleSet;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicUsize = AtomicUsize::new(0);
+/// Serializes tests that use the counting allocator so concurrent
+/// tests in this file don't pollute each other's counters.
+static COUNTING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct CountingAllocator;
 
@@ -43,6 +46,68 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[global_allocator]
 static A: CountingAllocator = CountingAllocator;
+
+/// Two archive-backed TribleSets with **overlapping** keys, unioned
+/// together. Decode chunks are sorted-disjoint, so the existing
+/// parallel-reduce path never hits a LocalLeaf-vs-LocalLeaf merge.
+/// This test triggers that path on purpose to keep the LocalLeaf-aware
+/// union honest: it would have panicked at `unreachable!()` before
+/// the `union` work in the wee hours of 2026-06-03.
+/// Regression: union two archive-backed TribleSets with overlapping
+/// keys *from different archive Arcs*. The merge path drives both
+/// the parallel `par_union` (above the 4096 threshold) and the
+/// serial fallback, and exercises every LocalLeaf-vs-LocalLeaf
+/// collision in the trie. The sources are dropped before any
+/// reads so the result must keep all LocalLeaves' backing bytes
+/// alive transitively via the surviving Branches' owner Arcs.
+#[test]
+fn union_two_overlapping_archives() {
+    // Big enough to engage the parallel par_union path on each
+    // index (threshold is 4096 leaves).
+    const N: usize = 8_192;
+
+    // Build two archive-backed TribleSets whose keys overlap heavily.
+    // Both are decoded from SimpleArchive blobs so they're LocalLeaf-
+    // backed, *with different owner Arcs* — the two blobs are
+    // independent so `try_from_blob_inner` wraps each in its own
+    // `Arc<Bytes>`. After the union consumes both inputs, the
+    // merged tree must keep all LocalLeaves' underlying bytes
+    // alive transitively (via the Arcs held on surviving
+    // Branches) — otherwise we get a use-after-free when we
+    // walk the merged data.
+    let mut a_src = TribleSet::new();
+    let mut b_src = TribleSet::new();
+    for i in 0..N as u64 {
+        a_src.insert(&make_trible(i));
+        b_src.insert(&make_trible(i + N as u64 / 2));
+    }
+    let expected_len = (0..N as u64 + N as u64 / 2).count();
+
+    let a_blob: Blob<SimpleArchive> = SimpleArchive::encode(&a_src);
+    let b_blob: Blob<SimpleArchive> = SimpleArchive::encode(&b_src);
+
+    // Drop the source TribleSets so the union's correctness depends
+    // entirely on the archive Arcs the LocalLeaves carry.
+    drop(a_src);
+    drop(b_src);
+
+    let a: TribleSet =
+        triblespace::core::blob::TryFromBlob::try_from_blob(a_blob).unwrap();
+    let b: TribleSet =
+        triblespace::core::blob::TryFromBlob::try_from_blob(b_blob).unwrap();
+
+    let unioned = a + b;
+    assert_eq!(
+        unioned.len(),
+        expected_len,
+        "archive-vs-archive union should contain every distinct key"
+    );
+
+    // Walk every key via the eav iterator — if any LocalLeaf points
+    // into freed archive bytes, this will read garbage or fault.
+    let count: usize = unioned.eav.iter_ordered().count();
+    assert_eq!(count, expected_len);
+}
 
 fn make_trible(i: u64) -> Trible {
     let mut data = [0u8; 64];
@@ -70,6 +135,7 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 
 #[test]
 fn simplearchive_decode_uses_archive_owner() {
+    let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
     // Both paths share the same parallel-reduce gate, so at small N
     // they're naturally serial. At large N the heap path goes parallel
     // via rayon while the archive path stays serial (LocalLeaf-aware
