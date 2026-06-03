@@ -857,18 +857,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         if end_depth != KEY_LEN {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
 
-            // Owner reconciliation at this Branch — adopt if empty,
-            // reify the incoming leaf on conflict, no-op when matched
-            // or both `None`.
-            let needs_adopt = matches!((ed.owner.as_ref(), leaf_owner),
-                (None, Some(_)));
-            let needs_reify = matches!((ed.owner.as_ref(), leaf_owner),
-                (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo));
-            if needs_adopt {
-                ed.owner = leaf_owner.map(|a| a.clone());
-            } else if needs_reify {
-                leaf = Self::reify_local_leaf_unit(leaf);
-                leaf_owner = None;
+            // Owner reconciliation at this Branch — single match block
+            // so the no-op (matched / both-None) case is one
+            // pattern-match comparison with no extra Arc traffic.
+            match (ed.owner.as_ref(), leaf_owner) {
+                (None, Some(lo)) => ed.owner = Some(lo.clone()),
+                (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
+                    leaf = Self::reify_local_leaf_unit(leaf);
+                    leaf_owner = None;
+                }
+                _ => {}
             }
 
             // Raw pointer into `ed.owner` so the inline-LocalLeaf
@@ -884,36 +882,32 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 None => Some(inserted),
-                Some(old) => Some(match old.body_ref() {
-                    BodyRef::LocalLeaf(_) => {
-                        // Direct-child LocalLeaf: its owner is THIS
-                        // Branch's owner. Build the divergence
-                        // sub-Branch inline and stop the recursion —
-                        // the deeper levels of the new sub-Branch
-                        // can host whatever the post-reconcile owner
-                        // backs.
-                        let (depth, old_byte_key, leaf_byte_key) = old
-                            .first_divergence(&inserted, end_depth)
-                            .expect(
-                                "LocalLeaf and the inserted leaf must \
-                                 diverge at some depth — equal keys \
-                                 would have been a no-op upstream",
-                            );
-                        let old_top_key = old.key();
-                        let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                        let new_body = crate::patch::branch::Branch::new_with_owner(
-                            depth,
-                            old.with_key(old_byte_key),
-                            inserted.with_key(leaf_byte_key),
-                            sub_owner,
+                Some(old) => Some(if old.tag() == HeadTag::LocalLeaf {
+                    // Direct-child LocalLeaf: its owner is THIS
+                    // Branch's owner. Build the divergence sub-Branch
+                    // inline and stop the recursion. `tag()` is a
+                    // pointer-bits check (no deref) — cheaper than
+                    // `body_ref()` for the common non-LocalLeaf case.
+                    let (depth, old_byte_key, leaf_byte_key) = old
+                        .first_divergence(&inserted, end_depth)
+                        .expect(
+                            "LocalLeaf and the inserted leaf must \
+                             diverge at some depth — equal keys \
+                             would have been a no-op upstream",
                         );
-                        Head::new(old_top_key, new_body)
-                    }
-                    BodyRef::Leaf(_) | BodyRef::Branch(_) => {
-                        // `old` is a heap Leaf or a Branch — recurse
-                        // with the protocol-conforming shape.
-                        Head::insert_leaf_with_owner(old, inserted, leaf_owner, end_depth)
-                    }
+                    let old_top_key = old.key();
+                    let sub_owner = unsafe { (*branch_owner_ptr).clone() };
+                    let new_body = crate::patch::branch::Branch::new_with_owner(
+                        depth,
+                        old.with_key(old_byte_key),
+                        inserted.with_key(leaf_byte_key),
+                        sub_owner,
+                    );
+                    Head::new(old_top_key, new_body)
+                } else {
+                    // `old` is a heap Leaf or a Branch — recurse with
+                    // the protocol-conforming shape.
+                    Head::insert_leaf_with_owner(old, inserted, leaf_owner, end_depth)
                 }),
             });
         }
