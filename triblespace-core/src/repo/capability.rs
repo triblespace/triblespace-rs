@@ -42,7 +42,7 @@ use crate::id_hex;
 pub const PERM_READ: Id = id_hex!("A75EED8224A553DD8002576E2E8A6823");
 /// Tag indicating a scope grants write access on the resources in scope.
 pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
-/// Tag indicating a scope grants admin (delegation + revocation) authority.
+/// Tag indicating a scope grants admin (delegation) authority.
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
 use crate::inline::encodings::ed25519 as ed;
@@ -653,8 +653,11 @@ struct CapFields {
 /// blobs are also looked up via `fetch_blob`, given the
 /// `leaf_sig_handle`.
 ///
-/// `revoked` is a set of pubkeys whose presence anywhere in the chain
-/// (as issuer or subject) invalidates the capability transitively.
+/// Eviction in the descriptive-caps model is per-issuer non-renewal
+/// (the issuer's local retraction-policy pin), not a broadcast
+/// revocation blob. Verification therefore checks signatures and
+/// expiry only; a "revoked" peer's chain dies at its next natural
+/// expiry once the issuer stops renewing.
 ///
 /// Returns the verified leaf capability on success.
 ///

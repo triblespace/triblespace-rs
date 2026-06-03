@@ -1,15 +1,16 @@
 //! `trible team` — capability-based team membership management.
 //!
-//! Issues, lists, and revokes capabilities for a triblespace team.
-//! Capabilities are signed delegations chained from a single team root
-//! keypair; possessing a leaf capability handle authorises a peer to
-//! connect to the team's mesh under the cap's scope.
+//! Issues, lists, retracts, and renews capabilities for a triblespace
+//! team. Capabilities are signed delegations chained from a single
+//! team root keypair; possessing a leaf capability handle authorises
+//! a peer to connect to the team's mesh under the cap's scope.
+//! Eviction is per-issuer non-renewal — there is no team-root
+//! broadcast revocation primitive in the descriptive-caps model.
 //!
 //! All commands accept the relevant team artefacts via CLI flags or
-//! environment variables (`TRIBLE_TEAM_ROOT`, `TRIBLE_TEAM_CAP`,
-//! `TRIBLE_TEAM_ROOT_SECRET`). The local pile stores the issued cap
-//! and revocation blobs so they're retrievable for verification when
-//! peers connect.
+//! environment variables (`TRIBLE_TEAM_ROOT`, `TRIBLE_TEAM_CAP`).
+//! The local pile stores the issued cap blobs so they're retrievable
+//! for verification when peers connect.
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -75,24 +76,7 @@ pub enum Command {
         #[arg(long = "branch", value_name = "BRANCH_HEX")]
         branches: Vec<String>,
     },
-    /// Issue a revocation for a pubkey. Must be signed by the team
-    /// root keypair (loaded from `--team-root-secret` /
-    /// `TRIBLE_TEAM_ROOT_SECRET`). Cascades transitively through any
-    /// chain involving the revoked pubkey.
-    Revoke {
-        /// Path to the local pile file.
-        #[arg(long)]
-        pile: PathBuf,
-        /// Team root secret key (hex of the 32-byte ed25519 SecretKey).
-        /// Treat this with extreme care; it's the team's entire
-        /// authority.
-        #[arg(long, env = "TRIBLE_TEAM_ROOT_SECRET")]
-        team_root_secret: String,
-        /// Pubkey to revoke (hex).
-        #[arg(long)]
-        target: String,
-    },
-    /// List capabilities and revocations stored in the local pile.
+    /// List capabilities stored in the local pile.
     List {
         /// Path to the local pile file.
         #[arg(long)]
@@ -240,11 +224,6 @@ pub fn run(cmd: Command) -> Result<()> {
             scope,
             branches,
         } => run_invite(pile, team_root, cap, key, invitee, scope, branches),
-        Command::Revoke {
-            pile,
-            team_root_secret,
-            target,
-        } => run_revoke(pile, team_root_secret, target),
         Command::List { pile } => run_list(pile),
         Command::ListPending { pile } => run_list_pending(pile),
         Command::ListIssued { pile } => run_list_issued(pile),
@@ -585,24 +564,6 @@ fn run_invite(
     Ok(())
 }
 
-fn run_revoke(
-    _pile_path: PathBuf,
-    _team_root_secret_hex: String,
-    _target_hex: String,
-) -> Result<()> {
-    // Revocation blobs no longer exist in the descriptive-caps model
-    // (see decide#4b321c47 / decide#4b59ce27). Eviction = local
-    // retraction of auto-renewal + natural cap expiry. The `team
-    // revoke` subcommand will be replaced by `team retract` once the
-    // local retraction-policy pin is wired in.
-    bail!(
-        "`team revoke` is removed in the descriptive-caps model. \
-         Eviction is now local per-issuer non-renewal — see \
-         decide#4b59ce27. The replacement `team retract` subcommand \
-         is not yet implemented."
-    )
-}
-
 /// Describe a single capability for the `team list` audit view.
 struct CapSummary {
     subject: VerifyingKey,
@@ -784,10 +745,6 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
         }
     }
 
-    // Revocation enumeration removed — revocations no longer exist
-    // in the descriptive-caps model. See decide#4b321c47. A future
-    // `team list-issued` / `team list-pending` will show A's local
-    // auto-renew branch.
     Ok(())
 }
 
@@ -1065,7 +1022,7 @@ fn run_show(
                     "  This is the SAME error the relay would raise on \
                      `OP_AUTH`. Check that the team root matches what the \
                      relay was configured with, and that no link in the \
-                     chain has expired or been revoked."
+                     chain has expired."
                 );
             }
         }

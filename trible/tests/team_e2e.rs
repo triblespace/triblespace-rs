@@ -1,11 +1,13 @@
 //! End-to-end test of the `trible team` CLI flow.
 //!
-//! Exercises create → invite → list → revoke → list against the real
-//! binary, validating that the four subcommands compose correctly and
-//! produce the expected on-pile artefacts. The actual network protocol
-//! (auth handshake on connection establishment) is exercised by the
+//! Exercises create → invite → list against the real binary, validating
+//! that the three subcommands compose correctly and produce the
+//! expected on-pile artefacts. The actual network protocol (auth
+//! handshake on connection establishment) is exercised by the
 //! capability lib tests in `triblespace-core::repo::capability`; this
-//! test covers the CLI surface that callers actually use.
+//! test covers the CLI surface that callers actually use. Eviction
+//! is per-issuer non-renewal (`team retract` / not auto-renewing) and
+//! is exercised by the daemon-side tests.
 
 use assert_cmd::Command;
 use tempfile::tempdir;
@@ -170,12 +172,11 @@ fn team_full_lifecycle() {
         "post-invite lists both PERM_ADMIN (founder) and PERM_READ (invitee); got:\n{list2_out}"
     );
 
-    // Revocation step removed — descriptive-caps model evicts via
-    // per-issuer non-renewal (decide#4b59ce27), not by issuing
-    // revocation blobs. `team revoke` now bails with a migration
-    // notice; the replacement `team retract` operation acts on a
-    // local-only renewal-policy branch (not yet implemented).
-    let _ = &team_root_secret; // silence unused-variable for now
+    // No revoke step — eviction in the descriptive-caps model is
+    // per-issuer non-renewal (`team retract`), not a broadcast
+    // revocation blob. The retraction daemon path is exercised in
+    // the capability lib tests.
+    let _ = &team_root_secret;
     let _ = &invitee_pubkey;
 }
 

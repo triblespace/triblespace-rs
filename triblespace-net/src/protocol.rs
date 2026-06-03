@@ -50,8 +50,8 @@ pub const OP_AUTH: u8 = 0x05;
 /// connection are scope-gated by the verified cap.
 pub const AUTH_OK: u8 = 0x00;
 /// Auth response: capability did not verify (chain malformed, signature
-/// failed, expired, revoked, scope-not-subset, fetch failed for any
-/// link, etc.). The connection should be closed by the client.
+/// failed, expired, scope-not-subset, fetch failed for any link, etc.).
+/// The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
 
 pub const NIL_HASH: RawHash = [0u8; 32];

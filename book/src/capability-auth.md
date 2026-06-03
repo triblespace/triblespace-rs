@@ -67,16 +67,35 @@ trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
     on its own (use `trible pile net identity` on the invitee's
     machine to print it). Prints the invitee's cap-sig handle.
 
-trible team revoke --pile PATH --team-root-secret HEX --target HEX
-    Issue a revocation blob, signed by the team root, against the
-    target pubkey. Cascades transitively: revoking K invalidates
-    every cap K signed and (transitively) every cap derived from
-    those.
+trible team request-join --admin HEX --scope (read|write|admin)
+                         [--key PATH] [--pile PATH]
+    Send an OP_REQUEST_CAP to an admin's running daemon asking to
+    be issued a capability. The admin sees the request on their
+    pending-requests pin (`team list-pending`); after `team approve`
+    the freshly-signed cap arrives via the auth-handshake ALPN.
+
+trible team approve --pile PATH --entry HEX --team-root HEX
+                    --cap HEX [--key PATH]
+    Approve a pending request, sign the cap, dispatch it back to
+    the requester, and add a renewal-policy entry so the local
+    daemon keeps the cap renewed.
+
+trible team retract --pile PATH --entry HEX
+    Stop auto-renewing one (subject, scope) entry. The peer's
+    chain dies at its next natural expiry. Pure local decision —
+    no broadcast, no transitive cascade. This is the eviction
+    primitive: there is no team-root-signed revocation blob in
+    the descriptive-caps model.
 
 trible team list --pile PATH
     Audit summary: per-cap detail line (issuer → subject, scope,
-    expiry — sorted soonest-expiry-first) plus the (revoker,
-    target) pair for each verifiable revocation.
+    expiry — sorted soonest-expiry-first).
+
+trible team list-pending --pile PATH
+    Incoming join requests awaiting approval.
+
+trible team list-issued --pile PATH
+    Renewal-policy entries this node is keeping renewed.
 
 trible team show --pile PATH --cap HEX [--verify TEAM_ROOT_HEX]
     Walk one chain end-to-end. Prints each level with subject,
@@ -197,39 +216,55 @@ sub-capabilities. The reachability scan is recomputed per request
 today; per-stream caching is a future optimisation for
 chain-walk-heavy workloads.
 
-## Revocation
+## Eviction
 
-Revocations are their own blob type — a small `TribleSet` carrying
-`rev_target` (the pubkey being revoked) and `metadata::created_at`,
-plus a sig blob of the same shape as cap signatures.
+There is no team-root-signed revocation blob. The descriptive-caps
+model evicts peers via **per-issuer non-renewal**: every cap carries
+a short natural expiry (default 30 days), the issuer's running
+daemon refreshes the cap before that expiry as long as a
+**renewal-policy entry** says it should, and `team retract` deletes
+the entry. The peer's chain dies at the next natural expiry. The
+decision is local to the issuer — nothing propagates, nothing
+cascades, nothing has to be signed by the team root.
 
-The relay maintains a `HashSet<VerifyingKey>` of revoked pubkeys.
-Every chain verification step checks `revoked.contains(issuer)` and
-`revoked.contains(subject)` — revoking key K invalidates every cap K
-signed and (transitively) every cap derived from those, with no
-restart needed.
+This trades the "instant network-wide revocation" property for
+several real wins:
 
-Two ways revocations land in that set:
+- **No revocation rescan on every snapshot refresh.** Previously
+  `update_snapshot` walked every blob looking for `(rev, sig)` pairs
+  signed by the team root; that was a CPU hotspot on quiescent peers.
+  The refresh path is now a near-no-op snapshot swap.
+- **No `HashSet<VerifyingKey>` shared state.** The old model needed
+  a process-wide revocation set, written from the snapshot scanner
+  and read from every chain verification. Removing it dropped a
+  cross-thread synchronisation point.
+- **No team-root keypair in normal operation.** Issuing a revocation
+  required the team root SECRET to sign. Now the root SECRET lives
+  in cold storage; every day-to-day operation (invite, approve,
+  retract) uses a regular admin cap.
+- **Monotonic gossip.** The wire protocol no longer has to gossip
+  revocation blobs as a special category that has to land *before*
+  the affected cap is verified. Caps and renewals are first-class
+  blobs; everything else is local issuer policy.
 
-1. **Boot seed.** `PeerConfig.revoked` is loaded once at relay
-   startup. Useful for hardcoded "always-revoked" lists.
-2. **Live propagation.** Every `Peer::refresh` (which is auto-called
-   on every read or write through the Peer) updates the served
-   snapshot. The update path *also* rescans the new snapshot for
-   `(rev, sig)` blob pairs signed by the configured team root and
-   unions them into the live revoked set. A revocation blob gossiped
-   into the pile is therefore picked up on the next snapshot refresh.
+The trade-off: there's no way to immediately invalidate a
+compromised key network-wide. The mitigation is to keep natural
+expiries short (the 30-day default is a starting point, not a
+hard rule) and to ensure issuers stop renewing the moment they
+notice. For acutely sensitive teams the natural-expiry window can
+be tightened to hours.
 
-The set is monotonically growing — boot-time revocations remain in
-even if the corresponding blob is later GC'd from the pile. Only
-revocations signed by the configured team root are accepted; bystander
-revocations are ignored.
+Renewal happens via the same `OP_DELIVER_CAP` path that `team
+approve` uses: the issuer's daemon signs a fresh cap with a
+later expiry, dispatches it to the subject's daemon over the
+auth-handshake ALPN, and the subject pins it on the team-cap pin.
+`team list-issued` shows the renewal-policy entries this node is
+keeping renewed; `team retract --entry HEX` removes one.
 
 ## `PeerConfig` Surface
 
 ```rust,ignore
 use triblespace::net::peer::{Peer, PeerConfig};
-use std::collections::HashSet;
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
@@ -237,7 +272,6 @@ let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     gossip: true,                           // false = pull/serve-only
     team_root: team_root_pubkey,            // 32 bytes — the team's CA AND
                                             // the gossip mesh id when gossip=true
-    revoked: HashSet::new(),                // boot-time seed (usually empty)
     self_cap: my_own_cap_sig_handle,        // what we present on OP_AUTH
 });
 ```

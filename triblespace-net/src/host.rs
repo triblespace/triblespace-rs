@@ -171,10 +171,7 @@ impl StoreSnapshot<()> {
 ///
 /// Carries just enough of the pile for the network thread to serve
 /// peer requests: per-hash blob fetch, branch head listing, and a
-/// quick presence check. The descriptive-caps refactor removed the
-/// `all_simple_archive_blobs` method that previously fed
-/// `extract_revocation_pairs` — there's no revocation rescan to
-/// support anymore.
+/// quick presence check.
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
@@ -208,11 +205,8 @@ where
 
 /// Send commands to the host thread + update the serving snapshot.
 ///
-/// In the descriptive-caps model `update_snapshot` is now a pure
-/// snapshot refresh — there's no revocation rescan to thread state
-/// through. The handler doesn't need any cross-thread policy view
-/// either, so this struct holds only the snapshot and the command
-/// channel.
+/// Holds only the snapshot and the command channel — `update_snapshot`
+/// is a pure snapshot refresh.
 #[derive(Clone)]
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
@@ -249,12 +243,6 @@ impl NetSender {
     }
 
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
-        // Descriptive caps: eviction is per-issuer non-renewal, not
-        // gossiped revocation blobs. So `update_snapshot` no longer
-        // scans for revocations — it just refreshes the served
-        // snapshot. The previous per-refresh `extract_revocation_pairs`
-        // walk was a CPU hotspot (~50% of samples on a quiescent peer);
-        // dropping it makes refresh near-free.
         let boxed: Box<dyn AnySnapshot> = Box::new(snapshot);
         *self.snapshot.lock().unwrap() = Some(boxed);
     }
@@ -1681,9 +1669,3 @@ fn blob_in_scope(
     }
 }
 
-// Tests removed: the original `mod tests` block was tightly coupled
-// to `build_revocation` and the old `verify_chain(.., &revoked, ..)`
-// signature. The descriptive-caps refactor (decide#5ed64e57) removed
-// both. Replacement tests need to use the new shape — see the TODO
-// at the bottom of `triblespace-core/src/repo/capability.rs` for the
-// minimum viable test set.

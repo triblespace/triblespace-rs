@@ -117,9 +117,13 @@ the full design.
 
 - `team create --pile PATH [--key KEY_PATH]` — mint a new team root keypair, sign the founder's self-cap with admin scope, and write both into the pile. Prints the team root pubkey (publish to peers), team root SECRET (archive offline), founder cap handles, and the cap's expiry timestamp.
 - `team invite --pile PATH --team-root HEX --cap HEX --key ISSUER --invitee HEX --scope (read|write|admin) [--branch HEX]...` — issue a sub-capability to another peer. ISSUER must hold a cap that subsumes the requested scope. `--branch` (repeatable) restricts the cap to specific branches; without it the cap applies to every branch within the granted permission set.
-- `team revoke --pile PATH --team-root-secret HEX --target HEX` — issue a team-root-signed revocation against a pubkey. Cascades transitively through any chain involving the revoked key.
-- `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first) plus the (revoker, target) pair for each verifiable revocation.
-- `team show --pile PATH --cap HEX` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, blob handles, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
+- `team request-join --admin HEX --scope (read|write|admin) [--key PATH] [--pile PATH]` — send an `OP_REQUEST_CAP` to an admin asking to be issued a capability via the running auth-handshake daemon.
+- `team approve --pile PATH --entry HEX --team-root HEX --cap HEX [--key PATH]` — approve a pending join request, sign the cap, dispatch it via the auth-handshake ALPN, and add a renewal-policy entry so the cap stays renewed.
+- `team retract --pile PATH --entry HEX` — stop auto-renewing a (subject, scope) entry. The peer's cap chain dies at its next natural expiry. Pure local decision, takes effect on the next daemon tick. There is no team-root broadcast revocation primitive; eviction is per-issuer non-renewal.
+- `team list --pile PATH` — audit the pile: per-cap details (issuer → subject, scope, expiry — sorted soonest-expiry-first).
+- `team list-pending --pile PATH` — incoming join requests awaiting approval.
+- `team list-issued --pile PATH` — renewal-policy entries this node is keeping renewed.
+- `team show --pile PATH --cap HEX [--verify HEX] [--expected-subject HEX]` — walk one chain end-to-end and print each level with subject, issuer, scope, expiry, blob handles, and a signer-matches-issuer check. Bounded by MAX_DEPTH=32; the diagnostic deep-dive that complements `team list`'s summary view.
 
 ### Work with remote stores
 

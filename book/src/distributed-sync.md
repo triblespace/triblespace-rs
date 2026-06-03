@@ -52,7 +52,6 @@ let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     // The team root pubkey doubles as the gossip mesh id when
     // `gossip = true`.
     team_root: signing_key.verifying_key(),  // single-user team-of-one
-    revoked: HashSet::new(),
     self_cap: [0u8; 32],
 });
 let mut repo = Repository::new(peer, signing_key, TribleSet::new())?;
@@ -220,7 +219,8 @@ trible pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]
     branch, merge into local. Useful for "give me a copy of that
     project" workflows. Same env-var fallback as `sync`.
 
-trible team {create, invite, revoke, list}
+trible team {create, invite, request-join, approve, retract, list,
+              list-pending, list-issued, show}
     Team capability lifecycle — see the Capability Auth chapter.
 ```
 
