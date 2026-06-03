@@ -925,7 +925,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                 let key_copy = *bytes;
                 drop(head);
                 let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
-                unsafe { Head::new(key_byte, new_leaf) }
+                Head::new(key_byte, new_leaf)
             }
         }
     }
