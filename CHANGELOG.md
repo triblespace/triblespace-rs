@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-06-03
+
+### Added
+
+- **PATCH `LocalLeaf` archive-leaf elimination.** New body kind for
+  PATCH heads that points directly into archive memory instead of
+  allocating a heap `Leaf<KEY_LEN, V>` per trible. Three node types
+  total — `Branch`, `Leaf`, `LocalLeaf` — with one local invariant:
+  a `LocalLeaf` may only appear as a direct child of a `Branch`
+  whose `owner: Option<Arc<dyn ArchiveOwner>>` is `Some(_)`. The
+  Branch's owner Arc keeps the underlying archive bytes alive for
+  the lifetime of the tree; reification to a heap `Leaf<KEY_LEN, ()>`
+  happens only at owner-mismatch boundaries. Reduces resident memory
+  from ~204 B/trible to ~109 B/trible (~47% saved) and drops
+  per-trible allocation count by ~83% for `SimpleArchive` ingest.
+  See wiki:808DE2FAB3F6DB95272F53F1E720BDA0 in the Liora pile.
+- **`ArchiveEntry<'a, KEY_LEN>` + `PATCH::insert_archive` +
+  `TribleSet::insert_archive`.** Ingest path that constructs a
+  `LocalLeaf` head from a `(NonNull<[u8; KEY_LEN]>, &Arc<dyn
+  ArchiveOwner>)` pair and threads the owner reference (not clone)
+  through `insert_leaf_with_owner` so per-trible insert pays zero
+  atomic ref-count traffic on the shared archive Arc. Clones happen
+  only at genuine `Branch.owner` adoption sites (~1 per ~30 tribles
+  given the trie's branching factor).
+- **Pre-computed siphash24 in `ArchiveEntry`.** `ArchiveEntry::new`
+  computes the LocalLeaf's hash once and threads it through both
+  `Head::insert_leaf_with_owner` (via the new
+  `BranchMut::modify_child_with_inserted_hint(key, hash, f)`
+  variant) and `Branch::new_with_owner_and_rchild_hash` so the
+  6-way index fan-out per trible runs one siphash instead of six.
+  This was the dominant per-trible cost before the optimization:
+  heap `Leaf` caches its hash in the struct; `LocalLeaf` has no
+  storage, so every `Head::hash()` was recomputing siphash24 over
+  64 bytes. Brings serial archive ingest from 1.59× slower than
+  the heap path to parity; at 4-8 threads archive is now 19-37%
+  *faster* than heap thanks to no per-trible malloc bandwidth
+  contention.
+- **`SimpleArchive` `try_from_blob` LocalLeaf ingest path.** Detects
+  16-byte alignment of the packed-trible buffer and, when satisfied,
+  wraps the blob's `Bytes` as an `Arc<dyn ArchiveOwner>` and feeds
+  `ArchiveEntry`s into the new path. Misaligned buffers (rare) fall
+  back to the heap-`Leaf` path. The parallel-reduce path
+  (`rayon::reduce` over per-chunk `serial_unarchive`) is re-enabled
+  for archive ingest now that `union` correctly handles same-owner
+  Branches and the per-trible Arc clones are eliminated.
+
+### Changed
+
+- **`Branch.childleaf` representation:** `*const Leaf<KEY_LEN, V>`
+  → `*const [u8; KEY_LEN]`. For heap `Leaf`s the pointer is to the
+  inline `key` field (offset 0 thanks to `#[repr(C, align(16))]`);
+  for `LocalLeaf`s it's the archive-resident bytes directly. All
+  `childleaf().key` / `childleaf().has_prefix` call sites delegate
+  to `leaf::key_ops` free functions against `childleaf_key()`. The
+  `V` type parameter on `Branch` becomes phantom-only (still
+  threaded through the child-table `Head<KEY_LEN, O, V>` slots).
+- **`Branch::get` value access** for ZST `V`: returns a
+  dangling-pointer reference (the only flavor compatible with
+  LocalLeaf-backed childleaves). Non-ZST `V` recovers the
+  `Leaf<KEY_LEN, V>` by casting `childleaf` back since `key` is at
+  offset 0.
+- **`trible team revoke` removed.** The descriptive-caps model
+  evicts via per-issuer non-renewal (`team retract` +
+  renewal-policy entries), not by team-root-signed revocation
+  blobs. The `revoke` subcommand had been a bail-out stub for
+  several releases; this release drops the `Command::Revoke`
+  variant, the `run_revoke` stub, the env-var
+  `TRIBLE_TEAM_ROOT_SECRET`, and sweeps stale revocation
+  references from the book's capability-auth chapter, the
+  `triblespace-net::host` module's doc comments, the
+  `triblespace-core::repo::capability::verify_chain` docstring,
+  the `PERM_ADMIN` description, and the `AUTH_REJECTED`
+  rejection-cause list.
+
+### Fixed
+
+- **Latent UAF in archive-backed PATCH union.** A regression test
+  for unioning two `SimpleArchive`-decoded TribleSets with
+  overlapping keys + different owner Arcs caught the structural
+  invariant violation at Branch::new(owner=None) with a LocalLeaf
+  direct child. Currently functionally fine because the parent's
+  owner Arc transitively keeps the bytes alive, but the regression
+  test pins the behavior and the union path is hardened to keep it
+  that way for the parallel reduce.
+
 ## [0.44.0] - 2026-05-31
 
 ### Added
