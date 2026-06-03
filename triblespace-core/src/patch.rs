@@ -845,11 +845,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         {
             let old_key = this.key();
             let new_branch_owner = leaf_owner.map(|a| a.clone());
-            let new_body = crate::patch::branch::Branch::new_with_owner(
+            let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
                 depth,
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
                 new_branch_owner,
+                leaf_hash,
             );
             return Head::new(old_key, new_body);
         }
@@ -898,11 +899,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                         );
                     let old_top_key = old.key();
                     let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                    let new_body = crate::patch::branch::Branch::new_with_owner(
+                    let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
                         depth,
                         old.with_key(old_byte_key),
                         inserted.with_key(leaf_byte_key),
                         sub_owner,
+                        leaf_hash,
                     );
                     Head::new(old_top_key, new_body)
                 } else {

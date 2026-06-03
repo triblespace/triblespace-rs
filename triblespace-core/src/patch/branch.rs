@@ -240,6 +240,31 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         rchild: Head<KEY_LEN, O, V>,
         owner: Option<Arc<dyn ArchiveOwner>>,
     ) -> NonNull<Self> {
+        // Compute rchild's hash via the normal path. For LocalLeaf
+        // this triggers siphash24; the
+        // [`new_with_owner_and_rchild_hash`] variant skips it when
+        // the caller has the hash already.
+        let rchild_hash = rchild.hash();
+        Self::new_with_owner_and_rchild_hash(end_depth, lchild, rchild, owner, rchild_hash)
+    }
+
+    /// Variant of [`Self::new_with_owner`] that takes a precomputed
+    /// `rchild_hash` and uses it instead of calling `rchild.hash()`.
+    /// Lets archive-ingest divergence paths reuse the
+    /// `ArchiveEntry::hash` they already have instead of recomputing
+    /// siphash24 over the LocalLeaf bytes.
+    ///
+    /// `rchild_hash` MUST equal `rchild.hash()`. The lchild hash
+    /// still goes through the normal path — it's typically a Branch
+    /// (cached) or heap Leaf (cached), so the only LocalLeaf hash
+    /// recompute that matters is on the freshly inserted side.
+    pub(super) fn new_with_owner_and_rchild_hash(
+        end_depth: usize,
+        lchild: Head<KEY_LEN, O, V>,
+        rchild: Head<KEY_LEN, O, V>,
+        owner: Option<Arc<dyn ArchiveOwner>>,
+        rchild_hash: u128,
+    ) -> NonNull<Self> {
         unsafe {
             let size = 2;
             // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
@@ -260,7 +285,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
                 .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild.hash());
+            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild_hash);
             addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
             (*ptr.as_ptr()).child_table[1] = Some(rchild);
