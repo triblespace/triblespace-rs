@@ -13,7 +13,7 @@ use std::thread;
 
 use iroh_base::{EndpointAddr, EndpointId};
 use ed25519_dalek::SigningKey;
-use tracing::{debug, debug_span, error, info, info_span, instrument, warn, Instrument};
+use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn, Instrument};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::identity::iroh_secret;
@@ -737,7 +737,9 @@ async fn fetch_reachable(
     // Note we pass the *fully-addressed* publisher only to seed the
     // cell with a known-good address; subsequent pool_get calls fall
     // through to iroh's address lookup if needed.
+    trace!(head = %hex::encode(&head[..4]), publisher = %publisher_id.fmt_short(), "fetch_reachable: seeding pool");
     let _ = pool_get(ep, pool, publisher_id, self_cap).await;
+    trace!(head = %hex::encode(&head[..4]), "fetch_reachable: pool seeded; entering Phase 1");
 
     // ── Phase 1: discovery (OP_CHILDREN only) ──
     //
@@ -755,6 +757,7 @@ async fn fetch_reachable(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
+            trace!(parent = %hex::encode(&parent[..4]), "fetch_reachable: calling children_one");
             let children = match children_one(ep, parent, dht, pool, publisher_id, my_id, self_cap).await {
                 Some(c) => c,
                 None => {
@@ -762,6 +765,7 @@ async fn fetch_reachable(
                     continue;
                 }
             };
+            trace!(parent = %hex::encode(&parent[..4]), n = children.len(), "fetch_reachable: children_one returned");
             for hash in children {
                 if !seen.insert(hash) {
                     continue;
@@ -856,8 +860,15 @@ async fn providers_for(
 ) -> Vec<EndpointId> {
     let mut providers: Vec<EndpointId> = if let Some(api) = dht {
         let blake3_hash = blake3::Hash::from_bytes(*hash);
-        api.find_providers(blake3_hash).await.unwrap_or_default()
+        trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
+        let result = api.find_providers(blake3_hash).await;
+        match &result {
+            Ok(v) => trace!(hash = %hex::encode(&hash[..4]), n = v.len(), "providers_for: DHT find_providers returned"),
+            Err(e) => trace!(hash = %hex::encode(&hash[..4]), error = %e, "providers_for: DHT find_providers errored"),
+        }
+        result.unwrap_or_default()
     } else {
+        trace!(hash = %hex::encode(&hash[..4]), "providers_for: no DHT");
         Vec::new()
     };
     providers.retain(|id| *id != my_id);
@@ -1081,16 +1092,21 @@ async fn children_one(
     my_id: EndpointId,
     self_cap: &RawHash,
 ) -> Option<Vec<RawHash>> {
+    trace!(parent = %hex::encode(&parent[..4]), "children_one: providers_for awaiting");
     let providers = providers_for(parent, dht, publisher_id, my_id).await;
-    for provider in providers {
-        let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
+    trace!(parent = %hex::encode(&parent[..4]), n = providers.len(), "children_one: providers_for returned");
+    for provider in &providers {
+        trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: pool_get awaiting");
+        let Some(conn) = pool_get(ep, pool, *provider, self_cap).await else {
+            trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: pool_get returned None");
             continue;
         };
+        trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: op_children awaiting");
         match op_children(&conn, parent).await {
             Ok(c) => return Some(c),
             Err(e) => {
                 debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "op_children errored, evicting and trying next provider");
-                pool_evict(pool, provider).await;
+                pool_evict(pool, *provider).await;
                 continue;
             }
         }
