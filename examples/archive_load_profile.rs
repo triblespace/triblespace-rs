@@ -27,22 +27,27 @@ fn make_trible(i: u64) -> Trible {
 }
 
 fn main() {
-    const N: usize = 100_000;
-    const ITERS: usize = 50;
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "archive".into());
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+    let iters: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
 
     let mut src = TribleSet::new();
-    for i in 0..N as u64 {
+    for i in 0..n as u64 {
         src.insert(&make_trible(i));
     }
     let archive: Blob<SimpleArchive> = SimpleArchive::encode(&src);
-    eprintln!("encoded {} tribles, {} bytes", N, archive.bytes.len());
-
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "archive".into());
-    eprintln!("mode = {mode} (iters = {ITERS})");
+    eprintln!("encoded {} tribles, {} bytes", n, archive.bytes.len());
+    eprintln!("mode = {mode} (iters = {iters})");
 
     let t0 = std::time::Instant::now();
     let mut total_len = 0;
-    for _ in 0..ITERS {
+    for _ in 0..iters {
         let set: TribleSet = match mode.as_str() {
             "heap" => try_from_blob_heap_only(archive.clone()).unwrap(),
             _ => triblespace::core::blob::TryFromBlob::try_from_blob(archive.clone()).unwrap(),
@@ -53,10 +58,10 @@ fn main() {
     let elapsed = t0.elapsed();
     eprintln!(
         "{} iters of {}-trible decode: {:?} total, {:?}/decode (len = {})",
-        ITERS,
-        N,
+        iters,
+        n,
         elapsed,
-        elapsed / ITERS as u32,
+        elapsed / iters as u32,
         total_len
     );
 }
