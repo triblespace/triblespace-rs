@@ -132,17 +132,13 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     }
 }
 
+impl<'a, const KEY_LEN: usize> Copy for ArchiveEntry<'a, KEY_LEN> {}
+
 impl<'a, const KEY_LEN: usize> Clone for ArchiveEntry<'a, KEY_LEN> {
     fn clone(&self) -> Self {
-        Self {
-            ptr: self.ptr,
-            owner: self.owner,
-            hash: self.hash,
-        }
+        *self
     }
 }
-
-impl<'a, const KEY_LEN: usize> Copy for ArchiveEntry<'a, KEY_LEN> {}
 
 impl<'a, const KEY_LEN: usize> core::fmt::Debug for ArchiveEntry<'a, KEY_LEN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

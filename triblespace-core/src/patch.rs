@@ -844,7 +844,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             this.first_divergence(&leaf, start_depth)
         {
             let old_key = this.key();
-            let new_branch_owner = leaf_owner.map(|a| a.clone());
+            let new_branch_owner = leaf_owner.cloned();
             let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
                 depth,
                 this.with_key(this_byte_key),
