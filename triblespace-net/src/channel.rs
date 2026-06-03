@@ -39,10 +39,15 @@ pub enum NetCommand {
     /// auth-handshake ALPN. Used by the renewal daemon (push-based
     /// renewal) and by the `team approve` subcommand (response to a
     /// pending request). The network thread opens a connection to
-    /// the subject's pubkey, sends `OP_DELIVER_CAP`, and closes —
-    /// no event is emitted back to the Peer on success or failure
-    /// (best-effort fire-and-forget; the recipient's ACK is observed
-    /// at the wire layer only).
+    /// the subject's pubkey, sends `OP_DELIVER_CAP`, and closes.
+    ///
+    /// Delivery is best-effort fire-and-forget at this layer.
+    /// Confirmation happens later, when the subject actually
+    /// authenticates against our pile-sync ALPN presenting the
+    /// delivered cap — see `NetEvent::CapDeliveryConfirmed`. The
+    /// renewal daemon redispatches entries that haven't been
+    /// confirmed yet (per-entry cooldown to avoid hammering an
+    /// unreachable peer).
     DeliverCap {
         subject: PublisherKey,
         cap_bytes: Bytes,
@@ -76,5 +81,17 @@ pub enum NetEvent {
         issuer: PublisherKey,
         cap_bytes: Bytes,
         sig_bytes: Bytes,
+    },
+    /// `subject` successfully authenticated against our pile-sync
+    /// `OP_AUTH` stream by presenting cap-sig handle `cap_hash`.
+    /// This is the unambiguous "the subject has the cap and uses
+    /// it" signal — the wire-level STATUS_OK on `OP_DELIVER_CAP`
+    /// only tells us the bytes landed; auth tells us the subject
+    /// can both load AND verify the chain. The Peer side uses this
+    /// to mark the matching renewal-policy entry as delivered so
+    /// the daemon's next tick skips it from the redispatch set.
+    CapDeliveryConfirmed {
+        subject: PublisherKey,
+        cap_hash: RawHash,
     },
 }

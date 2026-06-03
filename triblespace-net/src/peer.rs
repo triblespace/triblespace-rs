@@ -122,6 +122,14 @@ where
     /// duplication stays auditable. Used by `renewal_tick` to sign
     /// fresh caps for entries on the renewal-policy pin.
     signing_key: SigningKey,
+
+    /// Per-entry cooldown for undelivered-cap re-dispatch. The
+    /// renewal daemon's tick runs every 100 ms; without this gate it
+    /// would hammer iroh-connect attempts for any peer that's down.
+    /// Recorded against `entry.id`. Cleared (entry-level) when the
+    /// delivery confirms; the whole map is in-memory and rebuilds
+    /// naturally if the daemon restarts.
+    last_dispatch_attempt: HashMap<Id, std::time::Instant>,
 }
 
 impl<S> Peer<S>
@@ -161,6 +169,7 @@ where
             last_event_at: std::time::Instant::now(),
             team_root,
             signing_key,
+            last_dispatch_attempt: HashMap::new(),
         };
 
         // Drive the first refresh synchronously so the DHT learns
@@ -249,6 +258,39 @@ where
                     // for now they're orphan blobs in the pile, same
                     // as our own outgoing-cap blobs.
                     self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
+                }
+                NetEvent::CapDeliveryConfirmed { subject, cap_hash } => {
+                    // The subject's daemon ack'd receipt of a cap we
+                    // dispatched. Find the matching policy entry (by
+                    // subject + latest_cap handle) and mark it as
+                    // delivered so the daemon's next tick skips it
+                    // from the re-dispatch set.
+                    use triblespace_core::inline::Inline;
+                    use triblespace_core::inline::encodings::hash::Handle;
+                    let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+                    let cap_handle: Inline<Handle<SimpleArchive>> =
+                        Inline::new(cap_hash);
+                    if let Some(entry_id) =
+                        crate::policy::find_policy_entry_by_subject_and_cap(
+                            &mut self.store,
+                            subject_key,
+                            cap_handle,
+                        )
+                    {
+                        let _ = crate::policy::mark_policy_delivered(
+                            &mut self.store,
+                            entry_id,
+                        );
+                        tracing::debug!(
+                            subject = %hex::encode(&subject[..4]),
+                            cap = %hex::encode(&cap_hash[..4]),
+                            entry = ?entry_id,
+                            "delivery confirmed; policy entry marked delivered"
+                        );
+                    }
                 }
             }
         }
@@ -415,16 +457,13 @@ where
         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-        // Subject must be US — a delivered cap is for our pubkey. The
-        // signing-key bytes aren't accessible here, but we know our
-        // own pubkey via the iroh endpoint id baked into the snapshot
-        // we serve; for v1 we just trust the verify_chain subject
-        // check via expected_subject = team_root if the delivery is
-        // the team-root case, or the requester pubkey for delegated
-        // chains. We can't know which without re-deriving our own
-        // pubkey, so for v1 we pass team_root and rely on
-        // verify_chain's chain walk catching subject mismatches.
-        let expected_subject = self.team_root;
+        // Subject must be US — a delivered cap is for our pubkey,
+        // which we derive from our own signing key. Earlier
+        // implementations passed `team_root` as a stand-in (subject
+        // == team_root only when we ARE the founder), so any
+        // delegated cap landed at SubjectMismatch even when the
+        // chain was otherwise valid.
+        let expected_subject = self.signing_key.verifying_key();
 
         // Build a fetch closure that consults the in-process pile.
         let Ok(reader) = self.store.reader() else {
@@ -500,16 +539,92 @@ where
         }
     }
 
+    /// Cooldown for re-dispatching undelivered cap blobs. The daemon's
+    /// tick cadence is sub-second; without this gate we'd hammer
+    /// iroh-connect against a down peer 10× per second.
+    const UNDELIVERED_REDISPATCH_COOLDOWN: std::time::Duration =
+        std::time::Duration::from_secs(15);
+
+    /// Re-dispatch the cap+sig pairs for every renewal-policy entry
+    /// that's not yet been ack'd by its subject, rate-limited per
+    /// entry via `last_dispatch_attempt`. The cap is NOT re-signed —
+    /// the same `(latest_cap, latest_sig)` blobs are sent again, so
+    /// idempotent on the receiver side (their OP_DELIVER_CAP handler
+    /// content-hashes the bytes and dedupes against what's already
+    /// pinned).
+    ///
+    /// Returns the count of entries dispatched this tick.
+    fn redispatch_undelivered(&mut self) -> usize {
+        use triblespace_core::blob::Blob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::repo::BlobStoreGet;
+
+        let entries = crate::policy::undelivered_entries(&mut self.store);
+        if entries.is_empty() {
+            return 0;
+        }
+
+        let now = std::time::Instant::now();
+        let Ok(reader) = self.store.reader() else { return 0; };
+
+        let mut dispatched = 0usize;
+        for entry in entries {
+            // Per-entry cooldown.
+            if let Some(prev) = self.last_dispatch_attempt.get(&entry.id) {
+                if now.duration_since(*prev) < Self::UNDELIVERED_REDISPATCH_COOLDOWN {
+                    continue;
+                }
+            }
+
+            let Ok(cap_blob) = reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_cap)
+            else {
+                continue;
+            };
+            let Ok(sig_blob) = reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(entry.latest_sig)
+            else {
+                continue;
+            };
+
+            self.sender.deliver_cap(
+                entry.subject.to_bytes(),
+                cap_blob.bytes.clone(),
+                sig_blob.bytes.clone(),
+            );
+            self.last_dispatch_attempt.insert(entry.id, now);
+            dispatched += 1;
+            tracing::debug!(
+                subject = %hex::encode(entry.subject.to_bytes()),
+                entry = ?entry.id,
+                "redispatch_undelivered: re-sent OP_DELIVER_CAP"
+            );
+        }
+        dispatched
+    }
+
     /// Run one tick of the auto-renewal scan.
     ///
-    /// Enumerates renewal-policy entries whose current cap expires
-    /// within `renewal_window` of now and aren't retracted, signs a
-    /// fresh cap+sig for each (using our team-cap as parent), and
-    /// dispatches via `OP_DELIVER_CAP`. The policy entry is updated
-    /// in lockstep so the next tick doesn't re-fire on the same entry.
+    /// Performs two pieces of work each tick:
     ///
-    /// Returns the count of entries renewed this tick — useful for
-    /// observability and tests. `0` on every tick after the swarm
+    /// 1. **Redispatch undelivered entries.** For each renewal-policy
+    ///    entry that's not yet been ack'd by its subject, re-send the
+    ///    same `(latest_cap, latest_sig)` blobs via
+    ///    [`crate::channel::NetCommand::DeliverCap`], rate-limited per
+    ///    entry by [`Self::UNDELIVERED_REDISPATCH_COOLDOWN`]. This is
+    ///    what catches the case where the initial `team approve`
+    ///    delivery failed (subject offline) and the subject comes back
+    ///    later.
+    ///
+    /// 2. **Re-sign near-expiry entries.** For each entry whose current
+    ///    cap upper bound falls within `renewal_window` of now, sign a
+    ///    fresh cap+sig (using our team-cap as parent) and dispatch.
+    ///    The policy entry is updated in lockstep, which also clears
+    ///    any `delivered_at` so step (1) on the next tick picks the
+    ///    fresh cap up for re-confirmation.
+    ///
+    /// Returns the total count of dispatches this tick (undelivered
+    /// re-sends + fresh renewals). `0` on every tick after the swarm
     /// settles into steady state means the daemon is quiet.
     ///
     /// Designed to be called from `trible pile net sync`'s main loop
@@ -523,9 +638,11 @@ where
         use triblespace_core::inline::encodings::hash::Handle;
         use triblespace_core::repo::BlobStoreGet;
 
+        let redispatched = self.redispatch_undelivered();
+
         let entries = crate::policy::renewable_within(&mut self.store, renewal_window);
         if entries.is_empty() {
-            return 0;
+            return redispatched;
         }
 
         // Our own current cap is the parent for every renewal. If
@@ -631,6 +748,11 @@ where
 
             // Dispatch over the wire.
             self.sender.deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
+            // Record the attempt so the undelivered-redispatch path
+            // doesn't immediately re-fire on the same entry within
+            // its cooldown window.
+            self.last_dispatch_attempt
+                .insert(entry.id, std::time::Instant::now());
 
             // Update the policy entry so we don't re-renew on the
             // next tick.
@@ -656,7 +778,7 @@ where
                 );
             }
         }
-        dispatched
+        dispatched + redispatched
     }
 
     /// Force-republish all current non-tracking branches to the gossip

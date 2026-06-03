@@ -593,13 +593,15 @@ async fn host_loop(
                 }
                 NetCommand::DeliverCap { subject, cap_bytes, sig_bytes } => {
                     // Open a fresh connection on the auth-handshake
-                    // ALPN, send OP_DELIVER_CAP, close. The recipient's
-                    // ack byte is observed but not surfaced — the
-                    // command is fire-and-forget at the Peer API
-                    // level. Failure paths (connection refused, peer
-                    // unreachable, recipient rejected) just log; the
-                    // renewal-daemon retries on its next tick.
+                    // ALPN, send OP_DELIVER_CAP, close. On STATUS_OK
+                    // ack we emit `NetEvent::CapDeliveryConfirmed`
+                    // so the Peer can mark the matching
+                    // renewal-policy entry as delivered; on any
+                    // failure (connect/send/non-OK) the entry stays
+                    // in the undelivered set and the next renewal
+                    // tick attempts redispatch.
                     let ep_for_deliver = ep.clone();
+                    let events_for_deliver = events.clone();
                     tokio::spawn(async move {
                         let subject_id = match iroh_base::EndpointId::from_bytes(&subject) {
                             Ok(id) => id,
@@ -633,7 +635,10 @@ async fn host_loop(
                             Ok(status) if status == crate::handshake::STATUS_OK => {
                                 debug!(
                                     subject = %hex::encode(&subject[..4]),
-                                    "DeliverCap: recipient ack OK"
+                                    "DeliverCap: recipient ack OK (wire-level — absorb \
+                                     happens asynchronously on recipient; \
+                                     CapDeliveryConfirmed is emitted later from the OP_AUTH \
+                                     path when the subject actually authenticates with the cap)"
                                 );
                             }
                             Ok(status) => {
@@ -1465,6 +1470,15 @@ async fn serve_stream(
                 for (_, bytes) in fetched.drain() {
                     let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(bytes)));
                 }
+                // Tell the Peer thread that this remote authed with
+                // `cap_handle_raw`. If the Peer issued a cap to this
+                // subject and `cap_handle_raw` matches the policy
+                // entry's `latest_sig`, the Peer marks the entry as
+                // delivered (the subject has the cap and can use it).
+                let _ = events.send(NetEvent::CapDeliveryConfirmed {
+                    subject: peer_pubkey.to_bytes(),
+                    cap_hash: cap_handle_raw,
+                });
                 *auth_state.write().await = Some(verified);
                 send_u8(send, AUTH_OK).await?;
             }

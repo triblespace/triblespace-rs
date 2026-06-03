@@ -80,6 +80,18 @@ attributes! {
     /// daemon skips entries with this attribute; the corresponding
     /// peer's chain dies naturally at the current cap's expiry.
     "57C45D022B79C4D3A021AC0114D973EE" as pub policy_retracted_at: NsTAIInterval;
+    /// Set when the most recently dispatched `OP_DELIVER_CAP` to the
+    /// subject returned a STATUS_OK ack — i.e. the subject's daemon
+    /// confirmed receipt of `policy_latest_cap` / `policy_latest_sig`.
+    /// Cleared (the attribute removed) every time we re-sign the cap
+    /// (on a renewal tick), so the next dispatch round resumes
+    /// retry-until-ack until the new cap also lands.
+    ///
+    /// The daemon's tick treats entries without this attribute as
+    /// "still pending delivery" and re-dispatches them (rate-limited
+    /// via an in-memory per-entry cooldown so a peer that's
+    /// persistently unreachable doesn't get hammered).
+    "2E289E766CFD4F2554D430C31337BE2B" as pub policy_delivered_at: NsTAIInterval;
 
     // ── Pending request entry ─────────────────────────────────────────
     /// The pubkey that sent the join request. Matches the iroh
@@ -444,6 +456,12 @@ pub struct PolicyEntry {
     /// `Some(t)` if A has chosen to stop auto-renewing this entry;
     /// the daemon must skip entries with this set.
     pub retracted_at: Option<Inline<NsTAIInterval>>,
+    /// `Some(t)` once the subject's daemon has ack'd receipt of the
+    /// current `latest_cap` / `latest_sig` via OP_DELIVER_CAP's
+    /// STATUS_OK. `None` means delivery is still pending — the
+    /// renewal daemon's tick re-dispatches such entries until the
+    /// ack lands.
+    pub delivered_at: Option<Inline<NsTAIInterval>>,
 }
 
 /// Enumerate the current renewal-policy entries.
@@ -490,14 +508,20 @@ where
     )
     .collect();
 
-    // Optional retraction lookup per entry (separate query — keeping
-    // `policy_retracted_at` in the main pattern would filter out
-    // non-retracted entries, which is the opposite of what we want).
+    // Optional retracted_at / delivered_at lookups per entry
+    // (separate queries — keeping either in the main pattern would
+    // filter out entries that lack the optional attribute, which is
+    // the opposite of what we want).
     core.into_iter()
         .map(|(id, subject, scope, issued_at, latest_cap, latest_sig)| {
             let retracted_at = find!(
                 t: Inline<NsTAIInterval>,
                 pattern!(&meta, [{ id @ policy_retracted_at: ?t }])
+            )
+            .next();
+            let delivered_at = find!(
+                t: Inline<NsTAIInterval>,
+                pattern!(&meta, [{ id @ policy_delivered_at: ?t }])
             )
             .next();
             PolicyEntry {
@@ -508,8 +532,24 @@ where
                 latest_cap,
                 latest_sig,
                 retracted_at,
+                delivered_at,
             }
         })
+        .collect()
+}
+
+/// Filter `list_renewal_policy` to entries that are still pending
+/// delivery: not retracted, and not yet ack'd by the subject's
+/// daemon. These are the entries the renewal daemon re-dispatches on
+/// each tick until the ack lands.
+pub fn undelivered_entries<S>(store: &mut S) -> Vec<PolicyEntry>
+where
+    S: BlobStore + PinStore,
+{
+    list_renewal_policy(store)
+        .into_iter()
+        .filter(|e| e.retracted_at.is_none())
+        .filter(|e| e.delivered_at.is_none())
         .collect()
 }
 
@@ -681,6 +721,24 @@ where
         meta = meta.difference(&t);
     }
 
+    // Re-signing supersedes the prior cap. The subject's daemon
+    // needs to ack the new (cap, sig) pair afresh, so clear any
+    // existing `policy_delivered_at` and let the next tick's
+    // `undelivered_entries` pick it up for re-dispatch.
+    let cur_delivered_at: Option<Inline<NsTAIInterval>> = find!(
+        t: Inline<NsTAIInterval>,
+        pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])
+    )
+    .next();
+    if let Some(old) = cur_delivered_at {
+        let t: TribleSet = entity! {
+            ExclusiveId::force_ref(&entry_id) @
+            policy_delivered_at: old,
+        }
+        .into();
+        meta = meta.difference(&t);
+    }
+
     let new_tribles: TribleSet = entity! {
         ExclusiveId::force_ref(&entry_id) @
         policy_issued_at: new_issued_at,
@@ -695,6 +753,79 @@ where
         PushResult::Success() => Some(()),
         PushResult::Conflict(_) => None,
     }
+}
+
+/// Mark a renewal-policy entry as delivered (sets
+/// `policy_delivered_at = now`). Called after the host loop's
+/// `OP_DELIVER_CAP` task observes a STATUS_OK ack from the subject.
+/// The daemon's `undelivered_entries` filter then skips this entry
+/// on subsequent ticks; only renewable_within (near-expiry) picks
+/// it up again, and `update_policy_entry` clears the field when the
+/// daemon re-signs.
+pub fn mark_policy_delivered<S>(
+    store: &mut S,
+    entry_id: Id,
+) -> Option<()>
+where
+    S: BlobStore + BlobStorePut + PinStore,
+{
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::inline::TryToInline;
+
+    let bid = find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY)?;
+    let prev_head = store.head(bid).ok()??;
+    let reader = store.reader().ok()?;
+    let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
+
+    // Remove any prior delivered_at (re-marking after a fresh re-sign).
+    let cur: Option<Inline<NsTAIInterval>> = find!(
+        t: Inline<NsTAIInterval>,
+        pattern!(&meta, [{ entry_id @ policy_delivered_at: ?t }])
+    )
+    .next();
+    if let Some(old) = cur {
+        let t: TribleSet = entity! {
+            ExclusiveId::force_ref(&entry_id) @
+            policy_delivered_at: old,
+        }
+        .into();
+        meta = meta.difference(&t);
+    }
+
+    let now = hifitime::Epoch::now().ok()?;
+    let delivered_at: Inline<NsTAIInterval> =
+        (now, now).try_to_inline().ok()?;
+
+    let trible: TribleSet = entity! {
+        ExclusiveId::force_ref(&entry_id) @
+        policy_delivered_at: delivered_at,
+    }
+    .into();
+    meta += trible;
+
+    let new_head: Inline<Handle<SimpleArchive>> = store.put(meta).ok()?;
+    match store.update(bid, Some(prev_head), Some(new_head)).ok()? {
+        PushResult::Success() => Some(()),
+        PushResult::Conflict(_) => None,
+    }
+}
+
+/// Look up a renewal-policy entry by `(subject, latest_cap)`. Used by
+/// the host loop's `OP_DELIVER_CAP` ack path to find which entry was
+/// just confirmed (the host knows subject + cap_handle from the
+/// dispatched payload).
+pub fn find_policy_entry_by_subject_and_cap<S>(
+    store: &mut S,
+    subject: ed25519_dalek::VerifyingKey,
+    latest_cap: Inline<Handle<SimpleArchive>>,
+) -> Option<Id>
+where
+    S: BlobStore + PinStore,
+{
+    list_renewal_policy(store)
+        .into_iter()
+        .find(|e| e.subject == subject && e.latest_cap == latest_cap)
+        .map(|e| e.id)
 }
 
 /// Mark a renewal-policy entry as retracted (sets `policy_retracted_at
