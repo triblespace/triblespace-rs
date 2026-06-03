@@ -82,11 +82,17 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 pub struct ArchiveEntry<'a, const KEY_LEN: usize> {
     pub(super) ptr: NonNull<[u8; KEY_LEN]>,
     pub(super) owner: &'a Arc<dyn ArchiveOwner>,
+    /// Pre-computed siphash24 of the trible bytes (matches what
+    /// `Head::hash()` would compute on the resulting `LocalLeaf`).
+    /// Cached once at `ArchiveEntry::new` so the 6-way fan-out across
+    /// covering indexes runs one hash instead of six.
+    pub(super) hash: u128,
 }
 
 impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     /// Creates an `ArchiveEntry` referencing a `[u8; KEY_LEN]` trible
-    /// inside an archive's bytes.
+    /// inside an archive's bytes. Computes the siphash24 of the
+    /// trible's bytes eagerly so the 6 covering indexes can share it.
     ///
     /// # Safety
     /// - `ptr` must remain valid for as long as `owner` is held.
@@ -103,17 +109,21 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
             0,
             "ArchiveEntry pointer must be 16-byte aligned"
         );
-        Self { ptr, owner }
+        let hash = unsafe {
+            use siphasher::sip128::SipHasher24;
+            use std::ptr::addr_of;
+            let key = *addr_of!(crate::patch::SIP_KEY);
+            SipHasher24::new_with_key(&key).hash(&ptr.as_ref()[..]).into()
+        };
+        Self { ptr, owner, hash }
     }
 
-    /// Returns a `LocalLeaf` head for this entry plus the borrowed
-    /// owner Arc. The caller threads the borrow down the insertion
-    /// recursion and only clones when actually storing into a
-    /// Branch's `owner` field.
+    /// Returns a `LocalLeaf` head for this entry, the borrowed owner
+    /// Arc, and the pre-computed leaf hash.
     pub(super) fn leaf<O: KeySchema<KEY_LEN>>(
         &self,
-    ) -> (Head<KEY_LEN, O, ()>, &'a Arc<dyn ArchiveOwner>) {
-        unsafe { (Head::new_local_leaf(0, self.ptr), self.owner) }
+    ) -> (Head<KEY_LEN, O, ()>, &'a Arc<dyn ArchiveOwner>, u128) {
+        unsafe { (Head::new_local_leaf(0, self.ptr), self.owner, self.hash) }
     }
 
     /// Borrows the owner Arc without cloning.
@@ -127,6 +137,7 @@ impl<'a, const KEY_LEN: usize> Clone for ArchiveEntry<'a, KEY_LEN> {
         Self {
             ptr: self.ptr,
             owner: self.owner,
+            hash: self.hash,
         }
     }
 }

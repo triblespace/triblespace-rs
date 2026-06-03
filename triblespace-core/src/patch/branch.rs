@@ -80,6 +80,23 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
+    /// Like [`modify_child`] but uses the supplied `inserted_hash`
+    /// for the empty-slot insertion case instead of calling
+    /// `inserted.hash()`. Lets archive ingest avoid recomputing
+    /// the LocalLeaf siphash24 once per index — the caller already
+    /// has it from `ArchiveEntry::hash`.
+    ///
+    /// The hint MUST equal the hash of whatever `f(None)` returns.
+    /// When the slot is non-empty and `f(Some(_))` runs, the result
+    /// is hashed normally (recursion result, hash already cached on
+    /// the Branch).
+    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
+    }
+
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
@@ -460,6 +477,83 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 }
             }
             // Debug invariant check (no-op in release builds).
+            #[cfg(debug_assertions)]
+            branch_nn.as_ref().debug_check_invariants();
+        }
+    }
+
+    /// Variant of [`Self::modify_child`] that takes a precomputed
+    /// `inserted_hash` and uses it for the empty-slot insertion path
+    /// instead of calling `inserted.hash()`. The hint MUST equal the
+    /// hash of whatever `f(None)` returns. The non-empty path uses
+    /// `new_child.hash()` as normal (the recursive result is a Branch
+    /// whose hash is already cached, so the call is O(1)).
+    pub(super) fn modify_child_with_inserted_hint<F>(
+        branch_nn: &mut NonNull<Self>,
+        key: u8,
+        inserted_hash: u128,
+        f: F,
+    )
+    where
+        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        unsafe {
+            let branch = branch_nn.as_ptr();
+            let end_depth = (*branch).end_depth as usize;
+
+            if let Some(slot) = (*branch).child_table.table_get_slot(key) {
+                let child = slot.take().unwrap();
+                let old_child_hash = child.hash();
+                let old_child_segment_count = child.count_segment(end_depth);
+                let old_child_leaf_count = child.count();
+
+                let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
+
+                if let Some(new_child) = f(Some(child)) {
+                    // Recursion result — its hash is cached on the
+                    // returned Head (Branch.hash field), so calling
+                    // .hash() is cheap.
+                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
+                    (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
+                        + new_child.count_segment(end_depth);
+                    (*branch).leaf_count =
+                        ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
+
+                    if replaced_childleaf {
+                        (*branch).childleaf = new_child.childleaf_ptr();
+                    }
+
+                    if slot.replace(new_child.with_key(key)).is_some() {
+                        unreachable!();
+                    }
+                } else {
+                    (*branch).hash ^= old_child_hash;
+                    (*branch).segment_count -= old_child_segment_count;
+                    (*branch).leaf_count -= old_child_leaf_count;
+
+                    if replaced_childleaf {
+                        if let Some(other) = (*branch).child_table.iter().find_map(|s| s.as_ref()) {
+                            (*branch).childleaf = other.childleaf_ptr();
+                        }
+                    }
+                }
+            } else {
+                if let Some(mut inserted) = f(None) {
+                    // Use the caller-supplied hint instead of
+                    // recomputing siphash24 over the LocalLeaf bytes.
+                    (*branch).leaf_count += inserted.count();
+                    (*branch).segment_count += inserted.count_segment(end_depth);
+                    (*branch).hash ^= inserted_hash;
+
+                    let mut branch_ptr = branch_nn.as_ptr();
+                    while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
+                    {
+                        inserted = new_displaced;
+                        Self::grow(branch_nn);
+                        branch_ptr = branch_nn.as_ptr();
+                    }
+                }
+            }
             #[cfg(debug_assertions)]
             branch_nn.as_ref().debug_check_invariants();
         }

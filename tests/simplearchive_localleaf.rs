@@ -62,6 +62,10 @@ static A: CountingAllocator = CountingAllocator;
 /// alive transitively via the surviving Branches' owner Arcs.
 #[test]
 fn union_two_overlapping_archives() {
+    // Serialize with the decode-allocation test — they share the
+    // process-global counting allocator and would race on its state
+    // if run in parallel.
+    let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
     // Big enough to engage the parallel par_union path on each
     // index (threshold is 4096 leaves).
     const N: usize = 8_192;

@@ -830,6 +830,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         mut this: Self,
         mut leaf: Self,
         mut leaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        leaf_hash: u128,
         start_depth: usize,
     ) -> Self {
         // Top-level divergence: `this` is a heap Leaf or a Branch
@@ -880,7 +881,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             > = &ed.owner;
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
+            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
                 None => Some(inserted),
                 Some(old) => Some(if old.tag() == HeadTag::LocalLeaf {
                     // Direct-child LocalLeaf: its owner is THIS
@@ -906,8 +907,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                     Head::new(old_top_key, new_body)
                 } else {
                     // `old` is a heap Leaf or a Branch — recurse with
-                    // the protocol-conforming shape.
-                    Head::insert_leaf_with_owner(old, inserted, leaf_owner, end_depth)
+                    // the protocol-conforming shape, threading the
+                    // precomputed leaf hash through.
+                    Head::insert_leaf_with_owner(
+                        old,
+                        inserted,
+                        leaf_owner,
+                        leaf_hash,
+                        end_depth,
+                    )
                 }),
             });
         }
@@ -2230,12 +2238,13 @@ where
     /// owner semantics and the materialization rule for owner
     /// mismatches.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
-        let (leaf_head, leaf_owner) = entry.leaf::<O>();
+        let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
         if let Some(this) = self.root.take() {
             let new_head = Head::insert_leaf_with_owner(
                 this,
                 leaf_head,
                 Some(leaf_owner),
+                leaf_hash,
                 0,
             );
             self.root.replace(new_head);
