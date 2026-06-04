@@ -457,11 +457,27 @@ async fn host_loop(
 
     // Auth-handshake ALPN (separate from PILE_SYNC because it's open
     // to unauthenticated peers — a peer requesting their first cap
-    // has nothing to present at OP_AUTH yet). The handler forwards
-    // incoming requests/deliveries to the Peer's event channel; the
-    // Peer surfaces them via NetEvent::CapRequest / CapDelivered.
+    // has nothing to present at OP_AUTH yet). For OP_REQUEST_CAP the
+    // handler is a thin wire→event bridge; for OP_DELIVER_CAP it
+    // verifies the chain (swarm-fetching missing chain blobs the
+    // same way OP_AUTH does), and only on a clean verify emits the
+    // verified blobs as `NetEvent::Blob` + `NetEvent::CapDelivered`
+    // and returns STATUS_OK — so a STATUS_OK at the wire means
+    // "we have absorbed and pinned this cap".
+    let our_pubkey = ed25519_dalek::VerifyingKey::from_bytes(
+        secret.public().as_bytes(),
+    )
+    .expect("iroh public key parses as ed25519 pubkey");
     let handshake_handler = HandshakeHandler {
         events: events.clone(),
+        team_root: config.team_root,
+        our_pubkey,
+        snapshot: snapshot.clone(),
+        ep: ep.clone(),
+        dht: dht_api.clone(),
+        self_cap,
+        pool: conn_pool.clone(),
+        my_id,
     };
     router_builder = router_builder
         .accept(crate::handshake::AUTH_HANDSHAKE_ALPN, handshake_handler);
@@ -1200,6 +1216,25 @@ impl std::fmt::Debug for SnapshotHandler {
 #[derive(Clone)]
 struct HandshakeHandler {
     events: mpsc::Sender<NetEvent>,
+    /// Team root pubkey — verifies the delivered cap's chain at
+    /// `OP_DELIVER_CAP` time so STATUS_OK means "we'd accept this".
+    team_root: ed25519_dalek::VerifyingKey,
+    /// Our own pubkey — the expected `cap_subject` of any cap
+    /// delivered to us.
+    our_pubkey: ed25519_dalek::VerifyingKey,
+    /// Snapshot for local-pile blob lookup during verify.
+    snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    /// Endpoint + DHT + pool + self_cap + my_id are the swarm-fetch
+    /// substrate. When the local-pile verify fails with `Fetch`, we
+    /// open `pile-sync/4` to providers of the missing blobs (DHT
+    /// providers first, dialer as fallback) and walk the chain via
+    /// `OP_CHILDREN` + `OP_GET_BLOB` until we have everything verify
+    /// needs.
+    ep: iroh::Endpoint,
+    dht: Option<crate::dht::api::ApiClient>,
+    self_cap: RawHash,
+    pool: SharedPool,
+    my_id: EndpointId,
 }
 
 impl std::fmt::Debug for HandshakeHandler {
@@ -1215,8 +1250,16 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
         // iroh's `EndpointId` is already an ed25519 pubkey so this
         // is a direct byte extraction (matched against the type
         // alias in channel.rs).
-        let peer_pubkey: PublisherKey = *peer_endpoint.as_bytes();
+        let peer_pubkey_bytes: PublisherKey = *peer_endpoint.as_bytes();
         let events = self.events.clone();
+        let team_root = self.team_root;
+        let our_pubkey = self.our_pubkey;
+        let snapshot = self.snapshot.clone();
+        let ep = self.ep.clone();
+        let dht = self.dht.clone();
+        let self_cap = self.self_cap;
+        let pool = self.pool.clone();
+        let my_id = self.my_id;
         let span = info_span!(
             "auth-handshake",
             peer = %peer_endpoint.fmt_short(),
@@ -1238,7 +1281,7 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                         partial_cap_bytes,
                     })) => {
                         let _ = events.send(NetEvent::CapRequest {
-                            requester: peer_pubkey,
+                            requester: peer_pubkey_bytes,
                             partial_cap_bytes,
                         });
                         let _ = crate::handshake::respond(
@@ -1251,16 +1294,144 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                         cap_bytes,
                         sig_bytes,
                     })) => {
-                        let _ = events.send(NetEvent::CapDelivered {
-                            issuer: peer_pubkey,
-                            cap_bytes,
-                            sig_bytes,
-                        });
-                        let _ = crate::handshake::respond(
-                            &mut send,
-                            crate::handshake::STATUS_OK,
-                        )
-                        .await;
+                        use triblespace_core::blob::Blob;
+                        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+                        use triblespace_core::inline::Inline;
+                        use triblespace_core::inline::encodings::hash::Handle;
+
+                        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes.clone());
+                        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
+                        let cap_hash: RawHash = *blake3::hash(&cap_bytes).as_bytes();
+                        let sig_hash: RawHash = *blake3::hash(&sig_bytes).as_bytes();
+                        let cap_handle: Inline<Handle<SimpleArchive>> =
+                            Inline::new(cap_hash);
+                        let sig_handle: Inline<Handle<SimpleArchive>> =
+                            Inline::new(sig_hash);
+
+                        // Verify-with-swarm-fetch: try local first, then
+                        // pull missing chain blobs via the same
+                        // DHT-routed pool path OP_AUTH uses. The dialer
+                        // is the immediate issuer and almost certainly
+                        // has the parent cap, but for 3+ hop chains the
+                        // intermediate cap might live elsewhere — DHT
+                        // provider lookup finds them either way.
+                        let verify_once = |fetched: &HashMap<RawHash, Vec<u8>>| {
+                            let snap_for_fetch = snapshot.clone();
+                            let fetched_for_lookup = fetched.clone();
+                            let cap_blob_for_fetch = cap_blob.clone();
+                            let sig_blob_for_fetch = sig_blob.clone();
+                            triblespace_core::repo::capability::verify_chain(
+                                team_root,
+                                sig_handle,
+                                our_pubkey,
+                                move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                                    if h.raw == cap_hash {
+                                        return Some(cap_blob_for_fetch.clone());
+                                    }
+                                    if h.raw == sig_hash {
+                                        return Some(sig_blob_for_fetch.clone());
+                                    }
+                                    if let Some(bytes) = snap_for_fetch
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .and_then(|s| s.get_blob(&h.raw))
+                                    {
+                                        return Some(Blob::new(anybytes::Bytes::from_source(bytes)));
+                                    }
+                                    let bytes = fetched_for_lookup.get(&h.raw)?.clone();
+                                    Some(Blob::new(anybytes::Bytes::from_source(bytes)))
+                                },
+                            )
+                        };
+
+                        let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+                        let mut result = verify_once(&fetched);
+
+                        if matches!(
+                            result,
+                            Err(triblespace_core::repo::capability::VerifyError::Fetch),
+                        ) {
+                            debug!(
+                                sig = %hex::encode(&sig_hash[..4]),
+                                "OP_DELIVER_CAP: chain incomplete locally, swarm-fetching",
+                            );
+                            let dialer_addr: EndpointAddr =
+                                peer_endpoint_for_dialer(
+                                    ed25519_dalek::VerifyingKey::from_bytes(
+                                        &peer_pubkey_bytes,
+                                    )
+                                    .expect("iroh peer pubkey parses"),
+                                );
+                            // Cold-start bootstrap: we may not have a
+                            // valid `self_cap` of our own yet (this is
+                            // the first cap landing on us). Use the
+                            // just-received `sig_hash` as the
+                            // OP_AUTH credential for the swarm-fetch.
+                            // It's genuinely ours (`cap_subject == us`,
+                            // signed by the dialer); the remote's own
+                            // OP_AUTH path validates the chain against
+                            // team_root, so a forged cap couldn't pass
+                            // here either. The dialer (immediate
+                            // issuer) trivially accepts it because
+                            // they signed it; deeper peers swarm-walk
+                            // the chain themselves on their auth path.
+                            let bootstrap_self_cap =
+                                if self_cap == [0u8; 32] { sig_hash } else { self_cap };
+                            fetched = swarm_fetch_chain(
+                                &ep, dialer_addr, &sig_hash, &dht,
+                                &bootstrap_self_cap, &pool, my_id,
+                            )
+                            .await;
+                            debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
+                            result = verify_once(&fetched);
+                        }
+
+                        match result {
+                            Ok(_verified) => {
+                                debug!(
+                                    sig = %hex::encode(&sig_hash[..4]),
+                                    issuer = %hex::encode(&peer_pubkey_bytes[..4]),
+                                    "OP_DELIVER_CAP: chain verified; absorbing",
+                                );
+                                // Emit Blob events for everything the
+                                // verify needed — the in-band leaf
+                                // pair + every swarm-fetched parent.
+                                // mpsc preserves order so the Peer
+                                // thread sees these before the
+                                // CapDelivered marker that triggers
+                                // pinning.
+                                let _ = events.send(NetEvent::Blob(cap_bytes.clone()));
+                                let _ = events.send(NetEvent::Blob(sig_bytes.clone()));
+                                for (_, bytes) in fetched.drain() {
+                                    let _ = events.send(NetEvent::Blob(
+                                        anybytes::Bytes::from_source(bytes),
+                                    ));
+                                }
+                                let _ = events.send(NetEvent::CapDelivered {
+                                    issuer: peer_pubkey_bytes,
+                                    cap_bytes,
+                                    sig_bytes,
+                                });
+                                let _ = crate::handshake::respond(
+                                    &mut send,
+                                    crate::handshake::STATUS_OK,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = ?e,
+                                    sig = %hex::encode(&sig_hash[..4]),
+                                    "OP_DELIVER_CAP: chain verify failed; rejecting",
+                                );
+                                let _ = crate::handshake::respond(
+                                    &mut send,
+                                    crate::handshake::STATUS_REJECTED,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Ok(None) => {
                         let _ = crate::handshake::respond(

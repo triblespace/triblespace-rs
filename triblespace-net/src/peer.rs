@@ -449,23 +449,23 @@ where
         use triblespace_core::blob::Blob;
         use triblespace_core::repo::BlobStoreGet;
 
-        // Reconstitute blobs. anybytes::Bytes is Arc-refcounted so
-        // `.clone()` here is a refcount bump, not a byte-copy — the
-        // same backing buffer flows through the verify path and into
-        // the pile put without re-allocating.
-        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes.clone());
-        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
+        // Verification + swarm-fetch of any missing chain blobs
+        // already happened in the host thread's HandshakeHandler
+        // (the OP_DELIVER_CAP path doesn't ack STATUS_OK until the
+        // chain verifies under our pubkey). The cap+sig blobs +
+        // every fetched parent have already arrived as earlier
+        // `NetEvent::Blob` events on this channel, so by the time
+        // we get here `self.store` already holds them and we only
+        // need to pin the team-cap pin onto the leaf pair.
+        let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes);
+        let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes);
+        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-        // Subject must be US — a delivered cap is for our pubkey,
-        // which we derive from our own signing key. Earlier
-        // implementations passed `team_root` as a stand-in (subject
-        // == team_root only when we ARE the founder), so any
-        // delegated cap landed at SubjectMismatch even when the
-        // chain was otherwise valid.
-        let expected_subject = self.signing_key.verifying_key();
-
-        // Build a fetch closure that consults the in-process pile.
+        // Defensive sanity: the cap+sig blobs really are in the
+        // store. If not, the host emitted the CapDelivered event
+        // without the preceding Blob events somehow — log and bail
+        // rather than pin handles that won't resolve.
         let Ok(reader) = self.store.reader() else {
             tracing::warn!(
                 issuer = %hex::encode(&issuer[..4]),
@@ -473,67 +473,33 @@ where
             );
             return;
         };
-        // The cap and sig blobs themselves aren't in the pile yet — we
-        // need to short-circuit fetches for them via a map, falling
-        // back to the pile for any intermediate chain caps.
-        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-        let cap_blob_for_fetch = cap_blob.clone();
-        let sig_blob_for_fetch = sig_blob.clone();
-        let fetch = move |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-            if h.raw == cap_handle.raw {
-                return Some(cap_blob_for_fetch.clone());
-            }
-            if h.raw == sig_handle.raw {
-                return Some(sig_blob_for_fetch.clone());
-            }
-            reader.get::<Blob<SimpleArchive>, SimpleArchive>(h).ok()
-        };
-        match triblespace_core::repo::capability::verify_chain(
+        if reader.get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle).is_err()
+            || reader.get::<Blob<SimpleArchive>, SimpleArchive>(sig_handle).is_err()
+        {
+            tracing::warn!(
+                issuer = %hex::encode(&issuer[..4]),
+                "CapDelivered: blobs missing from store (host should have emitted Blob events first)"
+            );
+            return;
+        }
+
+        match crate::policy::pin_team_cap(
+            &mut self.store,
             self.team_root,
+            cap_handle,
             sig_handle,
-            expected_subject,
-            fetch,
         ) {
-            Ok(_verified) => {
-                // Persist both blobs into the local store, then pin
-                // them via the per-team-cap pin. The pin is a
-                // single-slot branch: each renewal overwrites the
-                // head, making old cap+sig blobs unreachable so the
-                // next compaction reclaims them. Forward security at
-                // the storage layer falls out naturally — only the
-                // current cap survives.
-                let _ = self
-                    .store
-                    .put::<UnknownBlob, anybytes::Bytes>(cap_bytes);
-                let _ = self
-                    .store
-                    .put::<UnknownBlob, anybytes::Bytes>(sig_bytes);
-                match crate::policy::pin_team_cap(
-                    &mut self.store,
-                    self.team_root,
-                    cap_handle,
-                    sig_handle,
-                ) {
-                    Some(_bid) => {
-                        tracing::info!(
-                            issuer = %hex::encode(&issuer[..4]),
-                            sig = %hex::encode(&sig_handle.raw[..4]),
-                            "CapDelivered: verified and pinned on team-cap pin"
-                        );
-                    }
-                    None => {
-                        tracing::warn!(
-                            issuer = %hex::encode(&issuer[..4]),
-                            "CapDelivered: verified but team-cap pin failed"
-                        );
-                    }
-                }
+            Some(_bid) => {
+                tracing::info!(
+                    issuer = %hex::encode(&issuer[..4]),
+                    sig = %hex::encode(&sig_handle.raw[..4]),
+                    "CapDelivered: pinned on team-cap pin"
+                );
             }
-            Err(e) => {
+            None => {
                 tracing::warn!(
                     issuer = %hex::encode(&issuer[..4]),
-                    error = ?e,
-                    "CapDelivered: verify_chain failed; dropping"
+                    "CapDelivered: team-cap pin failed"
                 );
             }
         }
