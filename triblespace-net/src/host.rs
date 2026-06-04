@@ -1294,10 +1294,12 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                         cap_bytes,
                         sig_bytes,
                     })) => {
-                        use triblespace_core::blob::Blob;
+                        use triblespace_core::blob::{Blob, TryFromBlob};
                         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
                         use triblespace_core::inline::Inline;
                         use triblespace_core::inline::encodings::hash::Handle;
+                        use triblespace_core::trible::TribleSet;
+                        use triblespace_core::macros::{find, pattern};
 
                         let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes.clone());
                         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
@@ -1307,6 +1309,57 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                             Inline::new(cap_hash);
                         let sig_handle: Inline<Handle<SimpleArchive>> =
                             Inline::new(sig_hash);
+
+                        // Cheap DoS guard before any swarm work: the
+                        // cap's declared `cap_issuer` must equal the
+                        // TLS-verified pubkey of whoever just dialed
+                        // us. The auth-handshake ALPN is open to
+                        // unauthenticated peers, so without this gate
+                        // a stranger could ship a cap with our subject
+                        // + a `cap_parent` pointing at random hashes,
+                        // and we'd burn DHT lookups chasing chain
+                        // blobs that will never verify. The check
+                        // costs one `find!` against the leaf cap
+                        // blob.
+                        let declared_issuer = if let Ok(cap_set) =
+                            TribleSet::try_from_blob(cap_blob.clone())
+                        {
+                            find!(
+                                (issuer: ed25519_dalek::VerifyingKey),
+                                pattern!(&cap_set, [{
+                                    triblespace_core::repo::capability::cap_issuer: ?issuer,
+                                }])
+                            )
+                            .next()
+                            .map(|(k,)| k)
+                        } else {
+                            None
+                        };
+                        match declared_issuer {
+                            Some(issuer) if issuer.to_bytes() == peer_pubkey_bytes => {}
+                            Some(issuer) => {
+                                warn!(
+                                    declared_issuer = %hex::encode(&issuer.to_bytes()[..4]),
+                                    dialer = %hex::encode(&peer_pubkey_bytes[..4]),
+                                    "OP_DELIVER_CAP: cap_issuer doesn't match TLS dialer; rejecting",
+                                );
+                                let _ = crate::handshake::respond(
+                                    &mut send,
+                                    crate::handshake::STATUS_REJECTED,
+                                )
+                                .await;
+                                continue;
+                            }
+                            None => {
+                                warn!("OP_DELIVER_CAP: cap blob malformed or missing cap_issuer; rejecting");
+                                let _ = crate::handshake::respond(
+                                    &mut send,
+                                    crate::handshake::STATUS_MALFORMED,
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
 
                         // Verify-with-swarm-fetch: try local first, then
                         // pull missing chain blobs via the same
@@ -1363,24 +1416,24 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                                     )
                                     .expect("iroh peer pubkey parses"),
                                 );
-                            // Cold-start bootstrap: we may not have a
-                            // valid `self_cap` of our own yet (this is
-                            // the first cap landing on us). Use the
-                            // just-received `sig_hash` as the
-                            // OP_AUTH credential for the swarm-fetch.
-                            // It's genuinely ours (`cap_subject == us`,
-                            // signed by the dialer); the remote's own
-                            // OP_AUTH path validates the chain against
-                            // team_root, so a forged cap couldn't pass
-                            // here either. The dialer (immediate
-                            // issuer) trivially accepts it because
-                            // they signed it; deeper peers swarm-walk
-                            // the chain themselves on their auth path.
-                            let bootstrap_self_cap =
-                                if self_cap == [0u8; 32] { sig_hash } else { self_cap };
+                            // Use the just-received `sig_hash` as the
+                            // OP_AUTH credential for the swarm-fetch
+                            // — for both first-time delivery and
+                            // renewals. The new cap is by definition
+                            // the one we're going to be using going
+                            // forward; the prior `self_cap` is at
+                            // best redundant and at worst
+                            // already-expired. The dialer-equals-
+                            // issuer precheck above already
+                            // established that the cap was actually
+                            // signed by this dialer, so they trivially
+                            // accept it on AUTH (they have its
+                            // chain), and the remote's own OP_AUTH
+                            // path validates against team_root for
+                            // anyone deeper.
                             fetched = swarm_fetch_chain(
                                 &ep, dialer_addr, &sig_hash, &dht,
-                                &bootstrap_self_cap, &pool, my_id,
+                                &sig_hash, &pool, my_id,
                             )
                             .await;
                             debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
