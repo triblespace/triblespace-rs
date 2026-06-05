@@ -295,7 +295,20 @@ where
             }
         }
 
-        // ── Phase 2: diff-and-publish blob deltas ─────────────────────
+        // ── Phase 2: refresh the snapshot served by the network thread ─
+        //
+        // MUST happen before any announce/gossip below: peers who hear
+        // our announce/gossip will dial us to fetch the closure, and
+        // the network thread serves them out of this snapshot. If we
+        // gossiped first, a fast-dialing peer would hit `has_blob =
+        // false` on the still-stale snapshot and the server would deny
+        // OP_CHILDREN/OP_GET_BLOB as "out of scope" — even though we
+        // just told them we have it.
+        if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
+            self.sender.update_snapshot(snap);
+        }
+
+        // ── Phase 3: diff-and-publish blob deltas ─────────────────────
         // ReadOnly skips the publish: we still update the baseline
         // reader so we don't accumulate a publish backlog if the
         // direction later changes. On the first refresh the baseline
@@ -322,7 +335,7 @@ where
             self.last_blob_reader = Some(current);
         }
 
-        // ── Phase 3: diff-and-publish branch deltas ───────────────────
+        // ── Phase 4: diff-and-publish branch deltas ───────────────────
         // ReadOnly skips this entire phase — followers don't gossip.
         if self.direction != SyncDirection::ReadOnly {
             let bids: Vec<Id> = match self.store.pins() {
@@ -350,11 +363,6 @@ where
                     self.last_branches.insert(bid, head.raw);
                 }
             }
-        }
-
-        // ── Phase 4: refresh the snapshot served by the network thread ─
-        if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
-            self.sender.update_snapshot(snap);
         }
     }
 
@@ -765,6 +773,11 @@ where
         if self.direction == SyncDirection::ReadOnly {
             return;
         }
+        // Refresh the snapshot served by the network thread BEFORE
+        // gossiping — see `refresh` Phase 2 for the ordering rationale.
+        if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
+            self.sender.update_snapshot(snap);
+        }
         let bids: Vec<Id> = match self.store.pins() {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),
             Err(_) => return,
@@ -781,10 +794,6 @@ where
                 self.sender.gossip(bid_bytes, head.raw);
                 self.last_branches.insert(bid, head.raw);
             }
-        }
-        // Refresh the snapshot served by the network thread.
-        if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
-            self.sender.update_snapshot(snap);
         }
     }
 
@@ -831,6 +840,13 @@ where
         Handle<Sch>: InlineEncoding,
     {
         let handle = self.store.put(item)?;
+        // Snapshot first, then announce — see `refresh` Phase 2 for the
+        // ordering rationale. Without this, DHT-receivers of the announce
+        // dial us, OP_GET_BLOB hits the stale snapshot, returns missing,
+        // and the receiver waits for backoff to retry.
+        if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
+            self.sender.update_snapshot(snap);
+        }
         if self.direction != SyncDirection::ReadOnly {
             self.sender.announce(handle.raw);
         }
@@ -884,6 +900,12 @@ where
         let result = self.store.update(id, old, new.clone())?;
         if let PushResult::Success() = &result {
             if let Some(head) = new {
+                // Refresh the snapshot served by the network thread
+                // BEFORE gossiping — see `refresh` Phase 2 for the
+                // ordering rationale.
+                if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
+                    self.sender.update_snapshot(snap);
+                }
                 // Tracking branches are local mirror state and must NOT be
                 // re-gossiped — otherwise the publisher would receive its
                 // own tracking branch back and create a tracking-of-the-
@@ -897,10 +919,6 @@ where
                     let bid_bytes: [u8; 16] = id.into();
                     self.sender.gossip(bid_bytes, head.raw);
                     self.last_branches.insert(id, head.raw);
-                }
-                // Refresh the snapshot served by the network thread.
-                if let Some(snap) = StoreSnapshot::from_store(&mut self.store) {
-                    self.sender.update_snapshot(snap);
                 }
             }
         }

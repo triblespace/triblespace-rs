@@ -403,6 +403,15 @@ pub enum PushResult {
     Conflict(Option<Inline<Handle<SimpleArchive>>>),
 }
 
+/// A point-in-time snapshot of (pin id → head) mappings.
+///
+/// PATCH keyed by 16-byte pin id, valued by the pinned head's handle.
+/// Cloning is O(1) (refcount bump), so this is the right primitive for
+/// handing pin state across threads or into long-lived serving views.
+///
+/// Returned by [`PinStore::pin_snapshot`].
+pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
+
 /// Storage backend for pins: named, atomically-updatable handles to
 /// SimpleArchive blobs.
 ///
@@ -451,9 +460,33 @@ pub trait PinStore {
     /// the `metadata::name` attribute on each pin's head metadata.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
 
-    // NOTE: keep the API lean — callers may call `pins()` and handle
-    // the fallible iterator directly; we avoid adding an extra helper
-    // here.
+    /// Cheap point-in-time snapshot of the (pin id → head) map.
+    ///
+    /// Returns a [`PinSnapshot`] — a PATCH keyed by pin id, valued by
+    /// the pinned head's handle. Cloning the returned PATCH is O(1)
+    /// (refcount bump), so this is also the right primitive for handing
+    /// the pin state to background threads / async tasks without
+    /// re-querying the store.
+    ///
+    /// The default impl walks `pins()` + `head()`. Stores with a
+    /// PATCH-backed pin index ([`crate::repo::pile::Pile`]) override to
+    /// clone the index directly. Head errors during the default walk
+    /// are skipped silently — partial snapshots are acceptable for the
+    /// "serving view" use case; callers that need strict atomicity
+    /// should drive [`pins`](Self::pins) + [`head`](Self::head)
+    /// themselves and handle errors.
+    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinsError> {
+        let mut out = PinSnapshot::new();
+        let ids: Vec<Id> = self.pins()?.filter_map(|r| r.ok()).collect();
+        for id in ids {
+            if let Ok(Some(h)) = self.head(id) {
+                let bid: [u8; 16] = id.into();
+                let entry = Entry::with_value(&bid, h);
+                out.insert(&entry);
+            }
+        }
+        Ok(out)
+    }
 
     /// Retrieves the current head of a pin by its id.
     ///

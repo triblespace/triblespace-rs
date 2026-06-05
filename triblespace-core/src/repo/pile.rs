@@ -1009,6 +1009,12 @@ impl PinStore for Pile
         Ok(self.branches.get(&raw).copied())
     }
 
+    fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
+        // Pin index is already a PATCH; clone is an O(1) refcount bump.
+        self.refresh()?;
+        Ok(self.branches.clone())
+    }
+
     /// Updates the head of `id` to `new` if it matches `old`.
     ///
     /// This method does not verify that `new` refers to a blob stored in the pile,

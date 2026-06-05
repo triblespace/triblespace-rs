@@ -143,7 +143,7 @@ pub enum SyncDirection {
 /// Snapshot of store state for serving protocol requests.
 pub struct StoreSnapshot<R> {
     pub reader: R,
-    pub branches: Vec<(RawPinId, RawHash)>,
+    pub branches: triblespace_core::repo::PinSnapshot,
 }
 
 impl StoreSnapshot<()> {
@@ -152,16 +152,7 @@ impl StoreSnapshot<()> {
         S: triblespace_core::repo::BlobStore
             + triblespace_core::repo::PinStore,
     {
-        let ids: Vec<triblespace_core::id::Id> = store.pins().ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-        let mut branches = Vec::new();
-        for id in ids {
-            if let Ok(Some(head)) = store.head(id) {
-                let id_bytes: [u8; 16] = id.into();
-                branches.push((id_bytes, head.raw));
-            }
-        }
+        let branches = store.pin_snapshot().ok()?;
         let reader = store.reader().ok()?;
         Some(StoreSnapshot { reader, branches })
     }
@@ -175,7 +166,7 @@ impl StoreSnapshot<()> {
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
-    fn list_branches(&self) -> &[(RawPinId, RawHash)];
+    fn branches(&self) -> &triblespace_core::repo::PinSnapshot;
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -196,7 +187,7 @@ where
         self.get_blob(hash).is_some()
     }
 
-    fn list_branches(&self) -> &[(RawPinId, RawHash)] {
+    fn branches(&self) -> &triblespace_core::repo::PinSnapshot {
         &self.branches
     }
 }
@@ -1871,13 +1862,13 @@ fn reachable_set_for(
         return None;
     }
 
-    let mut frontier: Vec<RawHash> = snap
-        .list_branches()
+    let branches = snap.branches();
+    let mut frontier: Vec<RawHash> = branches
         .iter()
-        .filter_map(|(bid, head)| {
+        .filter_map(|bid| {
             triblespace_core::id::Id::new(*bid)
                 .filter(|id| verified.grants_read_on(id))
-                .map(|_| *head)
+                .and_then(|_| branches.get(bid).map(|h| h.raw))
         })
         .collect();
     let mut reachable: HashSet<RawHash> = HashSet::new();
