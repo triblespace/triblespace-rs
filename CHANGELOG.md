@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-06-05
+
+### Added
+
+- **`triblespace_core::repo::PinSnapshot`** — type alias for
+  `PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>`, the
+  natural representation of a frozen "what's pinned right now" view.
+- **`PinStore::pin_snapshot()`** — cheap point-in-time snapshot of
+  the (pin id → head) map. Default impl walks `pins()` + `head()`;
+  Pile overrides with `self.branches.clone()` (O(refcount bump)).
+  Replaces the per-refresh Vec rebuild that previously lived in
+  `triblespace-net`'s `StoreSnapshot::from_store`.
+
+### Changed
+
+- **`triblespace-net`: snapshot-first publish ordering.** Every
+  `announce` / `gossip` site in `peer.rs` now runs *after*
+  `update_snapshot`. Closes a race where a peer dialing in fast
+  after a gossip would hit the still-stale serving snapshot,
+  `has_blob` returned false, and `OP_CHILDREN` / `OP_GET_BLOB`
+  denied the request as "out of scope" even though we'd just told
+  them we have the closure. Four sites fixed: `refresh`,
+  `republish_branches`, `BlobStorePut::put`, `PinStore::update`.
+- **`triblespace-net`: `StoreSnapshot.branches` is now a
+  `PinSnapshot`.** Drops the per-refresh `Vec<(RawPinId, RawHash)>`
+  rebuild in favor of the cheap PATCH clone on the Pile fast path.
+  `AnySnapshot::branches()` returns `&PinSnapshot` (was
+  `list_branches() -> &[(RawPinId, RawHash)]`).
+- **`triblespace-net`: OP_DELIVER_CAP verifies inline + swarm-fetches
+  missing chain blobs** using the just-received signature handle as
+  bootstrap credential. Receiver runs a dialer-equals-issuer
+  precheck on the incoming cap so a malicious peer can't make us
+  swarm-fetch garbage chains. Sender side: renewal daemon retries
+  undelivered caps with a 15s per-entry cooldown; delivery is
+  considered confirmed when the subject authenticates against
+  pile-sync with the new cap (`NetEvent::CapDeliveryConfirmed`),
+  not on the wire `STATUS_OK` ack.
+- **`triblespace-net::host`: trace-level instrumentation** at the
+  fetch-reachable hot path (pool seed, children_one, providers_for,
+  fetch_one) for diagnosing sync stalls in the field.
+
 ## [0.45.0] - 2026-06-03
 
 ### Added
