@@ -604,6 +604,16 @@ where
 /// + handles in place).
 ///
 /// Returns the new entry's entity id.
+///
+/// Idempotent on `(subject, scope)`: if an *active* (non-retracted)
+/// entry already exists for the same pair, returns that entry's id
+/// without minting a duplicate. This handles the
+/// killed-approve-then-retry case (the killed CLI's writes are
+/// durable, the retry would otherwise create a phantom-twin entry
+/// that the renewal daemon would dispatch in parallel with the
+/// original — wasted wire bytes, no correctness benefit). Genuine
+/// re-issuance with a fresh cap+sig should go through
+/// [`update_policy_entry`] instead, which rewrites in place.
 pub fn record_policy_entry<S>(
     store: &mut S,
     subject: ed25519_dalek::VerifyingKey,
@@ -616,6 +626,15 @@ where
     S: BlobStore + BlobStorePut + PinStore,
 {
     use triblespace_core::id::ExclusiveId;
+
+    // Idempotent guard: if an active entry for this (subject, scope)
+    // already exists, return its id rather than minting a duplicate.
+    if let Some(existing) = list_renewal_policy(store)
+        .into_iter()
+        .find(|e| e.retracted_at.is_none() && e.subject == subject && e.scope == scope)
+    {
+        return Some(existing.id);
+    }
 
     let (bid, prev_head) = match find_local_only_pin_of_kind(store, KIND_RENEWAL_POLICY) {
         Some(bid) => (bid, store.head(bid).ok().flatten()),

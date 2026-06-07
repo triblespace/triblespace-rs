@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.2] - 2026-06-07
+
+### Fixed
+
+- **`team approve` no longer hangs when the subject is offline.**
+  Previously dispatched OP_DELIVER_CAP via `block_on(one_shot_deliver_cap)`
+  before marking the request `STATUS_APPROVED`, which had no timeout
+  and would block forever if the subject couldn't be reached (the
+  whole-point case for async approve). The CLI now does only local
+  pile writes — persist cap+sig blobs, record the renewal-policy
+  entry, mark the request approved, close — and relies on the
+  running sync daemon's `redispatch_undelivered` loop to push the
+  cap on its next tick. That loop has to exist anyway (subjects are
+  commonly offline at approve time), so the in-CLI dispatcher was
+  redundant; it also spun up a fresh iroh endpoint with the
+  *same* signing key as the daemon's long-lived endpoint, producing
+  the `"Another endpoint connected with the same endpoint id"`
+  warns we kept seeing on the N0 relay.
+- **`record_policy_entry` deduplicates by `(subject, scope)`.** If
+  an active (non-retracted) entry already exists for the same
+  subject+scope pair, the helper returns its id rather than
+  minting a phantom-twin entry. Handles the
+  killed-approve-then-retry case (the killed CLI's writes are
+  durable; the retry would otherwise create a duplicate entry the
+  renewal daemon would dispatch in parallel with the original).
+  Genuine re-issuance with a fresh cap+sig still goes through
+  `update_policy_entry` (in-place rewrite).
+
+### Removed
+
+- **`triblespace_net::handshake::one_shot_deliver_cap`** — was used
+  only by `team approve`, which now delegates dispatch to the
+  running daemon. `one_shot_endpoint` and `one_shot_request_cap`
+  stay (still legitimately used by `team request-join`, where the
+  requester has no daemon yet by definition).
+
 ## [0.46.1] - 2026-06-07
 
 ### Fixed

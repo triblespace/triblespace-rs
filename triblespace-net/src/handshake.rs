@@ -287,25 +287,3 @@ pub async fn one_shot_request_cap(
     status
 }
 
-/// One-shot OP_DELIVER_CAP: dial `target` and ship a signed cap+sig
-/// pair. Used by `team approve` to deliver the first cap after
-/// approving a pending request.
-pub async fn one_shot_deliver_cap(
-    key: ed25519_dalek::SigningKey,
-    target: ed25519_dalek::VerifyingKey,
-    cap_bytes: &[u8],
-    sig_bytes: &[u8],
-) -> Result<u8> {
-    use iroh_base::EndpointId;
-    let ep = one_shot_endpoint(key).await?;
-    let target_id = EndpointId::from_bytes(&target.to_bytes())
-        .map_err(|e| anyhow!("target pubkey: {e}"))?;
-    let conn = ep
-        .connect(target_id, AUTH_HANDSHAKE_ALPN)
-        .await
-        .map_err(|e| anyhow!("connect: {e}"))?;
-    let status = send_deliver_cap(&conn, cap_bytes, sig_bytes).await;
-    conn.close(0u32.into(), b"ok");
-    drop(ep);
-    status
-}

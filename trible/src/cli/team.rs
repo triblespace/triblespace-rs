@@ -1375,11 +1375,28 @@ fn run_approve(
     // anybytes::Bytes is Arc-refcounted; clone is a refcount bump,
     // not a byte-copy. We need the bytes after store_blob consumes
     // the typed Blob wrapper.
-    let cap_bytes = cap_blob.bytes.clone();
-    let sig_bytes = sig_blob.bytes.clone();
-
-    // Persist locally + record on the renewal-policy pin so the daemon
-    // takes over future renewals.
+    // Persist cap+sig blobs, record on the renewal-policy pin, mark
+    // the request approved, close — purely local writes, no network.
+    //
+    // The running `pile net sync` daemon's `redispatch_undelivered`
+    // loop picks the new policy entry up on its next tick (every
+    // 100ms) and dispatches OP_DELIVER_CAP over its already-up iroh
+    // endpoint. We don't dispatch from the CLI for three reasons:
+    //
+    // 1. The subject is commonly offline at approve-time — the whole
+    //    point of an async request/approve flow is that the requester
+    //    and admin needn't be online simultaneously. The daemon's
+    //    re-dispatch loop has to exist for that case to work; once
+    //    it exists, an extra "try once and hope" from the CLI is
+    //    redundant.
+    // 2. The CLI's dispatcher (`one_shot_deliver_cap`) spins up a
+    //    fresh iroh endpoint with the issuer's signing key — *same*
+    //    pubkey as the daemon's long-lived endpoint. N0's relay
+    //    server treats that as "another endpoint connected with the
+    //    same id" and the duplicate-identity warns spam the log.
+    // 3. The block-on dispatch had no timeout: a 30-day-fresh cap to
+    //    an offline subject hung the CLI forever instead of returning
+    //    with "daemon will retry."
     store_blob(&mut pile, cap_blob)?;
     store_blob(&mut pile, sig_blob)?;
 
@@ -1392,23 +1409,6 @@ fn run_approve(
         sig_handle,
     );
 
-    // Dispatch via auth-handshake.
-    println!(
-        "delivering OP_DELIVER_CAP to {}…",
-        hex::encode(subject.to_bytes())
-    );
-    let dispatch_result = block_on(async {
-        triblespace_net::handshake::one_shot_deliver_cap(
-            issuer_key.clone(),
-            subject,
-            &cap_bytes,
-            &sig_bytes,
-        )
-        .await
-    });
-
-    // Mark request as approved regardless of dispatch outcome —
-    // the daemon will retry delivery on subsequent renewal ticks.
     let _ = triblespace_net::policy::set_request_status(
         &mut pile,
         request.id,
@@ -1423,22 +1423,10 @@ fn run_approve(
         let eid_bytes: [u8; 16] = eid.into();
         println!("renewal entry:     {}", hex::encode(eid_bytes));
     }
-    match dispatch_result {
-        Ok(triblespace_net::handshake::STATUS_OK) => {
-            println!("delivered: recipient ACK OK.");
-        }
-        Ok(status) => {
-            println!(
-                "(delivery: recipient returned status {status:#x}; the renewal \
-                 daemon will retry on its next tick)"
-            );
-        }
-        Err(e) => {
-            println!(
-                "(delivery failed: {e}; the renewal daemon will retry on its next \
-                 tick once both peers are reachable)"
-            );
-        }
-    }
+    println!(
+        "  request marked APPROVED; the running sync daemon will deliver via \
+         OP_DELIVER_CAP on its next tick (visible in `team list-issued` when \
+         the subject's daemon auths back with the new cap)"
+    );
     Ok(())
 }
