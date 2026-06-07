@@ -1692,7 +1692,7 @@ async fn serve_stream(
                 // delivered (the subject has the cap and can use it).
                 let _ = events.send(NetEvent::CapDeliveryConfirmed {
                     subject: peer_pubkey.to_bytes(),
-                    cap_hash: cap_handle_raw,
+                    sig_handle: cap_handle_raw,
                 });
                 *auth_state.write().await = Some(verified);
                 send_u8(send, AUTH_OK).await?;

@@ -83,15 +83,21 @@ pub enum NetEvent {
         sig_bytes: Bytes,
     },
     /// `subject` successfully authenticated against our pile-sync
-    /// `OP_AUTH` stream by presenting cap-sig handle `cap_hash`.
+    /// `OP_AUTH` stream by presenting signature handle `sig_handle`.
     /// This is the unambiguous "the subject has the cap and uses
     /// it" signal — the wire-level STATUS_OK on `OP_DELIVER_CAP`
     /// only tells us the bytes landed; auth tells us the subject
     /// can both load AND verify the chain. The Peer side uses this
     /// to mark the matching renewal-policy entry as delivered so
     /// the daemon's next tick skips it from the redispatch set.
+    ///
+    /// Field is the *signature* handle, not the cap blob handle —
+    /// OP_AUTH wires the sig blob since that's the credential the
+    /// dialer needs to prove possession of. Match against
+    /// `PolicyEntry::latest_sig` (not `latest_cap`) when looking up
+    /// the corresponding renewal-policy entry.
     CapDeliveryConfirmed {
         subject: PublisherKey,
-        cap_hash: RawHash,
+        sig_handle: RawHash,
     },
 }

@@ -1098,6 +1098,10 @@ fn run_list_issued(pile_path: PathBuf) -> Result<()> {
         if let Some(r) = &e.retracted_at {
             println!("    retracted: {}", format_expiry(r));
         }
+        match &e.delivered_at {
+            Some(d) => println!("    delivered: {}", format_expiry(d)),
+            None => println!("    delivered: (not yet)"),
+        }
         println!();
     }
     Ok(())

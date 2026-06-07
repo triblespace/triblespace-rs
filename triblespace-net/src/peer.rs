@@ -259,25 +259,26 @@ where
                     // as our own outgoing-cap blobs.
                     self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
                 }
-                NetEvent::CapDeliveryConfirmed { subject, cap_hash } => {
-                    // The subject's daemon ack'd receipt of a cap we
-                    // dispatched. Find the matching policy entry (by
-                    // subject + latest_cap handle) and mark it as
-                    // delivered so the daemon's next tick skips it
-                    // from the re-dispatch set.
+                NetEvent::CapDeliveryConfirmed { subject, sig_handle } => {
+                    // The subject's daemon authenticated against us with
+                    // a cap we dispatched. `sig_handle` is the signature
+                    // blob handle (what OP_AUTH wires) — match by
+                    // subject + latest_sig and mark the entry delivered
+                    // so the daemon's next tick skips it from the
+                    // re-dispatch set.
                     use triblespace_core::inline::Inline;
                     use triblespace_core::inline::encodings::hash::Handle;
                     let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
                         Ok(k) => k,
                         Err(_) => continue,
                     };
-                    let cap_handle: Inline<Handle<SimpleArchive>> =
-                        Inline::new(cap_hash);
+                    let sig_inline: Inline<Handle<SimpleArchive>> =
+                        Inline::new(sig_handle);
                     if let Some(entry_id) =
-                        crate::policy::find_policy_entry_by_subject_and_cap(
+                        crate::policy::find_policy_entry_by_subject_and_sig(
                             &mut self.store,
                             subject_key,
-                            cap_handle,
+                            sig_inline,
                         )
                     {
                         let _ = crate::policy::mark_policy_delivered(
@@ -286,7 +287,7 @@ where
                         );
                         tracing::debug!(
                             subject = %hex::encode(&subject[..4]),
-                            cap = %hex::encode(&cap_hash[..4]),
+                            sig = %hex::encode(&sig_handle[..4]),
                             entry = ?entry_id,
                             "delivery confirmed; policy entry marked delivered"
                         );
