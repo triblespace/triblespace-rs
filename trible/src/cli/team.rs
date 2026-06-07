@@ -259,6 +259,37 @@ fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
     Ok(pile)
 }
 
+/// Open + restore the pile at `path`, run `f`, close the pile, propagate.
+///
+/// Calls `pile.close()` unconditionally on the way out — both happy
+/// path and any `Err` returned by `f`. `Pile`'s `Drop` impl warns
+/// (loudly, on stderr) when the pile is dropped without `close()`, so
+/// every `?` or `bail!` between `open_pile` and the final `close` in
+/// a CLI subcommand was a latent warning waiting to surface. Routing
+/// through this helper makes the "every successful subcommand closes
+/// its pile" invariant load-bearing on the type system instead of
+/// on hand-discipline.
+///
+/// If both `f` returns Err AND `close` fails, the user-facing error
+/// (f's) wins — close errors are appended to the message so they're
+/// still visible but don't shadow the original cause.
+fn with_pile<T>(
+    path: &PathBuf,
+    f: impl FnOnce(&mut PileBlake3) -> Result<T>,
+) -> Result<T> {
+    let mut pile = open_pile(path)?;
+    let result = f(&mut pile);
+    let close_err = pile.close().err();
+    match (result, close_err) {
+        (Ok(t), None) => Ok(t),
+        (Ok(_), Some(e)) => Err(anyhow!("pile close: {e:?}")),
+        (Err(e), None) => Err(e),
+        (Err(e), Some(close_e)) => {
+            Err(anyhow!("{e:#}; additionally pile close failed: {close_e:?}"))
+        }
+    }
+}
+
 fn load_or_generate_signing_key(
     path: Option<PathBuf>,
     pile_path: &PathBuf,
@@ -1255,167 +1286,171 @@ fn run_approve(
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
 
-    // Load the issuer's signing key + open the pile.
-    let mut pile = open_pile(&pile_path)?;
     let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
 
-    // Look up the pending request entry. Read the partial cap blob,
-    // its subject pubkey, scope_root, and expiry — those are what the
-    // requester proposed. We pass them through to build_capability
-    // (along with our parent cap+sig and signing key).
-    let pending = triblespace_net::policy::list_pending_requests(&mut pile);
-    let request = pending
-        .iter()
-        .find(|p| p.id == entry_id)
-        .ok_or_else(|| anyhow!("pending request {entry_hex} not found"))?;
+    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
 
-    if request.status != triblespace_net::policy::STATUS_PENDING {
-        bail!(
-            "request {entry_hex} is not PENDING (current status: another state)"
-        );
-    }
+        // Look up the pending request entry. Read the partial cap
+        // blob, its subject pubkey, scope_root, and expiry — those
+        // are what the requester proposed. We pass them through to
+        // build_capability (along with our parent cap+sig and
+        // signing key).
+        let pending = triblespace_net::policy::list_pending_requests(pile);
+        let request = pending
+            .iter()
+            .find(|p| p.id == entry_id)
+            .ok_or_else(|| anyhow!("pending request {entry_hex} not found"))?;
 
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let partial_cap_blob: Blob<SimpleArchive> = reader
-        .get(request.partial_cap)
-        .map_err(|e| anyhow!("fetch partial cap blob: {e:?}"))?;
-    let partial_set: TribleSet = TryFromBlob::try_from_blob(partial_cap_blob)
-        .map_err(|e| anyhow!("parse partial cap blob: {e:?}"))?;
-
-    let mut iter = find!(
-        (
-            e: Id,
-            subject: VerifyingKey,
-            scope_root: Id,
-            expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-        ),
-        pattern!(&partial_set, [{
-            ?e @
-            capability::cap_subject: ?subject,
-            capability::cap_scope_root: ?scope_root,
-            triblespace_core::metadata::expires_at: ?expiry,
-        }])
-    );
-    let (_cap_id, subject, scope_root, expiry) = match (iter.next(), iter.next()) {
-        (Some(row), None) => row,
-        _ => bail!("partial cap blob malformed (no unique subject/scope/expiry)"),
-    };
-
-    if subject != request.requester {
-        bail!(
-            "partial cap subject {} doesn't match requester {} — refusing to sign",
-            hex::encode(subject.to_bytes()),
-            hex::encode(request.requester.to_bytes()),
-        );
-    }
-
-    // Extract scope_facts (all tribles hanging off scope_root in the
-    // partial cap). build_capability takes scope_facts so we preserve
-    // whatever the requester wrote there.
-    let mut scope_facts = TribleSet::new();
-    for t in partial_set.iter() {
-        if *t.e() == scope_root {
-            scope_facts.insert(t);
+        if request.status != triblespace_net::policy::STATUS_PENDING {
+            bail!(
+                "request {entry_hex} is not PENDING (current status: another state)"
+            );
         }
-    }
 
-    // Fetch our issuer cap+sig (the parent for the new cap). The
-    // sig blob carries `sig_signs: <cap_handle>` pointing at the cap,
-    // so one read gives us both via the reader we already have.
-    let parent_sig_blob: Blob<SimpleArchive> = reader
-        .get(issuer_cap_sig_handle)
-        .map_err(|e| anyhow!("fetch issuer sig blob: {e:?}"))?;
-    let parent_sig_set: TribleSet = TryFromBlob::try_from_blob(parent_sig_blob.clone())
-        .map_err(|e| anyhow!("parse issuer sig blob: {e:?}"))?;
-    let mut sig_signs_iter = find!(
-        (e: Id, h: Inline<Handle<SimpleArchive>>),
-        pattern!(&parent_sig_set, [{ ?e @ capability::sig_signs: ?h }])
-    );
-    let (_e, parent_cap_handle) = match (sig_signs_iter.next(), sig_signs_iter.next()) {
-        (Some(row), None) => row,
-        _ => bail!("issuer sig blob malformed (no unique sig_signs)"),
-    };
-    let parent_cap_blob: Blob<SimpleArchive> = reader
-        .get(parent_cap_handle)
-        .map_err(|e| anyhow!("fetch issuer cap blob: {e:?}"))?;
-    // Verify the issuer's chain before signing — refuse to delegate
-    // off an invalid chain.
-    let snap_reader = pile
-        .reader()
-        .map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let _ = capability::verify_chain(
-        team_root,
-        issuer_cap_sig_handle,
-        issuer_key.verifying_key(),
-        |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-            snap_reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(h)
-                .ok()
-        },
-    )
-    .map_err(|e| anyhow!("issuer's cap chain does not verify: {e:?}"))?;
+        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let partial_cap_blob: Blob<SimpleArchive> = reader
+            .get(request.partial_cap)
+            .map_err(|e| anyhow!("fetch partial cap blob: {e:?}"))?;
+        let partial_set: TribleSet = TryFromBlob::try_from_blob(partial_cap_blob)
+            .map_err(|e| anyhow!("parse partial cap blob: {e:?}"))?;
 
-    // Sign the cap. Note: build_capability sets cap_issuer to the
-    // issuer's verifying key automatically (overrides whatever the
-    // partial cap declared); that's correct — the requester's
-    // declared cap_issuer was just a placeholder telling us "this is
-    // for the K_A path".
-    let (cap_blob, sig_blob) = capability::build_capability(
-        &issuer_key,
-        subject,
-        Some((parent_cap_blob, parent_sig_blob)),
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .map_err(|e| anyhow!("build cap: {e:?}"))?;
+        let mut iter = find!(
+            (
+                e: Id,
+                subject: VerifyingKey,
+                scope_root: Id,
+                expiry: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
+            ),
+            pattern!(&partial_set, [{
+                ?e @
+                capability::cap_subject: ?subject,
+                capability::cap_scope_root: ?scope_root,
+                triblespace_core::metadata::expires_at: ?expiry,
+            }])
+        );
+        let (_cap_id, subject, scope_root, expiry) = match (iter.next(), iter.next()) {
+            (Some(row), None) => row,
+            _ => bail!("partial cap blob malformed (no unique subject/scope/expiry)"),
+        };
 
-    let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
-    // anybytes::Bytes is Arc-refcounted; clone is a refcount bump,
-    // not a byte-copy. We need the bytes after store_blob consumes
-    // the typed Blob wrapper.
-    // Persist cap+sig blobs, record on the renewal-policy pin, mark
-    // the request approved, close — purely local writes, no network.
-    //
-    // The running `pile net sync` daemon's `redispatch_undelivered`
-    // loop picks the new policy entry up on its next tick (every
-    // 100ms) and dispatches OP_DELIVER_CAP over its already-up iroh
-    // endpoint. We don't dispatch from the CLI for three reasons:
-    //
-    // 1. The subject is commonly offline at approve-time — the whole
-    //    point of an async request/approve flow is that the requester
-    //    and admin needn't be online simultaneously. The daemon's
-    //    re-dispatch loop has to exist for that case to work; once
-    //    it exists, an extra "try once and hope" from the CLI is
-    //    redundant.
-    // 2. The CLI's dispatcher (`one_shot_deliver_cap`) spins up a
-    //    fresh iroh endpoint with the issuer's signing key — *same*
-    //    pubkey as the daemon's long-lived endpoint. N0's relay
-    //    server treats that as "another endpoint connected with the
-    //    same id" and the duplicate-identity warns spam the log.
-    // 3. The block-on dispatch had no timeout: a 30-day-fresh cap to
-    //    an offline subject hung the CLI forever instead of returning
-    //    with "daemon will retry."
-    store_blob(&mut pile, cap_blob)?;
-    store_blob(&mut pile, sig_blob)?;
+        if subject != request.requester {
+            bail!(
+                "partial cap subject {} doesn't match requester {} — refusing to sign",
+                hex::encode(subject.to_bytes()),
+                hex::encode(request.requester.to_bytes()),
+            );
+        }
 
-    let policy_entry = triblespace_net::policy::record_policy_entry(
-        &mut pile,
-        subject,
-        scope_root,
-        expiry,
-        cap_handle,
-        sig_handle,
-    );
+        // Extract scope_facts (all tribles hanging off scope_root in the
+        // partial cap). build_capability takes scope_facts so we preserve
+        // whatever the requester wrote there.
+        let mut scope_facts = TribleSet::new();
+        for t in partial_set.iter() {
+            if *t.e() == scope_root {
+                scope_facts.insert(t);
+            }
+        }
 
-    let _ = triblespace_net::policy::set_request_status(
-        &mut pile,
-        request.id,
-        triblespace_net::policy::STATUS_APPROVED,
-    );
+        // Fetch our issuer cap+sig (the parent for the new cap). The
+        // sig blob carries `sig_signs: <cap_handle>` pointing at the cap,
+        // so one read gives us both via the reader we already have.
+        let parent_sig_blob: Blob<SimpleArchive> = reader
+            .get(issuer_cap_sig_handle)
+            .map_err(|e| anyhow!("fetch issuer sig blob: {e:?}"))?;
+        let parent_sig_set: TribleSet = TryFromBlob::try_from_blob(parent_sig_blob.clone())
+            .map_err(|e| anyhow!("parse issuer sig blob: {e:?}"))?;
+        let mut sig_signs_iter = find!(
+            (e: Id, h: Inline<Handle<SimpleArchive>>),
+            pattern!(&parent_sig_set, [{ ?e @ capability::sig_signs: ?h }])
+        );
+        let (_e, parent_cap_handle) = match (sig_signs_iter.next(), sig_signs_iter.next()) {
+            (Some(row), None) => row,
+            _ => bail!("issuer sig blob malformed (no unique sig_signs)"),
+        };
+        let parent_cap_blob: Blob<SimpleArchive> = reader
+            .get(parent_cap_handle)
+            .map_err(|e| anyhow!("fetch issuer cap blob: {e:?}"))?;
+        // Verify the issuer's chain before signing — refuse to delegate
+        // off an invalid chain.
+        let snap_reader = pile
+            .reader()
+            .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let _ = capability::verify_chain(
+            team_root,
+            issuer_cap_sig_handle,
+            issuer_key.verifying_key(),
+            |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                snap_reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(h)
+                    .ok()
+            },
+        )
+        .map_err(|e| anyhow!("issuer's cap chain does not verify: {e:?}"))?;
 
-    let _ = pile.close();
+        // Sign the cap. Note: build_capability sets cap_issuer to the
+        // issuer's verifying key automatically (overrides whatever the
+        // partial cap declared); that's correct — the requester's
+        // declared cap_issuer was just a placeholder telling us "this is
+        // for the K_A path".
+        let (cap_blob, sig_blob) = capability::build_capability(
+            &issuer_key,
+            subject,
+            Some((parent_cap_blob, parent_sig_blob)),
+            scope_root,
+            scope_facts,
+            expiry,
+        )
+        .map_err(|e| anyhow!("build cap: {e:?}"))?;
+
+        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
+        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+        let request_id = request.id;
+
+        // Persist cap+sig blobs, record on the renewal-policy pin,
+        // mark the request approved — purely local writes, no
+        // network. The running `pile net sync` daemon's
+        // `redispatch_undelivered` loop picks the new policy entry up
+        // on its next tick (every 100ms) and dispatches
+        // OP_DELIVER_CAP over its already-up iroh endpoint. We don't
+        // dispatch from the CLI for three reasons:
+        //
+        // 1. The subject is commonly offline at approve-time — the
+        //    whole point of an async request/approve flow is that
+        //    the requester and admin needn't be online
+        //    simultaneously. The daemon's re-dispatch loop has to
+        //    exist for that case to work; once it exists, an extra
+        //    "try once and hope" from the CLI is redundant.
+        // 2. The CLI's dispatcher (`one_shot_deliver_cap`) used to
+        //    spin up a fresh iroh endpoint with the issuer's signing
+        //    key — *same* pubkey as the daemon's long-lived endpoint.
+        //    N0's relay server treats that as "another endpoint
+        //    connected with the same id" and the duplicate-identity
+        //    warns spam the log.
+        // 3. The block-on dispatch had no timeout: a 30-day-fresh
+        //    cap to an offline subject hung the CLI forever instead
+        //    of returning with "daemon will retry."
+        drop(reader);
+        drop(snap_reader);
+        store_blob(pile, cap_blob)?;
+        store_blob(pile, sig_blob)?;
+
+        let policy_entry = triblespace_net::policy::record_policy_entry(
+            pile,
+            subject,
+            scope_root,
+            expiry,
+            cap_handle,
+            sig_handle,
+        );
+
+        let _ = triblespace_net::policy::set_request_status(
+            pile,
+            request_id,
+            triblespace_net::policy::STATUS_APPROVED,
+        );
+
+        Ok((sig_handle, expiry, policy_entry))
+    })?;
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
