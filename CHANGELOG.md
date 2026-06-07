@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.1] - 2026-06-07
+
+### Fixed
+
+- **`CapDeliveryConfirmed` lookup matched against the wrong handle.**
+  OP_AUTH wires the signature blob (since that's the credential the
+  dialer needs to prove possession of), so the
+  `cap_handle_raw` carried by the host's `CapDeliveryConfirmed`
+  event is the **sig** handle — but
+  `find_policy_entry_by_subject_and_cap` was comparing it against
+  `PolicyEntry::latest_cap` (the cap-blob handle). The lookup always
+  returned `None`, the entry never got marked delivered, and the
+  renewal daemon kept redispatching `OP_DELIVER_CAP` forever instead
+  of stopping after the first successful auth. Renamed the helper
+  to `find_policy_entry_by_subject_and_sig` and the `NetEvent`
+  field to `sig_handle`, comparing against `latest_sig` — which
+  matches the wire reality and removes the conceptual confusion
+  that produced the bug. (Discovered during 24/7 relay deployment.)
+
+### Changed
+
+- **`trible team list-issued` now shows `delivered_at`** so
+  operators can see whether the subject has authenticated back with
+  the dispatched cap (and the renewal daemon will stop
+  redispatching) or whether the entry is still in the
+  re-dispatch set.
+
 ## [0.46.0] - 2026-06-05
 
 ### Added
