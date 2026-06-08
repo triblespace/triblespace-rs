@@ -96,21 +96,39 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
         let mut pending_not = false;
         while i < ts.len() {
             match &ts[i] {
-                TokenTree::Ident(_) => {
-                    let mut j = i;
-                    let mut pieces: Vec<String> = Vec::new();
+                TokenTree::Ident(id) => {
+                    // Collect a single path atom. Walk across
+                    // `::` segments so `loader::predicate_id`
+                    // reads as one syn::Path. Stop at a bare
+                    // adjacent Ident: those are separate atoms
+                    // in the regex and need an explicit Concat
+                    // inserted between them (which
+                    // `needs_concat` handles below). Without
+                    // this boundary the lexer used to silently
+                    // fuse `p31 p279` into the single Path
+                    // `p31p279`, producing a wrong query that
+                    // happily compiled.
+                    let mut pieces: Vec<String> = vec![id.to_string()];
+                    let mut j = i + 1;
                     while j < ts.len() {
-                        match &ts[j] {
-                            TokenTree::Ident(id) => {
-                                pieces.push(id.to_string());
-                                j += 1;
-                            }
-                            TokenTree::Punct(p) if p.as_char() == ':' => {
-                                pieces.push(p.as_char().to_string());
-                                j += 1;
-                            }
-                            _ => break,
+                        let TokenTree::Punct(p) = &ts[j] else {
+                            break;
+                        };
+                        if p.as_char() != ':' {
+                            break;
                         }
+                        let Some(TokenTree::Punct(p2)) = ts.get(j + 1) else {
+                            break;
+                        };
+                        if p2.as_char() != ':' {
+                            break;
+                        }
+                        let Some(TokenTree::Ident(id_next)) = ts.get(j + 2) else {
+                            break;
+                        };
+                        pieces.push("::".to_string());
+                        pieces.push(id_next.to_string());
+                        j += 3;
                     }
                     let s = pieces.join("");
                     let path: Path = syn::parse_str(&s).map_err(|e| {

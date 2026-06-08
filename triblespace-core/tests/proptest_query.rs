@@ -808,6 +808,35 @@ proptest! {
     }
 
     #[test]
+    fn path_concatenation_bare_adjacent_atoms(
+        chain_len in 3..6usize,
+    ) {
+        // Same as `path_concatenation_two_hops` but without
+        // wrapping each atom in parens. Previously the lexer
+        // fused adjacent bare idents into a single combined
+        // Path symbol; the fix in path_impl breaks the run at
+        // bare-ident boundaries so each atom lexes separately
+        // and `needs_concat` inserts the Concat between them.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+
+        let start_val = (&entities[0]).to_inline();
+        let results: Vec<(Inline<_>, Inline<_>)> = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is(start_val), path!(set.clone(), s test_ns::link test_ns::link d))
+        ).collect();
+
+        prop_assert!(results.iter().any(|(_, d)| *d == (&entities[2]).to_inline()),
+            "bare-adjacent two-hop should reach e2");
+        prop_assert!(!results.iter().any(|(_, d)| *d == (&entities[1]).to_inline()),
+            "bare-adjacent two-hop should not include one-hop target");
+    }
+
+    #[test]
     fn path_reflexive_closure_includes_start(
         chain_len in 2..5usize,
     ) {
