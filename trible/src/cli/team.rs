@@ -404,7 +404,6 @@ fn print_warning_box(lines: &[&str]) {
 // ── Subcommands ─────────────────────────────────────────────────────
 
 fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
-    let mut pile = open_pile(&pile_path)?;
     let founder_key = load_or_generate_signing_key(key, &pile_path)?;
 
     // Generate the team root keypair. Used exactly once, here, to sign
@@ -435,15 +434,11 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
     let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-    store_blob(&mut pile, cap_blob)?;
-    store_blob(&mut pile, sig_blob)?;
-
-    let close_res = pile
-        .close()
-        .map_err(|e| anyhow!("close pile: {e:?}"));
-    if let Err(e) = close_res {
-        eprintln!("warning: close pile: {e:#}");
-    }
+    with_pile(&pile_path, |pile| {
+        store_blob(pile, cap_blob)?;
+        store_blob(pile, sig_blob)?;
+        Ok(())
+    })?;
 
     println!("team root pubkey:  {}", hex::encode(team_root_pubkey.to_bytes()));
     print_warning_box(&[
@@ -472,7 +467,6 @@ fn run_invite(
     scope: ScopeArg,
     branches_hex: Vec<String>,
 ) -> Result<()> {
-    let mut pile = open_pile(&pile_path)?;
     let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
@@ -490,88 +484,89 @@ fn run_invite(
         })
         .collect::<Result<_>>()?;
 
-    // Verify the issuer's cap chain first — we don't sign delegations
-    // off invalid/expired caps. This also confirms the cap blobs are
-    // present locally so `fetch_cap_blob_pair` will succeed below.
-    let mut pile_for_fetch: PileBlake3 = open_pile(&pile_path)?;
-    let issuer_pubkey = issuer_key.verifying_key();
-    let snap_reader = {
-        use triblespace_core::repo::BlobStore;
-        pile_for_fetch
-            .reader()
-            .map_err(|e| anyhow!("pile reader: {e:?}"))?
-    };
-    let _ = capability::verify_chain(
-        team_root,
-        issuer_cap_sig_handle,
-        issuer_pubkey,
-        |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-            use triblespace_core::repo::BlobStoreGet;
-            snap_reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(h)
-                .ok()
-        },
-    )
-    .map_err(|e| anyhow!("issuer's cap does not verify: {e:?}"))?;
+    let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
+        // Verify the issuer's cap chain first — we don't sign
+        // delegations off invalid/expired caps. This also confirms
+        // the cap blobs are present locally so `fetch_cap_blob_pair`
+        // will succeed below.
+        let issuer_pubkey = issuer_key.verifying_key();
+        let snap_reader = {
+            use triblespace_core::repo::BlobStore;
+            pile.reader()
+                .map_err(|e| anyhow!("pile reader: {e:?}"))?
+        };
+        let _ = capability::verify_chain(
+            team_root,
+            issuer_cap_sig_handle,
+            issuer_pubkey,
+            |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                use triblespace_core::repo::BlobStoreGet;
+                snap_reader
+                    .get::<Blob<SimpleArchive>, SimpleArchive>(h)
+                    .ok()
+            },
+        )
+        .map_err(|e| anyhow!("issuer's cap does not verify: {e:?}"))?;
+        drop(snap_reader);
 
-    let (parent_cap_blob, parent_sig_blob) =
-        fetch_cap_blob_pair(&mut pile_for_fetch, issuer_cap_sig_handle)?;
+        let (parent_cap_blob, parent_sig_blob) =
+            fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
 
-    // Build the invitee's scope: a permission tag plus zero or
-    // more `scope_branch` restrictions. Caller is responsible for
-    // ensuring the requested branch set is a subset of the
-    // issuer's own scope; verify_chain rejects the issued cap
-    // chain at use time if not (the relay's scope_subsumes check
-    // catches it).
-    let scope_root = *triblespace_core::id::ufoid();
-    use triblespace_core::id::ExclusiveId;
-    use triblespace_core::macros::entity;
-    let mut scope_facts = TribleSet::from(entity! {
-        ExclusiveId::force_ref(&scope_root) @
-        triblespace_core::metadata::tag: scope.perm_id(),
-    });
-    for branch in &branches {
-        scope_facts += TribleSet::from(entity! {
+        // Build the invitee's scope: a permission tag plus zero or
+        // more `scope_branch` restrictions. Caller is responsible for
+        // ensuring the requested branch set is a subset of the
+        // issuer's own scope; verify_chain rejects the issued cap
+        // chain at use time if not (the relay's scope_subsumes check
+        // catches it).
+        let scope_root = *triblespace_core::id::ufoid();
+        use triblespace_core::id::ExclusiveId;
+        use triblespace_core::macros::entity;
+        let mut scope_facts = TribleSet::from(entity! {
             ExclusiveId::force_ref(&scope_root) @
-            capability::scope_branch: *branch,
+            triblespace_core::metadata::tag: scope.perm_id(),
         });
-    }
+        for branch in &branches {
+            scope_facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                capability::scope_branch: *branch,
+            });
+        }
 
-    let expiry = now_plus_30_days();
-    let (cap_blob, sig_blob) = capability::build_capability(
-        &issuer_key,
-        invitee,
-        Some((parent_cap_blob, parent_sig_blob)),
-        scope_root,
-        scope_facts,
-        expiry,
-    )
-    .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
+        let expiry = now_plus_30_days();
+        let (cap_blob, sig_blob) = capability::build_capability(
+            &issuer_key,
+            invitee,
+            Some((parent_cap_blob, parent_sig_blob)),
+            scope_root,
+            scope_facts,
+            expiry,
+        )
+        .map_err(|e| anyhow!("build invitee cap: {e:?}"))?;
 
-    let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
-    let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
+        let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
+        let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
 
-    store_blob(&mut pile, cap_blob)?;
-    store_blob(&mut pile, sig_blob)?;
+        store_blob(pile, cap_blob)?;
+        store_blob(pile, sig_blob)?;
 
-    // Record on the renewal-policy pin so the running `pile net sync`
-    // daemon's renewal_tick takes over from here: once this cap nears
-    // expiry, the daemon signs a successor and dispatches via
-    // OP_DELIVER_CAP. The invitee experiences the issuance and every
-    // subsequent renewal as the same OP_DELIVER_CAP event — the first
-    // delivery (shaped by the printed handle below for v1) and the
-    // daemon's later renewals are indistinguishable on B's side.
-    let policy_entry = triblespace_net::policy::record_policy_entry(
-        &mut pile,
-        invitee,
-        scope_root,
-        expiry,
-        cap_handle,
-        sig_handle,
-    );
+        // Record on the renewal-policy pin so the running `pile net
+        // sync` daemon's renewal_tick takes over from here: once this
+        // cap nears expiry, the daemon signs a successor and
+        // dispatches via OP_DELIVER_CAP. The invitee experiences the
+        // issuance and every subsequent renewal as the same
+        // OP_DELIVER_CAP event — the first delivery and the daemon's
+        // later renewals are indistinguishable on B's side.
+        let policy_entry = triblespace_net::policy::record_policy_entry(
+            pile,
+            invitee,
+            scope_root,
+            expiry,
+            cap_handle,
+            sig_handle,
+        );
 
-    let _ = pile_for_fetch.close();
-    let _ = pile.close();
+        Ok((sig_handle, expiry, policy_entry))
+    })?;
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
@@ -638,7 +633,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::repo::BlobStoreList;
 
-    let mut pile = open_pile(&pile_path)?;
+    let mut caps: Vec<CapSummary> = with_pile(&pile_path, |pile| {
     let reader = pile
         .reader()
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
@@ -716,7 +711,8 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
 
     }
 
-    let _ = pile.close();
+        Ok(caps)
+    })?;
 
     println!("capabilities in pile:  {}", caps.len());
 
@@ -791,8 +787,9 @@ fn run_show(
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
 
-    let mut pile = open_pile(&pile_path)?;
     let leaf_sig = parse_handle_hex(&cap_hex)?;
+
+    with_pile(&pile_path, |pile| {
     let reader = pile
         .reader()
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
@@ -1059,8 +1056,8 @@ fn run_show(
         }
     }
 
-    let _ = pile.close();
-    Ok(())
+        Ok(())
+    })
 }
 
 // ── Descriptive-caps subcommands (decide#4b59ce27) ─────────────────────
@@ -1070,9 +1067,9 @@ fn run_show(
 /// requester pubkey, partial-cap handle, received-at instant, and
 /// status tag.
 fn run_list_pending(pile_path: PathBuf) -> Result<()> {
-    let mut pile = open_pile(&pile_path)?;
-    let pending = triblespace_net::policy::list_pending_requests(&mut pile);
-    let _ = pile.close();
+    let pending = with_pile(&pile_path, |pile| {
+        Ok(triblespace_net::policy::list_pending_requests(pile))
+    })?;
 
     if pending.is_empty() {
         println!("(no pending requests)");
@@ -1103,9 +1100,9 @@ fn run_list_pending(pile_path: PathBuf) -> Result<()> {
 /// Print the renewal-policy entries on the local pile: caps this node
 /// is currently auto-renewing, plus any that have been retracted.
 fn run_list_issued(pile_path: PathBuf) -> Result<()> {
-    let mut pile = open_pile(&pile_path)?;
-    let entries = triblespace_net::policy::list_renewal_policy(&mut pile);
-    let _ = pile.close();
+    let entries = with_pile(&pile_path, |pile| {
+        Ok(triblespace_net::policy::list_renewal_policy(pile))
+    })?;
 
     if entries.is_empty() {
         println!("(no renewal-policy entries)");
@@ -1150,9 +1147,9 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
     let entry_id = Id::new(entry_bytes)
         .ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
 
-    let mut pile = open_pile(&pile_path)?;
-    let outcome = triblespace_net::policy::retract_policy_entry(&mut pile, entry_id);
-    let _ = pile.close();
+    let outcome = with_pile(&pile_path, |pile| {
+        Ok(triblespace_net::policy::retract_policy_entry(pile, entry_id))
+    })?;
 
     match outcome {
         Some(()) => {
