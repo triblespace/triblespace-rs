@@ -34,6 +34,16 @@ mod literature {
     use triblespace::prelude::blobencodings::LongString;
     use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
 
+    // Each attribute is declared with a 128-bit hex constant that
+    // names the *field itself*, not any value stored in it. The
+    // constant is the stable global id for the attribute — `title`
+    // is just the human-readable Rust binding inside this module.
+    // Renaming the binding (or another codebase calling the same
+    // field `name`) doesn't break compatibility, because everyone
+    // writes and queries the same underlying id. See the
+    // [Identifiers chapter](./deep-dive/identifiers.md#abstract-vs-semantic-identifiers)
+    // for why abstract ids + local semantic names is the
+    // recommended split.
     attributes! {
         /// The title of a work.
         ///
