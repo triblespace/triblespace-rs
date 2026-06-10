@@ -39,7 +39,7 @@ use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Reposito
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
-use triblespace_net::transport::sim::{SimConfig, SimNet};
+use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 use triblespace_net::tracking;
 
 thread_local! {
@@ -128,6 +128,10 @@ struct RunReport {
 }
 
 fn run_sim(seed: u64) -> RunReport {
+    run_sim_with(seed, SimConfig::default())
+}
+
+fn run_sim_with(seed: u64, config: SimConfig) -> RunReport {
     // Debug visibility: RUST_LOG=triblespace_net=trace cargo test ...
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -149,12 +153,12 @@ fn run_sim(seed: u64) -> RunReport {
         .build()
         .expect("paused current-thread runtime");
     let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(sim_body(vc, seed)))
+    rt.block_on(local.run_until(sim_body(vc, seed, config)))
 }
 
-async fn sim_body(vc: Arc<VirtualClock>, seed: u64) -> RunReport {
+async fn sim_body(vc: Arc<VirtualClock>, seed: u64, config: SimConfig) -> RunReport {
     let start_ns = vc.now_ns();
-    let net = SimNet::new(seed, SimConfig::default());
+    let net = SimNet::new(seed, config);
 
     // ── Identities + out-of-band cap provisioning ────────────────────
     let root = key(0xF0);
@@ -547,4 +551,32 @@ fn partition_blocks_then_heal_converges() {
             "B must converge to A's head after the partition heals              (rebroadcast-driven recovery)"
         );
     }));
+}
+
+
+/// Regression test for the 2026-06-10 production sync hang: a DHT
+/// with zero reachability (lookups never resolve) must not stall
+/// closure fetches, because `providers_for` asks the gossip frame's
+/// publisher FIRST (the bottom-up insertion invariant guarantees the
+/// announcer holds the closure) and only consults the DHT — behind a
+/// deadline — when no publisher is known.
+///
+/// Pre-fix, this scenario hangs forever: the walk awaited
+/// `dht_providers` unboundedly with the publisher fallback
+/// unreachable *behind* that await. If this test starts timing out,
+/// that bug is back.
+#[test]
+fn converges_with_blackhole_dht() {
+    let _serial = sim_guard();
+    let report = run_sim_with(
+        7331,
+        SimConfig {
+            dht: DhtMode::Blackhole,
+            ..SimConfig::default()
+        },
+    );
+    assert!(
+        report.converged_at_ns > 0,
+        "publisher-first fetching must converge without any DHT"
+    );
 }

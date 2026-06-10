@@ -66,6 +66,25 @@ pub struct SimConfig {
     /// would retransmit; model connection loss with
     /// [`SimNet::partition`] / [`SimNet::crash`] instead).
     pub gossip_drop_prob: f64,
+    /// Content-discovery behavior. [`DhtMode::Blackhole`] models a
+    /// DHT with no reachability: `dht_providers` futures never
+    /// resolve. This is the exact failure shape of the 2026-06-10
+    /// production sync hang (providers_for awaited an answer that
+    /// would never come, with the known publisher unreachable behind
+    /// the await) — keep a scenario running under Blackhole so that
+    /// class of bug stays dead.
+    pub dht: DhtMode,
+}
+
+/// Behavior of the simulated content-discovery layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DhtMode {
+    /// Lookups resolve after one link latency (the default).
+    Responsive,
+    /// Lookups never resolve — models a DHT with zero reachability
+    /// (fresh swarm, filtered egress, dead bootstrap nodes).
+    /// Announces are silently dropped.
+    Blackhole,
 }
 
 impl Default for SimConfig {
@@ -73,6 +92,7 @@ impl Default for SimConfig {
         Self {
             latency: Duration::from_millis(1)..Duration::from_millis(30),
             gossip_drop_prob: 0.0,
+            dht: DhtMode::Responsive,
         }
     }
 }
@@ -322,14 +342,25 @@ impl Transport for SimTransport {
 
     async fn dht_announce(&self, hash: [u8; 32]) {
         let mut inner = self.net.inner.lock().unwrap();
+        if inner.config.dht == DhtMode::Blackhole {
+            return;
+        }
         inner.dht.entry(hash).or_default().insert(self.id);
     }
 
     async fn dht_providers(&self, hash: [u8; 32]) -> Vec<PeerId> {
-        let latency = {
+        let (latency, blackhole) = {
             let mut inner = self.net.inner.lock().unwrap();
-            inner.latency()
+            let bh = inner.config.dht == DhtMode::Blackhole;
+            (inner.latency(), bh)
         };
+        if blackhole {
+            // Never resolves — like a lookup against a DHT nobody
+            // answers on. Callers without their own deadline hang
+            // here, exactly like production did pre-publisher-first.
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
         tokio::time::sleep(latency).await;
         let inner = self.net.inner.lock().unwrap();
         inner
