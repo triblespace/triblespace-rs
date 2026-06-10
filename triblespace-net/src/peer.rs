@@ -266,14 +266,27 @@ where
                 }
                 NetEvent::Head { branch, head, publisher } => {
                     if let Some(remote_id) = Id::new(branch) {
-                        if let Some(name) = read_remote_name(&mut self.store, &head) {
-                            crate::tracking::ensure_tracking_pin(
-                                &mut self.store,
-                                remote_id,
-                                &head,
-                                &name,
-                                &publisher,
-                            );
+                        match read_remote_name(&mut self.store, &head) {
+                            Some(name) => {
+                                let r = crate::tracking::ensure_tracking_pin(
+                                    &mut self.store,
+                                    remote_id,
+                                    &head,
+                                    &name,
+                                    &publisher,
+                                );
+                                tracing::trace!(
+                                    head = %hex::encode(&head[..4]),
+                                    ok = r.is_some(),
+                                    "head event -> ensure_tracking_pin"
+                                );
+                            }
+                            None => {
+                                tracing::warn!(
+                                    head = %hex::encode(&head[..4]),
+                                    "peer: head event but branch meta unreadable; dropped"
+                                );
+                            }
                         }
                     }
                 }

@@ -235,14 +235,24 @@ impl SimNet {
     /// caller to be inside a `start_paused(true)` current-thread
     /// runtime with `clock` installed virtual.
     pub async fn step(clock: &crate::clock::VirtualClock, dur: Duration) {
+        // Quiescence-driven stepping: on a `start_paused(true)`
+        // runtime, `sleep` only resolves after the runtime has fully
+        // parked — i.e. every runnable task has run to its next await
+        // — at which point tokio auto-advances to the next timer
+        // deadline. Intermediate timers (sim latencies, host poll
+        // sleeps) fire and their wake cascades drain COMPLETELY
+        // before time moves again. This is what makes the step
+        // deterministic AND starvation-free: a fixed yield budget
+        // (the previous design) silently starved the task-queue tail
+        // once enough concurrent walks piled up, freezing in-flight
+        // streams for tens of virtual seconds.
+        //
+        // The virtual wall clock advances in lockstep AFTER the
+        // sleep: protocol-visible time (cooldowns, rebroadcast
+        // ticks, expiry) lags tokio's timer wheel by at most one
+        // step — a bounded, deterministic skew.
+        tokio::time::sleep(dur).await;
         clock.advance(dur);
-        tokio::time::advance(dur).await;
-        // Let everything woken by the timer wheel run. A handful of
-        // yields drains multi-hop cascades (timer → task → channel →
-        // task); the budget is generous because yields are free.
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
     }
 }
 

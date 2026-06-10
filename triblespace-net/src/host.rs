@@ -337,7 +337,6 @@ async fn connect_authed<T: Transport>(
     peer: PeerId,
     self_cap: &RawHash,
 ) -> anyhow::Result<T::Conn> {
-    debug!(alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN), "connecting");
     let conn = t.dial(peer, PILE_SYNC_ALPN).await
         .map_err(|e| {
             warn!(error = %e, "connect failed");
@@ -585,6 +584,7 @@ async fn host_loop<T: Transport>(
         }
 
         if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
+            trace!(n = last_published.len(), "rebroadcast tick: replaying published heads");
             if let Some(sender) = &gossip_sender {
                 for (branch, head) in &last_published {
                     let msg = gossip_frame(branch, head, &my_id);
@@ -779,13 +779,37 @@ async fn providers_for<T: Transport>(
     publisher_id: PeerId,
 ) -> Vec<PeerId> {
     let my_id = t.local_id();
+    // Publisher-first: the gossip frame's publisher announced the
+    // head, and the bottom-up insertion invariant says an announcer
+    // holds the full closure — so when we know a publisher, ask THEM
+    // and skip the DHT round-trip entirely. The DHT path only runs
+    // when no publisher is known (e.g. cold-start tracking pulls),
+    // and is timeout-bounded so a dark DHT degrades to "no
+    // alternates" instead of hanging the walk (the 2026-06-10 sync
+    // hang: dht_providers never resolved on a 2-node mesh with no
+    // DHT reachability, and the publisher fallback sat unreachable
+    // *behind* that await).
+    if publisher_id != my_id {
+        return vec![publisher_id];
+    }
     trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
-    let mut providers: Vec<PeerId> = t.dht_providers(*hash).await;
+    let mut providers: Vec<PeerId> = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        t.dht_providers(*hash),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(_) => {
+            warn!(
+                hash = %hex::encode(&hash[..4]),
+                "dht_providers timed out; no provider candidates"
+            );
+            Vec::new()
+        }
+    };
     trace!(hash = %hex::encode(&hash[..4]), n = providers.len(), "providers_for: DHT find_providers returned");
     providers.retain(|id| *id != my_id);
-    if publisher_id != my_id && !providers.contains(&publisher_id) {
-        providers.push(publisher_id);
-    }
     providers
 }
 
@@ -914,6 +938,7 @@ async fn swarm_fetch_chain<T: Transport>(
     self_cap: &RawHash,
     pool: &SharedPool<T::Conn>,
 ) -> std::collections::BTreeMap<RawHash, Vec<u8>> {
+
     let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
         std::collections::BTreeMap::new();
     let publisher_id = publisher;
