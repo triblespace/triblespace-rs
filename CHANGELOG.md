@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.3] - 2026-06-10
+
+### Fixed
+
+- **`team approve` and remaining `team` subcommands route through
+  `with_pile`**, so `close()` runs on every exit path. Previously an
+  early-return (error or otherwise) could skip the pile close,
+  leaving the flush to the OS and the lock held until process exit —
+  exactly the wrong failure mode for the founder side of a live
+  join handshake.
+- **`path!` no longer silently fuses adjacent bare-ident atoms** in
+  a regex body; the macro now rejects the ambiguous form instead of
+  parsing `a b` as `ab`.
+
+### Added
+
+- **triblespace-net DST stages 1-3**: Transport seam extracted,
+  virtualizable time + seedable ids, deterministic simulation
+  transport with first sim tests. Groundwork for deterministic
+  simulation testing of the sync stack; no behaviour change in
+  production paths.
+
+### Docs
+
+- Dedup embeddings paragraph; spell out UFOID/FUCID acronyms;
+  clarify attribute-id hex-literal guidance.
+
 ## [0.46.2] - 2026-06-07
 
 ### Fixed

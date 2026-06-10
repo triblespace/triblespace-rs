@@ -1,6 +1,6 @@
 [package]
 name = "triblespace-core"
-version = "0.46.2"
+version = "0.46.3"
 authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
 edition = "2021"
 rust-version = "1.89"
@@ -51,7 +51,7 @@ quick_cache = "0.6.9"
 uuid = "1.15.1"
 page_size = "0.6.0"
 ryu = "1.0"
-triblespace-core-macros = { version = "0.46.2", path = "../triblespace-core-macros" }
+triblespace-core-macros = { version = "0.46.3", path = "../triblespace-core-macros" }
 wasmi = { version = "0.31", optional = true }
 rayon = { version = "1", optional = true }
 
