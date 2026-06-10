@@ -528,3 +528,67 @@ impl Conn for SimConn {
 fn hex_prefix(id: &PeerId) -> String {
     hex::encode(&id[..4])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The close/drop contract the protocol's evict-and-retry paths
+    /// rely on (and that iroh QUIC provides in production): a conn
+    /// whose remote end is gone must FAIL FAST — open_bi errors,
+    /// accept_bi returns None, in-flight stream reads see EOF —
+    /// never silently black-hole.
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_of_acceptor_fails_dialer_open_bi() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        drop(acceptor);
+        assert!(
+            dialer.open_bi().await.is_err(),
+            "open_bi to a dropped remote must error, not queue"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_of_dialer_ends_acceptor_accept_loop() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        drop(dialer);
+        assert!(
+            acceptor.accept_bi().await.is_none(),
+            "accept_bi must end when the remote end is dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_wakes_blocked_accept() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let acceptor2 = acceptor.clone();
+        let waiter = tokio::spawn(async move { acceptor2.accept_bi().await.is_none() });
+        tokio::task::yield_now().await;
+        dialer.close(0, b"bye");
+        assert!(
+            waiter.await.unwrap(),
+            "close() must wake a parked accept_bi with None"
+        );
+        assert!(dialer.open_bi().await.is_err(), "open_bi after close errors");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handler_dropping_stream_halves_eofs_client_read() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let (mut c_send, mut c_recv) = dialer.open_bi().await.unwrap();
+        let (s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
+        c_send.write_all(b"hi").await.unwrap();
+        let mut buf = [0u8; 2];
+        s_recv.read_exact(&mut buf).await.unwrap();
+        // Server abandons the stream without replying (handler died).
+        drop(s_send);
+        drop(s_recv);
+        let mut resp = [0u8; 1];
+        assert!(
+            c_recv.read_exact(&mut resp).await.is_err(),
+            "client read on an abandoned stream must EOF, not hang"
+        );
+    }
+}
