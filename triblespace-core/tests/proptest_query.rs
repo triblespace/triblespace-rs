@@ -738,9 +738,9 @@ proptest! {
         }
 
         // Single hop from e0 should find e1
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link d))
         ).collect();
 
@@ -762,9 +762,9 @@ proptest! {
         }
 
         // Transitive closure from e0 should find all reachable
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link+ d))
         ).collect();
 
@@ -773,7 +773,7 @@ proptest! {
             "expected {} reachable, got {}", chain_len - 1, results.len());
 
         for i in 1..chain_len {
-            let expected = (&entities[i]).to_inline();
+            let expected: Inline<GenId> = (&entities[i]).to_inline();
             prop_assert!(results.iter().any(|(_, d)| *d == expected),
                 "missing entity {} from transitive closure", i);
         }
@@ -792,9 +792,9 @@ proptest! {
         }
 
         // Two-hop path from e0 should reach e2
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val), path!(set.clone(), s (test_ns::link)(test_ns::link) d))
         ).collect();
 
@@ -824,9 +824,9 @@ proptest! {
             set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
         }
 
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link test_ns::link d))
         ).collect();
 
@@ -848,9 +848,9 @@ proptest! {
         }
 
         // star (*) includes the start node itself
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val), path!(set.clone(), s test_ns::link* d))
         ).collect();
 
@@ -860,6 +860,108 @@ proptest! {
         // Start must be in results
         prop_assert!(results.iter().any(|(_, d)| *d == start_val),
             "reflexive closure missing start node");
+    }
+
+    #[test]
+    fn path_final_hop_reaches_literal_values(
+        chain_len in 2..4usize,
+    ) {
+        // SPARQL paths may END at a literal: `?x p "lit"` is a match.
+        // The engine operates in 32-byte value space, so literal
+        // destinations flow through hops and concatenations like any
+        // other value; they simply have no outgoing edges.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        // Every entity carries the same label literal.
+        let label: Inline<inlineencodings::ShortString> =
+            "lit".try_to_inline().expect("short label");
+        for e in &entities {
+            set += entity! { e @ test_ns::label: label };
+        }
+
+        // Direct literal hop from the head.
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
+        let direct: Vec<(Inline<GenId>, Inline<UnknownInline>)> = find!(
+            (s: Inline<GenId>, d: Inline<UnknownInline>),
+            and!(s.is(start_val), path!(set.clone(), s test_ns::label d))
+        ).collect();
+        prop_assert_eq!(direct.len(), 1, "one label literal from the head");
+        prop_assert_eq!(direct[0].1.raw, label.raw, "the literal value itself");
+
+        // Closure then literal hop: every chain node's label is
+        // reachable from the head via (link)* / label.
+        let through: usize = find!(
+            (s: Inline<GenId>, d: Inline<UnknownInline>),
+            and!(
+                s.is(start_val),
+                path!(set.clone(), s (test_ns::link)* (test_ns::label) d)
+            )
+        ).count();
+        // All entities share ONE distinct label value; set semantics
+        // dedup to a single row.
+        prop_assert_eq!(through, 1, "(link)*/label reaches the shared label");
+    }
+
+    #[test]
+    fn path_zero_length_ranges_over_literal_terms(
+        chain_len in 2..4usize,
+    ) {
+        // SPARQL §17.5: NODES(D) is ALL terms of the graph — literals
+        // included. Free-endpoint `(p)*` therefore pairs every term
+        // with itself, plus the genuine traversals.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let label: Inline<inlineencodings::ShortString> =
+            "term".try_to_inline().expect("short label");
+        set += entity! { &entities[0] @ test_ns::label: label };
+
+        let rows: usize = find!(
+            (x: Inline<UnknownInline>, y: Inline<UnknownInline>),
+            path!(set.clone(), x test_ns::link* y)
+        ).count();
+        // Terms: chain_len entities + 1 literal. Zero-length pairs:
+        // one per term. Length-≥1 link pairs: ordered reachable pairs
+        // along the chain = chain_len*(chain_len-1)/2.
+        let terms = chain_len + 1;
+        let traversals = chain_len * (chain_len - 1) / 2;
+        prop_assert_eq!(rows, terms + traversals,
+            "zero-length over all terms (incl. the literal) + chain traversals");
+    }
+
+    #[test]
+    fn path_literal_bound_end_walks_inverse(
+        chain_len in 2..4usize,
+    ) {
+        // A literal-bound end must propose its sources via the
+        // inverse walk — VAE keys the full 32-byte value, so walking
+        // backward from a literal is the same probe as from an
+        // entity. (Pre-value-space, the bound literal failed the
+        // id_from_value conversion and silently yielded zero rows.)
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let label: Inline<inlineencodings::ShortString> =
+            "needle".try_to_inline().expect("short label");
+        set += entity! { &entities[0] @ test_ns::label: label };
+
+        let sources: Vec<(Inline<GenId>, Inline<UnknownInline>)> = find!(
+            (s: Inline<GenId>, d: Inline<UnknownInline>),
+            and!(
+                d.is(label.transmute::<UnknownInline>()),
+                path!(set.clone(), s test_ns::label d)
+            )
+        ).collect();
+        prop_assert_eq!(sources.len(), 1, "the labeled entity is found");
+        let expected: Inline<GenId> = (&entities[0]).to_inline();
+        prop_assert_eq!(sources[0].0.raw, expected.raw);
     }
 
     #[test]
@@ -880,9 +982,9 @@ proptest! {
         let absent = rngid(); // never inserted anywhere
 
         // Star with absent bound START: no reflexive row.
-        let absent_val = (&absent).to_inline();
+        let absent_val: Inline<GenId> = (&absent).to_inline();
         let star_rows = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(absent_val), path!(set.clone(), s test_ns::link* d))
         ).count();
         prop_assert_eq!(star_rows, 0,
@@ -890,7 +992,7 @@ proptest! {
 
         // Star with absent bound END: symmetric.
         let end_rows = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(d.is(absent_val), path!(set.clone(), s test_ns::link* d))
         ).count();
         prop_assert_eq!(end_rows, 0,
@@ -898,7 +1000,7 @@ proptest! {
 
         // Optional with absent bound start: same rule for `?`.
         let opt_rows = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(absent_val), path!(set.clone(), s test_ns::link? d))
         ).count();
         prop_assert_eq!(opt_rows, 0,
@@ -906,9 +1008,9 @@ proptest! {
 
         // And a PRESENT bound endpoint keeps its reflexive row: the
         // chain's tail has no outgoing links but occurs as a value.
-        let tail_val = (&entities[chain_len - 1]).to_inline();
+        let tail_val: Inline<GenId> = (&entities[chain_len - 1]).to_inline();
         let tail_rows = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(tail_val), path!(set.clone(), s test_ns::link* d))
         ).count();
         prop_assert_eq!(tail_rows, 1,
@@ -931,11 +1033,11 @@ proptest! {
         let start = &entities[0];
         let one_hop = &entities[1];
 
-        let start_val = (&*start).to_inline();
+        let start_val: Inline<GenId> = (&*start).to_inline();
         let attr_id = test_ns::link.raw();
         let set_clone = set.clone();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(
                 s.is(start_val),
                 RegularPathConstraint::new(
@@ -981,9 +1083,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let target_val = (&target).to_inline();
+        let target_val: Inline<GenId> = (&target).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(target_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1030,9 +1132,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let h_val = (&h).to_inline();
+        let h_val: Inline<GenId> = (&h).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(h_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1076,16 +1178,16 @@ proptest! {
             set += entity! { &start @ test_ns::link: &*n };
         }
         let attr_id = test_ns::link.raw();
-        let start_val = (&start).to_inline();
+        let start_val: Inline<GenId> = (&start).to_inline();
 
         let forward: HashSet<_> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(set.clone(), s, d, &[PathOp::Attr(attr_id)]),
             )
         ).map(|(_, d)| d).collect();
         let double_inv: HashSet<_> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1113,9 +1215,9 @@ proptest! {
         }
         let attr_id = test_ns::link.raw();
 
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
         let results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1171,15 +1273,15 @@ proptest! {
         }
 
         // Single hop via link
-        let root_val = (&root).to_inline();
+        let root_val: Inline<GenId> = (&root).to_inline();
         let link_results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(root_val), path!(set.clone(), s test_ns::link d))
         ).collect();
 
         // link | link should equal link (idempotent alternation)
         let alt_results: Vec<(Inline<_>, Inline<_>)> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(root_val), path!(set.clone(), s (test_ns::link | test_ns::link) d))
         ).collect();
 
@@ -1305,7 +1407,7 @@ proptest! {
         let link_attr_id = test_ns::link.raw();
 
         let dests: HashSet<_> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is((&start).to_inline()),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1342,7 +1444,7 @@ proptest! {
         }
         let link_attr_id = test_ns::link.raw();
         let dests: HashSet<_> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is((&start).to_inline()),
                 RegularPathConstraint::new(
                     set.clone(), s, d,
@@ -1376,13 +1478,13 @@ proptest! {
             set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
         }
         let link_id = test_ns::link.raw();
-        let start_val = (&entities[0]).to_inline();
+        let start_val: Inline<GenId> = (&entities[0]).to_inline();
 
         // (!link)+ closure: every step excludes link. With chain
         // built entirely from link edges, no destinations are
         // reachable.
         let dests: HashSet<_> = find!(
-            (s: Inline<_>, d: Inline<_>),
+            (s: Inline<GenId>, d: Inline<GenId>),
             and!(s.is(start_val),
                 RegularPathConstraint::new(
                     set.clone(), s, d,

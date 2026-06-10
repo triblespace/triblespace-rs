@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
-use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
@@ -255,7 +254,7 @@ fn distribute_concat(l: PathExpr, r: PathExpr) -> PathExpr {
 fn build_join(
     set: &TribleSet,
     expr: &PathExpr,
-    start: &RawId,
+    start: &RawInline,
 ) -> (
     IntersectionConstraint<Box<dyn Constraint<'static>>>,
     VariableId,
@@ -263,7 +262,7 @@ fn build_join(
     let mut ctx = VariableContext::new();
     let start_var = ctx.next_variable::<GenId>();
     let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
-    constraints.push(Box::new(start_var.is(start.to_inline())));
+    constraints.push(Box::new(start_var.is(Inline::new(*start))));
     let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
     (IntersectionConstraint::new(constraints), dest_var.index)
 }
@@ -273,18 +272,47 @@ fn build_join(
 /// Evaluate a path expression from a bound start node, returning all
 /// reachable endpoints. Uses the WCO join engine for Attr/Concat bodies
 /// and BFS for transitive closures.
-/// Single-attribute hop via direct index scan. No query engine overhead.
-fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+/// The path engine operates uniformly in 32-byte Value space — the
+/// same space the WCO join engine's bindings use. Entity and
+/// attribute ids are *compressed* values: a GenId value is the
+/// 16-byte id left-padded with zeros, and the E/A trible positions
+/// store just the id half because today's tribles key them narrow.
+/// The compression is visible only at the index boundary (the prefix
+/// builders below); the traversal algorithms never see it. If E/A
+/// ever widen to full values, only these helpers change.
+///
+/// Forward hops require a GenId-shaped start (only entities have
+/// outgoing edges — a literal dead-ends naturally by returning the
+/// empty set). Inverse hops work from ANY value: the VAE/VEA indexes
+/// key the full 32-byte value, so walking backward from a literal is
+/// the same probe as walking backward from an entity.
+
+/// Extract the entity-id half of a GenId-shaped value, or `None` for
+/// literal-shaped values. The id-compression boundary for forward
+/// hops.
+fn value_as_entity(value: &RawInline) -> Option<RawId> {
+    if value[..ID_LEN] == [0; ID_LEN] {
+        Some(value[ID_LEN..].try_into().unwrap())
+    } else {
+        None
+    }
+}
+
+/// Single-attribute hop via direct index scan. No query engine
+/// overhead. Emits every destination value regardless of shape —
+/// paths may END at a literal (`?x p "lit"` is a SPARQL match); the
+/// closure walkers simply find no outgoing edges there.
+fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
     let mut results = HashSet::new();
+    let Some(start_id) = value_as_entity(start) else {
+        return results;
+    };
     let mut prefix = [0u8; ID_LEN * 2];
-    prefix[..ID_LEN].copy_from_slice(start);
+    prefix[..ID_LEN].copy_from_slice(&start_id);
     prefix[ID_LEN..].copy_from_slice(attr);
     set.eav
         .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-            if value[..ID_LEN] == [0; ID_LEN] {
-                let dest: RawId = value[ID_LEN..].try_into().unwrap();
-                results.insert(dest);
-            }
+            results.insert(*value);
         });
     results
 }
@@ -297,10 +325,13 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
 ///   2. For each surviving attribute, enumerate GenId-encoded
 ///      values via EAV prefix `[start, attr]` and collect their
 ///      id-portion as the destination.
-fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<RawId> {
+fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
     let mut results = HashSet::new();
+    let Some(start_id) = value_as_entity(start) else {
+        return results;
+    };
     let mut e_prefix = [0u8; ID_LEN];
-    e_prefix.copy_from_slice(start);
+    e_prefix.copy_from_slice(&start_id);
     // Step 1: enumerate distinct attributes from this entity.
     let mut attrs: Vec<RawId> = Vec::new();
     set.eav.infixes::<{ ID_LEN }, ID_LEN, _>(&e_prefix, |a: &[u8; ID_LEN]| {
@@ -312,14 +343,11 @@ fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<Ra
     // Step 2: enumerate values per surviving attribute.
     for attr in attrs {
         let mut ea_prefix = [0u8; ID_LEN * 2];
-        ea_prefix[..ID_LEN].copy_from_slice(start);
+        ea_prefix[..ID_LEN].copy_from_slice(&start_id);
         ea_prefix[ID_LEN..].copy_from_slice(&attr);
         set.eav
             .infixes::<{ ID_LEN * 2 }, 32, _>(&ea_prefix, |value: &[u8; 32]| {
-                if value[..ID_LEN] == [0; ID_LEN] {
-                    let dest: RawId = value[ID_LEN..].try_into().unwrap();
-                    results.insert(dest);
-                }
+                results.insert(*value);
             });
     }
     results
@@ -330,13 +358,16 @@ fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<Ra
 /// using the VAE index: enumerate attributes via prefix
 /// `[start_as_value]`, then enumerate entities per surviving
 /// attribute via `[start_as_value, attr]`.
-fn eval_not_attr_inverse(set: &TribleSet, excluded: &RawId, start: &RawId) -> HashSet<RawId> {
+fn eval_not_attr_inverse(
+    set: &TribleSet,
+    excluded: &RawId,
+    start: &RawInline,
+) -> HashSet<RawInline> {
+    // Inverse hops take the full 32-byte value directly — walking
+    // backward from a literal is the same probe as from an entity.
     let mut results = HashSet::new();
-    let start_value = id_into_value(start);
-    let mut v_prefix = [0u8; 32];
-    v_prefix.copy_from_slice(&start_value);
     let mut attrs: Vec<RawId> = Vec::new();
-    set.vae.infixes::<32, ID_LEN, _>(&v_prefix, |a: &[u8; ID_LEN]| {
+    set.vae.infixes::<32, ID_LEN, _>(start, |a: &[u8; ID_LEN]| {
         if a == excluded {
             return;
         }
@@ -344,11 +375,11 @@ fn eval_not_attr_inverse(set: &TribleSet, excluded: &RawId, start: &RawId) -> Ha
     });
     for attr in attrs {
         let mut va_prefix = [0u8; 32 + ID_LEN];
-        va_prefix[..32].copy_from_slice(&start_value);
+        va_prefix[..32].copy_from_slice(start);
         va_prefix[32..].copy_from_slice(&attr);
         set.vae
             .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&va_prefix, |entity: &[u8; ID_LEN]| {
-                results.insert(*entity);
+                results.insert(id_into_value(entity));
             });
     }
     results
@@ -358,15 +389,14 @@ fn eval_not_attr_inverse(set: &TribleSet, excluded: &RawId, start: &RawId) -> Ha
 /// `s attr start` holds. Uses the VAE index (Inline, Attribute,
 /// Entity ordering) so the prefix `[start_as_value (32B), attr
 /// (16B)]` lands directly at the slice of matching entity bytes.
-fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
     let mut results = HashSet::new();
-    let start_value = id_into_value(start);
     let mut prefix = [0u8; 32 + ID_LEN];
-    prefix[..32].copy_from_slice(&start_value);
+    prefix[..32].copy_from_slice(start);
     prefix[32..].copy_from_slice(attr);
     set.vae
         .infixes::<{ 32 + ID_LEN }, ID_LEN, _>(&prefix, |entity: &[u8; ID_LEN]| {
-            results.insert(*entity);
+            results.insert(id_into_value(entity));
         });
     results
 }
@@ -394,7 +424,7 @@ fn has_unbounded_closure(expr: &PathExpr) -> bool {
     }
 }
 
-fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
+fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<RawInline> {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
@@ -414,8 +444,7 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             }
             let (constraint, dest_idx) = build_join(set, expr, start);
             Query::new(constraint, move |binding: &Binding| {
-                let raw = binding.get(dest_idx)?;
-                id_from_value(raw)
+                binding.get(dest_idx).copied()
             })
             .collect()
         }
@@ -425,9 +454,9 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             results
         }
         PathExpr::Plus(body) => {
-            let mut visited: HashSet<RawId> = HashSet::new();
-            let mut results: HashSet<RawId> = HashSet::new();
-            let mut frontier: VecDeque<RawId> = VecDeque::new();
+            let mut visited: HashSet<RawInline> = HashSet::new();
+            let mut results: HashSet<RawInline> = HashSet::new();
+            let mut frontier: VecDeque<RawInline> = VecDeque::new();
             frontier.push_back(*start);
             visited.insert(*start);
 
@@ -454,7 +483,7 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
     }
 }
 
-fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
+fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
@@ -472,15 +501,14 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
         PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, from);
             Query::new(constraint, move |binding: &Binding| {
-                let raw = binding.get(dest_idx)?;
-                id_from_value(raw)
+                binding.get(dest_idx).copied()
             })
             .any(|dest| dest == *to)
         }
         PathExpr::Union(lhs, rhs) => has_path(set, lhs, from, to) || has_path(set, rhs, from, to),
         PathExpr::Plus(body) => {
-            let mut visited: HashSet<RawId> = HashSet::new();
-            let mut frontier: VecDeque<RawId> = VecDeque::new();
+            let mut visited: HashSet<RawInline> = HashSet::new();
+            let mut frontier: VecDeque<RawInline> = VecDeque::new();
             frontier.push_back(*from);
             visited.insert(*from);
 
@@ -531,9 +559,9 @@ const RPQ_ESTIMATE_DEPTH: usize = 5;
 fn bounded_eval_from(
     set: &TribleSet,
     expr: &PathExpr,
-    start: &RawId,
+    start: &RawInline,
     depth: usize,
-) -> HashSet<RawId> {
+) -> HashSet<RawInline> {
     match expr {
         PathExpr::Attr(attr) => eval_attr(set, attr, start),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
@@ -552,12 +580,12 @@ fn bounded_eval_from(
             results
         }
         PathExpr::Plus(body) => {
-            let mut results: HashSet<RawId> = HashSet::new();
-            let mut visited: HashSet<RawId> = HashSet::new();
-            let mut frontier: Vec<RawId> = vec![*start];
+            let mut results: HashSet<RawInline> = HashSet::new();
+            let mut visited: HashSet<RawInline> = HashSet::new();
+            let mut frontier: Vec<RawInline> = vec![*start];
             visited.insert(*start);
             for _ in 0..depth {
-                let mut next: Vec<RawId> = Vec::new();
+                let mut next: Vec<RawInline> = Vec::new();
                 for node in &frontier {
                     for dest in bounded_eval_from(set, body, node, depth) {
                         results.insert(dest);
@@ -593,7 +621,7 @@ fn bounded_eval_from(
 
 /// Shallow estimate: build the one-step constraint and ask it for the
 /// destination variable's cardinality with the start bound.
-fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
+fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
     // Unwrap closure to get the body for estimation.
     let body = match expr {
         PathExpr::Star(inner) | PathExpr::Plus(inner) | PathExpr::Optional(inner) => {
@@ -603,15 +631,17 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
     };
     match body {
         PathExpr::Attr(attr) => {
+            let Some(start_id) = value_as_entity(start) else {
+                return 0;
+            };
             let mut prefix = [0u8; ID_LEN * 2];
-            prefix[..ID_LEN].copy_from_slice(start);
+            prefix[..ID_LEN].copy_from_slice(&start_id);
             prefix[ID_LEN..].copy_from_slice(attr);
             set.eav.segmented_len(&prefix) as usize
         }
         PathExpr::InverseAttr(attr) => {
-            let start_value = id_into_value(start);
             let mut prefix = [0u8; 32 + ID_LEN];
-            prefix[..32].copy_from_slice(&start_value);
+            prefix[..32].copy_from_slice(start);
             prefix[32..].copy_from_slice(attr);
             set.vae.segmented_len(&prefix) as usize
         }
@@ -634,47 +664,47 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
             let mut binding = Binding::default();
-            let start_inline: Inline<GenId> = start.to_inline();
-            binding.set(0, &start_inline.raw);
+            binding.set(0, start);
             constraint.estimate(dest_idx, &binding).unwrap_or(0)
         }
     }
 }
 
-/// Is `id` a node of the graph, in the same sense [`RegularPathConstraint::all_nodes`]
-/// uses — does it occur as the subject of any GenId-valued trible, or
-/// as the GenId value of any trible? Two PATCH prefix probes.
+/// Is `term` a term of the graph in the SPARQL 1.1 §17.5 NODES(D)
+/// sense — does it occur as the value of any trible, or (for
+/// entity-shaped terms) as the subject of any trible? Two PATCH
+/// prefix probes.
 ///
-/// This is the SPARQL 1.1 §17.5 zero-length-path scope rule's
-/// membership test: `(p)*` / `(p)?` match the length-0 path only for
-/// terms that occur in the graph. The free-endpoint dispatch cases
-/// already enforce this implicitly (their candidates come from
-/// `all_nodes()`); the bound-endpoint cases use this probe so all
-/// dispatch cases agree on one relation regardless of which
-/// constraint proposes first.
-fn is_graph_node(set: &TribleSet, id: &RawId) -> bool {
-    // Subject of a GenId-valued trible: EVA layout is e(16) ++ v(32)
-    // ++ a(16); the prefix [id ++ 0u8;16] matches any trible with
-    // subject `id` whose value carries GenId's 16-byte zero padding.
-    let mut subject_prefix = [0u8; ID_LEN + ID_LEN];
-    subject_prefix[..ID_LEN].copy_from_slice(id);
-    if set.eva.has_prefix(&subject_prefix) {
+/// This is the zero-length-path scope rule's membership test:
+/// `(p)*` / `(p)?` match the length-0 path only for terms that occur
+/// in the graph. The free-endpoint dispatch cases enforce this
+/// implicitly (their candidates come from `all_terms()`); the
+/// bound-endpoint cases use this probe so all dispatch cases agree
+/// on one relation regardless of which constraint proposes first.
+fn is_graph_term(set: &TribleSet, term: &RawInline) -> bool {
+    // Value of any trible: VEA layout leads with the full 32-byte
+    // value — works uniformly for entity and literal shapes.
+    if set.vea.has_prefix(term) {
         return true;
     }
-    // GenId value of any trible: VEA layout leads with the full
-    // 32-byte value.
-    let value_prefix = id_into_value(id);
-    set.vea.has_prefix(&value_prefix)
+    // Subject of any trible: only entity-shaped terms can be
+    // subjects; the id half is the EAV key prefix. (The E position
+    // stores the compressed 16-byte form of the value — see the
+    // value-space note on the hop helpers.)
+    match value_as_entity(term) {
+        Some(id) => set.eav.has_prefix(&id),
+        None => false,
+    }
 }
 
 /// [`has_path`] with the zero-length-path scope rule applied: a
-/// reflexive match (`from == to`) requires the node to occur in the
-/// graph. A reflexive `true` for an absent node could only come from
+/// reflexive match (`from == to`) requires the term to occur in the
+/// graph. A reflexive `true` for an absent term could only come from
 /// the ε-branch of `*`/`?` — a genuine cycle implies an outgoing
 /// edge, which implies graph membership — so gating the `from == to`
 /// case is exact.
-fn has_path_gated(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
-    if from == to && !is_graph_node(set, from) {
+fn has_path_gated(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
+    if from == to && !is_graph_term(set, from) {
         return false;
     }
     has_path(set, expr, from, to)
@@ -709,10 +739,18 @@ pub struct RegularPathConstraint {
 impl RegularPathConstraint {
     /// Creates a path constraint from `start` to `end` over the given
     /// postfix-encoded path operations.
-    pub fn new(
+    ///
+    /// The endpoint variables may carry any inline schema — the
+    /// constraint operates in raw 32-byte value space and only the
+    /// variable indices matter here. Declare an endpoint as
+    /// `Inline<UnknownInline>` in `find!` when paths may end at
+    /// literal values (SPARQL paths can: `?x p "lit"` is a match);
+    /// `Inline<GenId>` remains the natural choice for entity-only
+    /// projections.
+    pub fn new<S: crate::inline::InlineEncoding, E: crate::inline::InlineEncoding>(
         set: TribleSet,
-        start: Variable<GenId>,
-        end: Variable<GenId>,
+        start: Variable<S>,
+        end: Variable<E>,
         ops: &[PathOp],
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
@@ -726,20 +764,19 @@ impl RegularPathConstraint {
         }
     }
 
-    /// Lazily collect all GenId nodes in the TribleSet.
-    /// Only called when neither start nor end is bound.
-    fn all_nodes(&self) -> Vec<RawInline> {
-        let mut node_set: HashSet<RawInline> = HashSet::new();
+    /// Lazily collect every term of the graph — SPARQL §17.5's
+    /// NODES(D): all values (entity- and literal-shaped alike) plus
+    /// all subjects, in canonical 32-byte value form. Only called
+    /// when neither start nor end is bound.
+    fn all_terms(&self) -> Vec<RawInline> {
+        let mut term_set: HashSet<RawInline> = HashSet::new();
         for t in self.set.iter() {
-            let v = &t.data[32..64];
-            if v[..ID_LEN] == [0; ID_LEN] {
-                let dest: RawId = v[ID_LEN..].try_into().unwrap();
-                node_set.insert(id_into_value(&dest));
-                let e: RawId = t.data[..ID_LEN].try_into().unwrap();
-                node_set.insert(id_into_value(&e));
-            }
+            let v: RawInline = t.data[32..64].try_into().unwrap();
+            term_set.insert(v);
+            let e: RawId = t.data[..ID_LEN].try_into().unwrap();
+            term_set.insert(id_into_value(&e));
         }
-        node_set.into_iter().collect()
+        term_set.into_iter().collect()
     }
 }
 
@@ -760,22 +797,16 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
-                if let Some(start_id) = id_from_value(start_val) {
-                    return Some(estimate_from(&self.set, &self.expr, &start_id).max(1));
-                }
-                return Some(0);
+                return Some(estimate_from(&self.set, &self.expr, start_val).max(1));
             }
             Some(self.set.len())
         } else if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
-                if let Some(end_id) = id_from_value(end_val) {
-                    // Symmetric to the start-bound case: BFS
-                    // backward via the inverted expression from
-                    // end_id, giving a tight estimate instead of
-                    // the conservative set-len fallback.
-                    return Some(estimate_from(&self.set, &self.inverse_expr, &end_id).max(1));
-                }
-                return Some(0);
+                // Symmetric to the start-bound case: BFS backward
+                // via the inverted expression from the bound end,
+                // giving a tight estimate instead of the
+                // conservative set-len fallback.
+                return Some(estimate_from(&self.set, &self.inverse_expr, end_val).max(1));
             }
             Some(self.set.len())
         } else {
@@ -789,60 +820,55 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         // self-loop via the path, rather than the cross-product
         // of all reachable (start, end) pairs.
         if self.start == self.end && variable == self.start {
-            let candidates = self.all_nodes();
-            proposals.extend(candidates.into_iter().filter(|v| {
-                id_from_value(v)
-                    .map_or(false, |id| has_path_gated(&self.set, &self.expr, &id, &id))
-            }));
+            let candidates = self.all_terms();
+            proposals.extend(
+                candidates
+                    .into_iter()
+                    .filter(|v| has_path_gated(&self.set, &self.expr, v, v)),
+            );
             return;
         }
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
-                if let Some(start_id) = id_from_value(start_val) {
-                    let mut reachable = eval_from(&self.set, &self.expr, &start_id);
-                    // Zero-length-path scope rule (SPARQL §17.5):
-                    // eval_from's nullable arms insert the seed
-                    // unconditionally; drop it when the bound start
-                    // isn't a graph node. Every other element of the
-                    // result arrived via ≥1 edge and is a graph node
-                    // by construction — and a seed on a genuine cycle
-                    // has an outgoing edge, so it survives the gate.
-                    // This makes the bound-endpoint cases agree with
-                    // the free-endpoint cases (whose candidates come
-                    // from `all_nodes()`), so the constraint denotes
-                    // one relation regardless of proposal order.
-                    if !is_graph_node(&self.set, &start_id) {
-                        reachable.remove(&start_id);
-                    }
-                    proposals.extend(reachable.iter().map(id_into_value));
+                let mut reachable = eval_from(&self.set, &self.expr, start_val);
+                // Zero-length-path scope rule (SPARQL §17.5):
+                // eval_from's nullable arms insert the seed
+                // unconditionally; drop it when the bound start
+                // isn't a graph term. Every other element of the
+                // result arrived via ≥1 edge and is a graph term
+                // by construction — and a seed on a genuine cycle
+                // has an outgoing edge, so it survives the gate.
+                // This makes the bound-endpoint cases agree with
+                // the free-endpoint cases (whose candidates come
+                // from `all_terms()`), so the constraint denotes
+                // one relation regardless of proposal order.
+                if !is_graph_term(&self.set, start_val) {
+                    reachable.remove(start_val);
                 }
+                proposals.extend(reachable);
                 return;
             }
         }
         if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
-                // End is bound; propose only those start nodes that
+                // End is bound; propose only those start terms that
                 // actually reach `end` via `expr`. Symmetric to the
                 // start-bound case: one BFS backward via the
-                // inverted expression from `end_id` enumerates
-                // every valid start, with dedup falling out of
-                // `eval_from`'s internal HashSet and the
-                // reflexive-path rule (`end_id` is a valid start
-                // for `(p)*` / `(p)?`) handled inside Star/Optional.
-                if let Some(end_id) = id_from_value(end_val) {
-                    let mut reachable = eval_from(&self.set, &self.inverse_expr, &end_id);
-                    // Zero-length-path scope rule — see the
-                    // start-bound arm above.
-                    if !is_graph_node(&self.set, &end_id) {
-                        reachable.remove(&end_id);
-                    }
-                    proposals.extend(reachable.iter().map(id_into_value));
+                // inverted expression from the bound end enumerates
+                // every valid start — including from literal ends,
+                // which inverse hops handle natively in value space.
+                let mut reachable = eval_from(&self.set, &self.inverse_expr, end_val);
+                // Zero-length-path scope rule — see the start-bound
+                // arm above.
+                if !is_graph_term(&self.set, end_val) {
+                    reachable.remove(end_val);
                 }
+                proposals.extend(reachable);
                 return;
             }
         }
         if variable == self.start || variable == self.end {
-            proposals.extend(self.all_nodes());
+            proposals.extend(self.all_terms());
         }
     }
 
@@ -850,35 +876,18 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         // Same-Variable case: filter proposals to those with a
         // self-loop via the path expression.
         if self.start == self.end && variable == self.start {
-            proposals.retain(|v| {
-                id_from_value(v)
-                    .map_or(false, |id| has_path_gated(&self.set, &self.expr, &id, &id))
-            });
+            proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, v));
             return;
         }
         if variable == self.start {
             if let Some(end_val) = binding.get(self.end) {
-                if let Some(end_id) = id_from_value(end_val) {
-                    proposals.retain(|v| {
-                        id_from_value(v).map_or(false, |sid| {
-                            has_path_gated(&self.set, &self.expr, &sid, &end_id)
-                        })
-                    });
-                } else {
-                    proposals.clear();
-                }
+                let end_val = *end_val;
+                proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, &end_val));
             }
         } else if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
-                if let Some(start_id) = id_from_value(start_val) {
-                    proposals.retain(|v| {
-                        id_from_value(v).map_or(false, |eid| {
-                            has_path_gated(&self.set, &self.expr, &start_id, &eid)
-                        })
-                    });
-                } else {
-                    proposals.clear();
-                }
+                let start_val = *start_val;
+                proposals.retain(|v| has_path_gated(&self.set, &self.expr, &start_val, v));
             }
         }
     }
