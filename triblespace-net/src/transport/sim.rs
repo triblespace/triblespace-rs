@@ -74,7 +74,22 @@ pub struct SimConfig {
     /// the await) — keep a scenario running under Blackhole so that
     /// class of bug stays dead.
     pub dht: DhtMode,
+    /// Model iroh-gossip's message-id dedupe. PlumTree derives the
+    /// message id from blake3(content) and suppresses re-delivery of
+    /// known ids for `message_id_retention` (default 90s) — AND a
+    /// suppressed duplicate REFRESHES its retention window
+    /// (plumtree.rs:511 in iroh-gossip 0.98). Net effect: an
+    /// IDENTICAL frame re-broadcast on a shorter period than the
+    /// retention window is suppressed forever at every receiver that
+    /// saw it once. Defaults ON because production behaves this way;
+    /// turning it off recreates the pre-2026-06-11 sim that
+    /// validated rebroadcast-driven recovery the real mesh does not
+    /// provide.
+    pub gossip_dedupe: bool,
 }
+
+/// iroh-gossip's default `message_id_retention`.
+const GOSSIP_ID_RETENTION: Duration = Duration::from_secs(90);
 
 /// Behavior of the simulated content-discovery layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +108,7 @@ impl Default for SimConfig {
             latency: Duration::from_millis(1)..Duration::from_millis(30),
             gossip_drop_prob: 0.0,
             dht: DhtMode::Responsive,
+            gossip_dedupe: true,
         }
     }
 }
@@ -101,6 +117,11 @@ struct NodeSlot {
     incoming_tx: mpsc::UnboundedSender<Incoming<SimConn>>,
     gossip_tx: Option<mpsc::UnboundedSender<GossipEvent>>,
     up: bool,
+    /// PlumTree-style dedupe cache: message-id (blake3 of frame) ->
+    /// suppression deadline in virtual nanoseconds. Duplicates seen
+    /// before the deadline are dropped AND refresh the deadline,
+    /// mirroring iroh-gossip's received_messages semantics.
+    gossip_seen: std::collections::HashMap<[u8; 32], u64>,
 }
 
 struct SimNetInner {
@@ -183,6 +204,7 @@ impl SimNet {
                 incoming_tx,
                 gossip_tx: gossip_pair.as_ref().map(|(tx, _)| tx.clone()),
                 up: true,
+                gossip_seen: std::collections::HashMap::new(),
             },
         );
         drop(inner);
@@ -404,6 +426,10 @@ impl GossipSink for SimGossip {
                 })
                 .map(|(id, _)| *id)
                 .collect();
+            let dedupe = inner.config.gossip_dedupe;
+            let msg_id: [u8; 32] = *blake3::hash(&frame).as_bytes();
+            let now_ns = crate::clock::mono_now().as_nanos();
+            let retention = GOSSIP_ID_RETENTION.as_nanos() as u64;
             targets
                 .into_iter()
                 .filter_map(|id| {
@@ -415,11 +441,19 @@ impl GossipSink for SimGossip {
                         return None;
                     }
                     let lat = inner.latency();
-                    inner
-                        .nodes
-                        .get(&id)
-                        .and_then(|n| n.gossip_tx.clone())
-                        .map(|tx| (tx, lat))
+                    let node = inner.nodes.get_mut(&id)?;
+                    if dedupe {
+                        // Known id within retention => suppress AND
+                        // refresh the window (plumtree behavior: a
+                        // duplicate re-arms its own suppression).
+                        let deadline = node.gossip_seen.entry(msg_id).or_insert(0);
+                        if *deadline > now_ns {
+                            *deadline = now_ns + retention;
+                            return None;
+                        }
+                        *deadline = now_ns + retention;
+                    }
+                    node.gossip_tx.clone().map(|tx| (tx, lat))
                 })
                 .collect()
         };
