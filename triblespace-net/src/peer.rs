@@ -141,12 +141,39 @@ where
     ///
     /// The thread lives for the Peer's lifetime and shuts down when the
     /// Peer drops.
-    pub fn new(mut store: S, key: SigningKey, config: PeerConfig) -> Self {
+    pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let direction = config.direction;
         let team_root = config.team_root;
         let signing_key = key.clone();
         let (sender, receiver) = host::spawn(key, config);
+        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+    }
 
+    /// Wrap a store in a Peer over caller-provided channel halves —
+    /// the host loop runs wherever the caller put it (deterministic
+    /// simulation: a local task on a shared paused runtime) instead
+    /// of on an internally-spawned thread.
+    ///
+    /// Pair with [`crate::host::wire`] + [`crate::host::run_host`].
+    pub fn with_wiring(
+        store: S,
+        signing_key: SigningKey,
+        direction: SyncDirection,
+        team_root: ed25519_dalek::VerifyingKey,
+        sender: host::NetSender,
+        receiver: host::NetReceiver,
+    ) -> Self {
+        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+    }
+
+    fn assemble(
+        mut store: S,
+        sender: host::NetSender,
+        receiver: host::NetReceiver,
+        direction: SyncDirection,
+        team_root: ed25519_dalek::VerifyingKey,
+        signing_key: SigningKey,
+    ) -> Self {
         // Seed the snapshot served by the network thread so peers
         // requesting via the protocol see our current state immediately.
         if let Some(snap) = StoreSnapshot::from_store(&mut store) {
@@ -174,7 +201,7 @@ where
         };
 
         // Drive the first refresh synchronously so the DHT learns
-        // about pre-existing blobs before `Peer::new` returns and the
+        // about pre-existing blobs before construction returns and the
         // first incoming AUTH can land.
         peer.refresh();
 

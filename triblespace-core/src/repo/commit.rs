@@ -18,7 +18,6 @@ use crate::query::find;
 use crate::trible::TribleSet;
 use crate::inline::Inline;
 
-use hifitime::Epoch;
 
 /// Error returned when commit signature verification fails.
 pub enum ValidationError {
@@ -63,7 +62,10 @@ pub fn commit_metadata(
     // (content = None) carry neither, so they stay content-deterministic.
     let (content_handle, signed_by, signature, created_at) = match content.as_ref() {
         Some(blob) => {
-            let now = Epoch::now().expect("system time");
+            // Through the clock seam (not Epoch::now directly) so
+            // simulated executions mint deterministic, virtual-time
+            // commit timestamps — bit-identical commits per seed.
+            let now = crate::clock::epoch_now();
             let timestamp: Inline<_> =
                 (now, now).try_to_inline().expect("point interval");
             (

@@ -6,7 +6,6 @@ use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::Verifier;
 use ed25519_dalek::VerifyingKey;
-use hifitime::prelude::*;
 use itertools::Itertools;
 
 use crate::blob::encodings::longstring::LongString;
@@ -31,7 +30,7 @@ use crate::inline::Inline;
 /// view; receivers simply hold out until the publisher's clock catches up
 /// and a fresher timestamp arrives.
 fn now_updated_at() -> Inline<NsTAIInterval> {
-    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let now = crate::clock::epoch_now();
     (now, now).try_to_inline().expect("same epoch is a valid point interval")
 }
 

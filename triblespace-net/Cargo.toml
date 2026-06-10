@@ -45,3 +45,13 @@ hifitime = "4.1.2"
 iroh = { version = "0.98", features = ["test-utils", "unstable-custom-transports"] }
 
 
+
+[features]
+# Deterministic simulation testing: in-memory transport (transport::sim),
+# public host wiring (host::wire / host::run_host), seeded id minting.
+# Test-only by design -- enables tokio test-util for paused-time control.
+sim = ["triblespace-core/deterministic", "tokio/test-util"]
+
+[dev-dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter"]

@@ -1,7 +1,5 @@
 use rand::thread_rng;
 use rand::RngCore;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use super::ExclusiveId;
 use super::Id;
@@ -48,14 +46,21 @@ use super::Id;
 /// ```
 pub fn ufoid() -> ExclusiveId {
     let mut rng = thread_rng();
-    let now_in_sys = SystemTime::now();
-    let now_since_epoch = now_in_sys
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards");
-    let now_in_ms = now_since_epoch.as_millis();
+    // Through the clock seam so simulated runs mint time-prefixes from
+    // virtual time. f64 unix-seconds keeps millisecond precision until
+    // far beyond the 32-bit prefix's own ~50-day horizon semantics.
+    let now_in_ms = (crate::clock::epoch_now().to_unix_seconds() * 1000.0) as u128;
 
     let mut id = [0; 16];
     id[0..4].copy_from_slice(&(now_in_ms as u32).to_be_bytes());
+    #[cfg(feature = "deterministic")]
+    {
+        if crate::id::rngid::deterministic::try_fill(&mut id[4..16]) {
+            return ExclusiveId::force(
+                Id::new(id).expect("the probability for a zero id should be negligible"),
+            );
+        }
+    }
     rng.fill_bytes(&mut id[4..16]);
 
     ExclusiveId::force(Id::new(id).expect("The probability time and rng = 0 should be neglegible."))

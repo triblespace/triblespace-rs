@@ -12,6 +12,9 @@ mod channel;
 pub mod clock;
 pub mod dht;
 pub mod handshake;
+#[cfg(feature = "sim")]
+pub mod host;
+#[cfg(not(feature = "sim"))]
 mod host;
 pub mod peer;
 pub mod policy;

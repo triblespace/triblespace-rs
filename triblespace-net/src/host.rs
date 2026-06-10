@@ -256,18 +256,60 @@ impl NetReceiver {
 
 // ── Spawn ────────────────────────────────────────────────────────────
 
+/// The host loop's end of the Peer↔host channel pair, plus the shared
+/// serving-snapshot slot. Produced by [`wire`]; consumed by
+/// [`run_host`]. Exists so the loop can run either on its own thread
+/// + runtime (production, [`spawn`]) or as a task on a caller-owned
+/// runtime (deterministic simulation, where every node shares one
+/// paused current-thread runtime).
+pub struct HostWiring {
+    pub(crate) cmd_rx: mpsc::Receiver<NetCommand>,
+    pub(crate) evt_tx: mpsc::Sender<NetEvent>,
+    pub(crate) snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+}
+
+/// Build the Peer↔host channel pair for a node with identity `id`.
+/// The `(NetSender, NetReceiver)` half goes to the Peer; the
+/// [`HostWiring`] half goes to [`run_host`].
+pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
+    let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
+    let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+        Arc::new(Mutex::new(None));
+
+    let sender = NetSender {
+        cmd_tx,
+        snapshot: snapshot.clone(),
+        id,
+    };
+    let receiver = NetReceiver { evt_rx };
+    let wiring = HostWiring {
+        cmd_rx,
+        evt_tx,
+        snapshot,
+    };
+    (sender, receiver, wiring)
+}
+
+/// Run the host loop over an already-constructed transport harness.
+/// This is the transport-generic entry point: production wraps it in
+/// a dedicated thread ([`spawn`]); the simulator spawns it as a local
+/// task per node on one shared deterministic runtime.
+pub async fn run_host<T: Transport>(
+    harness: Harness<T>,
+    config: PeerConfig,
+    wiring: HostWiring,
+) {
+    host_loop(harness, config, wiring.cmd_rx, wiring.evt_tx, wiring.snapshot).await;
+}
+
 /// Spawn the network thread. Returns the outgoing/incoming channel halves
 /// — used internally by [`Peer::new`](crate::peer::Peer::new).
 pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
-    let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
-
-    let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
-        Arc::new(Mutex::new(None));
-    let thread_snapshot = snapshot.clone();
+    let (sender, receiver, wiring) = wire(id);
 
     let _thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -276,16 +318,10 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
                 // bind already logged the failure; net thread exits.
                 return;
             };
-            host_loop(harness, config, cmd_rx, evt_tx, thread_snapshot).await;
+            run_host(harness, config, wiring).await;
         });
     });
 
-    let sender = NetSender {
-        cmd_tx,
-        snapshot,
-        id,
-    };
-    let receiver = NetReceiver { evt_rx };
     (sender, receiver)
 }
 

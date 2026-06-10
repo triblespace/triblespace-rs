@@ -165,3 +165,6 @@ pub struct Harness<T: Transport> {
 }
 
 pub mod iroh;
+
+#[cfg(feature = "sim")]
+pub mod sim;

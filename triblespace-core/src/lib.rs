@@ -11,6 +11,7 @@ extern crate proc_macro;
 compile_error!("triblespace-rs requires a 64-bit little-endian target");
 
 /// Attribute definition and usage metadata.
+pub mod clock;
 pub mod attribute;
 /// Blob storage, schemas, and conversion traits.
 pub mod blob;

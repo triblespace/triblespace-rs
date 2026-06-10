@@ -37,6 +37,17 @@ pub mod deterministic {
     pub fn unseed_ids() {
         SOURCE.with(|s| *s.borrow_mut() = None);
     }
+
+    /// Fill `buf` from the seeded stream if one is installed. Returns
+    /// false (buf untouched) when unseeded. Shared by [`super::rngid`]
+    /// and [`crate::id::ufoid::ufoid`] so ALL id randomness drains one
+    /// deterministic stream under simulation.
+    pub fn try_fill(buf: &mut [u8]) -> bool {
+        use rand::RngCore;
+        SOURCE.with(|s| {
+            s.borrow_mut().as_mut().map(|rng| rng.fill_bytes(buf)).is_some()
+        })
+    }
 }
 
 #[cfg(feature = "deterministic")]

@@ -743,7 +743,10 @@ pub fn verify_chain<F>(
 where
     F: FnMut(Inline<Handle<SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
 {
-    let now: Epoch = hifitime::Epoch::now().expect("system time");
+    // Through the clock seam: simulated runs check expiry against
+    // virtual time, so cap-lifetime scenarios (renewal windows,
+    // expiry-during-partition) are deterministically scriptable.
+    let now: Epoch = crate::clock::epoch_now();
 
     // Helper: a cap is valid until the *upper bound* of its expiry
     // interval. We compare that upper bound against `now`.
