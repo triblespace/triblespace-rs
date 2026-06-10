@@ -28,7 +28,9 @@
 //! `decide#4b321c47` for the surrounding cap-system design.
 
 use anyhow::{Result, anyhow};
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::transport::Conn;
 
 /// ALPN for the auth handshake. Distinct from `PILE_SYNC_ALPN` —
 /// connections here are open to any pubkey-bearing peer; identity is
@@ -70,7 +72,7 @@ pub const MAX_BLOB_BYTES: u32 = 16 * 1024;
 /// `partial_cap_bytes` is a SimpleArchive-encoded cap blob the subject
 /// has prepared (declaring subject pubkey, scope root, expiry, and
 /// scope facts). The issuer will fill in chain linkage and re-sign.
-pub async fn send_request_cap(conn: &Connection, partial_cap_bytes: &[u8]) -> Result<u8> {
+pub async fn send_request_cap<C: Conn>(conn: &C, partial_cap_bytes: &[u8]) -> Result<u8> {
     if partial_cap_bytes.len() > MAX_BLOB_BYTES as usize {
         return Err(anyhow!(
             "partial cap is {} bytes, exceeds MAX_BLOB_BYTES {}",
@@ -91,7 +93,7 @@ pub async fn send_request_cap(conn: &Connection, partial_cap_bytes: &[u8]) -> Re
     send.write_all(partial_cap_bytes)
         .await
         .map_err(|e| anyhow!("send body: {e}"))?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let mut status = [0u8; 1];
     recv.read_exact(&mut status)
@@ -102,8 +104,8 @@ pub async fn send_request_cap(conn: &Connection, partial_cap_bytes: &[u8]) -> Re
 
 /// Send `OP_DELIVER_CAP` on a fresh stream of `conn`. Returns the
 /// recipient's status byte.
-pub async fn send_deliver_cap(
-    conn: &Connection,
+pub async fn send_deliver_cap<C: Conn>(
+    conn: &C,
     cap_bytes: &[u8],
     sig_bytes: &[u8],
 ) -> Result<u8> {
@@ -131,7 +133,7 @@ pub async fn send_deliver_cap(
     send.write_all(sig_bytes)
         .await
         .map_err(|e| anyhow!("send sig body: {e}"))?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let mut status = [0u8; 1];
     recv.read_exact(&mut status)
@@ -161,7 +163,7 @@ pub enum IncomingOp {
 /// Read one operation from a freshly-accepted bi-stream. Returns
 /// `Some(IncomingOp)` on a recognised op, `None` on an unknown op
 /// (caller should write `STATUS_MALFORMED` + close).
-pub async fn read_incoming(recv: &mut RecvStream) -> Result<Option<IncomingOp>> {
+pub async fn read_incoming<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Option<IncomingOp>> {
     let mut op = [0u8; 1];
     recv.read_exact(&mut op)
         .await
@@ -183,7 +185,7 @@ pub async fn read_incoming(recv: &mut RecvStream) -> Result<Option<IncomingOp>> 
     }
 }
 
-async fn read_length_prefixed(recv: &mut RecvStream) -> Result<anybytes::Bytes> {
+async fn read_length_prefixed<R: AsyncRead + Unpin>(recv: &mut R) -> Result<anybytes::Bytes> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -206,11 +208,11 @@ async fn read_length_prefixed(recv: &mut RecvStream) -> Result<anybytes::Bytes> 
 }
 
 /// Write a status byte and finish the stream.
-pub async fn respond(send: &mut SendStream, status: u8) -> Result<()> {
+pub async fn respond<W: AsyncWrite + Unpin>(send: &mut W, status: u8) -> Result<()> {
     send.write_all(&[status])
         .await
         .map_err(|e| anyhow!("send status: {e}"))?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
     Ok(())
 }
 
@@ -278,7 +280,7 @@ pub async fn one_shot_request_cap(
         .connect(target_id, AUTH_HANDSHAKE_ALPN)
         .await
         .map_err(|e| anyhow!("connect: {e}"))?;
-    let status = send_request_cap(&conn, partial_cap_bytes).await;
+    let status = send_request_cap(&crate::transport::iroh::IrohConn(conn.clone()), partial_cap_bytes).await;
     conn.close(0u32.into(), b"ok");
     // Drop the endpoint last so the connection's relay route stays
     // alive through the close. iroh tears down a Connection's transport

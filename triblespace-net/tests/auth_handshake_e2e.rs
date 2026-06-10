@@ -119,7 +119,7 @@ async fn op_request_cap_round_trips() {
         .connect(custom_addr(admin_id), AUTH_HANDSHAKE_ALPN)
         .await
         .expect("connect");
-    let status = send_request_cap(&conn, &payload).await.expect("send");
+    let status = send_request_cap(&triblespace_net::transport::iroh::IrohConn(conn.clone()), &payload).await.expect("send");
     assert_eq!(status, STATUS_OK, "admin should ACK the request");
     conn.close(0u32.into(), b"ok");
 
@@ -162,7 +162,7 @@ async fn op_deliver_cap_round_trips() {
         .connect(custom_addr(recipient_id), AUTH_HANDSHAKE_ALPN)
         .await
         .expect("connect");
-    let status = send_deliver_cap(&conn, &cap_bytes, &sig_bytes)
+    let status = send_deliver_cap(&triblespace_net::transport::iroh::IrohConn(conn.clone()), &cap_bytes, &sig_bytes)
         .await
         .expect("send");
     assert_eq!(status, STATUS_OK, "recipient should ACK the delivery");

@@ -61,55 +61,63 @@ pub type RawHash = [u8; 32];
 pub type RawPinId = [u8; 16];
 
 // ── Send/Recv helpers ────────────────────────────────────────────────
+//
+// Generic over `tokio::io::{AsyncRead, AsyncWrite}` so the same wire
+// code runs over iroh QUIC streams (production) and in-memory duplex
+// pipes (deterministic simulation). `SendStream::finish()` from the
+// pre-seam code maps to `AsyncWriteExt::shutdown()` — iroh's QUIC
+// send-stream implements `poll_shutdown` as finish.
 
 use anyhow::{Result, anyhow};
-use iroh::endpoint::{SendStream, RecvStream, Connection};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub async fn send_u8(send: &mut SendStream, v: u8) -> Result<()> {
+use crate::transport::Conn;
+
+pub async fn send_u8<W: AsyncWrite + Unpin>(send: &mut W, v: u8) -> Result<()> {
     send.write_all(&[v]).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn send_hash(send: &mut SendStream, hash: &RawHash) -> Result<()> {
+pub async fn send_hash<W: AsyncWrite + Unpin>(send: &mut W, hash: &RawHash) -> Result<()> {
     send.write_all(hash).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn send_branch_id(send: &mut SendStream, id: &RawPinId) -> Result<()> {
+pub async fn send_branch_id<W: AsyncWrite + Unpin>(send: &mut W, id: &RawPinId) -> Result<()> {
     send.write_all(id).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn send_u32_be(send: &mut SendStream, v: u32) -> Result<()> {
+pub async fn send_u32_be<W: AsyncWrite + Unpin>(send: &mut W, v: u32) -> Result<()> {
     send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn send_u64_be(send: &mut SendStream, v: u64) -> Result<()> {
+pub async fn send_u64_be<W: AsyncWrite + Unpin>(send: &mut W, v: u64) -> Result<()> {
     send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
 }
 
-pub async fn recv_u8(recv: &mut RecvStream) -> Result<u8> {
+pub async fn recv_u8<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u8> {
     let mut buf = [0u8; 1];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf[0])
 }
 
-pub async fn recv_hash(recv: &mut RecvStream) -> Result<RawHash> {
+pub async fn recv_hash<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawHash> {
     let mut buf = [0u8; 32];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf)
 }
 
-pub async fn recv_branch_id(recv: &mut RecvStream) -> Result<RawPinId> {
+pub async fn recv_branch_id<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawPinId> {
     let mut buf = [0u8; 16];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(buf)
 }
 
-pub async fn recv_u32_be(recv: &mut RecvStream) -> Result<u32> {
+pub async fn recv_u32_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u32> {
     let mut buf = [0u8; 4];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(u32::from_be_bytes(buf))
 }
 
-pub async fn recv_u64_be(recv: &mut RecvStream) -> Result<u64> {
+pub async fn recv_u64_be<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u64> {
     let mut buf = [0u8; 8];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(u64::from_be_bytes(buf))
@@ -120,11 +128,11 @@ pub async fn recv_u64_be(recv: &mut RecvStream) -> Result<u64> {
 /// AUTH: present a capability handle. Must be the first stream opened
 /// on every new connection. Returns `Ok(())` if the server accepted the
 /// capability and the connection is authorised for subsequent ops.
-pub async fn op_auth(conn: &Connection, cap_handle: &RawHash) -> Result<()> {
+pub async fn op_auth<C: Conn>(conn: &C, cap_handle: &RawHash) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_AUTH).await?;
     send_hash(&mut send, cap_handle).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
     let resp = recv_u8(&mut recv).await?;
     match resp {
         AUTH_OK => Ok(()),
@@ -136,11 +144,11 @@ pub async fn op_auth(conn: &Connection, cap_handle: &RawHash) -> Result<()> {
 /// GET_BLOB: fetch a single blob by hash.
 /// Response: len:u64 + data. len=u64::MAX means missing.
 /// Supports empty blobs (len=0) and blobs up to 2^64-2 bytes.
-pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec<u8>>> {
+pub async fn op_get_blob<C: Conn>(conn: &C, hash: &RawHash) -> Result<Option<Vec<u8>>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_GET_BLOB).await?;
     send_hash(&mut send, hash).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let len = recv_u64_be(&mut recv).await?;
     if len == u64::MAX { return Ok(None); }
@@ -150,14 +158,14 @@ pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec
 }
 
 /// CHILDREN: get child hashes of a parent blob. Nil hash terminates.
-pub async fn op_children(
-    conn: &Connection,
+pub async fn op_children<C: Conn>(
+    conn: &C,
     parent: &RawHash,
 ) -> Result<Vec<RawHash>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_CHILDREN).await?;
     send_hash(&mut send, parent).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    send.shutdown().await.map_err(|e| anyhow!("finish: {e}"))?;
 
     let mut children = Vec::new();
     loop {

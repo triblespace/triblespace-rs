@@ -11,13 +11,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use iroh_base::{EndpointAddr, EndpointId};
 use ed25519_dalek::SigningKey;
+use iroh_base::{EndpointAddr, EndpointId};
 use tracing::{debug, debug_span, error, info, info_span, instrument, trace, warn, Instrument};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
+use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
+use tokio::io::AsyncWriteExt;
 
 fn op_name(op: u8) -> &'static str {
     match op {
@@ -269,13 +271,13 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
     let _thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(host_loop(
-            secret,
-            config,
-            cmd_rx,
-            evt_tx,
-            thread_snapshot,
-        ));
+        rt.block_on(async move {
+            let Some(harness) = crate::transport::iroh::bind(secret, &config).await else {
+                // bind already logged the failure; net thread exits.
+                return;
+            };
+            host_loop(harness, config, cmd_rx, evt_tx, thread_snapshot).await;
+        });
     });
 
     let sender = NetSender {
@@ -293,14 +295,14 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 /// our capability so subsequent ops are authorised. Protocol v4 makes
 /// this mandatory — the server rejects any op until the connection
 /// completes auth.
-#[instrument(level = "info", skip(ep, self_cap), fields(peer = %peer.id.fmt_short()))]
-async fn connect_authed(
-    ep: &iroh::Endpoint,
-    peer: EndpointAddr,
+#[instrument(level = "info", skip(t, self_cap), fields(peer = %hex::encode(&peer[..4])))]
+async fn connect_authed<T: Transport>(
+    t: &T,
+    peer: PeerId,
     self_cap: &RawHash,
-) -> anyhow::Result<iroh::endpoint::Connection> {
+) -> anyhow::Result<T::Conn> {
     debug!(alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN), "connecting");
-    let conn = ep.connect(peer, PILE_SYNC_ALPN).await
+    let conn = t.dial(peer, PILE_SYNC_ALPN).await
         .map_err(|e| {
             warn!(error = %e, "connect failed");
             anyhow::anyhow!("connect: {e}")
@@ -315,252 +317,137 @@ async fn connect_authed(
     Ok(conn)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn host_loop(
-    secret: iroh_base::SecretKey,
+async fn host_loop<T: Transport>(
+    harness: Harness<T>,
     config: PeerConfig,
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
 ) {
-    use iroh::endpoint::presets;
-    use iroh::protocol::Router;
-    use iroh::Endpoint;
-    use iroh_gossip::Gossip;
-    use iroh_gossip::api::GossipSender;
-    use futures::TryStreamExt;
+    let Harness {
+        transport,
+        incoming,
+        gossip,
+    } = harness;
 
-    // Use the OS trust store (via rustls-platform-verifier) rather
-    // than the compiled-in Mozilla webpki-roots bundle. The default
-    // (webpki-roots) breaks when running inside corporate-proxy /
-    // sandbox environments that present a custom CA at egress: iroh's
-    // relay HTTPS probes and pkarr publish/lookup over HTTPS get
-    // `invalid peer certificate: UnknownIssuer`, discovery dies
-    // silently, and the QUIC handshake never starts. Reading the OS
-    // store at runtime lets the sandbox CA (or any admin-installed
-    // root) participate. macOS uses the Security framework; Linux
-    // reads /etc/ssl/certs; Windows reads the certificate store.
-
-    // Strip trailing dots from default relay hostnames. iroh's
-    // defaults ship FQDN-absolute form (`*.iroh-canary.iroh.link.`
-    // — note trailing dot), which is technically RFC-correct but
-    // propagates into reqwest's HTTP `Host` header. Many WAFs
-    // (notably the one fronting Anthropic's web sandbox egress)
-    // treat trailing-dot Host as a known bypass-attempt
-    // signature and 503 the request, leaving iroh's net_report
-    // permanently stuck. Stripping the dot before iroh constructs
-    // its RelayUrls produces an HTTP-canonical Host header that
-    // passes through unmolested. Same upstream relay, just
-    // friendlier URL shape.
-    let relay_map = dot_stripped_default_relay_map();
-
-    // Discovery is layered. `presets::N0` gives us pkarr publish +
-    // DNS lookup via n0.computer. On top of that:
-    //
-    // - `MdnsAddressLookup` adds local-network discovery (zero-conf,
-    //   no internet needed). Two peers on the same LAN find each
-    //   other without pkarr/DNS roundtrips. Works on home WiFi,
-    //   conference rooms, sneakernet; subject to whether the network
-    //   permits client-to-client multicast (some hostile APs filter
-    //   mDNS).
-    //
-    // - `DhtAddressLookup` (pkarr-over-BitTorrent-DHT) gives a third
-    //   discovery path that doesn't depend on n0.computer's DNS
-    //   server being reachable. Default filter is `relay_only`, so
-    //   we don't leak direct-IP addresses to the public DHT.
-    //
-    // All three providers run in parallel; lookup results are
-    // unioned. If any one path is reachable, peers can find each
-    // other.
-    let mdns = match iroh::address_lookup::MdnsAddressLookup::builder().build(EndpointId::from(secret.public())) {
-        Ok(m) => Some(m),
-        Err(e) => { warn!(error = %e, "mDNS discovery init failed; continuing without LAN discovery"); None }
-    };
-
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret.clone())
-        .ca_roots_config(iroh::tls::CaRootsConfig::system())
-        .relay_mode(iroh::RelayMode::Custom(relay_map))
-        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
-    if let Some(m) = mdns {
-        builder = builder.address_lookup(m);
-    }
-    let ep = match builder.bind().await {
-        Ok(ep) => ep,
-        Err(e) => { error!(error = %e, "iroh endpoint bind failed; net thread exiting"); return; }
-    };
-    ep.online().await;
-
-    let my_id = ep.id();
+    let my_id: PeerId = transport.local_id();
     let self_cap: RawHash = config.self_cap;
-    let mut router_builder = Router::builder(ep.clone());
 
     // Host-wide singleflight connection pool — one authed
     // connection per remote peer, reused across all concurrent
     // fetch_reachable / swarm_fetch_chain calls. See `SharedPool`
-    // docs for the OnceCell-based dial deduplication. Named
-    // `conn_pool` to avoid shadowing the unrelated iroh_blobs
-    // ConnectionPool that gets initialized below for the DHT.
-    let conn_pool: SharedPool = new_shared_pool();
+    // docs for the OnceCell-based dial deduplication.
+    let conn_pool: SharedPool<T::Conn> = new_shared_pool();
 
-    // DHT — always on. Peers bootstrap the routing table.
-    let dht_alpn = crate::dht::rpc::ALPN;
-    let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
-        ep.clone(), dht_alpn,
-        iroh_blobs::util::connection_pool::Options {
-            max_connections: 64,
-            idle_timeout: std::time::Duration::from_secs(30),
-            connect_timeout: std::time::Duration::from_secs(10),
-            on_connected: None,
-        },
-    );
-    let iroh_pool = crate::dht::pool::IrohPool::new(ep.clone(), pool);
-    // Gossip + DHT bootstrap want bare EndpointIds; the addresses
-    // attached to each peer were seeded into the address lookup
-    // service above, so iroh will resolve them locally on connect.
-    let bootstrap_ids: Vec<EndpointId> =
-        config.peers.iter().map(|addr| addr.id).collect();
-    let (rpc, dht_api) = crate::dht::create_node(
-        my_id, iroh_pool.clone(), bootstrap_ids.clone(), Default::default(),
-    );
-    iroh_pool.set_self_client(Some(rpc.downgrade()));
-    let dht_sender = rpc.inner().as_local().expect("local sender");
-    router_builder = router_builder
-        .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
-    let dht_api = Some(dht_api);
+    // Our own pubkey — the expected `cap_subject` of any cap
+    // delivered to us via OP_DELIVER_CAP.
+    let our_pubkey = ed25519_dalek::VerifyingKey::from_bytes(&my_id)
+        .expect("transport local id is an ed25519 pubkey");
 
-    // Protocol handler. ep + dht + self_cap + events are threaded
-    // through so the OP_AUTH path can fall back to a swarm fetch
-    // when the presented cap chain references blobs we don't have
-    // locally (caps are orphan blobs that don't ride along with
-    // normal branch syncs).
-    let handler = SnapshotHandler {
+    // ── Inbound connections: dispatch by ALPN to the protocol
+    // handlers. Each connection gets its own task; each handler
+    // accepts sequential bi-streams until the peer closes.
+    let snapshot_handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         team_root: config.team_root,
-        ep: ep.clone(),
-        dht: dht_api.clone(),
+        transport: transport.clone(),
         self_cap,
         events: events.clone(),
         pool: conn_pool.clone(),
-        my_id,
     };
-    router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
-
-    // Auth-handshake ALPN (separate from PILE_SYNC because it's open
-    // to unauthenticated peers — a peer requesting their first cap
-    // has nothing to present at OP_AUTH yet). For OP_REQUEST_CAP the
-    // handler is a thin wire→event bridge; for OP_DELIVER_CAP it
-    // verifies the chain (swarm-fetching missing chain blobs the
-    // same way OP_AUTH does), and only on a clean verify emits the
-    // verified blobs as `NetEvent::Blob` + `NetEvent::CapDelivered`
-    // and returns STATUS_OK — so a STATUS_OK at the wire means
-    // "we have absorbed and pinned this cap".
-    let our_pubkey = ed25519_dalek::VerifyingKey::from_bytes(
-        secret.public().as_bytes(),
-    )
-    .expect("iroh public key parses as ed25519 pubkey");
     let handshake_handler = HandshakeHandler {
         events: events.clone(),
         team_root: config.team_root,
         our_pubkey,
         snapshot: snapshot.clone(),
-        ep: ep.clone(),
-        dht: dht_api.clone(),
-        self_cap,
+        transport: transport.clone(),
         pool: conn_pool.clone(),
-        my_id,
     };
-    router_builder = router_builder
-        .accept(crate::handshake::AUTH_HANDSHAKE_ALPN, handshake_handler);
+    let mut incoming = incoming;
+    tokio::spawn(async move {
+        while let Some(inc) = incoming.recv().await {
+            if inc.alpn == PILE_SYNC_ALPN {
+                let h = snapshot_handler.clone();
+                tokio::spawn(async move { h.handle(inc.conn).await });
+            } else if inc.alpn == crate::handshake::AUTH_HANDSHAKE_ALPN {
+                let h = handshake_handler.clone();
+                tokio::spawn(async move { h.handle(inc.conn).await });
+            } else {
+                debug!(alpn = %String::from_utf8_lossy(inc.alpn), "incoming conn on unknown alpn; dropping");
+            }
+        }
+    });
 
-    // Gossip.
-    let mut gossip_sender: Option<GossipSender> = None;
-    if config.gossip {
-        let gossip = Gossip::builder().spawn(ep.clone());
-        router_builder = router_builder.accept(iroh_gossip::ALPN, gossip.clone());
+    // ── Gossip: consume the team-topic event stream. HEAD frames
+    // trigger reachable-closure fetches; neighbor events are logged.
+    let mut gossip_sender: Option<T::Gossip> = None;
+    if let Some((sender, mut gossip_events)) = gossip {
+        gossip_sender = Some(sender);
+        let events_tx = events.clone();
+        let t2 = transport.clone();
+        // Local snapshot handle — used by fetch_reachable's
+        // discovery phase to skip subtrees we already have.
+        // Same Arc the protocol server uses to answer
+        // OP_CHILDREN / OP_GET_BLOB to remote peers.
+        let snapshot_for_fetch = snapshot.clone();
+        let pool_for_fetch = conn_pool.clone();
+        tokio::spawn(async move {
+            while let Some(event) = gossip_events.recv().await {
+                match event {
+                    GossipEvent::Received { bytes, delivered_from } => {
+                        // Gossip HEAD message: 0x01 + branch(16) + head(32) + publisher(32) = 81 bytes
+                        if bytes.len() == 81 && bytes[0] == 0x01 {
+                            let mut branch = [0u8; 16];
+                            branch.copy_from_slice(&bytes[1..17]);
+                            let mut head = [0u8; 32];
+                            head.copy_from_slice(&bytes[17..49]);
+                            let mut publisher = [0u8; 32];
+                            publisher.copy_from_slice(&bytes[49..81]);
 
-        // Topic id is the team root pubkey directly: the team root is
-        // already 32 uniform bytes (an ed25519 pubkey), so no hashing
-        // is needed. One gossip mesh per team — knowing the team
-        // identifies the rendezvous channel.
-        let topic_id = iroh_gossip::TopicId::from_bytes(config.team_root.to_bytes());
-        // Always use subscribe (non-blocking). The join happens in the background
-        // as peers come online. subscribe_and_join blocks until at least one peer
-        // is reachable, which causes hangs if peers start at different times.
-        let topic = gossip.subscribe(topic_id, bootstrap_ids.clone()).await;
-        if let Ok(topic) = topic {
-            let (sender, receiver) = topic.split();
-            gossip_sender = Some(sender);
-            let events_tx = events.clone();
-            let ep2 = ep.clone();
-            let dht_api2 = dht_api.clone();
-            // Local snapshot handle — used by fetch_reachable's
-            // discovery phase to skip subtrees we already have.
-            // Same Arc the protocol server uses to answer
-            // OP_CHILDREN / OP_GET_BLOB to remote peers.
-            let snapshot_for_fetch = snapshot.clone();
-            let pool_for_fetch = conn_pool.clone();
-            let my_id_for_fetch = my_id;
-            tokio::spawn(async move {
-                let mut receiver = receiver;
-                while let Ok(Some(event)) = receiver.try_next().await {
-                    match &event {
-                        iroh_gossip::api::Event::Received(msg) => {
-                            // Gossip HEAD message: 0x01 + branch(16) + head(32) + publisher(32) = 81 bytes
-                            if msg.content.len() == 81 && msg.content[0] == 0x01 {
-                                let mut branch = [0u8; 16];
-                                branch.copy_from_slice(&msg.content[1..17]);
-                                let mut head = [0u8; 32];
-                                head.copy_from_slice(&msg.content[17..49]);
-                                let mut publisher = [0u8; 32];
-                                publisher.copy_from_slice(&msg.content[49..81]);
-
-                                let ep2 = ep2.clone();
-                                let events_tx2 = events_tx.clone();
-                                let dht2 = dht_api2.clone();
-                                let self_cap2 = self_cap;
-                                let snap2 = snapshot_for_fetch.clone();
-                                let pool2 = pool_for_fetch.clone();
-                                let my_id2 = my_id_for_fetch;
-                                // Use publisher key to connect for fetch (they're the source).
-                                let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
-                                    pk.into()
+                            let t3 = t2.clone();
+                            let events_tx2 = events_tx.clone();
+                            let self_cap2 = self_cap;
+                            let snap2 = snapshot_for_fetch.clone();
+                            let pool2 = pool_for_fetch.clone();
+                            // Use publisher key to connect for fetch
+                            // (they're the source); fall back to the
+                            // relaying neighbor if the frame carries
+                            // an invalid pubkey.
+                            let fetch_peer: PeerId =
+                                if ed25519_dalek::VerifyingKey::from_bytes(&publisher).is_ok() {
+                                    publisher
                                 } else {
-                                    msg.delivered_from.into()
+                                    delivered_from
                                 };
-                                tokio::spawn(async move {
-                                    debug!(
-                                        head = %hex::encode(&head[..4]),
-                                        publisher = %hex::encode(&publisher[..4]),
-                                        "gossip head update; fetching"
-                                    );
-                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2, &snap2, &pool2, my_id2).await;
-                                });
-                            }
+                            tokio::spawn(async move {
+                                debug!(
+                                    head = %hex::encode(&head[..4]),
+                                    publisher = %hex::encode(&publisher[..4]),
+                                    "gossip head update; fetching"
+                                );
+                                track_known_head(&t3, fetch_peer, branch, head, publisher, &events_tx2, &self_cap2, &snap2, &pool2).await;
+                            });
                         }
-                        iroh_gossip::api::Event::NeighborUp(peer) => {
-                            info!(peer = %peer.fmt_short(), "gossip neighbor up");
-                        }
-                        iroh_gossip::api::Event::NeighborDown(peer) => {
-                            info!(peer = %peer.fmt_short(), "gossip neighbor down");
-                        }
-                        _ => {}
+                    }
+                    GossipEvent::NeighborUp(peer) => {
+                        info!(peer = %hex::encode(&peer[..4]), "gossip neighbor up");
+                    }
+                    GossipEvent::NeighborDown(peer) => {
+                        info!(peer = %hex::encode(&peer[..4]), "gossip neighbor down");
                     }
                 }
-            });
-        }
+            }
+        });
     }
-
-    let _router = router_builder.spawn();
 
     /// Build the gossip wire frame for a (branch, head) pair.
     /// 0x01 | branch(16) | head(32) | publisher(32) = 81 bytes.
-    fn gossip_frame(branch: &RawPinId, head: &RawHash, publisher: &EndpointId) -> Vec<u8> {
+    fn gossip_frame(branch: &RawPinId, head: &RawHash, publisher: &PeerId) -> Vec<u8> {
         let mut msg = Vec::with_capacity(81);
         msg.push(0x01);
         msg.extend_from_slice(branch);
         msg.extend_from_slice(head);
-        msg.extend_from_slice(publisher.as_bytes());
+        msg.extend_from_slice(publisher);
         msg
     }
 
@@ -580,13 +467,10 @@ async fn host_loop(
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
                 NetCommand::Announce(hash) => {
-                    if let Some(api) = &dht_api {
-                        let api = api.clone();
-                        tokio::spawn(async move {
-                            let blake3_hash = blake3::Hash::from_bytes(hash);
-                            let _ = api.announce_provider(blake3_hash, my_id).await;
-                        });
-                    }
+                    let t = transport.clone();
+                    tokio::spawn(async move {
+                        t.dht_announce(hash).await;
+                    });
                 }
                 NetCommand::Gossip { branch, head } => {
                     last_published.insert(branch, head);
@@ -594,7 +478,7 @@ async fn host_loop(
                         let msg = gossip_frame(&branch, &head, &my_id);
                         let sender = sender.clone();
                         tokio::spawn(async move {
-                            let _ = sender.broadcast(msg.into()).await;
+                            let _ = sender.broadcast(msg).await;
                         });
                     }
                 }
@@ -607,21 +491,10 @@ async fn host_loop(
                     // failure (connect/send/non-OK) the entry stays
                     // in the undelivered set and the next renewal
                     // tick attempts redispatch.
-                    let ep_for_deliver = ep.clone();
-                    let events_for_deliver = events.clone();
+                    let t_for_deliver = transport.clone();
                     tokio::spawn(async move {
-                        let subject_id = match iroh_base::EndpointId::from_bytes(&subject) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                warn!(error = %e, "DeliverCap: bad subject pubkey");
-                                return;
-                            }
-                        };
-                        let conn = match ep_for_deliver
-                            .connect(
-                                subject_id,
-                                crate::handshake::AUTH_HANDSHAKE_ALPN,
-                            )
+                        let conn = match t_for_deliver
+                            .dial(subject, crate::handshake::AUTH_HANDSHAKE_ALPN)
                             .await
                         {
                             Ok(c) => c,
@@ -663,7 +536,7 @@ async fn host_loop(
                                 );
                             }
                         }
-                        conn.close(0u32.into(), b"ok");
+                        conn.close(0, b"ok");
                     });
                 }
             }
@@ -675,7 +548,7 @@ async fn host_loop(
                     let msg = gossip_frame(branch, head, &my_id);
                     let sender = sender.clone();
                     tokio::spawn(async move {
-                        let _ = sender.broadcast(msg.into()).await;
+                        let _ = sender.broadcast(msg).await;
                     });
                 }
             }
@@ -705,17 +578,14 @@ async fn host_loop(
 /// number of ops; with DHT-driven provider selection, the walk
 /// fans out across multiple caching peers in parallel hops
 /// rather than funnelling everything through the publisher.
-#[allow(clippy::too_many_arguments)]
-async fn fetch_reachable(
-    ep: &iroh::Endpoint,
-    publisher: EndpointAddr,
+async fn fetch_reachable<T: Transport>(
+    t: &T,
+    publisher: PeerId,
     head: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    pool: &SharedPool,
-    my_id: EndpointId,
+    pool: &SharedPool<T::Conn>,
 ) -> anyhow::Result<()> {
     // Local-presence check against the same snapshot the server
     // uses to answer remote OP_CHILDREN / OP_GET_BLOB. Closure
@@ -739,18 +609,15 @@ async fn fetch_reachable(
         return Ok(());
     }
 
-    let publisher_id = publisher.id;
+    let publisher_id = publisher;
 
     // Seed the pool with the publisher's connection on first encounter.
     // pool_get is singleflight-on-dial via OnceCell, so concurrent
     // fetch_reachable calls targeting the same publisher share one
     // dial and one OP_AUTH; the resulting connection serves every
     // op_children/op_get_blob on this and all other walks.
-    // Note we pass the *fully-addressed* publisher only to seed the
-    // cell with a known-good address; subsequent pool_get calls fall
-    // through to iroh's address lookup if needed.
-    trace!(head = %hex::encode(&head[..4]), publisher = %publisher_id.fmt_short(), "fetch_reachable: seeding pool");
-    let _ = pool_get(ep, pool, publisher_id, self_cap).await;
+    trace!(head = %hex::encode(&head[..4]), publisher = %hex::encode(&publisher_id[..4]), "fetch_reachable: seeding pool");
+    let _ = pool_get(t, pool, publisher_id, self_cap).await;
     trace!(head = %hex::encode(&head[..4]), "fetch_reachable: pool seeded; entering Phase 1");
 
     // ── Phase 1: discovery (OP_CHILDREN only) ──
@@ -770,7 +637,7 @@ async fn fetch_reachable(
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
             trace!(parent = %hex::encode(&parent[..4]), "fetch_reachable: calling children_one");
-            let children = match children_one(ep, parent, dht, pool, publisher_id, my_id, self_cap).await {
+            let children = match children_one(t, parent, pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => {
                     warn!(parent = %hex::encode(&parent[..4]), "op_children: no provider could serve");
@@ -824,7 +691,7 @@ async fn fetch_reachable(
     // short-circuit on them and only re-fetch the still-missing
     // ancestors.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await
+        let Some(data) = fetch_one(t, hash, pool, publisher_id, self_cap).await
         else {
             warn!(
                 hash = %hex::encode(&hash[..4]),
@@ -864,25 +731,15 @@ async fn fetch_reachable(
 /// error. If we have the blob, we'd have hit the `have_local`
 /// short-circuit upstream; if we're being asked to fetch, by
 /// definition we don't have it (yet) — so self is never useful here.
-async fn providers_for(
+async fn providers_for<T: Transport>(
+    t: &T,
     hash: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
-    publisher_id: EndpointId,
-    my_id: EndpointId,
-) -> Vec<EndpointId> {
-    let mut providers: Vec<EndpointId> = if let Some(api) = dht {
-        let blake3_hash = blake3::Hash::from_bytes(*hash);
-        trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
-        let result = api.find_providers(blake3_hash).await;
-        match &result {
-            Ok(v) => trace!(hash = %hex::encode(&hash[..4]), n = v.len(), "providers_for: DHT find_providers returned"),
-            Err(e) => trace!(hash = %hex::encode(&hash[..4]), error = %e, "providers_for: DHT find_providers errored"),
-        }
-        result.unwrap_or_default()
-    } else {
-        trace!(hash = %hex::encode(&hash[..4]), "providers_for: no DHT");
-        Vec::new()
-    };
+    publisher_id: PeerId,
+) -> Vec<PeerId> {
+    let my_id = t.local_id();
+    trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
+    let mut providers: Vec<PeerId> = t.dht_providers(*hash).await;
+    trace!(hash = %hex::encode(&hash[..4]), n = providers.len(), "providers_for: DHT find_providers returned");
     providers.retain(|id| *id != my_id);
     if publisher_id != my_id && !providers.contains(&publisher_id) {
         providers.push(publisher_id);
@@ -904,11 +761,11 @@ async fn providers_for(
 /// `serve_stream` accepts unbounded sequential bi-streams per
 /// connection (auth state set on the first OP_AUTH stream, reused on
 /// every subsequent stream). So one connection per peer is enough.
-pub(crate) type SharedPool = Arc<tokio::sync::Mutex<
-    HashMap<EndpointId, Arc<tokio::sync::OnceCell<iroh::endpoint::Connection>>>,
+pub(crate) type SharedPool<C> = Arc<tokio::sync::Mutex<
+    HashMap<PeerId, Arc<tokio::sync::OnceCell<C>>>,
 >>;
 
-fn new_shared_pool() -> SharedPool {
+fn new_shared_pool<C>() -> SharedPool<C> {
     Arc::new(tokio::sync::Mutex::new(HashMap::new()))
 }
 
@@ -917,12 +774,12 @@ fn new_shared_pool() -> SharedPool {
 /// if many tasks race here concurrently; the rest await the same
 /// initialization. Returns `None` if the dial fails (the cell stays
 /// uninitialized so a later call can retry).
-async fn pool_get(
-    ep: &iroh::Endpoint,
-    pool: &SharedPool,
-    provider: EndpointId,
+async fn pool_get<T: Transport>(
+    t: &T,
+    pool: &SharedPool<T::Conn>,
+    provider: PeerId,
     self_cap: &RawHash,
-) -> Option<iroh::endpoint::Connection> {
+) -> Option<T::Conn> {
     let cell = {
         let mut guard = pool.lock().await;
         guard
@@ -930,14 +787,11 @@ async fn pool_get(
             .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
             .clone()
     };
-    let init = || async {
-        let addr: EndpointAddr = provider.into();
-        connect_authed(ep, addr, self_cap).await
-    };
+    let init = || async { connect_authed(t, provider, self_cap).await };
     match cell.get_or_try_init(init).await {
         Ok(conn) => Some(conn.clone()),
         Err(e) => {
-            debug!(error = %e, provider = %provider.fmt_short(), "pool dial failed");
+            debug!(error = %e, provider = %hex::encode(&provider[..4]), "pool dial failed");
             // Drop the cell so the next caller can retry. Use a fresh
             // entry: if anyone awaited the original cell while we were
             // in get_or_try_init, they all got the same Err — they'll
@@ -956,14 +810,14 @@ async fn pool_get(
 /// Evict a connection from the pool. Called when an op on the pooled
 /// connection errors (peer may have closed, network changed, etc.)
 /// so the next access re-dials.
-async fn pool_evict(pool: &SharedPool, provider: EndpointId) {
+async fn pool_evict<C: Conn>(pool: &SharedPool<C>, provider: PeerId) {
     let removed = {
         let mut guard = pool.lock().await;
         guard.remove(&provider)
     };
     if let Some(cell) = removed {
         if let Some(conn) = cell.get() {
-            conn.close(0u32.into(), b"pool evict");
+            conn.close(0, b"pool evict");
         }
     }
 }
@@ -971,29 +825,26 @@ async fn pool_evict(pool: &SharedPool, provider: EndpointId) {
 /// Fetch a single blob via the swarm — DHT-resolved providers
 /// first, publisher as fallback. Returns the first successful
 /// fetch's bytes (caller verifies hash).
-#[allow(clippy::too_many_arguments)]
-async fn fetch_one(
-    ep: &iroh::Endpoint,
+async fn fetch_one<T: Transport>(
+    t: &T,
     hash: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
-    pool: &SharedPool,
-    publisher_id: EndpointId,
-    my_id: EndpointId,
+    pool: &SharedPool<T::Conn>,
+    publisher_id: PeerId,
     self_cap: &RawHash,
 ) -> Option<Vec<u8>> {
-    let providers = providers_for(hash, dht, publisher_id, my_id).await;
+    let providers = providers_for(t, hash, publisher_id).await;
     for provider in providers {
-        let Some(conn) = pool_get(ep, pool, provider, self_cap).await else {
+        let Some(conn) = pool_get(t, pool, provider, self_cap).await else {
             continue;
         };
         match op_get_blob(&conn, hash).await {
             Ok(Some(data)) => return Some(data),
             Ok(None) => {
-                debug!(hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "blob miss");
+                debug!(hash = %hex::encode(&hash[..4]), provider = %hex::encode(&provider[..4]), "blob miss");
                 continue;
             }
             Err(e) => {
-                debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %provider.fmt_short(), "op_get_blob errored, evicting and trying next provider");
+                debug!(error = %e, hash = %hex::encode(&hash[..4]), provider = %hex::encode(&provider[..4]), "op_get_blob errored, evicting and trying next provider");
                 // Connection-level error: pooled connection may be
                 // dead. Evict so subsequent ops to this peer re-dial.
                 pool_evict(pool, provider).await;
@@ -1004,18 +855,6 @@ async fn fetch_one(
     None
 }
 
-/// Convert the connecting peer's verified pubkey into an EndpointAddr
-/// suitable for `connect_authed`. Carries no relay/direct addrs — iroh's
-/// discovery layer resolves them on dial. Used by the OP_AUTH swarm-
-/// fetch fallback to seed the publisher slot of the fetch pool with
-/// the very peer that just initiated the OP_AUTH (they have their
-/// own cap by construction).
-fn peer_endpoint_for_dialer(peer_pubkey: ed25519_dalek::VerifyingKey) -> EndpointAddr {
-    // iroh's PublicKey wraps the same 32 ed25519 bytes.
-    let pk = iroh_base::PublicKey::from_bytes(peer_pubkey.as_bytes())
-        .expect("ed25519 VerifyingKey is a valid iroh PublicKey");
-    EndpointAddr::from(EndpointId::from(pk))
-}
 
 /// Swarm-fetch the closure rooted at `head` (a cap sig handle, in the
 /// OP_AUTH context) and return it as a `HashMap<RawHash, Vec<u8>>`.
@@ -1024,18 +863,15 @@ fn peer_endpoint_for_dialer(peer_pubkey: ed25519_dalek::VerifyingKey) -> Endpoin
 /// the results to a map instead of emitting `NetEvent::Blob`. The
 /// caller decides whether to cache the bytes into the local store
 /// after using them.
-#[allow(clippy::too_many_arguments)]
-async fn swarm_fetch_chain(
-    ep: &iroh::Endpoint,
-    publisher: EndpointAddr,
+async fn swarm_fetch_chain<T: Transport>(
+    t: &T,
+    publisher: PeerId,
     head: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
     self_cap: &RawHash,
-    pool: &SharedPool,
-    my_id: EndpointId,
+    pool: &SharedPool<T::Conn>,
 ) -> HashMap<RawHash, Vec<u8>> {
     let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
-    let publisher_id = publisher.id;
+    let publisher_id = publisher;
 
     // Ensure we have an authed connection to the publisher (the
     // peer that just sent us the cap_handle via OP_AUTH). pool_get
@@ -1043,7 +879,7 @@ async fn swarm_fetch_chain(
     // the parallel-OP_AUTH-burst case share one dial + one OP_AUTH.
     // The whole recursion bottoms out at the publisher for typical
     // two-level chains.
-    if pool_get(ep, pool, publisher_id, self_cap).await.is_none() {
+    if pool_get(t, pool, publisher_id, self_cap).await.is_none() {
         // Couldn't even auth to the dialer. Give up — there's no
         // realistic path to fetch the chain without them.
         return fetched;
@@ -1061,7 +897,7 @@ async fn swarm_fetch_chain(
     while !frontier.is_empty() {
         let mut next: Vec<RawHash> = Vec::new();
         for parent in &frontier {
-            let children = match children_one(ep, parent, dht, pool, publisher_id, my_id, self_cap).await {
+            let children = match children_one(t, parent, pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => continue,
             };
@@ -1080,7 +916,7 @@ async fn swarm_fetch_chain(
     // cache-write step: emitting children before parents keeps the
     // bottom-up insertion invariant when the events get drained.
     for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(ep, hash, dht, pool, publisher_id, my_id, self_cap).await else {
+        let Some(data) = fetch_one(t, hash, pool, publisher_id, self_cap).await else {
             continue;
         };
         if blake3::hash(&data).as_bytes() != hash {
@@ -1094,30 +930,27 @@ async fn swarm_fetch_chain(
 }
 
 /// Walk children of a parent blob via the swarm.
-#[allow(clippy::too_many_arguments)]
-async fn children_one(
-    ep: &iroh::Endpoint,
+async fn children_one<T: Transport>(
+    t: &T,
     parent: &RawHash,
-    dht: &Option<crate::dht::api::ApiClient>,
-    pool: &SharedPool,
-    publisher_id: EndpointId,
-    my_id: EndpointId,
+    pool: &SharedPool<T::Conn>,
+    publisher_id: PeerId,
     self_cap: &RawHash,
 ) -> Option<Vec<RawHash>> {
     trace!(parent = %hex::encode(&parent[..4]), "children_one: providers_for awaiting");
-    let providers = providers_for(parent, dht, publisher_id, my_id).await;
+    let providers = providers_for(t, parent, publisher_id).await;
     trace!(parent = %hex::encode(&parent[..4]), n = providers.len(), "children_one: providers_for returned");
     for provider in &providers {
-        trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: pool_get awaiting");
-        let Some(conn) = pool_get(ep, pool, *provider, self_cap).await else {
-            trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: pool_get returned None");
+        trace!(parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "children_one: pool_get awaiting");
+        let Some(conn) = pool_get(t, pool, *provider, self_cap).await else {
+            trace!(parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "children_one: pool_get returned None");
             continue;
         };
-        trace!(parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "children_one: op_children awaiting");
+        trace!(parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "children_one: op_children awaiting");
         match op_children(&conn, parent).await {
             Ok(c) => return Some(c),
             Err(e) => {
-                debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %provider.fmt_short(), "op_children errored, evicting and trying next provider");
+                debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "op_children errored, evicting and trying next provider");
                 pool_evict(pool, *provider).await;
                 continue;
             }
@@ -1134,23 +967,19 @@ async fn children_one(
 /// both know (fetch_peer, branch, head, publisher) by the time they
 /// get here. Gossip gets the head directly from the broadcast message;
 /// `Track` asks the peer via `op_head` first.
-#[allow(clippy::too_many_arguments)]
-async fn track_known_head(
-    ep: &iroh::Endpoint,
-    fetch_peer: EndpointAddr,
+async fn track_known_head<T: Transport>(
+    t: &T,
+    fetch_peer: PeerId,
     branch: RawPinId,
     head: RawHash,
-    publisher: crate::channel::PublisherKey,
-    dht: &Option<crate::dht::api::ApiClient>,
+    publisher: PublisherKey,
     events: &mpsc::Sender<NetEvent>,
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    pool: &SharedPool,
-    my_id: EndpointId,
+    pool: &SharedPool<T::Conn>,
 ) {
-    let fetch_id = fetch_peer.id;
-    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap, local, pool, my_id).await {
-        warn!(error = %e, peer = %fetch_id.fmt_short(), "fetch_reachable failed");
+    if let Err(e) = fetch_reachable(t, fetch_peer, &head, events, self_cap, local, pool).await {
+        warn!(error = %e, peer = %hex::encode(&fetch_peer[..4]), "fetch_reachable failed");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
     }
@@ -1159,19 +988,15 @@ async fn track_known_head(
 // ── Protocol handler ─────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct SnapshotHandler {
+struct SnapshotHandler<T: Transport> {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     /// Verifies all incoming capability chains. Required — protocol v4
     /// has mandatory auth.
     team_root: ed25519_dalek::VerifyingKey,
-    /// Our endpoint for opening outbound connections during the
-    /// swarm-fetch fallback in OP_AUTH (when an incoming cap chain
-    /// references blobs we don't have locally).
-    ep: iroh::Endpoint,
-    /// DHT client for resolving "who has this cap blob?" during the
-    /// swarm-fetch fallback. `None` only in test setups that don't
-    /// bring up a DHT — production always has one.
-    dht: Option<crate::dht::api::ApiClient>,
+    /// Transport for outbound connections + DHT provider lookup
+    /// during the swarm-fetch fallback in OP_AUTH (when an incoming
+    /// cap chain references blobs we don't have locally).
+    transport: T,
     /// Our own cap handle, presented at OP_AUTH when we dial peers
     /// to fetch missing cap chain blobs.
     self_cap: RawHash,
@@ -1184,18 +1009,7 @@ struct SnapshotHandler {
     /// Host-wide connection pool. Shared with the gossip-arrival
     /// fetch path. The OP_AUTH swarm-fetch and the gossip-driven
     /// fetch end up using the same authed connection per peer.
-    pool: SharedPool,
-    /// Our own endpoint id. Used to filter self out of provider
-    /// lists during swarm-fetch (find_providers may list us as a
-    /// provider for blobs we've announced, but we'd hit the local
-    /// cache instead of dialing — and iroh refuses self-connect).
-    my_id: EndpointId,
-}
-
-impl std::fmt::Debug for SnapshotHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnapshotHandler").finish()
-    }
+    pool: SharedPool<T::Conn>,
 }
 
 /// Protocol handler for `/triblespace/auth-handshake/1`. Accepts
@@ -1205,7 +1019,7 @@ impl std::fmt::Debug for SnapshotHandler {
 /// receiving Peer, not here — this handler just bridges the wire to
 /// the local event queue.
 #[derive(Clone)]
-struct HandshakeHandler {
+struct HandshakeHandler<T: Transport> {
     events: mpsc::Sender<NetEvent>,
     /// Team root pubkey — verifies the delivered cap's chain at
     /// `OP_DELIVER_CAP` time so STATUS_OK means "we'd accept this".
@@ -1215,57 +1029,42 @@ struct HandshakeHandler {
     our_pubkey: ed25519_dalek::VerifyingKey,
     /// Snapshot for local-pile blob lookup during verify.
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    /// Endpoint + DHT + pool + self_cap + my_id are the swarm-fetch
-    /// substrate. When the local-pile verify fails with `Fetch`, we
-    /// open `pile-sync/4` to providers of the missing blobs (DHT
-    /// providers first, dialer as fallback) and walk the chain via
-    /// `OP_CHILDREN` + `OP_GET_BLOB` until we have everything verify
-    /// needs.
-    ep: iroh::Endpoint,
-    dht: Option<crate::dht::api::ApiClient>,
-    self_cap: RawHash,
-    pool: SharedPool,
-    my_id: EndpointId,
+    /// Transport + pool are the swarm-fetch substrate. When the
+    /// local-pile verify fails with `Fetch`, we open `pile-sync/4`
+    /// to providers of the missing blobs (DHT providers first,
+    /// dialer as fallback) and walk the chain via `OP_CHILDREN` +
+    /// `OP_GET_BLOB` until we have everything verify needs. The
+    /// swarm-fetch credential is the just-delivered sig handle
+    /// itself (see the OP_DELIVER_CAP arm), so no self_cap here.
+    transport: T,
+    pool: SharedPool<T::Conn>,
 }
 
-impl std::fmt::Debug for HandshakeHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HandshakeHandler").finish()
-    }
-}
-
-impl iroh::protocol::ProtocolHandler for HandshakeHandler {
-    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let peer_endpoint = connection.remote_id();
+impl<T: Transport> HandshakeHandler<T> {
+    async fn handle(&self, connection: T::Conn) {
         // PublisherKey is just the 32-byte pubkey representation;
-        // iroh's `EndpointId` is already an ed25519 pubkey so this
-        // is a direct byte extraction (matched against the type
-        // alias in channel.rs).
-        let peer_pubkey_bytes: PublisherKey = *peer_endpoint.as_bytes();
+        // the transport's remote id is the TLS-verified ed25519
+        // pubkey of the dialer (matched against the type alias in
+        // channel.rs).
+        let peer_pubkey_bytes: PublisherKey = connection.remote_id();
         let events = self.events.clone();
         let team_root = self.team_root;
         let our_pubkey = self.our_pubkey;
         let snapshot = self.snapshot.clone();
-        let ep = self.ep.clone();
-        let dht = self.dht.clone();
-        let self_cap = self.self_cap;
+        let transport = self.transport.clone();
         let pool = self.pool.clone();
-        let my_id = self.my_id;
         let span = info_span!(
             "auth-handshake",
-            peer = %peer_endpoint.fmt_short(),
+            peer = %hex::encode(&peer_pubkey_bytes[..4]),
         );
         async move {
             // Each connection can carry multiple bi-streams (e.g. a
             // request followed by a deliver). Loop until the peer
             // closes the connection.
             loop {
-                let (mut send, mut recv) = match connection.accept_bi().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        debug!(error = %e, "accept_bi ended; handshake connection closing");
-                        break;
-                    }
+                let Some((mut send, mut recv)) = connection.accept_bi().await else {
+                    debug!("accept_bi ended; handshake connection closing");
+                    break;
                 };
                 match crate::handshake::read_incoming(&mut recv).await {
                     Ok(Some(crate::handshake::IncomingOp::Request {
@@ -1296,8 +1095,6 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes.clone());
                         let cap_hash: RawHash = *blake3::hash(&cap_bytes).as_bytes();
                         let sig_hash: RawHash = *blake3::hash(&sig_bytes).as_bytes();
-                        let cap_handle: Inline<Handle<SimpleArchive>> =
-                            Inline::new(cap_hash);
                         let sig_handle: Inline<Handle<SimpleArchive>> =
                             Inline::new(sig_hash);
 
@@ -1400,13 +1197,7 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                                 sig = %hex::encode(&sig_hash[..4]),
                                 "OP_DELIVER_CAP: chain incomplete locally, swarm-fetching",
                             );
-                            let dialer_addr: EndpointAddr =
-                                peer_endpoint_for_dialer(
-                                    ed25519_dalek::VerifyingKey::from_bytes(
-                                        &peer_pubkey_bytes,
-                                    )
-                                    .expect("iroh peer pubkey parses"),
-                                );
+
                             // Use the just-received `sig_hash` as the
                             // OP_AUTH credential for the swarm-fetch
                             // — for both first-time delivery and
@@ -1423,8 +1214,8 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
                             // path validates against team_root for
                             // anyone deeper.
                             fetched = swarm_fetch_chain(
-                                &ep, dialer_addr, &sig_hash, &dht,
-                                &sig_hash, &pool, my_id,
+                                &transport, peer_pubkey_bytes, &sig_hash,
+                                &sig_hash, &pool,
                             )
                             .await;
                             debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
@@ -1497,36 +1288,31 @@ impl iroh::protocol::ProtocolHandler for HandshakeHandler {
         }
         .instrument(span)
         .await;
-        Ok(())
     }
 }
 
-impl iroh::protocol::ProtocolHandler for SnapshotHandler {
-    async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
+impl<T: Transport> SnapshotHandler<T> {
+    async fn handle(&self, connection: T::Conn) {
         let snap = self.snapshot.clone();
         let team_root = self.team_root;
-        let ep = self.ep.clone();
-        let dht = self.dht.clone();
+        let transport = self.transport.clone();
         let self_cap = self.self_cap;
         let events = self.events.clone();
         let pool = self.pool.clone();
-        let my_id = self.my_id;
 
-        let peer_endpoint = connection.remote_id();
+        let peer_id: PeerId = connection.remote_id();
         let span = info_span!(
             "connection",
-            peer = %peer_endpoint.fmt_short(),
+            peer = %hex::encode(&peer_id[..4]),
             alpn = %String::from_utf8_lossy(PILE_SYNC_ALPN),
         );
 
         async move {
             info!("connection accepted");
 
-            // Extract the connecting peer's verified ed25519 identity
-            // from iroh's TLS handshake.
-            let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(
-                peer_endpoint.as_bytes(),
-            ) {
+            // The connecting peer's verified ed25519 identity from
+            // the transport's TLS layer.
+            let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(&peer_id) {
                 Ok(k) => k,
                 Err(e) => {
                     warn!(error = %e, "peer pubkey parse failed; closing");
@@ -1541,17 +1327,13 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
             >> = Arc::new(tokio::sync::RwLock::new(None));
 
             loop {
-                let (mut send, mut recv) = match connection.accept_bi().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        debug!(error = %e, "accept_bi ended; connection closing");
-                        break;
-                    }
+                let Some((mut send, mut recv)) = connection.accept_bi().await else {
+                    debug!("accept_bi ended; connection closing");
+                    break;
                 };
                 let snap = snap.clone();
                 let auth_state = auth_state.clone();
-                let ep = ep.clone();
-                let dht = dht.clone();
+                let transport = transport.clone();
                 let events = events.clone();
                 let pool = pool.clone();
                 tokio::spawn(
@@ -1561,18 +1343,16 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
                             team_root,
                             peer_pubkey,
                             auth_state,
-                            &ep,
-                            &dht,
+                            &transport,
                             &self_cap,
                             &events,
                             &pool,
-                            my_id,
                             &mut send,
                             &mut recv,
                         ).await {
                             error!(error = %e, "stream handler error");
                         }
-                        let _ = send.finish();
+                        let _ = send.shutdown().await;
                     }
                     .in_current_span(),
                 );
@@ -1580,26 +1360,23 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
         }
         .instrument(span)
         .await;
-        Ok(())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn serve_stream(
+async fn serve_stream<T: Transport>(
     snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     team_root: ed25519_dalek::VerifyingKey,
     peer_pubkey: ed25519_dalek::VerifyingKey,
     auth_state: Arc<tokio::sync::RwLock<
         Option<triblespace_core::repo::capability::VerifiedCapability>,
     >>,
-    ep: &iroh::Endpoint,
-    dht: &Option<crate::dht::api::ApiClient>,
+    t: &T,
     self_cap: &RawHash,
     events: &mpsc::Sender<NetEvent>,
-    pool: &SharedPool,
-    my_id: EndpointId,
-    send: &mut iroh::endpoint::SendStream,
-    recv: &mut iroh::endpoint::RecvStream,
+    pool: &SharedPool<T::Conn>,
+    send: &mut <T::Conn as Conn>::SendHalf,
+    recv: &mut <T::Conn as Conn>::RecvHalf,
 ) -> anyhow::Result<()> {
     use triblespace_core::blob::Blob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -1662,8 +1439,8 @@ async fn serve_stream(
                 cap_handle = %hex::encode(&cap_handle_raw[..4]),
                 "auth: chain incomplete locally, swarm-fetching",
             );
-            let publisher_addr: EndpointAddr = peer_endpoint_for_dialer(peer_pubkey);
-            fetched = swarm_fetch_chain(ep, publisher_addr, &cap_handle_raw, dht, self_cap, pool, my_id).await;
+            let publisher: PeerId = peer_pubkey.to_bytes();
+            fetched = swarm_fetch_chain(t, publisher, &cap_handle_raw, self_cap, pool).await;
             debug!(blobs = fetched.len(), "swarm-fetched chain blobs");
             result = verify_once(&fetched);
         }
