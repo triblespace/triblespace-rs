@@ -641,6 +641,45 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
     }
 }
 
+/// Is `id` a node of the graph, in the same sense [`RegularPathConstraint::all_nodes`]
+/// uses — does it occur as the subject of any GenId-valued trible, or
+/// as the GenId value of any trible? Two PATCH prefix probes.
+///
+/// This is the SPARQL 1.1 §17.5 zero-length-path scope rule's
+/// membership test: `(p)*` / `(p)?` match the length-0 path only for
+/// terms that occur in the graph. The free-endpoint dispatch cases
+/// already enforce this implicitly (their candidates come from
+/// `all_nodes()`); the bound-endpoint cases use this probe so all
+/// dispatch cases agree on one relation regardless of which
+/// constraint proposes first.
+fn is_graph_node(set: &TribleSet, id: &RawId) -> bool {
+    // Subject of a GenId-valued trible: EVA layout is e(16) ++ v(32)
+    // ++ a(16); the prefix [id ++ 0u8;16] matches any trible with
+    // subject `id` whose value carries GenId's 16-byte zero padding.
+    let mut subject_prefix = [0u8; ID_LEN + ID_LEN];
+    subject_prefix[..ID_LEN].copy_from_slice(id);
+    if set.eva.has_prefix(&subject_prefix) {
+        return true;
+    }
+    // GenId value of any trible: VEA layout leads with the full
+    // 32-byte value.
+    let value_prefix = id_into_value(id);
+    set.vea.has_prefix(&value_prefix)
+}
+
+/// [`has_path`] with the zero-length-path scope rule applied: a
+/// reflexive match (`from == to`) requires the node to occur in the
+/// graph. A reflexive `true` for an absent node could only come from
+/// the ε-branch of `*`/`?` — a genuine cycle implies an outgoing
+/// edge, which implies graph membership — so gating the `from == to`
+/// case is exact.
+fn has_path_gated(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
+    if from == to && !is_graph_node(set, from) {
+        return false;
+    }
+    has_path(set, expr, from, to)
+}
+
 // ── Constraint ───────────────────────────────────────────────────────────
 
 /// Constrains two variables to be connected by a regular path expression.
@@ -753,14 +792,28 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             let candidates = self.all_nodes();
             proposals.extend(candidates.into_iter().filter(|v| {
                 id_from_value(v)
-                    .map_or(false, |id| has_path(&self.set, &self.expr, &id, &id))
+                    .map_or(false, |id| has_path_gated(&self.set, &self.expr, &id, &id))
             }));
             return;
         }
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
-                    let reachable = eval_from(&self.set, &self.expr, &start_id);
+                    let mut reachable = eval_from(&self.set, &self.expr, &start_id);
+                    // Zero-length-path scope rule (SPARQL §17.5):
+                    // eval_from's nullable arms insert the seed
+                    // unconditionally; drop it when the bound start
+                    // isn't a graph node. Every other element of the
+                    // result arrived via ≥1 edge and is a graph node
+                    // by construction — and a seed on a genuine cycle
+                    // has an outgoing edge, so it survives the gate.
+                    // This makes the bound-endpoint cases agree with
+                    // the free-endpoint cases (whose candidates come
+                    // from `all_nodes()`), so the constraint denotes
+                    // one relation regardless of proposal order.
+                    if !is_graph_node(&self.set, &start_id) {
+                        reachable.remove(&start_id);
+                    }
                     proposals.extend(reachable.iter().map(id_into_value));
                 }
                 return;
@@ -777,7 +830,12 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 // reflexive-path rule (`end_id` is a valid start
                 // for `(p)*` / `(p)?`) handled inside Star/Optional.
                 if let Some(end_id) = id_from_value(end_val) {
-                    let reachable = eval_from(&self.set, &self.inverse_expr, &end_id);
+                    let mut reachable = eval_from(&self.set, &self.inverse_expr, &end_id);
+                    // Zero-length-path scope rule — see the
+                    // start-bound arm above.
+                    if !is_graph_node(&self.set, &end_id) {
+                        reachable.remove(&end_id);
+                    }
                     proposals.extend(reachable.iter().map(id_into_value));
                 }
                 return;
@@ -794,7 +852,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if self.start == self.end && variable == self.start {
             proposals.retain(|v| {
                 id_from_value(v)
-                    .map_or(false, |id| has_path(&self.set, &self.expr, &id, &id))
+                    .map_or(false, |id| has_path_gated(&self.set, &self.expr, &id, &id))
             });
             return;
         }
@@ -802,8 +860,9 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             if let Some(end_val) = binding.get(self.end) {
                 if let Some(end_id) = id_from_value(end_val) {
                     proposals.retain(|v| {
-                        id_from_value(v)
-                            .map_or(false, |sid| has_path(&self.set, &self.expr, &sid, &end_id))
+                        id_from_value(v).map_or(false, |sid| {
+                            has_path_gated(&self.set, &self.expr, &sid, &end_id)
+                        })
                     });
                 } else {
                     proposals.clear();
@@ -814,7 +873,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 if let Some(start_id) = id_from_value(start_val) {
                     proposals.retain(|v| {
                         id_from_value(v).map_or(false, |eid| {
-                            has_path(&self.set, &self.expr, &start_id, &eid)
+                            has_path_gated(&self.set, &self.expr, &start_id, &eid)
                         })
                     });
                 } else {

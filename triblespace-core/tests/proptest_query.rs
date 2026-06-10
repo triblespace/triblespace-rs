@@ -863,6 +863,59 @@ proptest! {
     }
 
     #[test]
+    fn path_reflexive_zero_hop_requires_graph_membership(
+        chain_len in 2..5usize,
+    ) {
+        // SPARQL 1.1 §17.5 zero-length-path scope rule: `(p)* <Q>`
+        // matches the length-0 path only when Q occurs in the graph.
+        // A bound endpoint that the graph has never seen must yield
+        // ZERO rows — not the phantom reflexive row the engine used
+        // to emit (and which made the answer depend on which
+        // constraint proposed first).
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let absent = rngid(); // never inserted anywhere
+
+        // Star with absent bound START: no reflexive row.
+        let absent_val = (&absent).to_inline();
+        let star_rows = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is(absent_val), path!(set.clone(), s test_ns::link* d))
+        ).count();
+        prop_assert_eq!(star_rows, 0,
+            "absent bound start must not match the zero-length path");
+
+        // Star with absent bound END: symmetric.
+        let end_rows = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(d.is(absent_val), path!(set.clone(), s test_ns::link* d))
+        ).count();
+        prop_assert_eq!(end_rows, 0,
+            "absent bound end must not match the zero-length path");
+
+        // Optional with absent bound start: same rule for `?`.
+        let opt_rows = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is(absent_val), path!(set.clone(), s test_ns::link? d))
+        ).count();
+        prop_assert_eq!(opt_rows, 0,
+            "absent bound start must not match the zero-length branch of `?`");
+
+        // And a PRESENT bound endpoint keeps its reflexive row: the
+        // chain's tail has no outgoing links but occurs as a value.
+        let tail_val = (&entities[chain_len - 1]).to_inline();
+        let tail_rows = find!(
+            (s: Inline<_>, d: Inline<_>),
+            and!(s.is(tail_val), path!(set.clone(), s test_ns::link* d))
+        ).count();
+        prop_assert_eq!(tail_rows, 1,
+            "graph-member bound start keeps the reflexive row");
+    }
+
+    #[test]
     fn path_optional_includes_start_and_one_step(
         chain_len in 2..5usize,
     ) {
