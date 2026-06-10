@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.4] - 2026-06-10
+
+### Fixed
+
+- **`providers_for` is publisher-first.** The peer that announced a
+  head holds its entire closure (bottom-up insertion invariant), so
+  when a publisher is known it is returned immediately as the sole
+  provider. Previously every closure-walk step awaited an unbounded
+  DHT lookup first — on meshes with no DHT reachability (local pairs,
+  offline LAN, firewalled venue wifi) that await pended forever,
+  freezing sync while the known-good provider sat unused. The DHT
+  path remains for the no-publisher case, now bounded by a 3s timeout.
+  Found during a live two-daemon repro; validated by the deterministic
+  sim suite (fault scripts incl. partitions/crashes/heals).
+
+### Added
+
+- **triblespace-net deterministic simulation, stage 4**:
+  `tests/sim_swarm.rs` — N-node seeded fault scripts
+  (commits/partitions/crashes/heals → quiescence) with convergence,
+  full-closure-via-checkout, and bit-identical-replay-per-seed
+  invariants, plus a seed sweep. Quiescence-driven stepping in SimNet
+  (replaces poll-rationing that starved the task queue under load).
+- **ntriples import**: provenance split (`rdf_uri` out of graph
+  facts), pure `Fragment` output with `commit_with_metadata` taking
+  fragments, and predicate describe-entities recorded in meta for
+  full self-description.
+
+- **SimConn close/drop fail-fast contract** pinned with tests:
+  dropping the remote handler's end wakes pending ops with a reset
+  error, matching iroh semantics (sim fidelity for evict/retry paths).
+
+### Notes
+
+- Known hardening follow-up tracked for a future release: idle
+  deadlines at the Transport seam with OnceCell reset on dial failure.
+
 ## [0.46.3] - 2026-06-10
 
 ### Fixed
