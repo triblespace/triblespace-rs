@@ -39,18 +39,27 @@ fn ingests_facts_and_roundtrips_via_query() {
     let branch_id = repo.ensure_branch("main", None).expect("branch");
     let mut ws = repo.pull(branch_id).expect("workspace");
 
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
-    assert_eq!(count, 4, "four non-empty triples in the sample");
+    let import = ingest_ntriples(&mut ws, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
+    assert_eq!(import.triples, 4, "four non-empty triples in the sample");
+    let facts = import.facts;
 
-    // Each subject URI produces one `rdf_uri` edge (emitted per triple), so
-    // the two distinct subject URIs (frank, dune) each appear in the facts,
-    // and the URI-valued object (dune) is also tagged with its rdf_uri.
-    let uri_count = find!(
+    // `facts` is the faithful graph — no rdf_uri annotations mixed in.
+    let uri_in_facts = find!(
         (entity: Id, uri: Inline<Handle<LongString>>),
         pattern!(&facts, [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
-    assert!(uri_count >= 2, "at least frank and dune carry rdf_uri");
+    assert_eq!(uri_in_facts, 0, "rdf_uri annotations stay out of facts");
+
+    // The URI↔id inverse mapping rides in `meta` instead: the two
+    // distinct subject URIs (frank, dune) each appear, and the
+    // URI-valued object (dune) is also tagged.
+    let uri_in_meta = find!(
+        (entity: Id, uri: Inline<Handle<LongString>>),
+        pattern!(&import.meta, [{ ?entity @ rdf_uri: ?uri }])
+    )
+    .count();
+    assert!(uri_in_meta >= 2, "at least frank and dune carry rdf_uri");
 
     // The integer literal lands as I256BE under an IRI-rooted attribute.
     let birthyear = Attribute::<inlineencodings::I256BE>::from(entity! {
@@ -108,8 +117,12 @@ fn uri_to_id_is_deterministic_across_workspaces() {
     let mut ws_a = repo_a.pull(branch_a).unwrap();
     let mut ws_b = repo_b.pull(branch_b).unwrap();
 
-    let (facts_a, _) = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
-    let (facts_b, _) = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
+    let facts_a = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE))
+        .expect("clean ntriples")
+        .facts;
+    let facts_b = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE))
+        .expect("clean ntriples")
+        .facts;
 
     let frank_attr = Attribute::<Handle<LongString>>::from(entity! {
         metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
@@ -145,8 +158,9 @@ fn xsd_datatypes_map_to_native_schemas() {
 <http://ex/a> <http://ex/b> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <http://ex/a> <http://ex/f> "2.5"^^<http://www.w3.org/2001/XMLSchema#double> .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
-    assert_eq!(count, 4);
+    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(import.triples, 4);
+    let facts = import.facts;
 
     let i_attr = Attribute::<inlineencodings::I256BE>::from(entity! {
         metadata::iri:          "http://ex/i".to_blob().get_handle(),
@@ -216,8 +230,9 @@ fn xsd_temporal_and_binary_types() {
 <http://ex/a> <http://ex/avatar> "SGVsbG8="^^<http://www.w3.org/2001/XMLSchema#base64Binary> .
 <http://ex/a> <http://ex/homepage> "http://example.org"^^<http://www.w3.org/2001/XMLSchema#anyURI> .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
-    assert_eq!(count, 8);
+    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(import.triples, 8);
+    let facts = import.facts;
 
     // dateTime → NsTAIInterval [t, t]
     let born = Attribute::<NsTAIInterval>::from(entity! {
@@ -329,8 +344,9 @@ fn lang_tagged_literals_reify_into_entities() {
 <http://ex/q5> <http://ex/label> "Mensch"@de .
 <http://ex/h1> <http://ex/label> "human"@en .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
-    assert_eq!(count, 3);
+    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(import.triples, 3);
+    let facts = import.facts;
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
     let label_attr = Attribute::<inlineencodings::GenId>::from(entity! {
@@ -394,8 +410,9 @@ _:a <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 _:b <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
-    assert_eq!(count, 3);
+    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(import.triples, 3);
+    let facts = import.facts;
 
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
@@ -430,8 +447,9 @@ fn bnode_object_resolves_to_intrinsic_id() {
 <http://ex/s> <http://ex/p> _:b1 .
 _:b1 <http://ex/q> "x" .
 "#;
-    let (facts, count) = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
-    assert_eq!(count, 2);
+    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    assert_eq!(import.triples, 2);
+    let facts = import.facts;
 
     let p = Attribute::<inlineencodings::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
@@ -496,10 +514,12 @@ fn orphan_bnode_skolemizes_per_import() {
     let data = br#"
 <http://ex/s> <http://ex/p> _:b1 .
 "#;
-    let (facts_a, _) =
-        ingest_ntriples(&mut ws_a, Cursor::new(&data[..])).expect("clean ntriples");
-    let (facts_b, _) =
-        ingest_ntriples(&mut ws_b, Cursor::new(&data[..])).expect("clean ntriples");
+    let facts_a = ingest_ntriples(&mut ws_a, Cursor::new(&data[..]))
+        .expect("clean ntriples")
+        .facts;
+    let facts_b = ingest_ntriples(&mut ws_b, Cursor::new(&data[..]))
+        .expect("clean ntriples")
+        .facts;
 
     let p = Attribute::<inlineencodings::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
@@ -552,7 +572,7 @@ fn assert_rejects(name: &str, input: &[u8]) {
     let branch_id = repo.ensure_branch("main", None).unwrap();
     let mut ws = repo.pull(branch_id).unwrap();
     let result = ingest_ntriples(&mut ws, Cursor::new(input));
-    let count = result.map(|(_, c)| c).unwrap_or(0);
+    let count = result.map(|import| import.triples).unwrap_or(0);
     assert_eq!(
         count, 0,
         "W3C `{name}` (negative) should reject, got {count} accepted triples"

@@ -924,17 +924,43 @@ pub fn uri_to_id_pure(uri: &str) -> Id {
 
 // ── Ingestion ───────────────────────────────────────────────────────
 
+/// An imported N-Triples document, split into the graph itself and
+/// the import's provenance exhaust.
+///
+/// `facts` is the faithful translation of the source document — one
+/// trible per source triple, nothing else. Queries over `facts` see
+/// exactly the rows a SPARQL engine over the same document would.
+///
+/// `meta` carries one `rdf_uri` annotation entity per distinct IRI:
+/// the URI↔id inverse mapping that makes intrinsic entity ids
+/// recoverable back to their source URIs. It is import *metadata*,
+/// not part of the imported graph — when persisting an import, store
+/// it in the commit's metadata slot
+/// ([`Workspace::commit_with_metadata`](crate::repo::Workspace::commit_with_metadata)),
+/// or union it into `facts` (`import.facts + import.meta`) if the
+/// merged view is genuinely wanted.
+#[derive(Debug)]
+pub struct NtImport {
+    /// The imported graph — one trible per source triple.
+    pub facts: TribleSet,
+    /// Import provenance: `rdf_uri` annotations for URI↔id recovery.
+    pub meta: TribleSet,
+    /// Number of triples parsed.
+    pub triples: usize,
+}
+
 /// Import an N-Triples document already loaded as `Bytes`. This is the
 /// core entry point — every other adapter funnels here. Mirrors
 /// [`crate::import::json::JsonObjectImporter::import_blob`]'s shape.
 pub fn import_bytes<Blobs>(
     ws: &mut Workspace<Blobs>,
     mut bytes: Bytes,
-) -> Result<(TribleSet, usize), IngestError>
+) -> Result<NtImport, IngestError>
 where
     Blobs: BlobStore,
 {
     let mut facts = TribleSet::new();
+    let mut meta = TribleSet::new();
     let mut bnodes = BnodeBuffer::new();
     let mut count = 0;
     let mut attr_cache = NTriplesAttrCache::default();
@@ -944,7 +970,14 @@ where
         if bytes.peek_token().is_none() {
             break;
         }
-        if parse_triple(ws, &mut facts, &mut bnodes, &mut bytes, &mut attr_cache) {
+        if parse_triple(
+            ws,
+            &mut facts,
+            &mut meta,
+            &mut bnodes,
+            &mut bytes,
+            &mut attr_cache,
+        ) {
             count += 1;
         } else {
             // Malformed triple — skip to next newline so a single bad
@@ -959,7 +992,11 @@ where
     }
 
     bnodes.flush(&mut facts)?;
-    Ok((facts, count))
+    Ok(NtImport {
+        facts,
+        meta,
+        triples: count,
+    })
 }
 
 /// Convenience wrapper around [`import_bytes`] for a `Blob<LongString>`
@@ -967,7 +1004,7 @@ where
 pub fn import_blob<Blobs>(
     ws: &mut Workspace<Blobs>,
     blob: Blob<LongString>,
-) -> Result<(TribleSet, usize), IngestError>
+) -> Result<NtImport, IngestError>
 where
     Blobs: BlobStore,
 {
@@ -979,7 +1016,7 @@ where
 pub fn ingest_ntriples<Blobs>(
     ws: &mut Workspace<Blobs>,
     mut reader: impl BufRead,
-) -> Result<(TribleSet, usize), IngestError>
+) -> Result<NtImport, IngestError>
 where
     Blobs: BlobStore,
 {
@@ -1130,6 +1167,7 @@ impl NTriplesAttrCache {
 fn parse_triple<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    meta: &mut TribleSet,
     bnodes: &mut BnodeBuffer,
     bytes: &mut Bytes,
     attr_cache: &mut NTriplesAttrCache,
@@ -1163,7 +1201,7 @@ where
         let s = uri.as_ref();
         let id = uri_to_id(ws, s);
         let sub_h: Inline<Handle<LongString>> = ws.put(uri.clone());
-        *facts += entity! { crate::import::rdf_uri: sub_h };
+        *meta += entity! { crate::import::rdf_uri: sub_h };
         id
     });
 
@@ -1176,6 +1214,7 @@ where
             emit_object_iri(
                 ws,
                 facts,
+                meta,
                 bnodes,
                 iri_subject_anchor,
                 subject_label,
@@ -1228,6 +1267,7 @@ where
                         LiteralSuffix::Datatype(dt) => emit_typed_literal(
                             ws,
                             facts,
+                            meta,
                             e,
                             predicate.as_ref(),
                             text,
@@ -1249,6 +1289,7 @@ where
                     if let Some(fact) = build_resolved_outgoing(
                         ws,
                         facts,
+                        meta,
                         predicate.as_ref(),
                         text,
                         suffix,
@@ -1279,6 +1320,7 @@ where
 fn emit_object_iri<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    meta: &mut TribleSet,
     bnodes: &mut BnodeBuffer,
     iri_subject_anchor: Option<Id>,
     subject_label: Option<View<str>>,
@@ -1293,6 +1335,7 @@ fn emit_object_iri<Blobs>(
             emit_uri_object(
                 ws,
                 facts,
+                meta,
                 &ExclusiveId::force_ref(&s_id),
                 predicate,
                 obj_uri.as_ref(),
@@ -1303,7 +1346,7 @@ fn emit_object_iri<Blobs>(
             let attr_id = attr_cache.genid(predicate);
             let obj_id = uri_to_id(ws, obj_uri.as_ref());
             let obj_h: Inline<Handle<LongString>> = ws.put(obj_uri);
-            *facts += entity! { crate::import::rdf_uri: obj_h };
+            *meta += entity! { crate::import::rdf_uri: obj_h };
             let g: Inline<GenId> = obj_id.to_inline();
             bnodes.push_outgoing(
                 s_label,
@@ -1324,6 +1367,7 @@ fn emit_object_iri<Blobs>(
 fn build_resolved_outgoing<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    meta: &mut TribleSet,
     predicate: &str,
     text: View<str>,
     suffix: LiteralSuffix,
@@ -1348,9 +1392,14 @@ where
             let mut scratch = TribleSet::new();
             let scratch_id = Id::new([0xFF; ID_LEN]).expect("non-nil scratch id");
             let scratch_e = ExclusiveId::force_ref(&scratch_id);
+            // The scratch set only captures the (attr, value) pair;
+            // rdf_uri annotations (the anyURI path) go to the real
+            // `meta` set — they're valid import provenance regardless
+            // of how the parent bnode resolves.
             emit_typed_literal(
                 ws,
                 &mut scratch,
+                meta,
                 scratch_e,
                 predicate,
                 text,
@@ -1393,6 +1442,7 @@ where
 fn emit_uri_object<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    meta: &mut TribleSet,
     e: &ExclusiveId,
     predicate: &str,
     obj_uri: &str,
@@ -1403,7 +1453,7 @@ fn emit_uri_object<Blobs>(
     let attr_id = attr_cache.genid(predicate);
     let obj_id = uri_to_id(ws, obj_uri);
     let obj_h: Inline<Handle<LongString>> = ws.put(obj_uri.to_owned());
-    *facts += entity! { crate::import::rdf_uri: obj_h };
+    *meta += entity! { crate::import::rdf_uri: obj_h };
     let g: Inline<GenId> = obj_id.to_inline();
     facts.insert(&Trible::new(e, &attr_id, &g));
 }
@@ -1426,6 +1476,7 @@ fn emit_text_literal<Blobs>(
 fn emit_typed_literal<Blobs>(
     ws: &mut Workspace<Blobs>,
     facts: &mut TribleSet,
+    meta: &mut TribleSet,
     e: &ExclusiveId,
     predicate: &str,
     text: View<str>,
@@ -1537,7 +1588,7 @@ fn emit_typed_literal<Blobs>(
                 // Treat the literal as an IRI reference — same path as
                 // bracketed `<...>` objects, so `"http://x"^^xsd:anyURI`
                 // and `<http://x>` collapse to the same entity id.
-                emit_uri_object(ws, facts, e, predicate, text.as_ref(), attr_cache);
+                emit_uri_object(ws, facts, meta, e, predicate, text.as_ref(), attr_cache);
                 return;
             }
             _ => {}
@@ -1600,7 +1651,7 @@ fn emit_lang_literal<Blobs>(
 pub fn ingest_ntriples_file<Blobs>(
     ws: &mut Workspace<Blobs>,
     path: &Path,
-) -> Result<(TribleSet, usize), IngestError>
+) -> Result<NtImport, IngestError>
 where
     Blobs: BlobStore,
 {
