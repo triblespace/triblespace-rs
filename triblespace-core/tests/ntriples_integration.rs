@@ -10,7 +10,7 @@ use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
-use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id, uri_to_id_pure, IngestError};
+use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -39,9 +39,9 @@ fn ingests_facts_and_roundtrips_via_query() {
     let branch_id = repo.ensure_branch("main", None).expect("branch");
     let mut ws = repo.pull(branch_id).expect("workspace");
 
-    let import = ingest_ntriples(&mut ws, Cursor::new(NT_SAMPLE)).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
@@ -56,7 +56,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     // URI-valued object (dune) is also tagged.
     let uri_in_meta = find!(
         (entity: Id, uri: Inline<Handle<LongString>>),
-        pattern!(&import.meta, [{ ?entity @ rdf_uri: ?uri }])
+        pattern!(import.meta.facts(), [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
     assert!(uri_in_meta >= 2, "at least frank and dune carry rdf_uri");
@@ -109,20 +109,14 @@ fn uri_to_id_is_deterministic_across_workspaces() {
     // The same URI imported from two independent repos must produce the
     // same triblespace Id. This is the property that makes N-Triples
     // imports idempotent across machines.
-    let mut repo_a = new_repo();
-    let mut repo_b = new_repo();
-
-    let branch_a = repo_a.ensure_branch("main", None).unwrap();
-    let branch_b = repo_b.ensure_branch("main", None).unwrap();
-    let mut ws_a = repo_a.pull(branch_a).unwrap();
-    let mut ws_b = repo_b.pull(branch_b).unwrap();
-
-    let facts_a = ingest_ntriples(&mut ws_a, Cursor::new(NT_SAMPLE))
+    let facts_a = ingest_ntriples(Cursor::new(NT_SAMPLE))
         .expect("clean ntriples")
-        .facts;
-    let facts_b = ingest_ntriples(&mut ws_b, Cursor::new(NT_SAMPLE))
+        .facts
+        .into_facts();
+    let facts_b = ingest_ntriples(Cursor::new(NT_SAMPLE))
         .expect("clean ntriples")
-        .facts;
+        .facts
+        .into_facts();
 
     let frank_attr = Attribute::<Handle<LongString>>::from(entity! {
         metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
@@ -148,9 +142,6 @@ fn uri_to_id_is_deterministic_across_workspaces() {
 
 #[test]
 fn xsd_datatypes_map_to_native_schemas() {
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     let data = br#"
 <http://ex/a> <http://ex/i> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
@@ -158,9 +149,9 @@ fn xsd_datatypes_map_to_native_schemas() {
 <http://ex/a> <http://ex/b> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <http://ex/a> <http://ex/f> "2.5"^^<http://www.w3.org/2001/XMLSchema#double> .
 "#;
-    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(import.triples, 4);
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     let i_attr = Attribute::<inlineencodings::I256BE>::from(entity! {
         metadata::iri:          "http://ex/i".to_blob().get_handle(),
@@ -216,9 +207,6 @@ fn xsd_temporal_and_binary_types() {
     use triblespace_core::blob::encodings::rawbytes::RawBytes;
     use triblespace_core::inline::encodings::time::{NsDuration, NsTAIInterval};
 
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     let data = br#"
 <http://ex/a> <http://ex/born> "1879-03-14T11:30:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
@@ -230,9 +218,9 @@ fn xsd_temporal_and_binary_types() {
 <http://ex/a> <http://ex/avatar> "SGVsbG8="^^<http://www.w3.org/2001/XMLSchema#base64Binary> .
 <http://ex/a> <http://ex/homepage> "http://example.org"^^<http://www.w3.org/2001/XMLSchema#anyURI> .
 "#;
-    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(import.triples, 8);
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     // dateTime → NsTAIInterval [t, t]
     let born = Attribute::<NsTAIInterval>::from(entity! {
@@ -333,9 +321,6 @@ fn xsd_temporal_and_binary_types() {
 fn lang_tagged_literals_reify_into_entities() {
     use triblespace_core::import::{rdf_lang, rdf_text};
 
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     // Same `(en, "human")` pair appears twice — should dedupe via the
     // intrinsic-id derivation. `(de, "Mensch")` is a separate entity.
@@ -344,9 +329,9 @@ fn lang_tagged_literals_reify_into_entities() {
 <http://ex/q5> <http://ex/label> "Mensch"@de .
 <http://ex/h1> <http://ex/label> "human"@en .
 "#;
-    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(import.triples, 3);
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
     let label_attr = Attribute::<inlineencodings::GenId>::from(entity! {
@@ -401,18 +386,15 @@ fn bnode_subjects_emit_with_intrinsic_ids() {
     // collapse to the same intrinsic id — that's the content-addressed
     // dedup property of the entity! macro applied to RDF's existential
     // semantics.
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     let data = br#"
 _:a <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 _:b <http://ex/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
-    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(import.triples, 3);
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
@@ -439,17 +421,14 @@ fn bnode_object_resolves_to_intrinsic_id() {
     // — `_:b1` has one outgoing fact, so its id is the entity! hash of
     //   that fact. The incoming reference resolves to the same id once
     //   the bnode's outgoing facts are seen.
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     let data = br#"
 <http://ex/s> <http://ex/p> _:b1 .
 _:b1 <http://ex/q> "x" .
 "#;
-    let import = ingest_ntriples(&mut ws, Cursor::new(&data[..])).expect("clean ntriples");
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     assert_eq!(import.triples, 2);
-    let facts = import.facts;
+    let facts = import.facts.into_facts();
 
     let p = Attribute::<inlineencodings::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
@@ -481,15 +460,12 @@ _:b1 <http://ex/q> "x" .
 
 #[test]
 fn bnode_cycle_is_an_error() {
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
 
     let data = br#"
 _:a <http://ex/p> _:b .
 _:b <http://ex/p> _:a .
 "#;
-    let err = ingest_ntriples(&mut ws, Cursor::new(&data[..])).unwrap_err();
+    let err = ingest_ntriples(Cursor::new(&data[..])).unwrap_err();
     match err {
         IngestError::BnodeCycle { labels } => {
             assert!(labels.contains(&"_:a".to_string()));
@@ -506,20 +482,17 @@ fn orphan_bnode_skolemizes_per_import() {
     // *different* ids for the same label. This matches RDF's existential
     // semantics — orphan bnodes in different documents are distinct
     // "some-things."
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws_a = repo.pull(branch_id).unwrap();
-    let mut ws_b = repo.pull(branch_id).unwrap();
-
     let data = br#"
 <http://ex/s> <http://ex/p> _:b1 .
 "#;
-    let facts_a = ingest_ntriples(&mut ws_a, Cursor::new(&data[..]))
+    let facts_a = ingest_ntriples(Cursor::new(&data[..]))
         .expect("clean ntriples")
-        .facts;
-    let facts_b = ingest_ntriples(&mut ws_b, Cursor::new(&data[..]))
+        .facts
+        .into_facts();
+    let facts_b = ingest_ntriples(Cursor::new(&data[..]))
         .expect("clean ntriples")
-        .facts;
+        .facts
+        .into_facts();
 
     let p = Attribute::<inlineencodings::GenId>::from(entity! {
         metadata::iri:          "http://ex/p".to_blob().get_handle(),
@@ -553,10 +526,7 @@ fn orphan_bnode_skolemizes_per_import() {
 // silently accept malformed input.
 
 fn assert_parses(name: &str, input: &[u8]) {
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
-    let result = ingest_ntriples(&mut ws, Cursor::new(input));
+    let result = ingest_ntriples(Cursor::new(input));
     assert!(
         result.is_ok(),
         "W3C `{name}` (positive) should parse, got {:?}",
@@ -568,10 +538,7 @@ fn assert_rejects(name: &str, input: &[u8]) {
     // The parser is line-tolerant: malformed lines are skipped rather
     // than aborting the whole ingest. So "rejects" is operationalised
     // as "produces zero accepted triples on a single-triple input."
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
-    let result = ingest_ntriples(&mut ws, Cursor::new(input));
+    let result = ingest_ntriples(Cursor::new(input));
     let count = result.map(|import| import.triples).unwrap_or(0);
     assert_eq!(
         count, 0,
@@ -676,23 +643,29 @@ fn w3c_negative_bad_esc_invalid_escape() {
 }
 
 #[test]
-fn uri_to_id_pure_matches_workspace_version() {
-    // The workspace-side-effect-free `uri_to_id_pure` must produce
-    // the same id that `uri_to_id` (with workspace-storage) does, so
-    // callers writing query constants can use either interchangeably.
-    let mut repo = new_repo();
-    let branch_id = repo.ensure_branch("main", None).unwrap();
-    let mut ws = repo.pull(branch_id).unwrap();
+fn uri_to_id_pure_matches_import_emission() {
+    // `uri_to_id_pure` must produce the same id the importer assigns
+    // to that URI, so callers can derive query constants without an
+    // import in hand.
+    let data = br#"
+<http://example.org/probe> <http://example.org/links> <http://example.org/target> .
+"#;
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
+    let facts = import.facts.into_facts();
 
-    for uri in [
-        "http://www.wikidata.org/entity/Q5",
-        "http://www.wikidata.org/prop/direct/P31",
-        "_:bf55954f96378f65ddb1da9836e2eb87",
-    ] {
-        let with_ws = uri_to_id(&mut ws, uri);
-        let pure = uri_to_id_pure(uri);
-        assert_eq!(with_ws, pure, "uri_to_id mismatch for {uri}");
-    }
+    let links = Attribute::<inlineencodings::GenId>::from(entity! {
+        metadata::iri:          "http://example.org/links".to_blob().get_handle(),
+        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
+    });
+    let (subject, object) = find!(
+        (s: Id, o: Id),
+        pattern!(&facts, [{ ?s @ links: ?o }])
+    )
+    .next()
+    .expect("probe triple");
+
+    assert_eq!(subject, uri_to_id_pure("http://example.org/probe"));
+    assert_eq!(object, uri_to_id_pure("http://example.org/target"));
 }
 
 #[test]

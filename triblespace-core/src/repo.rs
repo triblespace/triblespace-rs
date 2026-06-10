@@ -2225,7 +2225,6 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         self.staged.put(item).expect("infallible blob put")
     }
 
-
     /// Retrieves a blob from the workspace.
     ///
     /// The method first checks the workspace's local blob store and falls back
@@ -2259,9 +2258,38 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         self.commit_internal(content_.into(), Some(self.commit_metadata), Some(message_));
     }
 
-    /// Like [`commit`](Self::commit) but attaches a one-off metadata handle
+    /// Like [`commit`](Self::commit) but attaches one-off metadata
     /// instead of the repository default.
+    ///
+    /// Accepts anything that converts into a [`Fragment`]: the
+    /// fragment's embedded blobs are absorbed into the staged blob
+    /// store and its facts are archived as a `SimpleArchive` blob
+    /// whose handle lands in the commit's metadata slot. Archiving is
+    /// content-addressed, so committing the same metadata fragment
+    /// repeatedly converges on one blob — no caller-side caching
+    /// needed for correctness or storage. When the metadata is
+    /// already archived (e.g. shared across many commits and you hold
+    /// its handle), use
+    /// [`commit_with_metadata_handle`](Self::commit_with_metadata_handle)
+    /// to skip re-serialization.
     pub fn commit_with_metadata(
+        &mut self,
+        content_: impl Into<Fragment>,
+        metadata_: impl Into<Fragment>,
+        message_: &str,
+    ) {
+        let (meta_facts, meta_blobs) = metadata_.into().into_facts_and_blobs();
+        self.staged.union(meta_blobs);
+        let metadata_handle = self.put(meta_facts);
+        self.commit_internal(content_.into(), Some(metadata_handle), Some(message_));
+    }
+
+    /// Like [`commit`](Self::commit) but attaches an already-archived
+    /// metadata handle instead of the repository default. The handle
+    /// variant of [`commit_with_metadata`](Self::commit_with_metadata):
+    /// no serialization happens, so this is the right form when the
+    /// same metadata archive is shared across many commits.
+    pub fn commit_with_metadata_handle(
         &mut self,
         content_: impl Into<Fragment>,
         metadata_: MetadataHandle,

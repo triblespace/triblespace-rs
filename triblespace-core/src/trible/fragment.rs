@@ -144,9 +144,24 @@ impl Fragment {
         &self.facts
     }
 
+    /// Mutable access to the fragment's facts, for producers that
+    /// accumulate tribles directly (e.g. importers inserting per-row
+    /// facts alongside `put`-ing the blobs those facts reference).
+    pub fn facts_mut(&mut self) -> &mut TribleSet {
+        &mut self.facts
+    }
+
     /// Borrow the fragment's local blob store.
     pub fn blobs(&self) -> &MemoryBlobStore {
         &self.blobs
+    }
+
+    /// Mutable access to the fragment's local blob store, for
+    /// producers that need to merge an existing store in bulk
+    /// (`blobs_mut().union(other)`) rather than `put` items one at
+    /// a time.
+    pub fn blobs_mut(&mut self) -> &mut MemoryBlobStore {
+        &mut self.blobs
     }
 
     pub fn into_facts(self) -> TribleSet {
