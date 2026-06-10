@@ -106,10 +106,11 @@ where
     /// local HEADs and/or react to remote HEADs.
     direction: SyncDirection,
 
-    /// Wall-clock time of the most recent NetEvent absorbed in
+    /// Monotonic time of the most recent NetEvent absorbed in
     /// [`refresh`](Peer::refresh). Drives quiescence-based stopping
-    /// in long-running sync drivers.
-    last_event_at: std::time::Instant,
+    /// in long-running sync drivers. Read through [`crate::clock`] so
+    /// simulated runs measure quiescence in virtual time.
+    last_event_at: crate::clock::Mono,
 
     /// Team root pubkey, copied from `PeerConfig::team_root` so the
     /// refresh loop can verify incoming `CapDelivered` events against
@@ -129,7 +130,7 @@ where
     /// Recorded against `entry.id`. Cleared (entry-level) when the
     /// delivery confirms; the whole map is in-memory and rebuilds
     /// naturally if the daemon restarts.
-    last_dispatch_attempt: HashMap<Id, std::time::Instant>,
+    last_dispatch_attempt: HashMap<Id, crate::clock::Mono>,
 }
 
 impl<S> Peer<S>
@@ -166,7 +167,7 @@ where
             last_blob_reader: None,
             last_branches: HashMap::new(),
             direction,
-            last_event_at: std::time::Instant::now(),
+            last_event_at: crate::clock::mono_now(),
             team_root,
             signing_key,
             last_dispatch_attempt: HashMap::new(),
@@ -180,14 +181,16 @@ where
         peer
     }
 
-    /// Wall-clock time of the most recent network event absorbed by
+    /// Monotonic time of the most recent network event absorbed by
     /// [`refresh`](Self::refresh). Useful for quiescence-based stopping:
     /// long-running sync drivers can poll `peer.last_event_at().elapsed()`
     /// and shut down once the swarm goes silent.
     ///
     /// Constructed-at-`Peer::new` initial value, so the first quiescence
     /// window starts at construction rather than at the first event.
-    pub fn last_event_at(&self) -> std::time::Instant {
+    /// Returned as a [`crate::clock::Mono`] — virtual-time-aware under
+    /// simulation, `.elapsed()`-compatible either way.
+    pub fn last_event_at(&self) -> crate::clock::Mono {
         self.last_event_at
     }
 
@@ -224,7 +227,7 @@ where
         // store mutation. The local node has nothing to learn from
         // the swarm.
         while let Some(event) = self.receiver.try_recv() {
-            self.last_event_at = std::time::Instant::now();
+            self.last_event_at = crate::clock::mono_now();
             if self.direction == SyncDirection::WriteOnly {
                 continue;
             }
@@ -408,13 +411,7 @@ where
 
         // Point-interval at "now" — pending-requests timeline is
         // just "this arrived at T".
-        let now = match hifitime::Epoch::now() {
-            Ok(n) => n,
-            Err(_) => {
-                tracing::warn!("CapRequest: system time unavailable; dropping");
-                return;
-            }
-        };
+        let now = crate::clock::epoch_now();
         let received_at = (now, now).try_to_inline().expect("point interval");
 
         match crate::policy::record_pending_request(
@@ -539,7 +536,7 @@ where
             return 0;
         }
 
-        let now = std::time::Instant::now();
+        let now = crate::clock::mono_now();
         let Ok(reader) = self.store.reader() else { return 0; };
 
         let mut dispatched = 0usize;
@@ -678,7 +675,7 @@ where
             // factor-of-two is a heuristic — we want the cap to cover
             // at least one more renewal cycle so missed ticks don't
             // immediately break the chain.
-            let Ok(now) = hifitime::Epoch::now() else { continue };
+            let now = crate::clock::epoch_now();
             let new_upper = now + renewal_window * 2;
             let Ok(new_expiry) = (now, new_upper).try_to_inline() else {
                 continue;
@@ -727,7 +724,7 @@ where
             // doesn't immediately re-fire on the same entry within
             // its cooldown window.
             self.last_dispatch_attempt
-                .insert(entry.id, std::time::Instant::now());
+                .insert(entry.id, crate::clock::mono_now());
 
             // Update the policy entry so we don't re-renew on the
             // next tick.

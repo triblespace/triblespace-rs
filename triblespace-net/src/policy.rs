@@ -569,7 +569,7 @@ pub fn renewable_within<S>(
 where
     S: BlobStore + PinStore,
 {
-    let Ok(now) = hifitime::Epoch::now() else { return Vec::new(); };
+    let now = crate::clock::epoch_now();
     let cutoff = now + renewal_window;
     list_renewal_policy(store)
         .into_iter()
@@ -811,7 +811,7 @@ where
         meta = meta.difference(&t);
     }
 
-    let now = hifitime::Epoch::now().ok()?;
+    let now = crate::clock::epoch_now();
     let delivered_at: Inline<NsTAIInterval> =
         (now, now).try_to_inline().ok()?;
 
@@ -869,7 +869,7 @@ where
     let reader = store.reader().ok()?;
     let mut meta: TribleSet = reader.get::<TribleSet, SimpleArchive>(prev_head).ok()?;
 
-    let now = hifitime::Epoch::now().ok()?;
+    let now = crate::clock::epoch_now();
     let retracted_at: Inline<NsTAIInterval> =
         (now, now).try_to_inline().ok()?;
 

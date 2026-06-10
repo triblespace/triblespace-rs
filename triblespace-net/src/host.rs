@@ -458,9 +458,15 @@ async fn host_loop<T: Transport>(
     // for neighbors who've already seen it, while giving
     // newly-joined neighbors a chance to discover our HEADs
     // without a JOIN message (which would add a DOS surface).
-    let mut last_published: HashMap<RawPinId, RawHash> = HashMap::new();
+    // BTreeMap (not HashMap): iterated on every rebroadcast tick, and
+    // deterministic iteration order is required for simulation replay
+    // (same seed => same frame order on the wire).
+    let mut last_published: std::collections::BTreeMap<RawPinId, RawHash> =
+        std::collections::BTreeMap::new();
     let rebroadcast_period = std::time::Duration::from_secs(30);
-    let mut last_rebroadcast = std::time::Instant::now();
+    // Read through crate::clock (not std Instant) so the rebroadcast
+    // tick advances under simulated virtual time.
+    let mut last_rebroadcast = crate::clock::mono_now();
 
     // Command loop.
     loop {
@@ -542,7 +548,7 @@ async fn host_loop<T: Transport>(
             }
         }
 
-        if last_rebroadcast.elapsed() >= rebroadcast_period {
+        if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
             if let Some(sender) = &gossip_sender {
                 for (branch, head) in &last_published {
                     let msg = gossip_frame(branch, head, &my_id);
@@ -552,7 +558,7 @@ async fn host_loop<T: Transport>(
                     });
                 }
             }
-            last_rebroadcast = std::time::Instant::now();
+            last_rebroadcast = crate::clock::mono_now();
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -857,7 +863,9 @@ async fn fetch_one<T: Transport>(
 
 
 /// Swarm-fetch the closure rooted at `head` (a cap sig handle, in the
-/// OP_AUTH context) and return it as a `HashMap<RawHash, Vec<u8>>`.
+/// OP_AUTH context) and return it as a `BTreeMap<RawHash, Vec<u8>>`
+/// (ordered, so draining it into NetEvent::Blob emissions is
+/// deterministic for simulation replay).
 /// Mirrors `fetch_reachable`'s two-phase walk (Phase 1 OP_CHILDREN
 /// discovery, Phase 2 OP_GET_BLOB in reverse-BFS order) but writes
 /// the results to a map instead of emitting `NetEvent::Blob`. The
@@ -869,8 +877,9 @@ async fn swarm_fetch_chain<T: Transport>(
     head: &RawHash,
     self_cap: &RawHash,
     pool: &SharedPool<T::Conn>,
-) -> HashMap<RawHash, Vec<u8>> {
-    let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+) -> std::collections::BTreeMap<RawHash, Vec<u8>> {
+    let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
+        std::collections::BTreeMap::new();
     let publisher_id = publisher;
 
     // Ensure we have an authed connection to the publisher (the
@@ -1156,7 +1165,7 @@ impl<T: Transport> HandshakeHandler<T> {
                         // has the parent cap, but for 3+ hop chains the
                         // intermediate cap might live elsewhere — DHT
                         // provider lookup finds them either way.
-                        let verify_once = |fetched: &HashMap<RawHash, Vec<u8>>| {
+                        let verify_once = |fetched: &std::collections::BTreeMap<RawHash, Vec<u8>>| {
                             let snap_for_fetch = snapshot.clone();
                             let fetched_for_lookup = fetched.clone();
                             let cap_blob_for_fetch = cap_blob.clone();
@@ -1186,7 +1195,8 @@ impl<T: Transport> HandshakeHandler<T> {
                             )
                         };
 
-                        let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+                        let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
+                            std::collections::BTreeMap::new();
                         let mut result = verify_once(&fetched);
 
                         if matches!(
@@ -1238,7 +1248,7 @@ impl<T: Transport> HandshakeHandler<T> {
                                 // pinning.
                                 let _ = events.send(NetEvent::Blob(cap_bytes.clone()));
                                 let _ = events.send(NetEvent::Blob(sig_bytes.clone()));
-                                for (_, bytes) in fetched.drain() {
+                                for (_, bytes) in std::mem::take(&mut fetched) {
                                     let _ = events.send(NetEvent::Blob(
                                         anybytes::Bytes::from_source(bytes),
                                     ));
@@ -1398,7 +1408,7 @@ async fn serve_stream<T: Transport>(
         // First-pass verify with local-only lookup. The common case is
         // "we already have the whole chain"; only retry with a swarm
         // fetch on the specific "missing blob" failure mode.
-        let verify_once = |fetched: &HashMap<RawHash, Vec<u8>>| {
+        let verify_once = |fetched: &std::collections::BTreeMap<RawHash, Vec<u8>>| {
             let snap_for_fetch = snap_arc.clone();
             let fetched_for_lookup = fetched.clone();
             triblespace_core::repo::capability::verify_chain(
@@ -1420,7 +1430,8 @@ async fn serve_stream<T: Transport>(
             )
         };
 
-        let mut fetched: HashMap<RawHash, Vec<u8>> = HashMap::new();
+        let mut fetched: std::collections::BTreeMap<RawHash, Vec<u8>> =
+            std::collections::BTreeMap::new();
         let mut result = verify_once(&fetched);
 
         // Swarm fetch + retry on missing-blob. Caps are orphan blobs
@@ -1459,7 +1470,7 @@ async fn serve_stream<T: Transport>(
                 // ordering doesn't matter here because the chain is
                 // already self-consistent (every parent referenced by
                 // every fetched cap is also in `fetched`).
-                for (_, bytes) in fetched.drain() {
+                for (_, bytes) in std::mem::take(&mut fetched) {
                     let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(bytes)));
                 }
                 // Tell the Peer thread that this remote authed with

@@ -69,6 +69,11 @@ default = ["proptest", "object-store", "parallel"]
 proptest = ["dep:proptest"]
 object-store = ["dep:object_store", "dep:tokio", "dep:futures", "dep:url"]
 kani = []
+# Deterministic id minting for simulation testing: enables
+# `id::rngid::seed_ids` (thread-local seeded source consulted by
+# rngid()/genid()). Zero cost when disabled — the production rngid
+# path is compiled identically without this feature.
+deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon"]
 
