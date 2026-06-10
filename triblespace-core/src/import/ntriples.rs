@@ -79,7 +79,6 @@ use winnow::stream::Stream;
 use winnow::token::{take, take_while};
 use winnow::Parser;
 
-use crate::attribute::Attribute;
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::rawbytes::RawBytes;
 use crate::blob::{Blob, IntoBlob};
@@ -934,22 +933,30 @@ fn record_uri(meta: &mut Fragment, uri: impl IntoBlob<LongString>) -> Id {
 /// Queries over `facts` see exactly the rows a SPARQL engine over
 /// the same document would.
 ///
-/// `meta` carries one `rdf_uri` annotation entity per distinct IRI —
-/// the URI↔id inverse mapping that makes intrinsic entity ids
-/// recoverable back to their source URIs — plus the URI-string blobs
-/// those annotations reference. It is import *metadata*, not part of
-/// the imported graph: when persisting an import, store it in the
-/// commit's metadata slot
-/// (`ws.commit_with_metadata(import.facts, ws.put_fragment(import.meta), msg)`),
-/// or union it into `facts` (`import.facts + import.meta`) if the
+/// `meta` is the import's full self-description, with the blobs it
+/// references embedded:
+///
+/// - one `rdf_uri` annotation entity per distinct entity IRI — the
+///   URI↔id inverse mapping that makes intrinsic entity ids
+///   recoverable back to their source URIs;
+/// - one describing entity per distinct `(predicate IRI, value
+///   schema)` pair — `metadata::iri` + `metadata::value_encoding`
+///   facts that make attribute ids recoverable back to their
+///   predicate URIs and schemas.
+///
+/// It is import *metadata*, not part of the imported graph: when
+/// persisting an import, store it in the commit's metadata slot
+/// (`ws.commit_with_metadata(import.facts, import.meta, msg)`), or
+/// union it into `facts` (`import.facts + import.meta`) if the
 /// merged view is genuinely wanted.
 #[derive(Debug)]
 pub struct NtImport {
     /// The imported graph — one trible per source triple, with the
     /// literal blobs those tribles reference embedded.
     pub facts: Fragment,
-    /// Import provenance: `rdf_uri` annotations plus the URI-string
-    /// blobs they reference, for URI↔id recovery.
+    /// Import self-description: `rdf_uri` annotations for entity
+    /// URIs, describing entities for predicate attributes, and the
+    /// URI-string blobs both reference.
     pub meta: Fragment,
     /// Number of triples parsed.
     pub triples: usize,
@@ -1020,11 +1027,18 @@ pub fn ingest_ntriples(mut reader: impl BufRead) -> Result<NtImport, IngestError
 /// node go into `bnodes` for deferred resolution. Returns `true` on
 /// success, `false` on malformed input (caller skips to next line).
 /// Per-import cache of predicate-IRI → attribute-id, one slot per value
-/// schema the parser dispatches to. Each cache method computes
-/// `Attribute::<S>::from(entity!{ metadata::iri:, metadata::value_encoding: }).id()`,
-/// which runs `<S as MetaDescribe>::id()` and an `entity!{}.root()` per
-/// call — both nontrivial — so caching by (S, IRI) avoids redoing that
-/// work for every trible sharing a predicate.
+/// schema the parser dispatches to. Resolution computes
+/// `entity!{ metadata::iri:, metadata::value_encoding: }.root()` —
+/// `<S as MetaDescribe>::id()` plus a content-address per call, both
+/// nontrivial — so caching by (S, IRI) avoids redoing that work for
+/// every trible sharing a predicate.
+///
+/// First resolution per (S, IRI) also records the attribute into the
+/// `meta` fragment: the describing entity (`metadata::iri` +
+/// `metadata::value_encoding` facts) and the IRI-string blob it
+/// references. Together with the `rdf_uri` annotations this makes an
+/// import fully self-describing — entity URIs *and* predicate URIs
+/// (with their value schemas) are recoverable from `meta` alone.
 #[derive(Default)]
 struct NTriplesAttrCache {
     genid: HashMap<String, Id>,
@@ -1040,115 +1054,58 @@ struct NTriplesAttrCache {
 }
 
 impl NTriplesAttrCache {
-    fn genid(&mut self, iri: &str) -> Id {
-        *self.genid.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::GenId>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::GenId as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    /// Shared resolver: derive (and memoise) the attribute id for
+    /// `(S, iri)`, emitting the attribute's describing entity and the
+    /// IRI-string blob into `meta` on first encounter.
+    fn resolve<S: crate::metadata::MetaDescribe>(
+        map: &mut HashMap<String, Id>,
+        meta: &mut Fragment,
+        iri: &str,
+    ) -> Id {
+        if let Some(id) = map.get(iri) {
+            return *id;
+        }
+        let h: Inline<Handle<LongString>> = meta.put(String::from(iri));
+        let describe = entity! {
+            crate::metadata::iri:            h,
+            crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+        };
+        let id = describe.root().expect("intrinsic attribute entity");
+        // Facts-only merge — see record_uri.
+        *meta += describe.into_facts();
+        map.insert(iri.to_string(), id);
+        id
     }
-    fn longstring(&mut self, iri: &str) -> Id {
-        *self.longstring.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<Handle<LongString>>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <Handle<LongString> as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+
+    fn genid(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::GenId>(&mut self.genid, meta, iri)
     }
-    fn rawbytes(&mut self, iri: &str) -> Id {
-        *self.rawbytes.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<Handle<RawBytes>>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <Handle<RawBytes> as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn longstring(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<Handle<LongString>>(&mut self.longstring, meta, iri)
     }
-    fn i256be(&mut self, iri: &str) -> Id {
-        *self.i256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::I256BE>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::I256BE as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn rawbytes(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<Handle<RawBytes>>(&mut self.rawbytes, meta, iri)
     }
-    fn u256be(&mut self, iri: &str) -> Id {
-        *self.u256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::U256BE>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::U256BE as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn i256be(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::I256BE>(&mut self.i256be, meta, iri)
     }
-    fn r256be(&mut self, iri: &str) -> Id {
-        *self.r256be.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::R256BE>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::R256BE as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn u256be(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::U256BE>(&mut self.u256be, meta, iri)
     }
-    fn f64(&mut self, iri: &str) -> Id {
-        *self.f64.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::F64>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::F64 as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn r256be(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::R256BE>(&mut self.r256be, meta, iri)
     }
-    fn boolean(&mut self, iri: &str) -> Id {
-        *self.boolean.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<inlineencodings::Boolean>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <inlineencodings::Boolean as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn f64(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::F64>(&mut self.f64, meta, iri)
     }
-    fn nsduration(&mut self, iri: &str) -> Id {
-        *self.nsduration.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<NsDuration>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <NsDuration as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn boolean(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<inlineencodings::Boolean>(&mut self.boolean, meta, iri)
     }
-    fn nstai(&mut self, iri: &str) -> Id {
-        *self.nstai.entry(iri.to_string()).or_insert_with(|| {
-            let h: Inline<Handle<crate::blob::encodings::longstring::LongString>> =
-                String::from(iri).to_blob().get_handle();
-            Attribute::<NsTAIInterval>::from(entity! {
-                crate::metadata::iri:          h,
-                crate::metadata::value_encoding: <NsTAIInterval as crate::metadata::MetaDescribe>::id(),
-            })
-            .id()
-        })
+    fn nsduration(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<NsDuration>(&mut self.nsduration, meta, iri)
+    }
+    fn nstai(&mut self, meta: &mut Fragment, iri: &str) -> Id {
+        Self::resolve::<NsTAIInterval>(&mut self.nstai, meta, iri)
     }
 }
 
@@ -1207,7 +1164,7 @@ fn parse_triple(
             let Some(target_label) = take_bnode(bytes) else {
                 return false;
             };
-            let attr_id = attr_cache.genid(predicate.as_ref());
+            let attr_id = attr_cache.genid(meta, predicate.as_ref());
             match (iri_subject_anchor, subject_label) {
                 (Some(s_id), None) => {
                     bnodes.push_incoming(IncomingFact {
@@ -1241,7 +1198,7 @@ fn parse_triple(
                     let e = ExclusiveId::force_ref(&s_id);
                     match suffix {
                         LiteralSuffix::None => {
-                            emit_text_literal(facts, e, predicate.as_ref(), text, attr_cache)
+                            emit_text_literal(facts, meta, e, predicate.as_ref(), text, attr_cache)
                         }
                         LiteralSuffix::Datatype(dt) => emit_typed_literal(
                             facts,
@@ -1254,6 +1211,7 @@ fn parse_triple(
                         ),
                         LiteralSuffix::Language(lang) => emit_lang_literal(
                             facts,
+                            meta,
                             e,
                             predicate.as_ref(),
                             lang.as_ref(),
@@ -1315,7 +1273,7 @@ fn emit_object_iri(
             );
         }
         (None, Some(s_label)) => {
-            let attr_id = attr_cache.genid(predicate);
+            let attr_id = attr_cache.genid(meta, predicate);
             let obj_id = record_uri(meta, obj_uri);
             let g: Inline<GenId> = obj_id.to_inline();
             bnodes.push_outgoing(
@@ -1344,7 +1302,7 @@ fn build_resolved_outgoing(
 ) -> Option<OutgoingFact> {
     match suffix {
         LiteralSuffix::None => {
-            let attr_id = attr_cache.longstring(predicate);
+            let attr_id = attr_cache.longstring(meta, predicate);
             let handle: Inline<Handle<LongString>> = facts.put(text);
             Some(OutgoingFact::Resolved {
                 attr_id,
@@ -1400,7 +1358,7 @@ fn build_resolved_outgoing(
                 .expect("intrinsic id from rdf_lang+rdf_text");
             // Facts-only merge — see emit_lang_literal.
             *facts += label_fragment.into_facts();
-            let attr_id = attr_cache.genid(predicate);
+            let attr_id = attr_cache.genid(meta, predicate);
             let g: Inline<GenId> = label_id.to_inline();
             Some(OutgoingFact::Resolved {
                 attr_id,
@@ -1418,7 +1376,7 @@ fn emit_uri_object(
     obj_uri: &str,
     attr_cache: &mut NTriplesAttrCache,
 ) {
-    let attr_id = attr_cache.genid(predicate);
+    let attr_id = attr_cache.genid(meta, predicate);
     let obj_id = record_uri(meta, obj_uri.to_owned());
     let g: Inline<GenId> = obj_id.to_inline();
     facts.facts_mut().insert(&Trible::new(e, &attr_id, &g));
@@ -1426,12 +1384,13 @@ fn emit_uri_object(
 
 fn emit_text_literal(
     facts: &mut Fragment,
+    meta: &mut Fragment,
     e: &ExclusiveId,
     predicate: &str,
     text: View<str>,
     attr_cache: &mut NTriplesAttrCache,
 ) {
-    let attr_id = attr_cache.longstring(predicate);
+    let attr_id = attr_cache.longstring(meta, predicate);
     let handle: Inline<Handle<LongString>> = facts.put(text);
     facts.facts_mut().insert(&Trible::new(e, &attr_id, &handle));
 }
@@ -1450,7 +1409,7 @@ fn emit_typed_literal(
             "integer" | "int" | "long" | "short" | "byte" | "negativeInteger"
             | "nonPositiveInteger" => {
                 if let Ok(val) = text.parse::<i128>() {
-                    let attr_id = attr_cache.i256be(predicate);
+                    let attr_id = attr_cache.i256be(meta, predicate);
                     let v: Inline<inlineencodings::I256BE> = val.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1459,7 +1418,7 @@ fn emit_typed_literal(
             "nonNegativeInteger" | "positiveInteger" | "unsignedInt" | "unsignedLong"
             | "unsignedShort" | "unsignedByte" => {
                 if let Ok(val) = text.parse::<u128>() {
-                    let attr_id = attr_cache.u256be(predicate);
+                    let attr_id = attr_cache.u256be(meta, predicate);
                     let v: Inline<inlineencodings::U256BE> = val.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1467,7 +1426,7 @@ fn emit_typed_literal(
             }
             "decimal" => {
                 if let Some(val) = parse_decimal(text.as_ref()) {
-                    let attr_id = attr_cache.r256be(predicate);
+                    let attr_id = attr_cache.r256be(meta, predicate);
                     let v: Inline<inlineencodings::R256BE> = val.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1475,7 +1434,7 @@ fn emit_typed_literal(
             }
             "float" | "double" => {
                 if let Ok(val) = text.parse::<f64>() {
-                    let attr_id = attr_cache.f64(predicate);
+                    let attr_id = attr_cache.f64(meta, predicate);
                     let v: Inline<F64> = val.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1483,13 +1442,13 @@ fn emit_typed_literal(
             }
             "boolean" => match text.as_ref() {
                 "true" | "1" => {
-                    let attr_id = attr_cache.boolean(predicate);
+                    let attr_id = attr_cache.boolean(meta, predicate);
                     let v: Inline<Boolean> = true.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
                 }
                 "false" | "0" => {
-                    let attr_id = attr_cache.boolean(predicate);
+                    let attr_id = attr_cache.boolean(meta, predicate);
                     let v: Inline<Boolean> = false.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1498,31 +1457,31 @@ fn emit_typed_literal(
             },
             "dateTime" => {
                 if let Some(ns) = parse_xsd_datetime(text.as_ref()) {
-                    emit_interval(facts.facts_mut(), e, predicate, ns, ns, attr_cache);
+                    emit_interval(facts.facts_mut(), meta, e, predicate, ns, ns, attr_cache);
                     return;
                 }
             }
             "date" => {
                 if let Some((lo, hi)) = parse_xsd_date(text.as_ref()) {
-                    emit_interval(facts.facts_mut(), e, predicate, lo, hi, attr_cache);
+                    emit_interval(facts.facts_mut(), meta, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "gYear" => {
                 if let Some((lo, hi)) = parse_xsd_gyear(text.as_ref()) {
-                    emit_interval(facts.facts_mut(), e, predicate, lo, hi, attr_cache);
+                    emit_interval(facts.facts_mut(), meta, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "gYearMonth" => {
                 if let Some((lo, hi)) = parse_xsd_gyearmonth(text.as_ref()) {
-                    emit_interval(facts.facts_mut(), e, predicate, lo, hi, attr_cache);
+                    emit_interval(facts.facts_mut(), meta, e, predicate, lo, hi, attr_cache);
                     return;
                 }
             }
             "duration" | "dayTimeDuration" => {
                 if let Some(ns) = parse_xsd_duration(text.as_ref()) {
-                    let attr_id = attr_cache.nsduration(predicate);
+                    let attr_id = attr_cache.nsduration(meta, predicate);
                     let v: Inline<NsDuration> = ns.to_inline();
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
                     return;
@@ -1530,7 +1489,7 @@ fn emit_typed_literal(
             }
             "hexBinary" => {
                 if let Ok(bytes) = hex::decode(text.as_ref()) {
-                    let attr_id = attr_cache.rawbytes(predicate);
+                    let attr_id = attr_cache.rawbytes(meta, predicate);
                     let handle: Inline<Handle<RawBytes>> = facts.put(bytes);
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &handle));
                     return;
@@ -1538,7 +1497,7 @@ fn emit_typed_literal(
             }
             "base64Binary" => {
                 if let Ok(bytes) = BASE64.decode(text.as_ref()) {
-                    let attr_id = attr_cache.rawbytes(predicate);
+                    let attr_id = attr_cache.rawbytes(meta, predicate);
                     let handle: Inline<Handle<RawBytes>> = facts.put(bytes);
                     facts.facts_mut().insert(&Trible::new(e, &attr_id, &handle));
                     return;
@@ -1555,19 +1514,20 @@ fn emit_typed_literal(
         }
     }
     // Unknown / unparseable typed literal: fall back to text storage.
-    emit_text_literal(facts, e, predicate, text, attr_cache);
+    emit_text_literal(facts, meta, e, predicate, text, attr_cache);
 }
 
 /// Helper to emit an `[lo, hi]` interval trible.
 fn emit_interval(
     facts: &mut TribleSet,
+    meta: &mut Fragment,
     e: &ExclusiveId,
     predicate: &str,
     lo: i128,
     hi: i128,
     attr_cache: &mut NTriplesAttrCache,
 ) {
-    let attr_id = attr_cache.nstai(predicate);
+    let attr_id = attr_cache.nstai(meta, predicate);
     let mut raw = [0u8; 32];
     raw[0..16].copy_from_slice(&i128_to_ordered_be(lo));
     raw[16..32].copy_from_slice(&i128_to_ordered_be(hi));
@@ -1577,6 +1537,7 @@ fn emit_interval(
 
 fn emit_lang_literal(
     facts: &mut Fragment,
+    meta: &mut Fragment,
     e: &ExclusiveId,
     predicate: &str,
     lang: &str,
@@ -1600,7 +1561,7 @@ fn emit_lang_literal(
     // Facts-only merge: accumulating one export per label entity
     // would bloat the import fragment's export set for no consumer.
     *facts += label_fragment.into_facts();
-    let attr_id = attr_cache.genid(predicate);
+    let attr_id = attr_cache.genid(meta, predicate);
     let v: Inline<GenId> = label_id.to_inline();
     facts.facts_mut().insert(&Trible::new(e, &attr_id, &v));
 }

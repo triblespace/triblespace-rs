@@ -5,6 +5,8 @@
 
 use std::io::Cursor;
 
+use anybytes::View;
+
 use ed25519_dalek::SigningKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::longstring::LongString;
@@ -15,6 +17,8 @@ use triblespace_core::import::rdf_uri;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::inlineencodings::{self, Handle};
+use triblespace_core::prelude::BlobStore as _;
+use triblespace_core::prelude::BlobStoreGet as _;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
@@ -640,6 +644,38 @@ fn w3c_negative_bad_esc_invalid_escape() {
         br#"<http://a.example/s> <http://a.example/p> "abc\m" .
 "#,
     );
+}
+
+#[test]
+fn predicate_uris_recoverable_from_meta() {
+    // The import's meta fragment is a full self-description: besides
+    // the rdf_uri annotations for entity URIs, it carries one
+    // describing entity per (predicate IRI, value schema) pair, plus
+    // the IRI-string blobs those facts reference. Round-trip: derive
+    // the attribute id the standard way, look up its IRI handle in
+    // meta, resolve the bytes from meta's embedded blob store.
+    let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
+
+    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
+        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
+        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+    });
+    let attr_entity = firstname_attr.id();
+
+    let (h,) = find!(
+        (h: Inline<Handle<LongString>>),
+        pattern!(import.meta.facts(), [{ attr_entity @ metadata::iri: ?h }])
+    )
+    .next()
+    .expect("describing entity for the firstname attribute in meta");
+
+    let mut blobs = import.meta.blobs().clone();
+    let uri: View<str> = blobs
+        .reader()
+        .expect("meta blob reader")
+        .get(h)
+        .expect("IRI blob resolvable from meta's embedded store");
+    assert_eq!(uri.as_ref(), "http://example.org/firstname");
 }
 
 #[test]
