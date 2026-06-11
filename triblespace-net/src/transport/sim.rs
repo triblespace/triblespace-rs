@@ -126,13 +126,31 @@ struct NodeSlot {
 
 struct SimNetInner {
     nodes: BTreeMap<PeerId, NodeSlot>,
+    /// Every live conn pair, for fault injection: crash() resets all
+    /// conns touching the node, like a dead process's QUIC conns.
+    conns: Vec<ConnHandle>,
     /// Symmetric partition set; (a, b) stored with a <= b.
     partitions: BTreeSet<(PeerId, PeerId)>,
+    /// Dial targets whose connection setup stalls forever (the
+    /// handshake neither completes nor errors). Models a peer that
+    /// is routable enough to start a dial but never finishes it —
+    /// the failure shape connection deadlines exist to catch. Unlike
+    /// `crash` (dials error fast), this keeps the dial future
+    /// pending, so an un-deadlined singleflight pool wedges every
+    /// later walk to that peer behind one stalled attempt.
+    stalled_dials: BTreeSet<PeerId>,
     /// Content-discovery table: hash -> providers, in deterministic
     /// (BTree) order.
     dht: BTreeMap<[u8; 32], BTreeSet<PeerId>>,
     rng: StdRng,
     config: SimConfig,
+}
+
+struct ConnHandle {
+    a: PeerId,
+    b: PeerId,
+    closed: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl SimNetInner {
@@ -164,7 +182,9 @@ impl SimNet {
         Self {
             inner: Arc::new(Mutex::new(SimNetInner {
                 nodes: BTreeMap::new(),
+                conns: Vec::new(),
                 partitions: BTreeSet::new(),
+                stalled_dials: BTreeSet::new(),
                 dht: BTreeMap::new(),
                 rng: StdRng::seed_from_u64(seed),
                 config,
@@ -256,10 +276,41 @@ impl SimNet {
     /// Its host loop keeps running (a crashed process is modeled by
     /// also dropping the node's Peer + harness; a *disconnected* node
     /// is modeled by this alone).
+    /// Make connection setup toward `id` stall forever (pending, not
+    /// erroring) until [`SimNet::unstall_dials`]. Established
+    /// connections are unaffected.
+    pub fn stall_dials(&self, id: PeerId) {
+        self.inner.lock().unwrap().stalled_dials.insert(id);
+    }
+
+    /// Lift a [`SimNet::stall_dials`] fault. Dials already pending
+    /// stay pending — like production, where a wedged handshake
+    /// doesn't retroactively complete; recovery comes from the
+    /// caller's deadline + retry.
+    pub fn unstall_dials(&self, id: PeerId) {
+        self.inner.lock().unwrap().stalled_dials.remove(&id);
+    }
+
     pub fn crash(&self, id: PeerId) {
-        if let Some(n) = self.inner.lock().unwrap().nodes.get_mut(&id) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(n) = inner.nodes.get_mut(&id) {
             n.up = false;
         }
+        // A dead process's QUIC connections reset: close every conn
+        // pair touching the node so the surviving side's in-flight
+        // ops fail fast (open_bi errors, accept_bi ends, reads EOF)
+        // instead of silently succeeding against a "crashed" peer.
+        // The pool's evict-on-error path then clears the cached conn
+        // and later walks re-dial — which fails until revive.
+        inner.conns.retain(|c| {
+            if c.a == id || c.b == id {
+                c.closed.store(true, Ordering::SeqCst);
+                c.notify.notify_waiters();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Bring `id` back onto the network.
@@ -327,7 +378,7 @@ impl Transport for SimTransport {
     }
 
     async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<Self::Conn> {
-        let (latency, incoming_tx) = {
+        let (latency, incoming_tx, stalled) = {
             let mut inner = self.net.inner.lock().unwrap();
             if inner.partitioned(&self.id, &peer) {
                 anyhow::bail!("simnet: {} -> {}: partitioned",
@@ -346,13 +397,39 @@ impl Transport for SimTransport {
                 }
                 slot.incoming_tx.clone()
             };
-            (inner.latency(), incoming_tx)
+            let stalled = inner.stalled_dials.contains(&peer);
+            (inner.latency(), incoming_tx, stalled)
         };
+
+        if stalled {
+            // Pending forever — the dial neither completes nor
+            // errors. See `stalled_dials`.
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
 
         // Connection setup costs one round trip.
         tokio::time::sleep(latency * 2).await;
 
         let (dialer, acceptor) = SimConn::pair(self.id, peer);
+        {
+            let mut inner = self.net.inner.lock().unwrap();
+            // Re-check liveness after the dial latency: a crash that
+            // landed mid-handshake kills the connection attempt.
+            let target_up = inner.nodes.get(&peer).map(|n| n.up).unwrap_or(false);
+            if !target_up || inner.partitioned(&self.id, &peer) {
+                anyhow::bail!(
+                    "simnet: dial {}: peer lost during handshake",
+                    hex_prefix(&peer)
+                );
+            }
+            inner.conns.push(ConnHandle {
+                a: self.id,
+                b: peer,
+                closed: dialer.closed.clone(),
+                notify: dialer.notify_close.clone(),
+            });
+        }
         incoming_tx
             .send(Incoming {
                 alpn,

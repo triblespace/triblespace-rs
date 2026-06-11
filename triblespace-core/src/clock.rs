@@ -70,6 +70,15 @@ impl Mono {
     }
 }
 
+impl std::ops::Add<Duration> for Mono {
+    type Output = Mono;
+    /// Saturating add — a deadline past u64::MAX nanoseconds (584
+    /// years of uptime) clamps rather than wraps.
+    fn add(self, rhs: Duration) -> Mono {
+        Mono(self.0.saturating_add(rhs.as_nanos() as u64))
+    }
+}
+
 /// A virtual clock for simulation: time is a counter the scheduler
 /// advances, plus a fixed wall-clock base so `epoch_now` stays
 /// meaningful for expiry math.

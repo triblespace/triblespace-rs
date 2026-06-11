@@ -327,6 +327,23 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
 // ── Network thread event loop ────────────────────────────────────────
 
+/// Deadline for establishing + authenticating a connection (the
+/// `pool_get` init future: dial + OP_AUTH round trip). A connection
+/// attempt that exceeds this counts as failed: the pool's
+/// singleflight cell resets so the next walk re-dials, instead of
+/// every later fetch to that peer queueing forever behind one
+/// stalled handshake. Generous relative to real-world QUIC + relay
+/// setup times; deterministic under simulated virtual time.
+const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Deadline for a single protocol op (OP_CHILDREN / OP_GET_BLOB
+/// request + full response) on an established connection. On expiry
+/// the op reports an error and the caller's existing
+/// evict-and-try-next-provider path takes over. Total-op rather than
+/// progress-based: at the 1 MiB max blob size even slow links finish
+/// well inside this; revisit with idle-deadlines if blob sizes grow.
+const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Connect to a peer over the pile-sync ALPN and immediately present
 /// our capability so subsequent ops are authorised. Protocol v4 makes
 /// this mandatory — the server rejects any op until the connection
@@ -373,6 +390,12 @@ async fn host_loop<T: Transport>(
     // fetch_reachable / swarm_fetch_chain calls. See `SharedPool`
     // docs for the OnceCell-based dial deduplication.
     let conn_pool: SharedPool<T::Conn> = new_shared_pool();
+
+    // Failed-walk retry queue (bug C): walks that fail transiently
+    // are re-attempted with backoff from the command loop below,
+    // because the gossip layer dedupes rebroadcast frames and will
+    // NOT redeliver an unchanged head.
+    let retries: RetryQueue = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     // Our own pubkey — the expected `cap_subject` of any cap
     // delivered to us via OP_DELIVER_CAP.
@@ -426,12 +449,18 @@ async fn host_loop<T: Transport>(
         // OP_CHILDREN / OP_GET_BLOB to remote peers.
         let snapshot_for_fetch = snapshot.clone();
         let pool_for_fetch = conn_pool.clone();
+        let retries_for_gossip = retries.clone();
         tokio::spawn(async move {
             while let Some(event) = gossip_events.recv().await {
                 match event {
                     GossipEvent::Received { bytes, delivered_from } => {
-                        // Gossip HEAD message: 0x01 + branch(16) + head(32) + publisher(32) = 81 bytes
-                        if bytes.len() == 81 && bytes[0] == 0x01 {
+                        // Gossip HEAD message, v1 (81B, 0x01) or
+                        // v2 (89B, 0x02 + 8-byte nonce; the nonce is
+                        // anti-dedupe padding — parsed fields are
+                        // identical).
+                        if (bytes.len() == 81 && bytes[0] == 0x01)
+                            || (bytes.len() == 89 && bytes[0] == 0x02)
+                        {
                             let mut branch = [0u8; 16];
                             branch.copy_from_slice(&bytes[1..17]);
                             let mut head = [0u8; 32];
@@ -454,13 +483,18 @@ async fn host_loop<T: Transport>(
                                 } else {
                                     delivered_from
                                 };
+                            // A fresh frame supersedes any pending
+                            // retry for this branch — the new walk
+                            // owns the branch's recovery from here.
+                            retries_for_gossip.lock().unwrap().remove(&branch);
+                            let retries2 = retries_for_gossip.clone();
                             tokio::spawn(async move {
                                 debug!(
                                     head = %hex::encode(&head[..4]),
                                     publisher = %hex::encode(&publisher[..4]),
                                     "gossip head update; fetching"
                                 );
-                                track_known_head(&t3, fetch_peer, branch, head, publisher, &events_tx2, &self_cap2, &snap2, &pool2).await;
+                                track_known_head(&t3, fetch_peer, branch, head, publisher, &events_tx2, &self_cap2, &snap2, &pool2, &retries2, 0).await;
                             });
                         }
                     }
@@ -476,13 +510,26 @@ async fn host_loop<T: Transport>(
     }
 
     /// Build the gossip wire frame for a (branch, head) pair.
-    /// 0x01 | branch(16) | head(32) | publisher(32) = 81 bytes.
+    /// v2: 0x02 | branch(16) | head(32) | publisher(32) | nonce(8) = 89 bytes.
+    ///
+    /// The nonce (sender's monotonic nanoseconds) makes every frame
+    /// instance bytewise unique. This is load-bearing, not
+    /// decoration: the gossip mesh dedupes by message id (content
+    /// hash), so the periodic rebroadcast of an UNCHANGED head would
+    /// otherwise be mesh-wide deduped into a no-op — and a peer that
+    /// missed the original flood (crashed, partitioned, not yet
+    /// joined) would never learn the head at all (bug C, 2026-06-11,
+    /// reproduced by sim_swarm under SimNet's dedupe model). With
+    /// the nonce, dedupe still kills real duplicates — the same
+    /// frame instance arriving via multiple mesh paths — but each
+    /// rebroadcast period generates a deliverable new instance.
     fn gossip_frame(branch: &RawPinId, head: &RawHash, publisher: &PeerId) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(81);
-        msg.push(0x01);
+        let mut msg = Vec::with_capacity(89);
+        msg.push(0x02);
         msg.extend_from_slice(branch);
         msg.extend_from_slice(head);
         msg.extend_from_slice(publisher);
+        msg.extend_from_slice(&crate::clock::mono_now().as_nanos().to_be_bytes());
         msg
     }
 
@@ -580,6 +627,51 @@ async fn host_loop<T: Transport>(
                         conn.close(0, b"ok");
                     });
                 }
+            }
+        }
+
+        // ── Failed-walk retries: respawn walks whose backoff expired.
+        {
+            let now = crate::clock::mono_now();
+            let due: Vec<(RawPinId, RetryEntry)> = {
+                let mut q = retries.lock().unwrap();
+                let keys: Vec<RawPinId> = q
+                    .iter()
+                    .filter(|(_, e)| e.next_attempt <= now)
+                    .map(|(k, _)| *k)
+                    .collect();
+                keys.into_iter()
+                    .filter_map(|k| q.remove(&k).map(|e| (k, e)))
+                    .collect()
+            };
+            for (branch, entry) in due {
+                debug!(
+                    head = %hex::encode(&entry.head[..4]),
+                    attempt = entry.attempt,
+                    "retrying failed walk"
+                );
+                let t3 = transport.clone();
+                let events_tx2 = events.clone();
+                let self_cap2 = self_cap;
+                let snap2 = snapshot.clone();
+                let pool2 = conn_pool.clone();
+                let retries2 = retries.clone();
+                tokio::spawn(async move {
+                    track_known_head(
+                        &t3,
+                        entry.fetch_peer,
+                        branch,
+                        entry.head,
+                        entry.publisher,
+                        &events_tx2,
+                        &self_cap2,
+                        &snap2,
+                        &pool2,
+                        &retries2,
+                        entry.attempt,
+                    )
+                    .await;
+                });
             }
         }
 
@@ -682,8 +774,27 @@ async fn fetch_reachable<T: Transport>(
             let children = match children_one(t, parent, pool, publisher_id, self_cap).await {
                 Some(c) => c,
                 None => {
-                    warn!(parent = %hex::encode(&parent[..4]), "op_children: no provider could serve");
-                    continue;
+                    // Discovery FAILED for this blob — every provider
+                    // was unreachable or errored (a crash reset the
+                    // conn mid-OP_CHILDREN, say). This is NOT "the
+                    // blob is a leaf": a genuine leaf returns
+                    // `Some(vec![])`. Treating a failed discovery as a
+                    // leaf would skip the parent's entire subtree,
+                    // complete the walk with a hole, and advance the
+                    // tracking pin to a head whose ancestry is missing
+                    // — after which every `merge_commit` dies on
+                    // Storage(NotFound). Abort instead so the caller's
+                    // retry queue re-attempts the whole walk; the
+                    // have_local short-circuits make the retry cheap
+                    // (already-fetched subtrees are skipped).
+                    warn!(
+                        parent = %hex::encode(&parent[..4]),
+                        "op_children: no provider could serve; aborting walk (closure would be incomplete)"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "op_children discovery failed for {}: closure incomplete",
+                        hex::encode(parent)
+                    ));
                 }
             };
             trace!(parent = %hex::encode(&parent[..4]), n = children.len(), "fetch_reachable: children_one returned");
@@ -853,7 +964,19 @@ async fn pool_get<T: Transport>(
             .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
             .clone()
     };
-    let init = || async { connect_authed(t, provider, self_cap).await };
+    let init = || async {
+        match tokio::time::timeout(
+            DIAL_DEADLINE,
+            connect_authed(t, provider, self_cap),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::anyhow!(
+                "connection setup deadline ({DIAL_DEADLINE:?}) exceeded"
+            )),
+        }
+    };
     match cell.get_or_try_init(init).await {
         Ok(conn) => Some(conn.clone()),
         Err(e) => {
@@ -903,7 +1026,12 @@ async fn fetch_one<T: Transport>(
         let Some(conn) = pool_get(t, pool, provider, self_cap).await else {
             continue;
         };
-        match op_get_blob(&conn, hash).await {
+        let op = tokio::time::timeout(OP_DEADLINE, op_get_blob(&conn, hash))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(
+                "OP_GET_BLOB deadline ({OP_DEADLINE:?}) exceeded"
+            )));
+        match op {
             Ok(Some(data)) => return Some(data),
             Ok(None) => {
                 debug!(hash = %hex::encode(&hash[..4]), provider = %hex::encode(&provider[..4]), "blob miss");
@@ -1017,7 +1145,12 @@ async fn children_one<T: Transport>(
             continue;
         };
         trace!(parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "children_one: op_children awaiting");
-        match op_children(&conn, parent).await {
+        let op = tokio::time::timeout(OP_DEADLINE, op_children(&conn, parent))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(
+                "OP_CHILDREN deadline ({OP_DEADLINE:?}) exceeded"
+            )));
+        match op {
             Ok(c) => return Some(c),
             Err(e) => {
                 debug!(error = %e, parent = %hex::encode(&parent[..4]), provider = %hex::encode(&provider[..4]), "op_children errored, evicting and trying next provider");
@@ -1037,6 +1170,43 @@ async fn children_one<T: Transport>(
 /// both know (fetch_peer, branch, head, publisher) by the time they
 /// get here. Gossip gets the head directly from the broadcast message;
 /// `Track` asks the peer via `op_head` first.
+///
+/// Failed-walk retry state, keyed by branch. One entry per branch —
+/// a newer head for the same branch replaces (and thereby cancels
+/// retries for) an older failed one.
+///
+/// Exists because gossip CANNOT be relied on to redeliver: the 30s
+/// rebroadcast replays byte-identical frames, and the gossip mesh
+/// dedupes message-ids — so a head whose first fetch failed
+/// transiently would otherwise never be retried (bug C, 2026-06-11:
+/// reproduced deterministically by sim_swarm the moment SimNet
+/// modeled iroh-gossip's dedupe; diagnosed from first principles by
+/// the organisation zooid).
+pub(crate) struct RetryEntry {
+    pub head: RawHash,
+    pub publisher: PublisherKey,
+    pub fetch_peer: PeerId,
+    pub next_attempt: crate::clock::Mono,
+    pub attempt: u32,
+}
+
+pub(crate) type RetryQueue = Arc<Mutex<std::collections::BTreeMap<RawPinId, RetryEntry>>>;
+
+/// Base backoff for failed-walk retries; doubles per attempt up to
+/// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer
+/// restarting, partition healing) is retried promptly while a
+/// persistently-dead publisher costs at most one dial per cap
+/// period.
+const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    RETRY_BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(RETRY_BACKOFF_CAP)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn track_known_head<T: Transport>(
     t: &T,
     fetch_peer: PeerId,
@@ -1047,11 +1217,37 @@ async fn track_known_head<T: Transport>(
     self_cap: &RawHash,
     local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     pool: &SharedPool<T::Conn>,
+    retries: &RetryQueue,
+    attempt: u32,
 ) {
     if let Err(e) = fetch_reachable(t, fetch_peer, &head, events, self_cap, local, pool).await {
-        warn!(error = %e, peer = %hex::encode(&fetch_peer[..4]), "fetch_reachable failed");
+        warn!(
+            error = %e,
+            peer = %hex::encode(&fetch_peer[..4]),
+            attempt,
+            "fetch_reachable failed; queueing retry"
+        );
+        // Unconditional insert: the gossip arm removes a branch's
+        // pending entry whenever a FRESH frame for that branch
+        // arrives, so whatever walk fails here is the newest known
+        // head for the branch at this moment.
+        retries.lock().unwrap().insert(
+            branch,
+            RetryEntry {
+                head,
+                publisher,
+                fetch_peer,
+                next_attempt: crate::clock::mono_now() + retry_backoff(attempt),
+                attempt: attempt.saturating_add(1),
+            },
+        );
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });
+        // Success cancels any pending retry for this branch+head.
+        let mut q = retries.lock().unwrap();
+        if q.get(&branch).map(|e| e.head == head).unwrap_or(false) {
+            q.remove(&branch);
+        }
     }
 }
 

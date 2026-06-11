@@ -580,3 +580,317 @@ fn converges_with_blackhole_dht() {
         "publisher-first fetching must converge without any DHT"
     );
 }
+
+
+/// Discriminator for "bug C" (organisation zooid, 2026-06-11): a
+/// receiver that GOT the gossip frame but whose closure fetch FAILED
+/// must eventually converge anyway.
+///
+/// The trap: iroh-gossip dedupes message ids (blake3 of content) for
+/// 90s and a suppressed duplicate refreshes its own window — while
+/// the host rebroadcasts identical frames every 30s. So "retry on
+/// next gossip" NEVER fires for a head that doesn't change: every
+/// rebroadcast re-arms its own suppression. Recovery must come from
+/// receiver-side retry of failed walks — the receiver is the only
+/// party that knows the fetch failed.
+///
+/// Scenario: A commits; the frame reaches B; A is partitioned away
+/// before B's fetch can dial; the partition heals; A's head never
+/// changes again. Pre-fix this freezes forever (the sim's dedupe
+/// model eats every identical rebroadcast); with receiver-side
+/// retry it converges.
+#[test]
+fn fetch_failure_recovers_despite_gossip_dedupe() {
+    let _serial = sim_guard();
+    let vc = vclock();
+    vc.reset();
+    seed_ids(4242);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("paused current-thread runtime");
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async move {
+        let net = SimNet::new(4242, SimConfig::default());
+        let root = key(0xF2);
+        let ka = key(0xA2);
+        let kb = key(0xB2);
+        let team_root = root.verifying_key();
+        let (cap_a, sig_a) = admin_cap(&root, &ka);
+        let (cap_b, sig_b) = admin_cap(&root, &kb);
+        let self_cap_a = (&sig_a).get_handle().raw;
+        let self_cap_b = (&sig_b).get_handle().raw;
+
+        let mut store_a = MemoryRepo::default();
+        let mut store_b = MemoryRepo::default();
+        for store in [&mut store_a, &mut store_b] {
+            store.put::<SimpleArchive, _>(cap_a.clone()).unwrap();
+            store.put::<SimpleArchive, _>(sig_a.clone()).unwrap();
+            store.put::<SimpleArchive, _>(cap_b.clone()).unwrap();
+            store.put::<SimpleArchive, _>(sig_b.clone()).unwrap();
+        }
+
+        let config = |self_cap: [u8; 32]| PeerConfig {
+            peers: Vec::new(),
+            gossip: true,
+            team_root,
+            self_cap,
+            direction: SyncDirection::Bidirectional,
+        };
+
+        let harness_a = net.join(pk(&ka), true);
+        let (sender_a, receiver_a, wiring_a) =
+            host::wire(EndpointId::from_bytes(&pk(&ka)).expect("id"));
+        tokio::task::spawn_local(host::run_host(harness_a, config(self_cap_a), wiring_a));
+        let peer_a = Peer::with_wiring(
+            store_a,
+            ka.clone(),
+            SyncDirection::Bidirectional,
+            team_root,
+            sender_a,
+            receiver_a,
+        );
+        let mut repo_a =
+            Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+
+        let harness_b = net.join(pk(&kb), true);
+        let (sender_b, receiver_b, wiring_b) =
+            host::wire(EndpointId::from_bytes(&pk(&kb)).expect("id"));
+        tokio::task::spawn_local(host::run_host(harness_b, config(self_cap_b), wiring_b));
+        let peer_b = Peer::with_wiring(
+            store_b,
+            kb.clone(),
+            SyncDirection::Bidirectional,
+            team_root,
+            sender_b,
+            receiver_b,
+        );
+        let mut repo_b =
+            Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+
+        // A commits while the link is still up...
+        let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
+        {
+            let mut ws = repo_a.pull(branch_id).expect("pull");
+            ws.commit(TribleSet::new(), "the only commit");
+            repo_a.push(&mut ws).ok().expect("push");
+        }
+        let a_head = {
+            let ws = repo_a.pull(branch_id).expect("pull");
+            ws.head().expect("branch has head").raw
+        };
+
+        // ...one short step lets A's host flush the gossip frame
+        // toward B (frame latency 1-30ms; the walk's conn work takes
+        // longer)...
+        SimNet::step(&vc, Duration::from_millis(60)).await;
+        repo_a.storage_mut().refresh();
+
+        // ...then A crashes mid-fetch: its conns reset (QUIC-style),
+        // so B's in-flight walk FAILS — but B's dedupe cache has
+        // already recorded the frame's message id.
+        net.crash(pk(&ka));
+        for _ in 0..100u32 {
+            SimNet::step(&vc, Duration::from_millis(50)).await;
+            repo_b.storage_mut().refresh();
+        }
+        net.revive(pk(&ka));
+
+        // A's head never changes again. Every rebroadcast is an
+        // identical frame — suppressed by B's dedupe cache, which
+        // each rebroadcast also refreshes. Only receiver-side retry
+        // can converge this.
+        let b_main_head = |repo_b: &mut Repository<Peer<MemoryRepo>>| {
+            repo_b
+                .lookup_branch("main")
+                .ok()
+                .flatten()
+                .and_then(|id| repo_b.pull(id).ok())
+                .and_then(|ws| ws.head())
+        };
+        let mut converged = false;
+        for _ in 0..6_000u32 {
+            SimNet::step(&vc, Duration::from_millis(50)).await;
+            repo_a.storage_mut().refresh();
+            repo_b.storage_mut().refresh();
+            for info in tracking::list_tracking_pins(repo_b.storage_mut()) {
+                let _ = tracking::merge_tracking_into_local(
+                    &mut repo_b,
+                    info.local_id,
+                    &info.remote_name,
+                );
+            }
+            if b_main_head(&mut repo_b).map(|h| h.raw == a_head).unwrap_or(false) {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "B received the frame, its fetch failed, the head never \
+             changed: only receiver-side retry can recover — and it must"
+        );
+    }));
+}
+
+
+/// A peer that accepts dial attempts but never completes the
+/// handshake must not wedge the swarm: the connection-setup deadline
+/// converts the stall into a failure, the pool's singleflight cell
+/// resets, and once the fault lifts the next gossip rebroadcast
+/// recovers sync. Pre-deadline, ONE stalled dial parked every
+/// subsequent fetch toward that peer forever (the singleflight cell
+/// never resolved, and waiters piled up behind it).
+#[test]
+fn stalled_dial_does_not_wedge_the_pool() {
+    let _serial = sim_guard();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+    let vc = vclock();
+    vc.reset();
+    seed_ids(4242);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .expect("paused current-thread runtime");
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async move {
+        let net = SimNet::new(4242, SimConfig::default());
+        let root = key(0xF2);
+        let ka = key(0xA2);
+        let kb = key(0xB2);
+        let team_root = root.verifying_key();
+        let (cap_a, sig_a) = admin_cap(&root, &ka);
+        let (cap_b, sig_b) = admin_cap(&root, &kb);
+        let self_cap_a = (&sig_a).get_handle().raw;
+        let self_cap_b = (&sig_b).get_handle().raw;
+
+        let mut store_a = MemoryRepo::default();
+        let mut store_b = MemoryRepo::default();
+        for store in [&mut store_a, &mut store_b] {
+            store.put::<SimpleArchive, _>(cap_a.clone()).unwrap();
+            store.put::<SimpleArchive, _>(sig_a.clone()).unwrap();
+            store.put::<SimpleArchive, _>(cap_b.clone()).unwrap();
+            store.put::<SimpleArchive, _>(sig_b.clone()).unwrap();
+        }
+
+        let config = |self_cap: [u8; 32]| PeerConfig {
+            peers: Vec::new(),
+            gossip: true,
+            team_root,
+            self_cap,
+            direction: SyncDirection::Bidirectional,
+        };
+
+        let harness_a = net.join(pk(&ka), true);
+        let (sender_a, receiver_a, wiring_a) =
+            host::wire(EndpointId::from_bytes(&pk(&ka)).expect("id"));
+        tokio::task::spawn_local(host::run_host(harness_a, config(self_cap_a), wiring_a));
+        let peer_a = Peer::with_wiring(
+            store_a,
+            ka.clone(),
+            SyncDirection::Bidirectional,
+            team_root,
+            sender_a,
+            receiver_a,
+        );
+        let mut repo_a =
+            Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
+
+        let harness_b = net.join(pk(&kb), true);
+        let (sender_b, receiver_b, wiring_b) =
+            host::wire(EndpointId::from_bytes(&pk(&kb)).expect("id"));
+        tokio::task::spawn_local(host::run_host(harness_b, config(self_cap_b), wiring_b));
+        let peer_b = Peer::with_wiring(
+            store_b,
+            kb.clone(),
+            SyncDirection::Bidirectional,
+            team_root,
+            sender_b,
+            receiver_b,
+        );
+        let mut repo_b =
+            Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
+
+        // Dials toward A stall BEFORE A commits: B hears the gossip
+        // but every fetch attempt parks in connection setup until
+        // the deadline trips it.
+        net.stall_dials(pk(&ka));
+
+        let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
+        {
+            let mut ws = repo_a.pull(branch_id).expect("pull");
+            ws.commit(TribleSet::new(), "committed behind a stalled dial");
+            repo_a.push(&mut ws).ok().expect("push");
+        }
+        let a_head = {
+            let ws = repo_a.pull(branch_id).expect("pull");
+            ws.head().expect("branch has head").raw
+        };
+
+        let b_main_head = |repo_b: &mut Repository<Peer<MemoryRepo>>| {
+            repo_b
+                .lookup_branch("main")
+                .ok()
+                .flatten()
+                .and_then(|id| repo_b.pull(id).ok())
+                .and_then(|ws| ws.head())
+        };
+
+        // 60 virtual seconds under the fault — several deadline
+        // cycles. B must not converge, and must not wedge.
+        for _ in 0..1_200u32 {
+            SimNet::step(&vc, Duration::from_millis(50)).await;
+            repo_a.storage_mut().refresh();
+            repo_b.storage_mut().refresh();
+            for info in tracking::list_tracking_pins(repo_b.storage_mut()) {
+                let _ = tracking::merge_tracking_into_local(
+                    &mut repo_b,
+                    info.local_id,
+                    &info.remote_name,
+                );
+            }
+        }
+        assert!(
+            b_main_head(&mut repo_b).map(|h| h.raw != a_head).unwrap_or(true),
+            "B cannot have A's head while dials to A stall"
+        );
+
+        // Lift the fault. The pool must NOT be wedged on the stalled
+        // attempt: the deadline already reset the singleflight cell,
+        // so the next rebroadcast-triggered walk re-dials and sync
+        // completes.
+        net.unstall_dials(pk(&ka));
+        let mut converged = false;
+        for _ in 0..2_400u32 {
+            SimNet::step(&vc, Duration::from_millis(50)).await;
+            repo_a.storage_mut().refresh();
+            repo_b.storage_mut().refresh();
+            for info in tracking::list_tracking_pins(repo_b.storage_mut()) {
+                let _ = tracking::merge_tracking_into_local(
+                    &mut repo_b,
+                    info.local_id,
+                    &info.remote_name,
+                );
+            }
+            if b_main_head(&mut repo_b).map(|h| h.raw == a_head).unwrap_or(false) {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "after the stall lifts, the deadline-reset pool must allow \
+             re-dial and convergence (a wedged singleflight cell fails this)"
+        );
+    }));
+}
