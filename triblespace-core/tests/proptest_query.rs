@@ -965,6 +965,69 @@ proptest! {
     }
 
     #[test]
+    fn path_same_var_concat_finds_only_cycles(
+        chain_len in 3..6usize,
+    ) {
+        // `?x (link/link) ?x` — same-Variable two-hop concat. On a
+        // pure chain there are no 2-cycles → zero rows (exercises the
+        // self-loop join tier). Closing the chain into a ring of even
+        // length creates them.
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        let acyclic: usize = find!(
+            (x: Inline<GenId>,),
+            path!(set.clone(), x (test_ns::link)(test_ns::link) x)
+        ).count();
+        prop_assert_eq!(acyclic, 0, "no 2-cycles on a chain");
+
+        // Close the ring: last → first. A ring of length N has a
+        // node returning to itself via 2 hops iff N == 2; for N > 2
+        // still zero — but every node DOES return via N hops. Use a
+        // 2-ring explicitly for the positive case.
+        let a = rngid();
+        let b = rngid();
+        let mut ring = TribleSet::new();
+        ring += entity! { &a @ test_ns::link: &b };
+        ring += entity! { &b @ test_ns::link: &a };
+        let two_ring: usize = find!(
+            (x: Inline<GenId>,),
+            path!(ring.clone(), x (test_ns::link)(test_ns::link) x)
+        ).count();
+        prop_assert_eq!(two_ring, 2, "both ring nodes 2-cycle to themselves");
+    }
+
+    #[test]
+    fn path_free_free_nonnullable_plus_restricts_seeds(
+        chain_len in 2..5usize,
+    ) {
+        // `?x link+ ?y` free-free: results are exactly the ordered
+        // reachable pairs — and the seed-restricted evaluation must
+        // produce the same answer as the spec demands, with no
+        // phantom rows from non-subjects (e.g. the chain tail or
+        // unrelated literal terms).
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+        // Distractor: a labelled node off to the side (literal term
+        // in the graph, irrelevant to link+).
+        let label: Inline<inlineencodings::ShortString> =
+            "x".try_to_inline().expect("short");
+        set += entity! { &entities[0] @ test_ns::label: label };
+
+        let rows: usize = find!(
+            (x: Inline<GenId>, y: Inline<GenId>),
+            path!(set.clone(), x test_ns::link+ y)
+        ).count();
+        let expected = chain_len * (chain_len - 1) / 2;
+        prop_assert_eq!(rows, expected, "ordered reachable pairs only");
+    }
+
+    #[test]
     fn path_reflexive_zero_hop_requires_graph_membership(
         chain_len in 2..5usize,
     ) {

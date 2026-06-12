@@ -670,6 +670,204 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
     }
 }
 
+// ── Karalis et al. (ESWC 2024) planning helpers ─────────────────────────
+//
+// Two ideas from "Efficient Evaluation of C2RPQs Using Multi-way
+// Joins" close the free-endpoint performance gaps the 10M census
+// surfaced:
+//
+//  1. EvalRPQ_VV's seed restriction: a two-free-variable RPQ that is
+//     not nullable can only start at terms able to take the FIRST
+//     step of the expression — enumerate subjects of the first
+//     forward attribute (AEV) / values of the first inverse attribute
+//     (AVE) instead of all_terms().
+//  2. The paper's core thesis — use the multi-way join: a
+//     same-Variable (`?x expr ?x`) query over a join-expressible
+//     expression is ONE WCO join with an equality constraint between
+//     the endpoints, not |candidates| separate reachability probes.
+//     The join dies at the first empty level (e.g. a 6-hop self-join
+//     over an acyclic hierarchy), where candidate filtering pays the
+//     full per-candidate setup cost regardless.
+
+/// Does the expression's language contain the empty path?
+fn nullable(expr: &PathExpr) -> bool {
+    match expr {
+        PathExpr::Star(_) | PathExpr::Optional(_) => true,
+        PathExpr::Plus(body) => nullable(body),
+        PathExpr::Attr(_)
+        | PathExpr::InverseAttr(_)
+        | PathExpr::NotAttr(_)
+        | PathExpr::InverseNotAttr(_) => false,
+        PathExpr::Concat(a, b) => nullable(a) && nullable(b),
+        PathExpr::Union(a, b) => nullable(a) || nullable(b),
+    }
+}
+
+/// One way a non-empty path may begin.
+enum FirstStep {
+    /// Forward hop over this attribute — the start must occur as a
+    /// subject of it.
+    Fwd(RawId),
+    /// Inverse hop over this attribute — the start must occur as a
+    /// value of it.
+    Inv(RawId),
+    /// Negated forward hop — any subject may start.
+    AnyFwd,
+    /// Negated inverse hop — any value may start.
+    AnyInv,
+}
+
+/// Collect the FIRST set of the expression: every (attribute,
+/// direction) a non-empty path may begin with.
+fn first_steps(expr: &PathExpr, out: &mut Vec<FirstStep>) {
+    match expr {
+        PathExpr::Attr(a) => out.push(FirstStep::Fwd(*a)),
+        PathExpr::InverseAttr(a) => out.push(FirstStep::Inv(*a)),
+        PathExpr::NotAttr(_) => out.push(FirstStep::AnyFwd),
+        PathExpr::InverseNotAttr(_) => out.push(FirstStep::AnyInv),
+        PathExpr::Concat(l, r) => {
+            first_steps(l, out);
+            if nullable(l) {
+                first_steps(r, out);
+            }
+        }
+        PathExpr::Union(l, r) => {
+            first_steps(l, out);
+            first_steps(r, out);
+        }
+        PathExpr::Star(b) | PathExpr::Plus(b) | PathExpr::Optional(b) => first_steps(b, out),
+    }
+}
+
+/// Enumerate every term that can take some FIRST step of the
+/// expression — the valid starts of a non-nullable expression.
+/// Index-driven: one AEV (subjects-of-attr) or AVE (values-of-attr)
+/// segment scan per FIRST entry.
+fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+    let mut steps = Vec::new();
+    first_steps(expr, &mut steps);
+    let mut seeds: HashSet<RawInline> = HashSet::new();
+    for step in &steps {
+        match step {
+            FirstStep::Fwd(attr) => {
+                set.aev.infixes::<ID_LEN, ID_LEN, _>(attr, |e: &[u8; ID_LEN]| {
+                    seeds.insert(id_into_value(e));
+                });
+            }
+            FirstStep::Inv(attr) => {
+                set.ave.infixes::<ID_LEN, 32, _>(attr, |v: &[u8; 32]| {
+                    seeds.insert(*v);
+                });
+            }
+            FirstStep::AnyFwd => {
+                set.eav.infixes::<0, ID_LEN, _>(&[0u8; 0], |e: &[u8; ID_LEN]| {
+                    seeds.insert(id_into_value(e));
+                });
+            }
+            FirstStep::AnyInv => {
+                set.vea.infixes::<0, 32, _>(&[0u8; 0], |v: &[u8; 32]| {
+                    seeds.insert(*v);
+                });
+            }
+        }
+    }
+    seeds
+}
+
+/// Cheap necessary condition for `∃ end: (term, end) ∈ expr` when the
+/// expression is not nullable: can `term` take some FIRST step? One
+/// PATCH prefix probe per FIRST entry.
+fn can_take_first_step(set: &TribleSet, steps: &[FirstStep], term: &RawInline) -> bool {
+    for step in steps {
+        match step {
+            FirstStep::Fwd(attr) => {
+                if let Some(id) = value_as_entity(term) {
+                    let mut prefix = [0u8; ID_LEN * 2];
+                    prefix[..ID_LEN].copy_from_slice(&id);
+                    prefix[ID_LEN..].copy_from_slice(attr);
+                    if set.eav.has_prefix(&prefix) {
+                        return true;
+                    }
+                }
+            }
+            FirstStep::Inv(attr) => {
+                let mut prefix = [0u8; 32 + ID_LEN];
+                prefix[..32].copy_from_slice(term);
+                prefix[32..].copy_from_slice(attr);
+                if set.vae.has_prefix(&prefix) {
+                    return true;
+                }
+            }
+            FirstStep::AnyFwd => {
+                if let Some(id) = value_as_entity(term) {
+                    if set.eav.has_prefix(&id) {
+                        return true;
+                    }
+                }
+            }
+            FirstStep::AnyInv => {
+                if set.vea.has_prefix(term) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Is the expression a pure forward/inverse hop chain — the shape
+/// `build_constraint` can lower to a single multi-way join?
+fn is_pure_join_chain(expr: &PathExpr) -> bool {
+    match expr {
+        PathExpr::Attr(_) | PathExpr::InverseAttr(_) => true,
+        PathExpr::Concat(a, b) => is_pure_join_chain(a) && is_pure_join_chain(b),
+        _ => false,
+    }
+}
+
+/// Is the expression a union of pure join chains? (Unions split at
+/// the self-loop level; chains lower to one join each.)
+fn is_selfloop_joinable(expr: &PathExpr) -> bool {
+    match expr {
+        PathExpr::Union(a, b) => is_selfloop_joinable(a) && is_selfloop_joinable(b),
+        other => is_pure_join_chain(other),
+    }
+}
+
+/// Same-Variable (`?x expr ?x`) solutions for join-expressible
+/// expressions: ONE multi-way join with an EqualityConstraint between
+/// the endpoints. The WCO sweep dies at the first empty join level,
+/// so e.g. `?x (P/P/P/P/P/P) ?x` over an acyclic predicate costs
+/// milliseconds — candidate filtering pays per-candidate join setup
+/// across millions of candidates for the same empty answer.
+fn eval_selfloop_join(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+    match expr {
+        PathExpr::Union(l, r) => {
+            let mut out = eval_selfloop_join(set, l);
+            out.extend(eval_selfloop_join(set, r));
+            out
+        }
+        chain => {
+            let mut ctx = VariableContext::new();
+            let start_var = ctx.next_variable::<GenId>();
+            let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+            let dest_var = chain.build_constraint(set, &mut ctx, start_var, &mut constraints);
+            constraints.push(Box::new(
+                crate::query::equalityconstraint::EqualityConstraint::new(
+                    start_var.index,
+                    dest_var.index,
+                ),
+            ));
+            let constraint = IntersectionConstraint::new(constraints);
+            let idx = start_var.index;
+            Query::new(constraint, move |binding: &Binding| {
+                binding.get(idx).copied()
+            })
+            .collect()
+        }
+    }
+}
+
 /// Is `term` a term of the graph in the SPARQL 1.1 §17.5 NODES(D)
 /// sense — does it occur as the value of any trible, or (for
 /// entity-shaped terms) as the subject of any trible? Two PATCH
@@ -820,7 +1018,29 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         // self-loop via the path, rather than the cross-product
         // of all reachable (start, end) pairs.
         if self.start == self.end && variable == self.start {
-            let candidates = self.all_terms();
+            // Tier 1 (Karalis: use the multi-way join): a self-loop
+            // over a join-expressible expression is one WCO join with
+            // an endpoint-equality constraint. No candidate
+            // enumeration; the join dies at the first empty level.
+            if is_selfloop_joinable(&self.expr) {
+                // Pure chains are never nullable, and every join
+                // solution is witnessed by real tribles — no
+                // zero-length-path gate needed.
+                proposals.extend(eval_selfloop_join(&self.set, &self.expr));
+                return;
+            }
+            // Tier 2: candidate filtering, with the candidate set
+            // restricted for non-nullable expressions — a self-loop
+            // must both LEAVE the node (FIRST step) and RE-ENTER it
+            // (LAST step = FIRST of the inverse), so intersect the
+            // two seed sets instead of enumerating all_terms().
+            let candidates: Vec<RawInline> = if nullable(&self.expr) {
+                self.all_terms()
+            } else {
+                let firsts = first_step_seeds(&self.set, &self.expr);
+                let lasts = first_step_seeds(&self.set, &self.inverse_expr);
+                firsts.intersection(&lasts).copied().collect()
+            };
             proposals.extend(
                 candidates
                     .into_iter()
@@ -868,7 +1088,21 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }
         if variable == self.start || variable == self.end {
-            proposals.extend(self.all_terms());
+            // Both endpoints free. Nullable expressions admit every
+            // graph term (the zero-length path), so the term universe
+            // is the candidate set. Non-nullable expressions can only
+            // start at terms able to take a FIRST step (and only end
+            // at terms able to take a LAST one) — Karalis et al.'s
+            // EvalRPQ_VV seed restriction, generalised from "first
+            // IRI of a + expression" to the FIRST set of any
+            // expression.
+            if nullable(&self.expr) {
+                proposals.extend(self.all_terms());
+            } else if variable == self.start {
+                proposals.extend(first_step_seeds(&self.set, &self.expr));
+            } else {
+                proposals.extend(first_step_seeds(&self.set, &self.inverse_expr));
+            }
         }
     }
 
@@ -883,11 +1117,23 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             if let Some(end_val) = binding.get(self.end) {
                 let end_val = *end_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, &end_val));
+            } else if !nullable(&self.expr) {
+                // End unbound: a non-nullable path from `v` exists
+                // only if `v` can take a FIRST step — one prefix
+                // probe per FIRST entry. Exact (necessary condition
+                // for ∃ end), and prunes join candidates early.
+                let mut steps = Vec::new();
+                first_steps(&self.expr, &mut steps);
+                proposals.retain(|v| can_take_first_step(&self.set, &steps, v));
             }
         } else if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 let start_val = *start_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, &start_val, v));
+            } else if !nullable(&self.expr) {
+                let mut steps = Vec::new();
+                first_steps(&self.inverse_expr, &mut steps);
+                proposals.retain(|v| can_take_first_step(&self.set, &steps, v));
             }
         }
     }
