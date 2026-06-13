@@ -185,6 +185,64 @@ fn lazy_read_lands_in_cache_not_durable() {
     });
 }
 
+/// A bounded cache evicts under read pressure, and the evicted blob is
+/// re-fetchable. B caches at most 2 blobs; after lazily reading 3, the
+/// oldest is gone from the local union (a miss) but the swarm still
+/// serves it on demand — "caches are free, eviction is always safe".
+#[test]
+fn lazy_cache_evicts_under_pressure_and_refetches() {
+    let _g = sim_guard();
+    run_paused(0xBEEF, async {
+        let net = SimNet::new(0xBEEF, SimConfig::default());
+        let root = key(0xF3);
+        let ka = key(0xA3);
+        let kb = key(0xB3);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        // A holds three content blobs; B caches at most two.
+        let blobs: Vec<(Blob<SimpleArchive>, [u8; 32])> =
+            (0..3u8).map(|i| content_blob(0x60 + i)).collect();
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        for (b, _) in &blobs {
+            store_a.put::<SimpleArchive, _>(b.clone()).unwrap();
+        }
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 2, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        // Lazily read all three, in order.
+        for (_, hash) in &blobs {
+            let rx = peer_b.request_blob(*hash);
+            let got = drive_until(&rx, || peer_a.refresh(), 120)
+                .await
+                .expect("swarm must serve each blob");
+            peer_b.land_in_cache(got.into());
+        }
+
+        // Capacity held: the first (oldest) evicted, the last two resident.
+        assert_eq!(peer_b.cache_len(), 2, "cache bounded to capacity");
+        assert!(peer_b.try_local(blobs[0].1).is_none(), "oldest evicted from the union");
+        assert!(peer_b.try_local(blobs[1].1).is_some(), "second still cached");
+        assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still cached");
+
+        // The evicted blob is re-fetchable from the swarm.
+        let rx = peer_b.request_blob(blobs[0].1);
+        let refetched = drive_until(&rx, || peer_a.refresh(), 120)
+            .await
+            .expect("evicted blob re-fetchable — caches are free");
+        assert_eq!(blake3::hash(&refetched).as_bytes(), &blobs[0].1);
+    });
+}
+
 /// Black-hole DHT, no other holder: the fetch resolves to `None`
 /// (Unavailable) — it must complete, not hang.
 #[test]
