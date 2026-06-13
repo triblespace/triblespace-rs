@@ -239,6 +239,43 @@ impl NetSender {
         let boxed: Box<dyn AnySnapshot> = Box::new(snapshot);
         *self.snapshot.lock().unwrap() = Some(boxed);
     }
+
+    /// Issue a swarm-addressed on-demand blob fetch WITHOUT blocking.
+    /// Returns the reply receiver; the host fills it (with `Some(bytes)`
+    /// or `None`) once resolution completes. The caller decides how to
+    /// wait — [`fetch_blob`](Self::fetch_blob) blocks on it with a
+    /// deadline (production); deterministic-sim drivers step the sim
+    /// and `try_recv` (so the single host thread isn't frozen by a
+    /// blocking caller).
+    pub fn request_blob(
+        &self,
+        hash: RawHash,
+    ) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        // If the send fails (host gone), the reply channel is dropped
+        // and the caller's recv yields Disconnected → treated as None.
+        let _ = self.cmd_tx.send(NetCommand::FetchBlob { hash, reply });
+        rx
+    }
+
+    /// Swarm-addressed on-demand blob fetch (lazy read-miss path).
+    /// Sends `FetchBlob` to the host and blocks on the reply up to
+    /// `deadline`. Returns the verified bytes, or `None` for
+    /// Unavailable — whether because no provider had it, the deadline
+    /// fired, or the host thread is gone. Never hangs.
+    ///
+    /// Synchronous by design: the caller is a sync store reader. The
+    /// concurrency (provider fan-out) happens inside the host thread;
+    /// this side just waits. (Precedent: the pre-May `Fetch` blocked
+    /// the same way; ObjectStoreRemote does blocking network IO inside
+    /// BlobStoreGet.)
+    pub fn fetch_blob(
+        &self,
+        hash: RawHash,
+        deadline: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        self.request_blob(hash).recv_timeout(deadline).ok().flatten()
+    }
 }
 
 // ── Incoming half ────────────────────────────────────────────────────
@@ -625,6 +662,31 @@ async fn host_loop<T: Transport>(
                             }
                         }
                         conn.close(0, b"ok");
+                    });
+                }
+                NetCommand::FetchBlob { hash, reply } => {
+                    // Lazy read-miss: resolve providers via the DHT
+                    // (publisher_id = my_id routes providers_for to
+                    // the DHT-only path — no peer named), fetch,
+                    // verify content hash, reply. Spawned so a slow
+                    // fetch doesn't stall the command loop; the
+                    // caller blocks on `reply` with its own deadline.
+                    let t_for_fetch = transport.clone();
+                    let pool_for_fetch = conn_pool.clone();
+                    let self_cap2 = self_cap;
+                    tokio::spawn(async move {
+                        let bytes = fetch_one(
+                            &t_for_fetch,
+                            &hash,
+                            &pool_for_fetch,
+                            my_id,
+                            &self_cap2,
+                        )
+                        .await
+                        .filter(|data| blake3::hash(data).as_bytes() == &hash);
+                        // Reply may fail if the caller already gave up
+                        // (its deadline fired) — fine, just drop.
+                        let _ = reply.send(bytes);
                     });
                 }
             }

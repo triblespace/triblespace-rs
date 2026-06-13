@@ -53,6 +53,26 @@ pub enum NetCommand {
         cap_bytes: Bytes,
         sig_bytes: Bytes,
     },
+    /// Swarm-addressed on-demand blob fetch — the lazy-replication
+    /// read-miss path. The caller (a `PeerReader` whose local stores
+    /// missed) hands a content hash and a reply channel; the host
+    /// resolves providers via the DHT (no peer is named — this is
+    /// NOT the pre-May peer-targeted `Fetch`, it is `get(hash)`
+    /// asking "whoever holds it"), fetches, verifies `blake3(bytes)
+    /// == hash`, and sends the bytes (or `None` if unavailable after
+    /// the deadline) back on `reply`.
+    ///
+    /// This is the one request-reply command — `NetCommand` is
+    /// otherwise fire-and-forget — and it reuses the exact shape the
+    /// removed `NetCommand::Fetch` had (std-mpsc reply over the same
+    /// sender/host split), so the mechanism is proven. The reply
+    /// being `None` (rather than the channel dropping) is the clean
+    /// "Unavailable" the read API surfaces; a dropped channel (host
+    /// gone) the caller also treats as Unavailable, never a hang.
+    FetchBlob {
+        hash: RawHash,
+        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    },
 }
 
 /// Events received from the network thread.

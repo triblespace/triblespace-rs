@@ -231,6 +231,32 @@ where
         self.sender.id()
     }
 
+    /// Swarm-addressed on-demand blob fetch — the lazy-replication
+    /// read-miss primitive. Blocks (up to `deadline`) on a swarm
+    /// fetch of `hash` from whoever the DHT says holds it; returns
+    /// verified bytes or `None` (Unavailable). Does NOT persist the
+    /// result anywhere — that is the caller's policy choice (cache
+    /// tier vs pin). See [`PeerReader`] for the read-path wiring that
+    /// uses this on a local miss.
+    pub fn fetch_blob(
+        &self,
+        hash: RawHash,
+        deadline: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        self.sender.fetch_blob(hash, deadline)
+    }
+
+    /// Non-blocking variant of [`fetch_blob`](Self::fetch_blob):
+    /// issue the swarm fetch and return its reply receiver. Used by
+    /// deterministic-sim drivers (step + `try_recv`) and by any caller
+    /// that wants to overlap the fetch with other work.
+    pub fn request_blob(
+        &self,
+        hash: RawHash,
+    ) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
+        self.sender.request_blob(hash)
+    }
+
     /// Reconcile this peer with the latest external state.
     ///
     /// Two phases:
