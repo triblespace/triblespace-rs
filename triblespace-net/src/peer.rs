@@ -22,26 +22,35 @@
 //! is asked of the team, via the topic, not of any individual peer.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::{BlobEncoding, IntoBlob};
+use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreList, BlobStorePut, PinStore, PushResult,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 
+use crate::cache::NullCache;
 use crate::channel::{NetEvent, PublisherKey};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
 pub use crate::host::{PeerConfig, SyncDirection};
+
+/// The cache tier's reader. Both [`NullCache`](crate::cache::NullCache)
+/// and [`BoundedBlobStore`](crate::cache::BoundedBlobStore) expose
+/// `MemoryBlobStore`'s snapshot reader, so the read-path union
+/// ([`PeerReader`]) can name it concretely instead of threading a
+/// second reader type parameter through every bound.
+type CacheReader = <triblespace_core::blob::MemoryBlobStore as BlobStore>::Reader;
 
 /// A store wrapped in distributed network sync.
 ///
@@ -84,11 +93,21 @@ pub use crate::host::{PeerConfig, SyncDirection};
 /// // any other triblespace storage.
 /// drop(peer);
 /// ```
-pub struct Peer<S>
+pub struct Peer<S, C = NullCache>
 where
     S: BlobStore + BlobStorePut + PinStore,
+    C: BlobStore<Reader = CacheReader> + BlobStorePut,
 {
     store: S,
+
+    /// Cache tier: where read-miss swarm fetches land
+    /// ([`get_or_fetch`](Peer::get_or_fetch)). Checked *after* `store`
+    /// (Durable) on every read, and never pinned — eviction is always
+    /// safe ("pins are promises, caches are free"). `NullCache` by
+    /// default, which makes a `Peer<S>` behave exactly as before: eager
+    /// history, no content cache. See [`crate::cache`].
+    cache: C,
+
     sender: NetSender,
     receiver: NetReceiver,
 
@@ -133,28 +152,40 @@ where
     last_dispatch_attempt: HashMap<Id, crate::clock::Mono>,
 }
 
-impl<S> Peer<S>
+impl<S> Peer<S, NullCache>
 where
     S: BlobStore + BlobStorePut + PinStore,
 {
-    /// Wrap a store in a Peer. Spawns the iroh network thread internally.
+    /// Wrap a store in a Peer with no cache tier — eager history only,
+    /// today's behavior. Spawns the iroh network thread internally.
     ///
     /// The thread lives for the Peer's lifetime and shuts down when the
-    /// Peer drops.
+    /// Peer drops. For a node that lazily caches swarm-fetched content
+    /// in a bounded tier, use [`Peer::with_cache`].
     pub fn new(store: S, key: SigningKey, config: PeerConfig) -> Self {
         let direction = config.direction;
         let team_root = config.team_root;
         let signing_key = key.clone();
         let (sender, receiver) = host::spawn(key, config);
-        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+        Self::assemble(
+            store,
+            NullCache::new(),
+            sender,
+            receiver,
+            direction,
+            team_root,
+            signing_key,
+        )
     }
 
-    /// Wrap a store in a Peer over caller-provided channel halves —
-    /// the host loop runs wherever the caller put it (deterministic
-    /// simulation: a local task on a shared paused runtime) instead
-    /// of on an internally-spawned thread.
+    /// Wrap a store in a Peer (no cache tier) over caller-provided
+    /// channel halves — the host loop runs wherever the caller put it
+    /// (deterministic simulation: a local task on a shared paused
+    /// runtime) instead of on an internally-spawned thread.
     ///
-    /// Pair with [`crate::host::wire`] + [`crate::host::run_host`].
+    /// Pair with [`crate::host::wire`] + [`crate::host::run_host`]. For
+    /// a cached peer over caller-provided wiring, use
+    /// [`Peer::with_wiring_and_cache`].
     pub fn with_wiring(
         store: S,
         signing_key: SigningKey,
@@ -163,11 +194,71 @@ where
         sender: host::NetSender,
         receiver: host::NetReceiver,
     ) -> Self {
-        Self::assemble(store, sender, receiver, direction, team_root, signing_key)
+        Self::assemble(
+            store,
+            NullCache::new(),
+            sender,
+            receiver,
+            direction,
+            team_root,
+            signing_key,
+        )
+    }
+}
+
+impl<S, C> Peer<S, C>
+where
+    S: BlobStore + BlobStorePut + PinStore,
+    C: BlobStore<Reader = CacheReader> + BlobStorePut,
+{
+    /// Wrap a store in a Peer with an explicit cache tier (e.g. a
+    /// [`BoundedBlobStore`](crate::cache::BoundedBlobStore)). Read-miss
+    /// swarm fetches via [`get_or_fetch`](Self::get_or_fetch) land in
+    /// `cache`, never in the Durable store. Spawns the iroh network
+    /// thread internally.
+    pub fn with_cache(store: S, cache: C, key: SigningKey, config: PeerConfig) -> Self {
+        let direction = config.direction;
+        let team_root = config.team_root;
+        let signing_key = key.clone();
+        let (sender, receiver) = host::spawn(key, config);
+        Self::assemble(
+            store,
+            cache,
+            sender,
+            receiver,
+            direction,
+            team_root,
+            signing_key,
+        )
+    }
+
+    /// Cached peer over caller-provided channel halves — the
+    /// deterministic-simulation constructor for a two-tier node. See
+    /// [`Self::with_wiring`] for the no-cache form and the wiring
+    /// contract.
+    pub fn with_wiring_and_cache(
+        store: S,
+        cache: C,
+        signing_key: SigningKey,
+        direction: SyncDirection,
+        team_root: ed25519_dalek::VerifyingKey,
+        sender: host::NetSender,
+        receiver: host::NetReceiver,
+    ) -> Self {
+        Self::assemble(
+            store,
+            cache,
+            sender,
+            receiver,
+            direction,
+            team_root,
+            signing_key,
+        )
     }
 
     fn assemble(
         mut store: S,
+        cache: C,
         sender: host::NetSender,
         receiver: host::NetReceiver,
         direction: SyncDirection,
@@ -189,6 +280,7 @@ where
         // ever being announced).
         let mut peer = Peer {
             store,
+            cache,
             sender,
             receiver,
             last_blob_reader: None,
@@ -876,11 +968,78 @@ where
     }
 
     /// Consume the Peer and return the underlying store. The network
-    /// thread shuts down when the Peer drops.
+    /// thread shuts down when the Peer drops. The cache tier is dropped
+    /// — its contents are transient and re-fetchable by construction.
     pub fn into_store(self) -> S {
         self.store
     }
+
+    /// Read `hash` from local tiers only (Durable, then Cache) without
+    /// touching the swarm. `Some(bytes)` on a local hit, `None` on a
+    /// local miss — this is the cheap, non-blocking half of the read
+    /// path, safe to call speculatively (e.g. the conservative
+    /// reference scan asking "do I already hold this?"). Calls
+    /// [`refresh`](Self::refresh) first so freshly-gossiped blobs count
+    /// as local.
+    pub fn try_local(&mut self, hash: RawHash) -> Option<Bytes> {
+        let reader = self.reader().ok()?;
+        reader.get::<Bytes, UnknownBlob>(Inline::new(hash)).ok()
+    }
+
+    /// Land swarm-fetched `bytes` into the Cache tier (never Durable).
+    /// Caches are free and eviction is always safe, so this never needs
+    /// the pin machinery. Returns the content handle. Used by
+    /// [`get_or_fetch`](Self::get_or_fetch) and by deterministic-sim
+    /// drivers that obtained the bytes through the non-blocking
+    /// [`request_blob`](Self::request_blob).
+    pub fn land_in_cache(&mut self, bytes: Bytes) -> Inline<Handle<UnknownBlob>> {
+        // Cache put is `Infallible` for the in-memory tiers we ship
+        // (`NullCache`, `BoundedBlobStore`); `expect` documents that.
+        self.cache
+            .put::<UnknownBlob, Bytes>(bytes)
+            .expect("cache put is infallible (MemoryBlobStore-backed)")
+    }
+
+    /// Number of blobs currently resident in the Cache tier. Diagnostic
+    /// / test hook — Durable holdings are not counted.
+    pub fn cache_len(&mut self) -> usize {
+        self.cache
+            .reader()
+            .ok()
+            .map(|r| r.blobs().filter(Result::is_ok).count())
+            .unwrap_or(0)
+    }
+
+    /// Lazy read: return `hash`'s bytes, fetching from the swarm and
+    /// landing into the Cache tier on a local miss.
+    ///
+    /// 1. **Local** — Durable then Cache (via [`try_local`](Self::try_local)).
+    ///    Hit ⇒ return immediately, no network.
+    /// 2. **Swarm** — a swarm-addressed [`fetch_blob`](Self::fetch_blob)
+    ///    (DHT-routed, hash-verified). The fetched bytes land in the
+    ///    Cache (not Durable — durability is a separate pin decision),
+    ///    so the next read is a local hit until eviction.
+    ///
+    /// `None` is *Unavailable*: nobody reachable holds it before
+    /// `deadline`. Existence is semidecidable — there is no
+    /// "definitely absent" outcome, only "not obtained in time".
+    ///
+    /// Blocks the calling thread on the swarm fetch, so it must NOT be
+    /// called on the single-threaded paused-time simulation runtime
+    /// (it would freeze the host that produces the reply). Sim drivers
+    /// compose the steppable pieces instead: [`request_blob`](Self::request_blob)
+    /// + [`land_in_cache`](Self::land_in_cache).
+    pub fn get_or_fetch(&mut self, hash: RawHash, deadline: Duration) -> Option<Bytes> {
+        if let Some(bytes) = self.try_local(hash) {
+            return Some(bytes);
+        }
+        let raw = self.fetch_blob(hash, deadline)?;
+        let bytes = Bytes::from(raw);
+        self.land_in_cache(bytes.clone());
+        Some(bytes)
+    }
 }
+
 
 // ── Trait delegations ───────────────────────────────────────────────
 //
@@ -891,9 +1050,10 @@ where
 // network thread, updating the diff baselines so refresh doesn't
 // double-announce.
 
-impl<S> BlobStorePut for Peer<S>
+impl<S, C> BlobStorePut for Peer<S, C>
 where
     S: BlobStore + BlobStorePut + PinStore,
+    C: BlobStore<Reader = CacheReader> + BlobStorePut,
 {
     type PutError = S::PutError;
 
@@ -920,27 +1080,37 @@ where
     }
 }
 
-impl<S> BlobStore for Peer<S>
+impl<S, C> BlobStore for Peer<S, C>
 where
     S: BlobStore + BlobStorePut + PinStore,
+    C: BlobStore<Reader = CacheReader> + BlobStorePut,
 {
-    type Reader = S::Reader;
+    type Reader = PeerReader<S::Reader>;
     type ReaderError = S::ReaderError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.refresh();
-        self.store.reader()
+        let durable = self.store.reader()?;
+        // The cache reader is `MemoryBlobStore`-backed, whose
+        // `ReaderError` is `Infallible` — snapshotting an in-memory
+        // PATCH cannot fail. `expect` documents that invariant.
+        let cache = self
+            .cache
+            .reader()
+            .expect("cache reader is infallible (MemoryBlobStore-backed)");
+        Ok(PeerReader { durable, cache })
     }
 }
 
-impl<S> PinStore for Peer<S>
+impl<S, C> PinStore for Peer<S, C>
 where
     S: BlobStore + BlobStorePut + PinStore,
+    C: BlobStore<Reader = CacheReader> + BlobStorePut,
 {
     type PinsError = S::PinsError;
     type HeadError = S::HeadError;
     type UpdateError = S::UpdateError;
-    type ListIter<'a> = S::ListIter<'a> where S: 'a;
+    type ListIter<'a> = S::ListIter<'a> where S: 'a, C: 'a;
 
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         self.refresh();
@@ -1036,4 +1206,85 @@ fn extract_scope_subgraph(
         }
     }
     result
+}
+
+/// The two-tier read view of a [`Peer`]: a Durable reader (`D`) over
+/// the pinned store, unioned with the [`Cache`](crate::cache) tier's
+/// `MemoryBlobStore`-backed reader.
+///
+/// Lookups fall through **Durable → Cache** (the order a lazy node
+/// should prefer: pinned-and-promised before transient). The union is
+/// *local only* — it does NOT reach the swarm. A read that wants to
+/// pull missing content from the swarm uses the explicit
+/// [`Peer::get_or_fetch`], keeping speculative gets (the conservative
+/// reference scan, `has_blob` checks) cheap and non-blocking. This is
+/// the decomplecting that makes "the layers above the blob substrate
+/// can do whatever fancy dance they like" hold: enumeration and
+/// existence stay local and total; only an explicit fetch is allowed
+/// to block.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerReader<D> {
+    durable: D,
+    cache: CacheReader,
+}
+
+impl<D> BlobStoreGet for PeerReader<D>
+where
+    D: BlobStoreGet + Clone + Send + PartialEq + Eq + 'static,
+{
+    // Report the Durable reader's error family. A Cache miss after a
+    // Durable miss yields the Durable error (a "not found" shape) — the
+    // two readers' error types don't unify, and Durable's is the
+    // authoritative "this isn't here" signal.
+    type GetError<E: std::error::Error + Send + Sync + 'static> = D::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        match self.durable.get::<T, S>(handle) {
+            Ok(value) => Ok(value),
+            // Durable miss → try Cache; on a Cache miss too, surface the
+            // Durable error.
+            Err(durable_err) => self.cache.get::<T, S>(handle).map_err(|_cache_err| durable_err),
+        }
+    }
+}
+
+impl<D> BlobStoreList for PeerReader<D>
+where
+    D: BlobStoreList + Clone + Send + PartialEq + Eq + 'static,
+{
+    type Iter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, D::Err>> where D: 'a;
+    type Err = D::Err;
+
+    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+        // Durable ∪ Cache. Collected eagerly so the two readers' iterator
+        // types unify into one concrete `vec::IntoIter`. The cache
+        // reader's list error is `Infallible`, so its `Err` arm is
+        // unreachable and gets dropped (the empty-`match` proves it).
+        let mut out: Vec<Result<Inline<Handle<UnknownBlob>>, D::Err>> =
+            self.durable.blobs().collect();
+        for entry in self.cache.blobs() {
+            match entry {
+                Ok(handle) => out.push(Ok(handle)),
+                Err(never) => match never {},
+            }
+        }
+        out.into_iter()
+    }
+}
+
+// Conservative reference discovery works through the fall-through
+// `get`: the default scan checks each 32-byte chunk against *both*
+// tiers, so a blob whose children live partly in Cache still resolves
+// its full local child set.
+impl<D> BlobChildren for PeerReader<D> where
+    D: BlobStoreGet + Clone + Send + PartialEq + Eq + 'static
+{
 }

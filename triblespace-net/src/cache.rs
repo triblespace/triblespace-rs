@@ -20,7 +20,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, MemoryBlobStore};
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
-use triblespace_core::repo::{BlobStore, BlobStoreKeep, BlobStorePut};
+use triblespace_core::repo::{BlobStore, BlobStorePut};
 
 use crate::protocol::RawHash;
 

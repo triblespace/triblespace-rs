@@ -118,6 +118,73 @@ fn fetch_blob_pulls_from_the_holder() {
     });
 }
 
+/// The full lazy-read invariant: a cached node B that does not hold a
+/// content blob fetches it from the swarm and lands it in its **Cache**
+/// tier — never the Durable store — after which the Durable∪Cache
+/// `PeerReader` serves it locally. This is "lazy replication" in one
+/// test: B reads content it never eagerly replicated, holds it only
+/// transiently, and a pin would be a separate decision.
+#[test]
+fn lazy_read_lands_in_cache_not_durable() {
+    let _g = sim_guard();
+    run_paused(0xCAFE, async {
+        let net = SimNet::new(0xCAFE, SimConfig::default());
+        let root = key(0xF2);
+        let ka = key(0xA2);
+        let kb = key(0xB2);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0x55);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        // B is a lazy node: a small bounded cache, no eager content.
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        // Settle the mesh so A's blobs are announced to the DHT.
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        // Precondition: B holds nothing locally and its cache is empty.
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+        assert_eq!(peer_b.cache_len(), 0, "precondition: B's cache is empty");
+
+        // Swarm-fetch (steppable form of get_or_fetch's miss path).
+        let rx = peer_b.request_blob(hash);
+        let got = drive_until(&rx, || peer_a.refresh(), 120)
+            .await
+            .expect("B must obtain the blob from the swarm");
+
+        // Land it exactly as get_or_fetch would.
+        peer_b.land_in_cache(got.clone().into());
+
+        // 1. The Durable∪Cache reader now serves it locally.
+        let local = peer_b.try_local(hash).expect("PeerReader union serves the cached blob");
+        assert_eq!(
+            blake3::hash(&local).as_bytes(),
+            &hash,
+            "served bytes hash to the content id"
+        );
+        // 2. It landed in the Cache tier...
+        assert_eq!(peer_b.cache_len(), 1, "blob resident in the cache tier");
+        // 3. ...and NOT in the Durable store (no eager persistence).
+        let durable_has = peer_b
+            .store_mut()
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, UnknownBlob>(Inline::new(hash))
+            .is_ok();
+        assert!(!durable_has, "lazy read must NOT persist to the Durable store");
+    });
+}
+
 /// Black-hole DHT, no other holder: the fetch resolves to `None`
 /// (Unavailable) — it must complete, not hang.
 #[test]
