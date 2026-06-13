@@ -1631,6 +1631,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Diagnostic: accumulate (branch nodes, total child-table slots,
+    /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
+    /// decompose a PATCH's *structural* byte size (vs resident RSS).
+    /// `branches` × `BRANCH_BASE_SIZE` + `slots` × 8 is the branch
+    /// allocation total; heap leaves add one `Leaf` node each.
+    pub(crate) fn node_stats(&self, acc: &mut (u64, u64, u64, u64)) {
+        match self.body_ref() {
+            BodyRef::Leaf(_) => acc.2 += 1,
+            BodyRef::LocalLeaf(_) => acc.3 += 1,
+            BodyRef::Branch(branch) => {
+                acc.0 += 1;
+                acc.1 += branch.child_table.len() as u64;
+                for child in branch.child_table.iter().flatten() {
+                    child.node_stats(acc);
+                }
+            }
+        }
+    }
+
     // NOTE: slot-level union wrapper removed; callers should take the slot and
     // call the owned helper `union` directly.
 
@@ -1961,6 +1980,19 @@ where
         } else {
             0
         }
+    }
+
+    /// Diagnostic structural census: returns
+    /// `(branch_nodes, child_table_slots, heap_leaf_nodes, local_leaf_slots)`.
+    /// Structural branch bytes ≈ `branches * BRANCH_BASE_SIZE + slots * 8`;
+    /// heap leaves add a `Leaf` node each (the key is shared across the six
+    /// orderings, so count it once per trible, not once per ordering).
+    pub fn node_stats(&self) -> (u64, u64, u64, u64) {
+        let mut acc = (0u64, 0u64, 0u64, 0u64);
+        if let Some(root) = &self.root {
+            root.node_stats(&mut acc);
+        }
+        acc
     }
 
     /// Returns true if the PATCH contains no keys.
