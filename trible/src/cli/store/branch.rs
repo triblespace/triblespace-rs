@@ -14,12 +14,13 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::List { url } => {
             use triblespace::prelude::PinStore;
+            use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
-            
+
             use url::Url;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             // Ensure remote listing is up-to-date when needed; callers can
             // refresh explicitly if they prefer.
             let iter = remote.pins()?;

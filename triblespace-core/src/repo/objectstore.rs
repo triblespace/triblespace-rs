@@ -3,13 +3,11 @@ use std::convert::Infallible;
 use std::convert::TryInto;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use anybytes::Bytes;
-use crossbeam_channel::{bounded, Receiver};
-use futures::Stream;
 use futures::StreamExt;
-use tokio::runtime::Runtime;
 
 use object_store::parse_url;
 use object_store::path::Path;
@@ -28,17 +26,17 @@ use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
-use crate::prelude::blobencodings::SimpleArchive;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::RawInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::prelude::blobencodings::SimpleArchive;
 
-use super::BlobStore;
-use super::BlobStoreGet;
-use super::BlobStoreList;
-use super::BlobStorePut;
-use super::PinStore;
+use super::async_store::{
+    AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPinStore,
+};
+use super::BlobMetadata;
 use super::PushResult;
 
 const BRANCH_INFIX: &str = "branches";
@@ -46,12 +44,31 @@ const BLOB_INFIX: &str = "blobs";
 
 /// Repository backed by an [`object_store`] compatible storage backend.
 ///
-/// All data is stored in an external service (e.g. S3, local filesystem) via
-/// the `object_store` crate.
+/// All data is stored in an external service (e.g. S3, local filesystem)
+/// via the `object_store` crate, which is async at its core — so this
+/// type is **async-native**: it implements the
+/// [`AsyncBlobStore`](super::async_store::AsyncBlobStore) family
+/// directly, awaiting each operation, with no owned runtime.
+///
+/// Synchronous callers wrap it in
+/// [`Blocking`](super::async_store::Blocking), which carries the single
+/// `block_on` boundary:
+///
+/// ```no_run
+/// # use url::Url;
+/// # use triblespace_core::repo::objectstore::ObjectStoreRemote;
+/// # use triblespace_core::repo::async_store::Blocking;
+/// # fn f(url: &Url) -> Result<(), Box<dyn std::error::Error>> {
+/// let remote = ObjectStoreRemote::with_url(url)?;
+/// let mut store = Blocking::new(remote)?; // now a plain sync BlobStore
+/// # let _ = &mut store;
+/// # Ok(())
+/// # }
+/// ```
 pub struct ObjectStoreRemote {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    rt: Arc<Runtime>,}
+}
 
 impl fmt::Debug for ObjectStoreRemote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -69,50 +86,12 @@ impl fmt::Debug for ObjectStoreReader {
     }
 }
 
-/// Read-only handle into an [`ObjectStoreRemote`] that can be cloned and shared.
+/// Read-only handle into an [`ObjectStoreRemote`] that can be cloned and
+/// shared.
 #[derive(Clone)]
 pub struct ObjectStoreReader {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
-    rt: Arc<Runtime>,}
-
-/// Iterator that bridges an async [`Stream`] into blocking iteration via a bounded channel.
-pub struct BlockingIter<T> {
-    rx: Receiver<T>,
-}
-
-impl<T> BlockingIter<T> {
-    fn from_stream<S>(handle: tokio::runtime::Handle, stream: S, capacity: usize) -> Self
-    where
-        S: Stream<Item = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = bounded(capacity);
-        let handle_for_spawn = handle.clone();
-        let handle_for_task = handle.clone();
-        handle_for_spawn.spawn(async move {
-            let mut s = Box::pin(stream);
-            let rt = handle_for_task;
-            while let Some(item) = s.next().await {
-                let tx_clone = tx.clone();
-                let bh = rt.clone();
-                // send on blocking pool to avoid blocking a runtime worker
-                match bh.spawn_blocking(move || tx_clone.send(item)).await {
-                    Ok(Ok(())) => {}
-                    _ => break,
-                }
-            }
-            // tx dropped here -> closes channel
-        });
-        BlockingIter { rx }
-    }
-}
-
-impl<T> Iterator for BlockingIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.rx.recv().ok()
-    }
 }
 
 impl PartialEq for ObjectStoreReader {
@@ -124,115 +103,118 @@ impl PartialEq for ObjectStoreReader {
 impl Eq for ObjectStoreReader {}
 
 impl ObjectStoreRemote {
-    /// Creates a repository pointing at the object store described by `url`.
+    /// Creates a repository pointing at the object store described by
+    /// `url`. The returned value is async-native — wrap it in
+    /// [`Blocking`](super::async_store::Blocking) for synchronous use.
     pub fn with_url(url: &Url) -> Result<ObjectStoreRemote, object_store::Error> {
         let (store, path) = parse_url(url)?;
         Ok(ObjectStoreRemote {
             store: Arc::from(store),
             prefix: path,
-            rt: Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .worker_threads(2)
-                    .build()
-                    .expect("build runtime"),
-            ),        })
+        })
     }
 }
 
-impl BlobStorePut for ObjectStoreRemote
-{
-
+impl AsyncBlobStorePut for ObjectStoreRemote {
     type PutError = object_store::Error;
 
-    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    fn put<S, T>(
+        &mut self,
+        item: T,
+    ) -> impl Future<Output = Result<Inline<Handle<S>>, Self::PutError>> + Send
     where
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
+        // Serialise + capture only Send primitives before the await (the
+        // phantom-typed handle is `!Send` when the schema is).
         let blob = item.to_blob();
-        let handle = blob.get_handle();
-        let path = self.prefix.child(BLOB_INFIX).child(hex::encode(handle.raw));
+        let raw = blob.get_handle().raw;
         let bytes: bytes::Bytes = blob.bytes.into();
-        let result = self.rt.block_on(async {
-            self.store
+        async move {
+            let path = self.prefix.child(BLOB_INFIX).child(hex::encode(raw));
+            let result = self
+                .store
                 .put_opts(&path, bytes.into(), PutMode::Create.into())
-                .await
-        });
-        match result {
-            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(handle),
-            Err(e) => Err(e),
+                .await;
+            match result {
+                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(Inline::new(raw)),
+                Err(e) => Err(e),
+            }
         }
     }
 }
 
-impl BlobStore for ObjectStoreRemote
-{
-
+impl AsyncBlobStore for ObjectStoreRemote {
     type Reader = ObjectStoreReader;
     type ReaderError = Infallible;
 
-    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        Ok(ObjectStoreReader {
+    fn reader(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+        let reader = ObjectStoreReader {
             store: self.store.clone(),
             prefix: self.prefix.clone(),
-            rt: self.rt.clone(),        })
+        };
+        async move { Ok(reader) }
     }
 }
 
-impl PinStore for ObjectStoreRemote
-{
-
+impl AsyncPinStore for ObjectStoreRemote {
     type PinsError = ListBranchesErr;
     type HeadError = PullBranchErr;
     type UpdateError = PushBranchErr;
 
-    type ListIter<'a> = BlockingIter<Result<Id, Self::PinsError>>;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        let prefix = self.prefix.child(BRANCH_INFIX);
-        let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
-            match r {
-                Ok(meta) if meta.size == 0 => None, // tombstoned branch (0-byte object)
-                Ok(meta) => {
-                    let name = match meta.location.filename() {
-                        Some(name) => name,
-                        None => return Some(Err(ListBranchesErr::NotAFile("no filename"))),
-                    };
-                    let digest = match RawId::from_hex(name) {
-                        Ok(digest) => digest,
-                        Err(e) => return Some(Err(ListBranchesErr::BadNameHex(e))),
-                    };
-                    let Some(id) = Id::new(digest) else {
-                        return Some(Err(ListBranchesErr::BadId));
-                    };
-                    Some(Ok(id))
+    fn pins(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
+    {
+        async move {
+            let prefix = self.prefix.child(BRANCH_INFIX);
+            let stream = self.store.list(Some(&prefix)).filter_map(|r| async move {
+                match r {
+                    Ok(meta) if meta.size == 0 => None, // tombstoned branch (0-byte object)
+                    Ok(meta) => {
+                        let name = match meta.location.filename() {
+                            Some(name) => name,
+                            None => return Some(Err(ListBranchesErr::NotAFile("no filename"))),
+                        };
+                        let digest = match RawId::from_hex(name) {
+                            Ok(digest) => digest,
+                            Err(e) => return Some(Err(ListBranchesErr::BadNameHex(e))),
+                        };
+                        let Some(id) = Id::new(digest) else {
+                            return Some(Err(ListBranchesErr::BadId));
+                        };
+                        Some(Ok(id))
+                    }
+                    Err(e) => Some(Err(ListBranchesErr::List(e))),
                 }
-                Err(e) => Some(Err(ListBranchesErr::List(e))),
-            }
-        });
-        Ok(BlockingIter::from_stream(
-            self.rt.handle().clone(),
-            stream,
-            16,
-        ))
+            });
+            Ok(stream.collect().await)
+        }
     }
 
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-        let result = self.rt.block_on(async { self.store.get(&path).await });
-        match result {
-            Ok(object) => {
-                let bytes = self.rt.block_on(object.bytes())?;
-                if bytes.is_empty() {
-                    return Ok(None);
+    fn head(
+        &mut self,
+        id: Id,
+    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
+    {
+        async move {
+            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
+            match self.store.get(&path).await {
+                Ok(object) => {
+                    let bytes = object.bytes().await?;
+                    if bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    let value = (&bytes[..]).try_into()?;
+                    Ok(Some(Inline::new(value)))
                 }
-                let value = (&bytes[..]).try_into()?;
-                Ok(Some(Inline::new(value)))
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(PullBranchErr::StoreErr(e)),
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(PullBranchErr::StoreErr(e)),
         }
     }
 
@@ -241,116 +223,142 @@ impl PinStore for ObjectStoreRemote
         id: Id,
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
-        // We encode "deleted branch" as an empty object. This lets us preserve
-        // CAS semantics for delete via conditional PUT (PutMode::Update), since
-        // `object_store` does not currently expose conditional delete.
-        //
-        // TODO: Once `object_store` supports conditional delete, migrate away
-        // from 0-byte tombstones and treat empty objects as corruption.
-        let new_bytes = match new {
-            Some(new) => bytes::Bytes::copy_from_slice(&new.raw),
-            None => bytes::Bytes::new(),
-        };
+    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
+        async move {
+            let path = self.prefix.child(BRANCH_INFIX).child(hex::encode(id));
+            // We encode "deleted branch" as an empty object. This lets us
+            // preserve CAS semantics for delete via conditional PUT
+            // (PutMode::Update), since `object_store` does not currently
+            // expose conditional delete.
+            //
+            // TODO: Once `object_store` supports conditional delete,
+            // migrate away from 0-byte tombstones and treat empty objects
+            // as corruption.
+            let new_bytes = match new {
+                Some(new) => bytes::Bytes::copy_from_slice(&new.raw),
+                None => bytes::Bytes::new(),
+            };
 
-        let parse_branch = |bytes: &bytes::Bytes| -> Result<
-            Option<Inline<Handle<SimpleArchive>>>,
-            TryFromSliceError,
-        > {
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            let value = (&bytes[..]).try_into()?;
-            Ok(Some(Inline::new(value)))
-        };
+            let parse_branch = |bytes: &bytes::Bytes| -> Result<
+                Option<Inline<Handle<SimpleArchive>>>,
+                TryFromSliceError,
+            > {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                let value = (&bytes[..]).try_into()?;
+                Ok(Some(Inline::new(value)))
+            };
 
-        if let Some(old_hash) = old {
-            let mut result = self.rt.block_on(async { self.store.get(&path).await });
-            loop {
-                match result {
-                    Ok(obj) => {
-                        let version = UpdateVersion {
-                            e_tag: obj.meta.e_tag.clone(),
-                            version: obj.meta.version.clone(),
-                        };
-                        let stored_bytes = self.rt.block_on(obj.bytes())?;
-                        let stored_hash = parse_branch(&stored_bytes)?;
-                        if stored_hash != Some(old_hash) {
-                            return Ok(PushResult::Conflict(stored_hash));
-                        }
-                        match self.rt.block_on(async {
-                            self.store
+            if let Some(old_hash) = old {
+                let mut result = self.store.get(&path).await;
+                loop {
+                    match result {
+                        Ok(obj) => {
+                            let version = UpdateVersion {
+                                e_tag: obj.meta.e_tag.clone(),
+                                version: obj.meta.version.clone(),
+                            };
+                            let stored_bytes = obj.bytes().await?;
+                            let stored_hash = parse_branch(&stored_bytes)?;
+                            if stored_hash != Some(old_hash) {
+                                return Ok(PushResult::Conflict(stored_hash));
+                            }
+                            match self
+                                .store
                                 .put_opts(
                                     &path,
                                     new_bytes.clone().into(),
                                     PutMode::Update(version).into(),
                                 )
                                 .await
-                        }) {
-                            Ok(_) => return Ok(PushResult::Success()),
-                            Err(object_store::Error::Precondition { .. }) => {
-                                result = self.rt.block_on(async { self.store.get(&path).await });
-                                continue;
+                            {
+                                Ok(_) => return Ok(PushResult::Success()),
+                                Err(object_store::Error::Precondition { .. }) => {
+                                    result = self.store.get(&path).await;
+                                    continue;
+                                }
+                                Err(e) => return Err(PushBranchErr::StoreErr(e)),
                             }
-                            Err(e) => return Err(PushBranchErr::StoreErr(e)),
                         }
+                        Err(object_store::Error::NotFound { .. }) => {
+                            return Ok(PushResult::Conflict(None))
+                        }
+                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
                     }
-                    Err(object_store::Error::NotFound { .. }) => {
-                        return Ok(PushResult::Conflict(None))
-                    }
-                    Err(e) => return Err(PushBranchErr::StoreErr(e)),
                 }
-            }
-        } else {
-            loop {
-                match self.rt.block_on(async {
-                    self.store
+            } else {
+                loop {
+                    match self
+                        .store
                         .put_opts(&path, new_bytes.clone().into(), PutMode::Create.into())
                         .await
-                }) {
-                    Ok(_) => return Ok(PushResult::Success()),
-                    Err(object_store::Error::AlreadyExists { .. }) => {
-                        let mut result = self.rt.block_on(async { self.store.get(&path).await });
-                        loop {
-                            match result {
-                                Ok(obj) => {
-                                    let version = UpdateVersion {
-                                        e_tag: obj.meta.e_tag.clone(),
-                                        version: obj.meta.version.clone(),
-                                    };
-                                    let stored_bytes = self.rt.block_on(obj.bytes())?;
-                                    let stored_hash = parse_branch(&stored_bytes)?;
-                                    if stored_hash.is_some() {
-                                        return Ok(PushResult::Conflict(stored_hash));
-                                    }
-                                    match self.rt.block_on(async {
-                                        self.store
+                    {
+                        Ok(_) => return Ok(PushResult::Success()),
+                        Err(object_store::Error::AlreadyExists { .. }) => {
+                            let mut result = self.store.get(&path).await;
+                            loop {
+                                match result {
+                                    Ok(obj) => {
+                                        let version = UpdateVersion {
+                                            e_tag: obj.meta.e_tag.clone(),
+                                            version: obj.meta.version.clone(),
+                                        };
+                                        let stored_bytes = obj.bytes().await?;
+                                        let stored_hash = parse_branch(&stored_bytes)?;
+                                        if stored_hash.is_some() {
+                                            return Ok(PushResult::Conflict(stored_hash));
+                                        }
+                                        match self
+                                            .store
                                             .put_opts(
                                                 &path,
                                                 new_bytes.clone().into(),
                                                 PutMode::Update(version).into(),
                                             )
                                             .await
-                                    }) {
-                                        Ok(_) => return Ok(PushResult::Success()),
-                                        Err(object_store::Error::Precondition { .. }) => {
-                                            result = self
-                                                .rt
-                                                .block_on(async { self.store.get(&path).await });
-                                            continue;
+                                        {
+                                            Ok(_) => return Ok(PushResult::Success()),
+                                            Err(object_store::Error::Precondition { .. }) => {
+                                                result = self.store.get(&path).await;
+                                                continue;
+                                            }
+                                            Err(e) => return Err(PushBranchErr::StoreErr(e)),
                                         }
-                                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
                                     }
+                                    // raced with delete; retry create
+                                    Err(object_store::Error::NotFound { .. }) => break,
+                                    Err(e) => return Err(PushBranchErr::StoreErr(e)),
                                 }
-                                Err(object_store::Error::NotFound { .. }) => break, // raced with delete; retry create
-                                Err(e) => return Err(PushBranchErr::StoreErr(e)),
                             }
+                            continue;
                         }
-                        continue;
+                        Err(e) => return Err(PushBranchErr::StoreErr(e)),
                     }
-                    Err(e) => return Err(PushBranchErr::StoreErr(e)),
                 }
+            }
+        }
+    }
+}
+
+impl AsyncBlobStoreForget for ObjectStoreRemote {
+    type ForgetError = object_store::Error;
+
+    fn forget<S>(
+        &mut self,
+        handle: Inline<Handle<S>>,
+    ) -> impl Future<Output = Result<(), Self::ForgetError>> + Send
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        let raw = handle.raw;
+        async move {
+            let path = self.prefix.child(BLOB_INFIX).child(hex::encode(raw));
+            match self.store.delete(&path).await {
+                Ok(_) => Ok(()),
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
             }
         }
     }
@@ -371,26 +379,82 @@ impl ObjectStoreReader {
     }
 }
 
-impl BlobStoreList for ObjectStoreReader
-{
+impl AsyncBlobStoreGet for ObjectStoreReader {
+    type GetError<E: Error + Send + Sync + 'static> = GetBlobErr<E>;
 
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> impl Future<Output = Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>> + Send
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        let raw = handle.raw;
+        async move {
+            let path = self.blob_path(hex::encode(raw));
+            let object = self.store.get(&path).await?;
+            let bytes = object.bytes().await?;
+            let bytes: Bytes = bytes.into();
+            let blob: Blob<S> = Blob::new(bytes);
+            blob.try_from_blob().map_err(GetBlobErr::Conversion)
+        }
+    }
+}
+
+impl AsyncBlobStoreList for ObjectStoreReader {
     type Err = ListBlobsErr;
-    type Iter<'a> = BlockingIter<Result<Inline<Handle<UnknownBlob>>, Self::Err>>;
 
-    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
-        let prefix = self.prefix.child(BLOB_INFIX);
-        let stream = self.store.list(Some(&prefix)).map(|r| match r {
-            Ok(meta) => {
-                let blob_name = meta
-                    .location
-                    .filename()
-                    .ok_or(ListBlobsErr::NotAFile("no filename"))?;
-                let digest = RawInline::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
-                Ok(Inline::new(digest))
+    fn blobs(
+        &self,
+    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+        async move {
+            let prefix = self.prefix.child(BLOB_INFIX);
+            let stream = self.store.list(Some(&prefix)).map(|r| match r {
+                Ok(meta) => {
+                    let blob_name = meta
+                        .location
+                        .filename()
+                        .ok_or(ListBlobsErr::NotAFile("no filename"))?;
+                    let digest =
+                        RawInline::from_hex(blob_name).map_err(ListBlobsErr::BadNameHex)?;
+                    Ok(Inline::new(digest))
+                }
+                Err(e) => Err(ListBlobsErr::List(e)),
+            });
+            stream.collect().await
+        }
+    }
+}
+
+impl AsyncBlobStoreMeta for ObjectStoreReader {
+    type MetaError = object_store::Error;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> impl Future<Output = Result<Option<BlobMetadata>, Self::MetaError>> + Send
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        let raw = handle.raw;
+        async move {
+            let path = self.prefix.child(BLOB_INFIX).child(hex::encode(raw));
+            match self.store.head(&path).await {
+                Ok(meta) => {
+                    let ts = meta.last_modified.timestamp_millis() as u64;
+                    let len = meta.size;
+                    Ok(Some(BlobMetadata {
+                        timestamp: ts,
+                        length: len,
+                    }))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
             }
-            Err(e) => Err(ListBlobsErr::List(e)),
-        });
-        BlockingIter::from_stream(self.rt.handle().clone(), stream, 16)
+        }
     }
 }
 
@@ -427,29 +491,6 @@ impl<E: Error> From<object_store::Error> for GetBlobErr<E> {
     }
 }
 
-impl BlobStoreGet for ObjectStoreReader
-{
-
-    type GetError<E: Error + Send + Sync + 'static> = GetBlobErr<E>;
-
-    fn get<T, S>(
-        &self,
-        handle: Inline<Handle<S>>,
-    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
-    where
-        S: BlobEncoding + 'static,
-        T: TryFromBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        let path = self.blob_path(hex::encode(handle.raw));
-        let object = self.rt.block_on(async { self.store.get(&path).await })?;
-        let bytes = self.rt.block_on(object.bytes())?;
-        let bytes: Bytes = bytes.into();
-        let blob: Blob<S> = Blob::new(bytes);
-        blob.try_from_blob().map_err(GetBlobErr::Conversion)
-    }
-}
-
 /// Error returned when listing blobs from the object store.
 #[derive(Debug)]
 pub enum ListBlobsErr {
@@ -471,8 +512,6 @@ impl fmt::Display for ListBlobsErr {
     }
 }
 impl Error for ListBlobsErr {}
-
-impl super::BlobChildren for ObjectStoreReader {}
 
 /// Error returned when listing branches from the object store.
 #[derive(Debug)]
@@ -534,7 +573,8 @@ impl From<TryFromSliceError> for PullBranchErr {
 /// Error returned when updating a branch head in the object store.
 #[derive(Debug)]
 pub enum PushBranchErr {
-    /// The stored bytes could not be parsed as a valid handle during a compare-and-swap.
+    /// The stored bytes could not be parsed as a valid handle during a
+    /// compare-and-swap.
     ValidationErr(TryFromSliceError),
     /// The underlying object store operation failed.
     StoreErr(object_store::Error),
@@ -560,55 +600,5 @@ impl From<object_store::Error> for PushBranchErr {
 impl From<TryFromSliceError> for PushBranchErr {
     fn from(err: TryFromSliceError) -> Self {
         Self::ValidationErr(err)
-    }
-}
-
-impl crate::repo::BlobStoreMeta for ObjectStoreReader
-{
-
-    type MetaError = object_store::Error;
-
-    fn metadata<S>(
-        &self,
-        handle: Inline<Handle<S>>,
-    ) -> Result<Option<crate::repo::BlobMetadata>, Self::MetaError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle_hex = hex::encode(handle.raw);
-        let path = self.prefix.child(BLOB_INFIX).child(handle_hex);
-        match self.rt.block_on(async { self.store.head(&path).await }) {
-            Ok(meta) => {
-                let ts = meta.last_modified.timestamp_millis() as u64;
-                let len = meta.size;
-                Ok(Some(crate::repo::BlobMetadata {
-                    timestamp: ts,
-                    length: len,
-                }))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-}
-
-impl crate::repo::BlobStoreForget for ObjectStoreRemote
-{
-
-    type ForgetError = object_store::Error;
-
-    fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle_hex = hex::encode(handle.raw);
-        let path = self.prefix.child(BLOB_INFIX).child(handle_hex);
-        match self.rt.block_on(async { self.store.delete(&path).await }) {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e),
-        }
     }
 }

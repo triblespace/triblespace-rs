@@ -7,6 +7,7 @@ use crate::cli::util::parse_blob_handle;
 use object_store::parse_url;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Bytes;
+use triblespace_core::repo::async_store::Blocking;
 use triblespace_core::repo::objectstore::ObjectStoreRemote;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStoreForget;
@@ -63,7 +64,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Prefer the repo-managed blob listing. Do not fall back to raw
             // listing automatically — bare files were a bug, not a feature.
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let reader = remote
                 .reader()
                 .map_err(|e| anyhow::anyhow!("remote reader error: {e:?}"))?;
@@ -93,7 +94,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::inline::encodings::hash::Hash;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let file_handle = File::open(&file)?;
             let bytes = unsafe { Bytes::map_file(&file_handle)? };
             let handle = remote.put::<RawBytes, _>(bytes)?;
@@ -113,7 +114,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace::prelude::BlobStoreGet;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let hash_val = parse_blob_handle(&handle)?;
             let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                 hash_val.into();
@@ -132,7 +133,7 @@ pub fn run(cmd: Command) -> Result<()> {
             use triblespace_core::blob::Blob;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let hash_val = parse_blob_handle(&handle)?;
             let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =
                 hash_val.into();
@@ -173,7 +174,7 @@ pub fn run(cmd: Command) -> Result<()> {
         }
         Command::Forget { url, handle } => {
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let (_store, _path) = parse_url(&url)?;
             let hash_val = parse_blob_handle(&handle)?;
             let handle_val: triblespace_core::inline::Inline<Handle<UnknownBlob>> =

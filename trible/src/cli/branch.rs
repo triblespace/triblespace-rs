@@ -35,13 +35,14 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
         BranchCommand::Push { url, pile, branch } => {
             use triblespace_core::id::Id;
             use triblespace_core::repo;
+            use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
             
             use url::Url;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             let mut pile: Pile = Pile::open(&pile)?;
 
             let res = (|| -> Result<(), anyhow::Error> {
@@ -75,13 +76,14 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
         BranchCommand::Pull { url, pile, branch } => {
             use triblespace_core::id::Id;
             use triblespace_core::repo;
+            use triblespace_core::repo::async_store::Blocking;
             use triblespace_core::repo::objectstore::ObjectStoreRemote;
             use triblespace_core::repo::pile::Pile;
             
             use url::Url;
 
             let url = Url::parse(&url)?;
-            let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+            let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
             // Pile::open no longer auto-creates the file; if the target
             // is a fresh path, touch it first so the pull lands in a
             // valid empty pile.

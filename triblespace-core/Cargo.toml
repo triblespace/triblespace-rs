@@ -31,7 +31,6 @@ ed25519-dalek = {version = "2.1.0", features = ["rand_core"]}
 blake3 = "1.8.4"
 futures = { version = "0.3.30", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
-crossbeam-channel = "0.5"
 signature = "2.2.0"
 bytes = "1.6.0"
 serde_json = "1.0"

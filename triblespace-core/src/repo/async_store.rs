@@ -36,8 +36,12 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{
-    BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
+    BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
+    BlobStorePut, PinStore, PushResult,
 };
+// Only used by the `object-store`-gated `Blocking` impls below.
+#[cfg(feature = "object-store")]
+use crate::repo::{BlobChildren, StorageClose};
 
 /// Async counterpart of [`BlobStoreGet`](crate::repo::BlobStoreGet).
 ///
@@ -160,6 +164,36 @@ pub trait AsyncPinStore {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
+}
+
+/// Async counterpart of [`BlobStoreMeta`](crate::repo::BlobStoreMeta).
+pub trait AsyncBlobStoreMeta {
+    /// Error type for metadata calls.
+    type MetaError: Error + Send + Sync + 'static;
+
+    /// Metadata for the blob `handle`, or `None` if absent.
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> impl Future<Output = Result<Option<BlobMetadata>, Self::MetaError>> + Send
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
+}
+
+/// Async counterpart of [`BlobStoreForget`](crate::repo::BlobStoreForget).
+pub trait AsyncBlobStoreForget {
+    /// Error type for forget operations.
+    type ForgetError: Error + Send + Sync + 'static;
+
+    /// Drop the materialised blob `handle` (monotonic, idempotent).
+    fn forget<S>(
+        &mut self,
+        handle: Inline<Handle<S>>,
+    ) -> impl Future<Output = Result<(), Self::ForgetError>> + Send
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
 }
 
 /// Lift a synchronous store into the async traits via zero-await
@@ -304,6 +338,44 @@ where
     }
 }
 
+impl<S> AsyncBlobStoreMeta for SyncAsAsync<S>
+where
+    S: BlobStoreMeta + Sync,
+{
+    type MetaError = S::MetaError;
+
+    fn metadata<Sch>(
+        &self,
+        handle: Inline<Handle<Sch>>,
+    ) -> impl Future<Output = Result<Option<BlobMetadata>, Self::MetaError>> + Send
+    where
+        Sch: BlobEncoding + 'static,
+        Handle<Sch>: InlineEncoding,
+    {
+        let raw = handle.raw;
+        async move { self.0.metadata::<Sch>(Inline::new(raw)) }
+    }
+}
+
+impl<S> AsyncBlobStoreForget for SyncAsAsync<S>
+where
+    S: BlobStoreForget + Send,
+{
+    type ForgetError = S::ForgetError;
+
+    fn forget<Sch>(
+        &mut self,
+        handle: Inline<Handle<Sch>>,
+    ) -> impl Future<Output = Result<(), Self::ForgetError>> + Send
+    where
+        Sch: BlobEncoding + 'static,
+        Handle<Sch>: InlineEncoding,
+    {
+        let raw = handle.raw;
+        async move { self.0.forget::<Sch>(Inline::new(raw)) }
+    }
+}
+
 /// Drive an async store from synchronous code through a single
 /// `block_on` boundary.
 ///
@@ -332,6 +404,14 @@ impl<A: Clone> Clone for Blocking<A> {
             inner: self.inner.clone(),
             rt: self.rt.clone(),
         }
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: std::fmt::Debug> std::fmt::Debug for Blocking<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The runtime is a driver, not state — show only the inner store.
+        f.debug_struct("Blocking").field("inner", &self.inner).finish()
     }
 }
 
@@ -462,6 +542,52 @@ impl<A: AsyncPinStore> PinStore for Blocking<A> {
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.rt.block_on(self.inner.update(id, old, new))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStoreMeta> BlobStoreMeta for Blocking<A> {
+    type MetaError = A::MetaError;
+
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<BlobMetadata>, Self::MetaError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.rt.block_on(self.inner.metadata::<S>(handle))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStoreForget> BlobStoreForget for Blocking<A> {
+    type ForgetError = A::ForgetError;
+
+    fn forget<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::ForgetError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.rt.block_on(self.inner.forget::<S>(handle))
+    }
+}
+
+// The conservative reference scan rides the (sync) `BlobStoreGet` that
+// Blocking already provides, so any Blocking reader gets `children` for
+// free via the default scan-and-check.
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStoreGet> BlobChildren for Blocking<A> {}
+
+// Lifecycle teardown forwards to the inner store (and drops the
+// runtime). `close` is not a storage op, so it stays synchronous.
+#[cfg(feature = "object-store")]
+impl<A: StorageClose> StorageClose for Blocking<A> {
+    type Error = A::Error;
+
+    fn close(self) -> Result<(), Self::Error> {
+        self.inner.close()
     }
 }
 

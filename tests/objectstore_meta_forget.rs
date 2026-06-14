@@ -9,14 +9,15 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Blob;
     use triblespace::core::blob::Bytes;
+    use triblespace::core::repo::async_store::Blocking;
     use triblespace::core::repo::objectstore::ObjectStoreRemote;
     use triblespace::core::repo::{BlobStoreForget, BlobStoreMeta};
-    
+
     use triblespace::prelude::BlobStorePut;
 
     let dir = tempdir()?;
     let url = Url::parse(&format!("file://{}", dir.path().display()))?;
-    let mut remote: ObjectStoreRemote = ObjectStoreRemote::with_url(&url)?;
+    let mut remote = Blocking::new(ObjectStoreRemote::with_url(&url)?)?;
 
     let contents = b"hello world".to_vec();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from(contents.clone()));
