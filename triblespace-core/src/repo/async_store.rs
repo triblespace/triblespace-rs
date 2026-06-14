@@ -57,19 +57,25 @@ pub trait AsyncBlobStoreGet {
         handle: Inline<Handle<S>>,
     ) -> impl Future<Output = Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>> + Send
     where
-        // `Send` on the schema: the handle (which is phantom-typed by
-        // `S`) is captured by the returned future, so it must be `Send`.
-        // Schemas are unit markers, so this is free in practice.
-        S: BlobEncoding + Send + 'static,
+        // Bounds mirror the sync `BlobStoreGet::get` exactly — notably
+        // NO `S: Send`. The phantom-typed handle is `!Send` when the
+        // schema is, so impls must extract the raw 32 bytes before any
+        // await rather than capturing the typed handle (see
+        // `SyncAsAsync`). This keeps the trait a drop-in mirror, which a
+        // sync `Blocking` adapter relies on (its sync `get` can't add an
+        // `S: Send` bound the sync trait doesn't have).
+        S: BlobEncoding + 'static,
         T: TryFromBlob<S>,
         Handle<S>: InlineEncoding;
 }
 
 /// Async counterpart of [`BlobStorePut`](crate::repo::BlobStorePut).
 ///
-/// `item: T` is captured by the returned future, so it must be `Send`
-/// (it crosses to the storage layer across the await) — the one place
-/// the async bounds are stricter than the sync ones.
+/// Bounds mirror the sync `put` exactly (no `T: Send`). Impls must
+/// serialise `item` to bytes *before* the first await and carry only
+/// those `Send` bytes across it — never the phantom-typed value — so
+/// the future is `Send` without constraining `T`. That keeps the trait
+/// a drop-in mirror the sync `Blocking` adapter can lower through.
 pub trait AsyncBlobStorePut {
     /// Error type for put operations.
     type PutError: Error + Send + Sync + 'static;
@@ -82,7 +88,7 @@ pub trait AsyncBlobStorePut {
     ) -> impl Future<Output = Result<Inline<Handle<S>>, Self::PutError>> + Send
     where
         S: BlobEncoding + 'static,
-        T: IntoBlob<S> + Send,
+        T: IntoBlob<S>,
         Handle<S>: InlineEncoding;
 }
 
@@ -192,15 +198,18 @@ where
         handle: Inline<Handle<Sch>>,
     ) -> impl Future<Output = Result<T, Self::GetError<<T as TryFromBlob<Sch>>::Error>>> + Send
     where
-        Sch: BlobEncoding + Send + 'static,
+        Sch: BlobEncoding + 'static,
         T: TryFromBlob<Sch>,
         Handle<Sch>: InlineEncoding,
     {
-        // No `.await`: the future captures only `&self` (Send iff
-        // S: Sync) and the Copy handle, so it is Send regardless of
-        // whether the output `T` is. `ready(..)` would instead require
-        // the output Send — hence the zero-await block.
-        async move { self.0.get::<T, Sch>(handle) }
+        // Extract the raw 32 bytes *before* the async block so the
+        // future captures only `[u8; 32]` (Send) and `&self` (Send iff
+        // S: Sync) — never the phantom-typed handle, which is `!Send`
+        // when `Sch` is. The typed handle is rebuilt inside, used in the
+        // same poll with no await in between, so it is never part of the
+        // future's held state.
+        let raw = handle.raw;
+        async move { self.0.get::<T, Sch>(Inline::new(raw)) }
     }
 }
 
@@ -216,10 +225,20 @@ where
     ) -> impl Future<Output = Result<Inline<Handle<Sch>>, Self::PutError>> + Send
     where
         Sch: BlobEncoding + 'static,
-        T: IntoBlob<Sch> + Send,
+        T: IntoBlob<Sch>,
         Handle<Sch>: InlineEncoding,
     {
-        async move { self.0.put::<Sch, T>(item) }
+        // Serialise synchronously and capture only the `Send` bytes +
+        // raw handle — never the phantom-typed item/blob/handle — so the
+        // future is Send without bounding `T` (mirrors the `get` trick).
+        let blob: crate::blob::Blob<Sch> = item.to_blob();
+        let raw = blob.get_handle().raw;
+        let bytes = blob.bytes;
+        async move {
+            self.0
+                .put::<Sch, crate::blob::Blob<Sch>>(crate::blob::Blob::new(bytes))
+                .map(|_| Inline::new(raw))
+        }
     }
 }
 
@@ -282,6 +301,167 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
         async move { self.0.update(id, old, new) }
+    }
+}
+
+/// Drive an async store from synchronous code through a single
+/// `block_on` boundary.
+///
+/// The inverse of [`SyncAsAsync`]: where that lifts a sync store into
+/// async with zero-await futures, `Blocking` lowers an async store into
+/// the sync traits by owning a tokio runtime and `block_on`-ing each
+/// call. It exists so the scattered `block_on`s that backends like
+/// `ObjectStore` carry internally collapse into *one* place — and so
+/// genuinely-sync call sites (a CLI `main`) can still use an async
+/// backend.
+///
+/// Caveat inherited from `block_on`: calling a `Blocking` method from
+/// *within* an existing tokio runtime panics. It is an edge adapter for
+/// sync boundaries, not something to thread through async code — async
+/// code should depend on the async traits directly.
+#[cfg(feature = "object-store")]
+pub struct Blocking<A> {
+    inner: A,
+    rt: std::sync::Arc<tokio::runtime::Runtime>,
+}
+
+#[cfg(feature = "object-store")]
+impl<A: Clone> Clone for Blocking<A> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            rt: self.rt.clone(),
+        }
+    }
+}
+
+// Identity ignores the runtime: two blocking wrappers are equal iff
+// their inner snapshots are. The runtime is a driver, not part of the
+// store's value. (Required so `Blocking<Reader>` satisfies the sync
+// `BlobStore::Reader: PartialEq + Eq` bound.)
+#[cfg(feature = "object-store")]
+impl<A: PartialEq> PartialEq for Blocking<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+#[cfg(feature = "object-store")]
+impl<A: Eq> Eq for Blocking<A> {}
+
+#[cfg(feature = "object-store")]
+impl<A> Blocking<A> {
+    /// Wrap an async store, owning a fresh current-thread runtime to
+    /// drive it. Current-thread (with all drivers enabled) is enough
+    /// for sequential `block_on` and far lighter than a multi-thread
+    /// runtime per store.
+    pub fn new(inner: A) -> std::io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        Ok(Self {
+            inner,
+            rt: std::sync::Arc::new(rt),
+        })
+    }
+
+    /// Wrap an async store, sharing a caller-provided runtime (e.g. a
+    /// multi-thread one the cloud SDK wants for its connection pool).
+    pub fn with_runtime(inner: A, rt: std::sync::Arc<tokio::runtime::Runtime>) -> Self {
+        Self { inner, rt }
+    }
+
+    /// Unwrap back to the async store.
+    pub fn into_inner(self) -> A {
+        self.inner
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStoreGet> BlobStoreGet for Blocking<A> {
+    type GetError<E: Error + Send + Sync + 'static> = A::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.rt.block_on(self.inner.get::<T, S>(handle))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStoreList> BlobStoreList for Blocking<A> {
+    type Iter<'a>
+        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, A::Err>>
+    where
+        A: 'a;
+    type Err = A::Err;
+
+    fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+        self.rt.block_on(self.inner.blobs()).into_iter()
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStorePut> BlobStorePut for Blocking<A> {
+    type PutError = A::PutError;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.rt.block_on(self.inner.put::<S, T>(item))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncBlobStore> BlobStore for Blocking<A> {
+    type Reader = Blocking<A::Reader>;
+    type ReaderError = A::ReaderError;
+
+    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        let reader = self.rt.block_on(self.inner.reader())?;
+        Ok(Blocking {
+            inner: reader,
+            rt: self.rt.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncPinStore> PinStore for Blocking<A> {
+    type PinsError = A::PinsError;
+    type HeadError = A::HeadError;
+    type UpdateError = A::UpdateError;
+    type ListIter<'a>
+        = std::vec::IntoIter<Result<Id, A::PinsError>>
+    where
+        A: 'a;
+
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
+        self.rt.block_on(self.inner.pins()).map(|v| v.into_iter())
+    }
+
+    fn head(
+        &mut self,
+        id: Id,
+    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+        self.rt.block_on(self.inner.head(id))
+    }
+
+    fn update(
+        &mut self,
+        id: Id,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
+        self.rt.block_on(self.inner.update(id, old, new))
     }
 }
 
@@ -348,6 +528,26 @@ mod tests {
         assert!(pins.is_empty(), "fresh repo has no pins");
         let head = block_on(repo.head(Id::new([7u8; 16]).unwrap())).unwrap();
         assert!(head.is_none(), "unknown pin has no head");
+    }
+
+    // Blocking and SyncAsAsync are inverses: a sync store wrapped up
+    // into async and back down through Blocking behaves as a plain sync
+    // store. This is the round-trip that proves Blocking yields a full,
+    // working sync `BlobStore` surface over an async backend.
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn blocking_over_async_roundtrips_as_a_sync_store() {
+        use crate::repo::{BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut};
+
+        let mut store = Blocking::new(SyncAsAsync::new(MemoryBlobStore::new())).unwrap();
+        let b = blob(5);
+        // Pure sync calls — no `.await`, no visible runtime.
+        let h = store.put::<SimpleArchive, _>(b.clone()).unwrap();
+        let reader = store.reader().unwrap();
+        let got: Blob<SimpleArchive> = reader.get(h).unwrap();
+        assert_eq!(got.bytes, b.bytes);
+        let listed: Vec<_> = reader.blobs().filter_map(Result::ok).map(|h| h.raw).collect();
+        assert!(listed.contains(&h.raw));
     }
 
     // Statically assert the futures are `Send` — the whole point of the
