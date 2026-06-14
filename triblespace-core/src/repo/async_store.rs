@@ -26,12 +26,18 @@
 //!   `block_on`s in `ObjectStore` collapse into one place.
 
 use std::error::Error;
+use std::fmt::Debug;
 use std::future::Future;
 
+use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use crate::repo::{
+    BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
+};
 
 /// Async counterpart of [`BlobStoreGet`](crate::repo::BlobStoreGet).
 ///
@@ -80,11 +86,36 @@ pub trait AsyncBlobStorePut {
         Handle<S>: InlineEncoding;
 }
 
+/// Async counterpart of [`BlobStoreList`](crate::repo::BlobStoreList).
+///
+/// Returns the listing eagerly as a `Vec` rather than a `Stream` — that
+/// keeps the trait dependency-free (only `std::future`) and is fine for
+/// blob enumeration, which is metadata-sized. A streaming variant can
+/// be added later if a backend's listing is genuinely unbounded.
+pub trait AsyncBlobStoreList {
+    /// Error type for listing operations.
+    type Err: Error + Debug + Send + Sync + 'static;
+
+    /// List all blob handles in the store.
+    fn blobs(
+        &self,
+    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send;
+}
+
 /// Async counterpart of [`BlobStore`](crate::repo::BlobStore): combined
 /// read/write with a shareable reader snapshot.
 pub trait AsyncBlobStore: AsyncBlobStorePut {
     /// A clonable async reader handle for concurrent blob lookups.
-    type Reader: AsyncBlobStoreGet + Clone + Send + Sync + 'static;
+    /// Mirrors the sync `Reader` bound (so it can round-trip through a
+    /// `Blocking` adapter into a full sync `BlobStore::Reader`).
+    type Reader: AsyncBlobStoreGet
+        + AsyncBlobStoreList
+        + Clone
+        + Send
+        + Sync
+        + PartialEq
+        + Eq
+        + 'static;
     /// Error type for creating a reader.
     type ReaderError: Error + Send + Sync + 'static;
 
@@ -92,6 +123,37 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
     fn reader(
         &mut self,
     ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
+}
+
+/// Async counterpart of [`PinStore`](crate::repo::PinStore): named,
+/// atomically-updatable handles to `SimpleArchive` blobs.
+pub trait AsyncPinStore {
+    /// Error type for listing pins.
+    type PinsError: Error + Debug + Send + Sync + 'static;
+    /// Error type for head lookups.
+    type HeadError: Error + Debug + Send + Sync + 'static;
+    /// Error type for CAS updates.
+    type UpdateError: Error + Debug + Send + Sync + 'static;
+
+    /// List every pin id (eagerly collected — see [`AsyncBlobStoreList`]
+    /// for why `Vec` over `Stream`).
+    fn pins(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send;
+
+    /// Current head of a pin: `Some(head)`, `None` if tombstoned.
+    fn head(
+        &mut self,
+        id: Id,
+    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send;
+
+    /// Compare-and-swap update of a pin's head.
+    fn update(
+        &mut self,
+        id: Id,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
 }
 
 /// Lift a synchronous store into the async traits via zero-await
@@ -161,6 +223,21 @@ where
     }
 }
 
+impl<S> AsyncBlobStoreList for SyncAsAsync<S>
+where
+    S: BlobStoreList + Sync,
+{
+    type Err = S::Err;
+
+    fn blobs(
+        &self,
+    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+        // The borrowed iterator is created and drained inside the
+        // future (no await), so only `&self` (Send iff S: Sync) is held.
+        async move { self.0.blobs().collect() }
+    }
+}
+
 impl<S> AsyncBlobStore for SyncAsAsync<S>
 where
     S: BlobStore + Send + Sync,
@@ -173,6 +250,38 @@ where
         &mut self,
     ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         async move { self.0.reader().map(SyncAsAsync) }
+    }
+}
+
+impl<S> AsyncPinStore for SyncAsAsync<S>
+where
+    S: PinStore + Send,
+{
+    type PinsError = S::PinsError;
+    type HeadError = S::HeadError;
+    type UpdateError = S::UpdateError;
+
+    fn pins(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send {
+        async move { self.0.pins().map(|it| it.collect()) }
+    }
+
+    fn head(
+        &mut self,
+        id: Id,
+    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError>> + Send
+    {
+        async move { self.0.head(id) }
+    }
+
+    fn update(
+        &mut self,
+        id: Id,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send {
+        async move { self.0.update(id, old, new) }
     }
 }
 
@@ -215,6 +324,30 @@ mod tests {
         let missing = blob(9).get_handle();
         let got = block_on(reader.get::<Blob<SimpleArchive>, SimpleArchive>(missing));
         assert!(got.is_err(), "absent blob resolves to Err, immediately");
+    }
+
+    #[test]
+    fn async_list_through_facade() {
+        let mut store = SyncAsAsync::new(MemoryBlobStore::new());
+        let h1 = block_on(store.put::<SimpleArchive, _>(blob(1))).unwrap();
+        let h2 = block_on(store.put::<SimpleArchive, _>(blob(2))).unwrap();
+        let reader = block_on(store.reader()).unwrap();
+        let listed: Vec<_> = block_on(reader.blobs())
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|h| h.raw)
+            .collect();
+        assert!(listed.contains(&h1.raw) && listed.contains(&h2.raw));
+    }
+
+    #[test]
+    fn async_pins_on_fresh_repo_are_empty() {
+        use crate::repo::memoryrepo::MemoryRepo;
+        let mut repo = SyncAsAsync::new(MemoryRepo::default());
+        let pins = block_on(repo.pins()).unwrap();
+        assert!(pins.is_empty(), "fresh repo has no pins");
+        let head = block_on(repo.head(Id::new([7u8; 16]).unwrap())).unwrap();
+        assert!(head.is_none(), "unknown pin has no head");
     }
 
     // Statically assert the futures are `Send` — the whole point of the
