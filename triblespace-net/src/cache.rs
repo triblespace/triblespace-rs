@@ -87,17 +87,22 @@ impl BoundedBlobStore {
             return; // already present — content-addressed, no-op
         }
         self.order.push_back(hash);
+        let mut evicted = false;
         while self.order.len() > self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.present.remove(&old);
-            } else {
-                break;
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.present.remove(&old);
+                    evicted = true;
+                }
+                None => break,
             }
         }
-        if self.order.len() < self.present.len() + 1 {
-            // Survivors changed — retain only what is still present.
-            // `MemoryBlobStore::keep` rebuilds the index with just
-            // these handles (O(survivors), bounded by capacity).
+        // Only rebuild the inner index when an eviction actually
+        // happened. `inner.put` already added the new blob, and `order`
+        // and `present` move in lockstep, so a non-evicting insert needs
+        // no retain pass at all — the only thing `keep` ever has to do
+        // is drop the just-evicted handles.
+        if evicted {
             let survivors: Vec<Inline<Handle<UnknownBlob>>> = self
                 .present
                 .iter()
