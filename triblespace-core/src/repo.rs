@@ -110,6 +110,8 @@
 //! working with trible repositories.
 //!
 /// Branch metadata construction and signature verification.
+pub mod async_store;
+
 pub mod branch;
 /// Capability-based authorization for triblespace networks.
 pub mod capability;
