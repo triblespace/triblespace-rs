@@ -22,7 +22,6 @@
 //! is asked of the team, via the topic, not of any individual peer.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -323,29 +322,18 @@ where
         self.sender.id()
     }
 
-    /// Swarm-addressed on-demand blob fetch — the lazy-replication
-    /// read-miss primitive. Blocks (up to `deadline`) on a swarm
-    /// fetch of `hash` from whoever the DHT says holds it; returns
-    /// verified bytes or `None` (Unavailable). Does NOT persist the
-    /// result anywhere — that is the caller's policy choice (cache
-    /// tier vs pin). See [`PeerReader`] for the read-path wiring that
-    /// uses this on a local miss.
-    pub fn fetch_blob(
-        &self,
-        hash: RawHash,
-        deadline: std::time::Duration,
-    ) -> Option<Vec<u8>> {
-        self.sender.fetch_blob(hash, deadline)
-    }
-
-    /// Non-blocking variant of [`fetch_blob`](Self::fetch_blob):
-    /// issue the swarm fetch and return its reply receiver. Used by
-    /// deterministic-sim drivers (step + `try_recv`) and by any caller
-    /// that wants to overlap the fetch with other work.
+    /// Issue a swarm-addressed on-demand blob fetch and return its
+    /// oneshot reply receiver — the lazy-replication read-miss
+    /// primitive. `.await` it for the verified bytes or `None`
+    /// (Unavailable); a dropped sender (host gone) also resolves to
+    /// `None`, never a hang. Does NOT persist the result — that is the
+    /// caller's policy choice (cache tier vs pin). Used by
+    /// [`get_or_fetch_async`](Self::get_or_fetch_async) and by
+    /// deterministic-sim drivers (step the sim + `try_recv`).
     pub fn request_blob(
         &self,
         hash: RawHash,
-    ) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
+    ) -> tokio::sync::oneshot::Receiver<Option<Vec<u8>>> {
         self.sender.request_blob(hash)
     }
 
@@ -1010,30 +998,31 @@ where
             .unwrap_or(0)
     }
 
-    /// Lazy read: return `hash`'s bytes, fetching from the swarm and
-    /// landing into the Cache tier on a local miss.
+    /// Honest **async** lazy read: return `hash`'s bytes, fetching from
+    /// the swarm and landing them into the Cache tier on a local miss.
     ///
     /// 1. **Local** — Durable then Cache (via [`try_local`](Self::try_local)).
     ///    Hit ⇒ return immediately, no network.
-    /// 2. **Swarm** — a swarm-addressed [`fetch_blob`](Self::fetch_blob)
-    ///    (DHT-routed, hash-verified). The fetched bytes land in the
-    ///    Cache (not Durable — durability is a separate pin decision),
-    ///    so the next read is a local hit until eviction.
+    /// 2. **Swarm** — a swarm-addressed [`request_blob`](Self::request_blob)
+    ///    (DHT-routed, hash-verified), `.await`ed. The fetched bytes land
+    ///    in the Cache (not Durable — durability is a separate pin
+    ///    decision), so the next read is a local hit until eviction.
     ///
-    /// `None` is *Unavailable*: nobody reachable holds it before
-    /// `deadline`. Existence is semidecidable — there is no
-    /// "definitely absent" outcome, only "not obtained in time".
+    /// `None` is *Unavailable*: nobody reachable served it. Existence is
+    /// semidecidable — there is no "definitely absent" outcome.
     ///
-    /// Blocks the calling thread on the swarm fetch, so it must NOT be
-    /// called on the single-threaded paused-time simulation runtime
-    /// (it would freeze the host that produces the reply). Sim drivers
-    /// compose the steppable pieces instead: [`request_blob`](Self::request_blob)
-    /// + [`land_in_cache`](Self::land_in_cache).
-    pub fn get_or_fetch(&mut self, hash: RawHash, deadline: Duration) -> Option<Bytes> {
+    /// The swarm fetch is *awaited*, never blocking the caller's thread:
+    /// the reply rides a tokio oneshot, so this composes inside any async
+    /// consumer and drives cleanly on a single-threaded runtime (the
+    /// await yields, letting the host produce the reply). This is where
+    /// the swarm fetch stops being a hidden block and becomes an honest
+    /// `.await`.
+    pub async fn get_or_fetch_async(&mut self, hash: RawHash) -> Option<Bytes> {
         if let Some(bytes) = self.try_local(hash) {
             return Some(bytes);
         }
-        let raw = self.fetch_blob(hash, deadline)?;
+        // Dropped sender (host gone) → Err → None, never a hang.
+        let raw = self.request_blob(hash).await.ok().flatten()?;
         let bytes = Bytes::from(raw);
         self.land_in_cache(bytes.clone());
         Some(bytes)

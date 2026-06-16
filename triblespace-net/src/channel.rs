@@ -63,15 +63,17 @@ pub enum NetCommand {
     /// the deadline) back on `reply`.
     ///
     /// This is the one request-reply command — `NetCommand` is
-    /// otherwise fire-and-forget — and it reuses the exact shape the
-    /// removed `NetCommand::Fetch` had (std-mpsc reply over the same
-    /// sender/host split), so the mechanism is proven. The reply
-    /// being `None` (rather than the channel dropping) is the clean
-    /// "Unavailable" the read API surfaces; a dropped channel (host
-    /// gone) the caller also treats as Unavailable, never a hang.
+    /// otherwise fire-and-forget. The reply is a **tokio oneshot**, so
+    /// the caller `.await`s it natively (an honest async read) rather
+    /// than blocking a thread on a std channel — the first step of
+    /// teaching the Peer↔host conversation to speak the runtime's async
+    /// instead of bridging across a thread. The reply being `None`
+    /// (rather than the channel dropping) is the clean "Unavailable" the
+    /// read API surfaces; a dropped sender (host gone) the caller also
+    /// treats as Unavailable, never a hang.
     FetchBlob {
         hash: RawHash,
-        reply: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
     },
 }
 

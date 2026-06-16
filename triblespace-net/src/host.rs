@@ -250,31 +250,12 @@ impl NetSender {
     pub fn request_blob(
         &self,
         hash: RawHash,
-    ) -> std::sync::mpsc::Receiver<Option<Vec<u8>>> {
-        let (reply, rx) = std::sync::mpsc::channel();
-        // If the send fails (host gone), the reply channel is dropped
-        // and the caller's recv yields Disconnected → treated as None.
+    ) -> tokio::sync::oneshot::Receiver<Option<Vec<u8>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        // If the send fails (host gone), the reply sender is dropped and
+        // the caller's `.await` resolves to `Err` → treated as None.
         let _ = self.cmd_tx.send(NetCommand::FetchBlob { hash, reply });
         rx
-    }
-
-    /// Swarm-addressed on-demand blob fetch (lazy read-miss path).
-    /// Sends `FetchBlob` to the host and blocks on the reply up to
-    /// `deadline`. Returns the verified bytes, or `None` for
-    /// Unavailable — whether because no provider had it, the deadline
-    /// fired, or the host thread is gone. Never hangs.
-    ///
-    /// Synchronous by design: the caller is a sync store reader. The
-    /// concurrency (provider fan-out) happens inside the host thread;
-    /// this side just waits. (Precedent: the pre-May `Fetch` blocked
-    /// the same way; ObjectStoreRemote does blocking network IO inside
-    /// BlobStoreGet.)
-    pub fn fetch_blob(
-        &self,
-        hash: RawHash,
-        deadline: std::time::Duration,
-    ) -> Option<Vec<u8>> {
-        self.request_blob(hash).recv_timeout(deadline).ok().flatten()
     }
 }
 
@@ -670,7 +651,7 @@ async fn host_loop<T: Transport>(
                     // the DHT-only path — no peer named), fetch,
                     // verify content hash, reply. Spawned so a slow
                     // fetch doesn't stall the command loop; the
-                    // caller blocks on `reply` with its own deadline.
+                    // caller awaits the oneshot `reply`.
                     let t_for_fetch = transport.clone();
                     let pool_for_fetch = conn_pool.clone();
                     let self_cap2 = self_cap;

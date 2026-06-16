@@ -7,11 +7,11 @@
 //! still obtain it from whoever in the swarm does — without every node
 //! eagerly replicating everything.
 //!
-//! Sim note: `fetch_blob` (the blocking wrapper) cannot be tested on
-//! the single-threaded paused-time runtime — blocking the one thread
-//! would freeze the host that must produce the reply. So these drive
-//! the non-blocking `request_blob` and step the sim while polling the
-//! reply (`try_recv`), which is the deterministic-sim idiom.
+//! Sim note: the swarm fetch replies on a tokio oneshot. Tests either
+//! drive `request_blob` + step the sim while polling the reply
+//! (`try_recv`) — the steppable idiom — or, for the async read
+//! (`get_or_fetch_async`), poll the future and step on `Pending` so the
+//! host produces the reply between polls. No thread is ever blocked.
 #![cfg(feature = "sim")]
 
 mod common;
@@ -52,17 +52,18 @@ fn content_blob(tag_byte: u8) -> (Blob<SimpleArchive>, [u8; 32]) {
 /// out. Returns the reply (`Some(bytes)` / `None`) or `None` if the
 /// budget exhausted.
 async fn drive_until<F: FnMut()>(
-    rx: &std::sync::mpsc::Receiver<Option<Vec<u8>>>,
+    rx: &mut tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
     mut on_step: F,
     steps: u32,
 ) -> Option<Vec<u8>> {
+    use tokio::sync::oneshot::error::TryRecvError;
     for _ in 0..steps {
         SimNet::step(&vclock(), Duration::from_millis(20)).await;
         on_step();
         match rx.try_recv() {
             Ok(reply) => return reply,
-            Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => continue,
+            Err(TryRecvError::Closed) => return None,
         }
     }
     None
@@ -106,8 +107,8 @@ fn fetch_blob_pulls_from_the_holder() {
 
         assert!(!holds_locally(&mut peer_b, hash), "precondition: B lacks the blob");
 
-        let rx = peer_b.request_blob(hash);
-        let got = drive_until(&rx, || peer_a.refresh(), 120)
+        let mut rx = peer_b.request_blob(hash);
+        let got = drive_until(&mut rx, || peer_a.refresh(), 120)
             .await
             .expect("B must obtain the blob from the swarm");
         assert_eq!(
@@ -157,8 +158,8 @@ fn lazy_read_lands_in_cache_not_durable() {
         assert_eq!(peer_b.cache_len(), 0, "precondition: B's cache is empty");
 
         // Swarm-fetch (steppable form of get_or_fetch's miss path).
-        let rx = peer_b.request_blob(hash);
-        let got = drive_until(&rx, || peer_a.refresh(), 120)
+        let mut rx = peer_b.request_blob(hash);
+        let got = drive_until(&mut rx, || peer_a.refresh(), 120)
             .await
             .expect("B must obtain the blob from the swarm");
 
@@ -221,8 +222,8 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
 
         // Lazily read all three, in order.
         for (_, hash) in &blobs {
-            let rx = peer_b.request_blob(*hash);
-            let got = drive_until(&rx, || peer_a.refresh(), 120)
+            let mut rx = peer_b.request_blob(*hash);
+            let got = drive_until(&mut rx, || peer_a.refresh(), 120)
                 .await
                 .expect("swarm must serve each blob");
             peer_b.land_in_cache(got.into());
@@ -235,11 +236,71 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
         assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still cached");
 
         // The evicted blob is re-fetchable from the swarm.
-        let rx = peer_b.request_blob(blobs[0].1);
-        let refetched = drive_until(&rx, || peer_a.refresh(), 120)
+        let mut rx = peer_b.request_blob(blobs[0].1);
+        let refetched = drive_until(&mut rx, || peer_a.refresh(), 120)
             .await
             .expect("evicted blob re-fetchable — caches are free");
         assert_eq!(blake3::hash(&refetched).as_bytes(), &blobs[0].1);
+    });
+}
+
+/// The honest **async** lazy read: `get_or_fetch_async` awaits the
+/// swarm fetch (oneshot reply, no blocked thread) and lands the result
+/// in Cache. Driven deterministically by polling the future and
+/// stepping the sim on `Pending` — the awaited oneshot resolves once
+/// the host (driven by the stepping) sends the reply.
+#[test]
+fn async_lazy_read_awaits_swarm_and_caches() {
+    let _g = sim_guard();
+    run_paused(0xA5A5, async {
+        let net = SimNet::new(0xA5A5, SimConfig::default());
+        let root = key(0xF4);
+        let ka = key(0xA4);
+        let kb = key(0xB4);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0x77);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+
+        // Drive the async read: poll once, and on Pending step the sim so
+        // the host can serve the reply. The future holds `&mut peer_b`
+        // for its lifetime, so only `peer_a` is touched inside the loop.
+        let got = {
+            let mut fut = Box::pin(peer_b.get_or_fetch_async(hash));
+            loop {
+                match futures::poll!(fut.as_mut()) {
+                    std::task::Poll::Ready(r) => break r,
+                    std::task::Poll::Pending => {
+                        SimNet::step(&vclock(), Duration::from_millis(20)).await;
+                        peer_a.refresh();
+                    }
+                }
+            }
+        };
+
+        let got = got.expect("async lazy read must obtain the blob from the swarm");
+        assert_eq!(
+            blake3::hash(&got).as_bytes(),
+            &hash,
+            "awaited bytes hash to the content id"
+        );
+        // Landed in Cache, served locally on the next read.
+        assert!(peer_b.try_local(hash).is_some(), "now resident in the local union");
+        assert_eq!(peer_b.cache_len(), 1, "landed in the cache tier");
     });
 }
 
@@ -265,10 +326,10 @@ fn fetch_blob_unavailable_is_clean() {
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
 
         let (_blob, hash) = content_blob(0x99);
-        let rx = peer_a.request_blob(hash);
+        let mut rx = peer_a.request_blob(hash);
         // providers_for has a 3s internal DHT timeout; give the sim
         // enough virtual steps to cross it, then expect a None reply.
-        let reply = drive_until(&rx, || peer_a.refresh(), 400).await;
+        let reply = drive_until(&mut rx, || peer_a.refresh(), 400).await;
         assert!(
             reply.is_none(),
             "unavailable fetch must resolve to None, got {:?} bytes",
