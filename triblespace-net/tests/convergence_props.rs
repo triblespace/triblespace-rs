@@ -328,3 +328,57 @@ fn line_topology_converges_transitively() {
         "expected at least one trible per peer in the merged union"
     );
 }
+
+/// A late joiner bootstrapping into a running mesh. Peers 0,1,2 converge
+/// first (peer 3 isolated); then peer 3 — carrying its own divergent
+/// commit — joins and gossips. Everyone converges *both ways*: the late
+/// joiner catches up to the established union, and the settled peers
+/// absorb the joiner's payload. Tests the "new node joins an existing
+/// system" path, which the all-start-together scenarios don't.
+#[test]
+fn late_joiner_converges_both_ways() {
+    let mut peers = diverged_peers(4); // peer 3 is the late joiner.
+
+    // Phase 1: converge the sub-mesh {0,1,2} only (peer 3 untouched).
+    loop {
+        let mut changed = false;
+        for to in 0..3 {
+            for from in 0..3 {
+                if to != from
+                    && !matches!(sync(&mut peers, to, from), MergeOutcome::UpToDate)
+                {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let established = content(&mut peers[0].repo, BRANCH);
+    assert_eq!(content(&mut peers[1].repo, BRANCH), established);
+    assert_eq!(content(&mut peers[2].repo, BRANCH), established);
+    assert_ne!(
+        content(&mut peers[3].repo, BRANCH),
+        established,
+        "the late joiner has not yet seen the established mesh"
+    );
+
+    // Phase 2: peer 3 joins — full-mesh drain.
+    drain_to_quiescence(&mut peers);
+    all_converged(&mut peers);
+
+    let full = content(&mut peers[0].repo, BRANCH);
+    assert!(
+        full.len() > established.len(),
+        "the joiner's payload must be absorbed by the settled peers"
+    );
+    for i in 0..4 {
+        assert_eq!(
+            content(&mut peers[i].repo, BRANCH),
+            full,
+            "peer {i} did not reach the post-join union"
+        );
+    }
+}
