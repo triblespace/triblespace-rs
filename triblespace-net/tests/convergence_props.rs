@@ -329,6 +329,16 @@ fn line_topology_converges_transitively() {
     );
 }
 
+// NOTE: there is deliberately no "same seed → identical commit hash"
+// test here. Authored commits carry `created_at = epoch_now()`
+// (commit.rs), which is only reproducible under the *seeded virtual
+// clock* the sim harness installs — these pure repo tests run on the
+// real wall clock, so commit hashes legitimately differ run to run. The
+// meaningful, timestamp-agnostic guarantee — that the merged *content*
+// converges order-independently — is covered above; hash-level
+// determinism (with the virtual clock) is covered by the sim_lazy
+// determinism meta-test.
+
 /// A late joiner bootstrapping into a running mesh. Peers 0,1,2 converge
 /// first (peer 3 isolated); then peer 3 — carrying its own divergent
 /// commit — joins and gossips. Everyone converges *both ways*: the late
