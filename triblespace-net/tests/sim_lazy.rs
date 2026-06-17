@@ -502,6 +502,94 @@ fn lazy_read_unavailable_under_crash_then_revives() {
     });
 }
 
+/// Randomized fault **chaos** — the Jepsen-style property fixed
+/// scenarios miss. Across several seeds, the A↔B link is partitioned and
+/// healed at random steps while B retries its lazy read; the back half
+/// of each run is forced healthy. Two invariants:
+///   * SAFETY — any bytes the fetch returns hash to the requested
+///     content id. Chaos never yields corrupt data.
+///   * LIVENESS — once the link stops flapping and stays healed, the
+///     read eventually succeeds.
+#[test]
+fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
+    use rand::{Rng, SeedableRng};
+    let _g = sim_guard();
+    for s in 0..6u64 {
+        let seed = 0x0C4A_0500 + s;
+        run_paused(seed, async move {
+            let net = SimNet::new(seed, SimConfig::default());
+            let root = key(0xFA);
+            let ka = key(0xAA);
+            let kb = key(0xBA);
+            let team_root = root.verifying_key();
+            let cap_a = admin_cap(&root, &ka);
+            let cap_b = admin_cap(&root, &kb);
+
+            let (blob, hash) = content_blob(0xAB);
+            let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+            store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+            let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+            let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+            let peer_b =
+                bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+            for _ in 0..40u32 {
+                SimNet::step(&vclock(), Duration::from_millis(20)).await;
+                peer_a.refresh();
+            }
+
+            let pa = pk(&ka);
+            let pb = pk(&kb);
+            let mut frng = rand::rngs::StdRng::seed_from_u64(seed ^ 0xF417);
+            const FLAP_UNTIL: u32 = 250;
+            const BUDGET: u32 = 600;
+
+            let mut got: Option<Vec<u8>> = None;
+            let mut fut = Box::pin(peer_b.fetch_blob(hash));
+            for step in 0..BUDGET {
+                if let std::task::Poll::Ready(v) = futures::poll!(fut.as_mut()) {
+                    if let Some(bytes) = v {
+                        // SAFETY invariant.
+                        assert_eq!(
+                            blake3::hash(&bytes).as_bytes(),
+                            &hash,
+                            "chaos must never yield corrupt bytes (seed {seed:#x})"
+                        );
+                        got = Some(bytes);
+                        break;
+                    }
+                    // One-shot attempt failed (partitioned mid-fetch);
+                    // retry. The old future drops here, freeing its
+                    // shared borrow of peer_b.
+                    fut = Box::pin(peer_b.fetch_blob(hash));
+                }
+
+                if step < FLAP_UNTIL {
+                    if frng.gen_bool(0.12) {
+                        if frng.gen_bool(0.5) {
+                            net.partition(pa, pb);
+                        } else {
+                            net.heal(pa, pb);
+                        }
+                    }
+                } else if step == FLAP_UNTIL {
+                    net.heal(pa, pb); // hold healthy so liveness can assert
+                }
+
+                SimNet::step(&vclock(), Duration::from_millis(20)).await;
+                peer_a.refresh();
+            }
+
+            // LIVENESS invariant.
+            assert!(
+                got.is_some(),
+                "lazy read must recover after the partition stops flapping (seed {seed:#x})"
+            );
+        });
+    }
+}
+
 /// Provider fallback across a 3-node mesh: the blob lives on both A and
 /// C; A crashes; B's lazy read must fall back to the surviving holder.
 /// Exercises `fetch_one`'s multi-provider iteration (try next provider
