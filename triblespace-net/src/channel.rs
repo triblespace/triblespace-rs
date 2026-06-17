@@ -53,28 +53,9 @@ pub enum NetCommand {
         cap_bytes: Bytes,
         sig_bytes: Bytes,
     },
-    /// Swarm-addressed on-demand blob fetch — the lazy-replication
-    /// read-miss path. The caller (a `PeerReader` whose local stores
-    /// missed) hands a content hash and a reply channel; the host
-    /// resolves providers via the DHT (no peer is named — this is
-    /// NOT the pre-May peer-targeted `Fetch`, it is `get(hash)`
-    /// asking "whoever holds it"), fetches, verifies `blake3(bytes)
-    /// == hash`, and sends the bytes (or `None` if unavailable after
-    /// the deadline) back on `reply`.
-    ///
-    /// This is the one request-reply command — `NetCommand` is
-    /// otherwise fire-and-forget. The reply is a **tokio oneshot**, so
-    /// the caller `.await`s it natively (an honest async read) rather
-    /// than blocking a thread on a std channel — the first step of
-    /// teaching the Peer↔host conversation to speak the runtime's async
-    /// instead of bridging across a thread. The reply being `None`
-    /// (rather than the channel dropping) is the clean "Unavailable" the
-    /// read API surfaces; a dropped sender (host gone) the caller also
-    /// treats as Unavailable, never a hang.
-    FetchBlob {
-        hash: RawHash,
-        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
-    },
+    // The swarm-addressed read-miss fetch is no longer a command: it
+    // runs inline via `NetSender::fetch_blob` / `host::NetCapability`,
+    // so there is no `FetchBlob` round-trip through this loop.
 }
 
 /// Events received from the network thread.

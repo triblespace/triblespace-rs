@@ -194,16 +194,64 @@ where
     }
 }
 
+/// The network capability a `Peer` invokes **inline** for
+/// request/response work — currently the lazy read-miss swarm fetch.
+///
+/// This is what replaces the old `FetchBlob` command round-trip: rather
+/// than ship a command to the host loop and await a reply channel, the
+/// Peer method awaits this directly and the fetch runs in its own task.
+/// Type-erased over the transport so `Peer` stays transport-agnostic;
+/// published through a readiness slot ([`NetSender::fetch_blob`]) once
+/// the transport binds, which is how the inline path handles the
+/// construction-ordering the command channel used to paper over.
+pub trait NetCapability: Send + Sync {
+    /// Swarm-addressed fetch of `hash` (DHT-routed, content-verified).
+    /// `None` is Unavailable.
+    fn fetch_blob(
+        &self,
+        hash: RawHash,
+    ) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
+}
+
+/// Transport-bound implementation of [`NetCapability`]. Holds exactly
+/// what `fetch_one` needs; built in the host once the transport exists.
+struct NetCap<T: Transport> {
+    transport: T,
+    pool: SharedPool<T::Conn>,
+    self_cap: RawHash,
+    my_id: PeerId,
+}
+
+impl<T: Transport> NetCapability for NetCap<T> {
+    fn fetch_blob(
+        &self,
+        hash: RawHash,
+    ) -> futures::future::BoxFuture<'static, Option<Vec<u8>>> {
+        let t = self.transport.clone();
+        let pool = self.pool.clone();
+        let self_cap = self.self_cap;
+        let my_id = self.my_id;
+        Box::pin(async move {
+            fetch_one(&t, &hash, &pool, my_id, &self_cap)
+                .await
+                .filter(|data| blake3::hash(data).as_bytes() == &hash)
+        })
+    }
+}
+
 // ── Outgoing half ────────────────────────────────────────────────────
 
-/// Send commands to the host thread + update the serving snapshot.
-///
-/// Holds only the snapshot and the command channel — `update_snapshot`
-/// is a pure snapshot refresh.
+/// Send fire-and-forget commands to the host loop, refresh the serving
+/// snapshot, and invoke inline request/response capabilities (the swarm
+/// fetch). `update_snapshot` is a pure snapshot refresh; `fetch_blob`
+/// awaits the inline capability rather than the command loop.
 #[derive(Clone)]
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    /// Readiness slot for the inline fetch capability, published by the
+    /// host once its transport binds. `None` until then.
+    cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     id: EndpointId,
 }
 
@@ -247,15 +295,24 @@ impl NetSender {
     /// deadline (production); deterministic-sim drivers step the sim
     /// and `try_recv` (so the single host thread isn't frozen by a
     /// blocking caller).
-    pub fn request_blob(
-        &self,
-        hash: RawHash,
-    ) -> tokio::sync::oneshot::Receiver<Option<Vec<u8>>> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        // If the send fails (host gone), the reply sender is dropped and
-        // the caller's `.await` resolves to `Err` → treated as None.
-        let _ = self.cmd_tx.send(NetCommand::FetchBlob { hash, reply });
-        rx
+    /// Swarm-addressed on-demand blob fetch (lazy read-miss) — run
+    /// **inline**, not via the command loop. Awaits the network
+    /// capability becoming ready (published once the host's transport
+    /// binds), then runs the fetch in this task. `None` is Unavailable:
+    /// no provider served it, or the host never came up.
+    pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
+        let mut rx = self.cap.clone();
+        // Resolve the capability — immediate if already published, else
+        // park until the transport binds. `Err` means the host dropped
+        // its sender (gone) → Unavailable.
+        let cap = match rx.wait_for(|c| c.is_some()).await {
+            Ok(guard) => guard.clone(),
+            Err(_) => return None,
+        };
+        match cap {
+            Some(cap) => cap.fetch_blob(hash).await,
+            None => None,
+        }
     }
 }
 
@@ -284,6 +341,9 @@ pub struct HostWiring {
     pub(crate) cmd_rx: mpsc::Receiver<NetCommand>,
     pub(crate) evt_tx: mpsc::Sender<NetEvent>,
     pub(crate) snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    /// Publish half of the inline-fetch capability slot; the host fills
+    /// it once its transport binds.
+    pub(crate) cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 }
 
 /// Build the Peer↔host channel pair for a node with identity `id`.
@@ -294,10 +354,13 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
         Arc::new(Mutex::new(None));
+    let (cap_tx, cap_rx) =
+        tokio::sync::watch::channel::<Option<Arc<dyn NetCapability>>>(None);
 
     let sender = NetSender {
         cmd_tx,
         snapshot: snapshot.clone(),
+        cap: cap_rx,
         id,
     };
     let receiver = NetReceiver { evt_rx };
@@ -305,6 +368,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
         cmd_rx,
         evt_tx,
         snapshot,
+        cap_tx,
     };
     (sender, receiver, wiring)
 }
@@ -318,7 +382,15 @@ pub async fn run_host<T: Transport>(
     config: PeerConfig,
     wiring: HostWiring,
 ) {
-    host_loop(harness, config, wiring.cmd_rx, wiring.evt_tx, wiring.snapshot).await;
+    host_loop(
+        harness,
+        config,
+        wiring.cmd_rx,
+        wiring.evt_tx,
+        wiring.snapshot,
+        wiring.cap_tx,
+    )
+    .await;
 }
 
 /// Spawn the network thread. Returns the outgoing/incoming channel halves
@@ -393,6 +465,7 @@ async fn host_loop<T: Transport>(
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
 ) {
     let Harness {
         transport,
@@ -408,6 +481,17 @@ async fn host_loop<T: Transport>(
     // fetch_reachable / swarm_fetch_chain calls. See `SharedPool`
     // docs for the OnceCell-based dial deduplication.
     let conn_pool: SharedPool<T::Conn> = new_shared_pool();
+
+    // Publish the inline-fetch capability now that the transport exists.
+    // `Peer::fetch_blob` parks on this slot until it's filled, which is
+    // how the inline read path handles the construction-ordering the old
+    // `FetchBlob` command channel used to buffer past.
+    let _ = cap_tx.send(Some(Arc::new(NetCap {
+        transport: transport.clone(),
+        pool: conn_pool.clone(),
+        self_cap,
+        my_id,
+    }) as Arc<dyn NetCapability>));
 
     // Failed-walk retry queue (bug C): walks that fail transiently
     // are re-attempted with backoff from the command loop below,
@@ -643,31 +727,6 @@ async fn host_loop<T: Transport>(
                             }
                         }
                         conn.close(0, b"ok");
-                    });
-                }
-                NetCommand::FetchBlob { hash, reply } => {
-                    // Lazy read-miss: resolve providers via the DHT
-                    // (publisher_id = my_id routes providers_for to
-                    // the DHT-only path — no peer named), fetch,
-                    // verify content hash, reply. Spawned so a slow
-                    // fetch doesn't stall the command loop; the
-                    // caller awaits the oneshot `reply`.
-                    let t_for_fetch = transport.clone();
-                    let pool_for_fetch = conn_pool.clone();
-                    let self_cap2 = self_cap;
-                    tokio::spawn(async move {
-                        let bytes = fetch_one(
-                            &t_for_fetch,
-                            &hash,
-                            &pool_for_fetch,
-                            my_id,
-                            &self_cap2,
-                        )
-                        .await
-                        .filter(|data| blake3::hash(data).as_bytes() == &hash);
-                        // Reply may fail if the caller already gave up
-                        // (its deadline fired) — fine, just drop.
-                        let _ = reply.send(bytes);
                     });
                 }
             }

@@ -329,19 +329,15 @@ where
         self.sender.id()
     }
 
-    /// Issue a swarm-addressed on-demand blob fetch and return its
-    /// oneshot reply receiver — the lazy-replication read-miss
-    /// primitive. `.await` it for the verified bytes or `None`
-    /// (Unavailable); a dropped sender (host gone) also resolves to
-    /// `None`, never a hang. Does NOT persist the result — that is the
-    /// caller's policy choice (cache tier vs pin). Used by
-    /// [`get_or_fetch_async`](Self::get_or_fetch_async) and by
-    /// deterministic-sim drivers (step the sim + `try_recv`).
-    pub fn request_blob(
-        &self,
-        hash: RawHash,
-    ) -> tokio::sync::oneshot::Receiver<Option<Vec<u8>>> {
-        self.sender.request_blob(hash)
+    /// Swarm-addressed on-demand blob fetch — the lazy-replication
+    /// read-miss primitive, run **inline** (no command round-trip).
+    /// Awaits the verified bytes or `None` (Unavailable); a host that
+    /// never came up also resolves to `None`, never a hang. Does NOT
+    /// persist the result — that is the caller's policy choice (cache
+    /// tier vs pin). Used by [`get_or_fetch_async`](Self::get_or_fetch_async)
+    /// and, in deterministic-sim drivers, polled while stepping the sim.
+    pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
+        self.sender.fetch_blob(hash).await
     }
 
     /// Reconcile this peer with the latest external state.
@@ -1032,8 +1028,7 @@ where
         if let Some(bytes) = self.try_local(hash) {
             return Some(bytes);
         }
-        // Dropped sender (host gone) → Err → None, never a hang.
-        let raw = self.request_blob(hash).await.ok().flatten()?;
+        let raw = self.fetch_blob(hash).await?;
         let bytes = Bytes::from(raw);
         self.land_in_cache(bytes.clone());
         Some(bytes)
@@ -1431,8 +1426,9 @@ where
                 } else if let Ok(b) = cache.get::<Bytes, UnknownBlob>(Inline::new(raw)) {
                     b
                 } else if let Some(cap) = fetch {
-                    // The host verified blake3(bytes) == raw before reply.
-                    match cap.sender.request_blob(raw).await.ok().flatten() {
+                    // Inline swarm fetch; the host verified
+                    // blake3(bytes) == raw before returning.
+                    match cap.sender.fetch_blob(raw).await {
                         Some(v) => {
                             let b = Bytes::from(v);
                             cap.sink.land(b.clone());

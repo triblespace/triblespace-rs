@@ -1,17 +1,16 @@
 //! Lazy-replication read path — deterministic simulation.
 //!
-//! Exercises the swarm-addressed on-demand fetch
-//! (`Peer::request_blob` / `NetCommand::FetchBlob`) and, as the build
-//! progresses, the `PeerReader` fall-through and pin policies. The
-//! property under test: a node which does NOT hold a content blob can
-//! still obtain it from whoever in the swarm does — without every node
-//! eagerly replicating everything.
+//! Exercises the swarm-addressed on-demand fetch (`Peer::fetch_blob`,
+//! run inline via `host::NetCapability`) plus the `PeerReader`
+//! fall-through and the transparent async read. The property under
+//! test: a node which does NOT hold a content blob can still obtain it
+//! from whoever in the swarm does — without every node eagerly
+//! replicating everything.
 //!
-//! Sim note: the swarm fetch replies on a tokio oneshot. Tests either
-//! drive `request_blob` + step the sim while polling the reply
-//! (`try_recv`) — the steppable idiom — or, for the async read
-//! (`get_or_fetch_async`), poll the future and step on `Pending` so the
-//! host produces the reply between polls. No thread is ever blocked.
+//! Sim note: the fetch runs inline (a future to poll), so tests drive it
+//! with `drive_future` — poll the future, and on `Pending` step the sim
+//! so the host (and the fetch) make progress between polls. No thread is
+//! ever blocked and nothing rides a reply channel.
 #![cfg(feature = "sim")]
 
 mod common;
@@ -49,23 +48,23 @@ fn content_blob(tag_byte: u8) -> (Blob<SimpleArchive>, [u8; 32]) {
     (blob, hash)
 }
 
-/// Drive the sim until `rx` produces a reply or the step budget runs
-/// out. Returns the reply (`Some(bytes)` / `None`) or `None` if the
-/// budget exhausted.
-async fn drive_until<F: FnMut()>(
-    rx: &mut tokio::sync::oneshot::Receiver<Option<Vec<u8>>>,
-    mut on_step: F,
-    steps: u32,
-) -> Option<Vec<u8>> {
-    use tokio::sync::oneshot::error::TryRecvError;
+/// Drive `fut` to completion, stepping the sim between polls so the
+/// host loop and the *inline* swarm fetch make progress. Returns
+/// `Some(value)`, or `None` if the step budget is exhausted. This is the
+/// deterministic-sim idiom now that the fetch runs inline (a future to
+/// poll) rather than replying on a channel to drain.
+async fn drive_future<T, Fut, F>(fut: Fut, mut on_step: F, steps: u32) -> Option<T>
+where
+    Fut: std::future::Future<Output = T>,
+    F: FnMut(),
+{
+    let mut fut = Box::pin(fut);
     for _ in 0..steps {
+        if let std::task::Poll::Ready(v) = futures::poll!(fut.as_mut()) {
+            return Some(v);
+        }
         SimNet::step(&vclock(), Duration::from_millis(20)).await;
         on_step();
-        match rx.try_recv() {
-            Ok(reply) => return reply,
-            Err(TryRecvError::Empty) => continue,
-            Err(TryRecvError::Closed) => return None,
-        }
     }
     None
 }
@@ -108,9 +107,9 @@ fn fetch_blob_pulls_from_the_holder() {
 
         assert!(!holds_locally(&mut peer_b, hash), "precondition: B lacks the blob");
 
-        let mut rx = peer_b.request_blob(hash);
-        let got = drive_until(&mut rx, || peer_a.refresh(), 120)
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120)
             .await
+            .flatten()
             .expect("B must obtain the blob from the swarm");
         assert_eq!(
             blake3::hash(&got).as_bytes(),
@@ -159,9 +158,9 @@ fn lazy_read_lands_in_cache_not_durable() {
         assert_eq!(peer_b.cache_len(), 0, "precondition: B's cache is empty");
 
         // Swarm-fetch (steppable form of get_or_fetch's miss path).
-        let mut rx = peer_b.request_blob(hash);
-        let got = drive_until(&mut rx, || peer_a.refresh(), 120)
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120)
             .await
+            .flatten()
             .expect("B must obtain the blob from the swarm");
 
         // Land it exactly as get_or_fetch would.
@@ -223,9 +222,9 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
 
         // Lazily read all three, in order.
         for (_, hash) in &blobs {
-            let mut rx = peer_b.request_blob(*hash);
-            let got = drive_until(&mut rx, || peer_a.refresh(), 120)
+            let got = drive_future(peer_b.fetch_blob(*hash), || peer_a.refresh(), 120)
                 .await
+                .flatten()
                 .expect("swarm must serve each blob");
             peer_b.land_in_cache(got.into());
         }
@@ -237,9 +236,9 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
         assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still cached");
 
         // The evicted blob is re-fetchable from the swarm.
-        let mut rx = peer_b.request_blob(blobs[0].1);
-        let refetched = drive_until(&mut rx, || peer_a.refresh(), 120)
+        let refetched = drive_future(peer_b.fetch_blob(blobs[0].1), || peer_a.refresh(), 120)
             .await
+            .flatten()
             .expect("evicted blob re-fetchable — caches are free");
         assert_eq!(blake3::hash(&refetched).as_bytes(), &blobs[0].1);
     });
@@ -387,13 +386,17 @@ fn fetch_blob_unavailable_is_clean() {
         let cap_a = admin_cap(&root, &ka);
 
         let store_a = store_with_caps(&[cap_a.clone()]);
-        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
 
         let (_blob, hash) = content_blob(0x99);
-        let mut rx = peer_a.request_blob(hash);
         // providers_for has a 3s internal DHT timeout; give the sim
         // enough virtual steps to cross it, then expect a None reply.
-        let reply = drive_until(&mut rx, || peer_a.refresh(), 400).await;
+        // No-op on_step: the inline fetch borrows `peer_a`, and stepping
+        // alone advances virtual time across the timeout (no refresh
+        // needed — there's nothing to gossip to here anyway).
+        let reply = drive_future(peer_a.fetch_blob(hash), || {}, 400)
+            .await
+            .flatten();
         assert!(
             reply.is_none(),
             "unavailable fetch must resolve to None, got {:?} bytes",
