@@ -404,3 +404,100 @@ fn fetch_blob_unavailable_is_clean() {
         );
     });
 }
+
+/// Lazy read degrades to Unavailable when the network partitions the
+/// reader from the only holder, and **recovers** once the link heals —
+/// the graceful-degradation property under a real fault. (The DHT find
+/// still names the holder; it's the dial that fails, then succeeds.)
+#[test]
+fn lazy_read_unavailable_under_partition_then_heals() {
+    let _g = sim_guard();
+    run_paused(0xD15C, async {
+        let net = SimNet::new(0xD15C, SimConfig::default());
+        let root = key(0xF6);
+        let ka = key(0xA6);
+        let kb = key(0xB6);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0xC1);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        // Sever A↔B: the DHT still resolves A as the provider, but B's
+        // dial to A fails.
+        net.partition(pk(&ka), pk(&kb));
+        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+            .await
+            .flatten();
+        assert!(
+            blocked.is_none(),
+            "partitioned from the only holder → Unavailable"
+        );
+        assert_eq!(peer_b.cache_len(), 0, "nothing cached from a failed fetch");
+
+        // Heal the link; the same read now succeeds.
+        net.heal(pk(&ka), pk(&kb));
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+            .await
+            .flatten()
+            .expect("after heal the holder is reachable again");
+        assert_eq!(blake3::hash(&got).as_bytes(), &hash);
+    });
+}
+
+/// Same graceful-degradation property under a node **crash** rather than
+/// a link partition: the holder crashing makes the read Unavailable
+/// (its connections reset, re-dials fail), and reviving it restores
+/// service. Exercises the conn-pool's evict-on-error + re-dial path.
+#[test]
+fn lazy_read_unavailable_under_crash_then_revives() {
+    let _g = sim_guard();
+    run_paused(0xC1A5, async {
+        let net = SimNet::new(0xC1A5, SimConfig::default());
+        let root = key(0xF7);
+        let ka = key(0xA7);
+        let kb = key(0xB7);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0xC2);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        net.crash(pk(&ka));
+        let blocked = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+            .await
+            .flatten();
+        assert!(blocked.is_none(), "holder crashed → Unavailable");
+
+        net.revive(pk(&ka));
+        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 300)
+            .await
+            .flatten()
+            .expect("after revive the holder serves again");
+        assert_eq!(blake3::hash(&got).as_bytes(), &hash);
+    });
+}
