@@ -279,3 +279,52 @@ fn merge_content_is_independent_of_remote_arrival_order() {
     assert_eq!(ascending, descending, "arrival 1,2,3 vs 3,2,1 — same content");
     assert_eq!(ascending, shuffled, "arrival 1,2,3 vs 2,1,3 — same content");
 }
+
+/// TRANSITIVE convergence: peers in a line `0—1—2—…—(n-1)` where only
+/// *adjacent* pairs ever sync. No peer talks directly to a non-neighbor,
+/// yet the whole line converges to the full union — gossip propagates
+/// through intermediaries. Because the merge is monotonic, repeated
+/// adjacent passes reach the global join; the test bounds the pass count
+/// to catch any failure to propagate.
+#[test]
+fn line_topology_converges_transitively() {
+    let n = 5;
+    let mut peers = diverged_peers(n);
+
+    let mut passes = 0u32;
+    loop {
+        passes += 1;
+        let mut changed = false;
+        for i in 0..n - 1 {
+            // sync each adjacent pair both directions
+            if !matches!(sync(&mut peers, i, i + 1), MergeOutcome::UpToDate) {
+                changed = true;
+            }
+            if !matches!(sync(&mut peers, i + 1, i), MergeOutcome::UpToDate) {
+                changed = true;
+            }
+        }
+        assert!(passes < 50, "line topology failed to converge transitively");
+        if !changed {
+            break;
+        }
+    }
+
+    all_converged(&mut peers);
+    // Every peer ends with the full union — the endpoints (0 and n-1),
+    // which never synced directly, still each hold the other's payload.
+    let full = content(&mut peers[0].repo, BRANCH);
+    for i in 1..n {
+        assert_eq!(
+            content(&mut peers[i].repo, BRANCH),
+            full,
+            "peer {i} did not receive the full union over the line"
+        );
+    }
+    // Sanity: the union is non-trivial (all n distinct payloads merged),
+    // so transitive propagation actually moved data end to end.
+    assert!(
+        full.len() >= n,
+        "expected at least one trible per peer in the merged union"
+    );
+}
