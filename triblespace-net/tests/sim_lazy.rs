@@ -24,6 +24,7 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::inline::Inline;
 use triblespace_core::prelude::BlobStore;
+use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
@@ -70,10 +71,10 @@ async fn drive_until<F: FnMut()>(
 }
 
 fn holds_locally(peer: &mut triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>, hash: [u8; 32]) -> bool {
-    peer.reader()
-        .unwrap()
-        .get::<anybytes::Bytes, UnknownBlob>(Inline::new(hash))
-        .is_ok()
+    let reader = peer.reader().unwrap();
+    // Disambiguate: the sync, local-only `BlobStoreGet::get` (PeerReader
+    // also impls the async fetching `AsyncBlobStoreGet::get`).
+    BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash)).is_ok()
 }
 
 /// A holds a content blob; B does not. B's swarm fetch must pull it
@@ -301,6 +302,69 @@ fn async_lazy_read_awaits_swarm_and_caches() {
         // Landed in Cache, served locally on the next read.
         assert!(peer_b.try_local(hash).is_some(), "now resident in the local union");
         assert_eq!(peer_b.cache_len(), 1, "landed in the cache tier");
+    });
+}
+
+/// Transparent async read through the trait surface: a *generic*
+/// `AsyncBlobStoreGet` consumer calls `reader.get(handle).await` on a
+/// blob B doesn't hold, and the `PeerReader` fetches it from the swarm
+/// and lands it in the shared Cache — no knowledge that it's a `Peer`.
+/// This is the "lazy replication for free" payoff of increment 5b.
+#[test]
+fn transparent_async_get_fetches_through_reader() {
+    let _g = sim_guard();
+    run_paused(0x9001, async {
+        let net = SimNet::new(0x9001, SimConfig::default());
+        let root = key(0xF5);
+        let ka = key(0xA5);
+        let kb = key(0xB5);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0x88);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+
+        // A generic async reader: it only knows `AsyncBlobStoreGet`.
+        let got: anybytes::Bytes = {
+            let reader = peer_b.reader().unwrap();
+            let mut fut = Box::pin(AsyncBlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(
+                &reader,
+                Inline::new(hash),
+            ));
+            loop {
+                match futures::poll!(fut.as_mut()) {
+                    std::task::Poll::Ready(r) => break r,
+                    std::task::Poll::Pending => {
+                        SimNet::step(&vclock(), Duration::from_millis(20)).await;
+                        peer_a.refresh();
+                    }
+                }
+            }
+            .expect("transparent get must fetch the blob from the swarm")
+        };
+
+        assert_eq!(
+            blake3::hash(&got).as_bytes(),
+            &hash,
+            "transparently-fetched bytes hash to the content id"
+        );
+        // The fetch landed in the *shared* cache (a &self read mutated
+        // Peer state), so a fresh local read now hits.
+        assert_eq!(peer_b.cache_len(), 1, "fetch landed in the shared cache tier");
+        assert!(peer_b.try_local(hash).is_some(), "served locally on the next read");
     });
 }
 
