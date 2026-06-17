@@ -502,6 +502,62 @@ fn lazy_read_unavailable_under_crash_then_revives() {
     });
 }
 
+/// Provider fallback across a 3-node mesh: the blob lives on both A and
+/// C; A crashes; B's lazy read must fall back to the surviving holder.
+/// Exercises `fetch_one`'s multi-provider iteration (try next provider
+/// on a dial/op failure) — invisible to the 2-node tests, where there's
+/// only ever one provider.
+#[test]
+fn lazy_fetch_falls_back_to_a_second_holder() {
+    let _g = sim_guard();
+    run_paused(0xFA11, async {
+        let net = SimNet::new(0xFA11, SimConfig::default());
+        let root = key(0xF9);
+        let ka = key(0xA9);
+        let kb = key(0xB9);
+        let kc = key(0xC9);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+        let cap_c = admin_cap(&root, &kc);
+        let all = [cap_a.clone(), cap_b.clone(), cap_c.clone()];
+
+        let (blob, hash) = content_blob(0xFB);
+        // A and C both hold the blob; B does not.
+        let mut store_a = store_with_caps(&all);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let mut store_c = store_with_caps(&all);
+        store_c.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&all);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..50u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+            peer_c.refresh();
+        }
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+
+        // Crash A. Both A and C are DHT providers; B must fall back to C.
+        net.crash(pk(&ka));
+        let got = drive_future(
+            peer_b.fetch_blob(hash),
+            || {
+                peer_c.refresh();
+            },
+            400,
+        )
+        .await
+        .flatten()
+        .expect("B must fall back to the surviving holder C");
+        assert_eq!(blake3::hash(&got).as_bytes(), &hash);
+    });
+}
+
 /// Run one full lazy-fetch scenario under `seed` and return the observed
 /// outcome: the fetched bytes (if any) and the number of sim steps the
 /// fetch took to complete. The step count is latency-sensitive — link
