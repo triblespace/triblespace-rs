@@ -502,6 +502,57 @@ fn lazy_read_unavailable_under_crash_then_revives() {
     });
 }
 
+/// A default `Peer<S, NullCache>` (no cache tier — what `Peer::new`
+/// gives) still fetches lazily: the fetch succeeds and returns the
+/// bytes, but the no-op `NullCache` land caches nothing, so a second
+/// read re-fetches rather than hitting locally. Validates the
+/// cache-less config through the lazy machinery — the `SharedCache<
+/// NullCache>` sink path that the bounded-cache tests never exercise.
+#[test]
+fn nullcache_peer_fetches_but_caches_nothing() {
+    let _g = sim_guard();
+    run_paused(0x0011_0000, async {
+        let net = SimNet::new(0x0011_0000, SimConfig::default());
+        let root = key(0xFC);
+        let ka = key(0xAC);
+        let kb = key(0xBC);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0xCD);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        // bring_up gives a plain `Peer<MemoryRepo, NullCache>` — no cache.
+        let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
+            .await
+            .flatten()
+            .expect("a cache-less peer still fetches from the swarm");
+        assert_eq!(blake3::hash(&got).as_bytes(), &hash);
+
+        // NullCache dropped the land — nothing is cached, nothing local.
+        assert_eq!(peer_b.cache_len(), 0, "NullCache caches nothing");
+        assert!(peer_b.try_local(hash).is_none(), "still a local miss after the fetch");
+
+        // A second read re-fetches and still succeeds.
+        let again = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
+            .await
+            .flatten()
+            .expect("re-fetch succeeds (no local hit to short-circuit)");
+        assert_eq!(blake3::hash(&again).as_bytes(), &hash);
+    });
+}
+
 /// Randomized fault **chaos** — the Jepsen-style property fixed
 /// scenarios miss. Across several seeds, the A↔B link is partitioned and
 /// healed at random steps while B retries its lazy read; the back half
