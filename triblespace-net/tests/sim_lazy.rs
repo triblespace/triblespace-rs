@@ -549,6 +549,89 @@ fn run_lazy_fetch(seed: u64) -> (Option<Vec<u8>>, u32) {
     })
 }
 
+/// Two concurrent transparent reads on the *same* node for the *same*
+/// missing blob. Stresses the 5b shared cache (interior-mutable
+/// `Arc<Mutex>`): both `&self` reads fetch from the swarm and land into
+/// the one shared tier. The conn-pool singleflight should share the dial
+/// to the holder, and the content-addressed cache must end with exactly
+/// one copy — no double-store from the racing lands.
+#[test]
+fn concurrent_transparent_reads_share_cache_and_dedupe() {
+    let _g = sim_guard();
+    run_paused(0xC0FFEE, async {
+        let net = SimNet::new(0xC0FFEE, SimConfig::default());
+        let root = key(0xF8);
+        let ka = key(0xA8);
+        let kb = key(0xB8);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0xCC);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+
+        // Two independent readers off the same Peer — each owns a clone
+        // of the durable+cache snapshot and a fetch capability into the
+        // *same* shared cache. (reader() borrows &mut only transiently.)
+        let reader1 = peer_b.reader().unwrap();
+        let reader2 = peer_b.reader().unwrap();
+
+        let (got1, got2) = {
+            let mut f1 = Box::pin(AsyncBlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(
+                &reader1,
+                Inline::new(hash),
+            ));
+            let mut f2 = Box::pin(AsyncBlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(
+                &reader2,
+                Inline::new(hash),
+            ));
+            let mut r1: Option<_> = None;
+            let mut r2: Option<_> = None;
+            for _ in 0..300u32 {
+                if r1.is_none() {
+                    if let std::task::Poll::Ready(v) = futures::poll!(f1.as_mut()) {
+                        r1 = Some(v);
+                    }
+                }
+                if r2.is_none() {
+                    if let std::task::Poll::Ready(v) = futures::poll!(f2.as_mut()) {
+                        r2 = Some(v);
+                    }
+                }
+                if r1.is_some() && r2.is_some() {
+                    break;
+                }
+                SimNet::step(&vclock(), Duration::from_millis(20)).await;
+                peer_a.refresh();
+            }
+            (r1, r2)
+        };
+
+        let got1 = got1.expect("reader 1 completed").expect("reader 1 fetched");
+        let got2 = got2.expect("reader 2 completed").expect("reader 2 fetched");
+        assert_eq!(blake3::hash(&got1).as_bytes(), &hash);
+        assert_eq!(blake3::hash(&got2).as_bytes(), &hash);
+        // Both racing lands hit the same content-addressed cache: one copy.
+        assert_eq!(
+            peer_b.cache_len(),
+            1,
+            "concurrent lands of the same blob dedupe to a single cache entry"
+        );
+    });
+}
+
 /// The foundational DST guarantee: a simulated run is a **pure function
 /// of `(seed, scenario)`**. The identical scenario under the identical
 /// seed must produce the identical observable — same fetched bytes *and*
