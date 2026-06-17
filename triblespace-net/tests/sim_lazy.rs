@@ -776,6 +776,80 @@ fn concurrent_transparent_reads_share_cache_and_dedupe() {
     });
 }
 
+/// Run a partition → heal → recover lazy fetch under `seed`, returning
+/// the recovered bytes and the steps the *recovery* attempt took. The
+/// scenario scripts a partition (failed attempt), then a heal, then a
+/// timed successful attempt — so the observable folds in both the fault
+/// injection and the latency-sensitive recovery.
+fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
+    run_paused(seed, async move {
+        let net = SimNet::new(seed, SimConfig::default());
+        let root = key(0xF0);
+        let ka = key(0xA0);
+        let kb = key(0xB0);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0x42);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        let pa = pk(&ka);
+        let pb = pk(&kb);
+
+        // Partition → a failed attempt → heal.
+        net.partition(pa, pb);
+        let _ = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120).await;
+        net.heal(pa, pb);
+
+        // Timed recovery attempt.
+        let mut fut = Box::pin(peer_b.fetch_blob(hash));
+        let mut steps = 0u32;
+        let got = loop {
+            if let std::task::Poll::Ready(v) = futures::poll!(fut.as_mut()) {
+                break v;
+            }
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+            steps += 1;
+            if steps > 400 {
+                break None;
+            }
+        };
+        (got, steps)
+    })
+}
+
+/// Determinism of the **faulted** path — the property that makes DST
+/// bug reports reproducible. Fault injection (partition/heal) and the
+/// recovery that follows must be a pure function of the seed too:
+/// otherwise a chaos-found failure couldn't be replayed. If `crash`'s
+/// conn-retain or `partition`'s set bookkeeping ever leaked
+/// non-determinism (HashMap order, wall-clock), the recovery step count
+/// would diverge between identical runs.
+#[test]
+fn faulted_lazy_fetch_is_deterministic() {
+    let _g = sim_guard();
+    let r1 = run_lazy_fetch_partition_recovery(0x0FD0_0001);
+    let r2 = run_lazy_fetch_partition_recovery(0x0FD0_0001);
+    assert!(r1.0.is_some(), "sanity: the fetch recovered after heal");
+    assert_eq!(
+        r1, r2,
+        "partition+heal+recovery is reproducible under the same seed"
+    );
+}
+
 /// The foundational DST guarantee: a simulated run is a **pure function
 /// of `(seed, scenario)`**. The identical scenario under the identical
 /// seed must produce the identical observable — same fetched bytes *and*
