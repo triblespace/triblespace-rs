@@ -507,9 +507,9 @@ fn lazy_read_unavailable_under_crash_then_revives() {
 /// fetch took to complete. The step count is latency-sensitive — link
 /// latencies are drawn from the seeded net RNG — so it's a real
 /// seed-dependent observable, exactly what a determinism check wants.
-fn run_lazy_fetch(seed: u64) -> (Option<Vec<u8>>, u32) {
+fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
     run_paused(seed, async move {
-        let net = SimNet::new(seed, SimConfig::default());
+        let net = SimNet::new(seed, config);
         let root = key(0xF0);
         let ka = key(0xA0);
         let kb = key(0xB0);
@@ -641,8 +641,8 @@ fn concurrent_transparent_reads_share_cache_and_dedupe() {
 #[test]
 fn lazy_fetch_is_deterministic_across_runs() {
     let _g = sim_guard();
-    let (bytes1, steps1) = run_lazy_fetch(0x0DDD_0001);
-    let (bytes2, steps2) = run_lazy_fetch(0x0DDD_0001);
+    let (bytes1, steps1) = run_lazy_fetch(0x0DDD_0001, SimConfig::default());
+    let (bytes2, steps2) = run_lazy_fetch(0x0DDD_0001, SimConfig::default());
     assert!(bytes1.is_some(), "sanity: the fetch actually succeeded");
     assert_eq!(bytes1, bytes2, "same seed → identical fetched bytes");
     assert_eq!(
@@ -660,10 +660,30 @@ fn lazy_fetch_succeeds_across_many_seeds() {
     let _g = sim_guard();
     for s in 0..16u64 {
         let seed = 0x5EED_0000 + s;
-        let (got, steps) = run_lazy_fetch(seed);
+        let (got, steps) = run_lazy_fetch(seed, SimConfig::default());
         assert!(
             got.is_some(),
             "lazy fetch must succeed under seed {seed:#x} (gave up after {steps} steps)"
         );
     }
+}
+
+/// The content layer is decoupled from the gossip layer. Under **total
+/// gossip loss** the branch-sync/announce mesh is dark — but the lazy
+/// read uses the DHT (a global provider record) plus a direct authed
+/// dial, neither of which is gossip, so it must still succeed. A
+/// regression that accidentally routed content discovery through gossip
+/// would fail here.
+#[test]
+fn lazy_fetch_is_independent_of_gossip_liveness() {
+    let _g = sim_guard();
+    let config = SimConfig {
+        gossip_drop_prob: 1.0,
+        ..SimConfig::default()
+    };
+    let (got, steps) = run_lazy_fetch(0x6055_1055, config);
+    assert!(
+        got.is_some(),
+        "lazy fetch must succeed despite total gossip loss (gave up after {steps} steps)"
+    );
 }
