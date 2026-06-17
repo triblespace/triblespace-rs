@@ -501,3 +501,86 @@ fn lazy_read_unavailable_under_crash_then_revives() {
         assert_eq!(blake3::hash(&got).as_bytes(), &hash);
     });
 }
+
+/// Run one full lazy-fetch scenario under `seed` and return the observed
+/// outcome: the fetched bytes (if any) and the number of sim steps the
+/// fetch took to complete. The step count is latency-sensitive — link
+/// latencies are drawn from the seeded net RNG — so it's a real
+/// seed-dependent observable, exactly what a determinism check wants.
+fn run_lazy_fetch(seed: u64) -> (Option<Vec<u8>>, u32) {
+    run_paused(seed, async move {
+        let net = SimNet::new(seed, SimConfig::default());
+        let root = key(0xF0);
+        let ka = key(0xA0);
+        let kb = key(0xB0);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        let (blob, hash) = content_blob(0x42);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let peer_b =
+            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        // Drive the fetch, counting steps until completion.
+        let mut fut = Box::pin(peer_b.fetch_blob(hash));
+        let mut steps = 0u32;
+        let got = loop {
+            if let std::task::Poll::Ready(v) = futures::poll!(fut.as_mut()) {
+                break v;
+            }
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+            steps += 1;
+            if steps > 600 {
+                break None;
+            }
+        };
+        (got, steps)
+    })
+}
+
+/// The foundational DST guarantee: a simulated run is a **pure function
+/// of `(seed, scenario)`**. The identical scenario under the identical
+/// seed must produce the identical observable — same fetched bytes *and*
+/// same step count. A regression that leaked real wall-clock time, or
+/// `HashMap`/`HashSet` iteration order, or any unseeded randomness into
+/// the sim would diverge here.
+#[test]
+fn lazy_fetch_is_deterministic_across_runs() {
+    let _g = sim_guard();
+    let (bytes1, steps1) = run_lazy_fetch(0x0DDD_0001);
+    let (bytes2, steps2) = run_lazy_fetch(0x0DDD_0001);
+    assert!(bytes1.is_some(), "sanity: the fetch actually succeeded");
+    assert_eq!(bytes1, bytes2, "same seed → identical fetched bytes");
+    assert_eq!(
+        steps1, steps2,
+        "same seed → identical step count: the sim is a pure function of the seed"
+    );
+}
+
+/// Liveness property across the seed space: under a healthy network, the
+/// lazy read must *always* eventually succeed, whatever the seed-chosen
+/// link latencies and id minting. Property-based DST — catches
+/// seed-dependent liveness bugs a single hand-picked seed would miss.
+#[test]
+fn lazy_fetch_succeeds_across_many_seeds() {
+    let _g = sim_guard();
+    for s in 0..16u64 {
+        let seed = 0x5EED_0000 + s;
+        let (got, steps) = run_lazy_fetch(seed);
+        assert!(
+            got.is_some(),
+            "lazy fetch must succeed under seed {seed:#x} (gave up after {steps} steps)"
+        );
+    }
+}
