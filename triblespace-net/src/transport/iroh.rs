@@ -172,9 +172,7 @@ pub async fn bind(
     config: &PeerConfig,
 ) -> Option<Harness<IrohTransport>> {
     use iroh::endpoint::presets;
-    use iroh::protocol::Router;
     use iroh::Endpoint;
-    use iroh_gossip::Gossip;
 
     // Use the OS trust store (via rustls-platform-verifier) rather
     // than the compiled-in Mozilla webpki-roots bundle. The default
@@ -219,6 +217,24 @@ pub async fn bind(
         }
     }
     ep.online().await;
+
+    Some(bind_with_endpoint(ep, config).await)
+}
+
+/// Wire the full transport stack (DHT node, protocol-forwarding
+/// handlers, gossip topic, router) over an already-bound endpoint, and
+/// return the [`Harness`] the host loop runs against.
+///
+/// Factored out of [`bind`] so a caller can supply its own endpoint —
+/// notably an `iroh::test_utils` `TestNetwork` endpoint for integration
+/// tests that wire two real `Peer`s over a virtual transport (no relays,
+/// no DNS), the way `auth_handshake_e2e` does for raw endpoints.
+pub async fn bind_with_endpoint(
+    ep: iroh::Endpoint,
+    config: &PeerConfig,
+) -> Harness<IrohTransport> {
+    use iroh::protocol::Router;
+    use iroh_gossip::Gossip;
 
     let my_id = ep.id();
     let mut router_builder = Router::builder(ep.clone());
@@ -319,9 +335,9 @@ pub async fn bind(
         }),
     };
 
-    Some(Harness {
+    Harness {
         transport,
         incoming: inc_rx,
         gossip,
-    })
+    }
 }
