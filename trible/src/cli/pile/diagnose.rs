@@ -209,10 +209,11 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 }
                             }
                             let meta_hash: Inline<Hash<Blake3>> = Handle::to_hash(meta_handle);
-                            let meta_hex: String = meta_hash.from_inline();
+                            // `from_inline` already yields the "blake3:HEX" form — don't re-prefix.
+                            let meta_ref: String = meta_hash.from_inline();
                             if let Some(n) = name_val.as_ref() {
                                 println!(
-                                    "- {id_hex} ({n}): meta blake3:{meta_hex} [{}]{}",
+                                    "- {id_hex} ({n}): meta {meta_ref} [{}]{}",
                                     if meta_present { "present" } else { "missing" },
                                     meta_err
                                         .as_deref()
@@ -221,7 +222,7 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                                 );
                             } else {
                                 println!(
-                                    "- {id_hex}: meta blake3:{meta_hex} [{}]{}",
+                                    "- {id_hex}: meta {meta_ref} [{}]{}",
                                     if meta_present { "present" } else { "missing" },
                                     meta_err
                                         .as_deref()

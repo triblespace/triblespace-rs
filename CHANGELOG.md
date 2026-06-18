@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`trible pile diagnose check` no longer doubles the blake3 prefix.** The
+  per-branch `meta` line printed `meta blake3:blake3:<hex>` because it prepended
+  `blake3:` to a string `from_inline()` already returns in `blake3:<hex>` form.
+  Cosmetic only.
+
 ## [0.46.4] - 2026-06-10
 
 ### Fixed
