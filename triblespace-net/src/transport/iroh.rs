@@ -3,7 +3,7 @@
 //!
 //! Everything iroh-specific that used to live inline in the host
 //! loop's startup — endpoint building (relay map, CA roots, mDNS +
-//! pkarr + DHT address lookup), protocol-handler registration, gossip
+//! pkarr + mDNS address lookup), protocol-handler registration, gossip
 //! topic join, DHT node spawn — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
@@ -160,7 +160,7 @@ impl iroh::protocol::ProtocolHandler for ForwardHandler {
 }
 
 /// Build the production transport: bind the iroh endpoint (OS trust
-/// store, dot-stripped default relays, mDNS + pkarr + DHT address
+/// store, dot-stripped default relays, N0 pkarr+DNS + mDNS address
 /// lookup), spawn the embedded DHT node, register the protocol-
 /// forwarding handlers, join the team gossip topic when configured,
 /// and spawn the router.
@@ -189,34 +189,15 @@ pub async fn bind(
     // story.
     let relay_map = crate::host::dot_stripped_default_relay_map();
 
-    // Discovery is layered. `presets::N0` gives us pkarr publish +
-    // DNS lookup via n0.computer. On top of that:
-    //
-    // - `MdnsAddressLookup` adds local-network discovery (zero-conf,
-    //   no internet needed).
-    // - `DhtAddressLookup` (pkarr-over-BitTorrent-DHT) gives a third
-    //   discovery path that doesn't depend on n0.computer's DNS
-    //   server being reachable.
-    //
-    // All providers run in parallel; lookup results are unioned.
-    let mdns = match iroh::address_lookup::MdnsAddressLookup::builder()
-        .build(EndpointId::from(secret.public()))
-    {
-        Ok(m) => Some(m),
-        Err(e) => {
-            warn!(error = %e, "mDNS discovery init failed; continuing without LAN discovery");
-            None
-        }
-    };
-
-    let mut builder = Endpoint::builder(presets::N0)
+    // Discovery: `presets::N0` gives pkarr publish + DNS lookup via
+    // n0.computer. On top of that we add mDNS for local-network
+    // discovery (zero-conf, no internet needed). pkarr-DHT address
+    // discovery was removed from iroh core in 1.0; we deliberately stay
+    // on the well-supported N0 + mDNS path rather than re-add it.
+    let builder = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
-        .ca_roots_config(iroh::tls::CaRootsConfig::system())
-        .relay_mode(iroh::RelayMode::Custom(relay_map))
-        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
-    if let Some(m) = mdns {
-        builder = builder.address_lookup(m);
-    }
+        .ca_tls_config(iroh::tls::CaTlsConfig::system())
+        .relay_mode(iroh::RelayMode::Custom(relay_map));
     let ep = match builder.bind().await {
         Ok(ep) => ep,
         Err(e) => {
@@ -224,6 +205,19 @@ pub async fn bind(
             return None;
         }
     };
+    // mDNS is best-effort — add it post-bind so a failure (e.g. no
+    // multicast on the interface) degrades to N0-only rather than
+    // failing the whole endpoint.
+    match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()) {
+        Ok(mdns) => {
+            if let Ok(al) = ep.address_lookup() {
+                al.add(mdns);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "mDNS discovery init failed; continuing without LAN discovery")
+        }
+    }
     ep.online().await;
 
     let my_id = ep.id();

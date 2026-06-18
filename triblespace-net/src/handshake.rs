@@ -224,7 +224,7 @@ pub async fn respond<W: AsyncWrite + Unpin>(send: &mut W, status: u8) -> Result<
 // long-lived daemon to dispatch through).
 //
 // The endpoint config mirrors the daemon's (`host::spawn`): same
-// dot-stripped relay map, same MdnsAddressLookup + DhtAddressLookup
+// dot-stripped relay map, same N0 (pkarr+DNS) + mDNS discovery
 // providers so we can reach peers on LAN or via mainline DHT
 // regardless of whether n0.computer's DNS is reachable. Outbound-only
 // here — no incoming-stream router, no pkarr publish (we're not
@@ -241,25 +241,24 @@ pub async fn one_shot_endpoint(
 ) -> Result<iroh::Endpoint> {
     use iroh::Endpoint;
     use iroh::endpoint::presets;
-    use iroh_base::EndpointId;
 
     let secret = crate::identity::iroh_secret(&key);
     let relay_map = crate::host::dot_stripped_default_relay_map();
-    let mdns = iroh::address_lookup::MdnsAddressLookup::builder()
-        .build(EndpointId::from(secret.public()))
-        .ok();
-    let mut builder = Endpoint::builder(presets::N0)
+    // N0 preset (pkarr + DNS) + best-effort mDNS, matching
+    // transport::iroh::bind. pkarr-DHT discovery dropped in the iroh 1.0
+    // upgrade (removed from core).
+    let ep = Endpoint::builder(presets::N0)
         .secret_key(secret)
-        .ca_roots_config(iroh::tls::CaRootsConfig::system())
+        .ca_tls_config(iroh::tls::CaTlsConfig::system())
         .relay_mode(iroh::RelayMode::Custom(relay_map))
-        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
-    if let Some(m) = mdns {
-        builder = builder.address_lookup(m);
-    }
-    let ep = builder
         .bind()
         .await
         .map_err(|e| anyhow!("endpoint bind: {e}"))?;
+    if let Ok(mdns) = iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(ep.id()) {
+        if let Ok(al) = ep.address_lookup() {
+            al.add(mdns);
+        }
+    }
     ep.online().await;
     Ok(ep)
 }
