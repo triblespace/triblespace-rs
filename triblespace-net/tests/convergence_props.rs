@@ -329,6 +329,69 @@ fn line_topology_converges_transitively() {
     );
 }
 
+/// Add one more distinct commit to a peer's branch (a live write).
+fn commit_more(peer: &mut Peer, tag: u8) {
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::macros::entity;
+    let id = lookup_id(&mut peer.repo, BRANCH);
+    let mut ws = peer.repo.pull(id).unwrap();
+    let mut idb = [0u8; 16];
+    idb[0] = 0x60;
+    idb[1] = tag;
+    let e = Id::new(idb).unwrap();
+    let mut vb = [0u8; 16];
+    vb[0] = 0x70;
+    vb[1] = tag;
+    let payload: TribleSet = entity! {
+        ExclusiveId::force_ref(&e) @
+        triblespace_core::metadata::tag: Id::new(vb).unwrap(),
+    }
+    .into();
+    ws.commit(payload, &format!("live write {tag}"));
+    peer.repo.push(&mut ws).unwrap();
+}
+
+/// Convergence under *ongoing* writes: peers keep committing *while*
+/// the gossip is in flight, not just once up front. After the writes
+/// stop and the mesh drains, everyone converges to the union of ALL
+/// commits — the realistic "live system" case the commit-once-then-sync
+/// tests don't reach. Monotonic merge means a moving target still
+/// converges once writes cease.
+#[test]
+fn convergence_under_ongoing_writes() {
+    let n = 3usize;
+    let mut peers = diverged_peers(n); // each starts with 1 commit
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x1117_0001);
+
+    let mut extra = 0u8;
+    for round in 0..(n * n * 4) {
+        // Interleave live writes with random gossip.
+        if round % 4 == 0 {
+            let i = rng.gen_range(0..n);
+            extra += 1;
+            commit_more(&mut peers[i], extra);
+        }
+        let from = rng.gen_range(0..n);
+        let to = rng.gen_range(0..n);
+        sync(&mut peers, to, from);
+    }
+
+    // Writes have stopped; drain to quiescence.
+    drain_to_quiescence(&mut peers);
+    all_converged(&mut peers);
+
+    let full = content(&mut peers[0].repo, BRANCH);
+    for i in 1..n {
+        assert_eq!(content(&mut peers[i].repo, BRANCH), full, "peer {i} content");
+    }
+    // The union includes the initial n commits plus every live write.
+    assert_eq!(
+        full.len() as u8,
+        n as u8 + extra,
+        "converged content must hold every commit (initial + live writes)"
+    );
+}
+
 // NOTE: there is deliberately no "same seed → identical commit hash"
 // test here. Authored commits carry `created_at = epoch_now()`
 // (commit.rs), which is only reproducible under the *seeded virtual
