@@ -99,6 +99,7 @@ fn sync_round(
         &remote_head,
         branch_name,
         remote_publisher,
+        false,
     )
     .expect("ensure tracking");
     merge_tracking_into_local(local, tracking_id, branch_name).expect("merge")
@@ -208,11 +209,11 @@ fn parallel_merges_produce_identical_commits() {
     let b_head = remote_head_hash(&mut b, "main");
 
     let tracking_in_a = ensure_tracking_pin(
-        a.storage_mut(), b_branch_id, &b_head, "main", &pub_b,
+        a.storage_mut(), b_branch_id, &b_head, "main", &pub_b, false,
     )
     .unwrap();
     let tracking_in_b = ensure_tracking_pin(
-        b.storage_mut(), a_branch_id, &a_head, "main", &pub_a,
+        b.storage_mut(), a_branch_id, &a_head, "main", &pub_a, false,
     )
     .unwrap();
 

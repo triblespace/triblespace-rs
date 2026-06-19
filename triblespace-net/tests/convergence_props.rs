@@ -80,7 +80,7 @@ fn sync_round(
     let from_branch_id = lookup_id(from, branch);
     let from_head = remote_head_hash(from, branch);
     let tracking_id =
-        ensure_tracking_pin(to.storage_mut(), from_branch_id, &from_head, branch, from_pub)
+        ensure_tracking_pin(to.storage_mut(), from_branch_id, &from_head, branch, from_pub, false)
             .expect("ensure tracking");
     merge_tracking_into_local(to, tracking_id, branch).expect("merge")
 }

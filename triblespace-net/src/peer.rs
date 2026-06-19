@@ -383,6 +383,10 @@ where
                                     &head,
                                     &name,
                                     &publisher,
+                                    // Gossip-driven auto-tracking stays strong
+                                    // (eager) for now; the weak/lazy path is
+                                    // opt-in and wired separately.
+                                    false,
                                 );
                                 tracing::trace!(
                                     head = %hex::encode(&head[..4]),
