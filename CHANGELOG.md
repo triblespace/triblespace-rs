@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   component that layers young-to-old Pile generations, union reads, per-blob
   strong/weak retention, weak-veto reachability pruning, and size-triggered
   strong tenuring without changing existing Peer or Pile APIs.
+- **Physical reclamation for `repo::yard`.** Adds explicit `Yard::reclaim()`
+  rewriting each generation's Pile to a sibling temporary Pile containing only
+  the current live set, then atomically renaming it over the original so
+  logically evicted blobs release disk space.
 
 ### Fixed
 

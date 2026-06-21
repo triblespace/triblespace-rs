@@ -3,14 +3,16 @@
 //! A [`Yard`] keeps an ordered young-to-old sequence of [`Pile`](super::pile::Pile)
 //! generations. Writes land in the youngest generation, reads search the union
 //! of each generation's live PATCH set, and retention/compaction update those
-//! PATCH sets without changing Pile's append-only storage contract.
+//! PATCH sets without changing Pile's append-only storage contract. Call
+//! [`Yard::reclaim`] after collection when the logically evicted blobs should
+//! also be physically removed from disk.
 
 use std::cmp::Reverse;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anybytes::Bytes;
@@ -106,6 +108,7 @@ impl Default for YardConfig {
 
 #[derive(Debug)]
 struct Generation {
+    path: PathBuf,
     pile: Option<Pile>,
     live: HandleSet,
 }
@@ -143,6 +146,7 @@ impl Yard {
             let mut pile = Pile::open(&path).map_err(YardOpenError::Pile)?;
             pile.restore().map_err(YardOpenError::Pile)?;
             generations.push(Generation {
+                path,
                 pile: Some(pile),
                 live: HandleSet::new(),
             });
@@ -174,6 +178,7 @@ impl Yard {
             let reader = pile.reader().map_err(YardOpenError::Pile)?;
             let live = collect_list(reader.blobs()).map_err(YardOpenError::List)?;
             generations.push(Generation {
+                path,
                 pile: Some(pile),
                 live,
             });
@@ -303,6 +308,40 @@ impl Yard {
         }
 
         self.collect()
+    }
+
+    /// Physically rewrite each generation's pile to contain only its live set.
+    ///
+    /// Collection and compaction are logical operations: they update each
+    /// generation's live PATCH set, so evicted blobs stop being readable through
+    /// Yard readers, but they do not mutate the underlying append-only pile
+    /// files. `reclaim` is the explicit physical step. For each generation it
+    /// writes the current live handles to a sibling temporary pile with
+    /// [`transfer`], closes both piles, atomically renames the temporary file
+    /// over the original on the same filesystem, and reopens the generation.
+    pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
+        for (level, generation) in self.generations.iter_mut().enumerate() {
+            let path = generation.path.clone();
+            let temp_path = reclaim_temp_path(&path, level);
+            let live = generation.live.clone();
+            let pile = generation
+                .pile
+                .take()
+                .expect("yard generation pile already closed");
+
+            match reclaim_generation(&path, &temp_path, &live, pile) {
+                Ok(pile) => generation.pile = Some(pile),
+                Err(err) => {
+                    if let Ok(mut pile) = Pile::open(&path) {
+                        if pile.restore().is_ok() {
+                            generation.pile = Some(pile);
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn strong_budget_for(&self, level: usize) -> usize {
@@ -579,6 +618,52 @@ fn collect_list<E>(
     Ok(set)
 }
 
+fn reclaim_generation(
+    path: &Path,
+    temp_path: &Path,
+    live: &HandleSet,
+    mut old_pile: Pile,
+) -> Result<Pile, YardReclaimError> {
+    match fs::remove_file(temp_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(YardReclaimError::Io(err)),
+    }
+
+    let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
+    File::create(temp_path).map_err(YardReclaimError::Io)?;
+    let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
+    let handles: Vec<_> = live
+        .clone()
+        .into_iter()
+        .map(Inline::<Handle<UnknownBlob>>::new)
+        .collect();
+
+    for result in transfer(&reader, &mut new_pile, handles) {
+        result.map_err(YardReclaimError::Transfer)?;
+    }
+
+    new_pile.close().map_err(YardReclaimError::Close)?;
+    drop(reader);
+    old_pile.close().map_err(YardReclaimError::Close)?;
+    fs::rename(temp_path, path).map_err(YardReclaimError::Io)?;
+
+    let mut reopened = Pile::open(path).map_err(YardReclaimError::Pile)?;
+    reopened.restore().map_err(YardReclaimError::Pile)?;
+    Ok(reopened)
+}
+
+fn reclaim_temp_path(path: &Path, level: usize) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "generation".into());
+    path.with_file_name(format!(
+        ".{file_name}.reclaim-{}-{level}.tmp",
+        std::process::id()
+    ))
+}
+
 #[derive(Debug)]
 pub enum YardOpenError {
     NoGenerations,
@@ -664,17 +749,46 @@ impl fmt::Display for YardCloseError {
 
 impl Error for YardCloseError {}
 
+#[derive(Debug)]
+pub enum YardReclaimError {
+    Io(std::io::Error),
+    Pile(ReadError),
+    Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
+    Close(super::pile::FlushError),
+}
+
+impl fmt::Display for YardReclaimError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
+            Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
+            Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
+            Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
+        }
+    }
+}
+
+impl Error for YardReclaimError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
 
-    fn yard_with(generations: usize, config: YardConfig) -> (tempfile::TempDir, Yard) {
+    fn yard_with_paths(
+        generations: usize,
+        config: YardConfig,
+    ) -> (tempfile::TempDir, Vec<PathBuf>, Yard) {
         let dir = tempfile::tempdir().unwrap();
         let paths = (0..generations)
             .map(|i| dir.path().join(format!("gen-{i}.pile")))
             .collect::<Vec<_>>();
-        let yard = Yard::create(paths, config).unwrap();
+        let yard = Yard::create(paths.clone(), config).unwrap();
+        (dir, paths, yard)
+    }
+
+    fn yard_with(generations: usize, config: YardConfig) -> (tempfile::TempDir, Yard) {
+        let (dir, _paths, yard) = yard_with_paths(generations, config);
         (dir, yard)
     }
 
@@ -691,6 +805,16 @@ mod tests {
         handle: Inline<Handle<RawBytes>>,
     ) -> Result<Bytes, YardGetError<Infallible>> {
         reader.get::<Bytes, RawBytes>(handle)
+    }
+
+    fn pile_blob_count(path: &Path) -> usize {
+        let mut pile = Pile::open(path).unwrap();
+        pile.restore().unwrap();
+        let reader = pile.reader().unwrap();
+        let count = reader.blobs().collect::<Result<Vec<_>, _>>().unwrap().len();
+        drop(reader);
+        pile.close().unwrap();
+        count
     }
 
     #[test]
@@ -824,5 +948,67 @@ mod tests {
 
         assert!(matches!(get_raw(&reader, old), Err(YardGetError::NotFound)));
         assert_eq!(get_raw(&reader, new).unwrap(), raw_blob(b"new"));
+    }
+
+    #[test]
+    fn reclaim_rewrites_generation_to_live_blobs_only() {
+        let (_dir, paths, mut yard) = yard_with_paths(
+            1,
+            YardConfig {
+                weak_budget: 0,
+                ..YardConfig::default()
+            },
+        );
+        let live = yard
+            .put::<RawBytes, _>(Bytes::from_source(vec![b'L'; 512]))
+            .unwrap();
+        let evicted = yard
+            .put::<RawBytes, _>(Bytes::from_source(vec![b'E'; 4096]))
+            .unwrap();
+
+        yard.pin_strong(pin_id(6), live);
+        yard.collect().unwrap();
+        let before_size = fs::metadata(&paths[0]).unwrap().len();
+        let before_count = pile_blob_count(&paths[0]);
+        let before_reader = yard.reader().unwrap();
+        let live_before = get_raw(&before_reader, live).unwrap();
+
+        assert!(matches!(
+            get_raw(&before_reader, evicted),
+            Err(YardGetError::NotFound)
+        ));
+        assert_eq!(before_count, 2);
+
+        yard.reclaim().unwrap();
+
+        let after_size = fs::metadata(&paths[0]).unwrap().len();
+        let after_count = pile_blob_count(&paths[0]);
+        let after_reader = yard.reader().unwrap();
+
+        assert!(after_size < before_size);
+        assert_eq!(after_count, 1);
+        assert_eq!(get_raw(&after_reader, live).unwrap(), live_before);
+        assert!(matches!(
+            get_raw(&after_reader, evicted),
+            Err(YardGetError::NotFound)
+        ));
+
+        let mut fresh_pile = Pile::open(&paths[0]).unwrap();
+        fresh_pile.restore().unwrap();
+        let fresh_reader = fresh_pile.reader().unwrap();
+        assert_eq!(
+            fresh_reader.get::<Bytes, RawBytes>(live).unwrap(),
+            live_before
+        );
+        assert!(matches!(
+            fresh_reader.get::<Bytes, RawBytes>(evicted),
+            Err(GetBlobError::BlobNotFound)
+        ));
+        drop(fresh_reader);
+        fresh_pile.close().unwrap();
+
+        yard.reclaim().unwrap();
+        assert_eq!(fs::metadata(&paths[0]).unwrap().len(), after_size);
+        assert_eq!(pile_blob_count(&paths[0]), after_count);
     }
 }
