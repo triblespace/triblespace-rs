@@ -155,3 +155,9 @@ prioritized for efficient zero-copy access.
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving
   live readers while replacing generation files.
+- Yard compact currently leaves a retained weak-pinned blob in the oldest
+  generation if the blob had already tenured before it was weak-pinned. Decide
+  whether weak-pinning old content should promote it back to young storage or
+  make collection evict it despite weak budget retention; see the ignored
+  `weak_pin_on_already_tenured_blob_stays_old_after_compact_bug` regression in
+  `repo::yard` tests.

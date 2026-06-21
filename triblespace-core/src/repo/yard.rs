@@ -774,6 +774,7 @@ impl Error for YardReclaimError {}
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     fn yard_with_paths(
         generations: usize,
@@ -1010,5 +1011,561 @@ mod tests {
         yard.reclaim().unwrap();
         assert_eq!(fs::metadata(&paths[0]).unwrap().len(), after_size);
         assert_eq!(pile_blob_count(&paths[0]), after_count);
+    }
+
+    mod dst {
+        use super::*;
+
+        const GENERATIONS: usize = 4;
+        const SEEDS: u64 = 50;
+        const STEPS: usize = 64;
+        const PIN_COUNT: usize = 8;
+
+        type RawHandle = [u8; INLINE_LEN];
+
+        #[derive(Debug, Clone)]
+        struct Model {
+            handles: Vec<RawHandle>,
+            bytes: BTreeMap<RawHandle, Vec<u8>>,
+            absent: Vec<RawHandle>,
+        }
+
+        impl Model {
+            fn new() -> Self {
+                Self {
+                    handles: Vec::new(),
+                    bytes: BTreeMap::new(),
+                    absent: Vec::new(),
+                }
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct FinalState {
+            live_by_generation: Vec<Vec<RawHandle>>,
+            readable: Vec<RawHandle>,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum WeakPinMode {
+            YoungOnly,
+            AnyKnownHandle,
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct SplitMix64 {
+            state: u64,
+        }
+
+        impl SplitMix64 {
+            fn new(seed: u64) -> Self {
+                Self { state: seed }
+            }
+
+            fn next_u64(&mut self) -> u64 {
+                self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+
+            fn index(&mut self, len: usize) -> usize {
+                (self.next_u64() as usize) % len
+            }
+
+            fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+                self.next_u64() % denominator < numerator
+            }
+
+            fn fill(&mut self, bytes: &mut [u8]) {
+                for chunk in bytes.chunks_mut(8) {
+                    let random = self.next_u64().to_le_bytes();
+                    chunk.copy_from_slice(&random[..chunk.len()]);
+                }
+            }
+        }
+
+        fn unknown(raw: RawHandle) -> Inline<Handle<UnknownBlob>> {
+            Inline::<Handle<UnknownBlob>>::new(raw)
+        }
+
+        fn pin_id(index: usize) -> Id {
+            Id::new([(index as u8).wrapping_add(1); 16]).unwrap()
+        }
+
+        fn live_sets(yard: &Yard) -> Vec<BTreeSet<RawHandle>> {
+            yard.generations
+                .iter()
+                .map(|generation| generation.live.clone().into_iter().collect())
+                .collect()
+        }
+
+        fn live_union(yard: &Yard) -> BTreeSet<RawHandle> {
+            live_sets(yard).into_iter().flatten().collect()
+        }
+
+        fn weak_pins(yard: &Yard) -> BTreeMap<RawHandle, u64> {
+            let weak_state = yard.weak_state.lock().expect("weak pin mutex poisoned");
+            weak_state
+                .pins
+                .clone()
+                .into_iter()
+                .map(|raw| {
+                    let pin = weak_state
+                        .pins
+                        .get(&raw)
+                        .expect("weak pin key resolves")
+                        .last_used;
+                    (raw, pin)
+                })
+                .collect()
+        }
+
+        fn strong_roots(yard: &Yard) -> Vec<RawHandle> {
+            (&yard.strong_pins)
+                .into_iter()
+                .filter_map(|pin| yard.strong_pins.get(pin).copied())
+                .map(|handle| handle.raw)
+                .collect()
+        }
+
+        fn budgeted_weak(
+            weak: &BTreeMap<RawHandle, u64>,
+            present: &BTreeSet<RawHandle>,
+            budget: usize,
+        ) -> BTreeSet<RawHandle> {
+            let mut candidates = weak
+                .iter()
+                .filter(|(raw, _)| present.contains(*raw))
+                .map(|(raw, last_used)| (*raw, *last_used))
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|(_, last_used)| Reverse(*last_used));
+            candidates
+                .into_iter()
+                .take(budget)
+                .map(|(raw, _)| raw)
+                .collect()
+        }
+
+        fn child_chunks(bytes: &[u8]) -> impl Iterator<Item = RawHandle> + '_ {
+            bytes.chunks_exact(INLINE_LEN).map(|chunk| {
+                let mut raw = [0u8; INLINE_LEN];
+                raw.copy_from_slice(chunk);
+                raw
+            })
+        }
+
+        fn model_strong_keep(
+            roots: &[RawHandle],
+            present: &BTreeSet<RawHandle>,
+            weak: &BTreeSet<RawHandle>,
+            model: &Model,
+        ) -> BTreeSet<RawHandle> {
+            let mut queue = VecDeque::new();
+            for root in roots {
+                if !weak.contains(root) {
+                    queue.push_back(*root);
+                }
+            }
+
+            let mut keep = BTreeSet::new();
+            while let Some(raw) = queue.pop_front() {
+                if !keep.insert(raw) || !present.contains(&raw) {
+                    continue;
+                }
+
+                let Some(bytes) = model.bytes.get(&raw) else {
+                    continue;
+                };
+
+                for child in child_chunks(bytes) {
+                    if !weak.contains(&child)
+                        && present.contains(&child)
+                        && model.bytes.contains_key(&child)
+                        && !keep.contains(&child)
+                    {
+                        queue.push_back(child);
+                    }
+                }
+            }
+
+            keep
+        }
+
+        fn expected_live_after_collect(yard: &Yard, model: &Model) -> BTreeSet<RawHandle> {
+            let present = live_union(yard);
+            let weak_with_lru = weak_pins(yard);
+            let weak = weak_with_lru.keys().copied().collect::<BTreeSet<_>>();
+            let strong_keep = model_strong_keep(&strong_roots(yard), &present, &weak, model);
+            let weak_keep = budgeted_weak(&weak_with_lru, &present, yard.config.weak_budget);
+
+            present
+                .into_iter()
+                .filter(|raw| strong_keep.contains(raw) || weak_keep.contains(raw))
+                .collect()
+        }
+
+        fn assert_readable_bytes(
+            reader: &YardReader,
+            raw: RawHandle,
+            expected: &[u8],
+            seed: u64,
+            step: usize,
+        ) {
+            let actual = reader
+                .get_local::<Bytes, UnknownBlob>(unknown(raw))
+                .unwrap_or_else(|| {
+                    panic!("seed {seed} step {step}: live handle {raw:02X?} was not readable")
+                })
+                .unwrap_or_else(|err| {
+                    panic!("seed {seed} step {step}: live handle {raw:02X?} errored: {err}")
+                });
+            assert_eq!(
+                actual.as_ref(),
+                expected,
+                "seed {seed} step {step}: readable bytes changed for {raw:02X?}"
+            );
+        }
+
+        fn assert_general_invariants(yard: &mut Yard, model: &Model, seed: u64, step: usize) {
+            let reader = yard.reader().unwrap();
+            let live = live_union(yard);
+            let weak = weak_pins(yard).keys().copied().collect::<BTreeSet<_>>();
+            let strong_keep = model_strong_keep(&strong_roots(yard), &live, &weak, model);
+
+            for raw in strong_keep.intersection(&live) {
+                let expected = model
+                    .bytes
+                    .get(raw)
+                    .unwrap_or_else(|| panic!("seed {seed} step {step}: unknown live handle"));
+                assert_readable_bytes(&reader, *raw, expected, seed, step);
+            }
+
+            for raw in weak.intersection(&strong_keep) {
+                panic!("seed {seed} step {step}: weak pin {raw:02X?} leaked into strong keep");
+            }
+
+            for raw in &live {
+                let expected = model.bytes.get(raw).unwrap_or_else(|| {
+                    panic!("seed {seed} step {step}: live set has unknown blob")
+                });
+                assert_readable_bytes(&reader, *raw, expected, seed, step);
+                let _ = reader.children(unknown(*raw));
+            }
+
+            for raw in model.bytes.keys().filter(|raw| !live.contains(*raw)) {
+                assert!(
+                    reader
+                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
+                        .is_none(),
+                    "seed {seed} step {step}: non-live handle {raw:02X?} was readable"
+                );
+            }
+
+            for raw in &model.absent {
+                assert!(
+                    reader
+                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
+                        .is_none(),
+                    "seed {seed} step {step}: absent handle {raw:02X?} became readable"
+                );
+                assert!(
+                    reader.children(unknown(*raw)).is_empty(),
+                    "seed {seed} step {step}: absent handle {raw:02X?} had children"
+                );
+            }
+        }
+
+        fn assert_exact_collect_result(
+            yard: &mut Yard,
+            expected: &BTreeSet<RawHandle>,
+            model: &Model,
+            seed: u64,
+            step: usize,
+        ) {
+            let actual = live_union(yard);
+            assert_eq!(
+                &actual, expected,
+                "seed {seed} step {step}: live union after collection did not equal keep set"
+            );
+            assert_general_invariants(yard, model, seed, step);
+        }
+
+        fn assert_weak_never_tenures_after_compact(yard: &Yard, seed: u64, step: usize) {
+            let Some(oldest) = live_sets(yard).last().cloned() else {
+                return;
+            };
+            let weak = weak_pins(yard).keys().copied().collect::<BTreeSet<_>>();
+            let tenured_weak = oldest.intersection(&weak).copied().collect::<Vec<_>>();
+            assert!(
+                tenured_weak.is_empty(),
+                "seed {seed} step {step}: weak-pinned blobs reached oldest generation: {tenured_weak:02X?}"
+            );
+        }
+
+        fn snapshot_readable(yard: &mut Yard) -> BTreeMap<RawHandle, Vec<u8>> {
+            let reader = yard.reader().unwrap();
+            live_union(yard)
+                .into_iter()
+                .filter_map(|raw| {
+                    reader
+                        .get_local::<Bytes, UnknownBlob>(unknown(raw))
+                        .map(|result| (raw, result.unwrap().as_ref().to_vec()))
+                })
+                .collect()
+        }
+
+        fn assert_reclaim_preserved(
+            yard: &mut Yard,
+            before: &BTreeMap<RawHandle, Vec<u8>>,
+            model: &Model,
+            seed: u64,
+            step: usize,
+        ) {
+            let reader = yard.reader().unwrap();
+            let live = live_union(yard);
+            for (raw, bytes) in before {
+                assert!(
+                    live.contains(raw),
+                    "seed {seed} step {step}: reclaim removed live handle {raw:02X?}"
+                );
+                assert_readable_bytes(&reader, *raw, bytes, seed, step);
+            }
+            for raw in model.bytes.keys().filter(|raw| !live.contains(*raw)) {
+                assert!(
+                    reader
+                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
+                        .is_none(),
+                    "seed {seed} step {step}: reclaim exposed non-live handle {raw:02X?}"
+                );
+            }
+        }
+
+        fn fresh_absent_handle(rng: &mut SplitMix64, model: &mut Model) -> RawHandle {
+            let mut bytes = vec![0u8; 48];
+            rng.fill(&mut bytes);
+            let handle = Blob::<UnknownBlob>::new(Bytes::from_source(bytes)).get_handle();
+            model.absent.push(handle.raw);
+            handle.raw
+        }
+
+        fn choose_known_or_absent(rng: &mut SplitMix64, model: &mut Model) -> RawHandle {
+            if !model.handles.is_empty() && rng.chance(3, 4) {
+                model.handles[rng.index(model.handles.len())]
+            } else {
+                fresh_absent_handle(rng, model)
+            }
+        }
+
+        fn choose_weak_target(
+            yard: &Yard,
+            rng: &mut SplitMix64,
+            model: &mut Model,
+            mode: WeakPinMode,
+        ) -> RawHandle {
+            match mode {
+                WeakPinMode::AnyKnownHandle => choose_known_or_absent(rng, model),
+                WeakPinMode::YoungOnly => {
+                    let young = live_sets(yard)
+                        .first()
+                        .into_iter()
+                        .flat_map(|set| set.iter())
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if !young.is_empty() && rng.chance(3, 4) {
+                        young[rng.index(young.len())]
+                    } else {
+                        fresh_absent_handle(rng, model)
+                    }
+                }
+            }
+        }
+
+        fn put_fresh_blob(
+            yard: &mut Yard,
+            model: &mut Model,
+            rng: &mut SplitMix64,
+            seed: u64,
+            step: usize,
+        ) {
+            let mut bytes = Vec::new();
+            let mut unique = [0u8; INLINE_LEN];
+            unique[..8].copy_from_slice(&seed.to_le_bytes());
+            unique[8..16].copy_from_slice(&(step as u64).to_le_bytes());
+            unique[16..24].copy_from_slice(&rng.next_u64().to_le_bytes());
+            unique[24..32].copy_from_slice(&rng.next_u64().to_le_bytes());
+            bytes.extend_from_slice(&unique);
+
+            let child_count = if model.handles.is_empty() {
+                0
+            } else {
+                rng.index(4)
+            };
+            for _ in 0..child_count {
+                let child = choose_known_or_absent(rng, model);
+                bytes.extend_from_slice(&child);
+            }
+
+            let noise_len = rng.index(17);
+            let mut noise = vec![0u8; noise_len];
+            rng.fill(&mut noise);
+            bytes.extend_from_slice(&noise);
+
+            let blob = Blob::<UnknownBlob>::new(Bytes::from_source(bytes.clone()));
+            let expected = blob.get_handle();
+            let handle = if rng.chance(2, 3) {
+                yard.put::<UnknownBlob, _>(blob).unwrap()
+            } else {
+                let level = rng.index(GENERATIONS);
+                yard.put_in_generation::<UnknownBlob, _>(level, blob)
+                    .unwrap()
+            };
+            assert_eq!(handle.raw, expected.raw);
+
+            model.bytes.entry(handle.raw).or_insert(bytes);
+            if !model.handles.contains(&handle.raw) {
+                model.handles.push(handle.raw);
+            }
+        }
+
+        fn run_one(seed: u64, weak_pin_mode: WeakPinMode) -> FinalState {
+            let (_dir, mut yard) = yard_with(
+                GENERATIONS,
+                YardConfig {
+                    weak_budget: 3,
+                    strong_level_budget: 2,
+                    fanout: 2,
+                },
+            );
+            let mut rng = SplitMix64::new(seed);
+            let mut model = Model::new();
+
+            for step in 0..STEPS {
+                match rng.index(9) {
+                    0 | 1 => put_fresh_blob(&mut yard, &mut model, &mut rng, seed, step),
+                    2 => {
+                        if !model.handles.is_empty() {
+                            let pin = pin_id(rng.index(PIN_COUNT));
+                            let raw = model.handles[rng.index(model.handles.len())];
+                            yard.pin_strong(pin, unknown(raw));
+                        }
+                    }
+                    3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))),
+                    4 => {
+                        let raw = choose_weak_target(&yard, &mut rng, &mut model, weak_pin_mode);
+                        yard.pin_weak(unknown(raw));
+                    }
+                    5 => {
+                        let raw = choose_known_or_absent(&mut rng, &mut model);
+                        let reader = yard.reader().unwrap();
+                        let result = reader.get::<Bytes, UnknownBlob>(unknown(raw));
+                        if !live_union(&yard).contains(&raw) {
+                            assert!(
+                                matches!(result, Err(YardGetError::NotFound)),
+                                "seed {seed} step {step}: absent get did not miss cleanly"
+                            );
+                        }
+                    }
+                    6 => {
+                        let expected = expected_live_after_collect(&yard, &model);
+                        yard.collect().unwrap();
+                        assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
+                    }
+                    7 => {
+                        let expected = expected_live_after_collect(&yard, &model);
+                        yard.compact().unwrap();
+                        assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
+                        assert_weak_never_tenures_after_compact(&yard, seed, step);
+                    }
+                    8 => {
+                        let before = snapshot_readable(&mut yard);
+                        yard.reclaim().unwrap();
+                        assert_reclaim_preserved(&mut yard, &before, &model, seed, step);
+                    }
+                    _ => unreachable!(),
+                }
+
+                assert_general_invariants(&mut yard, &model, seed, step);
+            }
+
+            let reader = yard.reader().unwrap();
+            let mut live_by_generation = live_sets(&yard)
+                .into_iter()
+                .map(|set| set.into_iter().collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            for generation in &mut live_by_generation {
+                generation.sort();
+            }
+            let mut readable = live_union(&yard)
+                .into_iter()
+                .filter(|raw| {
+                    reader
+                        .get_local::<Bytes, UnknownBlob>(unknown(*raw))
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            readable.sort();
+
+            FinalState {
+                live_by_generation,
+                readable,
+            }
+        }
+
+        #[test]
+        fn seeded_yard_property_sequences() {
+            for seed in 0..SEEDS {
+                run_one(0xC0DE_0000_0000_0000 ^ seed, WeakPinMode::YoungOnly);
+            }
+        }
+
+        #[test]
+        fn seeded_yard_property_sequences_are_deterministic() {
+            for seed in [0, 13, 49] {
+                let seed = 0xD57D_0000_0000_0000 ^ seed;
+                assert_eq!(
+                    run_one(seed, WeakPinMode::YoungOnly),
+                    run_one(seed, WeakPinMode::YoungOnly),
+                    "seed {seed} diverged"
+                );
+            }
+        }
+
+        #[test]
+        #[ignore = "FOUND BUG: weak-pinning an already-tenured blob lets it remain in the oldest generation after compact"]
+        fn seeded_yard_property_sequences_with_tenured_weak_pins_exposes_bug() {
+            // Failing seed from the full operation space:
+            // 0xC0DE_0000_0000_0000 ^ 2, first observed at step 32.
+            run_one(0xC0DE_0000_0000_0000 ^ 2, WeakPinMode::AnyKnownHandle);
+        }
+
+        #[test]
+        #[ignore = "FOUND BUG: compact does not move or evict a retained weak pin that was already oldest"]
+        fn weak_pin_on_already_tenured_blob_stays_old_after_compact_bug() {
+            let (_dir, mut yard) = yard_with(
+                3,
+                YardConfig {
+                    weak_budget: 1,
+                    strong_level_budget: 0,
+                    fanout: 1,
+                },
+            );
+            let tenured = yard
+                .put::<UnknownBlob, _>(Bytes::from_source(b"tenured then weak".to_vec()))
+                .unwrap();
+
+            yard.pin_strong(pin_id(0), tenured);
+            yard.compact().unwrap();
+            assert!(yard.contains_in_generation(2, tenured));
+
+            yard.pin_weak(tenured);
+            yard.compact().unwrap();
+
+            assert!(
+                !yard.contains_in_generation(2, tenured),
+                "weak-pinned blob remained live in the oldest generation"
+            );
+        }
     }
 }

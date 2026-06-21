@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewriting each generation's Pile to a sibling temporary Pile containing only
   the current live set, then atomically renaming it over the original so
   logically evicted blobs release disk space.
+- **Deterministic `repo::yard` property tests.** Adds seeded operation-sequence
+  tests covering strong/weak retention, collect/compact/reclaim consistency,
+  hole-safe walks, live-set exactness after collection, and deterministic replay.
 
 ### Fixed
 
