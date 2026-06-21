@@ -151,4 +151,7 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
-- No open issues recorded yet.
+- Yard collection currently evicts blobs from per-generation live PATCH sets
+  while leaving the append-only Pile records in place. Add a future physical
+  compaction/rewrite path when Yard needs to reclaim disk space, preserving
+  live readers while replacing generation files.

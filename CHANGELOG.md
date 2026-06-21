@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`repo::yard` generational blob storage.** Adds a standalone Yard storage
+  component that layers young-to-old Pile generations, union reads, per-blob
+  strong/weak retention, weak-veto reachability pruning, and size-triggered
+  strong tenuring without changing existing Peer or Pile APIs.
+
 ### Fixed
 
 - **`trible pile diagnose check` no longer doubles the blake3 prefix.** The

@@ -126,6 +126,8 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
+/// Generational collection of piles for lazy-retention blob storage.
+pub mod yard;
 
 /// Trait for storage backends that require explicit close/cleanup.
 ///
