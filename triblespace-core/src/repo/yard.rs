@@ -441,6 +441,35 @@ impl YardReader {
         }
         live
     }
+
+    /// Union read across generations (young -> old) that does NOT mint a
+    /// demand-born weak pin on a miss; returns `None` on a clean miss.
+    /// Speculative / structural reads (reference discovery via
+    /// `children`) use this so they never pollute the weak set with
+    /// wants for non-existent hashes. The public `get` layers the
+    /// demand-born want on top of it.
+    fn get_local<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Option<Result<T, YardGetError<<T as TryFromBlob<S>>::Error>>>
+    where
+        S: BlobEncoding + 'static,
+        T: TryFromBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
+        for generation in &self.generations {
+            if generation.live.get(&unknown.raw).is_none() {
+                continue;
+            }
+            match generation.reader.get::<T, S>(handle) {
+                Ok(value) => return Some(Ok(value)),
+                Err(GetBlobError::BlobNotFound) => continue,
+                Err(err) => return Some(Err(YardGetError::Pile(err))),
+            }
+        }
+        None
+    }
 }
 
 impl PartialEq for YardReader {
@@ -463,30 +492,27 @@ impl BlobStoreGet for YardReader {
         T: TryFromBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
-        for generation in &self.generations {
-            if generation.live.get(&unknown.raw).is_none() {
-                continue;
-            }
-
-            match generation.reader.get::<T, S>(handle) {
-                Ok(value) => return Ok(value),
-                Err(GetBlobError::BlobNotFound) => continue,
-                Err(err) => return Err(YardGetError::Pile(err)),
+        match self.get_local::<T, S>(handle) {
+            Some(result) => result,
+            None => {
+                // An *intentional* read that missed is a demand-born
+                // "want" — mint the weak pin so the sync daemon can fetch
+                // it. Speculative scans use `get_local` and never land here.
+                self.weak_state
+                    .lock()
+                    .expect("weak pin mutex poisoned")
+                    .pin(handle.transmute());
+                Err(YardGetError::NotFound)
             }
         }
-
-        self.weak_state
-            .lock()
-            .expect("weak pin mutex poisoned")
-            .pin(unknown);
-        Err(YardGetError::NotFound)
     }
 }
 
 impl BlobChildren for YardReader {
     fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
-        let Ok(blob) = self.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
+        // Structural scan: use the non-minting read so reference
+        // discovery never floods the weak set with speculative wants.
+        let Some(Ok(blob)) = self.get_local::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
             return Vec::new();
         };
         let bytes = blob.bytes.as_ref();
@@ -507,7 +533,7 @@ impl BlobChildren for YardReader {
             }
 
             let candidate = Inline::<Handle<UnknownBlob>>::new(raw);
-            if self.get::<Bytes, UnknownBlob>(candidate).is_ok() {
+            if matches!(self.get_local::<Bytes, UnknownBlob>(candidate), Some(Ok(_))) {
                 result.push(candidate);
             }
             offset += INLINE_LEN;
