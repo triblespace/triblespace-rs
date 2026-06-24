@@ -234,12 +234,27 @@ impl Yard {
     }
 
     /// Weakly pin a blob and refresh its LRU recency.
+    ///
+    /// A weak pin is the want-signal for content you *lack*. Weak-pinning a
+    /// blob you already hold (resident in any generation) is a **no-op**:
+    /// resident content is released by changing the strong branches that
+    /// root it, never by tagging it weak. Allowing it would let a tenured
+    /// blob acquire a weak tag and break the "weak never tenures to the
+    /// bottom" invariant — so the want simply never targets resident
+    /// content, and the invariant holds by construction.
     pub fn pin_weak<S>(&self, handle: Inline<Handle<S>>)
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+        if self
+            .generations
+            .iter()
+            .any(|generation| generation.live.get(&handle.raw).is_some())
+        {
+            return;
+        }
         self.weak_state
             .lock()
             .expect("weak pin mutex poisoned")
@@ -840,10 +855,14 @@ mod tests {
             },
         );
         let strong = yard.put::<RawBytes, _>(raw_blob(b"strong")).unwrap();
-        let weak = yard.put::<RawBytes, _>(raw_blob(b"weak")).unwrap();
+        // demand-born weak: wanted while absent, then fetched, then LRU-
+        // evicted under a zero budget — a genuine cache eviction, not an
+        // orphan sweep.
+        let weak = Blob::<RawBytes>::new(raw_blob(b"weak")).get_handle();
+        yard.pin_weak(weak);
+        yard.put::<RawBytes, _>(raw_blob(b"weak")).unwrap();
 
         yard.pin_strong(pin_id(1), strong);
-        yard.pin_weak(weak);
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
@@ -863,15 +882,19 @@ mod tests {
                 ..YardConfig::default()
             },
         );
-        let child = yard
-            .put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
+        // `child` enters the cache the demand-born way: weak-pinned while
+        // absent (the want), then fetched. It is reachable from a strong
+        // parent, yet the weak veto still makes it evictable.
+        let child =
+            Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
+        yard.pin_weak(child);
+        yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
             .unwrap();
         let parent = yard
             .put::<UnknownBlob, _>(Bytes::from_source(child.raw.to_vec()))
             .unwrap();
 
         yard.pin_strong(pin_id(2), parent);
-        yard.pin_weak(child);
         yard.collect().unwrap();
         let reader = yard.reader().unwrap();
 
@@ -915,9 +938,12 @@ mod tests {
             },
         );
         let strong = yard.put::<RawBytes, _>(raw_blob(b"tenured")).unwrap();
-        let weak = yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
-        yard.pin_strong(pin_id(4), strong);
+        // `weak` is demand-born: wanted while absent, then fetched, so it is
+        // a genuine cache entry — not a resident downgrade, which no-ops.
+        let weak = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
         yard.pin_weak(weak);
+        yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
+        yard.pin_strong(pin_id(4), strong);
 
         yard.compact().unwrap();
 
@@ -1533,16 +1559,20 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "FOUND BUG: weak-pinning an already-tenured blob lets it remain in the oldest generation after compact"]
-        fn seeded_yard_property_sequences_with_tenured_weak_pins_exposes_bug() {
-            // Failing seed from the full operation space:
-            // 0xC0DE_0000_0000_0000 ^ 2, first observed at step 32.
-            run_one(0xC0DE_0000_0000_0000 ^ 2, WeakPinMode::AnyKnownHandle);
+        fn seeded_yard_property_sequences_resident_weak_pins_are_noops() {
+            // Full operation space, including attempts to weak-pin resident
+            // (even already-tenured) blobs. With the resident-weak-pin
+            // no-op, those attempts are inert — the want only ever targets
+            // absent content — so "weak never tenures" and the live=keep
+            // invariants all hold. (Seed 0xC0DE^2, step 32, exposed the
+            // pre-no-op bug; it now passes alongside the rest of the sweep.)
+            for seed in [0, 2, 7, 13, 31, 49] {
+                run_one(0xC0DE_0000_0000_0000 ^ seed, WeakPinMode::AnyKnownHandle);
+            }
         }
 
         #[test]
-        #[ignore = "FOUND BUG: compact does not move or evict a retained weak pin that was already oldest"]
-        fn weak_pin_on_already_tenured_blob_stays_old_after_compact_bug() {
+        fn weak_pin_on_resident_tenured_blob_is_a_noop() {
             let (_dir, mut yard) = yard_with(
                 3,
                 YardConfig {
@@ -1559,12 +1589,17 @@ mod tests {
             yard.compact().unwrap();
             assert!(yard.contains_in_generation(2, tenured));
 
+            // Weak-pinning a blob you already hold is a no-op: the want
+            // signal only ever targets absent content. The resident blob
+            // stays strong in the bottom generation, never acquiring a weak
+            // tag — which is exactly why "weak never tenures" holds by
+            // construction rather than needing eviction machinery here.
             yard.pin_weak(tenured);
             yard.compact().unwrap();
 
             assert!(
-                !yard.contains_in_generation(2, tenured),
-                "weak-pinned blob remained live in the oldest generation"
+                yard.contains_in_generation(2, tenured),
+                "resident weak-pin must be a no-op; the strong blob stays held"
             );
         }
     }
