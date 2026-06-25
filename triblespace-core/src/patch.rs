@@ -1650,6 +1650,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Per-end-depth branch census: `hist[d] = (branch_count, filled_children)`
+    /// for branches whose branching point is at byte-depth `d`. Reveals where
+    /// the branches sit and their fanout — the input to the HOT/variable-width
+    /// densification question.
+    pub(crate) fn branch_hist(&self, hist: &mut [(u64, u64); 65]) {
+        if let BodyRef::Branch(branch) = self.body_ref() {
+            let d = self.end_depth().min(64);
+            let fanout = branch.child_table.iter().flatten().count() as u64;
+            hist[d].0 += 1;
+            hist[d].1 += fanout;
+            for child in branch.child_table.iter().flatten() {
+                child.branch_hist(hist);
+            }
+        }
+    }
+
     // NOTE: slot-level union wrapper removed; callers should take the slot and
     // call the owned helper `union` directly.
 
@@ -1993,6 +2009,17 @@ where
             root.node_stats(&mut acc);
         }
         acc
+    }
+
+    /// Per-end-depth `(branch_count, filled_children)` histogram (65 buckets,
+    /// byte-depths 0..=64), for analysing trie shape — where branches sit and
+    /// their fanout distribution.
+    pub fn branch_histogram(&self) -> [(u64, u64); 65] {
+        let mut hist = [(0u64, 0u64); 65];
+        if let Some(root) = &self.root {
+            root.branch_hist(&mut hist);
+        }
+        hist
     }
 
     /// Returns true if the PATCH contains no keys.
