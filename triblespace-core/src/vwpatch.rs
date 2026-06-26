@@ -1821,17 +1821,35 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // below the load threshold); narrow by one byte and retry. A
         // single-byte span always places, so this terminates.
         loop {
-            use std::collections::HashMap;
-            let mut groups: HashMap<Vec<u8>, Vec<Self>> = HashMap::new();
+            // Group `units` by their span sub-key `key[start..end)`. A span never
+            // crosses a segment boundary, so the sub-key is bounded by the widest
+            // segment and fits a fixed-width, `Copy`, stack key — no per-child
+            // heap `Vec` allocation. We sort `(sub-key, index)` pairs and walk
+            // adjacent equal runs to form groups, avoiding a map entirely.
+            let span_len = end - start;
+            let mut keyed: Vec<([u8; KEY_LEN], usize)> = Vec::with_capacity(units.len());
             let mut buf = [0u8; KEY_LEN];
-            for l in &units {
-                let key = Self::span_sub(l.childleaf_key(), start, end, &mut buf).to_vec();
-                groups.entry(key).or_default().push(l.clone());
+            for (i, l) in units.iter().enumerate() {
+                let sub = Self::span_sub(l.childleaf_key(), start, end, &mut buf);
+                let mut sk = [0u8; KEY_LEN];
+                sk[..span_len].copy_from_slice(sub);
+                keyed.push((sk, i));
             }
-            let children: Vec<Self> = groups
-                .into_values()
-                .map(|members| Self::build_dense_node(members, end, max_end).with_span(start, end))
-                .collect();
+            keyed.sort_unstable_by(|a, b| a.0[..span_len].cmp(&b.0[..span_len]));
+            let mut children: Vec<Self> = Vec::new();
+            let mut run_start = 0;
+            while run_start < keyed.len() {
+                let mut run_end = run_start + 1;
+                while run_end < keyed.len()
+                    && keyed[run_end].0[..span_len] == keyed[run_start].0[..span_len]
+                {
+                    run_end += 1;
+                }
+                let members: Vec<Self> =
+                    keyed[run_start..run_end].iter().map(|&(_, i)| units[i].clone()).collect();
+                children.push(Self::build_dense_node(members, end, max_end).with_span(start, end));
+                run_start = run_end;
+            }
             match Branch::from_children_dense(start, end, children) {
                 Some(nn) => return Head::new(0, nn),
                 None => {
