@@ -79,7 +79,6 @@ struct ChildTable {
 #[derive(Clone, Debug)]
 struct Child {
     fp: u16,
-    subkey: Vec<u8>,
     entry: Entry,
 }
 
@@ -288,7 +287,7 @@ impl Node {
         let mut node = Self {
             span,
             childleaf: children[0].entry.representative(),
-            children: ChildTable { children },
+            children: ChildTable::new(span, children),
             hash: 0,
             leaf_count: 0,
             segment_count: 0,
@@ -309,14 +308,46 @@ impl Node {
             self.segment_count += child.entry.count_segment(self.span.end as usize);
         }
     }
+
+    fn refresh_childleaf(&mut self) {
+        self.childleaf = self.children.children[0].entry.representative();
+    }
+
+    fn apply_child_delta(
+        &mut self,
+        old_hash: u128,
+        new_hash: u128,
+        old_leaf_count: u64,
+        new_leaf_count: u64,
+        old_segment_count: u64,
+        new_segment_count: u64,
+    ) {
+        self.hash ^= old_hash ^ new_hash;
+        self.leaf_count += new_leaf_count - old_leaf_count;
+        self.segment_count += new_segment_count - old_segment_count;
+        self.refresh_childleaf();
+    }
+
+    fn add_leaf_child(&mut self, key: Key) {
+        let entry = Entry::Leaf(key);
+        self.hash ^= entry.hash();
+        self.leaf_count += 1;
+        self.segment_count += entry.count_segment(self.span.end as usize);
+        self.children.push(self.span, entry);
+        self.refresh_childleaf();
+    }
 }
 
 impl Entry {
-    fn representative(&self) -> Key {
+    fn representative_ref(&self) -> &Key {
         match self {
-            Entry::Leaf(key) => *key,
-            Entry::Node(node) => node.childleaf,
+            Entry::Leaf(key) => key,
+            Entry::Node(node) => &node.childleaf,
         }
+    }
+
+    fn representative(&self) -> Key {
+        *self.representative_ref()
     }
 
     fn min_branch_start(&self) -> usize {
@@ -416,46 +447,90 @@ impl Entry {
 }
 
 impl ChildTable {
-    fn get_exact_mut(&mut self, key: &Key, span: Span) -> Option<&mut Child> {
+    fn new(span: Span, mut children: Vec<Child>) -> Self {
+        children.sort_unstable_by(|left, right| {
+            left.fp
+                .cmp(&right.fp)
+                .then_with(|| left.subkey(span).cmp(right.subkey(span)))
+        });
+        debug_assert!(
+            children
+                .windows(2)
+                .all(|pair| pair[0].subkey(span) != pair[1].subkey(span)),
+            "duplicate child subkey"
+        );
+        Self { children }
+    }
+
+    fn get_exact_index(&self, key: &Key, span: Span) -> Option<usize> {
         let subkey = &key[span.start as usize..span.end as usize];
         let fp = fingerprint16(subkey);
-        self.children
-            .iter_mut()
-            .find(|child| child.fp == fp && child.subkey == subkey)
+        let range = self.fp_range(fp);
+        let start = range.start;
+        self.children[range]
+            .iter()
+            .position(|child| child.subkey(span) == subkey)
+            .map(|offset| start + offset)
     }
 
     fn get_exact(&self, key: &Key, span: Span) -> Option<&Child> {
-        let subkey = &key[span.start as usize..span.end as usize];
-        let fp = fingerprint16(subkey);
-        self.children
-            .iter()
-            .find(|child| child.fp == fp && child.subkey == subkey)
+        self.get_exact_index(key, span)
+            .map(|index| &self.children[index])
     }
 
     fn get_exact_for_prefix(&self, prefix: &[u8], span: Span) -> Option<&Child> {
         let subkey = &prefix[span.start as usize..span.end as usize];
         let fp = fingerprint16(subkey);
-        self.children
+        let range = self.fp_range(fp);
+        self.children[range]
             .iter()
-            .find(|child| child.fp == fp && child.subkey == subkey)
+            .find(|child| child.subkey(span) == subkey)
     }
 
     fn best_partial_lcp(&self, key: &Key, span: Span) -> usize {
         let subkey = &key[span.start as usize..span.end as usize];
         self.children
             .iter()
-            .map(|child| common_prefix_len(&child.subkey, subkey))
+            .map(|child| common_prefix_len(child.subkey(span), subkey))
             .filter(|&len| len > 0 && len < span.len())
             .max()
             .unwrap_or(0)
     }
 
-    fn push(&mut self, subkey: &[u8], entry: Entry) {
-        debug_assert!(
-            !self.children.iter().any(|child| child.subkey == subkey),
-            "duplicate child subkey"
-        );
-        self.children.push(Child::new(subkey, entry));
+    fn push(&mut self, span: Span, entry: Entry) {
+        let child = Child::new_from_entry(span, entry);
+        let fp = child.fp;
+        let pos = {
+            let subkey = child.subkey(span);
+            debug_assert!(
+                !self
+                    .children
+                    .iter()
+                    .any(|child| child.subkey(span) == subkey),
+                "duplicate child subkey"
+            );
+            self.children.partition_point(|existing| {
+                existing.fp < fp || (existing.fp == fp && existing.subkey(span) < subkey)
+            })
+        };
+        self.children.insert(pos, child);
+    }
+
+    fn fp_range(&self, fp: u16) -> std::ops::Range<usize> {
+        let start = self.children.partition_point(|child| child.fp < fp);
+        let end = start + self.children[start..].partition_point(|child| child.fp == fp);
+        start..end
+    }
+
+    fn has_matching_prefix(&self, span: Span, key: &Key, prefix_len: usize) -> bool {
+        if prefix_len == span.end as usize {
+            return self.get_exact(key, span).is_some();
+        }
+
+        let span_start = span.start as usize;
+        self.children.iter().any(|child| {
+            child.subkey(span)[..prefix_len - span_start] == key[span_start..prefix_len]
+        })
     }
 
     fn fp_collision_entries(&self) -> u64 {
@@ -473,9 +548,17 @@ impl Child {
     fn new(subkey: &[u8], entry: Entry) -> Self {
         Self {
             fp: fingerprint16(subkey),
-            subkey: subkey.to_vec(),
             entry,
         }
+    }
+
+    fn new_from_entry(span: Span, entry: Entry) -> Self {
+        let fp = fingerprint16(&entry.representative_ref()[span.start as usize..span.end as usize]);
+        Self { fp, entry }
+    }
+
+    fn subkey(&self, span: Span) -> &[u8] {
+        &self.entry.representative_ref()[span.start as usize..span.end as usize]
     }
 }
 
@@ -499,10 +582,44 @@ fn insert_entry(entry: &mut Entry, key: Key, depth: usize) -> bool {
                 return true;
             }
 
-            if let Some(child) = node.children.get_exact_mut(&key, node.span) {
-                let inserted = insert_entry(&mut child.entry, key, node.span.end as usize);
+            if let Some(child_index) = node.children.get_exact_index(&key, node.span) {
+                let span_end = node.span.end as usize;
+                let (
+                    inserted,
+                    old_hash,
+                    new_hash,
+                    old_leaves,
+                    new_leaves,
+                    old_segments,
+                    new_segments,
+                ) = {
+                    let child = &mut node.children.children[child_index];
+                    let old_hash = child.entry.hash();
+                    let old_leaves = child.entry.leaf_count();
+                    let old_segments = child.entry.count_segment(span_end);
+                    let inserted = insert_entry(&mut child.entry, key, span_end);
+                    let new_hash = child.entry.hash();
+                    let new_leaves = child.entry.leaf_count();
+                    let new_segments = child.entry.count_segment(span_end);
+                    (
+                        inserted,
+                        old_hash,
+                        new_hash,
+                        old_leaves,
+                        new_leaves,
+                        old_segments,
+                        new_segments,
+                    )
+                };
                 if inserted {
-                    node.recompute();
+                    node.apply_child_delta(
+                        old_hash,
+                        new_hash,
+                        old_leaves,
+                        new_leaves,
+                        old_segments,
+                        new_segments,
+                    );
                 }
                 return inserted;
             }
@@ -513,9 +630,7 @@ fn insert_entry(entry: &mut Entry, key: Key, depth: usize) -> bool {
                 return true;
             }
 
-            let subkey = &key[node.span.start as usize..node.span.end as usize];
-            node.children.push(subkey, Entry::Leaf(key));
-            node.recompute();
+            node.add_leaf_child(key);
             true
         }
     }
@@ -545,20 +660,51 @@ fn insert_dense_entry(entry: &mut Entry, key: Key, depth: usize) -> bool {
                 return true;
             }
 
-            if let Some(child) = node.children.get_exact_mut(&key, node.span) {
-                let inserted = insert_dense_entry(&mut child.entry, key, node.span.end as usize);
+            if let Some(child_index) = node.children.get_exact_index(&key, node.span) {
+                let span_end = node.span.end as usize;
+                let (
+                    inserted,
+                    old_hash,
+                    new_hash,
+                    old_leaves,
+                    new_leaves,
+                    old_segments,
+                    new_segments,
+                ) = {
+                    let child = &mut node.children.children[child_index];
+                    let old_hash = child.entry.hash();
+                    let old_leaves = child.entry.leaf_count();
+                    let old_segments = child.entry.count_segment(span_end);
+                    let inserted = insert_dense_entry(&mut child.entry, key, span_end);
+                    let new_hash = child.entry.hash();
+                    let new_leaves = child.entry.leaf_count();
+                    let new_segments = child.entry.count_segment(span_end);
+                    (
+                        inserted,
+                        old_hash,
+                        new_hash,
+                        old_leaves,
+                        new_leaves,
+                        old_segments,
+                        new_segments,
+                    )
+                };
                 if inserted {
-                    node.recompute();
+                    node.apply_child_delta(
+                        old_hash,
+                        new_hash,
+                        old_leaves,
+                        new_leaves,
+                        old_segments,
+                        new_segments,
+                    );
                 }
                 return inserted;
             }
 
-            let subkey = &key[node.span.start as usize..node.span.end as usize];
-            node.children.push(subkey, Entry::Leaf(key));
+            node.add_leaf_child(key);
             if node.children.children.len() > MAX_FANOUT {
                 narrow_dense_node(node);
-            } else {
-                node.recompute();
             }
             true
         }
@@ -596,12 +742,9 @@ fn has_prefix_entry(entry: &Entry, key: &Key, prefix_len: usize, depth: usize) -
                 return true;
             }
             if prefix_len <= span_end {
-                let rel = prefix_len - span_start;
                 return node
                     .children
-                    .children
-                    .iter()
-                    .any(|child| child.subkey[..rel] == key[span_start..prefix_len]);
+                    .has_matching_prefix(node.span, key, prefix_len);
             }
 
             node.children
@@ -640,9 +783,8 @@ fn infixes_entry<const INFIX_LEN: usize>(
                 return;
             }
             if prefix_len <= span_end {
-                let rel = prefix_len - span_start;
-                for child in &node.children.children {
-                    if child.subkey[..rel] == prefix[span_start..prefix_len] {
+                if prefix_len == span_end {
+                    if let Some(child) = node.children.get_exact_for_prefix(prefix, node.span) {
                         collect_infixes_entry(
                             &child.entry,
                             prefix_len,
@@ -651,6 +793,20 @@ fn infixes_entry<const INFIX_LEN: usize>(
                             nodes_visited,
                             true,
                         );
+                    }
+                } else {
+                    let rel = prefix_len - span_start;
+                    for child in &node.children.children {
+                        if child.subkey(node.span)[..rel] == prefix[span_start..prefix_len] {
+                            collect_infixes_entry(
+                                &child.entry,
+                                prefix_len,
+                                infix_end,
+                                out,
+                                nodes_visited,
+                                true,
+                            );
+                        }
                     }
                 }
                 return;
@@ -759,8 +915,10 @@ fn split_node_for_new_child(node: &mut Node, key: Key, split_rel: usize) {
 
     let mut groups = Vec::new();
     for child in std::mem::take(&mut node.children.children) {
-        let prefix = &child.subkey[..split_rel];
-        let suffix = &child.subkey[split_rel..];
+        let rep = child.entry.representative();
+        let subkey = &rep[old_start..old_end];
+        let prefix = &subkey[..split_rel];
+        let suffix = &subkey[split_rel..];
         push_group(&mut groups, prefix, suffix, child.entry);
     }
     push_group(
@@ -787,7 +945,7 @@ fn split_node_for_new_child(node: &mut Node, key: Key, split_rel: usize) {
     }
 
     node.span = Span::new(old_start, split);
-    node.children.children = parent_children;
+    node.children = ChildTable::new(node.span, parent_children);
     node.recompute();
 }
 
@@ -826,7 +984,7 @@ fn narrow_dense_node(node: &mut Node) {
     }
     let end = widest_valid_span_with_limit(&keys, start, current_end);
     node.span = Span::new(start, end);
-    node.children.children = dense_children(keys, start, end);
+    node.children = ChildTable::new(node.span, dense_children(keys, start, end));
     node.recompute();
 }
 
@@ -890,6 +1048,12 @@ fn leaf_hash(key: &Key) -> u128 {
 }
 
 fn fingerprint16(bytes: &[u8]) -> u16 {
+    match bytes {
+        [one] => return *one as u16,
+        [first, second] => return u16::from_be_bytes([*first, *second]),
+        _ => {}
+    }
+
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytes {
         h ^= *byte as u64;
@@ -992,5 +1156,39 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert_eq!(values[0][0], 1);
         assert_eq!(values[1][0], 2);
+    }
+
+    #[test]
+    fn wide_root_hash_is_insertion_order_invariant_and_lookups_hold() {
+        let mut keys = Vec::new();
+        for i in 0..1024u32 {
+            let mut key = [0u8; KEY_LEN];
+            key[0..4].copy_from_slice(&i.to_be_bytes());
+            key[16..20].copy_from_slice(&i.wrapping_mul(37).to_be_bytes());
+            key[32..36].copy_from_slice(&i.wrapping_mul(65_537).to_be_bytes());
+            keys.push(key);
+        }
+
+        let mut forward = HatchWide::new();
+        for key in &keys {
+            assert!(forward.insert(*key));
+        }
+        for key in &keys {
+            assert!(forward.lookup(key));
+        }
+        forward.assert_segment_spans();
+        forward.assert_widest_valid_spans();
+
+        let mut reverse = HatchWide::new();
+        for key in keys.iter().rev() {
+            assert!(reverse.insert(*key));
+        }
+        for key in &keys {
+            assert!(reverse.lookup(key));
+        }
+
+        assert_eq!(forward.leaf_count(), reverse.leaf_count());
+        assert_eq!(forward.segment_count(), reverse.segment_count());
+        assert_eq!(forward.root_hash(), reverse.root_hash());
     }
 }
