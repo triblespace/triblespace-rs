@@ -392,7 +392,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         rchild_hash: u128,
     ) -> NonNull<Self> {
         unsafe {
-            let size = 2;
+            // The smallest table is one full bucket (`BUCKET_ENTRY_COUNT`
+            // slots): it is a single bucket, so the cheap/rand hashes both
+            // compress to bucket 0 and the two children placed directly at
+            // slots 0 and 1 are always found by a full-bucket scan. (Two-slot
+            // tables are unrepresentable with four-slot buckets.)
+            let size = BUCKET_ENTRY_COUNT;
             // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
             // that the computed layout size is valid.
             let layout = Layout::from_size_align_unchecked(
@@ -788,7 +793,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) -> Option<NonNull<Self>> {
         debug_assert!(children.len() >= 2, "dense branch needs >= 2 children");
         debug_assert!(children.len() <= 256, "dense fanout exceeds 256");
-        let mut size = 2usize;
+        // Start at one full bucket (`BUCKET_ENTRY_COUNT`); doubling keeps every
+        // table a power-of-two number of slots up to the 256 maximum.
+        let mut size = BUCKET_ENTRY_COUNT;
         while size < children.len() {
             size *= 2;
         }

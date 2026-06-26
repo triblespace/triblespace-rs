@@ -1701,7 +1701,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// (`fingerprint16` is the identity for one byte), so up to 256 children
     /// always place — exactly as single-byte PATCH does. A multi-byte span
     /// keys by an arbitrary folded fingerprint; the child table is a blocked
-    /// cuckoo table (two hashes × two-slot buckets, load threshold ≈0.90), so
+    /// cuckoo table (two hashes × four-slot buckets, load threshold ≈0.97), so
     /// packing 256 arbitrary keys into 256 slots would force a grow past the
     /// 256-slot maximum. Capping multi-byte fanout below the threshold keeps
     /// every node placeable while still collapsing whole sub-segments into one
@@ -1711,10 +1711,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if span_len == 1 {
             256
         } else {
-            // Comfortably below the blocked-cuckoo load threshold (~0.90 for
-            // two-slot buckets) so incremental adds place without triggering
-            // reactive rebuilds.
-            224
+            // Conservatively below the four-slot blocked-cuckoo load threshold
+            // (~0.97) so the bounded random-walk places incremental adds
+            // without exhausting its kick budget; on the rare near-cap failure
+            // the caller narrows. Denser than the two-slot cap (224) because
+            // four-slot buckets tolerate higher load.
+            240
         }
     }
 

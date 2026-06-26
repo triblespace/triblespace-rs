@@ -39,14 +39,13 @@ use std::fmt::Debug;
 use std::sync::Once;
 
 /// The number of slots per bucket.
-const BUCKET_ENTRY_COUNT: usize = 2;
-
-/// The maximum number of slots per table.
-const MAX_SLOT_COUNT: usize = 256;
-
-/// The maximum number of cuckoo displacements attempted during
-/// insert before the size of the table is increased.
-const MAX_RETRIES: usize = 2;
+///
+/// Four-slot buckets pack the multi-byte cuckoo table denser (load threshold
+/// rises from ≈0.88 for two-slot buckets to ≈0.97 for four-slot buckets), so a
+/// wide dense node fits more distinct fingerprints before it must narrow. The
+/// smallest branch table therefore holds one full bucket (`BUCKET_ENTRY_COUNT`
+/// slots); `Branch2` is unused.
+pub(crate) const BUCKET_ENTRY_COUNT: usize = 4;
 
 static INIT: Once = Once::new();
 
@@ -132,11 +131,6 @@ impl ByteSet {
         self.0[(idx >> 7) as usize] |= 1u128 << bit;
     }
 
-    pub(crate) fn remove(&mut self, idx: u8) {
-        let bit = (idx & 0b0111_1111) as u32;
-        self.0[(idx >> 7) as usize] &= !(1u128 << bit);
-    }
-
     pub(crate) fn contains(&self, idx: u8) -> bool {
         let bit = (idx & 0b0111_1111) as u32;
         (self.0[(idx >> 7) as usize] & (1u128 << bit)) != 0
@@ -179,10 +173,25 @@ impl ByteSet {
     }
 }
 
+/// Search the cuckoo graph for an augmenting path: a sequence of evictions that
+/// frees a slot reachable (through alternate-bucket hops) from `bucket_idx`. If
+/// found, the entries along the path are shifted toward the freed slot and the
+/// index of the now-empty slot in `bucket_idx` is returned for the caller to
+/// fill.
+///
+/// `visited` marks slot indices and is **never unmarked** — this is the crux of
+/// the instability fix. The previous bucket-4 attempt unmarked on backtrack,
+/// turning the search into an exponential DFS that thrashed (and hung) at the
+/// 256-slot maximum where four-slot buckets branch four ways. With permanent
+/// marking every slot is explored at most once, so the search is a plain graph
+/// reachability walk: `O(slot_count)` work, `O(buckets)` recursion depth, and
+/// it still finds a valid placement whenever one exists — which is what lets the
+/// identity-packed single-byte case reach load 1.0 (all 256 children present).
+/// When no augmenting path exists the search exhausts `visited` and returns
+/// `None`, and the caller grows the table or narrows the span.
 fn plan_insert<T: ByteEntry + Debug>(
     table: &mut [Option<T>],
     bucket_idx: usize,
-    depth: usize,
     visited: &mut ByteSet,
 ) -> Option<usize> {
     let bucket_start = bucket_idx * BUCKET_ENTRY_COUNT;
@@ -193,17 +202,11 @@ fn plan_insert<T: ByteEntry + Debug>(
         }
     }
 
-    if depth == 0 {
-        return None;
-    }
-
     for slot_idx in 0..BUCKET_ENTRY_COUNT {
         let slot = bucket_start + slot_idx;
-        // The key now spans 16 bits and can no longer index the 256-bit
-        // `ByteSet`. Track visited *slot indices* instead — there are at
-        // most `MAX_SLOT_COUNT = 256` slots (index `0..=255`), which still
-        // fits the 256-bit set, and revisiting the same slot is precisely
-        // the cuckoo cycle we need to forbid.
+        // Slot indices live in `0..MAX_SLOT_COUNT` (`0..=255`), so they index
+        // the 256-bit `ByteSet` directly. Permanent marking bounds the whole
+        // search to one visit per slot.
         if visited.contains(slot as u8) {
             continue;
         }
@@ -215,14 +218,11 @@ fn plan_insert<T: ByteEntry + Debug>(
         // Try the other bucket that the key could occupy.
         let alt_idx = if bucket_idx == cheap { rand } else { cheap };
         if alt_idx != bucket_idx {
-            if let Some(hole_idx) = plan_insert(table, alt_idx, depth - 1, visited) {
+            if let Some(hole_idx) = plan_insert(table, alt_idx, visited) {
                 table[hole_idx] = table[slot].take();
-                visited.remove(slot as u8);
                 return Some(slot);
             }
         }
-
-        visited.remove(slot as u8);
     }
 
     None
@@ -354,29 +354,30 @@ impl<T: ByteEntry + Debug> ByteTable<T> for [Option<T>] {
     }
 
     fn table_insert_allow_dup(&mut self, inserted: T) -> Option<T> {
-        // `visited` now tracks slot indices, not keys (see `plan_insert`).
-        // The freshly inserted entry has no slot yet, so the set starts
-        // empty — the displacement chain marks slots as it descends.
+        // `visited` tracks slot indices (not keys) and is shared across both
+        // candidate-bucket searches so the bounded graph walk never explores a
+        // slot twice. The freshly inserted entry has no slot yet, so the set
+        // starts empty; [`plan_insert`] marks slots permanently as it descends,
+        // which bounds the whole insert to `O(MAX_SLOT_COUNT)` and rules out the
+        // exponential displacement thrash that hung the prior bucket-4 attempt.
         let mut visited = ByteSet::new_empty();
         let key = inserted.key();
-        let limit = if self.len() == MAX_SLOT_COUNT {
-            MAX_SLOT_COUNT
-        } else {
-            MAX_RETRIES
-        };
 
         let cheap_bucket = compress_hash(self.len(), cheap_hash(key)) as usize;
-        if let Some(slot) = plan_insert(self, cheap_bucket, limit, &mut visited) {
+        if let Some(slot) = plan_insert(self, cheap_bucket, &mut visited) {
             self[slot] = Some(inserted);
             return None;
         }
 
         let rand_bucket = compress_hash(self.len(), rand_hash(key)) as usize;
-        if let Some(slot) = plan_insert(self, rand_bucket, limit, &mut visited) {
+        if let Some(slot) = plan_insert(self, rand_bucket, &mut visited) {
             self[slot] = Some(inserted);
             return None;
         }
 
+        // No augmenting path from either candidate bucket: the table is
+        // genuinely full for this key. The caller grows (below the maximum) or
+        // narrows the span (at the maximum) — never retries in place.
         Some(inserted)
     }
 
@@ -492,8 +493,10 @@ mod tests {
                 };
             }
 
-            let mut table2: [Option<DummyEntry>; 2] = [None, None];
-            insert_step!(table2, table4, 4);
+            // The smallest valid table holds one full bucket
+            // (`BUCKET_ENTRY_COUNT` slots); size-2 is below one bucket and
+            // would underflow `compress_hash`'s `bucket_count - 1` mask.
+            let mut table4: [Option<DummyEntry>; 4] = [None; 4];
             insert_step!(table4, table8, 8);
             insert_step!(table8, table16, 16);
             insert_step!(table16, table32, 32);
@@ -511,6 +514,41 @@ mod tests {
         let mut table: [Option<DummyEntry>; 256] = [None; 256];
         for n in 0u16..=255 {
             assert!(table.table_insert(DummyEntry::new(n)).is_none());
+        }
+    }
+
+    /// Mimics the `install_child_growing` path: insert all 256 single-byte
+    /// keys into a `Vec`-backed table that *grows* from the minimum size,
+    /// instead of into a pre-sized 256-slot table. The growing path is where
+    /// squatters can form, so this is the case that must still reach load 1.0.
+    #[test]
+    fn growing_insert_all_keys_in_arbitrary_order() {
+        init();
+        // A deliberately adversarial order (reversed) to stress the walk.
+        let keys: Vec<u16> = (0u16..=255).rev().collect();
+
+        let mut table: Vec<Option<DummyEntry>> = vec![None; BUCKET_ENTRY_COUNT];
+        for &k in &keys {
+            let mut entry = DummyEntry::new(k);
+            loop {
+                match table.as_mut_slice().table_insert(entry) {
+                    None => break,
+                    Some(displaced) => {
+                        assert!(
+                            table.len() < 256,
+                            "key {k} failed to place even at the 256-slot maximum"
+                        );
+                        let new_len = table.len() * 2;
+                        let mut grown: Vec<Option<DummyEntry>> = vec![None; new_len];
+                        table.as_mut_slice().table_grow(grown.as_mut_slice());
+                        table = grown;
+                        entry = displaced;
+                    }
+                }
+            }
+        }
+        for k in 0u16..=255 {
+            assert!(table.as_slice().table_get(k).is_some(), "missing key {k}");
         }
     }
 }
