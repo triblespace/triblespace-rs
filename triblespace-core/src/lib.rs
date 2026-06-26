@@ -19,6 +19,9 @@ pub mod blob;
 pub mod export;
 /// Identifier types and generation strategies.
 pub mod id;
+/// Variable-width trie prototype for EAV trible keys.
+#[cfg(feature = "hatch")]
+pub mod hatch;
 /// Import utilities for deserialising external data into tribles.
 pub mod import;
 /// Bootstrap metadata namespace for describing schemas and attributes.
