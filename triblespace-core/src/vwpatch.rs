@@ -16,6 +16,8 @@ mod branch;
 pub mod bytetable;
 mod entry;
 mod leaf;
+/// READ-ONLY union span-misalignment measurement spike.
+pub mod spike;
 
 use arrayvec::ArrayVec;
 
