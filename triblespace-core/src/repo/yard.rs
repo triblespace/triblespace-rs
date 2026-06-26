@@ -285,46 +285,83 @@ impl Yard {
     /// pins are only retained in the young generation and never copied down.
     pub fn compact(&mut self) -> Result<(), YardCollectError> {
         self.collect()?;
-        let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let strong_keep = self.strong_keep_set(&reader);
         let last = self.generations.len().saturating_sub(1);
+        let mut dumped = Vec::new();
 
-        for level in 0..last {
-            let strong_here = self.generations[level].live.intersect(&strong_keep);
-            if strong_here.len() as usize <= self.strong_budget_for(level) {
-                continue;
-            }
+        {
+            let reader = self.reader().map_err(YardCollectError::Reader)?;
+            let strong_keep = self.strong_keep_set(&reader);
 
-            // Overflow: dump the whole level down — strong *and* weak
-            // survivors. `collect()` above already dropped dead, so `live`
-            // here is exactly the survivors. Weak is allowed to descend and
-            // use space in lower tiers rather than being pinned to the
-            // youngest generation; it stays evictable everywhere and is
-            // dropped by the weak budget under pressure.
-            let movers = self.generations[level].live.clone();
-            let handles: Vec<_> = movers
-                .clone()
-                .into_iter()
-                .map(Inline::<Handle<UnknownBlob>>::new)
-                .collect();
-
-            let mut copied = Vec::new();
-            {
-                let target = self.generations[level + 1].pile_mut();
-                for result in transfer(&reader, target, handles.clone()) {
-                    let (source, _target) = result.map_err(YardCollectError::Transfer)?;
-                    copied.push(source);
+            for level in 0..last {
+                let strong_here = self.generations[level].live.intersect(&strong_keep);
+                if strong_here.len() as usize <= self.strong_budget_for(level) {
+                    continue;
                 }
-            }
 
-            for source in copied {
+                // Overflow: dump the whole level down — strong *and* weak
+                // survivors. `collect()` above already dropped dead, so `live`
+                // here is exactly the survivors. Weak is allowed to descend and
+                // use space in lower tiers rather than being pinned to the
+                // youngest generation; it stays evictable everywhere and is
+                // dropped by the weak budget under pressure.
+                let movers = self.generations[level].live.clone();
+                let handles: Vec<_> = movers
+                    .clone()
+                    .into_iter()
+                    .map(Inline::<Handle<UnknownBlob>>::new)
+                    .collect();
+
+                let mut copied = Vec::new();
+                {
+                    let target = self.generations[level + 1].pile_mut();
+                    for result in transfer(&reader, target, handles.clone()) {
+                        let (source, _target) = result.map_err(YardCollectError::Transfer)?;
+                        copied.push(source);
+                    }
+                }
+
+                for source in copied {
+                    self.generations[level + 1]
+                        .live
+                        .insert(&Entry::new(&source.raw));
+                }
+
+                for raw in movers {
+                    self.generations[level].live.remove(&raw);
+                }
+
+                // Make the moved blobs durable in the target before the source
+                // pile is recycled below, so a crash can't drop content that
+                // would briefly live in neither place.
                 self.generations[level + 1]
-                    .live
-                    .insert(&Entry::new(&source.raw));
+                    .pile_mut()
+                    .flush()
+                    .map_err(YardCollectError::Flush)?;
+                dumped.push(level);
             }
+        }
 
-            for raw in movers {
-                self.generations[level].live.remove(&raw);
+        // Fold reclamation into the merge: each dumped level is now empty, so
+        // recycle its pile in place (crash-safe write-empty + atomic rename)
+        // rather than leaving dead bytes for a separate reclaim() pass.
+        for level in dumped {
+            let path = self.generations[level].path.clone();
+            let temp_path = reclaim_temp_path(&path, level);
+            let live = self.generations[level].live.clone();
+            let pile = self.generations[level]
+                .pile
+                .take()
+                .expect("yard generation pile already closed");
+            match reclaim_generation(&path, &temp_path, &live, pile) {
+                Ok(pile) => self.generations[level].pile = Some(pile),
+                Err(err) => {
+                    if let Ok(mut pile) = Pile::open(&path) {
+                        if pile.restore().is_ok() {
+                            self.generations[level].pile = Some(pile);
+                        }
+                    }
+                    return Err(YardCollectError::Reclaim(err));
+                }
             }
         }
 
@@ -742,6 +779,8 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 pub enum YardCollectError {
     Reader(YardReaderError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
+    Flush(super::pile::FlushError),
+    Reclaim(YardReclaimError),
 }
 
 impl fmt::Display for YardCollectError {
@@ -749,6 +788,10 @@ impl fmt::Display for YardCollectError {
         match self {
             Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
             Self::Transfer(err) => write!(f, "failed to compact yard generation: {err}"),
+            Self::Flush(err) => write!(f, "failed to flush yard generation pile: {err}"),
+            Self::Reclaim(err) => {
+                write!(f, "failed to recycle compacted yard generation: {err}")
+            }
         }
     }
 }
@@ -963,6 +1006,44 @@ mod tests {
         assert!(!yard.contains_in_generation(0, weak));
         assert!(!yard.contains_in_generation(1, weak));
         assert!(yard.contains_in_generation(2, weak));
+    }
+
+    #[test]
+    fn compact_recycles_dumped_generations_without_a_separate_reclaim() {
+        let (_dir, paths, mut yard) = yard_with_paths(
+            2,
+            YardConfig {
+                weak_budget: 0,
+                strong_level_budget: 0,
+                fanout: 1,
+            },
+        );
+        // A strong blob lands in gen 0 and, with a zero budget, overflows on
+        // compaction — the whole of gen 0 dumps into gen 1.
+        let strong = yard
+            .put::<RawBytes, _>(Bytes::from_source(vec![b'S'; 512]))
+            .unwrap();
+        yard.pin_strong(pin_id(7), strong);
+        // Dead bytes physically present in gen 0, so there is genuinely
+        // something for the merge to reclaim.
+        let _dead = yard
+            .put::<RawBytes, _>(Bytes::from_source(vec![b'D'; 4096]))
+            .unwrap();
+        assert_eq!(pile_blob_count(&paths[0]), 2);
+        let strong_before = {
+            let reader = yard.reader().unwrap();
+            get_raw(&reader, strong).unwrap()
+        };
+
+        yard.compact().unwrap();
+
+        // No separate reclaim(): the merge itself recycled gen 0's pile, so it
+        // is physically empty, while the live blob moved down to gen 1 and
+        // stays readable.
+        assert_eq!(pile_blob_count(&paths[0]), 0);
+        assert!(yard.contains_in_generation(1, strong));
+        let reader = yard.reader().unwrap();
+        assert_eq!(get_raw(&reader, strong).unwrap(), strong_before);
     }
 
     #[test]
