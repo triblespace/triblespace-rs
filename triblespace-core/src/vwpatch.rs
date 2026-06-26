@@ -1,18 +1,18 @@
 //! Persistent Adaptive Trie with Cuckoo-compression and
-//! Hash-maintenance (PATCH).
+//! Hash-maintenance (VWPATCH).
 //!
-//! See the [PATCH](../book/src/deep-dive/patch.md) chapter of the Tribles Book
+//! See the [VWPATCH](../book/src/deep-dive/patch.md) chapter of the Tribles Book
 //! for the full design description and hashing scheme.
 //!
 //! Values stored in leaves are not part of hashing or equality comparisons.
-//! Two [`PATCH`](crate::patch::PATCH)es are considered equal if they contain the same set of keys,
+//! Two [`VWPATCH`](crate::vwpatch::VWPATCH)es are considered equal if they contain the same set of keys,
 //! even if the associated values differ. This allows using the structure as an
 //! idempotent blobstore where a value's hash determines its key.
 //!
 #![allow(unstable_name_collisions)]
 
 mod branch;
-/// Byte-indexed lookup tables used by PATCH branch nodes.
+/// Byte-indexed lookup tables used by VWPATCH branch nodes.
 pub mod bytetable;
 mod entry;
 mod leaf;
@@ -27,8 +27,6 @@ use leaf::*;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
-use rand::thread_rng;
-use rand::RngCore;
 use std::cmp::Reverse;
 use std::convert::TryInto;
 use std::fmt;
@@ -38,11 +36,15 @@ use std::ptr::NonNull;
 use std::sync::Once;
 
 #[cfg(not(target_pointer_width = "64"))]
-compile_error!("PATCH tagged pointers require 64-bit targets");
+compile_error!("VWPATCH tagged pointers require 64-bit targets");
 
-// `pub` (was private) so the `vwpatch` clone can share the same SIP key and
-// thus produce identical leaf/node hashes for identical key sets.
-pub static mut SIP_KEY: [u8; 16] = [0; 16];
+// Share the SIP key with the original `patch` module so that an identical
+// key set produces identical leaf/node hashes across both tries. The key is
+// owned and initialized exactly once by `crate::patch` (its `INIT` Once);
+// the clone re-exports it and routes initialization through
+// `crate::patch::init_sip_key()` (see `init_sip_key` below). The local `INIT`
+// Once here only guards this module's own `bytetable::init()`.
+pub(crate) use crate::patch::SIP_KEY;
 static INIT: Once = Once::new();
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
@@ -52,7 +54,7 @@ static INIT: Once = Once::new();
 #[cfg(feature = "parallel")]
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 
-/// Parallel-aware PATCH union, with a shared work-stealing budget
+/// Parallel-aware VWPATCH union, with a shared work-stealing budget
 /// carried across the entire recursive descent.
 ///
 /// Two-phase model per parallel call:
@@ -154,234 +156,27 @@ mod parallel_union {
 }
 
 /// Initializes the SIP key used for key hashing.
-/// This function is called automatically when a new PATCH is created.
-///
-/// `pub(crate)` (was private) so the `vwpatch` clone can route its own SIP-key
-/// initialization through this single `Once`, guaranteeing one shared key.
-pub(crate) fn init_sip_key() {
+/// This function is called automatically when a new VWPATCH is created.
+fn init_sip_key() {
+    // Guard this module's own bytetable dispersion init.
     INIT.call_once(|| {
         bytetable::init();
-
-        let mut rng = thread_rng();
-        unsafe {
-            rng.fill_bytes(&mut SIP_KEY[..]);
-        }
     });
+    // Fill the shared SIP key exactly once via the original module's Once.
+    crate::patch::init_sip_key();
 }
 
-/// Builds a per-byte segment map from the segment lengths.
-///
-/// The returned table maps each key byte to its segment index.
-pub const fn build_segmentation<const N: usize, const M: usize>(lens: [usize; M]) -> [usize; N] {
-    let mut res = [0; N];
-    let mut seg = 0;
-    let mut off = 0;
-    while seg < M {
-        let len = lens[seg];
-        let mut i = 0;
-        while i < len {
-            res[off + i] = seg;
-            i += 1;
-        }
-        off += len;
-        seg += 1;
-    }
-    res
-}
-
-/// Builds an identity permutation table of length `N`.
-pub const fn identity_map<const N: usize>() -> [usize; N] {
-    let mut res = [0; N];
-    let mut i = 0;
-    while i < N {
-        res[i] = i;
-        i += 1;
-    }
-    res
-}
-
-/// Builds a table translating indices from key order to tree order.
-///
-/// `lens` describes the segment lengths in key order and `perm` is the
-/// permutation of those segments in tree order.
-pub const fn build_key_to_tree<const N: usize, const M: usize>(
-    lens: [usize; M],
-    perm: [usize; M],
-) -> [usize; N] {
-    let mut key_starts = [0; M];
-    let mut off = 0;
-    let mut i = 0;
-    while i < M {
-        key_starts[i] = off;
-        off += lens[i];
-        i += 1;
-    }
-
-    let mut tree_starts = [0; M];
-    off = 0;
-    i = 0;
-    while i < M {
-        let seg = perm[i];
-        tree_starts[seg] = off;
-        off += lens[seg];
-        i += 1;
-    }
-
-    let mut res = [0; N];
-    let mut seg = 0;
-    while seg < M {
-        let len = lens[seg];
-        let ks = key_starts[seg];
-        let ts = tree_starts[seg];
-        let mut j = 0;
-        while j < len {
-            res[ks + j] = ts + j;
-            j += 1;
-        }
-        seg += 1;
-    }
-    res
-}
-
-/// Inverts a permutation table.
-pub const fn invert<const N: usize>(arr: [usize; N]) -> [usize; N] {
-    let mut res = [0; N];
-    let mut i = 0;
-    while i < N {
-        res[arr[i]] = i;
-        i += 1;
-    }
-    res
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! key_segmentation {
-    (@count $($e:expr),* $(,)?) => {
-        <[()]>::len(&[$($crate::key_segmentation!(@sub $e)),*])
-    };
-    (@sub $e:expr) => { () };
-    ($(#[$meta:meta])* $name:ident, $len:expr, [$($seg_len:expr),+ $(,)?]) => {
-        $(#[$meta])*
-        #[derive(Copy, Clone, Debug)]
-        pub struct $name;
-        impl $name {
-            pub const SEG_LENS: [usize; $crate::key_segmentation!(@count $($seg_len),*)] = [$($seg_len),*];
-        }
-        impl $crate::patch::KeySegmentation<$len> for $name {
-            const SEGMENTS: [usize; $len] = $crate::patch::build_segmentation::<$len, {$crate::key_segmentation!(@count $($seg_len),*)}>(Self::SEG_LENS);
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! key_schema {
-    (@count $($e:expr),* $(,)?) => {
-        <[()]>::len(&[$($crate::key_schema!(@sub $e)),*])
-    };
-    (@sub $e:expr) => { () };
-    ($(#[$meta:meta])* $name:ident, $seg:ty, $len:expr, [$($perm:expr),+ $(,)?]) => {
-        $(#[$meta])*
-        #[derive(Copy, Clone, Debug)]
-        pub struct $name;
-        impl $crate::patch::KeySchema<$len> for $name {
-            type Segmentation = $seg;
-            const SEGMENT_PERM: &'static [usize] = &[$($perm),*];
-            const KEY_TO_TREE: [usize; $len] = $crate::patch::build_key_to_tree::<$len, {$crate::key_schema!(@count $($perm),*)}>(<$seg>::SEG_LENS, [$($perm),*]);
-            const TREE_TO_KEY: [usize; $len] = $crate::patch::invert(Self::KEY_TO_TREE);
-        }
-    };
-}
-
-/// A trait is used to provide a re-ordered view of the keys stored in the PATCH.
-/// This allows for different PATCH instances share the same leaf nodes,
-/// independent of the key ordering used in the tree.
-pub trait KeySchema<const KEY_LEN: usize>: Copy + Clone + Debug {
-    /// The segmentation this ordering operates over.
-    type Segmentation: KeySegmentation<KEY_LEN>;
-    /// Order of segments from key layout to tree layout.
-    const SEGMENT_PERM: &'static [usize];
-    /// Maps each key index to its position in the tree view.
-    const KEY_TO_TREE: [usize; KEY_LEN];
-    /// Maps each tree index to its position in the key view.
-    const TREE_TO_KEY: [usize; KEY_LEN];
-
-    /// Reorders the key from the shared key ordering to the tree ordering.
-    fn tree_ordered(key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
-        let mut new_key = [0; KEY_LEN];
-        let mut i = 0;
-        while i < KEY_LEN {
-            new_key[Self::KEY_TO_TREE[i]] = key[i];
-            i += 1;
-        }
-        new_key
-    }
-
-    /// Reorders the key from the tree ordering to the shared key ordering.
-    fn key_ordered(tree_key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
-        let mut new_key = [0; KEY_LEN];
-        let mut i = 0;
-        while i < KEY_LEN {
-            new_key[Self::TREE_TO_KEY[i]] = tree_key[i];
-            i += 1;
-        }
-        new_key
-    }
-
-    /// Return the segment index for the byte at `at_depth` in tree ordering.
-    ///
-    /// Default implementation reads the static segmentation table and the
-    /// tree->key mapping. Having this as a method makes call sites clearer and
-    /// reduces the verbosity of expressions that access the segmentation table.
-    fn segment_of_tree_depth(at_depth: usize) -> usize {
-        <Self::Segmentation as KeySegmentation<KEY_LEN>>::SEGMENTS[Self::TREE_TO_KEY[at_depth]]
-    }
-
-    /// Return true if the tree-ordered bytes at `a` and `b` belong to the same
-    /// logical segment.
-    fn same_segment_tree(a: usize, b: usize) -> bool {
-        <Self::Segmentation as KeySegmentation<KEY_LEN>>::SEGMENTS[Self::TREE_TO_KEY[a]]
-            == <Self::Segmentation as KeySegmentation<KEY_LEN>>::SEGMENTS[Self::TREE_TO_KEY[b]]
-    }
-}
-
-/// This trait is used to segment keys stored in the PATCH.
-/// The segmentation is used to determine sub-fields of the key,
-/// allowing for segment based operations, like counting the number
-/// of elements in a segment with a given prefix without traversing the tree.
-///
-/// Note that the segmentation is defined on the shared key ordering,
-/// and should thus be only implemented once, independent of additional key orderings.
-///
-/// See [TribleSegmentation](crate::trible::TribleSegmentation) for an example that segments keys into entity,
-/// attribute, and value segments.
-pub trait KeySegmentation<const KEY_LEN: usize>: Copy + Clone + Debug {
-    /// Segment index for each position in the key.
-    const SEGMENTS: [usize; KEY_LEN];
-}
-
-/// A `KeySchema` that does not reorder the keys.
-/// This is useful for keys that are already ordered in the desired way.
-/// This is the default ordering.
-#[derive(Copy, Clone, Debug)]
-pub struct IdentitySchema {}
-
-/// A `KeySegmentation` that does not segment the keys.
-/// This is useful for keys that do not have a segment structure.
-/// This is the default segmentation.
-#[derive(Copy, Clone, Debug)]
-pub struct SingleSegmentation {}
-impl<const KEY_LEN: usize> KeySchema<KEY_LEN> for IdentitySchema {
-    type Segmentation = SingleSegmentation;
-    const SEGMENT_PERM: &'static [usize] = &[0];
-    const KEY_TO_TREE: [usize; KEY_LEN] = identity_map::<KEY_LEN>();
-    const TREE_TO_KEY: [usize; KEY_LEN] = identity_map::<KEY_LEN>();
-}
-
-impl<const KEY_LEN: usize> KeySegmentation<KEY_LEN> for SingleSegmentation {
-    const SEGMENTS: [usize; KEY_LEN] = [0; KEY_LEN];
-}
+// --- Shared key-schema infrastructure -------------------------------------
+//
+// The const helpers, the `key_schema!` / `key_segmentation!` macros, the
+// `KeySchema` / `KeySegmentation` traits, and the `IdentitySchema` /
+// `SingleSegmentation` types are reused verbatim from `crate::patch`. They are
+// `pub` there, the macros are `#[macro_export]` (so they live at the crate
+// root and must not be redefined here, or the export would collide), and the
+// existing ordering schemas (`EAVOrder`, etc.) implement
+// `crate::patch::KeySchema`. Re-exporting the same items keeps those impls
+// valid for `VWPATCH` and avoids duplicate macro exports.
+pub use crate::patch::{IdentitySchema, KeySchema, KeySegmentation, SingleSegmentation};
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
@@ -744,7 +539,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             if this.tag() == HeadTag::Leaf {
                 slot.take();
             } else {
-                let mut ed = crate::patch::branch::BranchMut::from_head(this);
+                let mut ed = crate::vwpatch::branch::BranchMut::from_head(this);
                 let key = leaf_key[end_depth];
                 ed.modify_child(key, |mut opt| {
                     Self::remove_leaf(&mut opt, leaf_key, end_depth);
@@ -791,7 +586,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             this.first_divergence(&leaf, start_depth)
         {
             let old_key = this.key();
-            let new_body = crate::patch::branch::Branch::new(
+            let new_body = crate::vwpatch::branch::Branch::new(
                 depth,
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
@@ -801,7 +596,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
         let end_depth = this.end_depth();
         if end_depth != KEY_LEN {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
@@ -817,7 +612,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 // machinery requires the value type to be zero-sized so reification
 // (constructing a heap Leaf with `()` as the value) is well-defined.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
-    /// Inserts a new leaf into a PATCH while keeping owner-aware
+    /// Inserts a new leaf into a VWPATCH while keeping owner-aware
     /// invariants intact. `this` is guaranteed by the call protocol
     /// to be a heap `Leaf` or a `Branch` — never a `LocalLeaf`,
     /// because LocalLeaf children are handled inline by their parent
@@ -830,7 +625,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     pub(crate) fn insert_leaf_with_owner(
         mut this: Self,
         mut leaf: Self,
-        mut leaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        mut leaf_owner: Option<&std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
         leaf_hash: u128,
         start_depth: usize,
     ) -> Self {
@@ -846,7 +641,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         {
             let old_key = this.key();
             let new_branch_owner = leaf_owner.cloned();
-            let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
+            let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                 depth,
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
@@ -858,7 +653,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 
         let end_depth = this.end_depth();
         if end_depth != KEY_LEN {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
 
             // Owner reconciliation at this Branch — single match block
             // so the no-op (matched / both-None) case is one
@@ -879,7 +674,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             // descent; we read through this pointer only inside the
             // closure body before it returns.
             let branch_owner_ptr: *const Option<
-                std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>,
+                std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>,
             > = &ed.owner;
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
@@ -899,7 +694,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                         );
                     let old_top_key = old.key();
                     let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                    let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
+                    let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                         depth,
                         old.with_key(old_byte_key),
                         inserted.with_key(leaf_byte_key),
@@ -935,7 +730,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     }
 
     /// Public re-export for the root-reification path used by
-    /// `PATCH::insert_archive` when the PATCH is empty.
+    /// `VWPATCH::insert_archive` when the VWPATCH is empty.
     pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
         Self::reify_local_leaf_unit(head)
     }
@@ -965,7 +760,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             return leaf.with_key(old_key);
         } else {
             // Use the editor view for branch mutation instead of raw pointer ops.
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
@@ -976,7 +771,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         this
     }
 
-    /// Sequential PATCH-trie union. Always serial; the parallel
+    /// Sequential VWPATCH-trie union. Always serial; the parallel
     /// dispatch lives in [`Self::par_union`] which calls back into
     /// `union` once budget is exhausted.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
@@ -1000,7 +795,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let this_depth = this.end_depth();
         let other_depth = other.end_depth();
         if this_depth < other_depth {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
             let inserted = other.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
@@ -1014,7 +809,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         if other_depth < this_depth {
             let old_key = this.key();
             let this_head = this;
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut other);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut other);
             let inserted = this_head.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
@@ -1042,7 +837,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
             unreachable!();
         };
-        let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+        let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
         for other_child in other_branch_ref
             .child_table
             .iter_mut()
@@ -1143,7 +938,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         };
 
         {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
             let end_depth = ed.end_depth as usize;
 
             // Scatter both child tables into key-indexed 256-slot
@@ -1152,8 +947,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // simple pass-throughs ("only").
             let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
             let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let mut this_present = crate::patch::bytetable::ByteSet::new_empty();
-            let mut other_present = crate::patch::bytetable::ByteSet::new_empty();
+            let mut this_present = crate::vwpatch::bytetable::ByteSet::new_empty();
+            let mut other_present = crate::vwpatch::bytetable::ByteSet::new_empty();
 
             for slot in ed.child_table.iter_mut() {
                 if let Some(head) = slot.take() {
@@ -1351,7 +1146,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         );
         let mut head_for_branch = Head::new(0, new_branch);
         {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
             for child in iter {
                 let inserted = child.with_start(self_depth);
                 let k = inserted.key();
@@ -1479,7 +1274,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         );
         let mut head_for_branch = Head::new(0, new_branch);
         {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
             for child in iter {
                 ed.install_child_growing(child.with_start(self_depth));
             }
@@ -1598,11 +1393,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     return None;
                 }
                 // SAFETY: LocalLeaf is only constructed by the SimpleArchive
-                // ingestion path (step 3), which constrains the PATCH to
+                // ingestion path (step 3), which constrains the VWPATCH to
                 // `V = ()`. The `Option<&V>` here therefore points at a
                 // zero-sized value; a static `()` provides the address.
                 // For non-`()` V this branch is unreachable today, and
-                // construction will refuse such PATCHes once step 3 lands.
+                // construction will refuse such VWPATCHes once step 3 lands.
                 // The type-system invariant will eventually be enforced
                 // via a `LocalLeafSupported: V` trait constraint at
                 // `Head::new_local_leaf` callers.
@@ -1633,7 +1428,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
     /// Diagnostic: accumulate (branch nodes, total child-table slots,
     /// heap-`Leaf` nodes, `LocalLeaf` slots) over the subtree. Used to
-    /// decompose a PATCH's *structural* byte size (vs resident RSS).
+    /// decompose a VWPATCH's *structural* byte size (vs resident RSS).
     /// `branches` × `BRANCH_BASE_SIZE` + `slots` × 8 is the branch
     /// allocation total; heap leaves add one `Leaf` node each.
     pub(crate) fn node_stats(&self, acc: &mut (u64, u64, u64, u64)) {
@@ -1752,7 +1547,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         // pointer into the Head when it is dropped.
         let mut head_for_branch = Head::new(0, new_branch);
         {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
             for child in intersected_children {
                 let inserted = child.with_start(self_depth);
                 let k = inserted.key();
@@ -1787,7 +1582,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let mut new_branch = self.clone();
             let other_byte_key = other.childleaf_key()[O::TREE_TO_KEY[self_depth]];
             {
-                let mut ed = crate::patch::branch::BranchMut::from_head(&mut new_branch);
+                let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut new_branch);
                 ed.modify_child(other_byte_key, |opt| {
                     opt.and_then(|child| child.difference(other, self_depth))
                 });
@@ -1850,7 +1645,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         );
         let mut head_for_branch = Head::new(0, new_branch);
         {
-            let mut ed = crate::patch::branch::BranchMut::from_head(&mut head_for_branch);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
             for child in differenced_children {
                 let inserted = child.with_start(self_depth);
                 let k = inserted.key();
@@ -1914,7 +1709,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
     }
 }
 
-/// A PATCH is a persistent data structure that stores a set of keys.
+/// A VWPATCH is a persistent data structure that stores a set of keys.
 /// Each key can be reordered and segmented, based on the provided key ordering and segmentation.
 ///
 /// The patch supports efficient set operations, like union, intersection, and difference,
@@ -1928,16 +1723,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
 /// Having a single node type for all branching factors simplifies the implementation,
 /// compared to other adaptive trie implementations, like ARTs or Judy Arrays
 ///
-/// The PATCH allows for cheap copy-on-write operations, with `clone` being O(1).
+/// The VWPATCH allows for cheap copy-on-write operations, with `clone` being O(1).
 #[derive(Debug)]
-pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
+pub struct VWPATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where
     O: KeySchema<KEY_LEN>,
 {
     root: Option<Head<KEY_LEN, O, V>>,
 }
 
-impl<const KEY_LEN: usize, O, V> Clone for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V> Clone for VWPATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
 {
@@ -1948,7 +1743,7 @@ where
     }
 }
 
-impl<const KEY_LEN: usize, O, V> Default for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V> Default for VWPATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
 {
@@ -1957,20 +1752,20 @@ where
     }
 }
 
-impl<const KEY_LEN: usize, O, V> PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V> VWPATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
 {
-    /// Creates a new empty PATCH.
+    /// Creates a new empty VWPATCH.
     pub fn new() -> Self {
         init_sip_key();
-        PATCH { root: None }
+        VWPATCH { root: None }
     }
 
-    /// Inserts a shared key into the PATCH.
+    /// Inserts a shared key into the VWPATCH.
     ///
     /// Takes an [Entry] object that can be created from a key,
-    /// and inserted into multiple PATCH instances.
+    /// and inserted into multiple VWPATCH instances.
     ///
     /// If the key is already present, this is a no-op.
     pub fn insert(&mut self, entry: &Entry<KEY_LEN, V>) {
@@ -1983,7 +1778,7 @@ where
         }
     }
 
-    /// Inserts a key into the PATCH, replacing the value if it already exists.
+    /// Inserts a key into the VWPATCH, replacing the value if it already exists.
     pub fn replace(&mut self, entry: &Entry<KEY_LEN, V>) {
         if self.root.is_some() {
             let this = self.root.take().expect("root should not be empty");
@@ -1994,14 +1789,14 @@ where
         }
     }
 
-    /// Removes a key from the PATCH.
+    /// Removes a key from the VWPATCH.
     ///
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
         Head::remove_leaf(&mut self.root, key, 0);
     }
 
-    /// Returns the number of keys in the PATCH.
+    /// Returns the number of keys in the VWPATCH.
     pub fn len(&self) -> u64 {
         if let Some(root) = &self.root {
             root.count()
@@ -2057,11 +1852,14 @@ where
         hist
     }
 
-    /// Returns true if the PATCH contains no keys.
+    /// Returns true if the VWPATCH contains no keys.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    // Unused outside this module's tests for now (the original `patch` variant
+    // is consumed by `trible::tribleset`); kept for the upcoming HATCH rework.
+    #[allow(dead_code)]
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
     }
@@ -2154,7 +1952,7 @@ where
         }
     }
 
-    /// Returns true if the PATCH has a key with the given prefix.
+    /// Returns true if the VWPATCH has a key with the given prefix.
     ///
     /// `PREFIX_LEN` must be less than or equal to `KEY_LEN` or a compile-time
     /// assertion will fail.
@@ -2169,11 +1967,11 @@ where
         }
     }
 
-    /// Returns the number of PATCH nodes inspected by a prefix lookup.
+    /// Returns the number of VWPATCH nodes inspected by a prefix lookup.
     ///
-    /// This is a diagnostic companion to [`PATCH::has_prefix`]. A miss counts
+    /// This is a diagnostic companion to [`VWPATCH::has_prefix`]. A miss counts
     /// the node where the mismatch or missing child is discovered; an empty
-    /// PATCH reports zero.
+    /// VWPATCH reports zero.
     pub fn traversal_depth<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> usize {
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
@@ -2205,33 +2003,33 @@ where
         }
     }
 
-    /// Iterates over all keys in the PATCH.
+    /// Iterates over all keys in the VWPATCH.
     /// The keys are returned in key ordering but random order.
-    pub fn iter<'a>(&'a self) -> PATCHIterator<'a, KEY_LEN, O, V> {
-        PATCHIterator::new(self)
+    pub fn iter<'a>(&'a self) -> VWPATCHIterator<'a, KEY_LEN, O, V> {
+        VWPATCHIterator::new(self)
     }
 
-    /// Iterates over all keys in the PATCH in key order.
+    /// Iterates over all keys in the VWPATCH in key order.
     ///
     /// The traversal visits every key in lexicographic key order, without
     /// accepting a prefix filter. For prefix-aware iteration, see
-    /// [`PATCH::iter_prefix_count`].
-    pub fn iter_ordered<'a>(&'a self) -> PATCHOrderedIterator<'a, KEY_LEN, O, V> {
-        PATCHOrderedIterator::new(self)
+    /// [`VWPATCH::iter_prefix_count`].
+    pub fn iter_ordered<'a>(&'a self) -> VWPATCHOrderedIterator<'a, KEY_LEN, O, V> {
+        VWPATCHOrderedIterator::new(self)
     }
 
-    /// Iterate over all prefixes of the given length in the PATCH.
+    /// Iterate over all prefixes of the given length in the VWPATCH.
     /// The prefixes are naturally returned in tree ordering and tree order.
     /// A count of the number of elements for the given prefix is also returned.
     pub fn iter_prefix_count<'a, const PREFIX_LEN: usize>(
         &'a self,
-    ) -> PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V> {
-        PATCHPrefixIterator::new(self)
+    ) -> VWPATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V> {
+        VWPATCHPrefixIterator::new(self)
     }
 
-    /// Unions this PATCH with another PATCH.
+    /// Unions this VWPATCH with another VWPATCH.
     ///
-    /// The other PATCH is consumed, and this PATCH is updated in place.
+    /// The other VWPATCH is consumed, and this VWPATCH is updated in place.
     pub fn union(&mut self, other: Self)
     where
         O: Send + Sync,
@@ -2251,9 +2049,9 @@ where
         }
     }
 
-    /// Intersects this PATCH with another PATCH.
+    /// Intersects this VWPATCH with another VWPATCH.
     ///
-    /// Returns a new PATCH that contains only the keys that are present in both PATCHes.
+    /// Returns a new VWPATCH that contains only the keys that are present in both VWPATCHes.
     pub fn intersect(&self, other: &Self) -> Self
     where
         O: Send + Sync,
@@ -2273,10 +2071,10 @@ where
         Self::new()
     }
 
-    /// Returns the difference between this PATCH and another PATCH.
+    /// Returns the difference between this VWPATCH and another VWPATCH.
     ///
-    /// Returns a new PATCH that contains only the keys that are present in this PATCH,
-    /// but not in the other PATCH.
+    /// Returns a new VWPATCH that contains only the keys that are present in this VWPATCH,
+    /// but not in the other VWPATCH.
     pub fn difference(&self, other: &Self) -> Self
     where
         O: Send + Sync,
@@ -2341,7 +2139,7 @@ where
 /// `LocalLeaf` head if the receiving Branch's `owner` matches the
 /// entry's; otherwise it is reified into a heap-allocated `Leaf<KEY_LEN,
 /// ()>` automatically.
-impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
+impl<const KEY_LEN: usize, O> VWPATCH<KEY_LEN, O, ()>
 where
     O: KeySchema<KEY_LEN>,
 {
@@ -2355,7 +2153,7 @@ where
                 Head::insert_leaf_with_owner(this, leaf_head, Some(leaf_owner), leaf_hash, 0);
             self.root.replace(new_head);
         } else {
-            // Empty PATCH: the standalone root can't host an owner field
+            // Empty VWPATCH: the standalone root can't host an owner field
             // (only Branches carry `owner`), so reify the single entry
             // into a heap Leaf. The next insertion creates a Branch
             // which can adopt the owner cleanly.
@@ -2365,7 +2163,7 @@ where
     }
 }
 
-impl<const KEY_LEN: usize, O, V> PartialEq for PATCH<KEY_LEN, O, V>
+impl<const KEY_LEN: usize, O, V> PartialEq for VWPATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
 {
@@ -2374,31 +2172,31 @@ where
     }
 }
 
-impl<const KEY_LEN: usize, O, V> Eq for PATCH<KEY_LEN, O, V> where O: KeySchema<KEY_LEN> {}
+impl<const KEY_LEN: usize, O, V> Eq for VWPATCH<KEY_LEN, O, V> where O: KeySchema<KEY_LEN> {}
 
-impl<'a, const KEY_LEN: usize, O, V> IntoIterator for &'a PATCH<KEY_LEN, O, V>
+impl<'a, const KEY_LEN: usize, O, V> IntoIterator for &'a VWPATCH<KEY_LEN, O, V>
 where
     O: KeySchema<KEY_LEN>,
 {
     type Item = &'a [u8; KEY_LEN];
-    type IntoIter = PATCHIterator<'a, KEY_LEN, O, V>;
+    type IntoIter = VWPATCHIterator<'a, KEY_LEN, O, V>;
 
     fn into_iter(self) -> Self::IntoIter {
-        PATCHIterator::new(self)
+        VWPATCHIterator::new(self)
     }
 }
 
-/// An iterator over all keys in a PATCH.
+/// An iterator over all keys in a VWPATCH.
 /// The keys are returned in key ordering but in random order.
-pub struct PATCHIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub struct VWPATCHIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     stack: ArrayVec<std::slice::Iter<'a, Option<Head<KEY_LEN, O, V>>>, KEY_LEN>,
     remaining: usize,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_LEN, O, V> {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> VWPATCHIterator<'a, KEY_LEN, O, V> {
     /// Creates an iterator over all keys in `patch`.
-    pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
-        let mut r = PATCHIterator {
+    pub fn new(patch: &'a VWPATCH<KEY_LEN, O, V>) -> Self {
+        let mut r = VWPATCHIterator {
             stack: ArrayVec::new(),
             remaining: patch.len().min(usize::MAX as u64) as usize,
         };
@@ -2408,7 +2206,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_L
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+    for VWPATCHIterator<'a, KEY_LEN, O, V>
 {
     type Item = &'a [u8; KEY_LEN];
 
@@ -2442,29 +2240,29 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ExactSizeIterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+    for VWPATCHIterator<'a, KEY_LEN, O, V>
 {
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterator
-    for PATCHIterator<'a, KEY_LEN, O, V>
+    for VWPATCHIterator<'a, KEY_LEN, O, V>
 {
 }
 
-/// An iterator over every key in a PATCH, returned in key order.
+/// An iterator over every key in a VWPATCH, returned in key order.
 ///
 /// Keys are yielded in lexicographic key order regardless of their physical
 /// layout in the underlying tree. This iterator walks the full tree and does
 /// not accept a prefix filter. For prefix-aware iteration, use
-/// [`PATCHPrefixIterator`], constructed via [`PATCH::iter_prefix_count`].
-pub struct PATCHOrderedIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+/// [`VWPATCHPrefixIterator`], constructed via [`VWPATCH::iter_prefix_count`].
+pub struct VWPATCHOrderedIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V>, 256>>,
     remaining: usize,
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a, KEY_LEN, O, V> {
-    pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
-        let mut r = PATCHOrderedIterator {
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> VWPATCHOrderedIterator<'a, KEY_LEN, O, V> {
+    pub fn new(patch: &'a VWPATCH<KEY_LEN, O, V>) -> Self {
+        let mut r = VWPATCHOrderedIterator {
             stack: Vec::with_capacity(KEY_LEN),
             remaining: patch.len().min(usize::MAX as u64) as usize,
         };
@@ -2486,17 +2284,17 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
 }
 
 // --- Owned consuming iterators ---
-/// Iterator that owns a PATCH and yields keys in key-order. The iterator
-/// consumes the PATCH and stores it on the heap (Box) so it can safely hold
+/// Iterator that owns a VWPATCH and yields keys in key-order. The iterator
+/// consumes the VWPATCH and stores it on the heap (Box) so it can safely hold
 /// raw pointers into the patch memory while the iterator is moved.
-pub struct PATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+pub struct VWPATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIntoIterator<KEY_LEN, O, V> {}
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> VWPATCHIntoIterator<KEY_LEN, O, V> {}
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoIterator<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for VWPATCHIntoIterator<KEY_LEN, O, V> {
     type Item = [u8; KEY_LEN];
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2528,14 +2326,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoItera
     }
 }
 
-/// Iterator that owns a PATCH and yields keys in key order.
-pub struct PATCHIntoOrderedIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+/// Iterator that owns a VWPATCH and yields keys in key order.
+pub struct VWPATCHIntoOrderedIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHIntoOrderedIterator<KEY_LEN, O, V>
+    for VWPATCHIntoOrderedIterator<KEY_LEN, O, V>
 {
     type Item = [u8; KEY_LEN];
 
@@ -2577,9 +2375,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for PATCH<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for VWPATCH<KEY_LEN, O, V> {
     type Item = [u8; KEY_LEN];
-    type IntoIter = PATCHIntoIterator<KEY_LEN, O, V>;
+    type IntoIter = VWPATCHIntoIterator<KEY_LEN, O, V>;
 
     fn into_iter(self) -> Self::IntoIter {
         let remaining = self.len().min(usize::MAX as u64) as usize;
@@ -2587,22 +2385,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for PATCH<KEY_
         if let Some(root) = self.root {
             q.push(root);
         }
-        PATCHIntoIterator {
+        VWPATCHIntoIterator {
             queue: q,
             remaining,
         }
     }
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCH<KEY_LEN, O, V> {
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> VWPATCH<KEY_LEN, O, V> {
     /// Consume and return an iterator that yields keys in key order.
-    pub fn into_iter_ordered(self) -> PATCHIntoOrderedIterator<KEY_LEN, O, V> {
+    pub fn into_iter_ordered(self) -> VWPATCHIntoOrderedIterator<KEY_LEN, O, V> {
         let remaining = self.len().min(usize::MAX as u64) as usize;
         let mut q = Vec::new();
         if let Some(root) = self.root {
             q.push(root);
         }
-        PATCHIntoOrderedIterator {
+        VWPATCHIntoOrderedIterator {
             queue: q,
             remaining,
         }
@@ -2610,7 +2408,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCH<KEY_LEN, O, V> {
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+    for VWPATCHOrderedIterator<'a, KEY_LEN, O, V>
 {
     type Item = &'a [u8; KEY_LEN];
 
@@ -2643,18 +2441,18 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ExactSizeIterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+    for VWPATCHOrderedIterator<'a, KEY_LEN, O, V>
 {
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V>
+    for VWPATCHOrderedIterator<'a, KEY_LEN, O, V>
 {
 }
 
-/// An iterator over all keys in a PATCH that have a given prefix.
+/// An iterator over all keys in a VWPATCH that have a given prefix.
 /// The keys are returned in tree ordering and in tree order.
-pub struct PATCHPrefixIterator<
+pub struct VWPATCHPrefixIterator<
     'a,
     const KEY_LEN: usize,
     const PREFIX_LEN: usize,
@@ -2665,13 +2463,13 @@ pub struct PATCHPrefixIterator<
 }
 
 impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V>
-    PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
+    VWPATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
 {
-    fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
+    fn new(patch: &'a VWPATCH<KEY_LEN, O, V>) -> Self {
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
         }
-        let mut r = PATCHPrefixIterator {
+        let mut r = VWPATCHPrefixIterator {
             stack: Vec::with_capacity(PREFIX_LEN),
         };
         if let Some(root) = &patch.root {
@@ -2692,7 +2490,7 @@ impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V
 }
 
 impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
-    for PATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
+    for VWPATCHPrefixIterator<'a, KEY_LEN, PREFIX_LEN, O, V>
 {
     type Item = ([u8; PREFIX_LEN], u64);
 
@@ -2759,13 +2557,13 @@ mod tests {
 
     #[test]
     fn empty_tree() {
-        let _tree = PATCH::<64, IdentitySchema, ()>::new();
+        let _tree = VWPATCH::<64, IdentitySchema, ()>::new();
     }
 
     #[test]
     fn tree_put_one() {
         const KEY_SIZE: usize = 64;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, ()>::new();
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
     }
@@ -2773,7 +2571,7 @@ mod tests {
     #[test]
     fn tree_clone_one() {
         const KEY_SIZE: usize = 64;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, ()>::new();
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         let _clone = tree.clone();
@@ -2782,7 +2580,7 @@ mod tests {
     #[test]
     fn tree_put_same() {
         const KEY_SIZE: usize = 64;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, ()>::new();
         let entry = Entry::new(&[0; KEY_SIZE]);
         tree.insert(&entry);
         tree.insert(&entry);
@@ -2792,7 +2590,7 @@ mod tests {
     fn tree_replace_existing() {
         const KEY_SIZE: usize = 64;
         let key = [1u8; KEY_SIZE];
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         let entry1 = Entry::with_value(&key, 1);
         tree.insert(&entry1);
         let entry2 = Entry::with_value(&key, 2);
@@ -2805,7 +2603,7 @@ mod tests {
         const KEY_SIZE: usize = 64;
         let key1 = [0u8; KEY_SIZE];
         let key2 = [1u8; KEY_SIZE];
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         let entry1 = Entry::with_value(&key1, 1);
         let entry2 = Entry::with_value(&key2, 2);
         tree.insert(&entry1);
@@ -2819,7 +2617,7 @@ mod tests {
     #[test]
     fn update_child_refreshes_childleaf_on_replace() {
         const KEY_SIZE: usize = 4;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let key1 = [0u8; KEY_SIZE];
         let key2 = [1u8; KEY_SIZE];
@@ -2846,7 +2644,7 @@ mod tests {
         // Replace that child with a new leaf that has a different childleaf key.
         let new_key = [2u8; KEY_SIZE];
         {
-            let mut ed = crate::patch::branch::BranchMut::from_slot(&mut tree.root);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_slot(&mut tree.root);
             ed.modify_child(slot_key, |_| {
                 Some(Entry::with_value(&new_key, 42).leaf::<IdentitySchema>())
             });
@@ -2860,7 +2658,7 @@ mod tests {
     #[test]
     fn remove_childleaf_updates_branch() {
         const KEY_SIZE: usize = 4;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let key1 = [0u8; KEY_SIZE];
         let key2 = [1u8; KEY_SIZE];
@@ -2882,7 +2680,7 @@ mod tests {
     #[test]
     fn remove_collapses_branch_to_single_child() {
         const KEY_SIZE: usize = 4;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let key1 = [0u8; KEY_SIZE];
         let key2 = [1u8; KEY_SIZE];
@@ -2951,13 +2749,13 @@ mod tests {
         );
     }
 
-    /// Checks what happens if we join two PATCHes that
+    /// Checks what happens if we join two VWPATCHes that
     /// only contain a single element each, that differs in the last byte.
     #[test]
     fn tree_union_single() {
         const KEY_SIZE: usize = 8;
-        let mut left = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
-        let mut right = PATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let mut left = VWPATCH::<KEY_SIZE, IdentitySchema, ()>::new();
+        let mut right = VWPATCH::<KEY_SIZE, IdentitySchema, ()>::new();
         let left_entry = Entry::new(&[0, 0, 0, 0, 0, 0, 0, 0]);
         let right_entry = Entry::new(&[0, 0, 0, 0, 0, 0, 0, 1]);
         left.insert(&left_entry);
@@ -2974,7 +2772,7 @@ mod tests {
     proptest! {
         #[test]
         fn tree_insert(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..1024)) {
-            let mut tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<64, IdentitySchema, ()>::new();
             for key in keys {
                 let key: [u8; 64] = key.try_into().unwrap();
                 let entry = Entry::new(&key);
@@ -2984,7 +2782,7 @@ mod tests {
 
         #[test]
         fn tree_len(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..1024)) {
-            let mut tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<64, IdentitySchema, ()>::new();
             let mut set = HashSet::new();
             for key in keys {
                 let key: [u8; 64] = key.try_into().unwrap();
@@ -2998,7 +2796,7 @@ mod tests {
 
         #[test]
         fn tree_infixes(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..1024)) {
-            let mut tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<64, IdentitySchema, ()>::new();
             let mut set = HashSet::new();
             for key in keys {
                 let key: [u8; 64] = key.try_into().unwrap();
@@ -3018,7 +2816,7 @@ mod tests {
 
         #[test]
         fn tree_iter(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..1024)) {
-            let mut tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<64, IdentitySchema, ()>::new();
             let mut set = HashSet::new();
             for key in keys {
                 let key: [u8; 64] = key.try_into().unwrap();
@@ -3043,7 +2841,7 @@ mod tests {
                         right in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 200)) {
             let mut set = HashSet::new();
 
-            let mut left_tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut left_tree = VWPATCH::<64, IdentitySchema, ()>::new();
             for entry in left {
                 let mut key = [0; 64];
                 key.iter_mut().set_from(entry.iter().cloned());
@@ -3052,7 +2850,7 @@ mod tests {
                 set.insert(key);
             }
 
-            let mut right_tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut right_tree = VWPATCH::<64, IdentitySchema, ()>::new();
             for entry in right {
                 let mut key = [0; 64];
                 key.iter_mut().set_from(entry.iter().cloned());
@@ -3077,7 +2875,7 @@ mod tests {
         fn tree_union_empty(left in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 2)) {
             let mut set = HashSet::new();
 
-            let mut left_tree = PATCH::<64, IdentitySchema, ()>::new();
+            let mut left_tree = VWPATCH::<64, IdentitySchema, ()>::new();
             for entry in left {
                 let mut key = [0; 64];
                 key.iter_mut().set_from(entry.iter().cloned());
@@ -3086,7 +2884,7 @@ mod tests {
                 set.insert(key);
             }
 
-            let right_tree = PATCH::<64, IdentitySchema, ()>::new();
+            let right_tree = VWPATCH::<64, IdentitySchema, ()>::new();
 
             left_tree.union(right_tree);
 
@@ -3111,7 +2909,7 @@ mod tests {
             // which might not be affected by nodes in lower levels being changed accidentally.
             // Instead we need to iterate over the keys and check if they are the same.
 
-            let mut tree = PATCH::<8, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<8, IdentitySchema, ()>::new();
             for key in base_keys {
                 let key: [u8; 8] = key[..].try_into().unwrap();
                 let entry = Entry::new(&key);
@@ -3137,7 +2935,7 @@ mod tests {
             // which might not be affected by nodes in lower levels being changed accidentally.
             // Instead we need to iterate over the keys and check if they are the same.
 
-            let mut tree = PATCH::<8, IdentitySchema, ()>::new();
+            let mut tree = VWPATCH::<8, IdentitySchema, ()>::new();
             for key in base_keys {
                 let key: [u8; 8] = key[..].try_into().unwrap();
                 let entry = Entry::new(&key);
@@ -3146,7 +2944,7 @@ mod tests {
             let base_tree_content: Vec<[u8; 8]> = tree.iter().copied().collect();
 
             let mut tree_clone = tree.clone();
-            let mut new_tree = PATCH::<8, IdentitySchema, ()>::new();
+            let mut new_tree = VWPATCH::<8, IdentitySchema, ()>::new();
             for key in new_keys {
                 let key: [u8; 8] = key[..].try_into().unwrap();
                 let entry = Entry::new(&key);
@@ -3162,8 +2960,8 @@ mod tests {
     #[test]
     fn intersect_multiple_common_children_commits_branchmut() {
         const KEY_SIZE: usize = 4;
-        let mut left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
-        let mut right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut left = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut right = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let a = [0u8, 0u8, 0u8, 1u8];
         let b = [0u8, 0u8, 0u8, 2u8];
@@ -3192,8 +2990,8 @@ mod tests {
     #[test]
     fn difference_multiple_children_commits_branchmut() {
         const KEY_SIZE: usize = 4;
-        let mut left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
-        let mut right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut left = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut right = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let a = [0u8, 0u8, 0u8, 1u8];
         let b = [0u8, 0u8, 0u8, 2u8];
@@ -3220,8 +3018,8 @@ mod tests {
     #[test]
     fn difference_empty_left_is_empty() {
         const KEY_SIZE: usize = 4;
-        let left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
-        let mut right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let left = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut right = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         let key = [1u8, 2u8, 3u8, 4u8];
         right.insert(&Entry::with_value(&key, 7));
 
@@ -3232,8 +3030,8 @@ mod tests {
     #[test]
     fn difference_empty_right_returns_left() {
         const KEY_SIZE: usize = 4;
-        let mut left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
-        let right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut left = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let right = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
         let key = [1u8, 2u8, 3u8, 4u8];
         left.insert(&Entry::with_value(&key, 7));
 
@@ -3246,7 +3044,7 @@ mod tests {
     fn slot_edit_branchmut_insert_update() {
         // Small unit test demonstrating the Slot::edit -> BranchMut insert/update pattern.
         const KEY_SIZE: usize = 8;
-        let mut tree = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
 
         let entry1 = Entry::with_value(&[0u8; KEY_SIZE], 1u32);
         let entry2 = Entry::with_value(&[1u8; KEY_SIZE], 2u32);
@@ -3256,7 +3054,7 @@ mod tests {
 
         // Edit the root slot in-place using the BranchMut editor.
         {
-            let mut ed = crate::patch::branch::BranchMut::from_slot(&mut tree.root);
+            let mut ed = crate::vwpatch::branch::BranchMut::from_slot(&mut tree.root);
 
             // Compute the insertion start depth first to avoid borrowing `ed` inside the closure.
             let start_depth = ed.end_depth as usize;
@@ -3274,5 +3072,67 @@ mod tests {
 
         assert_eq!(tree.len(), 3);
         assert_eq!(tree.get(&[2u8; KEY_SIZE]), Some(&3u32));
+    }
+
+    /// Faithful-clone equivalence: insert the same ~10_000 64-byte keys into
+    /// the original `crate::patch::PATCH` and the cloned `VWPATCH`, both under
+    /// the `EAVOrder` schema, and assert identical leaf_count, identical root
+    /// hash (they share the SIP key), and identical lookup results. This is the
+    /// Phase-1 acceptance check that the clone is behaviorally identical.
+    #[test]
+    fn clone_equivalence_with_patch() {
+        use crate::patch::PATCH;
+        use crate::trible::EAVOrder;
+
+        // Deterministic, well-spread 64-byte keys from a counter (splitmix64).
+        fn key_for(i: u64) -> [u8; 64] {
+            let mut k = [0u8; 64];
+            let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for chunk in k.chunks_mut(8) {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                chunk.copy_from_slice(&z.to_le_bytes());
+            }
+            k
+        }
+
+        const N: u64 = 10_000;
+
+        let mut orig: PATCH<64, EAVOrder, ()> = PATCH::new();
+        let mut clone: VWPATCH<64, EAVOrder, ()> = VWPATCH::new();
+
+        for i in 0..N {
+            let key = key_for(i);
+            orig.insert(&crate::patch::Entry::new(&key));
+            clone.insert(&Entry::new(&key));
+        }
+
+        // Identical leaf_count.
+        assert_eq!(orig.len(), clone.len(), "leaf_count must match");
+        assert_eq!(orig.len(), N, "all keys deduplicate to N distinct leaves");
+
+        // Identical root hash (shared SIP key makes this meaningful).
+        assert_eq!(
+            orig.root_hash(),
+            clone.root_hash(),
+            "root hash must match between PATCH and VWPATCH"
+        );
+        assert!(orig.root_hash().is_some());
+
+        // Identical lookup results for present keys ...
+        for i in 0..N {
+            let key = key_for(i);
+            assert_eq!(orig.get(&key), Some(&()));
+            assert_eq!(clone.get(&key), orig.get(&key), "present-key lookup match");
+        }
+        // ... and for absent keys.
+        for i in N..(N + 1000) {
+            let key = key_for(i);
+            assert_eq!(orig.get(&key), None);
+            assert_eq!(clone.get(&key), orig.get(&key), "absent-key lookup match");
+        }
     }
 }

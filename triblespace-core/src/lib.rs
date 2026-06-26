@@ -28,6 +28,11 @@ pub mod import;
 pub mod metadata;
 /// Adaptive radix tree (PATCH) used as the backing store for trible indexes.
 pub mod patch;
+/// Faithful clone of [`patch`] (as `VWPATCH`) — the starting point for the
+/// variable-width trie ("HATCH") rework. Identical algorithm/layout to
+/// [`patch`]; reuses its key-schema infrastructure and shared SIP key.
+#[cfg(feature = "vwpatch")]
+pub mod vwpatch;
 /// Commonly used re-exports for convenient glob imports.
 pub mod prelude;
 /// Query engine: constraints, variables, and the Atreides join algorithm.
