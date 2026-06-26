@@ -235,13 +235,12 @@ impl Yard {
 
     /// Weakly pin a blob and refresh its LRU recency.
     ///
-    /// A weak pin is the want-signal for content you *lack*. Weak-pinning a
-    /// blob you already hold (resident in any generation) is a **no-op**:
-    /// resident content is released by changing the strong branches that
-    /// root it, never by tagging it weak. Allowing it would let a tenured
-    /// blob acquire a weak tag and break the "weak never tenures to the
-    /// bottom" invariant — so the want simply never targets resident
-    /// content, and the invariant holds by construction.
+    /// A weak pin is the demand-born want-signal for content you *lack*
+    /// (minted on a get-miss). Weak-pinning a blob you already hold
+    /// (resident in any generation) is a **no-op**: weak entries originate
+    /// only from demand, never from tagging resident content. (Releasing
+    /// resident content you no longer need durably is a separate concern —
+    /// the local→distributed handoff — not wired here yet.)
     pub fn pin_weak<S>(&self, handle: Inline<Handle<S>>)
     where
         S: BlobEncoding + 'static,
@@ -296,7 +295,14 @@ impl Yard {
                 continue;
             }
 
-            let handles: Vec<_> = strong_here
+            // Overflow: dump the whole level down — strong *and* weak
+            // survivors. `collect()` above already dropped dead, so `live`
+            // here is exactly the survivors. Weak is allowed to descend and
+            // use space in lower tiers rather than being pinned to the
+            // youngest generation; it stays evictable everywhere and is
+            // dropped by the weak budget under pressure.
+            let movers = self.generations[level].live.clone();
+            let handles: Vec<_> = movers
                 .clone()
                 .into_iter()
                 .map(Inline::<Handle<UnknownBlob>>::new)
@@ -317,7 +323,7 @@ impl Yard {
                     .insert(&Entry::new(&source.raw));
             }
 
-            for raw in strong_here {
+            for raw in movers {
                 self.generations[level].live.remove(&raw);
             }
         }
@@ -928,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn lsm_compaction_tenures_strong_and_keeps_weak_young() {
+    fn compaction_tenures_strong_and_lets_weak_descend() {
         let (_dir, mut yard) = yard_with(
             3,
             YardConfig {
@@ -947,12 +953,16 @@ mod tests {
 
         yard.compact().unwrap();
 
+        // With a zero strong budget everything overflows downward; weak now
+        // rides the flow to the bottom alongside strong (it is not pinned to
+        // the youngest generation), and stays there because it is within the
+        // weak budget.
         assert!(!yard.contains_in_generation(0, strong));
         assert!(!yard.contains_in_generation(1, strong));
         assert!(yard.contains_in_generation(2, strong));
-        assert!(yard.contains_in_generation(0, weak));
+        assert!(!yard.contains_in_generation(0, weak));
         assert!(!yard.contains_in_generation(1, weak));
-        assert!(!yard.contains_in_generation(2, weak));
+        assert!(yard.contains_in_generation(2, weak));
     }
 
     #[test]
@@ -1318,18 +1328,6 @@ mod tests {
             assert_general_invariants(yard, model, seed, step);
         }
 
-        fn assert_weak_never_tenures_after_compact(yard: &Yard, seed: u64, step: usize) {
-            let Some(oldest) = live_sets(yard).last().cloned() else {
-                return;
-            };
-            let weak = weak_pins(yard).keys().copied().collect::<BTreeSet<_>>();
-            let tenured_weak = oldest.intersection(&weak).copied().collect::<Vec<_>>();
-            assert!(
-                tenured_weak.is_empty(),
-                "seed {seed} step {step}: weak-pinned blobs reached oldest generation: {tenured_weak:02X?}"
-            );
-        }
-
         fn snapshot_readable(yard: &mut Yard) -> BTreeMap<RawHandle, Vec<u8>> {
             let reader = yard.reader().unwrap();
             live_union(yard)
@@ -1502,7 +1500,6 @@ mod tests {
                         let expected = expected_live_after_collect(&yard, &model);
                         yard.compact().unwrap();
                         assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
-                        assert_weak_never_tenures_after_compact(&yard, seed, step);
                     }
                     8 => {
                         let before = snapshot_readable(&mut yard);
