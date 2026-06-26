@@ -141,6 +141,94 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
             Branch::recompute_aggregates(&mut self.branch_nn);
         }
     }
+
+    /// If a child whose span sub-key equals `sub` (fingerprint `fp`) exists,
+    /// replace it with `f(child)`, update the branch aggregates incrementally
+    /// (XOR hash delta, leaf/segment sums, childleaf refresh), and return
+    /// `true`. Otherwise return `false` without touching anything.
+    ///
+    /// Folding the membership test and the mutable descent into a single
+    /// verified slot lookup avoids scanning + span-verifying the cuckoo table
+    /// twice on the hot descend path.
+    #[must_use]
+    pub fn recurse_dense_child<F>(&mut self, fp: u16, sub: &[u8], f: F) -> bool
+    where
+        F: FnOnce(Head<KEY_LEN, O, V>) -> Head<KEY_LEN, O, V>,
+    {
+        let span_start = self.span_start as usize;
+        let branch_childleaf = self.childleaf;
+        let base_hash = self.hash;
+        let base_seg = self.segment_count;
+        let base_leaf = self.leaf_count;
+
+        let branch = unsafe { self.branch_nn.as_mut() };
+        let Some(slot) = branch.child_table.table_get_slot_verified(fp, |child| {
+            let ck = child.childleaf_key();
+            (0..sub.len()).all(|j| ck[O::TREE_TO_KEY[span_start + j]] == sub[j])
+        }) else {
+            return false;
+        };
+
+        let child = slot.take().unwrap();
+        let old_hash = child.hash();
+        let old_seg = child.count_segment(span_start);
+        let old_leaf = child.count();
+        let replaced_childleaf = child.childleaf_ptr() == branch_childleaf;
+
+        let new_child = f(child);
+        let new_hash = new_child.hash();
+        let new_seg = new_child.count_segment(span_start);
+        let new_leaf = new_child.count();
+        let new_cl = new_child.childleaf_ptr();
+        *slot = Some(new_child.with_key(fp));
+
+        branch.hash = (base_hash ^ old_hash) ^ new_hash;
+        branch.segment_count = (base_seg - old_seg) + new_seg;
+        branch.leaf_count = (base_leaf - old_leaf) + new_leaf;
+        if replaced_childleaf {
+            branch.childleaf = new_cl;
+        }
+        #[cfg(debug_assertions)]
+        unsafe {
+            self.branch_nn.as_ref().debug_check_invariants();
+        }
+        true
+    }
+
+    /// Add a brand-new distinct child (already keyed by its span fingerprint),
+    /// updating aggregates incrementally and growing the table if needed.
+    ///
+    /// Returns `Some(child)` if cuckoo placement failed within 256 slots; the
+    /// table and aggregates are then left unchanged and the caller must narrow
+    /// (rebuild). Returns `None` on success.
+    #[must_use]
+    pub fn add_dense_child(&mut self, child: Head<KEY_LEN, O, V>) -> Option<Head<KEY_LEN, O, V>> {
+        let span_start = self.span_start as usize;
+        // Metrics captured before the move so they can be applied post-install.
+        let add_leaf = child.count();
+        let add_seg = child.count_segment(span_start);
+        let add_hash = child.hash();
+        let add_cl = child.childleaf_ptr();
+
+        if let Some(leftover) =
+            unsafe { Branch::install_child_growing_dup(&mut self.branch_nn, child) }
+        {
+            return Some(leftover);
+        }
+
+        let branch = unsafe { self.branch_nn.as_mut() };
+        branch.leaf_count += add_leaf;
+        branch.segment_count += add_seg;
+        branch.hash ^= add_hash;
+        if branch.childleaf.is_null() {
+            branch.childleaf = add_cl;
+        }
+        #[cfg(debug_assertions)]
+        unsafe {
+            self.branch_nn.as_ref().debug_check_invariants();
+        }
+        None
+    }
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Deref for BranchMut<'a, KEY_LEN, O, V> {
@@ -651,6 +739,93 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Like [`install_child_growing`] but allows the child's fingerprint key
+    /// to already exist in the table (a true span fingerprint collision
+    /// between distinct sub-keys — possible once spans go multi-byte).
+    ///
+    /// Returns `Some(head)` if the child could not be placed within the
+    /// 256-slot maximum (a cuckoo placement failure — arbitrary fingerprints
+    /// can be unplaceable even below the load threshold). On failure the table
+    /// is left set-unchanged (cuckoo displacement backtracks cleanly), so the
+    /// caller can narrow the span and rebuild. Returns `None` on success.
+    #[must_use]
+    pub(crate) unsafe fn install_child_growing_dup(
+        branch_nn: &mut NonNull<Self>,
+        head: Head<KEY_LEN, O, V>,
+    ) -> Option<Head<KEY_LEN, O, V>> {
+        let mut to_insert = head;
+        loop {
+            let branch_ptr = branch_nn.as_ptr();
+            match (*branch_ptr).child_table.table_insert_allow_dup(to_insert) {
+                None => return None,
+                Some(displaced) => {
+                    if dst_len(addr_of!((*branch_ptr).child_table)) >= 256 {
+                        return Some(displaced);
+                    }
+                    to_insert = displaced;
+                    Self::grow(branch_nn);
+                }
+            }
+        }
+    }
+
+    /// Allocate a fresh dense branch spanning `[span_start, span_end)` and
+    /// install the already-keyed `children` (each child's `key()` must be the
+    /// fingerprint of its span sub-key over this span). Aggregates are rebuilt
+    /// in one pass. The initial table is sized to the next power of two that
+    /// holds all children, so the common case installs without a grow.
+    ///
+    /// Returns `None` if the children cannot be cuckoo-placed within the
+    /// 256-slot maximum; the caller must then narrow the span and rebuild. On
+    /// failure all allocated state (the partial branch and any not-yet-installed
+    /// children) is dropped cleanly.
+    ///
+    /// Used only by the variable-width dense insert / rebuild paths.
+    pub(super) fn from_children_dense(
+        span_start: usize,
+        span_end: usize,
+        children: Vec<Head<KEY_LEN, O, V>>,
+    ) -> Option<NonNull<Self>> {
+        debug_assert!(children.len() >= 2, "dense branch needs >= 2 children");
+        debug_assert!(children.len() <= 256, "dense fanout exceeds 256");
+        let mut size = 2usize;
+        while size < children.len() {
+            size *= 2;
+        }
+        unsafe {
+            let layout = Layout::from_size_align_unchecked(
+                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
+                BRANCH_ALIGN,
+            );
+            let Some(mut ptr) =
+                NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
+                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
+            else {
+                handle_alloc_error(layout);
+            };
+            addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
+            addr_of_mut!((*ptr.as_ptr()).span_start).write(span_start as u16);
+            addr_of_mut!((*ptr.as_ptr()).span_end).write(span_end as u16);
+            addr_of_mut!((*ptr.as_ptr()).childleaf).write(std::ptr::null());
+            addr_of_mut!((*ptr.as_ptr()).leaf_count).write(0);
+            addr_of_mut!((*ptr.as_ptr()).segment_count).write(0);
+            addr_of_mut!((*ptr.as_ptr()).hash).write(0);
+            addr_of_mut!((*ptr.as_ptr()).owner).write(None);
+            for child in children {
+                if let Some(leftover) = Self::install_child_growing_dup(&mut ptr, child) {
+                    // Placement failed. Drop the leftover and the partially
+                    // built branch (which rc_dec's the already-installed
+                    // children); the for-loop's iterator drops the rest.
+                    drop(leftover);
+                    Self::rc_dec(ptr);
+                    return None;
+                }
+            }
+            Self::recompute_aggregates(&mut ptr);
+            Some(ptr)
+        }
+    }
+
     /// Rebuild aggregate fields (`hash`, `leaf_count`, `segment_count`,
     /// `childleaf`) from the current child table in one linear pass.
     /// Cheaper than paying `modify_child`'s per-call accounting when
@@ -734,29 +909,29 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
-    /// Fingerprint the query's single-byte span sub-key (the byte at
-    /// `span_start`), fetch the candidate child from the cuckoo table, and
-    /// confirm it actually carries that span byte.
+    /// Fingerprint the query's span sub-key (the tree-ordered bytes
+    /// `query[span_start..span_end)`), then return the child whose own span
+    /// sub-key actually equals it.
     ///
     /// A fingerprint match is only a *candidate*: `fingerprint16` is not
-    /// injective in general, so a returned slot whose `key() == fp` must be
-    /// confirmed against the candidate's real span sub-key (recovered from
-    /// its `childleaf` over `[span_start, span_end)`). For the single-byte
-    /// spans of phase 2b-i the fingerprint is bijective, so this always
-    /// confirms — but wiring the check now puts the fp-collision
-    /// disambiguation machinery in place for the dense, multi-byte spans of
-    /// phase 2b-ii.
+    /// injective for multi-byte spans, so several distinct span sub-keys may
+    /// collide on one `u16`. [`ByteTable::table_get_verified`] scans every
+    /// table entry sharing the fingerprint and confirms each candidate's real
+    /// span sub-key (recovered from its `childleaf` over `[span_start,
+    /// span_end)`). `query` is the tree-ordered query key/prefix and must be
+    /// at least `span_end` bytes long (guaranteed at the descent call sites by
+    /// the segment-alignment invariant: a span never crosses a checkpoint, so
+    /// any segment-aligned prefix that reaches into the span reaches past it).
     #[inline]
-    pub(super) fn select_child(&self, span_byte: u8) -> Option<&Head<KEY_LEN, O, V>> {
-        let fp = fingerprint16(&[span_byte]);
-        let child = self.child_table.table_get(fp)?;
-        // Verify the candidate's actual span sub-key matches the query's.
-        let i = O::TREE_TO_KEY[self.span_start as usize];
-        if child.childleaf_key()[i] == span_byte {
-            Some(child)
-        } else {
-            None
-        }
+    pub(super) fn select_child(&self, query: &[u8]) -> Option<&Head<KEY_LEN, O, V>> {
+        let s = self.span_start as usize;
+        let e = self.span_end as usize;
+        let sub = &query[s..e];
+        let fp = fingerprint16(sub);
+        self.child_table.table_get_verified(fp, |child| {
+            let ck = child.childleaf_key();
+            (0..(e - s)).all(|j| ck[O::TREE_TO_KEY[s + j]] == sub[j])
+        })
     }
 
     /// Return true if this branch's childleaf key matches the provided
@@ -796,7 +971,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // The prefix ends in a child of this node — fingerprint-select the
         // span child and descend past the span (to span_end).
         if PREFIX_LEN > span_start {
-            if let Some(child) = self.select_child(prefix[span_start]) {
+            if let Some(child) = self.select_child(prefix) {
                 child.infixes(prefix, span_end, f);
             }
             return;
@@ -848,7 +1023,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         // Case 2: prefix extends into a specific child.
         if PREFIX_LEN > span_start {
-            if let Some(child) = self.select_child(prefix[span_start]) {
+            if let Some(child) = self.select_child(prefix) {
                 child.infixes_range(prefix, span_end, min_infix, max_infix, f);
             }
             return;
@@ -937,7 +1112,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         // Case 2: prefix extends into a specific child.
         if PREFIX_LEN > span_start {
-            if let Some(child) = self.select_child(prefix[span_start]) {
+            if let Some(child) = self.select_child(prefix) {
                 return child.count_range(prefix, span_end, min_infix, max_infix);
             }
             return 0;
@@ -1014,7 +1189,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return true;
         }
 
-        if let Some(child) = self.select_child(prefix[span_start]) {
+        if let Some(child) = self.select_child(prefix) {
             return child.has_prefix::<PREFIX_LEN>(span_end, prefix);
         }
 
@@ -1044,7 +1219,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return 1;
         }
 
-        if let Some(child) = self.select_child(prefix[span_start]) {
+        if let Some(child) = self.select_child(prefix) {
             return 1 + child.traversal_depth::<PREFIX_LEN>(span_end, prefix);
         }
 
@@ -1079,7 +1254,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return Some(unsafe { &(*leaf_ptr).value });
         }
 
-        if let Some(child) = self.select_child(key[span_start]) {
+        if let Some(child) = self.select_child(key) {
             return child.get(span_end, key);
         }
         None
@@ -1107,7 +1282,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 return self.segment_count;
             }
         }
-        if let Some(child) = self.select_child(prefix[span_start]) {
+        if let Some(child) = self.select_child(prefix) {
             child.segmented_len::<PREFIX_LEN>(span_end, prefix)
         } else {
             0

@@ -254,6 +254,31 @@ pub const fn invert<const N: usize>(arr: [usize; N]) -> [usize; N] {
     res
 }
 
+/// For each tree-depth `d`, the end (exclusive) of the segment that contains
+/// `d`, derived from a segmentation table (in key order) and a tree→key map.
+///
+/// Each logical segment is contiguous in tree order, so the boundary after a
+/// depth is simply the first deeper depth whose segment id differs (or
+/// `KEY_LEN`). Used by [`KeySchema::next_boundary`] / `SEGMENT_ENDS` to cap
+/// variable-width branch spans so they never cross a segment checkpoint.
+pub const fn build_segment_ends<const N: usize>(
+    segments: [usize; N],
+    tree_to_key: [usize; N],
+) -> [usize; N] {
+    let mut ends = [0usize; N];
+    let mut d = 0;
+    while d < N {
+        let seg = segments[tree_to_key[d]];
+        let mut e = d + 1;
+        while e < N && segments[tree_to_key[e]] == seg {
+            e += 1;
+        }
+        ends[d] = e;
+        d += 1;
+    }
+    ends
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! key_segmentation {
@@ -306,6 +331,27 @@ pub trait KeySchema<const KEY_LEN: usize>: Copy + Clone + Debug {
     const KEY_TO_TREE: [usize; KEY_LEN];
     /// Maps each tree index to its position in the key view.
     const TREE_TO_KEY: [usize; KEY_LEN];
+
+    /// For each tree-depth, the exclusive end of the segment containing it.
+    ///
+    /// Purely additive (a provided default derived from `Segmentation` +
+    /// `TREE_TO_KEY`); it does not affect single-byte PATCH behaviour. The
+    /// variable-width [`VWPATCH`](crate::vwpatch) uses it to start branch spans
+    /// segment-wide and guarantee a span never crosses a checkpoint. For EAV
+    /// over a 64-byte trible this yields ends `{16,32,64}`; for VEA `{32,48,64}`.
+    const SEGMENT_ENDS: [usize; KEY_LEN] = build_segment_ends::<KEY_LEN>(
+        <Self::Segmentation as KeySegmentation<KEY_LEN>>::SEGMENTS,
+        Self::TREE_TO_KEY,
+    );
+
+    /// The exclusive end of the segment containing tree-depth `tree_depth`.
+    ///
+    /// A variable-width branch starting at `span_start` may widen its span up
+    /// to `next_boundary(span_start)` but no further, so each branch stays
+    /// within a single segment.
+    fn next_boundary(tree_depth: usize) -> usize {
+        Self::SEGMENT_ENDS[tree_depth]
+    }
 
     /// Reorders the key from the shared key ordering to the tree ordering.
     fn tree_ordered(key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {

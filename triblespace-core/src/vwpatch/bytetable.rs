@@ -234,8 +234,27 @@ pub trait ByteTable<T: ByteEntry + Debug> {
     fn table_get(&self, byte_key: u16) -> Option<&T>;
     /// Returns a mutable reference to the slot holding `byte_key`, if present.
     fn table_get_slot(&mut self, byte_key: u16) -> Option<&mut Option<T>>;
+    /// Like [`table_get`] but, among all entries sharing `byte_key`, returns
+    /// the first one for which `verify` is true.
+    ///
+    /// Multi-byte spans fold through a non-injective fingerprint, so several
+    /// distinct span sub-keys can land on the same `byte_key`. Every entry
+    /// with a given key necessarily lives in one of that key's two candidate
+    /// buckets (the cuckoo invariant), so scanning those `2 * BUCKET_ENTRY_COUNT`
+    /// slots and confirming the real sub-key disambiguates collisions.
+    fn table_get_verified<F: Fn(&T) -> bool>(&self, byte_key: u16, verify: F) -> Option<&T>;
+    /// Mutable-slot variant of [`table_get_verified`].
+    fn table_get_slot_verified<F: Fn(&T) -> bool>(
+        &mut self,
+        byte_key: u16,
+        verify: F,
+    ) -> Option<&mut Option<T>>;
     /// Inserts `entry` into the table, returning it back if the table is full.
     fn table_insert(&mut self, entry: T) -> Option<T>;
+    /// Like [`table_insert`] but permits an entry whose `key()` already exists
+    /// (a fingerprint collision between distinct span sub-keys). Returns the
+    /// entry back if no slot could be found.
+    fn table_insert_allow_dup(&mut self, entry: T) -> Option<T>;
     /// Moves entries from `self` into `grown`, which must be twice the size.
     fn table_grow(&mut self, grown: &mut Self);
 }
@@ -289,10 +308,52 @@ impl<T: ByteEntry + Debug> ByteTable<T> for [Option<T>] {
         None
     }
 
+    fn table_get_verified<F: Fn(&T) -> bool>(&self, byte_key: u16, verify: F) -> Option<&T> {
+        let cheap_start =
+            compress_hash(self.len(), cheap_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
+        let rand_start =
+            compress_hash(self.len(), rand_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
+        for start in [cheap_start, rand_start] {
+            for slot in 0..BUCKET_ENTRY_COUNT {
+                if let Some(entry) = self[start + slot].as_ref() {
+                    if entry.key() == byte_key && verify(entry) {
+                        return Some(entry);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn table_get_slot_verified<F: Fn(&T) -> bool>(
+        &mut self,
+        byte_key: u16,
+        verify: F,
+    ) -> Option<&mut Option<T>> {
+        let cheap_start =
+            compress_hash(self.len(), cheap_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
+        let rand_start =
+            compress_hash(self.len(), rand_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
+        for start in [cheap_start, rand_start] {
+            for slot in 0..BUCKET_ENTRY_COUNT {
+                let idx = start + slot;
+                if let Some(entry) = self[idx].as_ref() {
+                    if entry.key() == byte_key && verify(entry) {
+                        return Some(&mut self[idx]);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// An entry with the same key must not exist in the table yet.
     fn table_insert(&mut self, inserted: T) -> Option<T> {
         debug_assert!(self.table_get(inserted.key()).is_none());
+        self.table_insert_allow_dup(inserted)
+    }
 
+    fn table_insert_allow_dup(&mut self, inserted: T) -> Option<T> {
         // `visited` now tracks slot indices, not keys (see `plan_insert`).
         // The freshly inserted entry has no slot yet, so the set starts
         // empty — the displacement chain marks slots as it descends.
