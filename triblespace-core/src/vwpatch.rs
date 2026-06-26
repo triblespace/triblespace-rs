@@ -369,10 +369,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn with_start(self, new_start_depth: usize) -> Head<KEY_LEN, O, V> {
         let leaf_key = self.childleaf_key();
         let i = O::TREE_TO_KEY[new_start_depth];
-        // Branching stays single-byte: derive the one branch byte and
-        // store it in the widened 16-bit key field.
-        let key = leaf_key[i];
-        self.with_key(key as u16)
+        // Branching stays single-byte (phase 2b-i): the span sub-key is the
+        // one byte at `new_start_depth`. The cuckoo child-table is keyed by
+        // the span fingerprint; `fingerprint16` is bijective for one byte, so
+        // the stored key still equals the raw branch byte and the structure
+        // stays identical to PATCH.
+        let fp = fingerprint16(&[leaf_key[i]]);
+        self.with_key(fp)
     }
 
     // Removed childleaf_matches_key_from in favor of composing the existing
@@ -458,10 +461,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// The node's divergence depth (`span_start`): the depth at which this
+    /// head's children begin to differ. Leaves have no divergence, so they
+    /// report `KEY_LEN`.
     pub(crate) fn end_depth(&self) -> usize {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => KEY_LEN,
-            BodyRef::Branch(branch) => branch.end_depth as usize,
+            BodyRef::Branch(branch) => branch.span_start as usize,
         }
     }
 
@@ -594,8 +600,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = crate::vwpatch::branch::Branch::new(
                 depth,
-                this.with_key(this_byte_key as u16),
-                leaf.with_key(leaf_byte_key as u16),
+                this.with_key(fingerprint16(&[this_byte_key])),
+                leaf.with_key(fingerprint16(&[leaf_byte_key])),
             );
             return Head::new(old_key, new_body);
         }
@@ -603,7 +609,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let end_depth = this.end_depth();
         if end_depth != KEY_LEN {
             let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.end_depth as usize);
+            let inserted = leaf.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 Some(old) => Some(Head::insert_leaf(old, inserted, end_depth)),
@@ -649,8 +655,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let new_branch_owner = leaf_owner.cloned();
             let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                 depth,
-                this.with_key(this_byte_key as u16),
-                leaf.with_key(leaf_byte_key as u16),
+                this.with_key(fingerprint16(&[this_byte_key])),
+                leaf.with_key(fingerprint16(&[leaf_byte_key])),
                 new_branch_owner,
                 leaf_hash,
             );
@@ -682,7 +688,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let branch_owner_ptr: *const Option<
                 std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>,
             > = &ed.owner;
-            let inserted = leaf.with_start(ed.end_depth as usize);
+            let inserted = leaf.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
                 None => Some(inserted),
@@ -702,8 +708,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                     let sub_owner = unsafe { (*branch_owner_ptr).clone() };
                     let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                         depth,
-                        old.with_key(old_byte_key as u16),
-                        inserted.with_key(leaf_byte_key as u16),
+                        old.with_key(fingerprint16(&[old_byte_key])),
+                        inserted.with_key(fingerprint16(&[leaf_byte_key])),
                         sub_owner,
                         leaf_hash,
                     );
@@ -753,8 +759,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key as u16),
-                leaf.with_key(leaf_byte_key as u16),
+                this.with_key(fingerprint16(&[this_byte_key])),
+                leaf.with_key(fingerprint16(&[leaf_byte_key])),
             );
 
             return Head::new(old_key, new_body);
@@ -767,7 +773,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         } else {
             // Use the editor view for branch mutation instead of raw pointer ops.
             let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.end_depth as usize);
+            let inserted = leaf.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 Some(old) => Some(Head::replace_leaf(old, inserted, end_depth)),
@@ -791,8 +797,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key as u16),
-                other.with_key(other_byte_key as u16),
+                this.with_key(fingerprint16(&[this_byte_key])),
+                other.with_key(fingerprint16(&[other_byte_key])),
             );
 
             return Head::new(old_key, new_body);
@@ -802,7 +808,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let other_depth = other.end_depth();
         if this_depth < other_depth {
             let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = other.with_start(ed.end_depth as usize);
+            let inserted = other.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, this_depth)),
@@ -816,7 +822,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let this_head = this;
             let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut other);
-            let inserted = this_head.with_start(ed.end_depth as usize);
+            let inserted = this_head.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, other_depth)),
@@ -849,7 +855,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             .iter_mut()
             .filter_map(Option::take)
         {
-            let inserted = other_child.with_start(ed.end_depth as usize);
+            let inserted = other_child.with_start(ed.span_start as usize);
             let key = inserted.key();
             ed.modify_child(key, |opt| match opt {
                 Some(old) => Some(Head::union(old, inserted, this_depth)),
@@ -903,8 +909,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key as u16),
-                other.with_key(other_byte_key as u16),
+                this.with_key(fingerprint16(&[this_byte_key])),
+                other.with_key(fingerprint16(&[other_byte_key])),
             );
             return Head::new(old_key, new_body);
         }
@@ -945,7 +951,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 
         {
             let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let end_depth = ed.end_depth as usize;
+            let span_start = ed.span_start as usize;
 
             // Scatter both child tables into key-indexed 256-slot
             // arrays + present bitsets. The bitset partition tells us
@@ -967,7 +973,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
             for slot in other_branch_ref.child_table.iter_mut() {
                 if let Some(head) = slot.take() {
-                    let head = head.with_start(end_depth);
+                    let head = head.with_start(span_start);
                     let key = head.key();
                     other_present.insert(key as u8);
                     other_arr[key as usize] = Some(head);
@@ -1112,8 +1118,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 let Some(self_child) = slot.as_ref() else {
                     continue;
                 };
-                let key = self_child.key();
-                let Some(other_child) = other_branch.child_table.table_get(key) else {
+                // Equal-depth branches share span_start; fingerprint-select
+                // and childleaf-verify the matching child in `other`.
+                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
+                let Some(other_child) = other_branch.select_child(span_byte) else {
                     continue;
                 };
 
@@ -1121,15 +1129,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     s.spawn(move |_| {
                         let result =
                             self_child.par_intersect_with_ctx(other_child, self_depth, ctx);
-                        // SAFETY: distinct keys → disjoint slots.
+                        // SAFETY: distinct span bytes → disjoint slots.
                         unsafe {
-                            resolved_ptr.write_at(key as usize, result);
+                            resolved_ptr.write_at(span_byte as usize, result);
                         }
                     });
                 } else {
                     let result = self_child.intersect(other_child, self_depth);
                     unsafe {
-                        resolved_ptr.write_at(key as usize, result);
+                        resolved_ptr.write_at(span_byte as usize, result);
                     }
                 }
             }
@@ -1227,9 +1235,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 let Some(self_child) = slot.as_ref() else {
                     continue;
                 };
-                let key = self_child.key();
+                // Equal-depth branches share span_start; fingerprint-select
+                // and childleaf-verify the matching child in `other`.
+                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
 
-                match other_branch.child_table.table_get(key) {
+                match other_branch.select_child(span_byte) {
                     Some(other_child) => {
                         if ctx.try_claim() {
                             s.spawn(move |_| {
@@ -1239,13 +1249,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                                     ctx,
                                 );
                                 unsafe {
-                                    resolved_ptr.write_at(key as usize, result);
+                                    resolved_ptr.write_at(span_byte as usize, result);
                                 }
                             });
                         } else {
                             let result = self_child.difference(other_child, self_depth);
                             unsafe {
-                                resolved_ptr.write_at(key as usize, result);
+                                resolved_ptr.write_at(span_byte as usize, result);
                             }
                         }
                     }
@@ -1255,7 +1265,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         // bump on Branch, leaf is small).
                         let cloned = self_child.clone();
                         unsafe {
-                            resolved_ptr.write_at(key as usize, Some(cloned));
+                            resolved_ptr.write_at(span_byte as usize, Some(cloned));
                         }
                     }
                 }
@@ -1502,8 +1512,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 unreachable!();
             };
             return branch
-                .child_table
-                .table_get(other.childleaf_key()[O::TREE_TO_KEY[self_depth]] as u16)
+                .select_child(other.childleaf_key()[O::TREE_TO_KEY[self_depth]])
                 .and_then(|self_child| other.intersect(self_child, self_depth));
         }
 
@@ -1515,8 +1524,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 unreachable!();
             };
             return other_branch
-                .child_table
-                .table_get(self.childleaf_key()[O::TREE_TO_KEY[other_depth]] as u16)
+                .select_child(self.childleaf_key()[O::TREE_TO_KEY[other_depth]])
                 .and_then(|other_child| self.intersect(other_child, other_depth));
         }
 
@@ -1537,7 +1545,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             .iter()
             .filter_map(Option::as_ref)
             .filter_map(|self_child| {
-                let other_child = other_branch.child_table.table_get(self_child.key())?;
+                // Equal-depth branches share span_start; fingerprint-select
+                // and childleaf-verify the matching child in `other`.
+                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
+                let other_child = other_branch.select_child(span_byte)?;
                 self_child.intersect(other_child, self_depth)
             });
         let first_child = intersected_children.next()?;
@@ -1588,7 +1599,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // that might intersect with other, copy self with it's correctly filled byte table, then
             // remove the old child, and insert the new child.
             let mut new_branch = self.clone();
-            let other_byte_key = other.childleaf_key()[O::TREE_TO_KEY[self_depth]] as u16;
+            let other_byte_key = fingerprint16(&[other.childleaf_key()[O::TREE_TO_KEY[self_depth]]]);
             {
                 let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut new_branch);
                 ed.modify_child(other_byte_key, |opt| {
@@ -1608,8 +1619,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let BodyRef::Branch(other_branch) = other.body_ref() else {
                 unreachable!();
             };
-            let self_byte_key = self.childleaf_key()[O::TREE_TO_KEY[other_depth]] as u16;
-            if let Some(other_child) = other_branch.child_table.table_get(self_byte_key) {
+            let self_byte = self.childleaf_key()[O::TREE_TO_KEY[other_depth]];
+            if let Some(other_child) = other_branch.select_child(self_byte) {
                 return self.difference(other_child, at_depth);
             } else {
                 return Some(self.clone());
@@ -1633,7 +1644,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             .iter()
             .filter_map(Option::as_ref)
             .filter_map(|self_child| {
-                if let Some(other_child) = other_branch.child_table.table_get(self_child.key()) {
+                // Equal-depth branches share span_start; fingerprint-select
+                // and childleaf-verify the matching child in `other`.
+                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
+                if let Some(other_child) = other_branch.select_child(span_byte) {
                     self_child.difference(other_child, self_depth)
                 } else {
                     Some(self_child.clone())
@@ -3065,7 +3079,7 @@ mod tests {
             let mut ed = crate::vwpatch::branch::BranchMut::from_slot(&mut tree.root);
 
             // Compute the insertion start depth first to avoid borrowing `ed` inside the closure.
-            let start_depth = ed.end_depth as usize;
+            let start_depth = ed.span_start as usize;
             let inserted = Entry::with_value(&[2u8; KEY_SIZE], 3u32)
                 .leaf::<IdentitySchema>()
                 .with_start(start_depth);

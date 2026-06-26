@@ -29,6 +29,31 @@ pub trait ArchiveOwner: Send + Sync + 'static {}
 
 impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
 
+/// Fingerprint of a span sub-key, used as the cuckoo child-table key.
+///
+/// For spans of length `<= 2` the mapping is bijective (the raw byte / the
+/// big-endian `u16`), so single-byte spans (phase 2b-i) stay collision-free
+/// and the table key equals the raw branch byte — keeping the VWPATCH
+/// structurally identical to PATCH. Longer spans (phase 2b-ii) fold through
+/// FNV-1a, which is *not* injective; lookups must therefore confirm a
+/// fingerprint match against the candidate child's actual span sub-key (see
+/// [`Branch::select_child`]).
+#[inline]
+pub(crate) fn fingerprint16(bytes: &[u8]) -> u16 {
+    match bytes {
+        [one] => return *one as u16,
+        [first, second] => return u16::from_be_bytes([*first, *second]),
+        _ => {}
+    }
+
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        h ^= *byte as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h ^ (h >> 32) ^ (h >> 16)) as u16
+}
+
 #[inline]
 pub(crate) fn dst_len<T>(ptr: *const [T]) -> usize {
     let ptr: *const [()] = ptr as _;
@@ -151,7 +176,15 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
     _value: PhantomData<fn() -> V>,
 
     rc: atomic::AtomicU32,
-    pub end_depth: u32,
+    /// Divergence depth — where this branch's children begin to differ.
+    /// All children share the tree-ordered bytes in `[parent_depth,
+    /// span_start)` (the compressed path) and branch on the span
+    /// `[span_start, span_end)`, whose fingerprint selects the child.
+    pub span_start: u16,
+    /// One-past-the-end of the branch span. In phase 2b-i branching stays
+    /// single-byte, so `span_end == span_start + 1`; phase 2b-ii widens the
+    /// span for dense nodes. Depths range over `0..=KEY_LEN` (fits `u16`).
+    pub span_end: u16,
     /// Thin pointer to the key bytes of a representative descendant
     /// leaf, used for prefix-matching shortcuts. Points either into a
     /// heap [`Leaf`]'s inline `key` field (offset 0 thanks to
@@ -182,7 +215,8 @@ impl<
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Branch")
             .field("rc", &self.rc)
-            .field("end_depth", &self.end_depth)
+            .field("span_start", &self.span_start)
+            .field("span_end", &self.span_end)
             .field("childleaf", &self.childleaf)
             .field("leaf_count", &self.leaf_count)
             .field("segment_count", &self.segment_count)
@@ -228,18 +262,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
 {
     pub(super) fn new(
-        end_depth: usize,
+        span_start: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
     ) -> NonNull<Self> {
-        Self::new_with_owner(end_depth, lchild, rchild, None)
+        Self::new_with_owner(span_start, lchild, rchild, None)
     }
 
     /// Like [`Self::new`] but sets the branch's `owner` field — used by
     /// the archive-leaf-elimination path so that a Branch created when
     /// inserting a `LocalLeaf` adopts the entry's archive owner.
     pub(super) fn new_with_owner(
-        end_depth: usize,
+        span_start: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
         owner: Option<Arc<dyn ArchiveOwner>>,
@@ -249,7 +283,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // [`new_with_owner_and_rchild_hash`] variant skips it when
         // the caller has the hash already.
         let rchild_hash = rchild.hash();
-        Self::new_with_owner_and_rchild_hash(end_depth, lchild, rchild, owner, rchild_hash)
+        Self::new_with_owner_and_rchild_hash(span_start, lchild, rchild, owner, rchild_hash)
     }
 
     /// Variant of [`Self::new_with_owner`] that takes a precomputed
@@ -263,7 +297,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// (cached) or heap Leaf (cached), so the only LocalLeaf hash
     /// recompute that matters is on the freshly inserted side.
     pub(super) fn new_with_owner_and_rchild_hash(
-        end_depth: usize,
+        span_start: usize,
         lchild: Head<KEY_LEN, O, V>,
         rchild: Head<KEY_LEN, O, V>,
         owner: Option<Arc<dyn ArchiveOwner>>,
@@ -284,11 +318,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 handle_alloc_error(layout);
             };
             addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
-            addr_of_mut!((*ptr.as_ptr()).end_depth).write(end_depth as u32);
+            // Single-byte span (phase 2b-i): span_end == span_start + 1.
+            addr_of_mut!((*ptr.as_ptr()).span_start).write(span_start as u16);
+            addr_of_mut!((*ptr.as_ptr()).span_end).write((span_start + 1) as u16);
             addr_of_mut!((*ptr.as_ptr()).childleaf).write(lchild.childleaf_ptr());
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
             addr_of_mut!((*ptr.as_ptr()).segment_count)
-                .write(lchild.count_segment(end_depth) + rchild.count_segment(end_depth));
+                .write(lchild.count_segment(span_start) + rchild.count_segment(span_start));
             addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild_hash);
             addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             (*ptr.as_ptr()).child_table[0] = Some(lchild);
@@ -362,7 +398,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                         as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
                 {
                     addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
-                    addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
+                    addr_of_mut!((*ptr.as_ptr()).span_start).write((*branch).span_start);
+                    addr_of_mut!((*ptr.as_ptr()).span_end).write((*branch).span_end);
                     addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
                     addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                     addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
@@ -406,7 +443,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
             {
                 addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
-                addr_of_mut!((*ptr.as_ptr()).end_depth).write((*branch).end_depth);
+                addr_of_mut!((*ptr.as_ptr()).span_start).write((*branch).span_start);
+                addr_of_mut!((*ptr.as_ptr()).span_end).write((*branch).span_end);
                 addr_of_mut!((*ptr.as_ptr()).leaf_count).write((*branch).leaf_count);
                 addr_of_mut!((*ptr.as_ptr()).segment_count).write((*branch).segment_count);
                 addr_of_mut!((*ptr.as_ptr()).childleaf).write((*branch).childleaf);
@@ -446,13 +484,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         unsafe {
             let branch = branch_nn.as_ptr();
-            let end_depth = (*branch).end_depth as usize;
+            // Segment accounting keys off the branch's divergence depth.
+            let span_start = (*branch).span_start as usize;
 
             // If a slot exists, operate on the existing child in-place.
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
                 let old_child_hash = child.hash();
-                let old_child_segment_count = child.count_segment(end_depth);
+                let old_child_segment_count = child.count_segment(span_start);
                 let old_child_leaf_count = child.count();
 
                 let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
@@ -461,7 +500,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Replace existing child
                     (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
-                        + new_child.count_segment(end_depth);
+                        + new_child.count_segment(span_start);
                     (*branch).leaf_count =
                         ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
 
@@ -491,7 +530,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // already prepared (with_start set to the appropriate depth).
                     // Update aggregates before attempting insertion.
                     (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(end_depth);
+                    (*branch).segment_count += inserted.count_segment(span_start);
                     (*branch).hash ^= inserted.hash();
 
                     // Cuckoo insert loop, growing the table when necessary.
@@ -527,12 +566,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         unsafe {
             let branch = branch_nn.as_ptr();
-            let end_depth = (*branch).end_depth as usize;
+            let span_start = (*branch).span_start as usize;
 
             if let Some(slot) = (*branch).child_table.table_get_slot(key) {
                 let child = slot.take().unwrap();
                 let old_child_hash = child.hash();
-                let old_child_segment_count = child.count_segment(end_depth);
+                let old_child_segment_count = child.count_segment(span_start);
                 let old_child_leaf_count = child.count();
 
                 let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
@@ -543,7 +582,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // .hash() is cheap.
                     (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
                     (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
-                        + new_child.count_segment(end_depth);
+                        + new_child.count_segment(span_start);
                     (*branch).leaf_count =
                         ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
 
@@ -570,7 +609,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                     // Use the caller-supplied hint instead of
                     // recomputing siphash24 over the LocalLeaf bytes.
                     (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(end_depth);
+                    (*branch).segment_count += inserted.count_segment(span_start);
                     (*branch).hash ^= inserted_hash;
 
                     let mut branch_ptr = branch_nn.as_ptr();
@@ -619,7 +658,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) unsafe fn recompute_aggregates(branch_nn: &mut NonNull<Self>) {
         let branch = branch_nn.as_ptr();
-        let end_depth = (*branch).end_depth as usize;
+        let span_start = (*branch).span_start as usize;
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
         let mut agg_hash: u128 = 0;
@@ -627,7 +666,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         for child in (*branch).child_table.iter().flatten() {
             agg_leaf_count += child.count();
-            agg_segment_count += child.count_segment(end_depth);
+            agg_segment_count += child.count_segment(span_start);
             agg_hash ^= child.hash();
             if first_childleaf.is_null() {
                 first_childleaf = child.childleaf_ptr();
@@ -646,7 +685,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     }
 
     pub fn count_segment(&self, at_depth: usize) -> u64 {
-        let node_end = self.end_depth as usize;
+        let node_end = self.span_start as usize;
         if !O::same_segment_tree(at_depth, node_end) {
             1
         } else {
@@ -660,7 +699,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// overhead in release binaries.
     #[cfg(debug_assertions)]
     pub fn debug_check_invariants(&self) {
-        let end_depth: usize = self.end_depth as usize;
+        let span_start: usize = self.span_start as usize;
         let mut agg_leaf_count: u64 = 0;
         let mut agg_segment_count: u64 = 0;
         let mut agg_hash: u128 = 0;
@@ -668,7 +707,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         for child in self.child_table.iter().flatten() {
             agg_leaf_count = agg_leaf_count.saturating_add(child.count());
-            agg_segment_count = agg_segment_count.saturating_add(child.count_segment(end_depth));
+            agg_segment_count = agg_segment_count.saturating_add(child.count_segment(span_start));
             agg_hash ^= child.hash();
             if child.childleaf_ptr() == self.childleaf {
                 match_found = true;
@@ -695,6 +734,31 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Fingerprint the query's single-byte span sub-key (the byte at
+    /// `span_start`), fetch the candidate child from the cuckoo table, and
+    /// confirm it actually carries that span byte.
+    ///
+    /// A fingerprint match is only a *candidate*: `fingerprint16` is not
+    /// injective in general, so a returned slot whose `key() == fp` must be
+    /// confirmed against the candidate's real span sub-key (recovered from
+    /// its `childleaf` over `[span_start, span_end)`). For the single-byte
+    /// spans of phase 2b-i the fingerprint is bijective, so this always
+    /// confirms — but wiring the check now puts the fp-collision
+    /// disambiguation machinery in place for the dense, multi-byte spans of
+    /// phase 2b-ii.
+    #[inline]
+    pub(super) fn select_child(&self, span_byte: u8) -> Option<&Head<KEY_LEN, O, V>> {
+        let fp = fingerprint16(&[span_byte]);
+        let child = self.child_table.table_get(fp)?;
+        // Verify the candidate's actual span sub-key matches the query's.
+        let i = O::TREE_TO_KEY[self.span_start as usize];
+        if child.childleaf_key()[i] == span_byte {
+            Some(child)
+        } else {
+            None
+        }
+    }
+
     /// Return true if this branch's childleaf key matches the provided
     /// `prefix` for all tree-ordered bytes in [at_depth, PREFIX_LEN).
     pub fn infixes<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
@@ -707,8 +771,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         // Early-prune: if the branch's representative childleaf doesn't match
         // the prefix then no child in this branch can match.
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         // If the branch's representative childleaf does NOT match the
         // provided prefix then no child in this branch can match and we can
         // early-return. The previous logic inverted this check which caused
@@ -721,24 +786,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return;
         }
 
-        // The infix ends within the current node.
-        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+        // The infix ends within the current node's compressed path.
+        if PREFIX_LEN + INFIX_LEN <= span_start {
             let infix: [u8; INFIX_LEN] =
                 core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             f(&infix);
             return;
         }
-        // The prefix ends in a child of this node.
-        if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-                child.infixes(prefix, node_end_depth, f);
+        // The prefix ends in a child of this node — fingerprint-select the
+        // span child and descend past the span (to span_end).
+        if PREFIX_LEN > span_start {
+            if let Some(child) = self.select_child(prefix[span_start]) {
+                child.infixes(prefix, span_end, f);
             }
             return;
         }
 
         // The prefix ends in this node, but the infix ends in a child.
         for entry in self.child_table.iter().flatten() {
-            entry.infixes(prefix, node_end_depth, f);
+            entry.infixes(prefix, span_end, f);
         }
     }
 
@@ -758,8 +824,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) where
         F: FnMut(&[u8; INFIX_LEN]),
     {
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -768,8 +835,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return;
         }
 
-        // Case 1: infix ends within this node — extract and range-check.
-        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+        // Case 1: infix ends within this node's compressed path — extract and
+        // range-check.
+        if PREFIX_LEN + INFIX_LEN <= span_start {
             let infix: [u8; INFIX_LEN] =
                 core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             if &infix >= min_infix && &infix <= max_infix {
@@ -779,17 +847,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
 
         // Case 2: prefix extends into a specific child.
-        if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-                child.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
+        if PREFIX_LEN > span_start {
+            if let Some(child) = self.select_child(prefix[span_start]) {
+                child.infixes_range(prefix, span_end, min_infix, max_infix, f);
             }
             return;
         }
 
         // Case 3: prefix ends here, infix spans children.
-        // First check the compressed path (bytes PREFIX_LEN..node_end_depth)
+        // First check the compressed path (bytes PREFIX_LEN..span_start)
         // against the range. All children share these bytes (path compression).
-        let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        let infix_byte_idx = span_start - PREFIX_LEN;
         let mut min_tight = true; // still on the min boundary
         let mut max_tight = true; // still on the max boundary
         for i in 0..infix_byte_idx {
@@ -822,7 +890,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             if max_tight && infix_byte_idx < INFIX_LEN && child_byte > max_infix[infix_byte_idx] {
                 continue;
             }
-            entry.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
+            entry.infixes_range(prefix, span_end, min_infix, max_infix, f);
         }
     }
 
@@ -843,8 +911,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         min_infix: &[u8; INFIX_LEN],
         max_infix: &[u8; INFIX_LEN],
     ) -> u64 {
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -856,7 +925,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // Case 1: infix ends within this node's compressed path. The full
         // infix is determined by this branch's path, so every leaf below
         // shares it — exactly one distinct infix value exists under self.
-        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+        if PREFIX_LEN + INFIX_LEN <= span_start {
             let infix: [u8; INFIX_LEN] =
                 core::array::from_fn(|i| self.childleaf_key()[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             return if &infix >= min_infix && &infix <= max_infix {
@@ -867,16 +936,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
 
         // Case 2: prefix extends into a specific child.
-        if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-                return child.count_range(prefix, node_end_depth, min_infix, max_infix);
+        if PREFIX_LEN > span_start {
+            if let Some(child) = self.select_child(prefix[span_start]) {
+                return child.count_range(prefix, span_end, min_infix, max_infix);
             }
             return 0;
         }
 
         // Case 3: prefix ends here, infix spans children.
         // Check compressed path against range (same logic as infixes_range).
-        let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        let infix_byte_idx = span_start - PREFIX_LEN;
         let mut min_tight = true;
         let mut max_tight = true;
         for i in 0..infix_byte_idx {
@@ -910,9 +979,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             let on_min = min_tight && child_byte == min_infix[infix_byte_idx];
             let on_max = max_tight && child_byte == max_infix[infix_byte_idx];
             if on_min || on_max {
-                total += entry.count_range(prefix, node_end_depth, min_infix, max_infix);
+                // Boundary child — descend past the span to recount.
+                total += entry.count_range(prefix, span_end, min_infix, max_infix);
             } else {
-                total += entry.count_segment(node_end_depth);
+                // Interior child — its cached segment_count is relative to
+                // this branch's divergence depth (span_start), matching how
+                // `Branch::new`/`modify_child` aggregated it.
+                total += entry.count_segment(span_start);
             }
         }
         total
@@ -926,8 +999,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
         }
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -936,12 +1010,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return false;
         }
 
-        if PREFIX_LEN <= node_end_depth {
+        if PREFIX_LEN <= span_start {
             return true;
         }
 
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-            return child.has_prefix::<PREFIX_LEN>(node_end_depth, prefix);
+        if let Some(child) = self.select_child(prefix[span_start]) {
+            return child.has_prefix::<PREFIX_LEN>(span_end, prefix);
         }
 
         false
@@ -955,8 +1029,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
         }
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -965,12 +1040,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return 1;
         }
 
-        if PREFIX_LEN <= node_end_depth {
+        if PREFIX_LEN <= span_start {
             return 1;
         }
 
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-            return 1 + child.traversal_depth::<PREFIX_LEN>(node_end_depth, prefix);
+        if let Some(child) = self.select_child(prefix[span_start]) {
+            return 1 + child.traversal_depth::<PREFIX_LEN>(span_end, prefix);
         }
 
         1
@@ -980,8 +1055,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     where
         O: 'a,
     {
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(KEY_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(KEY_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -989,8 +1065,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         ) {
             return None;
         }
-        if node_end_depth >= KEY_LEN {
-            // Childleaf prefix matched and end_depth == KEY_LEN means the
+        if span_start >= KEY_LEN {
+            // Childleaf prefix matched and span_start == KEY_LEN means the
             // representative IS the lookup target. For ZST `V` (the only
             // shape compatible with `LocalLeaf`-backed childleaves) we
             // synthesize a reference from a dangling pointer; otherwise
@@ -1003,8 +1079,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return Some(unsafe { &(*leaf_ptr).value });
         }
 
-        if let Some(child) = self.child_table.table_get(key[node_end_depth] as u16) {
-            return child.get(node_end_depth, key);
+        if let Some(child) = self.select_child(key[span_start]) {
+            return child.get(span_end, key);
         }
         None
     }
@@ -1014,8 +1090,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         at_depth: usize,
         prefix: &[u8; PREFIX_LEN],
     ) -> u64 {
-        let node_end_depth = self.end_depth as usize;
-        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        let span_start = self.span_start as usize;
+        let span_end = self.span_end as usize;
+        let limit = std::cmp::min(PREFIX_LEN, span_start);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
             self.childleaf_key(),
             at_depth,
@@ -1023,15 +1100,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         ) {
             return 0;
         }
-        if PREFIX_LEN <= node_end_depth {
-            if !O::same_segment_tree(PREFIX_LEN, node_end_depth) {
+        if PREFIX_LEN <= span_start {
+            if !O::same_segment_tree(PREFIX_LEN, span_start) {
                 return 1;
             } else {
                 return self.segment_count;
             }
         }
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
-            child.segmented_len::<PREFIX_LEN>(node_end_depth, prefix)
+        if let Some(child) = self.select_child(prefix[span_start]) {
+            child.segmented_len::<PREFIX_LEN>(span_end, prefix)
         } else {
             0
         }
