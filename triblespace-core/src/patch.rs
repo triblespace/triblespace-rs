@@ -2023,6 +2023,19 @@ where
         acc
     }
 
+    /// Returns the total capacity of all branch child tables.
+    ///
+    /// This counts allocated table slots (`child_table.len()`), not filled
+    /// children.
+    pub fn total_table_slots(&self) -> u64 {
+        self.node_stats().1
+    }
+
+    /// Fixed branch header bytes, excluding the trailing child table.
+    pub fn branch_header_bytes() -> usize {
+        std::mem::size_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>; 0], V>>()
+    }
+
     /// Per-end-depth `(branch_count, filled_children)` histogram (65 buckets,
     /// byte-depths 0..=64), for analysing trie shape — where branches sit and
     /// their fanout distribution.
