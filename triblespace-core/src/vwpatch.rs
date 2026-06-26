@@ -270,19 +270,23 @@ unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Sync for Head<KEY_LE
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // Tagged pointer layout (64-bit only):
     // - bits 0..=3:   HeadTag (requires 16-byte aligned bodies)
-    // - bits 4..=55:  body pointer bits (52 bits)
-    // - bits 56..=63: key byte for cuckoo table lookup
+    // - bits 4..=47:  body pointer bits (44 bits → 16 TB addressable)
+    // - bits 48..=63: key (16 bits) for cuckoo table lookup
+    //
+    // Phase 2a widens the key field from 8 to 16 bits. The body pointer
+    // shrinks from 52 to 44 bits to make room; the low-4-bits-free
+    // alignment invariant (16-byte aligned bodies) is unchanged.
     const TAG_MASK: u64 = 0x0f;
-    const BODY_MASK: u64 = 0x00_ff_ff_ff_ff_ff_ff_f0;
-    const KEY_MASK: u64 = 0xff_00_00_00_00_00_00_00;
+    const BODY_MASK: u64 = 0x00_00_ff_ff_ff_ff_ff_f0;
+    const KEY_MASK: u64 = 0xff_ff_00_00_00_00_00_00;
 
-    pub(crate) fn new<T: Body + ?Sized>(key: u8, body: NonNull<T>) -> Self {
+    pub(crate) fn new<T: Body + ?Sized>(key: u16, body: NonNull<T>) -> Self {
         unsafe {
             let tptr =
                 std::ptr::NonNull::new_unchecked((body.as_ptr() as *mut u8).map_addr(|addr| {
                     debug_assert_eq!(addr as u64 & Self::TAG_MASK, 0);
                     ((addr as u64 & Self::BODY_MASK)
-                        | ((key as u64) << 56)
+                        | ((key as u64) << 48)
                         | (<T as Body>::tag(body) as u64)) as usize
                 }));
             Self {
@@ -307,7 +311,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     ///   by holding an `Arc<dyn ArchiveOwner>` in the nearest ancestor
     ///   `Branch`'s `owner` slot.
     /// - The pointer must be 16-byte aligned; this is debug-asserted.
-    pub(crate) unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
+    pub(crate) unsafe fn new_local_leaf(key: u16, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
         unsafe {
             let tptr = std::ptr::NonNull::new_unchecked((trible_ptr.as_ptr() as *mut u8).map_addr(
                 |addr| {
@@ -317,7 +321,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                         "LocalLeaf trible pointer must be 16-byte aligned"
                     );
                     ((addr as u64 & Self::BODY_MASK)
-                        | ((key as u64) << 56)
+                        | ((key as u64) << 48)
                         | (HeadTag::LocalLeaf as u64)) as usize
                 },
             ));
@@ -336,15 +340,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     #[inline]
-    pub(crate) fn key(&self) -> u8 {
-        (self.tptr.as_ptr() as u64 >> 56) as u8
+    pub(crate) fn key(&self) -> u16 {
+        (self.tptr.as_ptr() as u64 >> 48) as u16
     }
 
     #[inline]
-    pub(crate) fn with_key(mut self, key: u8) -> Self {
+    pub(crate) fn with_key(mut self, key: u16) -> Self {
         self.tptr =
             std::ptr::NonNull::new(self.tptr.as_ptr().map_addr(|addr| {
-                ((addr as u64 & !Self::KEY_MASK) | ((key as u64) << 56)) as usize
+                ((addr as u64 & !Self::KEY_MASK) | ((key as u64) << 48)) as usize
             }))
             .unwrap();
         self
@@ -365,8 +369,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn with_start(self, new_start_depth: usize) -> Head<KEY_LEN, O, V> {
         let leaf_key = self.childleaf_key();
         let i = O::TREE_TO_KEY[new_start_depth];
+        // Branching stays single-byte: derive the one branch byte and
+        // store it in the widened 16-bit key field.
         let key = leaf_key[i];
-        self.with_key(key)
+        self.with_key(key as u16)
     }
 
     // Removed childleaf_matches_key_from in favor of composing the existing
@@ -540,7 +546,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 slot.take();
             } else {
                 let mut ed = crate::vwpatch::branch::BranchMut::from_head(this);
-                let key = leaf_key[end_depth];
+                let key = leaf_key[end_depth] as u16;
                 ed.modify_child(key, |mut opt| {
                     Self::remove_leaf(&mut opt, leaf_key, end_depth);
                     opt
@@ -588,8 +594,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = crate::vwpatch::branch::Branch::new(
                 depth,
-                this.with_key(this_byte_key),
-                leaf.with_key(leaf_byte_key),
+                this.with_key(this_byte_key as u16),
+                leaf.with_key(leaf_byte_key as u16),
             );
             return Head::new(old_key, new_body);
         }
@@ -643,8 +649,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
             let new_branch_owner = leaf_owner.cloned();
             let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                 depth,
-                this.with_key(this_byte_key),
-                leaf.with_key(leaf_byte_key),
+                this.with_key(this_byte_key as u16),
+                leaf.with_key(leaf_byte_key as u16),
                 new_branch_owner,
                 leaf_hash,
             );
@@ -696,8 +702,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
                     let sub_owner = unsafe { (*branch_owner_ptr).clone() };
                     let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
                         depth,
-                        old.with_key(old_byte_key),
-                        inserted.with_key(leaf_byte_key),
+                        old.with_key(old_byte_key as u16),
+                        inserted.with_key(leaf_byte_key as u16),
                         sub_owner,
                         leaf_hash,
                     );
@@ -747,8 +753,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key),
-                leaf.with_key(leaf_byte_key),
+                this.with_key(this_byte_key as u16),
+                leaf.with_key(leaf_byte_key as u16),
             );
 
             return Head::new(old_key, new_body);
@@ -785,8 +791,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key),
-                other.with_key(other_byte_key),
+                this.with_key(this_byte_key as u16),
+                other.with_key(other_byte_key as u16),
             );
 
             return Head::new(old_key, new_body);
@@ -897,8 +903,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let old_key = this.key();
             let new_body = Branch::new(
                 depth,
-                this.with_key(this_byte_key),
-                other.with_key(other_byte_key),
+                this.with_key(this_byte_key as u16),
+                other.with_key(other_byte_key as u16),
             );
             return Head::new(old_key, new_body);
         }
@@ -953,7 +959,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             for slot in ed.child_table.iter_mut() {
                 if let Some(head) = slot.take() {
                     let key = head.key();
-                    this_present.insert(key);
+                    // Branch keys are still single-byte (0..=255), so they
+                    // index the 256-slot scatter arrays / `ByteSet` directly.
+                    this_present.insert(key as u8);
                     this_arr[key as usize] = Some(head);
                 }
             }
@@ -961,7 +969,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 if let Some(head) = slot.take() {
                     let head = head.with_start(end_depth);
                     let key = head.key();
-                    other_present.insert(key);
+                    other_present.insert(key as u8);
                     other_arr[key as usize] = Some(head);
                 }
             }
@@ -1495,7 +1503,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
             return branch
                 .child_table
-                .table_get(other.childleaf_key()[O::TREE_TO_KEY[self_depth]])
+                .table_get(other.childleaf_key()[O::TREE_TO_KEY[self_depth]] as u16)
                 .and_then(|self_child| other.intersect(self_child, self_depth));
         }
 
@@ -1508,7 +1516,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             };
             return other_branch
                 .child_table
-                .table_get(self.childleaf_key()[O::TREE_TO_KEY[other_depth]])
+                .table_get(self.childleaf_key()[O::TREE_TO_KEY[other_depth]] as u16)
                 .and_then(|other_child| self.intersect(other_child, other_depth));
         }
 
@@ -1580,7 +1588,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             // that might intersect with other, copy self with it's correctly filled byte table, then
             // remove the old child, and insert the new child.
             let mut new_branch = self.clone();
-            let other_byte_key = other.childleaf_key()[O::TREE_TO_KEY[self_depth]];
+            let other_byte_key = other.childleaf_key()[O::TREE_TO_KEY[self_depth]] as u16;
             {
                 let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut new_branch);
                 ed.modify_child(other_byte_key, |opt| {
@@ -1600,7 +1608,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             let BodyRef::Branch(other_branch) = other.body_ref() else {
                 unreachable!();
             };
-            let self_byte_key = self.childleaf_key()[O::TREE_TO_KEY[other_depth]];
+            let self_byte_key = self.childleaf_key()[O::TREE_TO_KEY[other_depth]] as u16;
             if let Some(other_child) = other_branch.child_table.table_get(self_byte_key) {
                 return self.difference(other_child, at_depth);
             } else {
@@ -1661,7 +1669,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 }
 
 unsafe impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> ByteEntry for Head<KEY_LEN, O, V> {
-    fn key(&self) -> u8 {
+    fn key(&self) -> u16 {
         self.key()
     }
 }

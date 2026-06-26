@@ -71,7 +71,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Self::from_head(head)
     }
 
-    pub fn modify_child<F>(&mut self, key: u8, f: F)
+    pub fn modify_child<F>(&mut self, key: u16, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
@@ -90,7 +90,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// When the slot is non-empty and `f(Some(_))` runs, the result
     /// is hashed normally (recursion result, hash already cached on
     /// the Branch).
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u8, inserted_hash: u128, f: F)
+    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u16, inserted_hash: u128, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
@@ -440,7 +440,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// insert/update/remove logic in one place and updates branch aggregates
     /// and `childleaf` as needed. The `branch_nn` pointer may be updated in
     /// place when the underlying allocation grows.
-    pub(super) fn modify_child<F>(branch_nn: &mut NonNull<Self>, key: u8, f: F)
+    pub(super) fn modify_child<F>(branch_nn: &mut NonNull<Self>, key: u16, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
@@ -519,7 +519,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// whose hash is already cached, so the call is O(1)).
     pub(super) fn modify_child_with_inserted_hint<F>(
         branch_nn: &mut NonNull<Self>,
-        key: u8,
+        key: u16,
         inserted_hash: u128,
         f: F,
     ) where
@@ -730,7 +730,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
         // The prefix ends in a child of this node.
         if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
                 child.infixes(prefix, node_end_depth, f);
             }
             return;
@@ -780,7 +780,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         // Case 2: prefix extends into a specific child.
         if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
                 child.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
             }
             return;
@@ -815,7 +815,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // Now iterate children, filtering by their byte at infix_byte_idx
         // only when we're still tight on that boundary.
         for entry in self.child_table.iter().flatten() {
-            let child_byte = entry.key();
+            let child_byte = entry.key() as u8;
             if min_tight && infix_byte_idx < INFIX_LEN && child_byte < min_infix[infix_byte_idx] {
                 continue;
             }
@@ -868,7 +868,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         // Case 2: prefix extends into a specific child.
         if PREFIX_LEN > node_end_depth {
-            if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+            if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
                 return child.count_range(prefix, node_end_depth, min_infix, max_infix);
             }
             return 0;
@@ -901,7 +901,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
         let mut total = 0u64;
         for entry in self.child_table.iter().flatten() {
-            let child_byte = entry.key();
+            let child_byte = entry.key() as u8;
             let below_min = min_tight && child_byte < min_infix[infix_byte_idx];
             let above_max = max_tight && child_byte > max_infix[infix_byte_idx];
             if below_min || above_max {
@@ -940,7 +940,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return true;
         }
 
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
             return child.has_prefix::<PREFIX_LEN>(node_end_depth, prefix);
         }
 
@@ -969,7 +969,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return 1;
         }
 
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
             return 1 + child.traversal_depth::<PREFIX_LEN>(node_end_depth, prefix);
         }
 
@@ -1003,7 +1003,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return Some(unsafe { &(*leaf_ptr).value });
         }
 
-        if let Some(child) = self.child_table.table_get(key[node_end_depth]) {
+        if let Some(child) = self.child_table.table_get(key[node_end_depth] as u16) {
             return child.get(node_end_depth, key);
         }
         None
@@ -1030,7 +1030,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
                 return self.segment_count;
             }
         }
-        if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+        if let Some(child) = self.child_table.table_get(prefix[node_end_depth] as u16) {
             child.segmented_len::<PREFIX_LEN>(node_end_depth, prefix)
         } else {
             0

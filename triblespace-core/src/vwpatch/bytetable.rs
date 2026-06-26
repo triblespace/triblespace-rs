@@ -35,8 +35,6 @@
 //! current bucket, to the corresponding bucket in the upper half.
 //! Incidentally this might flip the hash function used for this entry.
 
-use rand::seq::SliceRandom;
-use rand::thread_rng;
 use std::fmt::Debug;
 use std::sync::Once;
 
@@ -50,32 +48,16 @@ const MAX_SLOT_COUNT: usize = 256;
 /// insert before the size of the table is increased.
 const MAX_RETRIES: usize = 2;
 
-/// Global randomness used for bucket selection.
-static mut RANDOM_PERMUTATION_RAND: [u8; 256] = [0; 256];
-static mut RANDOM_PERMUTATION_HASH: [u8; 256] = [0; 256];
 static INIT: Once = Once::new();
 
-/// Initialise the randomness source and hash function
-/// used by all tables.
+/// Initialise the hash function used by all tables.
+///
+/// The widened `u16` key table uses a fixed multiplicative permutation
+/// (see [`rand_hash`]) instead of a randomized 256-entry lookup table,
+/// so there is no per-process randomness left to seed. The hook is kept
+/// (with its `INIT` guard) so call sites have a stable entry point.
 pub fn init() {
-    INIT.call_once(|| {
-        let mut rng = thread_rng();
-        let mut bytes: [u8; 256] = [0; 256];
-
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-
-        bytes.shuffle(&mut rng);
-        unsafe {
-            RANDOM_PERMUTATION_HASH = bytes;
-        }
-
-        bytes.shuffle(&mut rng);
-        unsafe {
-            RANDOM_PERMUTATION_RAND = bytes;
-        }
-    });
+    INIT.call_once(|| {});
 }
 
 /// Types must implement this trait in order to be storable in the byte table.
@@ -86,8 +68,13 @@ pub fn init() {
 /// type is `mem::zeroed()`. Failure to uphold this contract may lead to
 /// incorrect behavior when entries are inserted into the table.
 pub unsafe trait ByteEntry {
-    /// Returns the byte key that identifies this entry's bucket.
-    fn key(&self) -> u8;
+    /// Returns the key that identifies this entry's bucket.
+    ///
+    /// The key is stored in a 16-bit field. While the trie still
+    /// branches on a single byte (values `0..=255`), the table keys,
+    /// hashes, and compares everything as `u16` so the bit-width
+    /// widening is exercised in isolation.
+    fn key(&self) -> u16;
 }
 
 /// Represents the hashtable's internal buckets, which allow for up to
@@ -98,23 +85,34 @@ pub unsafe trait ByteEntry {
 /// A cheap hash *cough* identity *cough* function that maps every entry to an
 /// almost linear ordering (modulo `BUCKET_ENTRY_COUNT`) when maximally grown.
 #[inline]
-fn cheap_hash(byte_key: u8) -> u8 {
+fn cheap_hash(byte_key: u16) -> u16 {
     byte_key
 }
 
-/// A hash function that uses a lookup table to provide a random bijective
-/// byte -> byte mapping.
+/// Odd multiplicative constant for the `u16` random permutation. Any
+/// odd value is invertible mod 2^16, hence a bijection over the whole
+/// 16-bit key domain. That bijectivity is exactly what the
+/// compressed-permutation grow invariant needs — the invariant only
+/// relies on the low `log2(bucket_count)` bits of a *fixed* hash. This
+/// is `floor(2^16 / phi)`, the 16-bit Fibonacci-hashing multiplier.
+const RAND_HASH_MUL: u16 = 0x9E37;
+
+/// A multiplicative permutation giving a fixed bijective `u16 -> u16`
+/// mapping. Replaces the former 256-entry byte lookup table, which
+/// could not index the widened 16-bit key domain.
 #[inline]
-fn rand_hash(byte_key: u8) -> u8 {
-    unsafe { RANDOM_PERMUTATION_HASH[byte_key as usize] }
+fn rand_hash(byte_key: u16) -> u16 {
+    byte_key.wrapping_mul(RAND_HASH_MUL)
 }
 
 /// Cut off the upper bits so that it fits in the bucket count.
+/// `bucket_count <= MAX_SLOT_COUNT / BUCKET_ENTRY_COUNT = 128`, so the
+/// masked result always fits in a `u8`.
 #[inline]
-fn compress_hash(slot_count: usize, hash: u8) -> u8 {
-    let bucket_count = (slot_count / BUCKET_ENTRY_COUNT) as u8;
+fn compress_hash(slot_count: usize, hash: u16) -> u8 {
+    let bucket_count = (slot_count / BUCKET_ENTRY_COUNT) as u16;
     let mask = bucket_count - 1;
-    hash & mask
+    (hash & mask) as u8
 }
 
 /// A 256-bit set indexed by byte. Two `u128` words give one bit per
@@ -200,28 +198,31 @@ fn plan_insert<T: ByteEntry + Debug>(
     }
 
     for slot_idx in 0..BUCKET_ENTRY_COUNT {
-        let key = table[bucket_start + slot_idx]
-            .as_ref()
-            .expect("slot must be occupied")
-            .key();
-        if visited.contains(key) {
+        let slot = bucket_start + slot_idx;
+        // The key now spans 16 bits and can no longer index the 256-bit
+        // `ByteSet`. Track visited *slot indices* instead — there are at
+        // most `MAX_SLOT_COUNT = 256` slots (index `0..=255`), which still
+        // fits the 256-bit set, and revisiting the same slot is precisely
+        // the cuckoo cycle we need to forbid.
+        if visited.contains(slot as u8) {
             continue;
         }
-        visited.insert(key);
+        visited.insert(slot as u8);
 
+        let key = table[slot].as_ref().expect("slot must be occupied").key();
         let cheap = compress_hash(table.len(), cheap_hash(key)) as usize;
         let rand = compress_hash(table.len(), rand_hash(key)) as usize;
         // Try the other bucket that the key could occupy.
         let alt_idx = if bucket_idx == cheap { rand } else { cheap };
         if alt_idx != bucket_idx {
             if let Some(hole_idx) = plan_insert(table, alt_idx, depth - 1, visited) {
-                table[hole_idx] = table[bucket_start + slot_idx].take();
-                visited.remove(key);
-                return Some(bucket_start + slot_idx);
+                table[hole_idx] = table[slot].take();
+                visited.remove(slot as u8);
+                return Some(slot);
             }
         }
 
-        visited.remove(key);
+        visited.remove(slot as u8);
     }
 
     None
@@ -229,10 +230,10 @@ fn plan_insert<T: ByteEntry + Debug>(
 
 /// Operations on a cuckoo hash table indexed by single-byte keys.
 pub trait ByteTable<T: ByteEntry + Debug> {
-    /// Looks up an entry by its byte key, returning a reference if found.
-    fn table_get(&self, byte_key: u8) -> Option<&T>;
+    /// Looks up an entry by its key, returning a reference if found.
+    fn table_get(&self, byte_key: u16) -> Option<&T>;
     /// Returns a mutable reference to the slot holding `byte_key`, if present.
-    fn table_get_slot(&mut self, byte_key: u8) -> Option<&mut Option<T>>;
+    fn table_get_slot(&mut self, byte_key: u16) -> Option<&mut Option<T>>;
     /// Inserts `entry` into the table, returning it back if the table is full.
     fn table_insert(&mut self, entry: T) -> Option<T>;
     /// Moves entries from `self` into `grown`, which must be twice the size.
@@ -240,7 +241,7 @@ pub trait ByteTable<T: ByteEntry + Debug> {
 }
 
 impl<T: ByteEntry + Debug> ByteTable<T> for [Option<T>] {
-    fn table_get(&self, byte_key: u8) -> Option<&T> {
+    fn table_get(&self, byte_key: u16) -> Option<&T> {
         let cheap_start =
             compress_hash(self.len(), cheap_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
         for slot in 0..BUCKET_ENTRY_COUNT {
@@ -263,7 +264,7 @@ impl<T: ByteEntry + Debug> ByteTable<T> for [Option<T>] {
         None
     }
 
-    fn table_get_slot(&mut self, byte_key: u8) -> Option<&mut Option<T>> {
+    fn table_get_slot(&mut self, byte_key: u16) -> Option<&mut Option<T>> {
         let cheap_start =
             compress_hash(self.len(), cheap_hash(byte_key)) as usize * BUCKET_ENTRY_COUNT;
         for slot in 0..BUCKET_ENTRY_COUNT {
@@ -292,9 +293,11 @@ impl<T: ByteEntry + Debug> ByteTable<T> for [Option<T>] {
     fn table_insert(&mut self, inserted: T) -> Option<T> {
         debug_assert!(self.table_get(inserted.key()).is_none());
 
+        // `visited` now tracks slot indices, not keys (see `plan_insert`).
+        // The freshly inserted entry has no slot yet, so the set starts
+        // empty — the displacement chain marks slots as it descends.
         let mut visited = ByteSet::new_empty();
         let key = inserted.key();
-        visited.insert(key);
         let limit = if self.len() == MAX_SLOT_COUNT {
             MAX_SLOT_COUNT
         } else {
@@ -356,31 +359,31 @@ mod tests {
     #[derive(Copy, Clone, Debug)]
     #[repr(C)]
     struct DummyEntry {
-        value: u8,
+        value: u16,
     }
 
     impl DummyEntry {
-        fn new(byte_key: u8) -> Self {
+        fn new(byte_key: u16) -> Self {
             DummyEntry { value: byte_key }
         }
     }
 
     unsafe impl ByteEntry for DummyEntry {
-        fn key(&self) -> u8 {
+        fn key(&self) -> u16 {
             self.value
         }
     }
 
     proptest! {
         #[test]
-        fn empty_table_then_empty_get(n in 0u8..255) {
+        fn empty_table_then_empty_get(n in 0u16..255) {
             init();
             let table: [Option<DummyEntry>; 4] = [None; 4];
             prop_assert!(table.table_get(n).is_none());
         }
 
         #[test]
-        fn single_insert_success(n in 0u8..255) {
+        fn single_insert_success(n in 0u16..255) {
             init();
             let mut table: [Option<DummyEntry>; 4] = [None; 4];
             let entry = DummyEntry::new(n);
@@ -390,7 +393,7 @@ mod tests {
         }
 
         #[test]
-        fn insert_success(entry_set in prop::collection::hash_set(0u8..255, 1..32)) {
+        fn insert_success(entry_set in prop::collection::hash_set(0u16..255, 1..32)) {
             init();
 
             let entries: Vec<_> = entry_set.iter().copied().collect();
@@ -420,9 +423,8 @@ mod tests {
                         for j in 0..i {
                             prop_assert!(
                                 $grown_table.table_get(entries[j]).is_some(),
-                                "Missing value {} after growth with hash {:?}",
-                                entries[j],
-                                unsafe { RANDOM_PERMUTATION_HASH }
+                                "Missing value {} after growth",
+                                entries[j]
                             );
                         }
                     }
@@ -446,7 +448,7 @@ mod tests {
     fn sequential_insert_all_keys() {
         init();
         let mut table: [Option<DummyEntry>; 256] = [None; 256];
-        for n in 0u8..=255 {
+        for n in 0u16..=255 {
             assert!(table.table_insert(DummyEntry::new(n)).is_none());
         }
     }
