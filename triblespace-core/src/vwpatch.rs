@@ -1731,18 +1731,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         self.with_key(fp)
     }
 
-    /// Append clones of every leaf head in this subtree to `out`.
-    fn collect_leaves(&self, out: &mut Vec<Self>) {
-        match self.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => out.push(self.clone()),
-            BodyRef::Branch(branch) => {
-                for child in branch.child_table.iter().flatten() {
-                    child.collect_leaves(out);
-                }
-            }
-        }
-    }
-
     /// Tree-ordered span sub-key of `key` over `[start, end)`, into `buf`.
     #[inline]
     fn span_sub<'b>(
@@ -1792,11 +1780,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         true
     }
 
-    /// Widest span `[start, end)` (`end <= next_boundary(start)`) satisfying
-    /// [`dense_span_ok`]. A single-byte span is always valid, so this returns
-    /// at least `start + 1`.
-    fn widest_dense_span(leaves: &[Self], start: usize) -> usize {
-        let mut end = O::next_boundary(start);
+    /// Widest span `[start, end)` (`end <= min(next_boundary(start), max_end)`)
+    /// satisfying [`dense_span_ok`]. A single-byte span is always valid, so this
+    /// returns at least `start + 1`.
+    ///
+    /// `max_end` caps the span so it never reaches into a unit's own internal
+    /// structure: when regrouping *subtree* units (the O(children) narrow), each
+    /// unit branches at depth `max_end`, so spans must stay `<= max_end` to keep
+    /// every unit an opaque, leaf-positioned child.
+    fn widest_dense_span(leaves: &[Self], start: usize, max_end: usize) -> usize {
+        let mut end = O::next_boundary(start).min(max_end);
         while end > start + 1 {
             if Self::dense_span_ok(leaves, start, end) {
                 break;
@@ -1806,15 +1799,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         end
     }
 
-    /// Build a dense subtree from `leaves` (all leaf heads sharing the
-    /// tree-bytes up to `min_start`). Groups by span sub-key and recurses;
-    /// singleton groups collapse to the leaf itself.
-    fn build_dense_node(leaves: Vec<Self>, min_start: usize) -> Self {
-        if leaves.len() == 1 {
-            return leaves.into_iter().next().unwrap();
+    /// Build a dense subtree from `units` (leaf *or* subtree heads, all sharing
+    /// the tree-bytes up to `min_start` and pairwise diverging within
+    /// `[min_start, max_end)`). Groups by span sub-key and recurses; singleton
+    /// groups collapse to the unit itself, leaving its subtree intact.
+    ///
+    /// `max_end` bounds every span so it never overruns a unit's own internal
+    /// structure (which begins at `max_end` for subtree units; `KEY_LEN` for
+    /// leaves). Because the function only reads each unit's representative
+    /// `childleaf_key()` and clones heads (Arc bump) — never walking a subtree —
+    /// it is O(units) regardless of how large those subtrees are.
+    fn build_dense_node(units: Vec<Self>, min_start: usize, max_end: usize) -> Self {
+        if units.len() == 1 {
+            return units.into_iter().next().unwrap();
         }
-        let start = Self::first_varying_depth(&leaves, min_start);
-        let mut end = Self::widest_dense_span(&leaves, start);
+        let start = Self::first_varying_depth(&units, min_start);
+        let mut end = Self::widest_dense_span(&units, start, max_end);
 
         // Group → build children → install. A chosen span may still be
         // cuckoo-unplaceable (arbitrary fingerprints can be unplaceable even
@@ -1824,13 +1824,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             use std::collections::HashMap;
             let mut groups: HashMap<Vec<u8>, Vec<Self>> = HashMap::new();
             let mut buf = [0u8; KEY_LEN];
-            for l in &leaves {
+            for l in &units {
                 let key = Self::span_sub(l.childleaf_key(), start, end, &mut buf).to_vec();
                 groups.entry(key).or_default().push(l.clone());
             }
             let children: Vec<Self> = groups
                 .into_values()
-                .map(|members| Self::build_dense_node(members, end).with_span(start, end))
+                .map(|members| Self::build_dense_node(members, end, max_end).with_span(start, end))
                 .collect();
             match Branch::from_children_dense(start, end, children) {
                 Some(nn) => return Head::new(0, nn),
@@ -1869,15 +1869,28 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         Head::new(0, nn)
     }
 
-    /// Collect every leaf under `this`, add `leaf`, and rebuild a dense subtree
-    /// from `min_start`. Used only on the rare overflow / placement-failure
-    /// narrow path (a node hitting its fanout cap), so the O(subtree) cost is
-    /// amortised across the cap-many inserts that filled it.
-    fn rebuild_with(this: Self, leaf: Self, min_start: usize) -> Self {
-        let mut leaves = Vec::with_capacity(this.count() as usize + 1);
-        this.collect_leaves(&mut leaves);
-        leaves.push(leaf);
-        Self::build_dense_node(leaves, min_start)
+    /// O(children) narrow of an overflowing dense node `this` (span `[s, e)`).
+    ///
+    /// The standard ART/HOT node split: instead of gathering every leaf under
+    /// the node and rebuilding the whole subtree, take only `this`'s **immediate
+    /// children** (clone = Arc bump, leaving their subtrees fully intact) plus
+    /// the new `extra` unit, and re-group them under a narrower span. Children
+    /// sharing the same narrowed sub-key get re-parented under a fresh
+    /// intermediate node spanning `[e', e)`; singletons collapse and re-key up.
+    /// The span bound `e` keeps every unit a leaf-positioned, opaque child, so
+    /// no subtree is ever walked or rebuilt — the cost is O(children of `this`),
+    /// not O(subtree). Cascades automatically when a freshly-formed intermediate
+    /// still exceeds capacity (handled by `build_dense_node`'s recursion).
+    fn narrow_with(this: Self, extra: Self, s: usize, e: usize) -> Self {
+        let mut units: Vec<Self> = match this.body_ref() {
+            BodyRef::Branch(branch) => branch.child_table.iter().flatten().cloned().collect(),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                unreachable!("narrow_with requires a Branch node")
+            }
+        };
+        units.push(extra);
+        drop(this);
+        Self::build_dense_node(units, s, e)
     }
 
     /// Variable-width dense insert of a fresh `leaf` head into `this`.
@@ -1928,15 +1941,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     && ed.child_table.iter().flatten().count() >= Self::max_fanout(e - s);
                 if over_cap {
                     drop(ed);
-                    return Self::rebuild_with(this, leaf, s);
+                    return Self::narrow_with(this, leaf, s, e);
                 }
 
                 let inserted = leaf.with_span(s, e);
                 let leftover = ed.add_dense_child(inserted);
                 drop(ed);
                 if let Some(leftover) = leftover {
-                    // Cuckoo placement failed below the cap — narrow (rebuild).
-                    return Self::rebuild_with(this, leftover, s);
+                    // Cuckoo placement failed below the cap — O(children) narrow.
+                    return Self::narrow_with(this, leftover, s, e);
                 }
                 this
             }
