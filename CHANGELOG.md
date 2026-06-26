@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a PATCH branch fanout diagnostic histogram for inspecting real trie
+  shapes in benchmark probes.
+
 ### Fixed
 
 - **`trible pile diagnose check` no longer doubles the blake3 prefix.** The

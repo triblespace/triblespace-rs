@@ -1666,6 +1666,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Per-fanout branch census: `hist[f] = branch_count` for branches with
+    /// exactly `f` filled children.
+    pub(crate) fn branch_fanout_hist(&self, hist: &mut [u64; 257]) {
+        if let BodyRef::Branch(branch) = self.body_ref() {
+            let fanout = branch.child_table.iter().flatten().count();
+            hist[fanout.min(256)] += 1;
+            for child in branch.child_table.iter().flatten() {
+                child.branch_fanout_hist(hist);
+            }
+        }
+    }
+
     // NOTE: slot-level union wrapper removed; callers should take the slot and
     // call the owned helper `union` directly.
 
@@ -2018,6 +2030,16 @@ where
         let mut hist = [(0u64, 0u64); 65];
         if let Some(root) = &self.root {
             root.branch_hist(&mut hist);
+        }
+        hist
+    }
+
+    /// Per-fanout branch census: returns `hist[f] = branch_count` for each
+    /// exact fanout `0..=256`.
+    pub fn branch_fanout_histogram(&self) -> [u64; 257] {
+        let mut hist = [0u64; 257];
+        if let Some(root) = &self.root {
+            root.branch_fanout_hist(&mut hist);
         }
         hist
     }
