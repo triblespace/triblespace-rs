@@ -107,17 +107,45 @@ impl Default for YardConfig {
 }
 
 #[derive(Debug)]
-struct Generation {
+struct Segment {
     path: PathBuf,
     pile: Option<Pile>,
     live: HandleSet,
 }
 
-impl Generation {
+impl Segment {
     fn pile_mut(&mut self) -> &mut Pile {
         self.pile
             .as_mut()
-            .expect("yard generation pile already closed")
+            .expect("yard segment pile already closed")
+    }
+}
+
+/// A generation (tier): an ordered list of segments. The youngest segment is
+/// the active write target; reads union across all segments. (Today every
+/// generation holds exactly one segment; multi-segment tiers land next.)
+#[derive(Debug)]
+struct Generation {
+    segments: Vec<Segment>,
+}
+
+impl Generation {
+    fn one(segment: Segment) -> Self {
+        Self {
+            segments: vec![segment],
+        }
+    }
+
+    /// The active write segment — the youngest in the tier.
+    fn active_mut(&mut self) -> &mut Segment {
+        self.segments
+            .last_mut()
+            .expect("yard generation has no segment")
+    }
+
+    /// Total live blobs across the tier's segments.
+    fn live_len(&self) -> usize {
+        self.segments.iter().map(|s| s.live.len() as usize).sum()
     }
 }
 
@@ -145,11 +173,11 @@ impl Yard {
             File::create(&path).map_err(YardOpenError::Io)?;
             let mut pile = Pile::open(&path).map_err(YardOpenError::Pile)?;
             pile.restore().map_err(YardOpenError::Pile)?;
-            generations.push(Generation {
+            generations.push(Generation::one(Segment {
                 path,
                 pile: Some(pile),
                 live: HandleSet::new(),
-            });
+            }));
         }
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
@@ -177,11 +205,11 @@ impl Yard {
             pile.restore().map_err(YardOpenError::Pile)?;
             let reader = pile.reader().map_err(YardOpenError::Pile)?;
             let live = collect_list(reader.blobs()).map_err(YardOpenError::List)?;
-            generations.push(Generation {
+            generations.push(Generation::one(Segment {
                 path,
                 pile: Some(pile),
                 live,
-            });
+            }));
         }
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
@@ -201,7 +229,7 @@ impl Yard {
 
     /// Number of live blobs in a generation.
     pub fn generation_len(&self, level: usize) -> Option<usize> {
-        self.generations.get(level).map(|g| g.live.len() as usize)
+        self.generations.get(level).map(|g| g.live_len())
     }
 
     /// Returns whether a live handle is currently associated with `level`.
@@ -211,9 +239,11 @@ impl Yard {
         Handle<S>: InlineEncoding,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        self.generations
-            .get(level)
-            .is_some_and(|g| g.live.get(&handle.raw).is_some())
+        self.generations.get(level).is_some_and(|g| {
+            g.segments
+                .iter()
+                .any(|s| s.live.get(&handle.raw).is_some())
+        })
     }
 
     /// Strongly pin a blob as the current head for `pin`.
@@ -247,11 +277,12 @@ impl Yard {
         Handle<S>: InlineEncoding,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        if self
-            .generations
-            .iter()
-            .any(|generation| generation.live.get(&handle.raw).is_some())
-        {
+        if self.generations.iter().any(|generation| {
+            generation
+                .segments
+                .iter()
+                .any(|s| s.live.get(&handle.raw).is_some())
+        }) {
             return;
         }
         self.weak_state
@@ -274,7 +305,9 @@ impl Yard {
         let mut keep = strong_keep;
         keep.union(weak_keep);
         for generation in &mut self.generations {
-            generation.live = generation.live.intersect(&keep);
+            for segment in &mut generation.segments {
+                segment.live = segment.live.intersect(&keep);
+            }
         }
         Ok(())
     }
@@ -293,18 +326,19 @@ impl Yard {
             let strong_keep = self.strong_keep_set(&reader);
 
             for level in 0..last {
-                let strong_here = self.generations[level].live.intersect(&strong_keep);
+                let strong_here =
+                    self.generations[level].segments[0].live.intersect(&strong_keep);
                 if strong_here.len() as usize <= self.strong_budget_for(level) {
                     continue;
                 }
 
-                // Overflow: dump the whole level down — strong *and* weak
-                // survivors. `collect()` above already dropped dead, so `live`
-                // here is exactly the survivors. Weak is allowed to descend and
+                // Overflow: dump the whole tier down — strong *and* weak
+                // survivors. `collect()` above already dropped dead, so the
+                // segment's `live` is exactly the survivors. Weak descends to
                 // use space in lower tiers rather than being pinned to the
                 // youngest generation; it stays evictable everywhere and is
                 // dropped by the weak budget under pressure.
-                let movers = self.generations[level].live.clone();
+                let movers = self.generations[level].segments[0].live.clone();
                 let handles: Vec<_> = movers
                     .clone()
                     .into_iter()
@@ -313,27 +347,29 @@ impl Yard {
 
                 let mut copied = Vec::new();
                 {
-                    let target = self.generations[level + 1].pile_mut();
+                    let target = self.generations[level + 1].active_mut().pile_mut();
                     for result in transfer(&reader, target, handles.clone()) {
                         let (source, _target) = result.map_err(YardCollectError::Transfer)?;
                         copied.push(source);
                     }
                 }
 
-                for source in copied {
-                    self.generations[level + 1]
-                        .live
-                        .insert(&Entry::new(&source.raw));
+                {
+                    let target = self.generations[level + 1].active_mut();
+                    for source in copied {
+                        target.live.insert(&Entry::new(&source.raw));
+                    }
                 }
 
                 for raw in movers {
-                    self.generations[level].live.remove(&raw);
+                    self.generations[level].segments[0].live.remove(&raw);
                 }
 
                 // Make the moved blobs durable in the target before the source
                 // pile is recycled below, so a crash can't drop content that
                 // would briefly live in neither place.
                 self.generations[level + 1]
+                    .active_mut()
                     .pile_mut()
                     .flush()
                     .map_err(YardCollectError::Flush)?;
@@ -341,23 +377,23 @@ impl Yard {
             }
         }
 
-        // Fold reclamation into the merge: each dumped level is now empty, so
-        // recycle its pile in place (crash-safe write-empty + atomic rename)
+        // Fold reclamation into the merge: each dumped tier is now empty, so
+        // recycle its segment in place (crash-safe write-empty + atomic rename)
         // rather than leaving dead bytes for a separate reclaim() pass.
         for level in dumped {
-            let path = self.generations[level].path.clone();
+            let path = self.generations[level].segments[0].path.clone();
             let temp_path = reclaim_temp_path(&path, level);
-            let live = self.generations[level].live.clone();
-            let pile = self.generations[level]
+            let live = self.generations[level].segments[0].live.clone();
+            let pile = self.generations[level].segments[0]
                 .pile
                 .take()
-                .expect("yard generation pile already closed");
+                .expect("yard segment pile already closed");
             match reclaim_generation(&path, &temp_path, &live, pile) {
-                Ok(pile) => self.generations[level].pile = Some(pile),
+                Ok(pile) => self.generations[level].segments[0].pile = Some(pile),
                 Err(err) => {
                     if let Ok(mut pile) = Pile::open(&path) {
                         if pile.restore().is_ok() {
-                            self.generations[level].pile = Some(pile);
+                            self.generations[level].segments[0].pile = Some(pile);
                         }
                     }
                     return Err(YardCollectError::Reclaim(err));
@@ -379,23 +415,25 @@ impl Yard {
     /// over the original on the same filesystem, and reopens the generation.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         for (level, generation) in self.generations.iter_mut().enumerate() {
-            let path = generation.path.clone();
-            let temp_path = reclaim_temp_path(&path, level);
-            let live = generation.live.clone();
-            let pile = generation
-                .pile
-                .take()
-                .expect("yard generation pile already closed");
+            for segment in &mut generation.segments {
+                let path = segment.path.clone();
+                let temp_path = reclaim_temp_path(&path, level);
+                let live = segment.live.clone();
+                let pile = segment
+                    .pile
+                    .take()
+                    .expect("yard segment pile already closed");
 
-            match reclaim_generation(&path, &temp_path, &live, pile) {
-                Ok(pile) => generation.pile = Some(pile),
-                Err(err) => {
-                    if let Ok(mut pile) = Pile::open(&path) {
-                        if pile.restore().is_ok() {
-                            generation.pile = Some(pile);
+                match reclaim_generation(&path, &temp_path, &live, pile) {
+                    Ok(pile) => segment.pile = Some(pile),
+                    Err(err) => {
+                        if let Ok(mut pile) = Pile::open(&path) {
+                            if pile.restore().is_ok() {
+                                segment.pile = Some(pile);
+                            }
                         }
+                        return Err(err);
                     }
-                    return Err(err);
                 }
             }
         }
@@ -439,9 +477,13 @@ impl Yard {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        let handle = self.generations[level].pile_mut().put::<S, T>(item)?;
+        let handle = self.generations[level]
+            .active_mut()
+            .pile_mut()
+            .put::<S, T>(item)?;
         let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
         self.generations[level]
+            .active_mut()
             .live
             .insert(&Entry::new(&unknown.raw));
         Ok(handle)
@@ -451,8 +493,10 @@ impl Yard {
 impl Drop for Yard {
     fn drop(&mut self) {
         for generation in &mut self.generations {
-            if let Some(pile) = generation.pile.take() {
-                let _ = pile.close();
+            for segment in &mut generation.segments {
+                if let Some(pile) = segment.pile.take() {
+                    let _ = pile.close();
+                }
             }
         }
     }
@@ -467,9 +511,15 @@ impl BlobStorePut for Yard {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        let handle = self.generations[0].pile_mut().put::<S, T>(item)?;
+        let handle = self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .put::<S, T>(item)?;
         let unknown: Inline<Handle<UnknownBlob>> = handle.transmute();
-        self.generations[0].live.insert(&Entry::new(&unknown.raw));
+        self.generations[0]
+            .active_mut()
+            .live
+            .insert(&Entry::new(&unknown.raw));
         Ok(handle)
     }
 }
@@ -479,15 +529,14 @@ impl BlobStore for Yard {
     type ReaderError = YardReaderError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        let mut generations = Vec::with_capacity(self.generations.len());
+        let mut generations = Vec::new();
         for generation in &mut self.generations {
-            generations.push(YardGenerationReader {
-                reader: generation
-                    .pile_mut()
-                    .reader()
-                    .map_err(YardReaderError::Pile)?,
-                live: generation.live.clone(),
-            });
+            for segment in &mut generation.segments {
+                generations.push(YardGenerationReader {
+                    reader: segment.pile_mut().reader().map_err(YardReaderError::Pile)?,
+                    live: segment.live.clone(),
+                });
+            }
         }
         Ok(YardReader {
             generations,
@@ -501,8 +550,10 @@ impl StorageClose for Yard {
 
     fn close(mut self) -> Result<(), Self::Error> {
         for generation in &mut self.generations {
-            if let Some(pile) = generation.pile.take() {
-                pile.close().map_err(YardCloseError::Pile)?;
+            for segment in &mut generation.segments {
+                if let Some(pile) = segment.pile.take() {
+                    pile.close().map_err(YardCloseError::Pile)?;
+                }
             }
         }
         Ok(())
@@ -1214,7 +1265,13 @@ mod tests {
         fn live_sets(yard: &Yard) -> Vec<BTreeSet<RawHandle>> {
             yard.generations
                 .iter()
-                .map(|generation| generation.live.clone().into_iter().collect())
+                .map(|generation| {
+                    generation
+                        .segments
+                        .iter()
+                        .flat_map(|s| s.live.clone().into_iter())
+                        .collect()
+                })
                 .collect()
         }
 
