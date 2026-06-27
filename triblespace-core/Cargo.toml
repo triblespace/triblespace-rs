@@ -107,6 +107,11 @@ name = "vwpatch_realmem"
 harness = false
 required-features = ["vwpatch"]
 
+[[bench]]
+name = "union_vw_vs_patch"
+harness = false
+required-features = ["vwpatch", "parallel"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
