@@ -125,3 +125,8 @@ default-unwind = "1"
 name = "vwpatch_readsweep"
 harness = false
 required-features = ["vwpatch"]
+
+[[bench]]
+name = "tribleset_vw_vs_patch"
+harness = false
+required-features = ["vwpatch"]
