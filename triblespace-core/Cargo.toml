@@ -108,6 +108,11 @@ harness = false
 required-features = ["vwpatch"]
 
 [[bench]]
+name = "vwpatch_archivemem"
+harness = false
+required-features = ["vwpatch"]
+
+[[bench]]
 name = "union_vw_vs_patch"
 harness = false
 required-features = ["vwpatch", "parallel"]
