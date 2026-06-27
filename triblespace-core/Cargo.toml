@@ -135,3 +135,7 @@ required-features = ["vwpatch"]
 name = "tribleset_vw_vs_patch"
 harness = false
 required-features = ["vwpatch"]
+
+[[bench]]
+name = "patch_bucket"
+harness = false
