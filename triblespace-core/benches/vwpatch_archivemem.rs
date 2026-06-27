@@ -29,7 +29,7 @@ use std::sync::Arc;
 use triblespace_core::patch::{
     ArchiveEntry as PaArchiveEntry, ArchiveOwner as PaOwner, Entry as PatchEntry, KeySchema, PATCH,
 };
-use triblespace_core::trible::{EAVOrder, VEAOrder};
+use triblespace_core::trible::{AEVOrder, AVEOrder, EAVOrder, EVAOrder, VAEOrder, VEAOrder};
 use triblespace_core::vwpatch::{
     ArchiveEntry as VwArchiveEntry, ArchiveOwner as VwOwner, Entry as VwEntry, VWPATCH,
 };
@@ -141,7 +141,9 @@ fn ps(label: &str, bytes: i64, n: f64, s: Stats) {
     );
 }
 
-fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
+/// Returns (archive_PATCH_bytes, bulk_VW_bytes) for summing into the full
+/// 6-index TribleSet archive footprint.
+fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) -> (i64, i64) {
     let n = arch.n;
     let nf = n as f64;
     println!("\n=== ordering {name} ===");
@@ -183,9 +185,21 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
     // its widest valid width (segment-checkpoint + max_fanout capped), reaching
     // the bulk-optimal node count — vs the incremental build above, which
     // narrows spans on partial data and over-splits.
+    // A SimpleArchive is sorted in EAV order ONLY. `from_sorted_archive` needs
+    // its input sorted in THIS ordering's tree order, so sort the entry sequence
+    // by `O::tree_ordered` first (a no-op permutation for EAV, a real sort for
+    // the other five). Without this, a non-eav bulk build groups mis-sorted keys
+    // and over-splits — never reaching its true bulk optimum.
+    let keys_for_sort = arch.keys();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| {
+        O::tree_ordered(&keys_for_sort[a]).cmp(&O::tree_ordered(&keys_for_sort[b]))
+    });
     let vw_bulk_owner: Arc<dyn VwOwner> = Arc::new(Keep);
     let (vw_bulk_bytes, vw_bulk) = measure(|| {
-        let entries = (0..n).map(|i| unsafe { VwArchiveEntry::new(arch.ptr(i), &vw_bulk_owner) });
+        let entries = order
+            .iter()
+            .map(|&i| unsafe { VwArchiveEntry::new(arch.ptr(i), &vw_bulk_owner) });
         VWPATCH::<TRIBLE_LEN, O, ()>::from_sorted_archive(entries, vw_bulk_owner.clone())
     });
     let vw_bulk_stats = vw_bulk.node_stats();
@@ -349,6 +363,7 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
         pa_arch_stats.1,
         if vw_bulk_bytes < pa_arch_bytes { "SMALLER than" } else { "still LARGER than" },
     );
+    (pa_arch_bytes, vw_bulk_bytes)
 }
 
 fn main() {
@@ -361,6 +376,30 @@ fn main() {
         arch.base() as usize & 0x0f == 0,
     );
 
-    run::<EAVOrder>("eav", &arch);
-    run::<VEAOrder>("vea", &arch);
+    // All 6 covering orderings. A SimpleArchive is eav-sorted; each non-eav
+    // bulk build sorts into its own tree order first (inside `run`). Sum the
+    // per-ordering archive footprints into the full TribleSet total — the real
+    // "load a pile, query from a laptop" memory.
+    let mut pa_total = 0i64;
+    let mut vw_total = 0i64;
+    for (pa, vw) in [
+        run::<EAVOrder>("eav", &arch),
+        run::<EVAOrder>("eva", &arch),
+        run::<AEVOrder>("aev", &arch),
+        run::<AVEOrder>("ave", &arch),
+        run::<VEAOrder>("vea", &arch),
+        run::<VAEOrder>("vae", &arch),
+    ] {
+        pa_total += pa;
+        vw_total += vw;
+    }
+    let nf = arch.n as f64;
+    println!(
+        "\n===== FULL 6-INDEX TRIBLESET (archive regime, optimal bulk vwpatch) =====\n  \
+         archive-PATCH  {:.1} B/tr\n  bulk-VWPATCH   {:.1} B/tr\n  RATIO vw/patch = {:.4}x  ({})",
+        pa_total as f64 / nf,
+        vw_total as f64 / nf,
+        vw_total as f64 / pa_total as f64,
+        if vw_total < pa_total { "vwpatch SMALLER" } else { "vwpatch LARGER" },
+    );
 }
