@@ -789,86 +789,103 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 
     /// Sequential VWPATCH-trie union. Always serial; the parallel
-    /// dispatch lives in [`Self::par_union`] which calls back into
-    /// `union` once budget is exhausted.
+    /// dispatch lives in [`Self::par_union`] which (post-correctness)
+    /// delegates here.
+    ///
+    /// Variable-width spans mean two independently-built tries can
+    /// branch at the same tree position over *different* windows
+    /// (`this` spans `[16,24)`, `other` `[16,20)`), and child keys are
+    /// 16-bit span fingerprints, not raw bytes. So union cannot reuse
+    /// the inherited single-byte `with_start`/`modify_child` merge; it
+    /// instead reuses the dense-insert machinery:
+    ///   * compressed-path divergence → [`Self::split_two`] (O(1));
+    ///   * span misalignment → [`Self::narrow_span`] reconciles the
+    ///     wider window to the narrower boundary (re-partitioning,
+    ///     recomputing each child's fingerprint) and re-enters;
+    ///   * an opaque subtree installs via [`Self::insert_subtree`],
+    ///     the same recurse / add / narrow-on-overflow path the dense
+    ///     insert uses for a single leaf.
     pub(crate) fn union(mut this: Self, mut other: Self, at_depth: usize) -> Self {
         if this.hash() == other.hash() {
             return this;
         }
 
-        if let Some((depth, this_byte_key, other_byte_key)) =
-            this.first_divergence(&other, at_depth)
-        {
-            let old_key = this.key();
-            let new_body = Branch::new(
-                depth,
-                this.with_key(fingerprint16(&[this_byte_key])),
-                other.with_key(fingerprint16(&[other_byte_key])),
-            );
-
-            return Head::new(old_key, new_body);
+        if let Some((start, _, _)) = this.first_divergence(&other, at_depth) {
+            // Compressed-path divergence: the two heads' representatives
+            // disagree before either branches — wrap both under a fresh dense
+            // parent at the divergence point, preserving each subtree intact.
+            return Self::split_two(this, other, start);
         }
 
-        let this_depth = this.end_depth();
-        let other_depth = other.end_depth();
-        if this_depth < other_depth {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = other.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
-            });
-            drop(ed);
+        // No compressed-path divergence: both heads share their tree-bytes up
+        // to `min(span_start)`. Orient so `this` branches no later than `other`
+        // (smaller `span_start`); union is commutative, so the swap is free.
+        if other.end_depth() < this.end_depth() {
+            std::mem::swap(&mut this, &mut other);
+        }
+
+        let (s, te) = match this.body_ref() {
+            BodyRef::Branch(b) => (b.span_start as usize, b.span_end as usize),
+            // A leaf has the maximal `end_depth` (`KEY_LEN`), so after the swap
+            // `this` is the earlier-branching side and can only be a leaf when
+            // `other` is one too — two equal-key leaves are hash-equal and two
+            // differing leaves diverge, both handled above.
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                unreachable!("equal-key leaves are hash-equal; leaf cannot be the earlier side")
+            }
+        };
+        let os = other.end_depth();
+
+        // Span reconciliation. `this` branches at `s` over the window `[s, te)`;
+        // `other` branches at `os >= s`. If `this`'s window overruns `other`'s
+        // branch point the two are misaligned: narrow the offending window to
+        // the narrower boundary and re-enter. A wider-window fingerprint is NOT
+        // a prefix of a narrower one, so `narrow_span` re-partitions
+        // (recomputing every child's fingerprint) rather than truncating.
+        if te > os {
+            if os > s {
+                // `this` branches strictly earlier but its window reaches past
+                // `other`'s branch point: clip `this` to end at `os`.
+                this = Self::narrow_span(this, os);
+                return Self::union(this, other, at_depth);
+            }
+            // `os == s`: same branch depth, differing windows. Reconcile both to
+            // the narrower span_end, then merge the now equal-span children.
+            let oe = match other.body_ref() {
+                BodyRef::Branch(b) => b.span_end as usize,
+                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                    unreachable!("os == s < KEY_LEN ⇒ other is a branch")
+                }
+            };
+            let target = te.min(oe);
+            if te > target {
+                this = Self::narrow_span(this, target);
+                return Self::union(this, other, at_depth);
+            }
+            if oe > target {
+                other = Self::narrow_span(other, target);
+                return Self::union(this, other, at_depth);
+            }
+            // `te == oe == target`: equal spans. Drain `other`'s children and
+            // install each into `this` via the shared dense path. Each child of
+            // a node spanning `[s, te)` branches at `>= te`, so it stays opaque
+            // even if an `insert_subtree` narrows `this`'s window further.
+            let children: Vec<Self> = match other.body_mut() {
+                BodyMut::Branch(ob) => {
+                    ob.child_table.iter_mut().filter_map(Option::take).collect()
+                }
+                BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => unreachable!(),
+            };
+            drop(other);
+            for child in children {
+                this = Self::insert_subtree(this, child);
+            }
             return this;
         }
 
-        if other_depth < this_depth {
-            let old_key = this.key();
-            let this_head = this;
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut other);
-            let inserted = this_head.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, other_depth)),
-                None => Some(inserted),
-            });
-            drop(ed);
-            return other.with_key(old_key);
-        }
-
-        // Equal depth, hashes differ → walk `other`'s children,
-        // resolving collisions via recursive `Head::union` and the
-        // `modify_child`'s per-call accounting.
-        //
-        // Union is commutative; mutating either side in place is
-        // semantically equivalent. Swap when `other`'s child_table
-        // is at least 2× larger than `this`'s — start with the
-        // bigger capacity so cuckoo grows are mostly avoided during
-        // insert. Branch tags encode `log2(child_table_size)`, so
-        // the 2× ratio reduces to `other_tag > this_tag` (no body
-        // deref needed; the tag bits live in the head's pointer).
-        if other.tag() > this.tag() {
-            std::mem::swap(&mut this, &mut other);
-        }
-        let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
-            unreachable!();
-        };
-        let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-        for other_child in other_branch_ref
-            .child_table
-            .iter_mut()
-            .filter_map(Option::take)
-        {
-            let inserted = other_child.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::union(old, inserted, this_depth)),
-                None => Some(inserted),
-            });
-        }
-        drop(ed);
-        this
+        // `te <= os`: `other` sits opaquely within `this`'s span window. Install
+        // it exactly as the dense insert installs a single leaf.
+        Self::insert_subtree(this, other)
     }
 
     /// Parallel-aware top-level union entry. Allocates a fresh
@@ -895,160 +912,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// they don't generate fan-out work for the budget to spend.
     #[cfg(feature = "parallel")]
     pub(crate) fn par_union_with_ctx(
-        mut this: Self,
-        mut other: Self,
+        this: Self,
+        other: Self,
         at_depth: usize,
-        ctx: &parallel_union::ParUnionCtx,
+        _ctx: &parallel_union::ParUnionCtx,
     ) -> Self
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if this.hash() == other.hash() {
-            return this;
-        }
-
-        if let Some((depth, this_byte_key, other_byte_key)) =
-            this.first_divergence(&other, at_depth)
-        {
-            let old_key = this.key();
-            let new_body = Branch::new(
-                depth,
-                this.with_key(fingerprint16(&[this_byte_key])),
-                other.with_key(fingerprint16(&[other_byte_key])),
-            );
-            return Head::new(old_key, new_body);
-        }
-
-        let this_depth = this.end_depth();
-        let other_depth = other.end_depth();
-        if this_depth != other_depth {
-            // Asymmetric — no fan-out opportunity, serial path wins.
-            return Self::union(this, other, at_depth);
-        }
-
-        // Equal depth, hashes differ → branch merge. Swap when
-        // `other`'s child_table is ≥2× `this`'s so the in-place
-        // target starts with the bigger capacity (fewer cuckoo
-        // grows when scattering children back via
-        // `install_child_growing`). Branch tags encode
-        // `log2(child_table_size)`, so the 2× ratio reduces to
-        // `other_tag > this_tag` — single byte compare from the
-        // head pointer, no body deref / CoW risk.
-        if other.tag() > this.tag() {
-            std::mem::swap(&mut this, &mut other);
-        }
-
-        // Threshold check via `body_ref` (no CoW); fall back to
-        // serial when the source side is too small to amortise the
-        // scatter machinery.
-        let small = match other.body_ref() {
-            BodyRef::Branch(b) => (b.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD,
-            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => unreachable!(),
-        };
-        if small {
-            return Self::union(this, other, at_depth);
-        }
-
-        let BodyMut::Branch(other_branch_ref) = other.body_mut() else {
-            unreachable!();
-        };
-
-        {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let span_start = ed.span_start as usize;
-
-            // Scatter both child tables into key-indexed 256-slot
-            // arrays + present bitsets. The bitset partition tells us
-            // which keys need a recursive union ("both") vs which are
-            // simple pass-throughs ("only").
-            let mut this_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let mut other_arr: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let mut this_present = crate::vwpatch::bytetable::ByteSet::new_empty();
-            let mut other_present = crate::vwpatch::bytetable::ByteSet::new_empty();
-
-            for slot in ed.child_table.iter_mut() {
-                if let Some(head) = slot.take() {
-                    let key = head.key();
-                    // Branch keys are still single-byte (0..=255), so they
-                    // index the 256-slot scatter arrays / `ByteSet` directly.
-                    this_present.insert(key as u8);
-                    this_arr[key as usize] = Some(head);
-                }
-            }
-            for slot in other_branch_ref.child_table.iter_mut() {
-                if let Some(head) = slot.take() {
-                    let head = head.with_start(span_start);
-                    let key = head.key();
-                    other_present.insert(key as u8);
-                    other_arr[key as usize] = Some(head);
-                }
-            }
-
-            let mut both = this_present.intersect(&other_present);
-            let mut only = this_present.symmetric_difference(&other_present);
-
-            // Pre-allocated scatter-write target. Each spawned task
-            // writes to `resolved[k]` for its specific key byte —
-            // disjoint by construction. The raw pointer wrapper
-            // (`ScatterPtr`) makes the cross-thread sharing explicit.
-            let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-            let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
-
-            rayon::scope(|s| {
-                // Drain `both` pairs serially in the parent; per
-                // pair, either claim a spawn unit and dispatch as a
-                // task, or run serially via `Head::union` here on
-                // the parent thread. The atomic budget is shared
-                // with all nested `par_union_with_ctx` calls.
-                while let Some(k) = both.drain_next_ascending() {
-                    let i = k as usize;
-                    let t = this_arr[i].take().expect("both ⇒ this");
-                    let o = other_arr[i].take().expect("both ⇒ other");
-                    if ctx.try_claim() {
-                        s.spawn(move |_| {
-                            let head = Self::par_union_with_ctx(t, o, this_depth, ctx);
-                            // SAFETY: each task has a distinct
-                            // key `k`, so the writes to
-                            // `resolved[i]` are non-aliasing.
-                            unsafe {
-                                resolved_ptr.write_at(i, Some(head));
-                            }
-                        });
-                    } else {
-                        // Budget exhausted — fall back to fully
-                        // serial union on this pair, then scatter
-                        // the result. SAFETY: same disjointness
-                        // invariant; the parent thread races only
-                        // with tasks targeting distinct keys.
-                        let head = Self::union(t, o, this_depth);
-                        unsafe {
-                            resolved_ptr.write_at(i, Some(head));
-                        }
-                    }
-                }
-            });
-            // After scope: all spawned tasks have completed; the
-            // scatter writes to `resolved` are all sequenced-before
-            // here by rayon's join semantics.
-
-            for slot in resolved.iter_mut() {
-                if let Some(head) = slot.take() {
-                    ed.install_child_growing(head);
-                }
-            }
-            while let Some(k) = only.drain_next_ascending() {
-                let i = k as usize;
-                let head = this_arr[i]
-                    .take()
-                    .or_else(|| other_arr[i].take())
-                    .expect("only ⇒ exactly one side");
-                ed.install_child_growing(head);
-            }
-
-            ed.recompute_aggregates();
-        }
-        this
+        // TODO: re-parallelise post-correctness. The previous fan-out path
+        // scattered child tables into 256-slot byte-indexed arrays, which is
+        // invalid for variable-width spans — children are keyed by 16-bit span
+        // fingerprints, not raw bytes, and two equal-depth branches may carry
+        // *different* span windows. The span-reconciling merge lives in
+        // `Self::union`; delegate to it for correctness. Reintroducing
+        // parallelism requires a fingerprint-aware scatter (and a parallel
+        // analogue of `narrow_span` for misaligned windows).
+        Self::union(this, other, at_depth)
     }
 
     /// Parallel-aware top-level intersect entry. Allocates a fresh
@@ -1974,6 +1855,129 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                     return Self::narrow_with(this, leftover, s, e);
                 }
                 this
+            }
+        }
+    }
+
+    /// Install the opaque subtree `unit` into the dense branch `this`, where
+    /// `unit.end_depth() >= this.span_end` (so `unit` is a leaf-positioned,
+    /// opaque child of `this`). This is [`Self::insert_dense`]'s branch arm
+    /// generalised from "a fresh leaf" to "any subtree": descend into the
+    /// matching child (resolving the collision via [`Self::union`]), else add a
+    /// new child, else narrow on overflow. A leaf is just the degenerate
+    /// subtree, so the dense single-leaf insert is the `unit = leaf` case.
+    fn insert_subtree(mut this: Self, unit: Self) -> Self {
+        let (s, e) = match this.body_ref() {
+            BodyRef::Branch(b) => (b.span_start as usize, b.span_end as usize),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                unreachable!("insert_subtree requires a Branch node")
+            }
+        };
+
+        let mut buf = [0u8; KEY_LEN];
+        let sub = Self::span_sub(unit.childleaf_key(), s, e, &mut buf);
+        let fp = fingerprint16(sub);
+
+        // Single verified lookup: descend into the matching child if it exists,
+        // otherwise fall through to the add/overflow path. `unit` is threaded
+        // through an `Option` so it is only consumed on a hit; on a miss it is
+        // handed back for the add path.
+        let mut unit_opt = Some(unit);
+        let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
+        if ed.recurse_dense_child(fp, sub, |child| {
+            Self::union(child, unit_opt.take().unwrap(), e)
+        }) {
+            drop(ed);
+            return this;
+        }
+        let unit = unit_opt.take().unwrap();
+
+        let over_cap = ed.child_table.len() >= 256
+            && ed.child_table.iter().flatten().count() >= Self::max_fanout(e - s);
+        if over_cap {
+            drop(ed);
+            return Self::narrow_with(this, unit, s, e);
+        }
+
+        let inserted = unit.with_span(s, e);
+        let leftover = ed.add_dense_child(inserted);
+        drop(ed);
+        if let Some(leftover) = leftover {
+            return Self::narrow_with(this, leftover, s, e);
+        }
+        this
+    }
+
+    /// Re-partition the dense branch `this` so its *top* branching window ends
+    /// no later than `e_prime` (`span_start < e_prime <= this.span_end`), used
+    /// by union's span reconciliation to align a wide window onto a narrower
+    /// neighbour's boundary.
+    ///
+    /// Unlike [`Self::narrow_with`] / [`Self::build_dense_node`], the top window
+    /// is capped at `e_prime` while the children's *internal* re-grouping is
+    /// allowed to span up to `this`'s original `span_end` (`te`). That split is
+    /// essential: two of `this`'s children can share the narrowed window
+    /// `[s, e_prime)` yet diverge in `[e_prime, te)`. They must be re-parented
+    /// under a fresh intermediate node spanning into `[e_prime, te)`; capping
+    /// every sub-span at `e_prime` (the bug a naive `build_dense_node(_, s,
+    /// e_prime)` hits) leaves them inseparable and recurses forever on an empty
+    /// window. A wider-window fingerprint is not a prefix of a narrower one, so
+    /// every child's fingerprint is recomputed over its new window.
+    fn narrow_span(this: Self, e_prime: usize) -> Self {
+        let (s, te, units): (usize, usize, Vec<Self>) = match this.body_ref() {
+            BodyRef::Branch(b) => (
+                b.span_start as usize,
+                b.span_end as usize,
+                b.child_table.iter().flatten().cloned().collect(),
+            ),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                unreachable!("narrow_span requires a Branch node")
+            }
+        };
+        drop(this);
+
+        // `units` (this's children) first diverge at `s`, so the top window
+        // starts at `s`. Pick the widest top window `<= e_prime` that places;
+        // sub-groups recurse with `max_end = te` so deeper divergence stays
+        // separable. A single-byte top window always places, so this loop
+        // terminates.
+        let mut end = Self::widest_dense_span(&units, s, e_prime);
+        loop {
+            let span_len = end - s;
+            let mut keyed: Vec<([u8; KEY_LEN], usize)> = Vec::with_capacity(units.len());
+            let mut buf = [0u8; KEY_LEN];
+            for (i, u) in units.iter().enumerate() {
+                let sub = Self::span_sub(u.childleaf_key(), s, end, &mut buf);
+                let mut sk = [0u8; KEY_LEN];
+                sk[..span_len].copy_from_slice(sub);
+                keyed.push((sk, i));
+            }
+            keyed.sort_unstable_by(|a, b| a.0[..span_len].cmp(&b.0[..span_len]));
+            let mut children: Vec<Self> = Vec::new();
+            let mut run_start = 0;
+            while run_start < keyed.len() {
+                let mut run_end = run_start + 1;
+                while run_end < keyed.len()
+                    && keyed[run_end].0[..span_len] == keyed[run_start].0[..span_len]
+                {
+                    run_end += 1;
+                }
+                let members: Vec<Self> =
+                    keyed[run_start..run_end].iter().map(|&(_, i)| units[i].clone()).collect();
+                // Sub-groups may span up to `te` (the original span_end), then
+                // re-key into the top window `[s, end)`.
+                children.push(Self::build_dense_node(members, end, te).with_span(s, end));
+                run_start = run_end;
+            }
+            match Branch::from_children_dense(s, end, children) {
+                Some(nn) => return Head::new(0, nn),
+                None => {
+                    assert!(
+                        end > s + 1,
+                        "single-byte top window [{s},{end}) failed to place in narrow_span"
+                    );
+                    end -= 1;
+                }
             }
         }
     }
