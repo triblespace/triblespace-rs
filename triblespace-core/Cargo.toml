@@ -120,3 +120,8 @@ default-unwind = "1"
 
 ## Removed workspace.metadata to allow this crate to be used as a path dependency
 ## inside the surrounding workspace without creating nested workspace roots.
+
+[[bench]]
+name = "vwpatch_readsweep"
+harness = false
+required-features = ["vwpatch"]
