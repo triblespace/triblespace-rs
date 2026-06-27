@@ -92,6 +92,11 @@ name = "vwpatch"
 harness = false
 required-features = ["vwpatch"]
 
+[[bench]]
+name = "vwpatch_setops"
+harness = false
+required-features = ["vwpatch", "parallel"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 

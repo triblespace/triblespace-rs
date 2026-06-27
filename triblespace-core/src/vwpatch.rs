@@ -48,40 +48,42 @@ compile_error!("VWPATCH tagged pointers require 64-bit targets");
 pub(crate) use crate::patch::SIP_KEY;
 static INIT: Once = Once::new();
 
-/// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
-/// scatter + bitset + rayon::scope-spawn path on the equal-depth-
-/// branch arm. Below this, the per-key `modify_child` loop wins
-/// because asymmetric merges only touch a handful of slots.
+/// Minimum combined `leaf_count` (`this + other`) at which the parallel set ops
+/// take the partition + `rayon::scope`-spawn fan-out path on the equal-depth,
+/// equal-span branch arm. Below this the serial span-reconciling descent wins
+/// because the per-spawn overhead isn't amortised.
 #[cfg(feature = "parallel")]
-#[allow(dead_code)] // retained for the post-correctness parallel scatter (see parallel_union)
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 
-/// Parallel-aware VWPATCH union, with a shared work-stealing budget
-/// carried across the entire recursive descent.
+/// Parallel-aware VWPATCH set ops (union/intersect/difference), with a shared
+/// work-stealing budget carried across the entire recursive descent.
 ///
-/// Two-phase model per parallel call:
-///   1. Spawn phase (collect sequentially, dispatch per child):
-///      drain "both" pairs, for each: claim 1 unit from the
-///      shared budget — if successful, spawn the child union as
-///      a `rayon::scope` task; if budget is exhausted, run the
-///      child serially via `Head::union`.
-///   2. Install phase (purely serial): scatter-collected resolved
-///      heads + single-side pass-throughs land in the parent
-///      branch, then `recompute_aggregates` rebuilds the
-///      hash/leaf_count/segment_count/childleaf in one pass.
+/// The cheap base cases (hash-equal short-circuit, compressed-path divergence,
+/// span reconciliation via `narrow_span`) stay serial and identical to the
+/// serial op — they don't fan out. The fan-out happens at the equal-depth,
+/// equal-span branch arm, per call:
+///   1. Partition both child sets by their actual span sub-key over `[s, te)`
+///      (NOT the 16-bit fingerprint, which collides) into "both" pairs and
+///      single-side "only" children.
+///   2. Fan out: for each "both" pair, claim one unit from the shared budget —
+///      if successful, `rayon::scope`-spawn the recursive op, writing the
+///      result into a disjoint `ScatterPtr` slot; if the budget is exhausted,
+///      run that pair inline (serial) on the current thread.
+///   3. Re-assemble the resolved "both" outputs + the op's kept "only" children
+///      (union: both∪ + only-this + only-other; intersect: both∩ only;
+///      difference: diff-of-both + only-this) with `build_dense_node`, which
+///      handles overflow-narrow and is order-independent.
 ///
-/// The budget is a single shared atomic — `num_threads²` total
-/// spawns across the entire descent, after which everything is
-/// sequential. This caps overhead without restricting the depth
-/// at which parallelism is reached: a heavy subtree near the
-/// root claims many units; a balanced descent spreads them.
+/// The budget is a single shared atomic — `num_threads³` total spawns across
+/// the entire descent, after which everything is sequential. This caps task
+/// explosion while permitting fan-out a couple of levels deep, which keeps even
+/// the imbalanced intersect workload near-linear (a single root level of
+/// `num_threads²` fan-out leaves intersect's heavy buckets stuck serial).
 #[cfg(feature = "parallel")]
 mod parallel_union {
-    // The byte-indexed scatter scaffolding (`ScatterPtr`, the spawn-budget
-    // `ParUnionCtx`) is retained for the post-correctness re-parallelisation of
-    // union/intersect/difference (all three currently delegate to the serial,
-    // span-reconciling paths). Allow the temporarily-unused pieces.
-    #![allow(dead_code)]
+    // The shared spawn-budget (`ParUnionCtx`) and the cross-thread disjoint
+    // scatter wrapper (`ScatterPtr`) backing the equal-span fan-out in
+    // `par_{union,intersect,difference}_with_ctx`.
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     /// Carries the shared spawn budget across recursive
@@ -92,9 +94,18 @@ mod parallel_union {
 
     impl ParUnionCtx {
         pub(crate) fn new() -> Self {
+            // `num_threads³` shared spawns across the whole descent. A single
+            // level of root fan-out (`num_threads²`, ~one chunk per thread×thread)
+            // suffices only when the per-child subtrees are balanced — true for
+            // union/difference, but NOT for intersect, whose work concentrates in
+            // a few heavy buckets. Allowing fan-out to continue a level or two
+            // deeper (the cubic budget) lets those heavy subtrees split too, so
+            // all three ops scale near-linearly (~11× on 16 threads at 10M).
+            // Still bounded ⇒ task explosion is capped; below the budget the rest
+            // runs serial.
             let n = rayon::current_num_threads();
             Self {
-                budget: AtomicUsize::new(n.saturating_mul(n).max(2)),
+                budget: AtomicUsize::new(n.saturating_mul(n).saturating_mul(n).max(2)),
             }
         }
 
@@ -941,24 +952,178 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// they don't generate fan-out work for the budget to spend.
     #[cfg(feature = "parallel")]
     pub(crate) fn par_union_with_ctx(
-        this: Self,
-        other: Self,
+        mut this: Self,
+        mut other: Self,
         at_depth: usize,
-        _ctx: &parallel_union::ParUnionCtx,
+        ctx: &parallel_union::ParUnionCtx,
     ) -> Self
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        // TODO: re-parallelise post-correctness. The previous fan-out path
-        // scattered child tables into 256-slot byte-indexed arrays, which is
-        // invalid for variable-width spans — children are keyed by 16-bit span
-        // fingerprints, not raw bytes, and two equal-depth branches may carry
-        // *different* span windows. The span-reconciling merge lives in
-        // `Self::union`; delegate to it for correctness. Reintroducing
-        // parallelism requires a fingerprint-aware scatter (and a parallel
-        // analogue of `narrow_span` for misaligned windows).
-        Self::union(this, other, at_depth)
+        // Cheap base cases — identical to `Self::union`, no fan-out. Hash-equal
+        // short-circuit and compressed-path divergence don't generate child work.
+        if this.hash() == other.hash() {
+            return this;
+        }
+        if let Some((start, _, _)) = this.first_divergence(&other, at_depth) {
+            return Self::split_two(this, other, start);
+        }
+        if other.end_depth() < this.end_depth() {
+            std::mem::swap(&mut this, &mut other);
+        }
+        let (s, te) = match this.body_ref() {
+            BodyRef::Branch(b) => (b.span_start as usize, b.span_end as usize),
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                unreachable!("equal-key leaves are hash-equal; leaf cannot be the earlier side")
+            }
+        };
+        let os = other.end_depth();
+        if te > os {
+            // Span reconciliation (no fan-out): narrow the wider window onto the
+            // narrower boundary and re-enter, staying on the parallel path.
+            if os > s {
+                this = Self::narrow_span(this, os);
+                return Self::par_union_with_ctx(this, other, at_depth, ctx);
+            }
+            let oe = match other.body_ref() {
+                BodyRef::Branch(b) => b.span_end as usize,
+                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                    unreachable!("os == s < KEY_LEN ⇒ other is a branch")
+                }
+            };
+            let target = te.min(oe);
+            if te > target {
+                this = Self::narrow_span(this, target);
+                return Self::par_union_with_ctx(this, other, at_depth, ctx);
+            }
+            if oe > target {
+                other = Self::narrow_span(other, target);
+                return Self::par_union_with_ctx(this, other, at_depth, ctx);
+            }
+
+            // EQUAL DEPTH, EQUAL SPAN `[s, te)`. Below the threshold the
+            // per-child spawn overhead isn't amortised — delegate to serial.
+            if this.count() + other.count() < PARALLEL_PATCH_UNION_THRESHOLD as u64 {
+                return Self::union(this, other, at_depth);
+            }
+
+            // Drain both child sets and partition by their actual span sub-key
+            // over `[s, te)` (NOT the 16-bit fingerprint, which collides).
+            let this_children: Vec<Self> = match this.body_mut() {
+                BodyMut::Branch(b) => b.child_table.iter_mut().filter_map(Option::take).collect(),
+                BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => unreachable!(),
+            };
+            let other_children: Vec<Self> = match other.body_mut() {
+                BodyMut::Branch(b) => b.child_table.iter_mut().filter_map(Option::take).collect(),
+                BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => unreachable!(),
+            };
+            drop(this);
+            drop(other);
+            let (both, only_this, only_other) =
+                Self::partition_by_span(this_children, other_children, s, te);
+
+            // Fan out: each "both" pair recurses concurrently (under budget),
+            // writing its resolved subtree into a disjoint output slot.
+            let resolved = Self::par_resolve_pairs(both, ctx, move |t, o, ctx| {
+                Some(Self::par_union_with_ctx(t, o, te, ctx))
+            });
+
+            // Union = both∪ + only-this + only-other. Re-assemble with the dense
+            // machinery (handles overflow-narrow); order-independent (it groups
+            // by span sub-key), so collection order doesn't affect the result.
+            let mut units: Vec<Self> = Vec::with_capacity(resolved.len() + only_this.len() + only_other.len());
+            units.extend(resolved.into_iter().flatten());
+            units.extend(only_this);
+            units.extend(only_other);
+            return Self::build_dense_node(units, s, te);
+        }
+
+        // `te <= os`: `other` sits opaquely within `this`'s span (asymmetric, at
+        // most one matching child — no fan-out). Install via the dense path.
+        Self::insert_subtree(this, other)
+    }
+
+    /// Partition two equal-span child sets by their actual span sub-key over
+    /// `[s, e)` into `(both, only_this, only_other)`. Matching is on the real
+    /// span bytes (via [`Self::span_subkey`]), never the 16-bit fingerprint,
+    /// which collides. Within one branch node children have pairwise-distinct
+    /// sub-keys, so the map keys never collide. Fanout `<= 256`, so this is cheap.
+    #[cfg(feature = "parallel")]
+    fn partition_by_span(
+        this_children: Vec<Self>,
+        other_children: Vec<Self>,
+        s: usize,
+        e: usize,
+    ) -> (Vec<(Self, Self)>, Vec<Self>, Vec<Self>) {
+        use std::collections::HashMap;
+        let mut map: HashMap<Vec<u8>, Self> = HashMap::with_capacity(this_children.len());
+        for c in this_children {
+            let key = Self::span_subkey(&c, s, e);
+            map.insert(key, c);
+        }
+        let mut both: Vec<(Self, Self)> = Vec::new();
+        let mut only_other: Vec<Self> = Vec::new();
+        for c in other_children {
+            let key = Self::span_subkey(&c, s, e);
+            if let Some(t) = map.remove(&key) {
+                both.push((t, c));
+            } else {
+                only_other.push(c);
+            }
+        }
+        let only_this: Vec<Self> = map.into_values().collect();
+        (both, only_this, only_other)
+    }
+
+    /// Tree-ordered span sub-key of `child`'s representative over `[s, e)`.
+    #[cfg(feature = "parallel")]
+    fn span_subkey(child: &Self, s: usize, e: usize) -> Vec<u8> {
+        let key = child.childleaf_key();
+        (s..e).map(|j| key[O::TREE_TO_KEY[j]]).collect()
+    }
+
+    /// Resolve each "both" pair concurrently under the shared spawn budget,
+    /// scattering results into disjoint output slots. Each task `i` owns a
+    /// distinct index, so the `ScatterPtr` writes are non-aliasing. A pair that
+    /// fails to claim a budget unit runs serially on the current thread (the
+    /// recursive callee will itself find the budget exhausted and stay serial).
+    #[cfg(feature = "parallel")]
+    fn par_resolve_pairs<F>(
+        both: Vec<(Self, Self)>,
+        ctx: &parallel_union::ParUnionCtx,
+        resolve: F,
+    ) -> Vec<Option<Self>>
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+        F: Fn(Self, Self, &parallel_union::ParUnionCtx) -> Option<Self> + Send + Sync,
+    {
+        let n = both.len();
+        let mut resolved: Vec<Option<Self>> = (0..n).map(|_| None).collect();
+        let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
+        let resolve = &resolve;
+        rayon::scope(|sc| {
+            for (i, (t, o)) in both.into_iter().enumerate() {
+                if ctx.try_claim() {
+                    sc.spawn(move |_| {
+                        let r = resolve(t, o, ctx);
+                        // SAFETY: index `i` is unique to this task ⇒ disjoint write.
+                        unsafe {
+                            resolved_ptr.write_at(i, r);
+                        }
+                    });
+                } else {
+                    let r = resolve(t, o, ctx);
+                    // SAFETY: same disjointness invariant; the parent races only
+                    // with tasks targeting distinct indices.
+                    unsafe {
+                        resolved_ptr.write_at(i, r);
+                    }
+                }
+            }
+        });
+        resolved
     }
 
     /// Parallel-aware top-level intersect entry. Allocates a fresh
@@ -988,21 +1153,91 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         &self,
         other: &Self,
         at_depth: usize,
-        _ctx: &parallel_union::ParUnionCtx,
+        ctx: &parallel_union::ParUnionCtx,
     ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        // TODO: re-parallelise post-correctness. The previous fan-out path
-        // scattered child tables into 256-slot byte-indexed arrays, which is
-        // invalid for variable-width spans — children are keyed by 16-bit span
-        // fingerprints, not raw bytes, and two equal-depth branches may carry
-        // *different* span windows. The span-reconciling intersect lives in
-        // `Self::intersect`; delegate to it for correctness. Reintroducing
-        // parallelism requires a fingerprint-aware scatter (and a parallel
-        // analogue of `narrow_span` for misaligned windows).
-        self.intersect(other, at_depth)
+        // Cheap base cases — identical to `Self::intersect`, no fan-out.
+        if self.hash() == other.hash() {
+            return Some(self.clone());
+        }
+        if self.first_divergence(other, at_depth).is_some() {
+            return None;
+        }
+
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth < other_depth {
+            let BodyRef::Branch(branch) = self.body_ref() else {
+                unreachable!();
+            };
+            let te = branch.span_end as usize;
+            if te > other_depth {
+                let narrowed = Self::narrow_span(self.clone(), other_depth);
+                return narrowed.par_intersect_with_ctx(other, at_depth, ctx);
+            }
+            return branch
+                .select_child(other.childleaf_key())
+                .and_then(|self_child| self_child.par_intersect_with_ctx(other, self_depth, ctx));
+        }
+
+        if other_depth < self_depth {
+            let BodyRef::Branch(other_branch) = other.body_ref() else {
+                unreachable!();
+            };
+            let oe = other_branch.span_end as usize;
+            if oe > self_depth {
+                let narrowed = Self::narrow_span(other.clone(), self_depth);
+                return self.par_intersect_with_ctx(&narrowed, at_depth, ctx);
+            }
+            return other_branch
+                .select_child(self.childleaf_key())
+                .and_then(|other_child| self.par_intersect_with_ctx(other_child, other_depth, ctx));
+        }
+
+        // Equal branch depth; reconcile windows to the narrower boundary.
+        let BodyRef::Branch(self_branch) = self.body_ref() else {
+            unreachable!();
+        };
+        let BodyRef::Branch(other_branch) = other.body_ref() else {
+            unreachable!();
+        };
+        let s = self_branch.span_start as usize;
+        let te = self_branch.span_end as usize;
+        let oe = other_branch.span_end as usize;
+        let target = te.min(oe);
+        if te > target {
+            let narrowed = Self::narrow_span(self.clone(), target);
+            return narrowed.par_intersect_with_ctx(other, at_depth, ctx);
+        }
+        if oe > target {
+            let narrowed = Self::narrow_span(other.clone(), target);
+            return self.par_intersect_with_ctx(&narrowed, at_depth, ctx);
+        }
+
+        // EQUAL DEPTH, EQUAL SPAN `[s, te)`. Below threshold → serial.
+        if self.count() + other.count() < PARALLEL_PATCH_UNION_THRESHOLD as u64 {
+            return self.intersect(other, at_depth);
+        }
+
+        let this_children: Vec<Self> =
+            self_branch.child_table.iter().flatten().cloned().collect();
+        let other_children: Vec<Self> =
+            other_branch.child_table.iter().flatten().cloned().collect();
+        let (both, _only_this, _only_other) =
+            Self::partition_by_span(this_children, other_children, s, te);
+
+        // Intersect = both∩ only; drop singletons. Fan out the matched pairs.
+        let resolved = Self::par_resolve_pairs(both, ctx, move |t, o, ctx| {
+            t.par_intersect_with_ctx(&o, self_depth, ctx)
+        });
+        let units: Vec<Self> = resolved.into_iter().flatten().collect();
+        if units.is_empty() {
+            return None;
+        }
+        Some(Self::build_dense_node(units, self_depth, te))
     }
 
     /// Parallel-aware top-level difference entry. Allocates a fresh
@@ -1027,17 +1262,113 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         &self,
         other: &Self,
         at_depth: usize,
-        _ctx: &parallel_union::ParUnionCtx,
+        ctx: &parallel_union::ParUnionCtx,
     ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        // TODO: re-parallelise post-correctness. See `par_intersect_with_ctx`:
-        // the byte-indexed scatter is invalid for variable-width spans. The
-        // span-reconciling difference lives in `Self::difference`; delegate to
-        // it for correctness.
-        self.difference(other, at_depth)
+        // Cheap base cases — identical to `Self::difference`, no fan-out.
+        if self.hash() == other.hash() {
+            return None;
+        }
+        if self.first_divergence(other, at_depth).is_some() {
+            return Some(self.clone());
+        }
+
+        let self_depth = self.end_depth();
+        let other_depth = other.end_depth();
+        if self_depth < other_depth {
+            let BodyRef::Branch(branch) = self.body_ref() else {
+                unreachable!();
+            };
+            let (s, te) = (branch.span_start as usize, branch.span_end as usize);
+            if te > other_depth {
+                let narrowed = Self::narrow_span(self.clone(), other_depth);
+                return narrowed.par_difference_with_ctx(other, at_depth, ctx);
+            }
+            // `te <= other_depth`: `other` opaque within `self`'s window. Only the
+            // matching child loses keys; the rest survive whole. No fan-out (one
+            // match), but recurse on the parallel path.
+            let mut buf = [0u8; KEY_LEN];
+            let sub = Self::span_sub(other.childleaf_key(), s, te, &mut buf);
+            let mut units: Vec<Self> = Vec::new();
+            for child in branch.child_table.iter().flatten() {
+                let ck = child.childleaf_key();
+                let is_match = (0..(te - s)).all(|j| ck[O::TREE_TO_KEY[s + j]] == sub[j]);
+                if is_match {
+                    if let Some(diffed) = child.par_difference_with_ctx(other, te, ctx) {
+                        units.push(diffed);
+                    }
+                } else {
+                    units.push(child.clone());
+                }
+            }
+            if units.is_empty() {
+                return None;
+            }
+            return Some(Self::build_dense_node(units, s, te));
+        }
+
+        if other_depth < self_depth {
+            let BodyRef::Branch(other_branch) = other.body_ref() else {
+                unreachable!();
+            };
+            let oe = other_branch.span_end as usize;
+            if oe > self_depth {
+                let narrowed = Self::narrow_span(other.clone(), self_depth);
+                return self.par_difference_with_ctx(&narrowed, at_depth, ctx);
+            }
+            if let Some(other_child) = other_branch.select_child(self.childleaf_key()) {
+                return self.par_difference_with_ctx(other_child, at_depth, ctx);
+            } else {
+                return Some(self.clone());
+            }
+        }
+
+        // Equal branch depth; reconcile windows to the narrower boundary.
+        let BodyRef::Branch(self_branch) = self.body_ref() else {
+            unreachable!();
+        };
+        let BodyRef::Branch(other_branch) = other.body_ref() else {
+            unreachable!();
+        };
+        let s = self_branch.span_start as usize;
+        let te = self_branch.span_end as usize;
+        let oe = other_branch.span_end as usize;
+        let target = te.min(oe);
+        if te > target {
+            let narrowed = Self::narrow_span(self.clone(), target);
+            return narrowed.par_difference_with_ctx(other, at_depth, ctx);
+        }
+        if oe > target {
+            let narrowed = Self::narrow_span(other.clone(), target);
+            return self.par_difference_with_ctx(&narrowed, at_depth, ctx);
+        }
+
+        // EQUAL DEPTH, EQUAL SPAN `[s, te)`. Below threshold → serial.
+        if self.count() + other.count() < PARALLEL_PATCH_UNION_THRESHOLD as u64 {
+            return self.difference(other, at_depth);
+        }
+
+        let this_children: Vec<Self> =
+            self_branch.child_table.iter().flatten().cloned().collect();
+        let other_children: Vec<Self> =
+            other_branch.child_table.iter().flatten().cloned().collect();
+        let (both, only_this, _only_other) =
+            Self::partition_by_span(this_children, other_children, s, te);
+
+        // Difference = (recursive diff of both) + only-this; drop only-other.
+        let resolved = Self::par_resolve_pairs(both, ctx, move |t, o, ctx| {
+            t.par_difference_with_ctx(&o, self_depth, ctx)
+        });
+        let mut units: Vec<Self> = Vec::with_capacity(resolved.len() + only_this.len());
+        units.extend(resolved.into_iter().flatten());
+        units.extend(only_this);
+        if units.is_empty() {
+            return None;
+        }
+        Some(Self::build_dense_node(units, self_depth, te))
     }
 
     pub(crate) fn infixes<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
@@ -2780,6 +3111,100 @@ mod tests {
     use std::convert::TryInto;
     use std::iter::FromIterator;
     use std::mem;
+
+    /// Determinism cross-check: the parallel set ops must be a faithful drop-in
+    /// for the serial ones. Builds two overlapping medium tries (well above
+    /// `PARALLEL_PATCH_UNION_THRESHOLD`, so the fan-out path is genuinely
+    /// engaged), then asserts `par == serial` on set-hash, leaf_count, and the
+    /// full key set for union, intersect AND difference. The XOR set-hash is
+    /// set-determined, so hash equality is an exact oracle independent of node
+    /// structure.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn par_matches_serial_set_ops() {
+        use std::collections::BTreeSet;
+        type Trie = VWPATCH<64, IdentitySchema, ()>;
+
+        fn mix(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn key_at(i: u64) -> [u8; 64] {
+            let mut s = i.wrapping_mul(0x1_0000_01B3).wrapping_add(1);
+            let mut k = [0u8; 64];
+            for chunk in k.chunks_mut(8) {
+                chunk.copy_from_slice(&mix(&mut s).to_le_bytes());
+            }
+            k
+        }
+        let build = |range: std::ops::Range<u64>| {
+            let mut t = Trie::new();
+            for i in range {
+                t.insert(&Entry::new(&key_at(i)));
+            }
+            t
+        };
+        // Overlapping ranges → exercises both/only-this/only-other partitions.
+        let a = build(0..8000);
+        let b = build(5000..13000);
+
+        // The parallel fan-out path is only meaningful with >1 worker thread,
+        // and only taken above the threshold — assert both so a future change
+        // that silently disables parallelism fails this gate.
+        assert!(
+            rayon::current_num_threads() > 1,
+            "rayon must have >1 thread for the parallel gate (got {})",
+            rayon::current_num_threads()
+        );
+        assert!(a.len() >= PARALLEL_PATCH_UNION_THRESHOLD as u64);
+        assert!(b.len() >= PARALLEL_PATCH_UNION_THRESHOLD as u64);
+
+        let keys = |t: &Trie| -> BTreeSet<[u8; 64]> { t.iter_ordered().copied().collect() };
+
+        // UNION
+        {
+            let mut par = a.clone();
+            par.union(b.clone());
+            let ser_root = Head::union(a.root.clone().unwrap(), b.root.clone().unwrap(), 0);
+            let ser = Trie { root: Some(ser_root) };
+            assert_eq!(
+                par.root.as_ref().unwrap().hash(),
+                ser.root.as_ref().unwrap().hash(),
+                "union: parallel set-hash != serial"
+            );
+            assert_eq!(par.len(), ser.len(), "union: leaf_count");
+            assert_eq!(keys(&par), keys(&ser), "union: key set");
+        }
+        // INTERSECT
+        {
+            let par = a.intersect(&b);
+            let ser_root = a.root.as_ref().unwrap().intersect(b.root.as_ref().unwrap(), 0);
+            let ser = Trie { root: ser_root };
+            assert_eq!(
+                par.root.as_ref().unwrap().hash(),
+                ser.root.as_ref().unwrap().hash(),
+                "intersect: parallel set-hash != serial"
+            );
+            assert_eq!(par.len(), ser.len(), "intersect: leaf_count");
+            assert_eq!(keys(&par), keys(&ser), "intersect: key set");
+        }
+        // DIFFERENCE
+        {
+            let par = a.difference(&b);
+            let ser_root = a.root.as_ref().unwrap().difference(b.root.as_ref().unwrap(), 0);
+            let ser = Trie { root: ser_root };
+            assert_eq!(
+                par.root.as_ref().unwrap().hash(),
+                ser.root.as_ref().unwrap().hash(),
+                "difference: parallel set-hash != serial"
+            );
+            assert_eq!(par.len(), ser.len(), "difference: leaf_count");
+            assert_eq!(keys(&par), keys(&ser), "difference: key set");
+        }
+    }
 
     #[test]
     fn head_tag() {
