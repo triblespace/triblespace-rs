@@ -167,7 +167,7 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
     });
     let pa_arch_stats = pa_arch.node_stats();
 
-    // --- archive VWPATCH ---
+    // --- archive VWPATCH (INCREMENTAL insert, narrow-on-partial-data spans) ---
     let (vw_arch_bytes, vw_arch) = measure(|| {
         let mut t = VWPATCH::<TRIBLE_LEN, O, ()>::new();
         for i in 0..n {
@@ -178,6 +178,18 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
     });
     let vw_arch_stats = vw_arch.node_stats();
 
+    // --- archive VWPATCH (OPTIMAL SORTED BULK build, widest dense spans) ---
+    // Every key in hand at once ⇒ `build_dense_node_owned` picks each span at
+    // its widest valid width (segment-checkpoint + max_fanout capped), reaching
+    // the bulk-optimal node count — vs the incremental build above, which
+    // narrows spans on partial data and over-splits.
+    let vw_bulk_owner: Arc<dyn VwOwner> = Arc::new(Keep);
+    let (vw_bulk_bytes, vw_bulk) = measure(|| {
+        let entries = (0..n).map(|i| unsafe { VwArchiveEntry::new(arch.ptr(i), &vw_bulk_owner) });
+        VWPATCH::<TRIBLE_LEN, O, ()>::from_sorted_archive(entries, vw_bulk_owner.clone())
+    });
+    let vw_bulk_stats = vw_bulk.node_stats();
+
     // --- correctness spot-check on the archive indexes (LocalLeaf reads) ---
     let keys = arch.keys();
     let probe: [usize; 5] = [0, n / 4, n / 2, (3 * n) / 4, n - 1];
@@ -187,11 +199,23 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
         let tk = O::tree_ordered(&keys[i]);
         assert!(pa_arch.get(&tk).is_some(), "archive PATCH lost key {i}");
         assert!(vw_arch.get(&tk).is_some(), "archive VWPATCH lost key {i}");
+        assert!(vw_bulk.get(&tk).is_some(), "bulk VWPATCH lost key {i}");
         // Negative control: flip a byte -> must be absent.
         let mut miss = tk;
         miss[0] ^= 0xff;
         assert!(pa_arch.get(&miss).is_none(), "archive PATCH false positive {i}");
+        assert!(vw_bulk.get(&miss).is_none(), "bulk VWPATCH false positive {i}");
     }
+    // Full positive sweep over the bulk build: every one of the 9.97M keys
+    // must resolve (the decisive correctness gate for the optimal build).
+    for k in keys {
+        let tk = O::tree_ordered(k);
+        debug_assert!(vw_bulk.get(&tk).is_some());
+    }
+    assert!(
+        keys.iter().all(|k| vw_bulk.get(&O::tree_ordered(k)).is_some()),
+        "bulk VWPATCH lost a key in the full sweep"
+    );
     // has_prefix at a 16-byte segment boundary, in tree-ordered space.
     let tree0 = O::tree_ordered(&keys[0]);
     let mut seg16 = [0u8; 16];
@@ -203,6 +227,18 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
     assert!(
         vw_arch.has_prefix(&seg16),
         "archive VWPATCH has_prefix(seg16) failed"
+    );
+    assert!(
+        vw_bulk.has_prefix(&seg16),
+        "bulk VWPATCH has_prefix(seg16) failed"
+    );
+
+    // Set-hash oracle: the optimal bulk build and the incremental build must
+    // agree bit-for-bit on the root hash (structure-independent XOR of leaf
+    // hashes ⇒ identical key set). This is THE proof the bulk shape is correct.
+    assert_eq!(
+        vw_bulk, vw_arch,
+        "bulk VWPATCH root hash != incremental VWPATCH root hash"
     );
 
     // --- ASSERT LocalLeaves actually formed (the does-it-work proof) ---
@@ -236,9 +272,30 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
         vw_arch_stats.3,
         n - 1
     );
+    // The BULK build's root is itself a Branch (it carries the owner), so it
+    // has NO bootstrap heap leaf at all: heap_leaf == 0 and local_leaf_slots == n.
+    assert_eq!(
+        vw_bulk_stats.2, 0,
+        "BULK VWPATCH SILENTLY REIFIED TO HEAP: {} heap leaves (expected 0)",
+        vw_bulk_stats.2
+    );
+    assert_eq!(
+        vw_bulk_stats.3, n as u64,
+        "bulk VWPATCH local_leaf_slots {} != n {} (local-leaf path failed)",
+        vw_bulk_stats.3, n
+    );
+    // The whole point: the optimal bulk build's branch count must come in WELL
+    // below the incremental build's (incremental over-splits on partial data).
+    assert!(
+        vw_bulk_stats.0 < vw_arch_stats.0,
+        "bulk branches {} not below incremental {}",
+        vw_bulk_stats.0,
+        vw_arch_stats.0
+    );
 
     drop(pa_arch);
     drop(vw_arch);
+    drop(vw_bulk);
 
     // --- heap PATCH ---
     let (pa_heap_bytes, pa_heap) = measure(|| {
@@ -263,15 +320,34 @@ fn run<O: KeySchema<TRIBLE_LEN>>(name: &str, arch: &AlignedArchive) {
     drop(vw_heap);
 
     ps("archive-PATCH", pa_arch_bytes, nf, pa_arch_stats);
-    ps("archive-VW", vw_arch_bytes, nf, vw_arch_stats);
+    ps("archive-VW(inc)", vw_arch_bytes, nf, vw_arch_stats);
+    ps("archive-VW(BULK)", vw_bulk_bytes, nf, vw_bulk_stats);
     ps("heap-PATCH", pa_heap_bytes, nf, pa_heap_stats);
     ps("heap-VW", vw_heap_bytes, nf, vw_heap_stats);
     println!(
-        "    --> archive vw/patch ratio {:.4}x  ({:.2} / {:.2} B/tr) | heap vw/patch ratio {:.4}x",
+        "    --> incremental archive vw/patch ratio {:.4}x ({:.2} / {:.2} B/tr) | heap vw/patch {:.4}x",
         vw_arch_bytes as f64 / pa_arch_bytes as f64,
         vw_arch_bytes as f64 / nf,
         pa_arch_bytes as f64 / nf,
         vw_heap_bytes as f64 / pa_heap_bytes as f64,
+    );
+    // THE DECISION NUMBER: optimal sorted bulk build vs single-byte archive
+    // PATCH — maximum span compression meeting free LocalLeaves.
+    println!(
+        "    ==> BULK archive vw/patch ratio {:.4}x ({:.2} B/tr bulk-VW vs {:.2} B/tr PATCH)  \
+         [bulk branches {} ({:.4}/key) slots {} | incremental branches {} ({:.4}/key) | PATCH branches {} slots {}]  \
+         VERDICT: vwpatch is {} PATCH in its best case",
+        vw_bulk_bytes as f64 / pa_arch_bytes as f64,
+        vw_bulk_bytes as f64 / nf,
+        pa_arch_bytes as f64 / nf,
+        vw_bulk_stats.0,
+        vw_bulk_stats.0 as f64 / nf,
+        vw_bulk_stats.1,
+        vw_arch_stats.0,
+        vw_arch_stats.0 as f64 / nf,
+        pa_arch_stats.0,
+        pa_arch_stats.1,
+        if vw_bulk_bytes < pa_arch_bytes { "SMALLER than" } else { "still LARGER than" },
     );
 }
 

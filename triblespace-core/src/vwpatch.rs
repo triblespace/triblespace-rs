@@ -781,6 +781,37 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
     pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
         Self::reify_local_leaf_unit(head)
     }
+
+    /// Optimal **sorted bulk** archive build: construct the global-optimal
+    /// dense VWPATCH structure from a full set of archive-backed `LocalLeaf`
+    /// heads in one recursive pass, threading the single shared archive
+    /// `owner` through every branch it builds so the referenced bytes stay
+    /// alive.
+    ///
+    /// Unlike the incremental [`Self::insert_dense_owned`] (which narrows spans
+    /// on partial data and over-splits — reaching ~712k branches on the 10M eav
+    /// fixture), this sees every key at once, so [`Self::build_dense_node_owned`]
+    /// picks each span at its widest valid width — capped only by the segment
+    /// checkpoints ([`KeySchema::next_boundary`], so a span never crosses
+    /// 16/32/64 in tree order) and [`Self::max_fanout`] (a node's distinct
+    /// sub-keys must fit its cuckoo table). That yields the bulk-optimal node
+    /// count (~318k for the prototype's unbounded-span ideal; somewhat higher
+    /// here because the 240 multi-byte fanout cap and segment checkpoints force
+    /// a few extra splits). Requires `leaves.len() >= 2`.
+    ///
+    /// The resulting root hash is identical to an incremental build over the
+    /// same key set: every branch hash is the XOR of its children's hashes, so
+    /// the root reduces to the XOR of all leaf hashes — structure-independent.
+    pub(crate) fn bulk_dense_owned(
+        leaves: Vec<Self>,
+        owner: std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>,
+    ) -> Self {
+        debug_assert!(
+            leaves.len() >= 2,
+            "bulk_dense_owned needs >= 2 leaves; callers handle 0/1 at the root"
+        );
+        Self::build_dense_node_owned(leaves, 0, KEY_LEN, Some(owner))
+    }
 }
 
 // Resume generic-V `Head` impl for the remaining methods (replace_leaf,
@@ -2773,6 +2804,41 @@ where
             // which can adopt the owner cleanly.
             self.root
                 .replace(Head::reify_local_leaf_unit_for_root(leaf_head));
+        }
+    }
+
+    /// Optimal **sorted bulk** archive constructor: build the global-optimal
+    /// dense VWPATCH from a full set of archive-backed entries in one recursive
+    /// pass, threading the single shared archive `owner` through every branch.
+    ///
+    /// This is VWPATCH's best memory case — maximum span compression
+    /// (widest valid dense spans, picked with all keys in hand rather than the
+    /// incremental [`Self::insert_archive`]'s narrow-on-partial-data spans) meets
+    /// free leaves (`LocalLeaf` = a tagged pointer into the archive bytes, no
+    /// heap `Leaf`). See [`Head::bulk_dense_owned`] for the span-selection rules
+    /// (segment checkpoints + `max_fanout`).
+    ///
+    /// All entries must share one `owner` Arc (the single-load invariant). The
+    /// resulting trie has no heap leaves at all (the root is a `Branch` carrying
+    /// the owner, so every key is a `LocalLeaf`) — unlike the incremental path,
+    /// which leaves one heap-`Leaf` at the bootstrap root.
+    pub fn from_sorted_archive<'a, I>(entries: I, owner: std::sync::Arc<dyn ArchiveOwner>) -> Self
+    where
+        I: IntoIterator<Item = ArchiveEntry<'a, KEY_LEN>>,
+    {
+        init_sip_key();
+        let leaves: Vec<Head<KEY_LEN, O, ()>> =
+            entries.into_iter().map(|e| e.leaf::<O>().0).collect();
+        match leaves.len() {
+            0 => Self::new(),
+            1 => {
+                let head =
+                    Head::reify_local_leaf_unit_for_root(leaves.into_iter().next().unwrap());
+                VWPATCH { root: Some(head) }
+            }
+            _ => VWPATCH {
+                root: Some(Head::bulk_dense_owned(leaves, owner)),
+            },
         }
     }
 }
