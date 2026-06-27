@@ -49,6 +49,24 @@ fn main() {
     );
     let _ = heap_leaves;
 
+    // --- fanout histogram (grounds the bucket-size tradeoff) ---
+    let hist = vw.branch_fanout_histogram();
+    let buckets: [(usize, usize); 8] = [
+        (2, 4), (5, 7), (8, 15), (16, 31), (32, 63), (64, 127), (128, 255), (256, 256),
+    ];
+    let total: u64 = hist.iter().sum();
+    print!("vwpatch fanout hist:");
+    for (lo, hi) in buckets {
+        let n: u64 = hist[lo..=hi.min(256)].iter().sum();
+        print!(" [{lo}-{hi}]={n} ({:.1}%)", 100.0 * n as f64 / total as f64);
+    }
+    println!();
+    let le4: u64 = hist[2..=4].iter().sum();
+    println!(
+        "  nodes with fanout<=4 (bucket-8 min-table-8 would inflate these): {le4} ({:.1}%)",
+        100.0 * le4 as f64 / total as f64
+    );
+
     // --- PATCH insert ---
     let patch_start = Instant::now();
     let mut patch = PATCH::<TRIBLE_LEN, EAVOrder, ()>::new();

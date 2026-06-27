@@ -40,12 +40,20 @@ use std::sync::Once;
 
 /// The number of slots per bucket.
 ///
-/// Four-slot buckets pack the multi-byte cuckoo table denser (load threshold
-/// rises from ≈0.88 for two-slot buckets to ≈0.97 for four-slot buckets), so a
-/// wide dense node fits more distinct fingerprints before it must narrow. The
-/// smallest branch table therefore holds one full bucket (`BUCKET_ENTRY_COUNT`
-/// slots); `Branch2` is unused.
-pub(crate) const BUCKET_ENTRY_COUNT: usize = 4;
+/// Bigger buckets pack the multi-byte cuckoo table denser (the achievable load
+/// rises ≈0.88 → ≈0.97 → ≈0.99 for 2/4/8-slot buckets), so a wide dense node
+/// fits more distinct fingerprints before it must narrow, but each lookup probes
+/// `2 × BUCKET_ENTRY_COUNT` slots, so reads cost more. Measured on the 10M-eav
+/// fixture, total table slots are U-shaped in the bucket size — 23.65M (4) →
+/// 22.00M (8) → 23.47M (16): eight is the minimum. Below it the medium/wide
+/// nodes (16–128 fanout) sit in needlessly large power-of-2 tables; above it the
+/// `BUCKET_ENTRY_COUNT`-slot minimum table inflates the 63% of nodes with fanout
+/// ≤4 faster than the wide nodes save. Reads degrade monotonically with bucket
+/// size (has_prefix16 1.06× → 1.11× → 1.31× vs single-byte PATCH), so 16 loses on
+/// both axes; 8 is the optimum (memory minimum, reads still near parity). The
+/// smallest branch table holds one full bucket (`BUCKET_ENTRY_COUNT` slots);
+/// `Branch2`/`Branch4` are unused.
+pub(crate) const BUCKET_ENTRY_COUNT: usize = 8;
 
 static INIT: Once = Once::new();
 
@@ -440,14 +448,14 @@ mod tests {
         #[test]
         fn empty_table_then_empty_get(n in 0u16..255) {
             init();
-            let table: [Option<DummyEntry>; 4] = [None; 4];
+            let table: [Option<DummyEntry>; BUCKET_ENTRY_COUNT] = [None; BUCKET_ENTRY_COUNT];
             prop_assert!(table.table_get(n).is_none());
         }
 
         #[test]
         fn single_insert_success(n in 0u16..255) {
             init();
-            let mut table: [Option<DummyEntry>; 4] = [None; 4];
+            let mut table: [Option<DummyEntry>; BUCKET_ENTRY_COUNT] = [None; BUCKET_ENTRY_COUNT];
             let entry = DummyEntry::new(n);
             let displaced = table.table_insert(entry);
             prop_assert!(displaced.is_none());
@@ -496,8 +504,7 @@ mod tests {
             // The smallest valid table holds one full bucket
             // (`BUCKET_ENTRY_COUNT` slots); size-2 is below one bucket and
             // would underflow `compress_hash`'s `bucket_count - 1` mask.
-            let mut table4: [Option<DummyEntry>; 4] = [None; 4];
-            insert_step!(table4, table8, 8);
+            let mut table8: [Option<DummyEntry>; BUCKET_ENTRY_COUNT] = [None; BUCKET_ENTRY_COUNT];
             insert_step!(table8, table16, 16);
             insert_step!(table16, table32, 32);
             insert_step!(table32, table64, 64);
