@@ -29,7 +29,6 @@ use leaf::*;
 
 /// Re-export of all byte table utilities.
 pub use bytetable::*;
-use std::cmp::Reverse;
 use std::convert::TryInto;
 use std::fmt;
 use std::fmt::Debug;
@@ -2471,6 +2470,31 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> std::iter::FusedIterato
 /// layout in the underlying tree. This iterator walks the full tree and does
 /// not accept a prefix filter. For prefix-aware iteration, use
 /// [`VWPATCHPrefixIterator`], constructed via [`VWPATCH::iter_prefix_count`].
+/// Compare two sibling children of a branch spanning tree depths `[s, e)` by
+/// their span sub-key bytes — the order-preserving key for ordered iteration.
+/// The 16-bit fingerprint (`Head::key`) is identity for 1-byte and big-endian
+/// for 2-byte spans, but an FNV hash for spans ≥3 bytes, so sorting on it would
+/// scramble key order on wide dense nodes. Mirrors the construction-path sort
+/// (`build_dense_node` / `narrow_span`).
+#[inline]
+fn cmp_child_span<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>(
+    a: &Head<KEY_LEN, O, V>,
+    b: &Head<KEY_LEN, O, V>,
+    s: usize,
+    e: usize,
+) -> std::cmp::Ordering {
+    let ak = a.childleaf_key();
+    let bk = b.childleaf_key();
+    for j in s..e {
+        let p = O::TREE_TO_KEY[j];
+        match ak[p].cmp(&bk[p]) {
+            std::cmp::Ordering::Equal => continue,
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 pub struct VWPATCHOrderedIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     stack: Vec<ArrayVec<&'a Head<KEY_LEN, O, V>, 256>>,
     remaining: usize,
@@ -2489,9 +2513,11 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> VWPATCHOrderedIterator<
                     r.stack[0].push(root);
                 }
                 BodyRef::Branch(branch) => {
+                    let (s, e) = (branch.span_start as usize, branch.span_end as usize);
                     let first_level = &mut r.stack[0];
                     first_level.extend(branch.child_table.iter().filter_map(|c| c.as_ref()));
-                    first_level.sort_unstable_by_key(|&k| Reverse(k.key())); // We need to reverse here because we pop from the vec.
+                    // Reverse (descending) so popping from the back yields ascending.
+                    first_level.sort_unstable_by(|a, b| cmp_child_span::<KEY_LEN, O, V>(b, a, s, e));
                 }
             }
         }
@@ -2571,16 +2597,18 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
                     return Some(*bytes);
                 }
                 BodyMut::Branch(branch) => {
+                    let (s, e) = (branch.span_start as usize, branch.span_end as usize);
                     let slice: &mut [Option<Head<KEY_LEN, O, V>>] = &mut branch.child_table;
-                    // Sort children by their byte-key, placing empty slots (None)
-                    // after all occupied slots. Using `sort_unstable_by_key` with
-                    // a simple key projection is clearer than a custom
-                    // comparator; it also avoids allocating temporaries. The
-                    // old comparator manually handled None/Some cases — we
-                    // express that intent directly by sorting on the tuple
-                    // (is_none, key_opt).
-                    slice
-                        .sort_unstable_by_key(|opt| (opt.is_none(), opt.as_ref().map(|h| h.key())));
+                    // Sort ascending by span sub-key with empty slots (None) last;
+                    // the `rev()`-push onto the LIFO queue then pops the smallest
+                    // first. Order on the recovered span bytes, not the fingerprint
+                    // (an FNV hash for spans ≥3 bytes — see `cmp_child_span`).
+                    slice.sort_unstable_by(|a, b| match (a, b) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (Some(a), Some(b)) => cmp_child_span::<KEY_LEN, O, V>(a, b, s, e),
+                    });
                     for slot in slice.iter_mut().rev() {
                         if let Some(c) = slot.take() {
                             q.push(c);
@@ -2640,10 +2668,12 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
                         return Some(child.childleaf_key());
                     }
                     BodyRef::Branch(branch) => {
+                        let (s, e) = (branch.span_start as usize, branch.span_end as usize);
                         self.stack.push(ArrayVec::new());
                         level = self.stack.last_mut()?;
                         level.extend(branch.child_table.iter().filter_map(|c| c.as_ref()));
-                        level.sort_unstable_by_key(|&k| Reverse(k.key())); // We need to reverse here because we pop from the vec.
+                        // Reverse (descending) so popping from the back yields ascending.
+                        level.sort_unstable_by(|a, b| cmp_child_span::<KEY_LEN, O, V>(b, a, s, e));
                     }
                 }
             } else {
@@ -2698,9 +2728,11 @@ impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V
                 let BodyRef::Branch(branch) = root.body_ref() else {
                     unreachable!();
                 };
+                let (s, e) = (branch.span_start as usize, branch.span_end as usize);
                 let first_level = &mut r.stack[0];
                 first_level.extend(branch.child_table.iter().filter_map(|c| c.as_ref()));
-                first_level.sort_unstable_by_key(|&k| Reverse(k.key())); // We need to reverse here because we pop from the vec.
+                // Reverse (descending) so popping from the back yields ascending.
+                first_level.sort_unstable_by(|a, b| cmp_child_span::<KEY_LEN, O, V>(b, a, s, e));
             }
         }
         r
@@ -2724,10 +2756,12 @@ impl<'a, const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V
                     let BodyRef::Branch(branch) = child.body_ref() else {
                         unreachable!();
                     };
+                    let (s, e) = (branch.span_start as usize, branch.span_end as usize);
                     self.stack.push(ArrayVec::new());
                     level = self.stack.last_mut()?;
                     level.extend(branch.child_table.iter().filter_map(|c| c.as_ref()));
-                    level.sort_unstable_by_key(|&k| Reverse(k.key())); // We need to reverse here because we pop from the vec.
+                    // Reverse (descending) so popping from the back yields ascending.
+                    level.sort_unstable_by(|a, b| cmp_child_span::<KEY_LEN, O, V>(b, a, s, e));
                 }
             } else {
                 self.stack.pop();
@@ -3097,6 +3131,31 @@ mod tests {
             tree_vec.sort();
 
             prop_assert_eq!(set_vec, tree_vec);
+        }
+
+        #[test]
+        fn tree_iter_ordered(keys in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 1..512)) {
+            // Ordered iteration must yield keys in ascending key order. With wide
+            // multi-byte spans the per-node child sort cannot key on the 16-bit
+            // fingerprint (an FNV hash for spans >2 bytes) — it must order by the
+            // recovered span sub-key bytes. Unlike `tree_iter`, this does NOT
+            // re-sort the tree output, so a fingerprint-ordered iterator fails.
+            let mut tree = VWPATCH::<64, IdentitySchema, ()>::new();
+            let mut set = HashSet::new();
+            for key in keys {
+                let key: [u8; 64] = key.try_into().unwrap();
+                let entry = Entry::new(&key);
+                tree.insert(&entry);
+                set.insert(key);
+            }
+            let mut expected = Vec::from_iter(set.into_iter());
+            expected.sort();
+
+            let borrowed: Vec<[u8; 64]> = tree.iter_ordered().copied().collect();
+            prop_assert_eq!(&borrowed, &expected);
+
+            let owned: Vec<[u8; 64]> = tree.clone().into_iter_ordered().collect();
+            prop_assert_eq!(&owned, &expected);
         }
 
         #[test]
