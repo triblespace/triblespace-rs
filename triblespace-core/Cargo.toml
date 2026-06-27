@@ -102,6 +102,11 @@ name = "vwpatch_allorderings"
 harness = false
 required-features = ["vwpatch"]
 
+[[bench]]
+name = "vwpatch_realmem"
+harness = false
+required-features = ["vwpatch"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
