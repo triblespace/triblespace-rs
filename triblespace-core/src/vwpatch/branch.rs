@@ -111,23 +111,6 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Branch::modify_child(&mut self.branch_nn, key, f);
     }
 
-    /// Like [`modify_child`] but uses the supplied `inserted_hash`
-    /// for the empty-slot insertion case instead of calling
-    /// `inserted.hash()`. Lets archive ingest avoid recomputing
-    /// the LocalLeaf siphash24 once per index — the caller already
-    /// has it from `ArchiveEntry::hash`.
-    ///
-    /// The hint MUST equal the hash of whatever `f(None)` returns.
-    /// When the slot is non-empty and `f(Some(_))` runs, the result
-    /// is hashed normally (recursion result, hash already cached on
-    /// the Branch).
-    pub fn modify_child_with_inserted_hint<F>(&mut self, key: u16, inserted_hash: u128, f: F)
-    where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
-    {
-        Branch::modify_child_with_inserted_hint(&mut self.branch_nn, key, inserted_hash, f);
-    }
-
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
@@ -435,60 +418,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
 {
-    /// Allocate a fresh two-child, single-byte-span branch, taking a precomputed
-    /// `rchild_hash` instead of calling `rchild.hash()`. Lets archive-ingest
-    /// divergence paths reuse the `ArchiveEntry::hash` they already have instead
-    /// of recomputing siphash24 over the LocalLeaf bytes. (`owner` is `Some` on
-    /// the archive-leaf-elimination path so the branch adopts the entry's
-    /// archive owner; `None` for pure-memory branches.)
-    ///
-    /// `rchild_hash` MUST equal `rchild.hash()`. The lchild hash
-    /// still goes through the normal path — it's typically a Branch
-    /// (cached) or heap Leaf (cached), so the only LocalLeaf hash
-    /// recompute that matters is on the freshly inserted side.
-    pub(super) fn new_with_owner_and_rchild_hash(
-        span_start: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
-        rchild_hash: u128,
-    ) -> NonNull<Self> {
-        unsafe {
-            // The smallest table is one full bucket (`BUCKET_ENTRY_COUNT`
-            // slots): it is a single bucket, so the cheap/rand hashes both
-            // compress to bucket 0 and the two children placed directly at
-            // slots 0 and 1 are always found by a full-bucket scan. (Two-slot
-            // tables are unrepresentable with four-slot buckets.)
-            let size = BUCKET_ENTRY_COUNT;
-            // SAFETY: `BRANCH_ALIGN` is a power of two and `size` is small enough
-            // that the computed layout size is valid.
-            let layout = Layout::from_size_align_unchecked(
-                BRANCH_BASE_SIZE + (TABLE_ENTRY_SIZE * size),
-                BRANCH_ALIGN,
-            );
-            let Some(ptr) =
-                NonNull::new(std::ptr::slice_from_raw_parts(alloc_zeroed(layout), size)
-                    as *mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>)
-            else {
-                handle_alloc_error(layout);
-            };
-            addr_of_mut!((*ptr.as_ptr()).rc).write(atomic::AtomicU32::new(1));
-            // Single-byte span (phase 2b-i): span_end == span_start + 1.
-            addr_of_mut!((*ptr.as_ptr()).span_start).write(span_start as u16);
-            addr_of_mut!((*ptr.as_ptr()).span_end).write((span_start + 1) as u16);
-            addr_of_mut!((*ptr.as_ptr()).childleaf).write(lchild.childleaf_ptr());
-            addr_of_mut!((*ptr.as_ptr()).leaf_count).write(lchild.count() + rchild.count());
-            addr_of_mut!((*ptr.as_ptr()).segment_count)
-                .write(lchild.count_segment(span_start) + rchild.count_segment(span_start));
-            addr_of_mut!((*ptr.as_ptr()).hash).write(lchild.hash() ^ rchild_hash);
-            addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
-            (*ptr.as_ptr()).child_table[0] = Some(lchild);
-            (*ptr.as_ptr()).child_table[1] = Some(rchild);
-
-            ptr
-        }
-    }
-
     pub(super) unsafe fn rc_inc(branch: NonNull<Self>) -> NonNull<Self> {
         unsafe {
             let branch = branch.as_ptr();
@@ -710,82 +639,6 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
-    /// Variant of [`Self::modify_child`] that takes a precomputed
-    /// `inserted_hash` and uses it for the empty-slot insertion path
-    /// instead of calling `inserted.hash()`. The hint MUST equal the
-    /// hash of whatever `f(None)` returns. The non-empty path uses
-    /// `new_child.hash()` as normal (the recursive result is a Branch
-    /// whose hash is already cached, so the call is O(1)).
-    pub(super) fn modify_child_with_inserted_hint<F>(
-        branch_nn: &mut NonNull<Self>,
-        key: u16,
-        inserted_hash: u128,
-        f: F,
-    ) where
-        F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
-    {
-        unsafe {
-            let branch = branch_nn.as_ptr();
-            let span_start = (*branch).span_start as usize;
-
-            if let Some(slot) = (*branch).child_table.table_get_slot(key) {
-                let child = slot.take().unwrap();
-                let old_child_hash = child.hash();
-                let old_child_segment_count = child.count_segment(span_start);
-                let old_child_leaf_count = child.count();
-
-                let replaced_childleaf = child.childleaf_ptr() == (*branch).childleaf;
-
-                if let Some(new_child) = f(Some(child)) {
-                    // Recursion result — its hash is cached on the
-                    // returned Head (Branch.hash field), so calling
-                    // .hash() is cheap.
-                    (*branch).hash = ((*branch).hash ^ old_child_hash) ^ new_child.hash();
-                    (*branch).segment_count = ((*branch).segment_count - old_child_segment_count)
-                        + new_child.count_segment(span_start);
-                    (*branch).leaf_count =
-                        ((*branch).leaf_count - old_child_leaf_count) + new_child.count();
-
-                    if replaced_childleaf {
-                        (*branch).childleaf = new_child.childleaf_ptr();
-                    }
-
-                    if slot.replace(new_child.with_key(key)).is_some() {
-                        unreachable!();
-                    }
-                } else {
-                    (*branch).hash ^= old_child_hash;
-                    (*branch).segment_count -= old_child_segment_count;
-                    (*branch).leaf_count -= old_child_leaf_count;
-
-                    if replaced_childleaf {
-                        if let Some(other) = (*branch).child_table.iter().find_map(|s| s.as_ref()) {
-                            (*branch).childleaf = other.childleaf_ptr();
-                        }
-                    }
-                }
-            } else {
-                if let Some(mut inserted) = f(None) {
-                    // Use the caller-supplied hint instead of
-                    // recomputing siphash24 over the LocalLeaf bytes.
-                    (*branch).leaf_count += inserted.count();
-                    (*branch).segment_count += inserted.count_segment(span_start);
-                    (*branch).hash ^= inserted_hash;
-
-                    let mut branch_ptr = branch_nn.as_ptr();
-                    while let Some(new_displaced) = (*branch_ptr).child_table.table_insert(inserted)
-                    {
-                        inserted = new_displaced;
-                        Self::grow(branch_nn);
-                        branch_ptr = branch_nn.as_ptr();
-                    }
-                }
-            }
-            #[cfg(debug_assertions)]
-            branch_nn.as_ref().debug_check_invariants();
-        }
-    }
-
     // Note: upsert_child removed in favor of explicit insert_child / update_child
 
     // The old in-place `update_child` helper has been superseded by
@@ -857,6 +710,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         span_start: usize,
         span_end: usize,
         children: Vec<Head<KEY_LEN, O, V>>,
+        owner: Option<Arc<dyn ArchiveOwner>>,
     ) -> Option<NonNull<Self>> {
         debug_assert!(children.len() >= 2, "dense branch needs >= 2 children");
         debug_assert!(children.len() <= 256, "dense fanout exceeds 256");
@@ -884,7 +738,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             addr_of_mut!((*ptr.as_ptr()).leaf_count).write(0);
             addr_of_mut!((*ptr.as_ptr()).segment_count).write(0);
             addr_of_mut!((*ptr.as_ptr()).hash).write(0);
-            addr_of_mut!((*ptr.as_ptr()).owner).write(None);
+            addr_of_mut!((*ptr.as_ptr()).owner).write(owner);
             for child in children {
                 if let Some(leftover) = Self::install_child_growing_dup(&mut ptr, child) {
                     // Placement failed. Drop the leftover and the partially

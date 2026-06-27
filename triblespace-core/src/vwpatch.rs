@@ -637,105 +637,127 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
 // machinery requires the value type to be zero-sized so reification
 // (constructing a heap Leaf with `()` as the value) is well-defined.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
-    /// Inserts a new leaf into a VWPATCH while keeping owner-aware
-    /// invariants intact. `this` is guaranteed by the call protocol
-    /// to be a heap `Leaf` or a `Branch` — never a `LocalLeaf`,
-    /// because LocalLeaf children are handled inline by their parent
-    /// Branch's `modify_child` closure (the only level where the
-    /// LocalLeaf's owner identity is locally known).
+    /// Variable-width **dense** archive insert — the owner-threading mirror of
+    /// the heap [`Self::insert_dense`]. Builds the same dense, multi-byte spans
+    /// (so an archive-loaded VWPATCH reaches the same compressed node count as
+    /// the heap build) while threading the `LocalLeaf` owner through every
+    /// branch it constructs, so the archive bytes referenced by `LocalLeaf`
+    /// children stay alive.
     ///
-    /// `leaf_owner` is `Some(arc)` when the new leaf is an archive
-    /// `LocalLeaf` backed by that owner Arc, and `None` for plain
-    /// heap leaves.
-    pub(crate) fn insert_leaf_with_owner(
+    /// Invariants and parameters:
+    /// - `this` is a heap `Leaf`, a `Branch`, or — only when reached via the
+    ///   `recurse_dense_child` closure below — a direct-child `LocalLeaf`.
+    /// - `leaf` is the freshly inserted archive `LocalLeaf` (or a heap `Leaf`
+    ///   once reified on an owner mismatch).
+    /// - `leaf_owner` is `Some(arc)` while `leaf` is still a `LocalLeaf`.
+    /// - `this_owner` is `Some(arc)` iff `this` is itself a `LocalLeaf` (the
+    ///   owner of the branch that holds it as a direct child); `None` otherwise.
+    ///
+    /// Single-load simplification: every entry of one archive load shares one
+    /// owner Arc, so when a dense span narrows and regroups children, all
+    /// resulting sub-branches inherit that same owner — no per-child conflict.
+    /// A cross-archive entry whose owner differs from the receiving branch's is
+    /// reified to a heap `Leaf` (owner dropped) before descending, exactly as
+    /// the old single-byte path did.
+    pub(crate) fn insert_dense_owned(
         mut this: Self,
         mut leaf: Self,
         mut leaf_owner: Option<&std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
-        leaf_hash: u128,
-        start_depth: usize,
+        at_depth: usize,
+        this_owner: Option<&std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
     ) -> Self {
-        // Top-level divergence: `this` is a heap Leaf or a Branch
-        // (never LocalLeaf per the protocol above). The only side
-        // that can be a LocalLeaf at this level is `leaf` — so the
-        // new parent Branch only needs to host whatever owner backs
-        // it. A `this = Branch` keeps its own owner field for its
-        // own subtree; the new parent doesn't inherit responsibility
-        // for that.
-        if let Some((depth, this_byte_key, leaf_byte_key)) =
-            this.first_divergence(&leaf, start_depth)
-        {
-            let old_key = this.key();
-            let new_branch_owner = leaf_owner.cloned();
-            let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
-                depth,
-                this.with_key(fingerprint16(&[this_byte_key])),
-                leaf.with_key(fingerprint16(&[leaf_byte_key])),
-                new_branch_owner,
-                leaf_hash,
-            );
-            return Head::new(old_key, new_body);
-        }
-
-        let end_depth = this.end_depth();
-        if end_depth != KEY_LEN {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-
-            // Owner reconciliation at this Branch — single match block
-            // so the no-op (matched / both-None) case is one
-            // pattern-match comparison with no extra Arc traffic.
-            match (ed.owner.as_ref(), leaf_owner) {
-                (None, Some(lo)) => ed.owner = Some(lo.clone()),
-                (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
-                    leaf_owner = None;
+        use std::sync::Arc;
+        match this.tag() {
+            HeadTag::Leaf | HeadTag::LocalLeaf => match this.first_divergence(&leaf, at_depth) {
+                None => this, // duplicate key
+                Some((start, _, _)) => {
+                    // The fresh parent must cover whichever direct child is a
+                    // LocalLeaf: `this` (owner `this_owner`) and/or `leaf`
+                    // (owner `leaf_owner`). Under the single-owner invariant
+                    // these agree whenever both are `Some`.
+                    let owner = this_owner.or(leaf_owner).cloned();
+                    Self::split_two_owned(this, leaf, start, owner)
                 }
-                _ => {}
-            }
+            },
+            _ => {
+                let (s, e) = {
+                    let BodyRef::Branch(b) = this.body_ref() else {
+                        unreachable!()
+                    };
+                    (b.span_start as usize, b.span_end as usize)
+                };
 
-            // Raw pointer into `ed.owner` so the inline-LocalLeaf
-            // closure path can clone the Arc without re-borrowing
-            // `ed` (which is uniquely held by `modify_child`).
-            // SAFETY: the Arc lives on the Branch for the whole
-            // descent; we read through this pointer only inside the
-            // closure body before it returns.
-            let branch_owner_ptr: *const Option<
-                std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>,
-            > = &ed.owner;
-            let inserted = leaf.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
-                None => Some(inserted),
-                Some(old) => Some(if old.tag() == HeadTag::LocalLeaf {
-                    // Direct-child LocalLeaf: its owner is THIS
-                    // Branch's owner. Build the divergence sub-Branch
-                    // inline and stop the recursion. `tag()` is a
-                    // pointer-bits check (no deref) — cheaper than
-                    // `body_ref()` for the common non-LocalLeaf case.
-                    let (depth, old_byte_key, leaf_byte_key) =
-                        old.first_divergence(&inserted, end_depth).expect(
-                            "LocalLeaf and the inserted leaf must \
-                             diverge at some depth — equal keys \
-                             would have been a no-op upstream",
-                        );
-                    let old_top_key = old.key();
-                    let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                    let new_body = crate::vwpatch::branch::Branch::new_with_owner_and_rchild_hash(
-                        depth,
-                        old.with_key(fingerprint16(&[old_byte_key])),
-                        inserted.with_key(fingerprint16(&[leaf_byte_key])),
-                        sub_owner,
-                        leaf_hash,
-                    );
-                    Head::new(old_top_key, new_body)
-                } else {
-                    // `old` is a heap Leaf or a Branch — recurse with
-                    // the protocol-conforming shape, threading the
-                    // precomputed leaf hash through.
-                    Head::insert_leaf_with_owner(old, inserted, leaf_owner, leaf_hash, end_depth)
-                }),
-            });
+                // Compressed-path divergence: `leaf` doesn't belong under this
+                // branch's span — wrap both under a fresh parent (O(1)). `this`
+                // is a Branch (self-covering); only `leaf` may need covering.
+                if let Some((start, _, _)) = this.first_divergence(&leaf, at_depth) {
+                    return Self::split_two_owned(this, leaf, start, leaf_owner.cloned());
+                }
+
+                // Owner reconciliation for the branch that will host `leaf`.
+                let branch_owner: Option<Arc<dyn crate::vwpatch::branch::ArchiveOwner>> =
+                    match this.body_ref() {
+                        BodyRef::Branch(b) => b.owner.clone(),
+                        _ => unreachable!(),
+                    };
+                if let (Some(bo), Some(lo)) = (branch_owner.as_ref(), leaf_owner) {
+                    if !Arc::ptr_eq(bo, lo) {
+                        // Cross-archive entry: reify to heap so it carries no
+                        // owner dependency, then descend as a plain leaf.
+                        leaf = Self::reify_local_leaf_unit(leaf);
+                        leaf_owner = None;
+                    }
+                }
+                // The owner covering this branch's LocalLeaf descendants after
+                // this op: the branch keeps its own owner, else adopts the
+                // incoming leaf's. Used for adoption, narrowing, and as the
+                // covering owner when recursing into a LocalLeaf child.
+                let active_owner: Option<Arc<dyn crate::vwpatch::branch::ArchiveOwner>> =
+                    branch_owner.or(leaf_owner.cloned());
+
+                let mut buf = [0u8; KEY_LEN];
+                let sub = Self::span_sub(leaf.childleaf_key(), s, e, &mut buf);
+                let fp = fingerprint16(sub);
+
+                let mut leaf_opt = Some(leaf);
+                let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
+                if ed.owner.is_none() {
+                    ed.owner = active_owner.clone();
+                }
+                let active_ref = active_owner.as_ref();
+                if ed.recurse_dense_child(fp, sub, |child| {
+                    // A direct-child LocalLeaf is covered by THIS branch's
+                    // (active) owner; any other child self-covers.
+                    let child_owner = if child.tag() == HeadTag::LocalLeaf {
+                        active_ref
+                    } else {
+                        None
+                    };
+                    Self::insert_dense_owned(child, leaf_opt.take().unwrap(), leaf_owner, e, child_owner)
+                }) {
+                    drop(ed);
+                    return this;
+                }
+                let leaf = leaf_opt.take().unwrap();
+
+                // New distinct child. Overflow only at the 256-slot maximum.
+                let over_cap = ed.child_table.len() >= 256
+                    && ed.child_table.iter().flatten().count() >= Self::max_fanout(e - s);
+                if over_cap {
+                    drop(ed);
+                    return Self::narrow_with_owned(this, leaf, s, e, active_owner);
+                }
+
+                let inserted = leaf.with_span(s, e);
+                let leftover = ed.add_dense_child(inserted);
+                drop(ed);
+                if let Some(leftover) = leftover {
+                    // Cuckoo placement failed below the cap — O(children) narrow.
+                    return Self::narrow_with_owned(this, leftover, s, e, active_owner);
+                }
+                this
+            }
         }
-        this
     }
 
     /// Reifies a LocalLeaf head into a heap `Leaf<KEY_LEN, ()>` head.
@@ -1918,6 +1940,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// `childleaf_key()` and clones heads (Arc bump) — never walking a subtree —
     /// it is O(units) regardless of how large those subtrees are.
     fn build_dense_node(units: Vec<Self>, min_start: usize, max_end: usize) -> Self {
+        Self::build_dense_node_owned(units, min_start, max_end, None)
+    }
+
+    /// Owner-threading variant of [`Self::build_dense_node`]. Every branch it
+    /// constructs adopts `owner` so that any `LocalLeaf` units it regroups stay
+    /// covered by the archive owner keeping their bytes alive. The heap path
+    /// uses `owner = None` via the thin wrapper above; the archive dense-insert
+    /// path passes the load's single shared owner Arc.
+    fn build_dense_node_owned(
+        units: Vec<Self>,
+        min_start: usize,
+        max_end: usize,
+        owner: Option<std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
+    ) -> Self {
         if units.len() == 1 {
             return units.into_iter().next().unwrap();
         }
@@ -1955,10 +1991,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 }
                 let members: Vec<Self> =
                     keyed[run_start..run_end].iter().map(|&(_, i)| units[i].clone()).collect();
-                children.push(Self::build_dense_node(members, end, max_end).with_span(start, end));
+                children.push(
+                    Self::build_dense_node_owned(members, end, max_end, owner.clone())
+                        .with_span(start, end),
+                );
                 run_start = run_end;
             }
-            match Branch::from_children_dense(start, end, children) {
+            match Branch::from_children_dense(start, end, children, owner.clone()) {
                 Some(nn) => return Head::new(0, nn),
                 None => {
                     // A single-byte span keys children by the branch byte and
@@ -1985,12 +2024,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// O(subtree), which is the difference between a usable insert and a
     /// 60×-PATCH one.
     fn split_two(a: Self, b: Self, start: usize) -> Self {
+        Self::split_two_owned(a, b, start, None)
+    }
+
+    /// Owner-threading variant of [`Self::split_two`]. `owner` must cover any
+    /// `LocalLeaf` that becomes a *direct* child of the fresh parent (i.e. when
+    /// `a` or `b` is itself a `LocalLeaf`); branch children carry their own
+    /// owner internally and need no covering here. The heap path passes `None`.
+    fn split_two_owned(
+        a: Self,
+        b: Self,
+        start: usize,
+        owner: Option<std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
+    ) -> Self {
         let end = O::next_boundary(start).min(a.end_depth()).min(b.end_depth());
         let a2 = a.with_span(start, end);
         let b2 = b.with_span(start, end);
         // Two children always fit a two-slot table, even on a fingerprint
         // collision (one bucket, two slots).
-        let nn = Branch::from_children_dense(start, end, vec![a2, b2])
+        let nn = Branch::from_children_dense(start, end, vec![a2, b2], owner)
             .expect("two children always place");
         Head::new(0, nn)
     }
@@ -2008,6 +2060,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// not O(subtree). Cascades automatically when a freshly-formed intermediate
     /// still exceeds capacity (handled by `build_dense_node`'s recursion).
     fn narrow_with(this: Self, extra: Self, s: usize, e: usize) -> Self {
+        Self::narrow_with_owned(this, extra, s, e, None)
+    }
+
+    /// Owner-threading variant of [`Self::narrow_with`]. The regrouped children
+    /// of `this` (which, on the archive path, include `LocalLeaf`s belonging to
+    /// `this`'s owner) are re-parented under fresh branches that must all adopt
+    /// that same `owner`. Within one archive load `this.owner == extra`'s owner,
+    /// so a single `owner` covers every regrouped unit. The heap path passes
+    /// `None`.
+    fn narrow_with_owned(
+        this: Self,
+        extra: Self,
+        s: usize,
+        e: usize,
+        owner: Option<std::sync::Arc<dyn crate::vwpatch::branch::ArchiveOwner>>,
+    ) -> Self {
         let mut units: Vec<Self> = match this.body_ref() {
             BodyRef::Branch(branch) => branch.child_table.iter().flatten().cloned().collect(),
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
@@ -2016,7 +2084,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         };
         units.push(extra);
         drop(this);
-        Self::build_dense_node(units, s, e)
+        Self::build_dense_node_owned(units, s, e, owner)
     }
 
     /// Variable-width dense insert of a fresh `leaf` head into `this`.
@@ -2192,7 +2260,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 children.push(Self::build_dense_node(members, end, te).with_span(s, end));
                 run_start = run_end;
             }
-            match Branch::from_children_dense(s, end, children) {
+            match Branch::from_children_dense(s, end, children, None) {
                 Some(nn) => return Head::new(0, nn),
                 None => {
                     assert!(
@@ -2693,10 +2761,10 @@ where
     /// owner semantics and the materialization rule for owner
     /// mismatches.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
-        let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
+        let (leaf_head, leaf_owner, _leaf_hash) = entry.leaf::<O>();
         if let Some(this) = self.root.take() {
             let new_head =
-                Head::insert_leaf_with_owner(this, leaf_head, Some(leaf_owner), leaf_hash, 0);
+                Head::insert_dense_owned(this, leaf_head, Some(leaf_owner), 0, None);
             self.root.replace(new_head);
         } else {
             // Empty VWPATCH: the standalone root can't host an owner field
@@ -3957,6 +4025,95 @@ mod tests {
         }
     }
 
+    /// Small in-debug gate for the dense ARCHIVE-insert path
+    /// ([`Head::insert_dense_owned`]). Runs under `debug_assertions`, so the
+    /// per-op `debug_check_invariants` validate the incrementally-maintained
+    /// branch aggregates (hash / leaf_count / segment_count / childleaf) on
+    /// every dense archive mutation — coverage the heavy `#[ignore]`d 10M gate
+    /// (release-only) cannot give. Builds a 16-byte-aligned synthetic archive
+    /// of distinct keys and asserts:
+    ///   * single-owner archive build == heap build (branch count, root hash,
+    ///     LocalLeaf census), and
+    ///   * cross-owner (two owner Arcs over the same bytes) still yields the
+    ///     correct key set via the reify-on-mismatch path.
+    #[test]
+    fn archive_insert_dense_matches_heap_small() {
+        use crate::vwpatch::branch::ArchiveOwner;
+        use std::sync::Arc;
+
+        const M: usize = 4000;
+        // 16-byte-aligned buffer (Vec<u128> base is 16-aligned).
+        let mut words: Vec<u128> = vec![0u128; M * 4];
+        let base = words.as_ptr() as usize;
+        assert_eq!(base & 0x0f, 0);
+        {
+            // SAFETY: words holds exactly M*64 bytes; plain-byte view.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, M * 64) };
+            let mut s = 0x1234_5678_9abc_def0u64;
+            for b in bytes.iter_mut() {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *b = (s >> 33) as u8;
+            }
+            // Make every key distinct by stamping its index into the first 8 bytes.
+            for i in 0..M {
+                bytes[i * 64..i * 64 + 8].copy_from_slice(&(i as u64).to_le_bytes());
+            }
+        }
+        // SAFETY: `words` outlives every trie built below.
+        let keys: &[[u8; 64]] = unsafe { std::slice::from_raw_parts(base as *const [u8; 64], M) };
+
+        // Heap reference build.
+        let mut heap: VWPATCH<64, IdentitySchema, ()> = VWPATCH::new();
+        for k in keys {
+            heap.insert(&Entry::new(k));
+        }
+        let (h_branches, ..) = heap.node_stats();
+
+        // Single-owner archive build.
+        let owner: Arc<dyn ArchiveOwner> = Arc::new(());
+        let mut arch: VWPATCH<64, IdentitySchema, ()> = VWPATCH::new();
+        for i in 0..M {
+            let p = unsafe { NonNull::new_unchecked((base + i * 64) as *mut [u8; 64]) };
+            let e = unsafe { ArchiveEntry::new(p, &owner) };
+            arch.insert_archive(&e);
+        }
+        assert_eq!(arch.len(), M as u64);
+        let (a_branches, _slots, a_heap, a_local) = arch.node_stats();
+        assert_eq!(a_heap, 1, "archive heap_leaves {a_heap} (expected 1 root bootstrap)");
+        assert_eq!(a_local, (M - 1) as u64, "archive local_leaf_slots {a_local}");
+        assert_eq!(a_branches, h_branches, "archive branch count != heap");
+        assert_eq!(arch.root_hash(), heap.root_hash(), "archive root hash != heap");
+        for k in keys {
+            assert!(arch.get(k).is_some(), "archive lost a present key");
+        }
+
+        // Cross-archive: two distinct owners over the SAME bytes exercises the
+        // reify-on-mismatch path. The final key set must still be correct.
+        let owner_a: Arc<dyn ArchiveOwner> = Arc::new(());
+        let owner_b: Arc<dyn ArchiveOwner> = Arc::new(());
+        let mut mixed: VWPATCH<64, IdentitySchema, ()> = VWPATCH::new();
+        for i in 0..M {
+            let p = unsafe { NonNull::new_unchecked((base + i * 64) as *mut [u8; 64]) };
+            let o = if i % 2 == 0 { &owner_a } else { &owner_b };
+            let e = unsafe { ArchiveEntry::new(p, o) };
+            mixed.insert_archive(&e);
+        }
+        assert_eq!(mixed.len(), M as u64);
+        assert_eq!(
+            mixed.root_hash(),
+            heap.root_hash(),
+            "cross-archive set-hash differs from heap"
+        );
+        for k in keys {
+            assert!(mixed.get(k).is_some(), "cross-archive lost a present key");
+        }
+
+        drop((owner, owner_a, owner_b));
+        drop(words);
+    }
+
     /// Phase 2b-ii correctness gate. Reads the 9,970,736 64-byte EAV tribles in
     /// `/tmp/facts.simplearchive` (raw, header-less: file size is exactly
     /// `N * 64`) and asserts the three dense-trie invariants:
@@ -4045,5 +4202,137 @@ mod tests {
             root_fwd, root_rev,
             "root hash must be insertion-order invariant (XOR)"
         );
+    }
+
+    /// Dense-span ARCHIVE-insert correctness gate. Archive-loads the
+    /// 9,970,736-trible fixture through `insert_archive` (the zero-copy
+    /// `LocalLeaf` path) for both an identity (EAV) and a value-first (VEA)
+    /// ordering, and proves the dense-archive rework holds every invariant:
+    ///
+    /// 1. **Compression matches the heap build.** The archive trie's branch
+    ///    count equals the heap `insert_dense` build's over the same keys —
+    ///    so archive loading now reaches the SAME ~712K dense node count,
+    ///    not single-byte PATCH's ~1.52M.
+    /// 2. **LocalLeaves preserved.** `heap_leaf_nodes == 1` (root bootstrap)
+    ///    and `local_leaf_slots == N-1` — compression did not silently reify
+    ///    leaves onto the heap.
+    /// 3. **Set-hash oracle.** The archive-built root hash equals the
+    ///    heap-built root hash over the same key set (XOR subtree-hash is
+    ///    set-determined, structure-independent).
+    /// 4. **Queries.** Every present key resolves; 100k perturbed keys miss;
+    ///    `has_prefix` at a 16-byte segment boundary holds.
+    ///
+    /// Heavy + external fixture → `#[ignore]`d. Run with
+    /// `cargo test -p triblespace-core --release --features vwpatch
+    /// dense_archive_gate_10m -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "heavy; needs /tmp/facts.simplearchive — run with --release --ignored"]
+    fn dense_archive_gate_10m() {
+        use crate::trible::{EAVOrder, VEAOrder};
+        use crate::vwpatch::branch::ArchiveOwner;
+        use std::sync::Arc;
+
+        const PATH: &str = "/tmp/facts.simplearchive";
+        const N: usize = 9_970_736;
+
+        let file = std::fs::File::open(PATH).expect("open /tmp/facts.simplearchive");
+        // SAFETY: read-only mapping of a file we do not mutate for the test.
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap facts") };
+        assert_eq!(mmap.len(), N * 64, "fixture must be N*64 raw trible bytes");
+        let base = mmap.as_ptr() as usize;
+        assert_eq!(base & 0x0f, 0, "mmap base must be 16-byte aligned");
+        // The owner Arc keeps the mapping alive for every LocalLeaf that
+        // points into it; the raw `base` reads stay valid as long as `owner`.
+        let owner: Arc<dyn ArchiveOwner> = Arc::new(mmap);
+        // SAFETY: `owner` holds the mapping; bytes are immutable and 16-aligned.
+        let keys: &[[u8; 64]] =
+            unsafe { std::slice::from_raw_parts(base as *const [u8; 64], N) };
+
+        fn run_gate<O: KeySchema<64>>(
+            name: &str,
+            n: usize,
+            base: usize,
+            owner: &Arc<dyn ArchiveOwner>,
+            keys: &[[u8; 64]],
+        ) {
+            // Archive build (LocalLeaf, dense spans, shared owner).
+            let mut arch: VWPATCH<64, O, ()> = VWPATCH::new();
+            for i in 0..n {
+                // SAFETY: 16-aligned, valid for `owner`'s lifetime.
+                let p = unsafe { NonNull::new_unchecked((base + i * 64) as *mut [u8; 64]) };
+                let e = unsafe { ArchiveEntry::new(p, owner) };
+                arch.insert_archive(&e);
+            }
+            assert_eq!(arch.len(), n as u64, "{name}: archive leaf_count");
+            let (a_branches, _slots, a_heap, a_local) = arch.node_stats();
+            assert_eq!(a_heap, 1, "{name}: archive heap_leaves {a_heap} (expected 1 root bootstrap)");
+            assert_eq!(
+                a_local,
+                (n - 1) as u64,
+                "{name}: archive local_leaf_slots {a_local} != N-1 {}",
+                n - 1
+            );
+
+            // Heap build over the same keys (dense, no owner).
+            let mut heap: VWPATCH<64, O, ()> = VWPATCH::new();
+            for k in keys {
+                heap.insert(&Entry::new(k));
+            }
+            let (h_branches, _, _, _) = heap.node_stats();
+            // The structural gate: the archive dense build must reach EXACTLY
+            // the heap dense build's node count over the same keys — proving
+            // archive loading now compresses identically (EAV: ~712K dense, not
+            // single-byte PATCH's ~1.52M). VEA's dense build is intrinsically
+            // bushier (value-first, near-unique prefixes + the non-re-widening
+            // split_two fast path), so its absolute count is higher; the
+            // archive==heap equality is the invariant that matters, and it must
+            // hold for every ordering.
+            assert_eq!(
+                a_branches, h_branches,
+                "{name}: archive branch count {a_branches} != heap {h_branches} \
+                 (dense compression must match the heap build)"
+            );
+
+            // Set-hash oracle: archive trie holds exactly the heap key set.
+            assert_eq!(
+                arch.root_hash(),
+                heap.root_hash(),
+                "{name}: archive root hash != heap root hash"
+            );
+
+            // Present keys (lookups index by tree position).
+            for k in keys {
+                let tk = O::tree_ordered(k);
+                assert!(arch.get(&tk).is_some(), "{name}: present key missing");
+            }
+            // Absent keys.
+            let mut absent = 0u64;
+            for k in keys.iter().take(100_000) {
+                let mut q = *k;
+                q[40] ^= 0xAA;
+                q[41] ^= 0x55;
+                let tq = O::tree_ordered(&q);
+                if arch.get(&tq).is_none() {
+                    absent += 1;
+                }
+            }
+            assert!(absent >= 99_990, "{name}: expected ~100k absent misses, got {absent}");
+
+            // has_prefix at a 16-byte segment boundary (tree-ordered space).
+            let tree0 = O::tree_ordered(&keys[0]);
+            let mut seg16 = [0u8; 16];
+            seg16.copy_from_slice(&tree0[..16]);
+            assert!(arch.has_prefix(&seg16), "{name}: has_prefix(seg16) failed");
+
+            println!(
+                "dense_archive_gate {name}: branches={a_branches} (heap {h_branches}) \
+                 heap_leaves={a_heap} local_leaf_slots={a_local} root_hash_eq=ok"
+            );
+        }
+
+        run_gate::<EAVOrder>("eav", N, base, &owner, keys);
+        run_gate::<VEAOrder>("vea", N, base, &owner, keys);
+
+        drop(owner); // keep the mapping alive through both gates
     }
 }
