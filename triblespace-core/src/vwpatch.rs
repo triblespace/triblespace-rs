@@ -54,6 +54,7 @@ static INIT: Once = Once::new();
 /// branch arm. Below this, the per-key `modify_child` loop wins
 /// because asymmetric merges only touch a handful of slots.
 #[cfg(feature = "parallel")]
+#[allow(dead_code)] // retained for the post-correctness parallel scatter (see parallel_union)
 const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 
 /// Parallel-aware VWPATCH union, with a shared work-stealing budget
@@ -77,6 +78,11 @@ const PARALLEL_PATCH_UNION_THRESHOLD: usize = 4096;
 /// root claims many units; a balanced descent spreads them.
 #[cfg(feature = "parallel")]
 mod parallel_union {
+    // The byte-indexed scatter scaffolding (`ScatterPtr`, the spawn-budget
+    // `ParUnionCtx`) is retained for the post-correctness re-parallelisation of
+    // union/intersect/difference (all three currently delegate to the serial,
+    // span-reconciling paths). Allow the temporarily-unused pieces.
+    #![allow(dead_code)]
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     /// Carries the shared spawn budget across recursive
@@ -959,104 +965,21 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         &self,
         other: &Self,
         at_depth: usize,
-        ctx: &parallel_union::ParUnionCtx,
+        _ctx: &parallel_union::ParUnionCtx,
     ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.hash() == other.hash() {
-            return Some(self.clone());
-        }
-        if self.first_divergence(other, at_depth).is_some() {
-            return None;
-        }
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
-        if self_depth != other_depth {
-            return self.intersect(other, at_depth);
-        }
-
-        let BodyRef::Branch(self_branch) = self.body_ref() else {
-            unreachable!();
-        };
-        let BodyRef::Branch(other_branch) = other.body_ref() else {
-            unreachable!();
-        };
-
-        // Intersect work is bounded by the smaller side — pairs only
-        // exist where keys appear in both branches.
-        let min_leaves = self_branch.leaf_count.min(other_branch.leaf_count) as usize;
-        if min_leaves < PARALLEL_PATCH_UNION_THRESHOLD {
-            return self.intersect(other, at_depth);
-        }
-
-        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-        let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
-
-        // `in_place_scope` runs the outer closure on the calling
-        // thread (no `Send` bound), which lets us hold `&Branch`
-        // borrows across the spawn loop. `Branch` is `!Sync` due
-        // to its raw `*const Leaf` pointer field, so a regular
-        // `rayon::scope` would reject the captures.
-        rayon::in_place_scope(|s| {
-            for slot in self_branch.child_table.iter() {
-                let Some(self_child) = slot.as_ref() else {
-                    continue;
-                };
-                // Equal-depth branches share span_start; fingerprint-select
-                // and childleaf-verify the matching child in `other`.
-                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
-                let Some(other_child) = other_branch.select_child(self_child.childleaf_key())
-                else {
-                    continue;
-                };
-
-                if ctx.try_claim() {
-                    s.spawn(move |_| {
-                        let result =
-                            self_child.par_intersect_with_ctx(other_child, self_depth, ctx);
-                        // SAFETY: distinct span bytes → disjoint slots.
-                        unsafe {
-                            resolved_ptr.write_at(span_byte as usize, result);
-                        }
-                    });
-                } else {
-                    let result = self_child.intersect(other_child, self_depth);
-                    unsafe {
-                        resolved_ptr.write_at(span_byte as usize, result);
-                    }
-                }
-            }
-        });
-
-        // Collect non-None results into a fresh Branch. Stick with
-        // per-key `modify_child` here — intersect's collection
-        // phase typically has FEW children (heavy filtering kept
-        // only the matching subset), so the per-call aggregate
-        // updates beat the fixed `recompute_aggregates` cost. Bench
-        // sanity-checked: install+recompute regressed intersect
-        // +18% on the 4M/50%-overlap dataset.
-        let mut iter = resolved.into_iter().flatten();
-        let first = iter.next()?;
-        let Some(second) = iter.next() else {
-            return Some(first);
-        };
-        let new_branch = Branch::new(
-            self_depth,
-            first.with_start(self_depth),
-            second.with_start(self_depth),
-        );
-        let mut head_for_branch = Head::new(0, new_branch);
-        {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
-            for child in iter {
-                let inserted = child.with_start(self_depth);
-                let k = inserted.key();
-                ed.modify_child(k, |_opt| Some(inserted));
-            }
-        }
-        Some(head_for_branch)
+        // TODO: re-parallelise post-correctness. The previous fan-out path
+        // scattered child tables into 256-slot byte-indexed arrays, which is
+        // invalid for variable-width spans — children are keyed by 16-bit span
+        // fingerprints, not raw bytes, and two equal-depth branches may carry
+        // *different* span windows. The span-reconciling intersect lives in
+        // `Self::intersect`; delegate to it for correctness. Reintroducing
+        // parallelism requires a fingerprint-aware scatter (and a parallel
+        // analogue of `narrow_span` for misaligned windows).
+        self.intersect(other, at_depth)
     }
 
     /// Parallel-aware top-level difference entry. Allocates a fresh
@@ -1081,111 +1004,17 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         &self,
         other: &Self,
         at_depth: usize,
-        ctx: &parallel_union::ParUnionCtx,
+        _ctx: &parallel_union::ParUnionCtx,
     ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if self.hash() == other.hash() {
-            return None;
-        }
-        if self.first_divergence(other, at_depth).is_some() {
-            return Some(self.clone());
-        }
-        let self_depth = self.end_depth();
-        let other_depth = other.end_depth();
-        if self_depth != other_depth {
-            return self.difference(other, at_depth);
-        }
-
-        let BodyRef::Branch(self_branch) = self.body_ref() else {
-            unreachable!();
-        };
-        let BodyRef::Branch(other_branch) = other.body_ref() else {
-            unreachable!();
-        };
-
-        // Difference work is bounded by `self` (every key in self is
-        // either kept or filtered against other).
-        if (self_branch.leaf_count as usize) < PARALLEL_PATCH_UNION_THRESHOLD {
-            return self.difference(other, at_depth);
-        }
-
-        let mut resolved: [Option<Head<KEY_LEN, O, V>>; 256] = std::array::from_fn(|_| None);
-        let resolved_ptr = parallel_union::ScatterPtr(resolved.as_mut_ptr());
-
-        // See `par_intersect_with_ctx` for why this is
-        // `in_place_scope` rather than `scope`.
-        rayon::in_place_scope(|s| {
-            for slot in self_branch.child_table.iter() {
-                let Some(self_child) = slot.as_ref() else {
-                    continue;
-                };
-                // Equal-depth branches share span_start; fingerprint-select
-                // and childleaf-verify the matching child in `other`.
-                let span_byte = self_child.childleaf_key()[O::TREE_TO_KEY[self_depth]];
-
-                match other_branch.select_child(self_child.childleaf_key()) {
-                    Some(other_child) => {
-                        if ctx.try_claim() {
-                            s.spawn(move |_| {
-                                let result = self_child.par_difference_with_ctx(
-                                    other_child,
-                                    self_depth,
-                                    ctx,
-                                );
-                                unsafe {
-                                    resolved_ptr.write_at(span_byte as usize, result);
-                                }
-                            });
-                        } else {
-                            let result = self_child.difference(other_child, self_depth);
-                            unsafe {
-                                resolved_ptr.write_at(span_byte as usize, result);
-                            }
-                        }
-                    }
-                    None => {
-                        // No match in other ⇒ keep `self_child`
-                        // unchanged. Clone is cheap (Arc-style rc
-                        // bump on Branch, leaf is small).
-                        let cloned = self_child.clone();
-                        unsafe {
-                            resolved_ptr.write_at(span_byte as usize, Some(cloned));
-                        }
-                    }
-                }
-            }
-        });
-
-        // Collect non-None results into a fresh Branch. Difference's
-        // collection phase typically has MANY children (most keys
-        // in `self` survive — only matching+empty subtrees get
-        // filtered), so `install_child_growing` + one
-        // `recompute_aggregates` pass wins handily over per-call
-        // `modify_child`. Mirror of the union pattern; intersect
-        // uses `modify_child` because its collection phase has
-        // far fewer children (heavy filtering).
-        let mut iter = resolved.into_iter().flatten();
-        let first = iter.next()?;
-        let Some(second) = iter.next() else {
-            return Some(first);
-        };
-        let new_branch = Branch::new(
-            self_depth,
-            first.with_start(self_depth),
-            second.with_start(self_depth),
-        );
-        let mut head_for_branch = Head::new(0, new_branch);
-        {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
-            for child in iter {
-                ed.install_child_growing(child.with_start(self_depth));
-            }
-            ed.recompute_aggregates();
-        }
-        Some(head_for_branch)
+        // TODO: re-parallelise post-correctness. See `par_intersect_with_ctx`:
+        // the byte-indexed scatter is invalid for variable-width spans. The
+        // span-reconciling difference lives in `Self::difference`; delegate to
+        // it for correctness.
+        self.difference(other, at_depth)
     }
 
     pub(crate) fn infixes<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
@@ -1381,88 +1210,104 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // NOTE: slot-level union wrapper removed; callers should take the slot and
     // call the owned helper `union` directly.
 
+    /// Span-reconciling intersect. Mirrors [`Self::union`]'s reconciliation
+    /// (hash-equal short-circuit → divergence ⇒ disjoint → orient by branch
+    /// depth → `narrow_span` the wider window onto the common boundary before
+    /// matching children), but builds fresh subtrees (`&self`), so it
+    /// clone-then-`narrow_span`s where union mutated in place. The combine
+    /// semantics keep only keys present in BOTH sides.
     pub(crate) fn intersect(&self, other: &Self, at_depth: usize) -> Option<Self> {
         if self.hash() == other.hash() {
             return Some(self.clone());
         }
 
         if self.first_divergence(other, at_depth).is_some() {
+            // The two heads' representatives diverge before either branches ⇒
+            // they share no key ⇒ the intersection is empty.
             return None;
         }
 
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth < other_depth {
-            // This means that there can be at most one child in self
-            // that might intersect with other.
+            // `self` branches earlier (window `[s, te)`); `other` branches at
+            // `other_depth`. If `self`'s window overruns `other`'s branch point
+            // a single-representative `select_child` would match the wrong
+            // window — narrow `self` to `other_depth` and re-enter.
             let BodyRef::Branch(branch) = self.body_ref() else {
                 unreachable!();
             };
+            let te = branch.span_end as usize;
+            if te > other_depth {
+                let narrowed = Self::narrow_span(self.clone(), other_depth);
+                return narrowed.intersect(other, at_depth);
+            }
+            // `te <= other_depth`: `other` sits opaquely within `self`'s window,
+            // so at most one child of `self` can intersect it.
             return branch
                 .select_child(other.childleaf_key())
-                .and_then(|self_child| other.intersect(self_child, self_depth));
+                .and_then(|self_child| self_child.intersect(other, self_depth));
         }
 
         if other_depth < self_depth {
-            // This means that there can be at most one child in other
-            // that might intersect with self.
-            // If the depth of other is less than the depth of self, then it can't be a leaf.
+            // Symmetric: `other` branches earlier. If `other`'s window overruns
+            // `self`'s branch point, narrow `other` first.
             let BodyRef::Branch(other_branch) = other.body_ref() else {
                 unreachable!();
             };
+            let oe = other_branch.span_end as usize;
+            if oe > self_depth {
+                let narrowed = Self::narrow_span(other.clone(), self_depth);
+                return self.intersect(&narrowed, at_depth);
+            }
             return other_branch
                 .select_child(self.childleaf_key())
                 .and_then(|other_child| self.intersect(other_child, other_depth));
         }
 
-        // If we reached this point then the depths are equal. The only way to have a leaf
-        // is if the other is a leaf as well, which is already handled by the hash check if they are equal,
-        // and by the key check if they are not equal.
-        // If one of them is a leaf and the other is a branch, then they would also have different depths,
-        // which is already handled by the above code.
+        // Equal branch depth (`span_start` equal). The two windows may still
+        // differ in `span_end`; reconcile both to the narrower boundary so the
+        // children align on a common fingerprint window before matching.
         let BodyRef::Branch(self_branch) = self.body_ref() else {
             unreachable!();
         };
         let BodyRef::Branch(other_branch) = other.body_ref() else {
             unreachable!();
         };
+        let te = self_branch.span_end as usize;
+        let oe = other_branch.span_end as usize;
+        let target = te.min(oe);
+        if te > target {
+            let narrowed = Self::narrow_span(self.clone(), target);
+            return narrowed.intersect(other, at_depth);
+        }
+        if oe > target {
+            let narrowed = Self::narrow_span(other.clone(), target);
+            return self.intersect(&narrowed, at_depth);
+        }
 
-        let mut intersected_children = self_branch
+        // `te == oe == target`: equal spans. Children now share the window
+        // `[s, te)`, so `select_child` (verified) matches correctly.
+        let intersected_children = self_branch
             .child_table
             .iter()
             .filter_map(Option::as_ref)
             .filter_map(|self_child| {
-                // TODO(vwpatch): span-reconciliation for multi-byte merge —
-                // equal-depth branches may now carry *different* span_end, so
-                // a single-representative select_child is only correct for
-                // single-byte spans.
                 let other_child = other_branch.select_child(self_child.childleaf_key())?;
                 self_child.intersect(other_child, self_depth)
             });
-        let first_child = intersected_children.next()?;
-        let Some(second_child) = intersected_children.next() else {
-            return Some(first_child);
-        };
-        let new_branch = Branch::new(
-            self_depth,
-            first_child.with_start(self_depth),
-            second_child.with_start(self_depth),
-        );
-        // Use a BranchMut editor to perform all child insertions via the
-        // safe editor API instead of manipulating the NonNull pointer
-        // directly. The editor will perform COW and commit the final
-        // pointer into the Head when it is dropped.
-        let mut head_for_branch = Head::new(0, new_branch);
-        {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
-            for child in intersected_children {
-                let inserted = child.with_start(self_depth);
-                let k = inserted.key();
-                ed.modify_child(k, |_opt| Some(inserted));
-            }
-            // ed dropped here commits the final branch pointer into head_for_branch
+        // Re-assemble with the dense machinery, NOT single-byte
+        // `Branch::new`/`with_start`: each surviving child is an opaque subtree
+        // keyed by its `[s, te)` fingerprint, and single-byte keying would
+        // collide (dropping a key) when two children share a byte at `s` but
+        // diverge within the span. `build_dense_node` re-groups by span sub-key
+        // (`max_end = te` keeps every child opaque); a single survivor collapses
+        // the level.
+        let units: Vec<Self> = intersected_children.collect();
+        if units.is_empty() {
+            return None;
         }
-        Some(head_for_branch)
+        Some(Self::build_dense_node(units, self_depth, te))
     }
 
     /// Returns the difference between self and other.
@@ -1480,34 +1325,61 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         let self_depth = self.end_depth();
         let other_depth = other.end_depth();
         if self_depth < other_depth {
-            // This means that there can be at most one child in self
-            // that might intersect with other. It's the only child that may not be in the difference.
-            // The other children are definitely in the difference, as they have no corresponding byte in other.
-            // Thus the cheapest way to compute the difference is compute the difference of the only child
-            // that might intersect with other, copy self with it's correctly filled byte table, then
-            // remove the old child, and insert the new child.
-            let mut new_branch = self.clone();
-            let other_byte_key =
-                fingerprint16(&[other.childleaf_key()[O::TREE_TO_KEY[self_depth]]]);
-            {
-                let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut new_branch);
-                ed.modify_child(other_byte_key, |opt| {
-                    opt.and_then(|child| child.difference(other, self_depth))
-                });
+            // `self` branches earlier (window `[s, te)`); `other` branches at
+            // `other_depth`. If `self`'s window overruns `other`'s branch point,
+            // narrow `self` to `other_depth` and re-enter so the matching child
+            // is keyed on the common window.
+            let BodyRef::Branch(branch) = self.body_ref() else {
+                unreachable!();
+            };
+            let (s, te) = (branch.span_start as usize, branch.span_end as usize);
+            if te > other_depth {
+                let narrowed = Self::narrow_span(self.clone(), other_depth);
+                return narrowed.difference(other, at_depth);
             }
-            return Some(new_branch);
+            // `te <= other_depth`: `other` is opaque within `self`'s window, so
+            // at most one child of `self` (the one whose `[s, te)` sub-key
+            // equals `other`'s) can lose keys; the rest survive whole. Replace
+            // that child with its difference (dropping it if it empties) and
+            // rebuild the level — the dense rebuild reuses each child as an
+            // opaque unit (Arc bump), never walking a subtree. We rebuild
+            // rather than `modify_child` because the latter is keyed by an
+            // unverified fingerprint, ambiguous under multi-byte span
+            // collisions.
+            let mut buf = [0u8; KEY_LEN];
+            let sub = Self::span_sub(other.childleaf_key(), s, te, &mut buf);
+            let mut units: Vec<Self> = Vec::new();
+            for child in branch.child_table.iter().flatten() {
+                let ck = child.childleaf_key();
+                let is_match = (0..(te - s)).all(|j| ck[O::TREE_TO_KEY[s + j]] == sub[j]);
+                if is_match {
+                    if let Some(diffed) = child.difference(other, te) {
+                        units.push(diffed);
+                    }
+                } else {
+                    units.push(child.clone());
+                }
+            }
+            if units.is_empty() {
+                return None;
+            }
+            return Some(Self::build_dense_node(units, s, te));
         }
 
         if other_depth < self_depth {
-            // This means that we need to check if there is a child in other
-            // that matches the path at the current depth of self.
-            // There is no such child, then then self must be in the difference.
-            // If there is such a child, then we have to compute the difference
-            // between self and that child.
-            // We know that other must be a branch.
+            // `other` branches earlier (window `[os, oe)`). If `other`'s window
+            // overruns `self`'s branch point, narrow `other` first. Otherwise
+            // `self` is opaque within `other`'s window: at most one child of
+            // `other` matches `self`'s path. If it exists, subtract it; else
+            // `self` survives whole.
             let BodyRef::Branch(other_branch) = other.body_ref() else {
                 unreachable!();
             };
+            let oe = other_branch.span_end as usize;
+            if oe > self_depth {
+                let narrowed = Self::narrow_span(other.clone(), self_depth);
+                return self.difference(&narrowed, at_depth);
+            }
             if let Some(other_child) = other_branch.select_child(self.childleaf_key()) {
                 return self.difference(other_child, at_depth);
             } else {
@@ -1515,25 +1387,34 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             }
         }
 
-        // If we reached this point then the depths are equal. The only way to have a leaf
-        // is if the other is a leaf as well, which is already handled by the hash check if they are equal,
-        // and by the key check if they are not equal.
-        // If one of them is a leaf and the other is a branch, then they would also have different depths,
-        // which is already handled by the above code.
+        // Equal branch depth (`span_start` equal). The two windows may differ
+        // in `span_end`; reconcile both to the narrower boundary so children
+        // align before matching.
         let BodyRef::Branch(self_branch) = self.body_ref() else {
             unreachable!();
         };
         let BodyRef::Branch(other_branch) = other.body_ref() else {
             unreachable!();
         };
+        let te = self_branch.span_end as usize;
+        let oe = other_branch.span_end as usize;
+        let target = te.min(oe);
+        if te > target {
+            let narrowed = Self::narrow_span(self.clone(), target);
+            return narrowed.difference(other, at_depth);
+        }
+        if oe > target {
+            let narrowed = Self::narrow_span(other.clone(), target);
+            return self.difference(&narrowed, at_depth);
+        }
 
-        let mut differenced_children = self_branch
+        // `te == oe == target`: equal spans. `select_child` (verified) now
+        // matches on the common window.
+        let differenced_children = self_branch
             .child_table
             .iter()
             .filter_map(Option::as_ref)
             .filter_map(|self_child| {
-                // TODO(vwpatch): span-reconciliation for multi-byte merge (see
-                // intersect) — only correct for single-byte spans today.
                 if let Some(other_child) = other_branch.select_child(self_child.childleaf_key()) {
                     self_child.difference(other_child, self_depth)
                 } else {
@@ -1541,31 +1422,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 }
             });
 
-        let first_child = differenced_children.next()?;
-        let second_child = match differenced_children.next() {
-            Some(sc) => sc,
-            None => return Some(first_child),
-        };
-
-        let new_branch = Branch::new(
-            self_depth,
-            first_child.with_start(self_depth),
-            second_child.with_start(self_depth),
-        );
-        let mut head_for_branch = Head::new(0, new_branch);
-        {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut head_for_branch);
-            for child in differenced_children {
-                let inserted = child.with_start(self_depth);
-                let k = inserted.key();
-                ed.modify_child(k, |_opt| Some(inserted));
-            }
-            // ed dropped here commits the final branch pointer into head_for_branch
+        // Re-assemble the surviving children with the dense machinery, NOT a
+        // single-byte `Branch::new`/`with_start`: each surviving child is an
+        // opaque subtree branching at `>= te` keyed by its `[s, te)`
+        // fingerprint, and two children sharing a single byte at `s` but
+        // diverging within the span would collide (and drop a key) under
+        // single-byte keying. `build_dense_node` re-groups by span sub-key
+        // (`max_end = te` keeps every child opaque). A single survivor collapses
+        // the level; difference may remove multiple levels of branches.
+        let units: Vec<Self> = differenced_children.collect();
+        if units.is_empty() {
+            return None;
         }
-        // The key will be set later, because we don't know it yet.
-        // The difference might remove multiple levels of branches,
-        // so we can't just take the key from self or other.
-        Some(head_for_branch)
+        Some(Self::build_dense_node(units, self_depth, te))
     }
 }
 
@@ -3226,6 +3095,76 @@ mod tests {
             prop_assert_eq!(set_vec, tree_vec);
             }
 
+        #[test]
+        fn tree_intersect(left in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 200),
+                        right in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 200)) {
+            let mut left_set = HashSet::new();
+            let mut right_set = HashSet::new();
+
+            let mut left_tree = VWPATCH::<64, IdentitySchema, ()>::new();
+            for entry in left {
+                let mut key = [0; 64];
+                key.iter_mut().set_from(entry.iter().cloned());
+                left_tree.insert(&Entry::new(&key));
+                left_set.insert(key);
+            }
+
+            let mut right_tree = VWPATCH::<64, IdentitySchema, ()>::new();
+            for entry in right {
+                let mut key = [0; 64];
+                key.iter_mut().set_from(entry.iter().cloned());
+                right_tree.insert(&Entry::new(&key));
+                right_set.insert(key);
+            }
+
+            let result = left_tree.intersect(&right_tree);
+
+            let mut oracle: Vec<[u8; 64]> =
+                left_set.intersection(&right_set).copied().collect();
+            let mut tree_vec = vec![];
+            result.infixes(&[0; 0], &mut |&x: &[u8; 64]| tree_vec.push(x));
+
+            oracle.sort();
+            tree_vec.sort();
+            prop_assert_eq!(oracle.len() as u64, result.len());
+            prop_assert_eq!(oracle, tree_vec);
+        }
+
+        #[test]
+        fn tree_difference(left in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 200),
+                        right in prop::collection::vec(prop::collection::vec(0u8..=255, 64), 200)) {
+            let mut left_set = HashSet::new();
+            let mut right_set = HashSet::new();
+
+            let mut left_tree = VWPATCH::<64, IdentitySchema, ()>::new();
+            for entry in left {
+                let mut key = [0; 64];
+                key.iter_mut().set_from(entry.iter().cloned());
+                left_tree.insert(&Entry::new(&key));
+                left_set.insert(key);
+            }
+
+            let mut right_tree = VWPATCH::<64, IdentitySchema, ()>::new();
+            for entry in right {
+                let mut key = [0; 64];
+                key.iter_mut().set_from(entry.iter().cloned());
+                right_tree.insert(&Entry::new(&key));
+                right_set.insert(key);
+            }
+
+            let result = left_tree.difference(&right_tree);
+
+            let mut oracle: Vec<[u8; 64]> =
+                left_set.difference(&right_set).copied().collect();
+            let mut tree_vec = vec![];
+            result.infixes(&[0; 0], &mut |&x: &[u8; 64]| tree_vec.push(x));
+
+            oracle.sort();
+            tree_vec.sort();
+            prop_assert_eq!(oracle.len() as u64, result.len());
+            prop_assert_eq!(oracle, tree_vec);
+        }
+
         // I got a feeling that we're not testing COW properly.
         // We should check if a tree remains the same after a clone of it
         // is modified by inserting new keys.
@@ -3287,7 +3226,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn intersect_multiple_common_children_commits_branchmut() {
         const KEY_SIZE: usize = 4;
         let mut left = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();

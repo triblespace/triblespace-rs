@@ -111,3 +111,98 @@ fn union_round_trip_10m() {
         union_nodes as f64 / direct_nodes as f64,
     );
 }
+
+/// INTERSECT scale gate. `A = keys[0..6M]`, `B = keys[4M..9.97M]`; their
+/// intersection is exactly the overlap `keys[4M..6M]` (2M keys). The
+/// subtree XOR-hash is set-determined, so equality of `A.intersect(B)`
+/// against a direct build of `keys[4M..6M]` is an exact set oracle.
+#[test]
+#[ignore = "scale gate: requires /tmp/facts.simplearchive; release-only (10M keys)"]
+fn intersect_round_trip_10m() {
+    let keys = load_keys();
+    assert_eq!(keys.len(), N, "fixture size mismatch");
+
+    let a_keys = &keys[0..6_000_000];
+    let b_keys = &keys[4_000_000..N];
+    let overlap_keys = &keys[4_000_000..6_000_000];
+
+    let direct = build(overlap_keys);
+    assert_eq!(direct.len(), 2_000_000, "direct overlap leaf_count");
+    let direct_nodes = node_count(&direct);
+
+    let a = build(a_keys);
+    let b = build(b_keys);
+    let inter = a.intersect(&b);
+
+    // leaf_count is exactly the overlap cardinality.
+    assert_eq!(inter.len(), 2_000_000, "intersect leaf_count");
+
+    // set-hash equals a direct build of the overlap (exact oracle).
+    assert_eq!(inter, direct, "intersect set-hash differs from direct overlap build");
+
+    // every overlap key is present.
+    for k in overlap_keys {
+        assert!(inter.get(k).is_some(), "missing overlap key after intersect");
+    }
+    // a sample of A-only / B-only keys is absent.
+    for k in keys[0..4_000_000].iter().step_by(40_000) {
+        assert!(inter.get(k).is_none(), "A-only key present in intersect");
+    }
+    for k in keys[6_000_000..N].iter().step_by(40_000) {
+        assert!(inter.get(k).is_none(), "B-only key present in intersect");
+    }
+
+    let inter_nodes = node_count(&inter);
+    println!(
+        "intersect_round_trip_10m OK: leaves={} inter_nodes={} direct_nodes={} (ratio {:.4})",
+        inter.len(),
+        inter_nodes,
+        direct_nodes,
+        inter_nodes as f64 / direct_nodes as f64,
+    );
+}
+
+/// DIFFERENCE scale gate. `A = keys[0..6M]`, `B = keys[4M..9.97M]`;
+/// `A \ B` is exactly the A-only prefix `keys[0..4M]` (4M keys). Exact
+/// set-determined oracle against a direct build of `keys[0..4M]`.
+#[test]
+#[ignore = "scale gate: requires /tmp/facts.simplearchive; release-only (10M keys)"]
+fn difference_round_trip_10m() {
+    let keys = load_keys();
+    assert_eq!(keys.len(), N, "fixture size mismatch");
+
+    let a_keys = &keys[0..6_000_000];
+    let b_keys = &keys[4_000_000..N];
+    let a_only_keys = &keys[0..4_000_000];
+
+    let direct = build(a_only_keys);
+    assert_eq!(direct.len(), 4_000_000, "direct A-only leaf_count");
+    let direct_nodes = node_count(&direct);
+
+    let a = build(a_keys);
+    let b = build(b_keys);
+    let diff = a.difference(&b);
+
+    // leaf_count is exactly the A-only cardinality.
+    assert_eq!(diff.len(), 4_000_000, "difference leaf_count");
+
+    // set-hash equals a direct build of the A-only prefix (exact oracle).
+    assert_eq!(diff, direct, "difference set-hash differs from direct A-only build");
+
+    // every A-only key present; every overlap key (now in B) absent.
+    for k in a_only_keys.iter().step_by(40_000) {
+        assert!(diff.get(k).is_some(), "missing A-only key after difference");
+    }
+    for k in keys[4_000_000..6_000_000].iter().step_by(40_000) {
+        assert!(diff.get(k).is_none(), "overlap key present in difference");
+    }
+
+    let diff_nodes = node_count(&diff);
+    println!(
+        "difference_round_trip_10m OK: leaves={} diff_nodes={} direct_nodes={} (ratio {:.4})",
+        diff.len(),
+        diff_nodes,
+        direct_nodes,
+        diff_nodes as f64 / direct_nodes as f64,
+    );
+}

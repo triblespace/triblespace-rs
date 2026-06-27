@@ -125,7 +125,9 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// Insert `head` into the child table, growing the allocation if cuckoo
     /// placement fails. Does *not* update the branch's aggregates —
     /// pair with [`Self::recompute_aggregates`] for bulk rewrites.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    // Bulk-rewrite helper retained for the post-correctness parallel scatter;
+    // the serial union/intersect/difference use the dense-insert path instead.
+    #[allow(dead_code)]
     pub fn install_child_growing(&mut self, head: Head<KEY_LEN, O, V>) {
         unsafe {
             Branch::install_child_growing(&mut self.branch_nn, head);
@@ -135,7 +137,7 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
     /// Rebuild aggregates (hash/leaf_count/segment_count/childleaf) in one
     /// linear pass over `child_table`. Call once after a batch of
     /// [`Self::install_child_growing`] mutations.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn recompute_aggregates(&mut self) {
         unsafe {
             Branch::recompute_aggregates(&mut self.branch_nn);
