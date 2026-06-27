@@ -162,6 +162,67 @@ fn intersect_round_trip_10m() {
     );
 }
 
+/// REMOVE scale gate. Build a trie from the full key-set `keys[0..9.97M]`,
+/// remove the tail `keys[6M..9.97M]` one key at a time, and check the result
+/// against a trie built directly from the surviving prefix `keys[0..6M]`. The
+/// subtree XOR-hash is set-determined, so equality of the post-removal root
+/// against the direct build is an *exact* oracle for "exactly the right keys
+/// remain" — independent of internal node structure (removal may leave the trie
+/// slightly over-deep, which the hash oracle is blind to).
+#[test]
+#[ignore = "scale gate: requires /tmp/facts.simplearchive; release-only (10M keys)"]
+fn remove_round_trip_10m() {
+    let keys = load_keys();
+    assert_eq!(keys.len(), N, "fixture size mismatch");
+
+    let survivors = &keys[0..6_000_000];
+    let removed = &keys[6_000_000..N];
+
+    let direct = build(survivors);
+    assert_eq!(direct.len(), 6_000_000, "direct survivor leaf_count");
+
+    let mut trie = build(&keys);
+    assert_eq!(trie.len(), N as u64, "full build leaf_count");
+    let full_nodes = node_count(&trie);
+
+    for k in removed {
+        trie.remove(k);
+    }
+
+    // (iv) leaf_count is exactly the survivor cardinality.
+    assert_eq!(trie.len(), 6_000_000, "post-remove leaf_count");
+
+    // (i) set-hash equals a direct build of the survivors (exact oracle).
+    assert_eq!(trie, direct, "post-remove set-hash differs from direct survivor build");
+
+    // (ii) every survivor is present; (iii) every removed key is absent.
+    for k in survivors {
+        assert!(trie.get(k).is_some(), "missing survivor after remove");
+    }
+    for k in removed {
+        assert!(trie.get(k).is_none(), "removed key still present");
+    }
+
+    // Replace spot-check: re-inserting a survivor key via the value-replacing
+    // path is a no-op on the key set (values are not part of the hash), so the
+    // set-hash must be unchanged. `()`-valued tries make this a pure set check.
+    {
+        let mut t2 = build(survivors);
+        t2.replace(&Entry::new(&survivors[0]));
+        assert_eq!(t2, direct, "replace of present key changed the set-hash");
+        assert_eq!(t2.len(), 6_000_000, "replace changed leaf_count");
+    }
+
+    let remove_nodes = node_count(&trie);
+    println!(
+        "remove_round_trip_10m OK: leaves={} remove_nodes={} full_nodes={} (over-depth ratio vs full {:.4})",
+        trie.len(),
+        remove_nodes,
+        full_nodes,
+        remove_nodes as f64 / node_count(&direct) as f64,
+    );
+}
+
 /// DIFFERENCE scale gate. `A = keys[0..6M]`, `B = keys[4M..9.97M]`;
 /// `A \ B` is exactly the A-only prefix `keys[0..4M]` (4M keys). Exact
 /// set-determined oracle against a direct build of `keys[0..4M]`.

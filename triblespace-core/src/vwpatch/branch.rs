@@ -96,6 +96,12 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         Self::from_head(head)
     }
 
+    // General fingerprint-keyed insert/update/remove editor primitive. The
+    // dense ops descend via the *verified* `recurse_dense_child` /
+    // `remove_dense_child` (fingerprint-only matching is ambiguous under
+    // multi-byte spans), so this is now exercised only by the BranchMut unit
+    // tests; retained as the documented general editor entry point.
+    #[allow(dead_code)]
     pub fn modify_child<F>(&mut self, key: u16, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
@@ -231,6 +237,84 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> BranchMut<'a, KEY_LEN, 
         }
         None
     }
+
+    /// Verified-descent removal. Finds the child whose span sub-key equals
+    /// `sub` (fingerprint `fp`); if none exists this is a no-op and returns
+    /// `None`. Otherwise applies `f` to the (owned) child:
+    ///   * `Some(new)` replaces it in place, re-keyed by `fp` (the span sub-key
+    ///     is invariant under the recursion: every key under the matched child
+    ///     shares `sub` over `[span_start, span_end)`);
+    ///   * `None` deletes it.
+    /// Aggregates (hash/leaf_count/segment_count) and `childleaf` are updated
+    /// incrementally, mirroring [`Self::recurse_dense_child`]. Returns
+    /// `Some(true)` when the deletion left exactly one filled child (the caller
+    /// must splice that child up — single-child branches are non-canonical),
+    /// otherwise `Some(false)`. The verified lookup (vs the fingerprint-only
+    /// `modify_child`) is required because multi-byte span fingerprints are not
+    /// injective, so a bare fingerprint match may name the wrong child.
+    #[must_use]
+    pub fn remove_dense_child<F>(&mut self, fp: u16, sub: &[u8], f: F) -> Option<bool>
+    where
+        F: FnOnce(Head<KEY_LEN, O, V>) -> Option<Head<KEY_LEN, O, V>>,
+    {
+        let span_start = self.span_start as usize;
+        let branch_childleaf = self.childleaf;
+        let base_hash = self.hash;
+        let base_seg = self.segment_count;
+        let base_leaf = self.leaf_count;
+
+        let branch = unsafe { self.branch_nn.as_mut() };
+        let Some(slot) = branch.child_table.table_get_slot_verified(fp, |child| {
+            let ck = child.childleaf_key();
+            (0..sub.len()).all(|j| ck[O::TREE_TO_KEY[span_start + j]] == sub[j])
+        }) else {
+            return None;
+        };
+
+        let child = slot.take().unwrap();
+        let old_hash = child.hash();
+        let old_seg = child.count_segment(span_start);
+        let old_leaf = child.count();
+        let replaced_childleaf = child.childleaf_ptr() == branch_childleaf;
+
+        let collapse = match f(child) {
+            Some(new_child) => {
+                let new_hash = new_child.hash();
+                let new_seg = new_child.count_segment(span_start);
+                let new_leaf = new_child.count();
+                let new_cl = new_child.childleaf_ptr();
+                *slot = Some(new_child.with_key(fp));
+                branch.hash = (base_hash ^ old_hash) ^ new_hash;
+                branch.segment_count = (base_seg - old_seg) + new_seg;
+                branch.leaf_count = (base_leaf - old_leaf) + new_leaf;
+                if replaced_childleaf {
+                    branch.childleaf = new_cl;
+                }
+                false
+            }
+            None => {
+                // `slot` already holds `None` from the `take()` above.
+                branch.hash = base_hash ^ old_hash;
+                branch.segment_count = base_seg - old_seg;
+                branch.leaf_count = base_leaf - old_leaf;
+                if replaced_childleaf {
+                    branch.childleaf = branch
+                        .child_table
+                        .iter()
+                        .flatten()
+                        .map(|c| c.childleaf_ptr())
+                        .next()
+                        .unwrap_or(std::ptr::null());
+                }
+                branch.child_table.iter().flatten().count() == 1
+            }
+        };
+        #[cfg(debug_assertions)]
+        unsafe {
+            self.branch_nn.as_ref().debug_check_invariants();
+        }
+        Some(collapse)
+    }
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Deref for BranchMut<'a, KEY_LEN, O, V> {
@@ -351,36 +435,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Body
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>
 {
-    pub(super) fn new(
-        span_start: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-    ) -> NonNull<Self> {
-        Self::new_with_owner(span_start, lchild, rchild, None)
-    }
-
-    /// Like [`Self::new`] but sets the branch's `owner` field — used by
-    /// the archive-leaf-elimination path so that a Branch created when
-    /// inserting a `LocalLeaf` adopts the entry's archive owner.
-    pub(super) fn new_with_owner(
-        span_start: usize,
-        lchild: Head<KEY_LEN, O, V>,
-        rchild: Head<KEY_LEN, O, V>,
-        owner: Option<Arc<dyn ArchiveOwner>>,
-    ) -> NonNull<Self> {
-        // Compute rchild's hash via the normal path. For LocalLeaf
-        // this triggers siphash24; the
-        // [`new_with_owner_and_rchild_hash`] variant skips it when
-        // the caller has the hash already.
-        let rchild_hash = rchild.hash();
-        Self::new_with_owner_and_rchild_hash(span_start, lchild, rchild, owner, rchild_hash)
-    }
-
-    /// Variant of [`Self::new_with_owner`] that takes a precomputed
-    /// `rchild_hash` and uses it instead of calling `rchild.hash()`.
-    /// Lets archive-ingest divergence paths reuse the
-    /// `ArchiveEntry::hash` they already have instead of recomputing
-    /// siphash24 over the LocalLeaf bytes.
+    /// Allocate a fresh two-child, single-byte-span branch, taking a precomputed
+    /// `rchild_hash` instead of calling `rchild.hash()`. Lets archive-ingest
+    /// divergence paths reuse the `ArchiveEntry::hash` they already have instead
+    /// of recomputing siphash24 over the LocalLeaf bytes. (`owner` is `Some` on
+    /// the archive-leaf-elimination path so the branch adopts the entry's
+    /// archive owner; `None` for pure-memory branches.)
     ///
     /// `rchild_hash` MUST equal `rchild.hash()`. The lchild hash
     /// still goes through the normal path — it's typically a Branch
@@ -573,6 +633,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// insert/update/remove logic in one place and updates branch aggregates
     /// and `childleaf` as needed. The `branch_nn` pointer may be updated in
     /// place when the underlying allocation grows.
+    ///
+    /// Superseded in production by the verified dense descent
+    /// (`recurse_dense_child` / `remove_dense_child`); retained for the
+    /// `BranchMut` unit tests and as the general editor primitive.
+    #[allow(dead_code)]
     pub(super) fn modify_child<F>(branch_nn: &mut NonNull<Self>, key: u16, f: F)
     where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,

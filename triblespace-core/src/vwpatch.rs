@@ -543,52 +543,67 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // NOTE: mut_children removed — prefer matching on BodyRef returned by
     // `body_mut()` and operating directly on the `&mut Branch` reference.
 
+    /// Span-reconciling removal of `leaf_key` from the subtree in `slot`.
+    ///
+    /// Variable-width spans mean a branch's children are keyed by the 16-bit
+    /// fingerprint of their span sub-key over `[span_start, span_end)`, not by a
+    /// raw byte — so the descent must fingerprint the matching window and use a
+    /// *verified* lookup ([`BranchMut::remove_dense_child`]), since multi-byte
+    /// fingerprints collide. Removal can also UNDERFLOW: dropping a child may
+    /// leave a branch with a single child, which is non-canonical. We splice
+    /// that lone child up (its span and subtree stay intact; the parent re-keys
+    /// it by its own fingerprint on the way out, or the key is irrelevant at the
+    /// root). This only ever makes the trie shallower — never deeper — so no
+    /// span re-widening is needed for correctness; a branch that lost fanout
+    /// keeps its (now possibly narrower-than-canonical) span, leaving the trie
+    /// slightly over-deep but fully correct.
     pub(crate) fn remove_leaf(
         slot: &mut Option<Self>,
         leaf_key: &[u8; KEY_LEN],
         start_depth: usize,
     ) {
-        if let Some(this) = slot {
-            let end_depth = std::cmp::min(this.end_depth(), KEY_LEN);
-            // Check reachable equality by asking the head to test the prefix
-            // up to its end_depth. Using the head/leaf primitive centralises the
-            // unsafe deref into Branch::childleaf()/Leaf::has_prefix.
-            if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
+        let Some(this) = slot.as_ref() else {
+            return;
+        };
+        // The representative must match `leaf_key` along the compressed path
+        // (for a branch, `[start_depth, span_start)`) or be exactly `leaf_key`
+        // (for a leaf). If not, the key is absent under this head.
+        if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
+            return;
+        }
+        let (s, e) = match this.body_ref() {
+            // An exact-key leaf (heap or archive-local): drop it.
+            BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
+                slot.take();
                 return;
             }
-            if this.tag() == HeadTag::Leaf {
-                slot.take();
-            } else {
-                let mut ed = crate::vwpatch::branch::BranchMut::from_head(this);
-                let key = leaf_key[end_depth] as u16;
-                ed.modify_child(key, |mut opt| {
-                    Self::remove_leaf(&mut opt, leaf_key, end_depth);
-                    opt
-                });
+            BodyRef::Branch(b) => (b.span_start as usize, b.span_end as usize),
+        };
 
-                // If the branch now contains a single remaining child we
-                // collapse the branch upward into that child. We must pull
-                // the remaining child out while `ed` is still borrowed,
-                // then drop `ed` before writing back into `slot` to avoid
-                // double mutable borrows of the slot.
-                if ed.leaf_count == 1 {
-                    let mut remaining: Option<Head<KEY_LEN, O, V>> = None;
-                    for slot_child in &mut ed.child_table {
-                        if let Some(child) = slot_child.take() {
-                            remaining = Some(child.with_start(start_depth));
-                            break;
-                        }
-                    }
-                    drop(ed);
-                    if let Some(child) = remaining {
-                        slot.replace(child);
-                    }
-                } else {
-                    // ensure we drop the editor when not collapsing so the
-                    // final pointer is committed back into the head.
-                    drop(ed);
+        let mut buf = [0u8; KEY_LEN];
+        let sub = Self::span_sub(leaf_key, s, e, &mut buf);
+        let fp = fingerprint16(sub);
+
+        let collapse = {
+            let this_mut = slot.as_mut().unwrap();
+            let mut ed = crate::vwpatch::branch::BranchMut::from_head(this_mut);
+            ed.remove_dense_child(fp, sub, |child| {
+                let mut opt = Some(child);
+                Self::remove_leaf(&mut opt, leaf_key, e);
+                opt
+            })
+        };
+
+        // Underflow: the branch dropped to a single child. Splice that child up
+        // into `slot`, collapsing the redundant branch level.
+        if collapse == Some(true) {
+            let remaining: Option<Self> = match slot.as_mut().unwrap().body_mut() {
+                BodyMut::Branch(b) => b.child_table.iter_mut().filter_map(Option::take).next(),
+                BodyMut::Leaf(_) | BodyMut::LocalLeaf(_) => {
+                    unreachable!("collapse only reported for a Branch node")
                 }
-            }
+            };
+            *slot = remaining;
         }
     }
 
@@ -597,37 +612,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     // directly. This reduces the indirection and keeps ownership semantics
     // explicit at the call site.
 
-    // Owned variants of the slot-based helpers. These accept the existing
-    // Head by value and return the new Head after performing the
-    // modification. They are used with the split `insert_child` /
-    // `update_child` APIs so we no longer need `Branch::upsert_child`.
-    // TODO(vwpatch): single-byte legacy insert, kept for the archive/owner
-    // path and unit tests; the dense `insert_dense` is the production path.
+    // Owned set-insert of a single fresh `leaf` head into `this`. This is just
+    // the variable-width dense insert ([`Self::insert_dense`]); the historical
+    // single-byte `insert_leaf` body (raw-byte `with_start` keys, single-byte
+    // `Branch::new`) mis-keys children on a multi-byte dense trie. Kept as a
+    // named entry point for the archive/owner path and the BranchMut unit tests.
     #[allow(dead_code)]
-    pub(crate) fn insert_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
-        if let Some((depth, this_byte_key, leaf_byte_key)) =
-            this.first_divergence(&leaf, start_depth)
-        {
-            let old_key = this.key();
-            let new_body = crate::vwpatch::branch::Branch::new(
-                depth,
-                this.with_key(fingerprint16(&[this_byte_key])),
-                leaf.with_key(fingerprint16(&[leaf_byte_key])),
-            );
-            return Head::new(old_key, new_body);
-        }
-
-        let end_depth = this.end_depth();
-        if end_depth != KEY_LEN {
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::insert_leaf(old, inserted, end_depth)),
-                None => Some(inserted),
-            });
-        }
-        this
+    pub(crate) fn insert_leaf(this: Self, leaf: Self, start_depth: usize) -> Self {
+        Self::insert_dense(this, leaf, start_depth)
     }
 }
 
@@ -763,35 +755,67 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
 // union, intersect, query operations, etc.) which don't care about V
 // shape and so remain in the V-generic impl block.
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
-    pub(crate) fn replace_leaf(mut this: Self, leaf: Self, start_depth: usize) -> Self {
-        if let Some((depth, this_byte_key, leaf_byte_key)) =
-            this.first_divergence(&leaf, start_depth)
-        {
-            let old_key = this.key();
-            let new_body = Branch::new(
-                depth,
-                this.with_key(fingerprint16(&[this_byte_key])),
-                leaf.with_key(fingerprint16(&[leaf_byte_key])),
-            );
+    /// Span-reconciling set-insert that REPLACES the value of an existing key.
+    ///
+    /// Identical in shape to the variable-width [`Self::insert_dense`] — same
+    /// divergence/`split_two`, same fingerprint descent, same add/overflow add
+    /// path — with one difference: when the key is already present, the dense
+    /// insert returns `this` unchanged (idempotent set insert), whereas replace
+    /// swaps in `leaf` so the stored value updates. Since values are not hashed,
+    /// the swap leaves the set-hash and all aggregate counts unchanged; only the
+    /// leaf node (and any `childleaf` pointer naming it) is refreshed.
+    pub(crate) fn replace_leaf(mut this: Self, leaf: Self, at_depth: usize) -> Self {
+        match this.tag() {
+            HeadTag::Leaf | HeadTag::LocalLeaf => match this.first_divergence(&leaf, at_depth) {
+                // Same key: swap the value-carrying leaf, keeping the slot key.
+                None => leaf.with_key(this.key()),
+                Some((start, _, _)) => Self::split_two(this, leaf, start),
+            },
+            _ => {
+                let (s, e) = {
+                    let BodyRef::Branch(b) = this.body_ref() else {
+                        unreachable!()
+                    };
+                    (b.span_start as usize, b.span_end as usize)
+                };
 
-            return Head::new(old_key, new_body);
-        }
+                // Compressed-path divergence: the new key doesn't belong under
+                // this branch's span — wrap both under a fresh parent (O(1)).
+                if let Some((start, _, _)) = this.first_divergence(&leaf, at_depth) {
+                    return Self::split_two(this, leaf, start);
+                }
 
-        let end_depth = this.end_depth();
-        if end_depth == KEY_LEN {
-            let old_key = this.key();
-            return leaf.with_key(old_key);
-        } else {
-            // Use the editor view for branch mutation instead of raw pointer ops.
-            let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
-            let inserted = leaf.with_start(ed.span_start as usize);
-            let key = inserted.key();
-            ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::replace_leaf(old, inserted, end_depth)),
-                None => Some(inserted),
-            });
+                let mut buf = [0u8; KEY_LEN];
+                let sub = Self::span_sub(leaf.childleaf_key(), s, e, &mut buf);
+                let fp = fingerprint16(sub);
+
+                let mut leaf_opt = Some(leaf);
+                let mut ed = crate::vwpatch::branch::BranchMut::from_head(&mut this);
+                if ed.recurse_dense_child(fp, sub, |child| {
+                    Self::replace_leaf(child, leaf_opt.take().unwrap(), e)
+                }) {
+                    drop(ed);
+                    return this;
+                }
+                let leaf = leaf_opt.take().unwrap();
+
+                // Key absent — add it exactly as the dense insert does.
+                let over_cap = ed.child_table.len() >= 256
+                    && ed.child_table.iter().flatten().count() >= Self::max_fanout(e - s);
+                if over_cap {
+                    drop(ed);
+                    return Self::narrow_with(this, leaf, s, e);
+                }
+
+                let inserted = leaf.with_span(s, e);
+                let leftover = ed.add_dense_child(inserted);
+                drop(ed);
+                if let Some(leftover) = leftover {
+                    return Self::narrow_with(this, leftover, s, e);
+                }
+                this
+            }
         }
-        this
     }
 
     /// Sequential VWPATCH-trie union. Always serial; the parallel
@@ -2793,7 +2817,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn tree_replace_childleaf_updates_branch() {
         const KEY_SIZE: usize = 64;
         let key1 = [0u8; KEY_SIZE];
@@ -2851,7 +2874,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn remove_childleaf_updates_branch() {
         const KEY_SIZE: usize = 4;
         let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
@@ -2874,7 +2896,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn remove_collapses_branch_to_single_child() {
         const KEY_SIZE: usize = 4;
         let mut tree = VWPATCH::<KEY_SIZE, IdentitySchema, u32>::new();
@@ -2989,6 +3010,51 @@ mod tests {
             }
 
             prop_assert_eq!(set.len() as u64, tree.len())
+        }
+
+        /// Insert a random key set, then remove a pseudo-random subset, and
+        /// assert membership matches a `HashSet` oracle (and `leaf_count` the
+        /// oracle cardinality). A small alphabet over 12-byte keys forces heavy
+        /// prefix sharing — deep multi-byte spans, branch collapses on
+        /// underflow, and fingerprint collisions — exactly the cases the
+        /// single-byte ops mis-handled. In debug builds every `remove`
+        /// internally fires `Branch::debug_check_invariants` after each
+        /// mutation, so aggregate/childleaf consistency is checked *throughout*,
+        /// not just at the end. Run heavy with `PROPTEST_CASES=2000`.
+        #[test]
+        fn tree_remove(
+            keys in prop::collection::vec(prop::collection::vec(0u8..=4, 12), 1..512),
+            remove_flags in prop::collection::vec(any::<bool>(), 1..256),
+        ) {
+            const K: usize = 12;
+            let mut tree = VWPATCH::<K, IdentitySchema, ()>::new();
+            let mut set: HashSet<[u8; K]> = HashSet::new();
+            let mut distinct: Vec<[u8; K]> = Vec::new();
+            for key in keys {
+                let key: [u8; K] = key.try_into().unwrap();
+                tree.insert(&Entry::new(&key));
+                if set.insert(key) {
+                    distinct.push(key);
+                }
+            }
+
+            for (i, key) in distinct.iter().enumerate() {
+                if remove_flags[i % remove_flags.len()] {
+                    tree.remove(key);
+                    set.remove(key);
+                    // Removing again must be an idempotent no-op.
+                    tree.remove(key);
+                    prop_assert!(tree.get(key).is_none());
+                }
+            }
+
+            prop_assert_eq!(tree.len(), set.len() as u64);
+            for key in &distinct {
+                prop_assert_eq!(tree.get(key).is_some(), set.contains(key));
+            }
+            // Removing a never-inserted key is a no-op too.
+            tree.remove(&[255u8; K]);
+            prop_assert_eq!(tree.len(), set.len() as u64);
         }
 
         #[test]
@@ -3196,7 +3262,6 @@ mod tests {
         }
 
         #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn cow_on_union(base_keys in prop::collection::vec(prop::collection::vec(0u8..=255, 8), 1..1024),
                          new_keys in prop::collection::vec(prop::collection::vec(0u8..=255, 8), 1..1024)) {
             // Note that we can't compare the trees directly, as that uses the hash,
@@ -3309,7 +3374,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deferred single-byte op (union/intersect/difference/remove/replace/insert_leaf) on a multi-byte dense trie — TODO(vwpatch): span-reconciliation"]
     fn slot_edit_branchmut_insert_update() {
         // Small unit test demonstrating the Slot::edit -> BranchMut insert/update pattern.
         const KEY_SIZE: usize = 8;
@@ -3321,19 +3385,23 @@ mod tests {
         tree.insert(&entry2);
         assert_eq!(tree.len(), 2);
 
-        // Edit the root slot in-place using the BranchMut editor.
+        // Edit the root slot in-place using the BranchMut editor. Children of a
+        // variable-width branch are keyed by the fingerprint of their span
+        // sub-key over `[span_start, span_end)`, so the inserted head must be
+        // span-keyed (`with_span`) — a raw single-byte key would mis-place it.
         {
             let mut ed = crate::vwpatch::branch::BranchMut::from_slot(&mut tree.root);
 
-            // Compute the insertion start depth first to avoid borrowing `ed` inside the closure.
-            let start_depth = ed.span_start as usize;
+            // Compute the span bounds first to avoid borrowing `ed` in the closure.
+            let span_start = ed.span_start as usize;
+            let span_end = ed.span_end as usize;
             let inserted = Entry::with_value(&[2u8; KEY_SIZE], 3u32)
                 .leaf::<IdentitySchema>()
-                .with_start(start_depth);
+                .with_span(span_start, span_end);
             let key = inserted.key();
 
             ed.modify_child(key, |opt| match opt {
-                Some(old) => Some(Head::insert_leaf(old, inserted, start_depth)),
+                Some(old) => Some(Head::insert_leaf(old, inserted, span_end)),
                 None => Some(inserted),
             });
             // BranchMut is dropped here and commits the updated branch pointer back into the head.
