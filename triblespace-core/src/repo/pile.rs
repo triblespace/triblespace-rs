@@ -60,9 +60,19 @@ use crate::inline::InlineEncoding;
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
+/// Blob record whose DATA is aligned to [`GPU_DATA_ALIGNMENT`] (via pre-header
+/// padding) so the bytes can be bound directly as a GPU storage buffer
+/// (zero-copy mmap aliasing). Layout: `[header][pre_pad][data][post_pad]`.
+/// Identical to a V1 [`MAGIC_MARKER_BLOB`] record except for the pre_pad; the
+/// scan branches on the marker, so V1 records are read byte-identically.
+/// (minted 2026-06-28 via `trible genid`)
+const MAGIC_MARKER_BLOB_V2: RawId = hex!("ACDBB53F22CEB71C8AA1497DA812F089");
 
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
+/// Alignment a V2 record's DATA start is padded to — the GPU storage-buffer
+/// binding-offset requirement (Metal `min_storage_buffer_offset_alignment`).
+const GPU_DATA_ALIGNMENT: usize = 256;
 
 /// Largest single blob record we'll write with the concurrent `write_vectored`
 /// fast path. Linux caps a single `writev` at `MAX_RW_COUNT` (`INT_MAX &
@@ -158,6 +168,17 @@ impl BlobHeader {
             hash: hash.raw,
         }
     }
+
+    /// A V2 (GPU-data-aligned) blob record header. Same fields, different marker;
+    /// the scan branches on the marker to insert the pre-header padding.
+    fn new_v2(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BLOB_V2,
+            timestamp,
+            length,
+            hash: hash.raw,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -190,6 +211,17 @@ pub struct Pile {
 
 fn padding_for_blob(blob_size: usize) -> usize {
     (BLOB_ALIGNMENT - ((BLOB_HEADER_LEN + blob_size) % BLOB_ALIGNMENT)) % BLOB_ALIGNMENT
+}
+
+/// Padding inserted BETWEEN a V2 record's header and its data so the data start
+/// lands on [`GPU_DATA_ALIGNMENT`]. Depends on the record's absolute start offset
+/// (so V2 writes hold the exclusive lock to keep that offset stable); the scan
+/// recomputes it identically from the record start. `record_start` and
+/// `BLOB_HEADER_LEN` are both multiples of `BLOB_ALIGNMENT` (64) and 64 divides
+/// 256, so the result is always a multiple of 64 — the next record stays
+/// 64-aligned via the usual post-padding.
+fn pre_pad_for(record_start: usize) -> usize {
+    (GPU_DATA_ALIGNMENT - ((record_start + BLOB_HEADER_LEN) % GPU_DATA_ALIGNMENT)) % GPU_DATA_ALIGNMENT
 }
 
 #[derive(Debug, Clone)]
@@ -616,6 +648,69 @@ impl Pile {
                 self.applied_length = start_offset + BLOB_HEADER_LEN + data_len + pad;
                 Ok(Some(Applied::Blob { hash }))
             }
+            MAGIC_MARKER_BLOB_V2 => {
+                // Same as a V1 blob record, but with `pre_pad` bytes between the
+                // header and the data so the data start is GPU_DATA_ALIGNMENT-
+                // aligned. `pre_pad` is recomputed here from the record's actual
+                // start offset — identical to what the (exclusive-locked) writer
+                // laid down.
+                let header =
+                    bytes
+                        .view_prefix::<BlobHeader>()
+                        .map_err(|_| ReadError::CorruptPile {
+                            valid_length: start_offset,
+                        })?;
+                let data_len = header.length as usize;
+                let pre_pad = pre_pad_for(start_offset);
+                let post_pad = padding_for_blob(data_len);
+                let data_offset = start_offset + BLOB_HEADER_LEN + pre_pad;
+                bytes.take_prefix(pre_pad).ok_or(ReadError::CorruptPile {
+                    valid_length: start_offset,
+                })?;
+                bytes.take_prefix(data_len).ok_or(ReadError::CorruptPile {
+                    valid_length: start_offset,
+                })?;
+                bytes.take_prefix(post_pad).ok_or(ReadError::CorruptPile {
+                    valid_length: start_offset,
+                })?;
+                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
+                let ts = header.timestamp;
+                let entry =
+                    Entry::with_value(&hash.raw, IndexEntry::new(data_offset, header.length, ts));
+                match self.blobs.get(&hash.raw) {
+                    None => {
+                        self.blobs.insert(&entry);
+                    }
+                    Some(entry_ref) => {
+                        let IndexEntry {
+                            state, offset, len, ..
+                        } = entry_ref.clone();
+                        let state = state.get_or_init(|| {
+                            let bytes = unsafe {
+                                let slice = slice_from_raw_parts(
+                                    self.mmap.as_ptr().add(offset),
+                                    len as usize,
+                                )
+                                .as_ref()
+                                .unwrap();
+                                Bytes::from_raw_parts(slice, self.mmap.clone())
+                            };
+                            let computed = Hash::<Blake3>::digest(&bytes);
+                            if computed == hash {
+                                ValidationState::Validated
+                            } else {
+                                ValidationState::Invalid
+                            }
+                        });
+                        if let ValidationState::Invalid = state {
+                            self.blobs.replace(&entry);
+                        }
+                    }
+                }
+                self.applied_length =
+                    start_offset + BLOB_HEADER_LEN + pre_pad + data_len + post_pad;
+                Ok(Some(Applied::Blob { hash }))
+            }
             MAGIC_MARKER_BRANCH => {
                 let header =
                     bytes
@@ -880,11 +975,37 @@ impl BlobStorePut for Pile {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
+        self.put_impl(item, false)
+    }
+
+    fn put_aligned<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.put_impl(item, true)
+    }
+}
+
+impl Pile {
+    /// Shared blob-append used by both [`BlobStorePut::put`] (`aligned=false`,
+    /// a V1 record) and [`BlobStorePut::put_aligned`] (`aligned=true`, a 256-data-
+    /// aligned V2 record). V2 writes take the EXCLUSIVE file lock so the record's
+    /// start offset is stable (the pre-header pad depends on it) and the scan
+    /// recomputes the same pad.
+    fn put_impl<S, T>(&mut self, item: T, aligned: bool) -> Result<Inline<Handle<S>>, InsertError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
         let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
         let padding = padding_for_blob(blob_size);
         let record_size = BLOB_HEADER_LEN + blob_size + padding;
-        let use_atomic = record_size <= ATOMIC_WRITE_LIMIT;
+        // V2 (aligned) records must hold the exclusive lock — see doc above.
+        let use_atomic = record_size <= ATOMIC_WRITE_LIMIT && !aligned;
 
         if use_atomic {
             self.file.lock_shared()?;
@@ -925,29 +1046,44 @@ impl BlobStorePut for Pile {
             }
 
             let now_in_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-            let header = BlobHeader::new(now_in_ms as u64, blob_size as u64, hash);
-            let padding_buf = [0u8; BLOB_ALIGNMENT];
+            // A V2 (aligned) record inserts `pre_pad` bytes between header and data
+            // so the data start is GPU_DATA_ALIGNMENT-aligned. `self.applied_length`
+            // is this record's start offset (refreshed above; stable because V2
+            // holds the exclusive lock). For V1, pre_pad == 0 → byte-identical.
+            let pre_pad = if aligned { pre_pad_for(self.applied_length) } else { 0 };
+            let header = if aligned {
+                BlobHeader::new_v2(now_in_ms as u64, blob_size as u64, hash)
+            } else {
+                BlobHeader::new(now_in_ms as u64, blob_size as u64, hash)
+            };
+            let actual_record_size = BLOB_HEADER_LEN + pre_pad + blob_size + padding;
+            // Big enough for pre_pad (<= 192) and post-pad (< 64).
+            let zero_buf = [0u8; GPU_DATA_ALIGNMENT];
             if use_atomic {
                 let bufs = [
                     IoSlice::new(header.as_bytes()),
+                    IoSlice::new(&zero_buf[..pre_pad]),
                     IoSlice::new(blob.bytes.as_ref()),
-                    IoSlice::new(&padding_buf[..padding]),
+                    IoSlice::new(&zero_buf[..padding]),
                 ];
                 let written = self.file.write_vectored(&bufs)?;
-                if written != record_size {
+                if written != actual_record_size {
                     return Err(InsertError::IoError(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
                         "failed to write blob record",
                     )));
                 }
             } else {
-                // Three separate `write_all` calls — payload dominates, so
-                // the extra syscalls for header/padding are negligible. Any
-                // partial completion after a crash is caught by `restore`.
+                // Separate `write_all` calls — payload dominates, so the extra
+                // syscalls for header/padding are negligible. Any partial
+                // completion after a crash is caught by `restore`.
                 self.file.write_all(header.as_bytes())?;
+                if pre_pad > 0 {
+                    self.file.write_all(&zero_buf[..pre_pad])?;
+                }
                 self.file.write_all(blob.bytes.as_ref())?;
                 if padding > 0 {
-                    self.file.write_all(&padding_buf[..padding])?;
+                    self.file.write_all(&zero_buf[..padding])?;
                 }
             }
 
@@ -1191,6 +1327,82 @@ mod tests {
         let mut reopened: Pile = Pile::open(&tmp_pile).unwrap();
         reopened.restore().unwrap();
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn put_aligned_v2_256_aligned_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "v2.pile");
+        // Sizes around the 64/256 boundaries to exercise every pre_pad value.
+        let sizes = [1usize, 7, 33, 64, 100, 192, 255, 256, 257, 1000, 4096];
+        let mut hashes = Vec::new();
+        let mut datas: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut pile: Pile = Pile::open(&path).unwrap();
+            for &sz in &sizes {
+                let data: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
+                let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
+                let h = pile.put_aligned::<UnknownBlob, _>(blob).unwrap();
+                let hash: Inline<Hash<Blake3>> = h.into();
+                hashes.push(hash);
+                datas.push(data);
+            }
+            pile.close().unwrap();
+        }
+        // Reopen fresh — the scan rebuilds the index from the on-disk V2 records.
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        pile.restore().unwrap();
+        for (hash, expected) in hashes.iter().zip(&datas) {
+            let entry = pile.blobs.get(&hash.raw).expect("V2 blob missing after reopen").clone();
+            let IndexEntry { offset, len, .. } = entry;
+            assert_eq!(
+                offset % GPU_DATA_ALIGNMENT,
+                0,
+                "V2 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
+                expected.len()
+            );
+            let got = unsafe {
+                std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize)
+            };
+            assert_eq!(got, &expected[..], "V2 roundtrip mismatch (size {})", expected.len());
+        }
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn put_aligned_and_put_interleave() {
+        // V1 (dense) and V2 (256-aligned) records in ONE pile must both scan and
+        // read back correctly — a V2 record's pre_pad must not desync the walk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "mix.pile");
+        let mut entries: Vec<(Inline<Hash<Blake3>>, Vec<u8>, bool)> = Vec::new();
+        {
+            let mut pile: Pile = Pile::open(&path).unwrap();
+            for i in 0..20usize {
+                let d1: Vec<u8> = (0..13 + i * 37).map(|j| ((j + i) % 251) as u8).collect();
+                let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
+                let h1: Inline<Hash<Blake3>> = pile.put::<UnknownBlob, _>(b1).unwrap().into();
+                entries.push((h1, d1, false));
+                let d2: Vec<u8> = (0..17 + i * 53).map(|j| ((j * 3 + i) % 251) as u8).collect();
+                let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
+                let h2: Inline<Hash<Blake3>> = pile.put_aligned::<UnknownBlob, _>(b2).unwrap().into();
+                entries.push((h2, d2, true));
+            }
+            pile.close().unwrap();
+        }
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        pile.restore().unwrap();
+        for (hash, expected, is_v2) in &entries {
+            let e = pile.blobs.get(&hash.raw).expect("blob missing after reopen").clone();
+            if *is_v2 {
+                assert_eq!(e.offset % GPU_DATA_ALIGNMENT, 0, "V2 record not aligned");
+            }
+            let got = unsafe {
+                std::slice::from_raw_parts(pile.mmap.as_ptr().add(e.offset), e.len as usize)
+            };
+            assert_eq!(got, &expected[..], "mismatch (v2={is_v2}, size {})", expected.len());
+        }
+        pile.close().unwrap();
     }
 
     #[test]

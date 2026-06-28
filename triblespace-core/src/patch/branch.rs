@@ -172,8 +172,12 @@ pub(crate) struct Branch<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Si
 
 // Manual Debug since `Option<Arc<dyn ArchiveOwner>>` doesn't impl Debug
 // (the trait is intentionally minimal — no Debug bound).
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized + core::fmt::Debug, V: core::fmt::Debug>
-    core::fmt::Debug for Branch<KEY_LEN, O, Table, V>
+impl<
+        const KEY_LEN: usize,
+        O: KeySchema<KEY_LEN>,
+        Table: ?Sized + core::fmt::Debug,
+        V: core::fmt::Debug,
+    > core::fmt::Debug for Branch<KEY_LEN, O, Table, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Branch")
@@ -518,8 +522,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         key: u8,
         inserted_hash: u128,
         f: F,
-    )
-    where
+    ) where
         F: FnOnce(Option<Head<KEY_LEN, O, V>>) -> Option<Head<KEY_LEN, O, V>>,
     {
         unsafe {
@@ -710,7 +713,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         // provided prefix then no child in this branch can match and we can
         // early-return. The previous logic inverted this check which caused
         // branches to be pruned incorrectly.
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
             return;
         }
 
@@ -753,7 +760,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
             return;
         }
 
@@ -834,7 +845,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) -> u64 {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
             return 0;
         }
 
@@ -913,7 +928,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
             return false;
         }
 
@@ -928,13 +947,46 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         false
     }
 
+    pub(crate) fn traversal_depth<const PREFIX_LEN: usize>(
+        &self,
+        at_depth: usize,
+        prefix: &[u8; PREFIX_LEN],
+    ) -> usize {
+        const {
+            assert!(PREFIX_LEN <= KEY_LEN);
+        }
+        let node_end_depth = self.end_depth as usize;
+        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
+            return 1;
+        }
+
+        if PREFIX_LEN <= node_end_depth {
+            return 1;
+        }
+
+        if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+            return 1 + child.traversal_depth::<PREFIX_LEN>(node_end_depth, prefix);
+        }
+
+        1
+    }
+
     pub fn get<'a>(&'a self, at_depth: usize, key: &[u8; KEY_LEN]) -> Option<&'a V>
     where
         O: 'a,
     {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(KEY_LEN, node_end_depth);
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &key[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &key[..limit],
+        ) {
             return None;
         }
         if node_end_depth >= KEY_LEN {
@@ -964,7 +1016,11 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     ) -> u64 {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
-        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &prefix[..limit]) {
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
+            self.childleaf_key(),
+            at_depth,
+            &prefix[..limit],
+        ) {
             return 0;
         }
         if PREFIX_LEN <= node_end_depth {

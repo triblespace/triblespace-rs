@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add a PATCH branch fanout diagnostic histogram for inspecting real trie
   shapes in benchmark probes.
+- Add a PATCH traversal-depth diagnostic for read-side benchmark probes.
 
 ### Fixed
 

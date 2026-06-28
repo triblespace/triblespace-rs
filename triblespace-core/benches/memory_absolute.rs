@@ -66,8 +66,15 @@ fn main() {
         patch_bytes as f64 / (TRIBLE_LEN as f64 * nf),
     );
 
-    // --- COMPRESSED queryable SuccinctArchive ---
+    // --- COMPRESSED queryable SuccinctArchive (timed: construction cost) ---
+    let tbuild = std::time::Instant::now();
     let archive: SuccinctArchive<CompressedUniverse> = (&set).into();
+    let build_s = tbuild.elapsed().as_secs_f64();
+    println!(
+        "SuccinctArchive BUILD: {build_s:.3}s for {n} tribles = {:.0} tribles/s ({:.1} ns/trible)",
+        nf / build_s,
+        build_s * 1e9 / nf,
+    );
     let arch_bytes = archive.bytes.len();
     println!(
         "SuccinctArchive (compressed, queryable):     {} B  =  {:.1} B/trible  ({:.2}x raw)",
