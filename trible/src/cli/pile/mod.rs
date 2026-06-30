@@ -10,6 +10,7 @@ mod merge;
 mod migrate;
 pub mod net;
 pub mod pin;
+mod reid;
 mod signing;
 mod squash;
 
@@ -96,6 +97,22 @@ pub enum PileCommand {
         #[arg(long)]
         signing_key: Option<PathBuf>,
     },
+    /// Re-id every branch into a new pile, preserving names + full history.
+    ///
+    /// Each branch keeps its name, head commit, and rollup, but receives a
+    /// freshly minted branch id; the full reachable blob graph is copied
+    /// unchanged (unlike `squash`, which collapses history). Use this to
+    /// de-alias two piles that share branch ids before `cat` + `branch
+    /// consolidate --by-name`.
+    Reid {
+        /// Source pile file
+        source: PathBuf,
+        /// Destination pile file (will be created)
+        dest: PathBuf,
+        /// Optional signing key path
+        #[arg(long)]
+        signing_key: Option<PathBuf>,
+    },
 }
 
 pub fn run(cmd: PileCommand) -> Result<()> {
@@ -139,5 +156,10 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             exclude,
             signing_key,
         } => squash::run(source, dest, signing_key, include, exclude),
+        PileCommand::Reid {
+            source,
+            dest,
+            signing_key,
+        } => reid::run(source, dest, signing_key),
     }
 }
