@@ -118,11 +118,25 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
         /// Stop after N seconds without any network event (no incoming
-        /// HEAD, no incoming blob). Best-effort "we appear to have
+        /// HEAD, no incoming blob) and without any want being serviced
+        /// by the lazy reconcile. Best-effort "we appear to have
         /// caught up" signal — useful for bounded sync in scripts where
-        /// you accept the two-generals caveat.
+        /// you accept the two-generals caveat. Wants that stay pending
+        /// (nobody reachable holds them) do NOT hold off quiescence —
+        /// a pending want is normal, not unfinished work.
         #[arg(long, value_name = "SECS")]
         quiescent_for: Option<u64>,
+        /// Disable the lazy want-reconcile tick. By default sync also
+        /// services durable weak-pin *wants*: weak-pin records appended
+        /// to the pile (by faculties or any other process) are noticed
+        /// each tick and the missing blobs fetched from the swarm
+        /// (fetch-on-want). Content-lazy is the doctrine; this flag is
+        /// the escape hatch.
+        #[arg(long)]
+        no_lazy: bool,
+        /// Seconds between want-reconcile passes.
+        #[arg(long, value_name = "SECS", default_value_t = 1)]
+        reconcile_interval: u64,
     },
 }
 
@@ -130,7 +144,17 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Identity { key } => run_identity(key),
         Command::Status { key } => run_status(key),
-        Command::Sync { pile, peers, key, read_only, write_only, duration, quiescent_for } => {
+        Command::Sync {
+            pile,
+            peers,
+            key,
+            read_only,
+            write_only,
+            duration,
+            quiescent_for,
+            no_lazy,
+            reconcile_interval,
+        } => {
             let direction = if read_only {
                 SyncDirection::ReadOnly
             } else if write_only {
@@ -138,7 +162,16 @@ pub fn run(cmd: Command) -> Result<()> {
             } else {
                 SyncDirection::Bidirectional
             };
-            run_sync(pile, peers, key, direction, duration, quiescent_for)
+            run_sync(
+                pile,
+                peers,
+                key,
+                direction,
+                duration,
+                quiescent_for,
+                no_lazy,
+                reconcile_interval,
+            )
         }
     }
 }
@@ -193,6 +226,7 @@ fn run_status(sk: Option<PathBuf>) -> Result<()> {
 
 // ── Sync ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_sync(
     pile_path: PathBuf,
     peer_strs: Vec<String>,
@@ -200,6 +234,8 @@ fn run_sync(
     direction: SyncDirection,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
+    no_lazy: bool,
+    reconcile_interval: u64,
 ) -> Result<()> {
     use triblespace_core::repo::Repository;
 
@@ -241,6 +277,17 @@ fn run_sync(
     if let Some(q) = quiescent_for {
         eprintln!("quiescent stop: {q}s without events");
     }
+    // Lazy content sync: service durable weak-pin wants. Fetching is a
+    // read, so WriteOnly ("no fetch") suppresses it; it stays on under
+    // ReadOnly — a leecher that only services wants is a legit workflow.
+    let lazy = !no_lazy && direction != SyncDirection::WriteOnly;
+    if lazy {
+        eprintln!("lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)");
+    } else if no_lazy {
+        eprintln!("lazy: disabled (--no-lazy)");
+    } else {
+        eprintln!("lazy: disabled under --write-only (servicing wants fetches; write-only never fetches)");
+    }
     eprintln!("live sync active. (Ctrl-C to stop)\n");
 
     // Initial broadcast so peers connecting later can learn our state.
@@ -250,6 +297,27 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
+
+    // Want-reconcile state. The Reconciler (triblespace-net) owns the
+    // per-want retry bookkeeping (exponential backoff, capped at 60s);
+    // the wants themselves live durably in the pile as weak pins. The
+    // tick is async (the swarm fetch awaits the host), so we drive it
+    // on a small current-thread runtime — the fetch's internal DHT
+    // deadline uses tokio timers, which need a runtime context.
+    let mut reconciler = triblespace_net::reconcile::Reconciler::new();
+    let reconcile_every = std::time::Duration::from_secs(reconcile_interval);
+    let mut next_reconcile = std::time::Instant::now();
+    let mut wants_fetched_total: u64 = 0;
+    let mut wants_pending: usize = 0;
+    let mut last_pending_logged: Option<usize> = None;
+    // Most recent time a want was actually serviced — lazy progress
+    // counts as activity for --quiescent-for (pending wants do NOT:
+    // an unsatisfiable want is steady state, not unfinished work).
+    let mut last_want_progress = std::time::Instant::now();
+    let reconcile_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow!("reconcile runtime: {e}"))?;
 
     loop {
         // Bounded run-time. The host_loop also does periodic re-broadcasts
@@ -261,12 +329,17 @@ fn run_sync(
                 break;
             }
         }
-        // Quiescence stop: no NetEvent absorbed for the configured window.
-        // The two-generals caveat applies — "looks idle" isn't "synced" —
-        // but for bounded sync in scripts the caller has explicitly opted
-        // into this trade-off.
+        // Quiescence stop: no NetEvent absorbed AND no want serviced for
+        // the configured window. The two-generals caveat applies —
+        // "looks idle" isn't "synced" — but for bounded sync in scripts
+        // the caller has explicitly opted into this trade-off. Wants
+        // still pending don't hold quiescence off: a want nobody
+        // reachable holds may stay pending forever, and that's its
+        // normal state (it survives in the pile for the next run).
         if let Some(limit) = quiescent_limit {
-            if repo.storage().last_event_at().elapsed() >= limit {
+            if repo.storage().last_event_at().elapsed() >= limit
+                && last_want_progress.elapsed() >= limit
+            {
                 eprintln!("\nquiescent for {}s; stopping", limit.as_secs());
                 break;
             }
@@ -320,7 +393,44 @@ fn run_sync(
                 .renewal_tick(hifitime::Duration::from_seconds(3600.0));
         }
 
+        // Want-reconcile tick: a weak pin IS a durable want-marker —
+        // "I would like this blob; fetch it if absent; evictable."
+        // Each pass re-reads the pile (weak-pin records appended by
+        // OTHER processes since the last pass become visible), diffs
+        // the want set against the blobs present, and swarm-fetches
+        // the missing ones, landing them under their existing weak
+        // pin. Failed fetches retry with per-want exponential backoff
+        // inside the Reconciler; a want nobody serves stays pending —
+        // normal, never an error, never dropped. Strong pins/branches
+        // are untouched.
+        if lazy && next_reconcile <= std::time::Instant::now() {
+            let stats = reconcile_rt.block_on(reconciler.tick(repo.storage_mut()));
+            next_reconcile = std::time::Instant::now() + reconcile_every;
+            wants_fetched_total += stats.fetched as u64;
+            wants_pending = stats.pending;
+            if stats.fetched > 0 {
+                last_want_progress = std::time::Instant::now();
+            }
+            // Trace on change (a want serviced, or the pending count
+            // moved), not per tick — pending wants are steady state.
+            if stats.fetched > 0 || last_pending_logged != Some(stats.pending) {
+                eprintln!(
+                    "  wants: {} seen, {} fetched this pass ({} total), {} pending",
+                    stats.wants, stats.fetched, wants_fetched_total, stats.pending,
+                );
+                last_pending_logged = Some(stats.pending);
+            }
+        }
+
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    if lazy {
+        eprintln!(
+            "wants: {wants_fetched_total} fetched this run; {wants_pending} still pending \
+             (pending is normal — the wants stay on record as weak pins in the pile \
+             and are serviced whenever a holder becomes reachable)"
+        );
     }
     Ok(())
 }

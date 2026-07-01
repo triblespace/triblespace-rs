@@ -58,6 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from before this change treat the new markers as unknown records — they
   fail loud on such piles (and never truncate, per the explicit-restore
   posture above).
+- **Lazy content sync — the want-reconcile loop.** `trible pile net sync` now
+  services durable weak-pin **wants** (fetch-on-want): each pass re-reads the
+  pile (weak-pin records appended by other processes — faculties writing "I
+  would like X" — become visible), diffs the LWW-resolved weak-pin set against
+  the blobs actually present, and swarm-fetches the missing ones, landing them
+  under their existing weak pin. A want nobody serves stays pending — normal,
+  never an error, never dropped — and is retried with per-want exponential
+  backoff (1s doubling to a 60s cap), logged once per state change rather than
+  per retry. Strong pins/branches are untouched. Enabled by default
+  (content-lazy is the doctrine), including under `--read-only` (a leecher
+  that only services wants is a legit workflow); `--no-lazy` disables it,
+  `--reconcile-interval <secs>` tunes the cadence (default 1s). The sync
+  output gains want counters (seen / fetched / still-pending) and
+  `--quiescent-for` counts a serviced want as activity (pending wants do NOT
+  hold quiescence off). The mechanism lives in the library as
+  `triblespace_net::reconcile::Reconciler` — an async, deterministic-sim-tested
+  `tick(&mut Peer<S>) -> ReconcileStats` — and the CLI is just the wiring.
 - **`trible pile restore <path>`.** Explicit, opt-in repair for a pile with a
   partial or corrupt (torn) tail: loads every valid record and, if the tail is
   torn, truncates back to the last known-good offset, reporting bytes before/after
