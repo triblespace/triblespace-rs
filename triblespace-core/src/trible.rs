@@ -5,8 +5,6 @@
 mod fragment;
 mod spread;
 mod tribleset;
-#[cfg(feature = "vwpatch")]
-mod vwtribleset;
 
 use std::convert::TryInto;
 
@@ -23,13 +21,6 @@ pub use spread::Spread;
 pub use tribleset::TribleSet;
 /// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).
 pub use tribleset::TribleSetFingerprint;
-/// Re-export of [`VwTribleSet`](vwtribleset::VwTribleSet), the VWPATCH-backed
-/// mirror of [`TribleSet`] used for index-backend head-to-head benchmarks.
-#[cfg(feature = "vwpatch")]
-pub use vwtribleset::VwTribleSet;
-/// Re-export of [`VwTribleSetConstraint`](vwtribleset::VwTribleSetConstraint).
-#[cfg(feature = "vwpatch")]
-pub use vwtribleset::VwTribleSetConstraint;
 
 /// The length of a trible in bytes.
 pub const TRIBLE_LEN: usize = 64;

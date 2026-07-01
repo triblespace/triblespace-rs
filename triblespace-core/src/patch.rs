@@ -335,10 +335,10 @@ pub trait KeySchema<const KEY_LEN: usize>: Copy + Clone + Debug {
     /// For each tree-depth, the exclusive end of the segment containing it.
     ///
     /// Purely additive (a provided default derived from `Segmentation` +
-    /// `TREE_TO_KEY`); it does not affect single-byte PATCH behaviour. The
-    /// variable-width [`VWPATCH`](crate::vwpatch) uses it to start branch spans
-    /// segment-wide and guarantee a span never crosses a checkpoint. For EAV
-    /// over a 64-byte trible this yields ends `{16,32,64}`; for VEA `{32,48,64}`.
+    /// `TREE_TO_KEY`); it does not affect single-byte PATCH behaviour. A
+    /// variable-width trie would use it to start branch spans segment-wide and
+    /// guarantee a span never crosses a checkpoint. For EAV over a 64-byte
+    /// trible this yields ends `{16,32,64}`; for VEA `{32,48,64}`.
     const SEGMENT_ENDS: [usize; KEY_LEN] = build_segment_ends::<KEY_LEN>(
         <Self::Segmentation as KeySegmentation<KEY_LEN>>::SEGMENTS,
         Self::TREE_TO_KEY,

@@ -19,20 +19,12 @@ pub mod blob;
 pub mod export;
 /// Identifier types and generation strategies.
 pub mod id;
-/// Variable-width trie prototype for EAV trible keys.
-#[cfg(feature = "hatch")]
-pub mod hatch;
 /// Import utilities for deserialising external data into tribles.
 pub mod import;
 /// Bootstrap metadata namespace for describing schemas and attributes.
 pub mod metadata;
 /// Adaptive radix tree (PATCH) used as the backing store for trible indexes.
 pub mod patch;
-/// Faithful clone of [`patch`] (as `VWPATCH`) — the starting point for the
-/// variable-width trie ("HATCH") rework. Identical algorithm/layout to
-/// [`patch`]; reuses its key-schema infrastructure and shared SIP key.
-#[cfg(feature = "vwpatch")]
-pub mod vwpatch;
 /// Commonly used re-exports for convenient glob imports.
 pub mod prelude;
 /// Query engine: constraints, variables, and the Atreides join algorithm.

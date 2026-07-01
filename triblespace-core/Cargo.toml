@@ -69,11 +69,6 @@ default = ["proptest", "object-store", "parallel"]
 proptest = ["dep:proptest"]
 object-store = ["dep:object_store", "dep:tokio", "dep:futures", "dep:url"]
 kani = []
-hatch = []
-# Variable-width trie ("HATCH") work-in-progress: a faithful clone of the
-# tuned `patch` module (as `vwpatch`) that will be reworked into the
-# variable-width design. Off by default; pure additive module.
-vwpatch = []
 # Deterministic id minting for simulation testing: enables
 # `id::rngid::seed_ids` (thread-local seeded source consulted by
 # rngid()/genid()). Zero cost when disabled — the production rngid
@@ -81,41 +76,6 @@ vwpatch = []
 deterministic = []
 wasm = ["dep:wasmi"]
 parallel = ["dep:rayon"]
-
-[[bench]]
-name = "hatch"
-harness = false
-required-features = ["hatch"]
-
-[[bench]]
-name = "vwpatch"
-harness = false
-required-features = ["vwpatch"]
-
-[[bench]]
-name = "vwpatch_setops"
-harness = false
-required-features = ["vwpatch", "parallel"]
-
-[[bench]]
-name = "vwpatch_allorderings"
-harness = false
-required-features = ["vwpatch"]
-
-[[bench]]
-name = "vwpatch_realmem"
-harness = false
-required-features = ["vwpatch"]
-
-[[bench]]
-name = "vwpatch_archivemem"
-harness = false
-required-features = ["vwpatch"]
-
-[[bench]]
-name = "union_vw_vs_patch"
-harness = false
-required-features = ["vwpatch", "parallel"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
@@ -125,16 +85,6 @@ default-unwind = "1"
 
 ## Removed workspace.metadata to allow this crate to be used as a path dependency
 ## inside the surrounding workspace without creating nested workspace roots.
-
-[[bench]]
-name = "vwpatch_readsweep"
-harness = false
-required-features = ["vwpatch"]
-
-[[bench]]
-name = "tribleset_vw_vs_patch"
-harness = false
-required-features = ["vwpatch"]
 
 [[bench]]
 name = "patch_bucket"
