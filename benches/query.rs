@@ -17,7 +17,7 @@ pub mod literature {
         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
         "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineencodings::ShortString;
         "FCCE870BECA333D059D5CD68C43B98F0" as page_count: inlineencodings::R256;
-        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineencodings::Handle<inlineencodings::Blake3, blobencodings::LongString>;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as quote: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

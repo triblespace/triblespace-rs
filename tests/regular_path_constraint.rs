@@ -15,8 +15,8 @@ fn simple_path() {
     let a = fucid();
     let b = fucid();
     kb += entity! { &a @ social::follows: &b };
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
     let results: Vec<_> =
         find!((s: Inline<_>, e: Inline<_>), path!(kb.clone(), s social::follows e)).collect();
     assert!(results.contains(&(a_val, b_val)));
@@ -30,9 +30,9 @@ fn alternation() {
     let c = fucid();
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &a @ social::likes: &c };
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
-    let c_val = c.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
+    let c_val: Inline<inlineencodings::GenId> = c.to_inline();
 
     let results: Vec<_> =
         find!((s: Inline<_>, e: Inline<_>), path!(kb.clone(), s (social::follows | social::likes) e))
@@ -50,8 +50,8 @@ fn repetition() {
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &b @ social::follows: &c };
 
-    let start_val = a.to_inline();
-    let end_val = c.to_inline();
+    let start_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let end_val: Inline<inlineencodings::GenId> = c.to_inline();
     let results: Vec<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(start_val), e.is(end_val), path!(kb.clone(), s social::follows+ e)))
     .collect();
@@ -68,8 +68,8 @@ fn inverse_prefix_single() {
     let b = fucid();
     kb += entity! { &a @ social::follows: &b };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(b_val), path!(kb.clone(), s ^social::follows e)))
     .map(|(_, e)| e)
@@ -93,9 +93,9 @@ fn inverse_of_group() {
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &a @ social::likes: &c };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
-    let c_val = c.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
+    let c_val: Inline<inlineencodings::GenId> = c.to_inline();
 
     let from_b: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(b_val), path!(kb.clone(), s ^(social::follows | social::likes) e)))
@@ -125,9 +125,9 @@ fn inverse_with_postfix_modifier() {
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &c @ social::follows: &a };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
-    let c_val = c.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
+    let c_val: Inline<inlineencodings::GenId> = c.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(b_val), path!(kb.clone(), s ^social::follows+ e)))
     .map(|(_, e)| e)
@@ -150,9 +150,9 @@ fn not_attr_single_attribute() {
     kb += entity! { &a @ social::follows: &b };
     kb += entity! { &a @ social::likes: &c };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
-    let c_val = c.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
+    let c_val: Inline<inlineencodings::GenId> = c.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(a_val), path!(kb.clone(), s !social::follows e)))
     .map(|(_, e)| e)
@@ -185,10 +185,10 @@ fn end_bound_propose_start_via_inverse_bfs() {
     kb += entity! { &b @ social::follows: &c };
     kb += entity! { &c @ social::follows: &d };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
-    let c_val = c.to_inline();
-    let d_val = d.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
+    let c_val: Inline<inlineencodings::GenId> = c.to_inline();
+    let d_val: Inline<inlineencodings::GenId> = d.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(e.is(d_val), path!(kb.clone(), s social::follows+ e)))
     .map(|(s, _)| s)
@@ -212,8 +212,8 @@ fn end_bound_propose_start_reflexive() {
     let b = fucid();
     kb += entity! { &a @ social::follows: &b };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(e.is(b_val), path!(kb.clone(), s social::follows* e)))
     .map(|(s, _)| s)
@@ -234,8 +234,8 @@ fn optional_question_mark() {
     let b = fucid();
     kb += entity! { &a @ social::follows: &b };
 
-    let a_val = a.to_inline();
-    let b_val = b.to_inline();
+    let a_val: Inline<inlineencodings::GenId> = a.to_inline();
+    let b_val: Inline<inlineencodings::GenId> = b.to_inline();
     let results: std::collections::HashSet<_> = find!((s: Inline<_>, e: Inline<_>),
         and!(s.is(a_val), path!(kb.clone(), s social::follows? e)))
     .map(|(_, e)| e)
