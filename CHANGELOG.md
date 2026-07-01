@@ -23,6 +23,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Durable weak pins.** Two new V3 pile record kinds — weak-pin and
+  weak-unpin markers (fixed 256-byte headers, keyed by blob handle, no branch
+  id) — make the soft half of the retention lattice
+  `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` durable, resolved last-writer-wins by
+  log position (the branch record is `pin`, the branch tombstone `unpin`). A
+  weak pin is the demand-born want-signal ("I want this blob; fetch if
+  absent; evictable"), the cache-retention marker, and the eviction target in
+  one record. New `WeakPinStore` trait (`pin_weak` / `unpin_weak` /
+  `weak_pins`) implemented by `Pile` (appends markers, rebuilds the
+  LWW-resolved set on scan) and `Yard` (persists markers to the young
+  generation's pile; `Yard::open` now reloads the weak state from the durable
+  markers instead of resetting it — fixing the restart amnesia of the
+  previously in-memory-only weak state — and `reclaim`/`compact` re-record
+  surviving markers when they rewrite the young pile). `Yard` also gains a
+  `PinStore` impl (in-memory CAS over its strong pins), required by the
+  `WeakPinStore: PinStore` bound. Note the loud-failure posture: binaries
+  from before this change treat the new markers as unknown records — they
+  fail loud on such piles (and never truncate, per the explicit-restore
+  posture above).
 - **`trible pile restore <path>`.** Explicit, opt-in repair for a pile with a
   partial or corrupt (torn) tail: loads every valid record and, if the tail is
   torn, truncates back to the last known-good offset, reporting bytes before/after
