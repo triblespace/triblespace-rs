@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Faculties no longer auto-truncate a corrupt pile on open (data-loss fix).**
+  **WARNING:** every faculty and tool at or before the prior version opened piles
+  with `Pile::open` + `Pile::restore()`, and `restore()` silently truncates the
+  file to the last valid record on a torn or corrupt tail. Under version skew this
+  is a silent data-loss hazard: a stale binary that hits a newer-format record
+  reads it as corruption and eats all data past that point. Faculties now open with
+  `Pile::open` + `Pile::refresh()` (a non-mutating full load) and **fail loud** with
+  a non-zero exit on any corruption, printing the byte offset and a repair
+  instruction instead of quietly repairing. Repair is now explicit and lives in one
+  place: `trible pile restore <path>`, the only entry point that still calls
+  `Pile::restore()`.
+
 ### Added
 
+- **`trible pile restore <path>`.** Explicit, opt-in repair for a pile with a
+  partial or corrupt (torn) tail: loads every valid record and, if the tail is
+  torn, truncates back to the last known-good offset, reporting bytes before/after
+  (or "already valid"). This replaces the implicit auto-repair that faculties used
+  to perform on open.
 - **`repo::yard` generational blob storage.** Adds a standalone Yard storage
   component that layers young-to-old Pile generations, union reads, per-blob
   strong/weak retention, weak-veto reachability pruning, and size-triggered

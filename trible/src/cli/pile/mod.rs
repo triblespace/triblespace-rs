@@ -64,6 +64,18 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: diagnose::Command,
     },
+    /// Repair a pile with a partial or corrupt (torn) tail.
+    ///
+    /// This is the ONLY explicit entry point that truncates a pile: it loads
+    /// every valid record and, if the tail is torn, drops it back to the last
+    /// known-good offset. Faculties and other tools deliberately refuse to do
+    /// this on open (a stale binary hitting a newer-format record could eat
+    /// valid data), so run this by hand after confirming the tail is genuinely
+    /// corrupt.
+    Restore {
+        /// Path to the pile file to repair
+        path: PathBuf,
+    },
     /// Migrate legacy pile metadata to the current schemas.
     Migrate {
         /// Path to the pile file to modify
@@ -148,6 +160,28 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         }
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
+        PileCommand::Restore { path } => {
+            use triblespace_core::repo::pile::Pile;
+
+            let before = fs::metadata(&path)?.len();
+            let mut pile = Pile::open(&path)?;
+            // `restore` loads every valid record and, on a torn tail, truncates
+            // the file back to the last known-good offset. This is the single
+            // place in the tree that performs that mutation.
+            pile.restore().map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
+            let after = fs::metadata(&path)?.len();
+            pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+            if after == before {
+                println!("{}: already valid ({before} bytes)", path.display());
+            } else {
+                println!(
+                    "{}: repaired torn tail, {before} -> {after} bytes ({} bytes dropped)",
+                    path.display(),
+                    before - after
+                );
+            }
+            Ok(())
+        }
         PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
         PileCommand::Squash {
             source,

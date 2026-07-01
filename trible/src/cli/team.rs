@@ -252,9 +252,14 @@ pub fn run(cmd: Command) -> Result<()> {
 fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
     let mut pile = PileBlake3::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.restore().map_err(|e| anyhow!("restore pile: {e:?}")) {
+    if let Err(err) = pile.refresh() {
         let _ = pile.close();
-        return Err(err);
+        return Err(anyhow!(
+            "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
+             truncate newer data). Repair a torn tail explicitly with: trible pile restore {}",
+            path.display(),
+            path.display()
+        ));
     }
     Ok(pile)
 }
