@@ -60,19 +60,37 @@ use crate::inline::InlineEncoding;
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
-/// Blob record whose DATA is aligned to [`GPU_DATA_ALIGNMENT`] (via pre-header
-/// padding) so the bytes can be bound directly as a GPU storage buffer
-/// (zero-copy mmap aliasing). Layout: `[header][pre_pad][data][post_pad]`.
-/// Identical to a V1 [`MAGIC_MARKER_BLOB`] record except for the pre_pad; the
-/// scan branches on the marker, so V1 records are read byte-identically.
-/// (minted 2026-06-28 via `trible genid`)
-const MAGIC_MARKER_BLOB_V2: RawId = hex!("ACDBB53F22CEB71C8AA1497DA812F089");
+/// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
+/// `trible genid`). Every V3 record (blob/branch/tombstone) has a FIXED 256-byte
+/// header and is padded to a 256-byte multiple. Consequences:
+///   * blob data starts at a constant `record_start + V3_HEADER_LEN` — reads are
+///     position-INDEPENDENT (no offset-derived pad), so a record survives
+///     relocation/`cat` and is found correctly regardless of its offset;
+///   * because every record is a 256-multiple, a pure-V3 pile stays 256-aligned
+///     throughout under ATOMIC lock-free append (no exclusive lock needed), so
+///     `cat a >> b` of two pure-V3 piles is a valid merge AND the data stays
+///     256-aligned for zero-copy GPU aliasing (CUDA/Metal `min_storage_buffer_offset_alignment`).
+/// New writes are V3; the reader still accepts the original V1
+/// [`MAGIC_MARKER_BLOB`] record so existing piles read byte-identical.
+const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
+const MAGIC_MARKER_BRANCH_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
+const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
 
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
-/// Alignment a V2 record's DATA start is padded to — the GPU storage-buffer
-/// binding-offset requirement (Metal `min_storage_buffer_offset_alignment`).
+/// GPU storage-buffer binding-offset requirement (CUDA / Metal
+/// `min_storage_buffer_offset_alignment`); a V3 record's data start lands on this.
 const GPU_DATA_ALIGNMENT: usize = 256;
+/// V3 fixed header length and record alignment (== GPU_DATA_ALIGNMENT). A V3
+/// header is always this many bytes; data follows at `record_start + V3_HEADER_LEN`,
+/// and the whole record is padded to a multiple of this.
+const V3_HEADER_LEN: usize = 256;
+const V3_ALIGNMENT: usize = GPU_DATA_ALIGNMENT;
+/// Post-data padding that rounds a V3 record up to a 256-byte multiple. The
+/// header is already 256, so this only rounds the data length.
+fn v3_post_pad(data_len: usize) -> usize {
+    (V3_ALIGNMENT - (data_len % V3_ALIGNMENT)) % V3_ALIGNMENT
+}
 
 /// Largest single blob record we'll write with the concurrent `write_vectored`
 /// fast path. Linux caps a single `writev` at `MAX_RW_COUNT` (`INT_MAX &
@@ -121,15 +139,8 @@ struct BranchHeader {
     hash: RawInline,
 }
 
-impl BranchHeader {
-    fn new(branch_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_BRANCH,
-            branch_id: *branch_id,
-            hash: hash.raw,
-        }
-    }
-}
+// `BranchHeader` / `BranchTombstoneHeader` have no constructors — new writes are
+// V3; these structs exist only so the reader can decode legacy V1 records.
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -138,16 +149,6 @@ struct BranchTombstoneHeader {
     branch_id: RawId,
     /// Reserved bytes to preserve 64 byte record alignment.
     reserved: RawInline,
-}
-
-impl BranchTombstoneHeader {
-    fn new(branch_id: Id) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_BRANCH_TOMBSTONE,
-            branch_id: *branch_id,
-            reserved: [0u8; 32],
-        }
-    }
 }
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -160,6 +161,9 @@ struct BlobHeader {
 }
 
 impl BlobHeader {
+    /// V1 blob constructor — retained only for the legacy-format backward-compat
+    /// test (new writes are V3; V1 blob records are otherwise read, never written).
+    #[allow(dead_code)]
     fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB,
@@ -168,18 +172,84 @@ impl BlobHeader {
             hash: hash.raw,
         }
     }
+}
 
-    /// A V2 (GPU-data-aligned) blob record header. Same fields, different marker;
-    /// the scan branches on the marker to insert the pre-header padding.
-    fn new_v2(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
+/// V3 blob header — fixed 256 bytes. Same load-bearing fields as V1; the data
+/// follows at `record_start + V3_HEADER_LEN` with no offset-derived pre-pad.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BlobHeaderV3 {
+    magic_marker: RawId,
+    timestamp: u64,
+    length: u64,
+    hash: RawInline,
+    /// Pads the header to V3_HEADER_LEN (256), zeroed. NOT part of the content
+    /// hash, so it never affects blob identity or dedup. Deliberately empty:
+    /// genuinely useful per-record metadata belongs in tribles (keyed by the
+    /// referencing attribute), and the encoding/schema must NOT live here — else
+    /// identical bytes would fork into distinct blobs. Fill only when a concrete,
+    /// content-independent need names itself.
+    reserved: [u8; 192],
+}
+
+impl BlobHeaderV3 {
+    fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
-            magic_marker: MAGIC_MARKER_BLOB_V2,
+            magic_marker: MAGIC_MARKER_BLOB_V3,
             timestamp,
             length,
             hash: hash.raw,
+            reserved: [0u8; 192],
         }
     }
 }
+
+/// V3 branch head — fixed 256 bytes (mirrors `BranchHeader` + reserved pad).
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BranchHeaderV3 {
+    magic_marker: RawId,
+    branch_id: RawId,
+    hash: RawInline,
+    reserved: [u8; 192],
+}
+
+impl BranchHeaderV3 {
+    fn new(branch_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BRANCH_V3,
+            branch_id: *branch_id,
+            hash: hash.raw,
+            reserved: [0u8; 192],
+        }
+    }
+}
+
+/// V3 branch tombstone — fixed 256 bytes.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BranchTombstoneHeaderV3 {
+    magic_marker: RawId,
+    branch_id: RawId,
+    reserved: [u8; 224],
+}
+
+impl BranchTombstoneHeaderV3 {
+    fn new(branch_id: Id) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_BRANCH_TOMBSTONE_V3,
+            branch_id: *branch_id,
+            reserved: [0u8; 224],
+        }
+    }
+}
+
+// Compile-time guarantee that every V3 header is exactly 256 bytes.
+const _: () = {
+    assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<BranchTombstoneHeaderV3>() == V3_HEADER_LEN);
+};
 
 #[derive(Debug)]
 enum Applied {
@@ -211,17 +281,6 @@ pub struct Pile {
 
 fn padding_for_blob(blob_size: usize) -> usize {
     (BLOB_ALIGNMENT - ((BLOB_HEADER_LEN + blob_size) % BLOB_ALIGNMENT)) % BLOB_ALIGNMENT
-}
-
-/// Padding inserted BETWEEN a V2 record's header and its data so the data start
-/// lands on [`GPU_DATA_ALIGNMENT`]. Depends on the record's absolute start offset
-/// (so V2 writes hold the exclusive lock to keep that offset stable); the scan
-/// recomputes it identically from the record start. `record_start` and
-/// `BLOB_HEADER_LEN` are both multiples of `BLOB_ALIGNMENT` (64) and 64 divides
-/// 256, so the result is always a multiple of 64 — the next record stays
-/// 64-aligned via the usual post-padding.
-fn pre_pad_for(record_start: usize) -> usize {
-    (GPU_DATA_ALIGNMENT - ((record_start + BLOB_HEADER_LEN) % GPU_DATA_ALIGNMENT)) % GPU_DATA_ALIGNMENT
 }
 
 #[derive(Debug, Clone)]
@@ -648,25 +707,54 @@ impl Pile {
                 self.applied_length = start_offset + BLOB_HEADER_LEN + data_len + pad;
                 Ok(Some(Applied::Blob { hash }))
             }
-            MAGIC_MARKER_BLOB_V2 => {
-                // Same as a V1 blob record, but with `pre_pad` bytes between the
-                // header and the data so the data start is GPU_DATA_ALIGNMENT-
-                // aligned. `pre_pad` is recomputed here from the record's actual
-                // start offset — identical to what the (exclusive-locked) writer
-                // laid down.
+            MAGIC_MARKER_BRANCH => {
                 let header =
                     bytes
-                        .view_prefix::<BlobHeader>()
+                        .view_prefix::<BranchHeader>()
                         .map_err(|_| ReadError::CorruptPile {
                             valid_length: start_offset,
                         })?;
-                let data_len = header.length as usize;
-                let pre_pad = pre_pad_for(start_offset);
-                let post_pad = padding_for_blob(data_len);
-                let data_offset = start_offset + BLOB_HEADER_LEN + pre_pad;
-                bytes.take_prefix(pre_pad).ok_or(ReadError::CorruptPile {
+                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
+                // Interpret the stored raw value as a hash and transmute into a
+                // handle value for storage. Use Entry to insert/replace into the PATCH.
+                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
+                let handle_val: Inline<Handle<SimpleArchive>> = hash.into();
+                let entry = Entry::with_value(&header.branch_id, handle_val);
+                // Replace existing mapping (if any) with the new head.
+                self.branches.replace(&entry);
+                self.applied_length = start_offset + std::mem::size_of::<BranchHeader>();
+                Ok(Some(Applied::Branch {
+                    id: branch_id,
+                    hash,
+                }))
+            }
+            MAGIC_MARKER_BRANCH_TOMBSTONE => {
+                let header = bytes.view_prefix::<BranchTombstoneHeader>().map_err(|_| {
+                    ReadError::CorruptPile {
+                        valid_length: start_offset,
+                    }
+                })?;
+                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
+                    valid_length: start_offset,
+                })?;
+                self.branches.remove(&header.branch_id);
+                self.applied_length = start_offset + std::mem::size_of::<BranchTombstoneHeader>();
+                Ok(Some(Applied::BranchTombstone { id: branch_id }))
+            }
+            MAGIC_MARKER_BLOB_V3 => {
+                // Fixed 256-byte header; data at a constant `record_start +
+                // V3_HEADER_LEN` (no offset-derived pad — position-independent),
+                // record padded to a 256-byte multiple.
+                let header = bytes.view_prefix::<BlobHeaderV3>().map_err(|_| {
+                    ReadError::CorruptPile {
+                        valid_length: start_offset,
+                    }
+                })?;
+                let data_len = header.length as usize;
+                let post_pad = v3_post_pad(data_len);
+                let data_offset = start_offset + V3_HEADER_LEN;
                 bytes.take_prefix(data_len).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
@@ -707,35 +795,30 @@ impl Pile {
                         }
                     }
                 }
-                self.applied_length =
-                    start_offset + BLOB_HEADER_LEN + pre_pad + data_len + post_pad;
+                self.applied_length = start_offset + V3_HEADER_LEN + data_len + post_pad;
                 Ok(Some(Applied::Blob { hash }))
             }
-            MAGIC_MARKER_BRANCH => {
-                let header =
-                    bytes
-                        .view_prefix::<BranchHeader>()
-                        .map_err(|_| ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        })?;
+            MAGIC_MARKER_BRANCH_V3 => {
+                let header = bytes.view_prefix::<BranchHeaderV3>().map_err(|_| {
+                    ReadError::CorruptPile {
+                        valid_length: start_offset,
+                    }
+                })?;
                 let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
                     valid_length: start_offset,
                 })?;
-                // Interpret the stored raw value as a hash and transmute into a
-                // handle value for storage. Use Entry to insert/replace into the PATCH.
                 let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
                 let handle_val: Inline<Handle<SimpleArchive>> = hash.into();
                 let entry = Entry::with_value(&header.branch_id, handle_val);
-                // Replace existing mapping (if any) with the new head.
                 self.branches.replace(&entry);
-                self.applied_length = start_offset + std::mem::size_of::<BranchHeader>();
+                self.applied_length = start_offset + V3_HEADER_LEN;
                 Ok(Some(Applied::Branch {
                     id: branch_id,
                     hash,
                 }))
             }
-            MAGIC_MARKER_BRANCH_TOMBSTONE => {
-                let header = bytes.view_prefix::<BranchTombstoneHeader>().map_err(|_| {
+            MAGIC_MARKER_BRANCH_TOMBSTONE_V3 => {
+                let header = bytes.view_prefix::<BranchTombstoneHeaderV3>().map_err(|_| {
                     ReadError::CorruptPile {
                         valid_length: start_offset,
                     }
@@ -744,7 +827,7 @@ impl Pile {
                     valid_length: start_offset,
                 })?;
                 self.branches.remove(&header.branch_id);
-                self.applied_length = start_offset + std::mem::size_of::<BranchTombstoneHeader>();
+                self.applied_length = start_offset + V3_HEADER_LEN;
                 Ok(Some(Applied::BranchTombstone { id: branch_id }))
             }
             _ => Err(ReadError::CorruptPile {
@@ -989,12 +1072,16 @@ impl BlobStorePut for Pile {
 }
 
 impl Pile {
-    /// Shared blob-append used by both [`BlobStorePut::put`] (`aligned=false`,
-    /// a V1 record) and [`BlobStorePut::put_aligned`] (`aligned=true`, a 256-data-
-    /// aligned V2 record). V2 writes take the EXCLUSIVE file lock so the record's
-    /// start offset is stable (the pre-header pad depends on it) and the scan
-    /// recomputes the same pad.
-    fn put_impl<S, T>(&mut self, item: T, aligned: bool) -> Result<Inline<Handle<S>>, InsertError>
+    /// Shared blob-append. Writes a V3 record: a fixed 256-byte header, the blob
+    /// data at `record_start + V3_HEADER_LEN`, and post-padding to a 256-byte
+    /// multiple. Because V3 has no offset-derived pad, the append uses the atomic
+    /// shared-lock fast path for records up to `ATOMIC_WRITE_LIMIT` (no exclusive lock needed —
+    /// a fixed header has no start offset to stabilize). The data is
+    /// absolutely 256-aligned (zero-copy GPU-aliasable) in a pure-V3 pile, which
+    /// stays 256-aligned because every V3 record is a 256-byte multiple. The
+    /// `aligned` flag is now vestigial — every V3 blob is aligned; `put` and
+    /// `put_aligned` both route here.
+    fn put_impl<S, T>(&mut self, item: T, _aligned: bool) -> Result<Inline<Handle<S>>, InsertError>
     where
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
@@ -1002,10 +1089,9 @@ impl Pile {
     {
         let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
-        let padding = padding_for_blob(blob_size);
-        let record_size = BLOB_HEADER_LEN + blob_size + padding;
-        // V2 (aligned) records must hold the exclusive lock — see doc above.
-        let use_atomic = record_size <= ATOMIC_WRITE_LIMIT && !aligned;
+        let padding = v3_post_pad(blob_size);
+        let record_size = V3_HEADER_LEN + blob_size + padding;
+        let use_atomic = record_size <= ATOMIC_WRITE_LIMIT;
 
         if use_atomic {
             self.file.lock_shared()?;
@@ -1046,23 +1132,13 @@ impl Pile {
             }
 
             let now_in_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-            // A V2 (aligned) record inserts `pre_pad` bytes between header and data
-            // so the data start is GPU_DATA_ALIGNMENT-aligned. `self.applied_length`
-            // is this record's start offset (refreshed above; stable because V2
-            // holds the exclusive lock). For V1, pre_pad == 0 → byte-identical.
-            let pre_pad = if aligned { pre_pad_for(self.applied_length) } else { 0 };
-            let header = if aligned {
-                BlobHeader::new_v2(now_in_ms as u64, blob_size as u64, hash)
-            } else {
-                BlobHeader::new(now_in_ms as u64, blob_size as u64, hash)
-            };
-            let actual_record_size = BLOB_HEADER_LEN + pre_pad + blob_size + padding;
-            // Big enough for pre_pad (<= 192) and post-pad (< 64).
-            let zero_buf = [0u8; GPU_DATA_ALIGNMENT];
+            let header = BlobHeaderV3::new(now_in_ms as u64, blob_size as u64, hash);
+            let actual_record_size = V3_HEADER_LEN + blob_size + padding;
+            // post-pad is < 256.
+            let zero_buf = [0u8; V3_ALIGNMENT];
             if use_atomic {
                 let bufs = [
                     IoSlice::new(header.as_bytes()),
-                    IoSlice::new(&zero_buf[..pre_pad]),
                     IoSlice::new(blob.bytes.as_ref()),
                     IoSlice::new(&zero_buf[..padding]),
                 ];
@@ -1078,9 +1154,6 @@ impl Pile {
                 // syscalls for header/padding are negligible. Any partial
                 // completion after a crash is caught by `restore`.
                 self.file.write_all(header.as_bytes())?;
-                if pre_pad > 0 {
-                    self.file.write_all(&zero_buf[..pre_pad])?;
-                }
                 self.file.write_all(blob.bytes.as_ref())?;
                 if padding > 0 {
                     self.file.write_all(&zero_buf[..padding])?;
@@ -1188,20 +1261,17 @@ impl PinStore for Pile
                 return Ok(PushResult::Success());
             }
 
+            // V3 branch/tombstone records: fixed 256-byte header, no data, so the
+            // record is exactly one 256-byte unit — keeping a pure-V3 pile
+            // 256-aligned throughout (branches write under the exclusive lock).
             let (expected, write_res) = match new {
                 Some(new) => {
-                    let header = BranchHeader::new(id, new);
-                    (
-                        std::mem::size_of::<BranchHeader>(),
-                        self.file.write(header.as_bytes()),
-                    )
+                    let header = BranchHeaderV3::new(id, new);
+                    (V3_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
                 None => {
-                    let header = BranchTombstoneHeader::new(id);
-                    (
-                        std::mem::size_of::<BranchTombstoneHeader>(),
-                        self.file.write(header.as_bytes()),
-                    )
+                    let header = BranchTombstoneHeaderV3::new(id);
+                    (V3_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
             };
             let written = match write_res {
@@ -1330,10 +1400,10 @@ mod tests {
     }
 
     #[test]
-    fn put_aligned_v2_256_aligned_roundtrip() {
+    fn put_aligned_v3_256_aligned_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "v2.pile");
-        // Sizes around the 64/256 boundaries to exercise every pre_pad value.
+        let path = fresh_empty_pile_path(&dir, "v3.pile");
+        // Sizes around the 64/256 boundaries to exercise the post-pad.
         let sizes = [1usize, 7, 33, 64, 100, 192, 255, 256, 257, 1000, 4096];
         let mut hashes = Vec::new();
         let mut datas: Vec<Vec<u8>> = Vec::new();
@@ -1349,30 +1419,133 @@ mod tests {
             }
             pile.close().unwrap();
         }
-        // Reopen fresh — the scan rebuilds the index from the on-disk V2 records.
+        // Reopen fresh — the scan rebuilds the index from the on-disk V3 records.
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
-            let entry = pile.blobs.get(&hash.raw).expect("V2 blob missing after reopen").clone();
+            let entry = pile.blobs.get(&hash.raw).expect("V3 blob missing after reopen").clone();
             let IndexEntry { offset, len, .. } = entry;
             assert_eq!(
                 offset % GPU_DATA_ALIGNMENT,
                 0,
-                "V2 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
+                "V3 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
                 expected.len()
             );
             let got = unsafe {
                 std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize)
             };
-            assert_eq!(got, &expected[..], "V2 roundtrip mismatch (size {})", expected.len());
+            assert_eq!(got, &expected[..], "V3 roundtrip mismatch (size {})", expected.len());
         }
+        pile.close().unwrap();
+    }
+
+    /// The whole point of uniform-V3: `cat a.pile >> b.pile` is a valid merge —
+    /// every record from both piles is found and byte-correct, the data stays
+    /// 256-aligned, and `restore()` does not truncate the concatenation as
+    /// corrupt. This is what an offset-derived pad could never survive.
+    #[test]
+    fn v3_cat_merge_preserves_all_blobs_and_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "b.pile");
+        let sizes = [1usize, 33, 100, 256, 257, 1000, 4096];
+        let mut handles: Vec<(Inline<Hash<Blake3>>, Vec<u8>)> = Vec::new();
+
+        {
+            let mut a: Pile = Pile::open(&path_a).unwrap();
+            for (k, &sz) in sizes.iter().enumerate() {
+                let data: Vec<u8> = (0..sz).map(|i| ((i + k) % 251) as u8).collect();
+                let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
+                let h: Inline<Hash<Blake3>> = a.put::<UnknownBlob, _>(blob).unwrap().into();
+                handles.push((h, data));
+            }
+            a.close().unwrap();
+        }
+        {
+            let mut b: Pile = Pile::open(&path_b).unwrap();
+            for (k, &sz) in sizes.iter().enumerate() {
+                // Distinct content so no hash collisions with pile A.
+                let data: Vec<u8> = (0..sz).map(|i| ((i + k + 128) % 251) as u8).collect();
+                let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
+                let h: Inline<Hash<Blake3>> = b.put::<UnknownBlob, _>(blob).unwrap().into();
+                handles.push((h, data));
+            }
+            b.close().unwrap();
+        }
+
+        // Each pure-V3 pile is a whole number of 256-byte units — the precondition
+        // that makes the appended pile land on a 256-aligned offset.
+        assert_eq!(std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+
+        // cat a.pile >> b.pile
+        {
+            let a_bytes = std::fs::read(&path_a).unwrap();
+            let mut bf = std::fs::OpenOptions::new().append(true).open(&path_b).unwrap();
+            bf.write_all(&a_bytes).unwrap();
+            bf.sync_all().unwrap();
+        }
+        let merged_len = std::fs::metadata(&path_b).unwrap().len();
+
+        let mut merged: Pile = Pile::open(&path_b).unwrap();
+        merged.restore().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path_b).unwrap().len(),
+            merged_len,
+            "cat-merged pile was truncated — cat is not a valid V3 merge"
+        );
+        for (hash, expected) in &handles {
+            let entry = merged
+                .blobs
+                .get(&hash.raw)
+                .expect("blob lost after cat-merge")
+                .clone();
+            let IndexEntry { offset, len, .. } = entry;
+            assert_eq!(offset % V3_ALIGNMENT, 0, "post-cat data offset not 256-aligned");
+            let got =
+                unsafe { std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize) };
+            assert_eq!(got, &expected[..], "blob bytes wrong after cat-merge");
+        }
+        // Still 256-aligned, so it can be cat'd again.
+        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        merged.close().unwrap();
+    }
+
+    /// Existing piles are V1; the V3-capable reader must read them unchanged.
+    #[test]
+    fn v3_reader_still_reads_legacy_v1_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "legacy_v1.pile");
+        let data = vec![9u8; 40];
+        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
+        let handle: Inline<Handle<UnknownBlob>> = blob.get_handle();
+        let hash: Inline<Hash<Blake3>> = handle.into();
+        // Hand-write a legacy V1 blob record: 64-byte header + data + 64-pad.
+        {
+            let header = BlobHeader::new(42, data.len() as u64, hash);
+            let pad = padding_for_blob(data.len());
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.write_all(&data).unwrap();
+            f.write_all(&vec![0u8; pad]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        pile.restore().unwrap();
+        let reader = pile.reader().unwrap();
+        let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
+        assert_eq!(
+            fetched.bytes.as_ref(),
+            data.as_slice(),
+            "legacy V1 blob not read by the V3-capable reader"
+        );
         pile.close().unwrap();
     }
 
     #[test]
     fn put_aligned_and_put_interleave() {
-        // V1 (dense) and V2 (256-aligned) records in ONE pile must both scan and
-        // read back correctly — a V2 record's pre_pad must not desync the walk.
+        // Interleaving put + put_aligned (both write V3 now): every record is
+        // 256-aligned and reads back correctly after a fresh scan.
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "mix.pile");
         let mut entries: Vec<(Inline<Hash<Blake3>>, Vec<u8>, bool)> = Vec::new();
@@ -1392,15 +1565,15 @@ mod tests {
         }
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
-        for (hash, expected, is_v2) in &entries {
+        for (hash, expected, via_aligned) in &entries {
             let e = pile.blobs.get(&hash.raw).expect("blob missing after reopen").clone();
-            if *is_v2 {
-                assert_eq!(e.offset % GPU_DATA_ALIGNMENT, 0, "V2 record not aligned");
+            if *via_aligned {
+                assert_eq!(e.offset % GPU_DATA_ALIGNMENT, 0, "V3 record not aligned");
             }
             let got = unsafe {
                 std::slice::from_raw_parts(pile.mmap.as_ptr().add(e.offset), e.len as usize)
             };
-            assert_eq!(got, &expected[..], "mismatch (v2={is_v2}, size {})", expected.len());
+            assert_eq!(got, &expected[..], "mismatch (aligned={via_aligned}, size {})", expected.len());
         }
         pile.close().unwrap();
     }
@@ -1996,8 +2169,10 @@ mod tests {
 
         pile.restore().unwrap();
 
+        // Blobs are now written as V3 records (fixed 256-byte header, padded to a
+        // 256-byte multiple).
         let expected_len =
-            (super::BLOB_HEADER_LEN + data.len() + super::padding_for_blob(data.len())) as u64;
+            (super::V3_HEADER_LEN + data.len() + super::v3_post_pad(data.len())) as u64;
         assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len);
 
         let reader = pile.reader().unwrap();
