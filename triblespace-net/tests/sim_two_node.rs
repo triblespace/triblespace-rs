@@ -32,7 +32,7 @@ use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::id::rngid::seed_ids;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
-use triblespace_core::prelude::{BlobStore, PinStore};
+use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, Repository};

@@ -146,44 +146,6 @@ pub fn bring_up(
     )
 }
 
-/// Like [`bring_up`] but with a bounded [`BoundedBlobStore`] cache tier
-/// of `capacity` blobs — a lazy node that caches swarm-fetched content
-/// instead of eagerly replicating it.
-pub fn bring_up_cached(
-    net: &SimNet,
-    signing_key: &SigningKey,
-    store: MemoryRepo,
-    cache_capacity: usize,
-    team_root: ed25519_dalek::VerifyingKey,
-    self_cap: [u8; 32],
-    gossip: bool,
-) -> Peer<MemoryRepo, triblespace_net::cache::BoundedBlobStore> {
-    let id = pk(signing_key);
-    let harness = net.join(id, gossip);
-    let (sender, receiver, wiring) =
-        host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
-    tokio::task::spawn_local(host::run_host(
-        harness,
-        PeerConfig {
-            peers: Vec::new(),
-            gossip,
-            team_root,
-            self_cap,
-            direction: SyncDirection::Bidirectional,
-        },
-        wiring,
-    ));
-    Peer::with_wiring_and_cache(
-        store,
-        triblespace_net::cache::BoundedBlobStore::new(cache_capacity),
-        signing_key.clone(),
-        SyncDirection::Bidirectional,
-        team_root,
-        sender,
-        receiver,
-    )
-}
-
 /// A MemoryRepo seeded with the given cap+sig blobs (so OP_AUTH
 /// verifies locally without a chain swarm-fetch).
 pub fn store_with_caps(caps: &[(Blob<SimpleArchive>, Blob<SimpleArchive>)]) -> MemoryRepo {

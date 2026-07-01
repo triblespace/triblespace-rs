@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Peer<S>` single-store collapse.** `Peer<Durable, Cache>` is now
+  `Peer<S: BlobStore + BlobStorePut + PinStore + WeakPinStore + Send + 'static>`
+  — the separate cache tier is gone, and any tiering (bounded retention,
+  generational eviction) lives in the store `S` itself (e.g. a `Yard`).
+  Read-miss swarm fetches land in `S` under a **weak pin**, following the
+  retention lattice `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`: the demand-born
+  want is recorded *before* the fetch (a failed fetch leaves it as an
+  outstanding want — a sync daemon's work queue), then it is the retention
+  marker for the fetched blob, then the eviction target. There is no
+  "promote to durable" operation — durability is reachability from strong
+  pins. `triblespace-net`'s `cache` module (`NullCache`, `BoundedBlobStore`)
+  is removed along with `Peer::with_wiring_and_cache`/`cache_len`/
+  `land_in_cache`. `WeakPinStore` is now also implemented for `MemoryRepo`
+  (in-memory `HashSet`, LWW = insert/remove; weak pins there are exactly as
+  ephemeral as the blobs — the trait is a capability, durability is the
+  store's own property).
 - **Faculties no longer auto-truncate a corrupt pile on open (data-loss fix).**
   **WARNING:** every faculty and tool at or before the prior version opened piles
   with `Pile::open` + `Pile::restore()`, and `restore()` silently truncates the

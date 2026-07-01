@@ -21,10 +21,14 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::{
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WeakPinStore,
+};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 
@@ -69,11 +73,17 @@ where
     None
 }
 
-fn holds_locally(peer: &mut triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>, hash: [u8; 32]) -> bool {
+fn holds_locally(peer: &mut triblespace_net::peer::Peer<MemoryRepo>, hash: [u8; 32]) -> bool {
     let reader = peer.reader().unwrap();
     // Disambiguate: the sync, local-only `BlobStoreGet::get` (PeerReader
     // also impls the async fetching `AsyncBlobStoreGet::get`).
     BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash)).is_ok()
+}
+
+/// Count of weak-pinned handles in the peer's store — the retention
+/// markers that lazy swarm fetches land under.
+fn weak_pin_count(peer: &triblespace_net::peer::Peer<MemoryRepo>) -> usize {
+    peer.store().weak_pins().unwrap().count()
 }
 
 /// A holds a content blob; B does not. B's swarm fetch must pull it
@@ -119,14 +129,15 @@ fn fetch_blob_pulls_from_the_holder() {
     });
 }
 
-/// The full lazy-read invariant: a cached node B that does not hold a
-/// content blob fetches it from the swarm and lands it in its **Cache**
-/// tier — never the Durable store — after which the Durable∪Cache
+/// The full lazy-read invariant: a node B that does not hold a content
+/// blob fetches it from the swarm and lands it in its store under a
+/// **weak pin** — the demand-born retention marker — after which the
 /// `PeerReader` serves it locally. This is "lazy replication" in one
-/// test: B reads content it never eagerly replicated, holds it only
-/// transiently, and a pin would be a separate decision.
+/// test: B reads content it never eagerly replicated, retains it as an
+/// evictable weak-pinned resident, and a strong pin (the durability
+/// promise) would be a separate decision.
 #[test]
-fn lazy_read_lands_in_cache_not_durable() {
+fn lazy_read_lands_weak_pinned_in_store() {
     let _g = sim_guard();
     run_paused(0xCAFE, async {
         let net = SimNet::new(0xCAFE, SimConfig::default());
@@ -143,9 +154,9 @@ fn lazy_read_lands_in_cache_not_durable() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        // B is a lazy node: a small bounded cache, no eager content.
+        // B is a lazy node: no eager content.
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         // Settle the mesh so A's blobs are announced to the DHT.
         for _ in 0..40u32 {
@@ -153,45 +164,53 @@ fn lazy_read_lands_in_cache_not_durable() {
             peer_a.refresh();
         }
 
-        // Precondition: B holds nothing locally and its cache is empty.
+        // Precondition: B holds nothing locally and has no weak pins.
         assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
-        assert_eq!(peer_b.cache_len(), 0, "precondition: B's cache is empty");
+        assert_eq!(weak_pin_count(&peer_b), 0, "precondition: no weak pins");
+        let strong_before = peer_b.store().pins().unwrap().count();
 
-        // Swarm-fetch (steppable form of get_or_fetch's miss path).
-        let got = drive_future(peer_b.fetch_blob(hash), || peer_a.refresh(), 120)
+        // The lazy read: record the demand-born weak pin, fetch from
+        // the swarm, land the verified bytes in the store.
+        let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 120)
             .await
             .flatten()
             .expect("B must obtain the blob from the swarm");
+        assert_eq!(
+            blake3::hash(&got).as_bytes(),
+            &hash,
+            "fetched bytes hash to the content id"
+        );
 
-        // Land it exactly as get_or_fetch would.
-        peer_b.land_in_cache(got.clone().into());
-
-        // 1. The Durable∪Cache reader now serves it locally.
-        let local = peer_b.try_local(hash).expect("PeerReader union serves the cached blob");
+        // 1. The store now serves it locally.
+        let local = peer_b.try_local(hash).expect("the store serves the fetched blob");
         assert_eq!(
             blake3::hash(&local).as_bytes(),
             &hash,
             "served bytes hash to the content id"
         );
-        // 2. It landed in the Cache tier...
-        assert_eq!(peer_b.cache_len(), 1, "blob resident in the cache tier");
-        // 3. ...and NOT in the Durable store (no eager persistence).
-        let durable_has = peer_b
-            .store_mut()
-            .reader()
-            .unwrap()
-            .get::<Blob<UnknownBlob>, UnknownBlob>(Inline::new(hash))
-            .is_ok();
-        assert!(!durable_has, "lazy read must NOT persist to the Durable store");
+        // 2. It is retained under a weak pin (the demand-born marker)...
+        let weak: Vec<_> = peer_b.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            weak,
+            vec![Inline::<Handle<UnknownBlob>>::new(hash)],
+            "fetched blob is weak-pinned"
+        );
+        // 3. ...and NOT strong-pinned (no eager durability promise).
+        assert_eq!(
+            peer_b.store().pins().unwrap().count(),
+            strong_before,
+            "lazy read must not create a strong pin"
+        );
     });
 }
 
-/// A bounded cache evicts under read pressure, and the evicted blob is
-/// re-fetchable. B caches at most 2 blobs; after lazily reading 3, the
-/// oldest is gone from the local union (a miss) but the swarm still
-/// serves it on demand — "caches are free, eviction is always safe".
+/// Eviction lives in the store now — and it is always safe: the evicted
+/// blob is re-fetchable. B lazily reads 3 blobs (each lands weak-pinned),
+/// then the store evicts the first (weak-unpin + drop the bytes); the
+/// evicted blob becomes a local miss but the swarm still serves it on
+/// demand — "weak pins are wants, eviction is always safe".
 #[test]
-fn lazy_cache_evicts_under_pressure_and_refetches() {
+fn lazy_store_eviction_is_safe_and_refetches() {
     let _g = sim_guard();
     run_paused(0xBEEF, async {
         let net = SimNet::new(0xBEEF, SimConfig::default());
@@ -202,7 +221,7 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
         let cap_a = admin_cap(&root, &ka);
         let cap_b = admin_cap(&root, &kb);
 
-        // A holds three content blobs; B caches at most two.
+        // A holds three content blobs; B holds none.
         let blobs: Vec<(Blob<SimpleArchive>, [u8; 32])> =
             (0..3u8).map(|i| content_blob(0x60 + i)).collect();
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
@@ -213,44 +232,67 @@ fn lazy_cache_evicts_under_pressure_and_refetches() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 2, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
         }
 
-        // Lazily read all three, in order.
+        // Lazily read all three, in order — each lands weak-pinned.
         for (_, hash) in &blobs {
-            let got = drive_future(peer_b.fetch_blob(*hash), || peer_a.refresh(), 120)
+            let got = drive_future(peer_b.get_or_fetch_async(*hash), || peer_a.refresh(), 120)
                 .await
                 .flatten()
                 .expect("swarm must serve each blob");
-            peer_b.land_in_cache(got.into());
+            assert_eq!(blake3::hash(&got).as_bytes(), hash);
+        }
+        assert_eq!(weak_pin_count(&peer_b), 3, "each lazy read landed weak-pinned");
+        for (_, hash) in &blobs {
+            assert!(peer_b.try_local(*hash).is_some(), "resident after the lazy read");
         }
 
-        // Capacity held: the first (oldest) evicted, the last two resident.
-        assert_eq!(peer_b.cache_len(), 2, "cache bounded to capacity");
-        assert!(peer_b.try_local(blobs[0].1).is_none(), "oldest evicted from the union");
-        assert!(peer_b.try_local(blobs[1].1).is_some(), "second still cached");
-        assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still cached");
+        // The store evicts the first blob: retract the weak pin and
+        // drop the bytes. (MemoryRepo has no eviction policy of its
+        // own — this is the store-side operation a budgeted store like
+        // Yard performs under pressure.)
+        {
+            let mut store = peer_b.store();
+            store
+                .unpin_weak(Inline::<Handle<UnknownBlob>>::new(blobs[0].1))
+                .unwrap();
+            let retained: Vec<Inline<Handle<UnknownBlob>>> = store
+                .reader()
+                .unwrap()
+                .blobs()
+                .filter_map(Result::ok)
+                .filter(|h| h.raw != blobs[0].1)
+                .collect();
+            store.keep(retained);
+        }
+
+        // The eviction retracted the pin and dropped the resident bytes.
+        assert_eq!(weak_pin_count(&peer_b), 2, "weak pin retracted by the eviction");
+        assert!(peer_b.try_local(blobs[0].1).is_none(), "oldest evicted from the store");
+        assert!(peer_b.try_local(blobs[1].1).is_some(), "second still resident");
+        assert!(peer_b.try_local(blobs[2].1).is_some(), "newest still resident");
 
         // The evicted blob is re-fetchable from the swarm.
         let refetched = drive_future(peer_b.fetch_blob(blobs[0].1), || peer_a.refresh(), 120)
             .await
             .flatten()
-            .expect("evicted blob re-fetchable — caches are free");
+            .expect("evicted blob re-fetchable — eviction is always safe");
         assert_eq!(blake3::hash(&refetched).as_bytes(), &blobs[0].1);
     });
 }
 
 /// The honest **async** lazy read: `get_or_fetch_async` awaits the
 /// swarm fetch (oneshot reply, no blocked thread) and lands the result
-/// in Cache. Driven deterministically by polling the future and
-/// stepping the sim on `Pending` — the awaited oneshot resolves once
-/// the host (driven by the stepping) sends the reply.
+/// weak-pinned in the store. Driven deterministically by polling the
+/// future and stepping the sim on `Pending` — the awaited oneshot
+/// resolves once the host (driven by the stepping) sends the reply.
 #[test]
-fn async_lazy_read_awaits_swarm_and_caches() {
+fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
     let _g = sim_guard();
     run_paused(0xA5A5, async {
         let net = SimNet::new(0xA5A5, SimConfig::default());
@@ -268,7 +310,7 @@ fn async_lazy_read_awaits_swarm_and_caches() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -298,17 +340,18 @@ fn async_lazy_read_awaits_swarm_and_caches() {
             &hash,
             "awaited bytes hash to the content id"
         );
-        // Landed in Cache, served locally on the next read.
-        assert!(peer_b.try_local(hash).is_some(), "now resident in the local union");
-        assert_eq!(peer_b.cache_len(), 1, "landed in the cache tier");
+        // Landed weak-pinned in the store, served locally on the next read.
+        assert!(peer_b.try_local(hash).is_some(), "now resident in the local store");
+        assert_eq!(weak_pin_count(&peer_b), 1, "landed under a weak pin");
     });
 }
 
 /// Transparent async read through the trait surface: a *generic*
 /// `AsyncBlobStoreGet` consumer calls `reader.get(handle).await` on a
 /// blob B doesn't hold, and the `PeerReader` fetches it from the swarm
-/// and lands it in the shared Cache — no knowledge that it's a `Peer`.
-/// This is the "lazy replication for free" payoff of increment 5b.
+/// and lands it weak-pinned in the shared store — no knowledge that
+/// it's a `Peer`. This is the "lazy replication for free" payoff of
+/// increment 5b.
 #[test]
 fn transparent_async_get_fetches_through_reader() {
     let _g = sim_guard();
@@ -328,7 +371,7 @@ fn transparent_async_get_fetches_through_reader() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -360,9 +403,9 @@ fn transparent_async_get_fetches_through_reader() {
             &hash,
             "transparently-fetched bytes hash to the content id"
         );
-        // The fetch landed in the *shared* cache (a &self read mutated
+        // The fetch landed in the *shared* store (a &self read mutated
         // Peer state), so a fresh local read now hits.
-        assert_eq!(peer_b.cache_len(), 1, "fetch landed in the shared cache tier");
+        assert_eq!(weak_pin_count(&peer_b), 1, "fetch recorded the demand-born weak pin");
         assert!(peer_b.try_local(hash).is_some(), "served locally on the next read");
     });
 }
@@ -428,7 +471,7 @@ fn lazy_read_unavailable_under_partition_then_heals() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -445,7 +488,12 @@ fn lazy_read_unavailable_under_partition_then_heals() {
             blocked.is_none(),
             "partitioned from the only holder → Unavailable"
         );
-        assert_eq!(peer_b.cache_len(), 0, "nothing cached from a failed fetch");
+        assert!(peer_b.try_local(hash).is_none(), "nothing landed from a failed fetch");
+        assert_eq!(
+            weak_pin_count(&peer_b),
+            0,
+            "fetch_blob records no want — pinning is the caller's policy"
+        );
 
         // Heal the link; the same read now succeeds.
         net.heal(pk(&ka), pk(&kb));
@@ -480,7 +528,7 @@ fn lazy_read_unavailable_under_crash_then_revives() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -502,14 +550,16 @@ fn lazy_read_unavailable_under_crash_then_revives() {
     });
 }
 
-/// A default `Peer<S, NullCache>` (no cache tier — what `Peer::new`
-/// gives) still fetches lazily: the fetch succeeds and returns the
-/// bytes, but the no-op `NullCache` land caches nothing, so a second
-/// read re-fetches rather than hitting locally. Validates the
-/// cache-less config through the lazy machinery — the `SharedCache<
-/// NullCache>` sink path that the bounded-cache tests never exercise.
+/// A default `Peer<S>` **retains** what it fetches: the lazy read lands
+/// the blob in the store under a weak pin, so a second read is a LOCAL
+/// hit — no re-fetch, no swarm dependency. Proven by crashing the only
+/// holder before the second read: it still succeeds, resolving on the
+/// first poll without a single sim step. (Under the old two-tier model
+/// a cache-less `Peer<S, NullCache>` re-fetched on every read; that
+/// behavior no longer exists — retention is the store's job, and every
+/// fetch stays resident until the store evicts it.)
 #[test]
-fn nullcache_peer_fetches_but_caches_nothing() {
+fn fetched_blob_is_retained_second_read_hits_locally() {
     let _g = sim_guard();
     run_paused(0x0011_0000, async {
         let net = SimNet::new(0x0011_0000, SimConfig::default());
@@ -526,7 +576,6 @@ fn nullcache_peer_fetches_but_caches_nothing() {
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
-        // bring_up gives a plain `Peer<MemoryRepo, NullCache>` — no cache.
         let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
@@ -537,18 +586,25 @@ fn nullcache_peer_fetches_but_caches_nothing() {
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
             .await
             .flatten()
-            .expect("a cache-less peer still fetches from the swarm");
+            .expect("the lazy read fetches from the swarm");
         assert_eq!(blake3::hash(&got).as_bytes(), &hash);
 
-        // NullCache dropped the land — nothing is cached, nothing local.
-        assert_eq!(peer_b.cache_len(), 0, "NullCache caches nothing");
-        assert!(peer_b.try_local(hash).is_none(), "still a local miss after the fetch");
+        // The fetch landed weak-pinned: resident, evictable, retained.
+        assert_eq!(weak_pin_count(&peer_b), 1, "fetch landed under a weak pin");
+        assert!(peer_b.try_local(hash).is_some(), "a local hit after the fetch");
 
-        // A second read re-fetches and still succeeds.
-        let again = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
-            .await
-            .flatten()
-            .expect("re-fetch succeeds (no local hit to short-circuit)");
+        // Crash the only holder: the second read must still succeed —
+        // it is a local hit, not a re-fetch. `drive_future`'s on_step
+        // panicking makes "no sim step needed" an explicit assertion.
+        net.crash(pk(&ka));
+        let again = drive_future(
+            peer_b.get_or_fetch_async(hash),
+            || panic!("second read must resolve locally without stepping the sim"),
+            1,
+        )
+        .await
+        .flatten()
+        .expect("second read is a local hit — no re-fetch");
         assert_eq!(blake3::hash(&again).as_bytes(), &hash);
     });
 }
@@ -583,7 +639,7 @@ fn lazy_fetch_under_partition_chaos_is_safe_and_recovers() {
 
             let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
             let peer_b =
-                bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+                bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
             for _ in 0..40u32 {
                 SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -672,7 +728,7 @@ fn lazy_fetch_falls_back_to_a_second_holder() {
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_c = bring_up(&net, &kc, store_c, team_root, self_cap_of(&cap_c.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..50u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -719,7 +775,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -745,13 +801,14 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
 }
 
 /// Two concurrent transparent reads on the *same* node for the *same*
-/// missing blob. Stresses the 5b shared cache (interior-mutable
+/// missing blob. Stresses the shared store (interior-mutable
 /// `Arc<Mutex>`): both `&self` reads fetch from the swarm and land into
-/// the one shared tier. The conn-pool singleflight should share the dial
-/// to the holder, and the content-addressed cache must end with exactly
-/// one copy — no double-store from the racing lands.
+/// the one shared store. The conn-pool singleflight should share the
+/// dial to the holder, and the content-addressed store must end with
+/// exactly one copy under exactly one weak pin — no double-store from
+/// the racing lands.
 #[test]
-fn concurrent_transparent_reads_share_cache_and_dedupe() {
+fn concurrent_transparent_reads_share_store_and_dedupe() {
     let _g = sim_guard();
     run_paused(0xC0FFEE, async {
         let net = SimNet::new(0xC0FFEE, SimConfig::default());
@@ -769,7 +826,7 @@ fn concurrent_transparent_reads_share_cache_and_dedupe() {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
@@ -778,8 +835,8 @@ fn concurrent_transparent_reads_share_cache_and_dedupe() {
         assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
 
         // Two independent readers off the same Peer — each owns a clone
-        // of the durable+cache snapshot and a fetch capability into the
-        // *same* shared cache. (reader() borrows &mut only transiently.)
+        // of the store snapshot and a fetch capability into the *same*
+        // shared store. (reader() borrows &mut only transiently.)
         let reader1 = peer_b.reader().unwrap();
         let reader2 = peer_b.reader().unwrap();
 
@@ -818,12 +875,14 @@ fn concurrent_transparent_reads_share_cache_and_dedupe() {
         let got2 = got2.expect("reader 2 completed").expect("reader 2 fetched");
         assert_eq!(blake3::hash(&got1).as_bytes(), &hash);
         assert_eq!(blake3::hash(&got2).as_bytes(), &hash);
-        // Both racing lands hit the same content-addressed cache: one copy.
+        // Both racing lands hit the same content-addressed store: one
+        // copy, and the two recorded wants collapse to one weak pin.
         assert_eq!(
-            peer_b.cache_len(),
+            weak_pin_count(&peer_b),
             1,
-            "concurrent lands of the same blob dedupe to a single cache entry"
+            "concurrent lands of the same blob dedupe to a single weak pin"
         );
+        assert!(peer_b.try_local(hash).is_some(), "resident after the racing reads");
     });
 }
 
@@ -849,7 +908,7 @@ fn run_lazy_fetch_partition_recovery(seed: u64) -> (Option<Vec<u8>>, u32) {
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let peer_b =
-            bring_up_cached(&net, &kb, store_b, 8, team_root, self_cap_of(&cap_b.1), true);
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
         for _ in 0..40u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
