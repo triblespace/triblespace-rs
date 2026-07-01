@@ -14,7 +14,6 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::core::inline::encodings::hash::Blake3;
 use triblespace::prelude::{BlobEncoding, BlobStore, TribleSet};
 
 const FIXTURE_NAME: &str = "mapping-authorities-gnd-agrovoc_lds.jsonld";
@@ -125,19 +124,19 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
     struct ExportFixture {
         merged: TribleSet,
         roots: Vec<Id>,
-        reader: <MemoryBlobStore as BlobStore<Blake3>>::Reader,
+        reader: <MemoryBlobStore as BlobStore>::Reader,
         payload_len: usize,
         _blobs: MemoryBlobStore,
     }
 
     let export_fixture = {
         let mut blobs = MemoryBlobStore::new();
-        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
         let fragment = importer
             .import_blob(import_blob.clone())
             .expect("import JSON-LD as JSON");
         let roots = fragment.exports().collect::<Vec<_>>();
-        let mut merged = importer.metadata().expect("metadata set").into_facts();
+        let mut merged = importer.metadata().into_facts();
         merged += fragment.into_facts();
         let reader = blobs.reader().expect("reader");
         let payload_len = import_payload.len();
@@ -155,7 +154,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::new();
-            let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+            let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
@@ -168,7 +167,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::new();
-            let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+            let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
@@ -181,12 +180,12 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
         let blob = import_blob.clone();
         b.iter(|| {
             let mut blobs = MemoryBlobStore::new();
-            let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+            let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
             let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             let roots = fragment.exports().collect::<Vec<_>>();
-            let mut merged = importer.metadata().expect("metadata set").into_facts();
+            let mut merged = importer.metadata().into_facts();
             merged += fragment.into_facts();
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {

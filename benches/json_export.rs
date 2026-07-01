@@ -10,10 +10,9 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::export::json::export_to_json;
 use triblespace::core::id::Id;
 use triblespace::core::import::json::JsonObjectImporter;
-use triblespace::core::inline::encodings::hash::Blake3;
 use triblespace::prelude::{BlobStore, TribleSet};
 
-type Reader = <MemoryBlobStore as BlobStore<Blake3>>::Reader;
+type Reader = <MemoryBlobStore as BlobStore>::Reader;
 
 struct Fixture {
     name: &'static str,
@@ -57,7 +56,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
         .filter_map(|fixture| {
             let mut blobs = MemoryBlobStore::new();
             let (merged, root, data_tribles) = {
-                let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+                let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                 let fragment = importer
                     .import_blob(Blob::<LongString>::new(Bytes::from(
                         fixture.payload.clone().into_bytes(),
@@ -67,7 +66,7 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
                     .root()
                     .expect("fixture payload imports as a single rooted object");
 
-                let mut merged = importer.metadata().expect("metadata set").into_facts();
+                let mut merged = importer.metadata().into_facts();
                 let data_tribles = fragment.len();
                 merged += fragment.into_facts();
                 (merged, root, data_tribles)
@@ -233,7 +232,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::new();
                     let (merged, root) = {
-                        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+                        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                         let fragment = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(
                                 prepared.payload.clone().into_bytes(),
@@ -242,7 +241,7 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                         let root = fragment
                             .root()
                             .expect("fixture payload imports as a single rooted object");
-                        let mut merged = importer.metadata().expect("metadata set").into_facts();
+                        let mut merged = importer.metadata().into_facts();
                         merged += fragment.into_facts();
                         (merged, root)
                     };
@@ -271,14 +270,14 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                 b.iter(|| {
                     let mut blobs = MemoryBlobStore::new();
                     let (merged, root) = {
-                        let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut blobs, None);
+                        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
                         let fragment = importer
                             .import_blob(Blob::<LongString>::new(Bytes::from(payload.clone())))
                             .expect("import JSON");
                         let root = fragment
                             .root()
                             .expect("fixture payload imports as a single rooted object");
-                        let mut merged = importer.metadata().expect("metadata set").into_facts();
+                        let mut merged = importer.metadata().into_facts();
                         merged += fragment.into_facts();
                         (merged, root)
                     };
