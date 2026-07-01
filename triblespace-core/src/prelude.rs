@@ -80,6 +80,7 @@ pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStoreList;
 pub use crate::repo::BlobStorePut;
 pub use crate::repo::PinStore;
+pub use crate::repo::WeakPinStore;
 pub use crate::repo::Checkout;
 pub use crate::repo::CommitHandle;
 pub use crate::repo::CommitSet;

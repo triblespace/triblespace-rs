@@ -542,6 +542,51 @@ pub trait PinStore {
     ) -> Result<PushResult, Self::UpdateError>;
 }
 
+/// Storage backend for *weak* pins: anonymous, per-blob retention markers.
+///
+/// Retention is one strength axis, resolved last-writer-wins by log
+/// position: `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`. A [`PinStore`]
+/// record is `pin`, its tombstone is `unpin`; this trait adds the soft
+/// siblings. Unlike a strong pin, a weak pin has no name — it is keyed
+/// by the blob handle itself.
+///
+/// A weak pin is demand-born: "I want this blob; fetch it if absent;
+/// keep it while there's room; evictable under pressure." One marker is
+/// simultaneously the want-signal a sync daemon works from (fetch what
+/// is weak-pinned but absent), the cache-retention marker, and the
+/// eviction target. `unpin_weak` retracts it.
+///
+/// Strong pins remain authoritative for GC — the keep set is
+/// `reachable(strong pins)` plus budgeted weak — and weak state never
+/// blocks strong retention.
+pub trait WeakPinStore: PinStore {
+    /// Error type for weak-pin operations.
+    type WeakPinError: Error + Debug + Send + Sync + 'static;
+
+    /// Iterator over the LWW-resolved weak-pinned handles.
+    type WeakListIter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::WeakPinError>>
+    where
+        Self: 'a;
+
+    /// Records a weak pin for `handle`. Later records win: a weak pin
+    /// after a weak unpin of the same handle re-pins it.
+    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
+
+    /// Retracts a weak pin for `handle` (last-writer-wins).
+    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding;
+
+    /// Lists every weakly pinned handle (the LWW-resolved set). This is
+    /// the enumeration surface for sync daemons (fetch the absent ones)
+    /// and GC (the budgeted-weak side of the keep set).
+    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError>;
+}
+
 /// Error returned by [`transfer`] when copying blobs between stores.
 #[derive(Debug)]
 pub enum TransferError<ListErr, LoadErr, StoreErr> {
