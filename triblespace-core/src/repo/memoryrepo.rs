@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::Infallible;
 
 use crate::blob::encodings::UnknownBlob;
@@ -9,6 +10,7 @@ use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
+use crate::repo::WeakPinStore;
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -23,6 +25,11 @@ pub struct MemoryRepo {
     pub blobs: MemoryBlobStore,
     /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
     pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
+    /// LWW-resolved weak-pin set (see [`WeakPinStore`]). In memory the
+    /// last-writer-wins resolution is just insert/remove. Weak pins here
+    /// are exactly as ephemeral as the blobs themselves — the trait is a
+    /// capability, durability is the store's own property.
+    pub weak: HashSet<Inline<Handle<UnknownBlob>>>,
 }
 
 impl crate::repo::BlobStorePut for MemoryRepo {
@@ -101,11 +108,82 @@ impl PinStore for MemoryRepo {
     }
 }
 
+impl WeakPinStore for MemoryRepo {
+    type WeakPinError = Infallible;
+
+    type WeakListIter<'a> =
+        std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, Self::WeakPinError>>;
+
+    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.weak.insert(handle.transmute());
+        Ok(())
+    }
+
+    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.weak.remove(&handle.transmute());
+        Ok(())
+    }
+
+    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
+        // Sorted for the same reason as `pins()`: weak-pin enumeration
+        // feeds sync-daemon fetch order, and HashSet's per-instance seed
+        // would break deterministic simulation replay.
+        let mut handles: Vec<Inline<Handle<UnknownBlob>>> = self.weak.iter().copied().collect();
+        handles.sort();
+        Ok(handles
+            .into_iter()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+}
+
 impl crate::repo::StorageClose for MemoryRepo {
     type Error = Infallible;
 
     fn close(self) -> Result<(), Self::Error> {
         // Nothing to do for the in-memory backend.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
+        Inline::new([byte; 32])
+    }
+
+    /// Weak pins resolve last-writer-wins: pin → listed, unpin →
+    /// gone, re-pin → listed again. Enumeration is sorted (stable
+    /// across runs despite HashSet backing).
+    #[test]
+    fn weak_pins_lww_roundtrip() {
+        let mut repo = MemoryRepo::default();
+        assert_eq!(repo.weak_pins().unwrap().count(), 0);
+
+        repo.pin_weak(handle(2)).unwrap();
+        repo.pin_weak(handle(1)).unwrap();
+        // Re-pinning an already-pinned handle is idempotent.
+        repo.pin_weak(handle(1)).unwrap();
+        let pins: Vec<_> = repo.weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(pins, vec![handle(1), handle(2)], "sorted enumeration");
+
+        repo.unpin_weak(handle(1)).unwrap();
+        let pins: Vec<_> = repo.weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(pins, vec![handle(2)]);
+
+        // A later weak pin wins over the earlier unpin.
+        repo.pin_weak(handle(1)).unwrap();
+        assert_eq!(repo.weak_pins().unwrap().count(), 2);
     }
 }
