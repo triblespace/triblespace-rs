@@ -996,6 +996,182 @@ fn lazy_fetch_succeeds_across_many_seeds() {
     }
 }
 
+/// The want-reconcile loop — the daemon half of "a weak pin IS a
+/// durable want-marker". A faculty (another process) appends a weak-pin
+/// record for a blob the node doesn't hold; the sync daemon's reconcile
+/// tick notices the want, fetches the blob from whoever holds it, and
+/// lands it under the existing weak pin. Strong pins are never touched,
+/// on either side. B runs WITHOUT gossip so the only path the content
+/// can take is the reconcile-driven swarm fetch — no eager branch sync
+/// can satisfy the want behind the test's back.
+#[test]
+fn reconcile_tick_services_out_of_band_want() {
+    use triblespace_core::id::Id;
+    use triblespace_net::reconcile::Reconciler;
+
+    let _g = sim_guard();
+    run_paused(0x3A2C, async {
+        let net = SimNet::new(0x3A2C, SimConfig::default());
+        let root = key(0xFD);
+        let ka = key(0xAD);
+        let kb = key(0xBD);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        // A holds the blob strong-pinned (a branch head points at it) —
+        // the eager holder whose retention the reconcile must not touch.
+        let (blob, hash) = content_blob(0x21);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        let pin_id = Id::new([0xAD; 16]).unwrap();
+        store_a
+            .update(pin_id, None, Some(blob.get_handle()))
+            .unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        // B: no gossip — a pure leecher; only the want-reconcile fetches.
+        let mut peer_b =
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), false);
+
+        // Settle the mesh so A's blobs are announced to the DHT.
+        for _ in 0..40u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+
+        // Out-of-band want: written through the store guard, bypassing
+        // the Peer's own read path — exactly what a faculty appending a
+        // weak-pin record to the shared pile looks like to the daemon.
+        peer_b
+            .store()
+            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
+            .unwrap();
+        assert!(peer_b.try_local(hash).is_none(), "precondition: B lacks the blob");
+
+        let a_pins_before: Vec<_> =
+            peer_a.store().pins().unwrap().map(Result::unwrap).collect();
+        let a_weak_before = weak_pin_count(&peer_a);
+        let b_pins_before = peer_b.store().pins().unwrap().count();
+
+        // The reconcile pass: notice the want, fetch, land.
+        let mut rec = Reconciler::new();
+        let stats = drive_future(rec.tick(&mut peer_b), || peer_a.refresh(), 300)
+            .await
+            .expect("reconcile tick completes");
+        assert_eq!(stats.wants, 1, "the out-of-band weak pin is the want set");
+        assert_eq!(stats.missing, 1, "its blob was absent at pass start");
+        assert_eq!(stats.fetched, 1, "the want was serviced from the swarm");
+        assert_eq!(stats.pending, 0, "nothing left outstanding");
+
+        // The blob landed at B...
+        assert!(
+            peer_b.try_local(hash).is_some(),
+            "want serviced: blob now resident at B"
+        );
+        // ...still weak-pinned — the want-marker became the retention
+        // marker (the reconciler records no pin state of its own)...
+        let weak: Vec<_> =
+            peer_b.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            weak,
+            vec![Inline::<Handle<UnknownBlob>>::new(hash)],
+            "the want stays on record as the weak pin"
+        );
+        // ...B grew no strong pin...
+        assert_eq!(
+            peer_b.store().pins().unwrap().count(),
+            b_pins_before,
+            "reconcile must not create strong pins"
+        );
+        // ...and A's retention is untouched.
+        let a_pins_after: Vec<_> =
+            peer_a.store().pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(a_pins_after, a_pins_before, "A's strong pins untouched");
+        assert_eq!(weak_pin_count(&peer_a), a_weak_before, "A's weak pins untouched");
+    });
+}
+
+/// A want for a handle NOBODY holds stays pending across ticks without
+/// erroring — "absent" is always "not obtained yet", never
+/// definitely-absent. Also pins down the backoff gate: an immediate
+/// re-tick issues no fetch (the failed want waits out its backoff), a
+/// re-tick after the backoff elapses retries.
+#[test]
+fn reconcile_unsatisfiable_want_stays_pending() {
+    use triblespace_net::reconcile::Reconciler;
+
+    let _g = sim_guard();
+    run_paused(0x9E4D, async {
+        // Black-hole DHT: provider lookups time out — the fetch resolves
+        // Unavailable in bounded (virtual) time, never hangs.
+        let net = SimNet::new(
+            0x9E4D,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let root = key(0xFE);
+        let ka = key(0xAE);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+
+        let store_a = store_with_caps(&[cap_a.clone()]);
+        let mut peer_a =
+            bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+
+        // A want for content nobody holds (an arbitrary content id).
+        let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
+        peer_a
+            .store()
+            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
+            .unwrap();
+
+        let mut rec = Reconciler::new();
+
+        // Tick 1: the want is attempted and comes back Unavailable —
+        // pending, not an error, not dropped. (No-op on_step: the tick
+        // borrows peer_a; stepping alone crosses the DHT deadline.)
+        let s1 = drive_future(rec.tick(&mut peer_a), || {}, 400)
+            .await
+            .expect("tick 1 completes despite the unsatisfiable want");
+        assert_eq!(s1.missing, 1);
+        assert_eq!(s1.attempted, 1, "first sighting is attempted immediately");
+        assert_eq!(s1.fetched, 0);
+        assert_eq!(s1.pending, 1, "the want stays pending");
+
+        // Tick 2, immediately: the backoff gate holds — still pending,
+        // but no fetch is issued (no hammering a dark swarm).
+        let s2 = drive_future(rec.tick(&mut peer_a), || {}, 400)
+            .await
+            .expect("tick 2 completes");
+        assert_eq!(s2.missing, 1);
+        assert_eq!(s2.attempted, 0, "backoff-gated: no immediate re-fetch");
+        assert_eq!(s2.pending, 1);
+
+        // Let the backoff (1s initial) elapse in virtual time, then
+        // tick 3: the want is retried — and stays pending again.
+        for _ in 0..100u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+        }
+        let s3 = drive_future(rec.tick(&mut peer_a), || {}, 400)
+            .await
+            .expect("tick 3 completes");
+        assert_eq!(s3.attempted, 1, "retried after the backoff elapsed");
+        assert_eq!(s3.fetched, 0);
+        assert_eq!(s3.pending, 1);
+
+        // Throughout: the want is still durably on record and the blob
+        // still absent — nothing was dropped, nothing errored.
+        let weak: Vec<_> =
+            peer_a.store().weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(weak, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
+        assert!(peer_a.try_local(hash).is_none());
+    });
+}
+
 /// The content layer is decoupled from the gossip layer. Under **total
 /// gossip loss** the branch-sync/announce mesh is dark — but the lazy
 /// read uses the DHT (a global provider record) plus a direct authed

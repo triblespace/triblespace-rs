@@ -19,6 +19,7 @@ mod host;
 pub mod peer;
 pub mod policy;
 pub mod protocol;
+pub mod reconcile;
 pub mod identity;
 pub mod tracking;
 pub mod transport;
