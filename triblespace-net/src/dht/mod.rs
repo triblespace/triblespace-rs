@@ -1251,9 +1251,11 @@ pub mod pool {
             })
         }
 
-        fn zero_rtt_accepted(
+        fn zero_rtt_rejected(
             &self,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+            // We never attempt 0-RTT, so nothing is ever rejected
+            // (matches irpc's local-connection default).
             Box::pin(std::future::ready(false))
         }
     }

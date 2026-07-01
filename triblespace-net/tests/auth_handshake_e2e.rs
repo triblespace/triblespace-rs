@@ -76,7 +76,7 @@ async fn test_endpoint(
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret)
         .relay_mode(iroh::RelayMode::Disabled)
-        .ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify())
+        .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
         .add_custom_transport(transport);
     builder = builder.clear_ip_transports();
     builder.bind().await.expect("bind endpoint")

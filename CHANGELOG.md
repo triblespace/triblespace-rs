@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`repo::yard` generational blob storage.** Adds a standalone Yard storage
+  component that layers young-to-old Pile generations, union reads, per-blob
+  strong/weak retention, weak-veto reachability pruning, and size-triggered
+  strong tenuring without changing existing Peer or Pile APIs.
+- **Physical reclamation for `repo::yard`.** Adds explicit `Yard::reclaim()`
+  rewriting each generation's Pile to a sibling temporary Pile containing only
+  the current live set, then atomically renaming it over the original so
+  logically evicted blobs release disk space.
+- **Deterministic `repo::yard` property tests.** Adds seeded operation-sequence
+  tests covering strong/weak retention, collect/compact/reclaim consistency,
+  hole-safe walks, live-set exactness after collection, and deterministic replay.
 - Add a PATCH branch fanout diagnostic histogram for inspecting real trie
   shapes in benchmark probes.
 - Add a PATCH traversal-depth diagnostic for read-side benchmark probes.
