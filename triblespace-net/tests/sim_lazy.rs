@@ -452,6 +452,72 @@ fn fetch_blob_unavailable_is_clean() {
     });
 }
 
+/// Publisher-first shortcut for read-miss fetches. Gossip already told
+/// B who publishes, so the on-demand fetch must consult that knowledge
+/// instead of always paying the DHT lookup. Proven under a BLACK-HOLE
+/// DHT: previously the on-demand path passed our own id as publisher,
+/// so `providers_for`'s publisher-first branch never fired — this fetch
+/// resolved Unavailable despite a reachable publisher one gossip hop
+/// away. Now the gossip-known publisher serves it directly, no DHT.
+#[test]
+fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
+    use triblespace_core::id::Id;
+
+    let _g = sim_guard();
+    run_paused(0x60B1_0001, async {
+        let net = SimNet::new(
+            0x60B1_0001,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let root = key(0xF0);
+        let ka = key(0xA0);
+        let kb = key(0xB0);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+        let cap_b = admin_cap(&root, &kb);
+
+        // A holds a branch (so it gossips a HEAD — that's how B learns
+        // A is a publisher) plus an ORPHAN content blob outside the
+        // branch closure, so the eager tracking walk cannot land the
+        // fetch target at B behind the test's back.
+        let (branch_blob, _) = content_blob(0x31);
+        let (orphan_blob, orphan_hash) = content_blob(0x32);
+        let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+        store_a.put::<SimpleArchive, _>(branch_blob.clone()).unwrap();
+        store_a.put::<SimpleArchive, _>(orphan_blob.clone()).unwrap();
+        store_a
+            .update(Id::new([0x77; 16]).unwrap(), None, Some(branch_blob.get_handle()))
+            .unwrap();
+        let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
+
+        let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let mut peer_b =
+            bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
+
+        // Settle: A's refresh gossips the branch HEAD; B's host notes A
+        // as a known publisher when the frame arrives.
+        for _ in 0..60u32 {
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+            peer_a.refresh();
+        }
+        assert!(
+            peer_b.try_local(orphan_hash).is_none(),
+            "precondition: the orphan blob never rode the eager walk to B"
+        );
+
+        // The DHT is dark, so the ONLY way this fetch can succeed is
+        // the gossip-known-publisher shortcut.
+        let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 200)
+            .await
+            .flatten()
+            .expect("gossip-known publisher must serve the read-miss fetch without the DHT");
+        assert_eq!(blake3::hash(&got).as_bytes(), &orphan_hash);
+    });
+}
+
 /// The END-TO-END fetch deadline. With a short explicit budget, an
 /// unavailable fetch resolves `None` as soon as the budget expires —
 /// well before the internal 3s DHT timeout (let alone a stack of

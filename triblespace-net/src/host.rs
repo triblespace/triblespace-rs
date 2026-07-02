@@ -213,13 +213,45 @@ pub trait NetCapability: Send + Sync {
     ) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
 }
 
+/// Gossip-known publishers, most-recent-first. Every HEAD frame names
+/// its publisher, and the bottom-up insertion invariant says an
+/// announcer holds the full closure of what it announces — so recent
+/// publishers are the best first guess for ANY on-demand fetch, before
+/// paying (or depending on) a DHT lookup. Vec, not a hash set:
+/// insertion order is event order, which keeps deterministic simulation
+/// replay intact.
+type KnownPublishers = Arc<Mutex<Vec<PeerId>>>;
+
+/// Cap on the remembered publisher list. Team meshes are small; eight
+/// most-recent publishers covers them while bounding the worst-case
+/// dial fan-out of a publisher-first miss (each attempt is further
+/// bounded by the caller's overall fetch budget).
+const KNOWN_PUBLISHER_CAP: usize = 8;
+
+/// Move `peer` to the front of the known-publisher list (dedup + cap).
+fn note_publisher(known: &KnownPublishers, peer: PeerId) {
+    let mut list = known.lock().unwrap();
+    if let Some(pos) = list.iter().position(|p| *p == peer) {
+        list.remove(pos);
+    }
+    list.insert(0, peer);
+    list.truncate(KNOWN_PUBLISHER_CAP);
+}
+
 /// Transport-bound implementation of [`NetCapability`]. Holds exactly
-/// what `fetch_one` needs; built in the host once the transport exists.
+/// what the fetch needs; built in the host once the transport exists.
 struct NetCap<T: Transport> {
     transport: T,
     pool: SharedPool<T::Conn>,
     self_cap: RawHash,
     my_id: PeerId,
+    /// Gossip-known publishers — consulted BEFORE the DHT on every
+    /// on-demand fetch. Previously this path passed `my_id` as the
+    /// publisher, so `providers_for`'s publisher-first shortcut never
+    /// fired and every read-miss paid the DHT lookup (and, on a dark
+    /// DHT, failed outright even with a reachable publisher in gossip
+    /// range).
+    publishers: KnownPublishers,
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
@@ -231,10 +263,29 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let pool = self.pool.clone();
         let self_cap = self.self_cap;
         let my_id = self.my_id;
+        // Snapshot the publisher list now (sync lock, most-recent-first,
+        // self excluded) so the future is self-contained.
+        let known: Vec<PeerId> = self
+            .publishers
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|p| *p != my_id)
+            .collect();
         Box::pin(async move {
-            fetch_one(&t, &hash, &pool, my_id, &self_cap)
-                .await
-                .filter(|data| blake3::hash(data).as_bytes() == &hash)
+            // Publisher-first: whoever gossiped a HEAD at us is a live,
+            // dialable holder candidate — ask them before the DHT.
+            let mut data = if known.is_empty() {
+                None
+            } else {
+                fetch_from_providers(&t, &hash, &pool, &known, &self_cap).await
+            };
+            // DHT fallback: no publisher known, or none of them held it.
+            if data.is_none() {
+                data = fetch_one(&t, &hash, &pool, my_id, &self_cap).await;
+            }
+            data.filter(|data| blake3::hash(data).as_bytes() == &hash)
         })
     }
 }
@@ -516,6 +567,11 @@ async fn host_loop<T: Transport>(
     // docs for the OnceCell-based dial deduplication.
     let conn_pool: SharedPool<T::Conn> = new_shared_pool();
 
+    // Gossip-known publishers: updated by the gossip task on every HEAD
+    // frame, consulted by the on-demand fetch capability below so
+    // read-miss fetches try the live publisher before the DHT.
+    let known_publishers: KnownPublishers = Arc::new(Mutex::new(Vec::new()));
+
     // Publish the inline-fetch capability now that the transport exists.
     // `Peer::fetch_blob` parks on this slot until it's filled, which is
     // how the inline read path handles the construction-ordering the old
@@ -525,6 +581,7 @@ async fn host_loop<T: Transport>(
         pool: conn_pool.clone(),
         self_cap,
         my_id,
+        publishers: known_publishers.clone(),
     }) as Arc<dyn NetCapability>));
 
     // Failed-walk retry queue (bug C): walks that fail transiently
@@ -586,6 +643,7 @@ async fn host_loop<T: Transport>(
         let snapshot_for_fetch = snapshot.clone();
         let pool_for_fetch = conn_pool.clone();
         let retries_for_gossip = retries.clone();
+        let publishers_for_gossip = known_publishers.clone();
         tokio::spawn(async move {
             while let Some(event) = gossip_events.recv().await {
                 match event {
@@ -619,6 +677,10 @@ async fn host_loop<T: Transport>(
                                 } else {
                                     delivered_from
                                 };
+                            // Remember the publisher for the on-demand
+                            // fetch path: read-miss fetches consult the
+                            // gossip-known publishers before the DHT.
+                            note_publisher(&publishers_for_gossip, fetch_peer);
                             // A fresh frame supersedes any pending
                             // retry for this branch — the new walk
                             // owns the branch's recovery from here.
@@ -1158,7 +1220,23 @@ async fn fetch_one<T: Transport>(
     self_cap: &RawHash,
 ) -> Option<Vec<u8>> {
     let providers = providers_for(t, hash, publisher_id).await;
-    for provider in providers {
+    fetch_from_providers(t, hash, pool, &providers, self_cap).await
+}
+
+/// Try `providers` in order for a single blob: pooled authed connection,
+/// OP_GET_BLOB with the per-op deadline, evict-and-try-next on
+/// connection errors. First success wins; the caller verifies the hash.
+/// The provider-iteration tail of [`fetch_one`], split out so the
+/// publisher-first on-demand path ([`NetCap::fetch_blob`]) can drive it
+/// with gossip-known candidates without a DHT round-trip.
+async fn fetch_from_providers<T: Transport>(
+    t: &T,
+    hash: &RawHash,
+    pool: &SharedPool<T::Conn>,
+    providers: &[PeerId],
+    self_cap: &RawHash,
+) -> Option<Vec<u8>> {
+    for &provider in providers {
         let Some(conn) = pool_get(t, pool, provider, self_cap).await else {
             continue;
         };
