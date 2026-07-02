@@ -119,6 +119,8 @@ pub mod capability;
 pub mod commit;
 /// Storage adapter that delegates blobs and branches to separate backends.
 pub mod hybridstore;
+/// LSMT-of-segments derived-index home (manifest pin + SuccinctArchive rollup).
+pub mod index_home;
 /// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
