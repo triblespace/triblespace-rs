@@ -146,6 +146,16 @@ impl WeakPinStore for MemoryRepo {
     }
 }
 
+impl crate::repo::StorageFlush for MemoryRepo {
+    type Error = Infallible;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        // In-memory state has no sync point; durability is exactly the
+        // process lifetime, same as the blobs themselves.
+        Ok(())
+    }
+}
+
 impl crate::repo::StorageClose for MemoryRepo {
     type Error = Infallible;
 

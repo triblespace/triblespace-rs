@@ -992,6 +992,17 @@ impl crate::repo::StorageClose for Pile {
     }
 }
 
+// Generic durability hook: appended records (blobs, branch updates,
+// weak-pin markers) are not crash-durable until flushed — see the
+// inherent [`Pile::flush`].
+impl crate::repo::StorageFlush for Pile {
+    type Error = FlushError;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Pile::flush(self)
+    }
+}
+
 use super::BlobStore;
 use super::BlobStoreGet;
 use super::BlobStoreList;

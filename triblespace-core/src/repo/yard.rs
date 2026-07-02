@@ -702,6 +702,24 @@ impl BlobStore for Yard {
     }
 }
 
+impl super::StorageFlush for Yard {
+    type Error = super::pile::FlushError;
+
+    /// Flush every open generation pile. Weak-pin markers and fresh
+    /// writes land in the young generation, but older generations can
+    /// hold unsynced rewrites from `reclaim`/`compact`, so sync them all.
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                if let Some(pile) = segment.pile.as_mut() {
+                    pile.flush()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl StorageClose for Yard {
     type Error = YardCloseError;
 

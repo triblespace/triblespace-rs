@@ -126,6 +126,8 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
+/// No-network lazy reader: local get, durable want on miss ([`wanting::Wanting`]).
+pub mod wanting;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
@@ -140,6 +142,24 @@ pub trait StorageClose {
 
     /// Consume the storage and perform any necessary cleanup.
     fn close(self) -> Result<(), Self::Error>;
+}
+
+/// Trait for storage backends that can make pending writes crash-durable.
+///
+/// Mirrors [`StorageClose`]: backends with buffered/unsynced state
+/// ([`pile::Pile`]'s appended records are not durable until
+/// [`pile::Pile::flush`]) expose it here so generic code can demand
+/// durability at a specific point — most importantly when recording a
+/// weak-pin **want** whose writer may exit immediately afterwards (a
+/// faculty process recording a demand for a sync daemon to service).
+/// Backends with nothing to sync (in-memory stores) return `Ok(())` with
+/// `Infallible` as the error type.
+pub trait StorageFlush {
+    /// Error type returned by `flush`.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Persist all pending writes and markers durably.
+    fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
 // Convenience impl for repositories whose storage supports explicit close.
