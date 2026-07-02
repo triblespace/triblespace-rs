@@ -104,6 +104,8 @@ pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
 #[cfg(feature = "succinct")]
+pub mod index_hnsw;
+#[cfg(feature = "succinct")]
 pub mod ring;
 pub mod schemas;
 #[cfg(feature = "succinct")]

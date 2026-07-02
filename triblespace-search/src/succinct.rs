@@ -937,6 +937,14 @@ impl SuccinctHNSWIndex {
         self.max_level
     }
 
+    /// The content-addressed embedding handle of node `i`, or `None`
+    /// if out of range. Lets callers enumerate a stored graph's nodes
+    /// (e.g. to union + rebuild several segments in an index-home
+    /// merge) without attaching a blob store.
+    pub fn handle(&self, i: usize) -> Option<Inline<EmbHandle>> {
+        self.handles.get(i).map(|raw| Inline::new(*raw))
+    }
+
     /// Attach a blob store to this index, returning a queryable
     /// view. Paired with the typical load flow:
     ///
