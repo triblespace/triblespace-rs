@@ -338,17 +338,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_recovers_corpus_wide_ranking() {
+    fn merge_unions_docs_and_matches_are_exact() {
         // merge(seg_a, seg_b) rebuilds one index over the union with
-        // corpus-wide IDF — its top-k must agree with the monolithic
-        // oracle over the same union (tf-recovery is approximate only
-        // in the saturated tail).
-        let mut a = synthetic(60);
+        // corpus-wide IDF. Term *presence* survives tf-recovery
+        // losslessly, so the merged index has every document and the
+        // matched-doc SET for any query is exactly the monolithic
+        // oracle's (only the scores/order are approximate — the
+        // documented saturated-tail caveat).
+        let a = synthetic(60);
         let b = synthetic(60);
         // Disjoint ids by construction (fucid); union is 120.
         let mut union = a.clone();
         union.extend(b.iter().cloned());
-        a.clear();
 
         let mut store = MemoryBlobStore::new();
         let (src_a, _) = stage(&mut store, &union[..60]);
@@ -361,23 +362,17 @@ mod tests {
         let merged = kind.attach(kind.merge(&[seg_a, seg_b]));
         assert_eq!(merged.doc_count(), union.len(), "merge unions all docs");
 
-        for q in ["memory pile", "alpha beta gamma", "index search rollup"] {
-            let got: Vec<RawInline> = query_across(std::slice::from_ref(&merged), &hash_tokens(q))
+        for q in ["memory pile", "alpha beta gamma", "index search rollup", "theta zeta eta"] {
+            let got: HashSet<RawInline> =
+                query_across(std::slice::from_ref(&merged), &hash_tokens(q))
+                    .into_iter()
+                    .map(|(d, _)| d.raw)
+                    .collect();
+            let want: HashSet<RawInline> = oracle_ranked(&union, q)
                 .into_iter()
-                .take(10)
-                .map(|(d, _)| d.raw)
-                .collect();
-            let want: Vec<RawInline> = oracle_ranked(&union, q)
-                .into_iter()
-                .take(10)
                 .map(|(d, _)| d)
                 .collect();
-            let overlap = got.iter().filter(|d| want.contains(d)).count();
-            assert!(
-                overlap >= want.len().saturating_sub(1),
-                "query `{q}`: merged top-10 overlap {overlap}/{}",
-                want.len()
-            );
+            assert_eq!(got, want, "query `{q}`: merged matched-doc set == oracle set");
         }
     }
 
