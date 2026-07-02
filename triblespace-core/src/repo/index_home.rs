@@ -1,6 +1,6 @@
 //! Index-home: a log-structured merge tree (LSMT) of immutable,
-//! content-addressed index *segments*, named by a mutable *manifest*
-//! pinned at the branch head.
+//! content-addressed index *segments*, named by a *manifest* that lives
+//! as tribles inside the branch-head tribleset.
 //!
 //! # The problem
 //!
@@ -19,46 +19,61 @@
 //! - **Segments** — immutable, content-addressed blobs (one per
 //!   maintenance step, plus merged segments). Local cache blobs, GC'd
 //!   when unreferenced.
-//! - **Manifest** — a single mutable pointer at the branch head naming
-//!   the current live segment set (with per-segment LSMT level + an
-//!   optional per-kind stats slot). Overwritten (not history-appended)
-//!   as the index evolves; the old manifest and its now-orphaned
-//!   segments become GC-able.
-//! - **Read** — one head lookup to the manifest, then union-query the
+//! - **Manifest** — a set of tribles (one entity per segment, tagged
+//!   with the owning kind, carrying the segment blob handle, its LSMT
+//!   level, a sequence number, and an optional stats-blob handle) unioned
+//!   directly into the branch-head tribleset. Rewritten (this kind's old
+//!   segment tribles differenced out, the new ones unioned in) as the
+//!   index evolves; the old branch-head-tribleset version and its
+//!   now-orphaned segments become GC-able.
+//! - **Read** — one branch-head lookup to the tribleset, select this
+//!   kind's manifest subset via `pattern!`, then union-query the
 //!   referenced segments (bounded fan-out). No commit walk, no checkout.
 //! - **Maintain** — [`IndexHome::update_index`] appends a small new
-//!   segment (cheap) and runs a size-tiered merge to bound fan-out; the
-//!   head manifest is overwritten and the superseded segments become
-//!   orphans for GC.
+//!   segment (cheap) and runs a size-tiered merge to bound fan-out; a new
+//!   branch-head-tribleset version carries the rewritten manifest and the
+//!   superseded segments become orphans for GC.
 //!
-//! # Attach point: a dedicated pin, not `commit_metadata`
+//! # Attach point: unioned into the branch-head tribleset
 //!
-//! The manifest is stored as a **dedicated [`PinStore`] pin** — its own
-//! mutable cell, whose id is derived deterministically from
-//! `(source_branch, kind)` via [`manifest_pin_id`]. This is the right
-//! attach point for three reasons the design fragment
+//! The manifest is **not** a separate pin. Its tribles are unioned
+//! directly into the **branch-head tribleset** — the blob the branch pin
+//! already references (the branch-metadata [`SimpleArchive`] built by
+//! [`branch_metadata`](crate::repo::branch::branch_metadata)). The nice
+//! thing about triblesets is that you can just union more data into them:
+//! existing queries that care for their own attribute subset (the branch
+//! `name`/`head`/`signature`/`rollup` facts, or another index kind's
+//! segments) don't change. The index-manifest facts and the
+//! branch-metadata facts coexist in one tribleset; every existing query
+//! reads its own subset and is unaffected by the added index tribles.
+//! This is the right attach point for three reasons the design fragment
 //! (wiki:100CE93A263F9308F4460A894BE323FE) calls load-bearing:
 //!
-//! 1. **Head-not-commit.** A pin is the one mutable, *not*
-//!    version-controlled pointer in the substrate. Attaching the
-//!    manifest to `commit_metadata` (a per-commit fact) would make it
-//!    accumulate in history and force "the current index" to be the
-//!    union of every commit's delta — the walk-all-commits problem,
-//!    worse than a checkout. The pin holds the *complete* current set as
-//!    one overwrite.
+//! 1. **Head-not-commit.** The branch pin is the one mutable, *not*
+//!    version-controlled pointer in the substrate. Attaching the manifest
+//!    to `commit_metadata` (a per-commit fact) would make it accumulate
+//!    in history and force "the current index" to be the union of every
+//!    commit's delta — the walk-all-commits problem, worse than a
+//!    checkout. Unioned into the branch head, the manifest holds the
+//!    *complete* current set as one repoint of the branch pin.
 //! 2. **GC-able.** The pile compaction sweep treats every pin head as a
 //!    reachability root (see [`reachable`](crate::repo::reachable) /
-//!    [`Yard`](crate::repo::yard::Yard)). Segments referenced by the
-//!    live manifest survive; superseded segments and old manifest blobs
-//!    become unreachable and are reclaimed by the *existing* store GC —
-//!    no bespoke collector.
-//! 3. **Ephemeral / local.** A manifest pin carries no
-//!    `metadata::name`, so it is not a content branch; it is re-derivable
-//!    from the commit chain and can be excluded from sync (a `local_only`
-//!    tagging is the intended seam, see below). The existing
-//!    single-blob `rollup` branch-metadata attribute is the monolithic
-//!    predecessor of this design; the manifest generalises it to an LSMT
-//!    without touching the branch-metadata format.
+//!    [`Yard`](crate::repo::yard::Yard)). Segment handles are values in
+//!    the branch-head tribleset, so segments referenced by the live
+//!    manifest survive as a side effect of the branch head being a
+//!    reachability root; superseded segments and the old branch-head
+//!    tribleset become unreachable and are reclaimed by the *existing*
+//!    store GC — no bespoke collector and no separate manifest-pin path.
+//! 3. **Ephemeral / soft-state.** The manifest is redundant with (and
+//!    re-derivable from) the commit chain; a `push` that rebuilds the
+//!    branch metadata simply drops it, exactly as it drops the `rollup`
+//!    attribute today, and [`IndexHome::update_index`] rebuilds it. Each
+//!    segment entity is tagged with its kind id ([`seg_kind`]), so two
+//!    kinds over the same branch keep independent manifests in the one
+//!    tribleset. The existing single-blob `rollup` branch-metadata
+//!    attribute is the monolithic predecessor of this design; the
+//!    manifest generalises it to an LSMT that lives in the same
+//!    branch-head tribleset.
 //!
 //! # Reuse of the Yard LSM machinery
 //!
@@ -97,7 +112,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
-use crate::id::{Id, RawId};
+use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
@@ -112,6 +127,12 @@ use crate::find;
 use crate::prelude::{attributes, entity, pattern};
 
 attributes! {
+    /// Kind id owning this segment. Since every kind's manifest lives in
+    /// the *same* branch-head tribleset, each segment entity is tagged
+    /// with its owning [`IndexKind::kind_id`] so a read selects exactly
+    /// one kind's segments and two kinds over the same branch keep
+    /// independent manifests.
+    "383FDDECB0317E1DC1CC6D11B38CE174" as pub seg_kind: GenId;
     /// Handle of an immutable index segment blob (schema-agnostic — the
     /// owning [`IndexKind`] knows how to `attach` it).
     "CEF658631FD636FB59C139E8C8EEECCE" as pub seg_blob: Handle<UnknownBlob>;
@@ -145,9 +166,9 @@ pub trait IndexKind {
     /// In-memory, queryable attachment of a single stored segment.
     type Segment;
 
-    /// Stable id identifying this kind. Combined with the source branch
-    /// id to derive the manifest pin (see [`manifest_pin_id`]), so two
-    /// kinds over the same branch get independent manifests.
+    /// Stable id identifying this kind. Tagged onto every segment entity
+    /// via [`seg_kind`], so two kinds sharing one branch-head tribleset
+    /// keep independent manifests and each read selects exactly its own.
     fn kind_id(&self) -> Id;
 
     /// Build a segment blob from a source trible view (typically a
@@ -190,11 +211,14 @@ pub struct SegmentEntry {
     pub stats: Option<Inline<Handle<UnknownBlob>>>,
 }
 
-/// The set of live segments for one index, ordered by `(level, seq)`.
+/// The set of live segments for one index kind, ordered by `(level, seq)`.
 ///
-/// Serialises to/from a [`TribleSet`] (one entity per segment) that is
-/// stored as the manifest pin's head blob. This is the mutable head
-/// state: overwritten as a whole on each [`IndexHome::update_index`].
+/// Serialises to/from the manifest subset of a [`TribleSet`] (one entity
+/// per segment, each tagged with the owning [`seg_kind`]). Those tribles
+/// are unioned into the branch-head tribleset alongside the branch
+/// metadata and any other kind's segments; a read selects just this
+/// kind's subset. This is the mutable head state: this kind's tribles are
+/// rewritten as a whole on each [`IndexHome::update_index`].
 #[derive(Debug, Clone, Default)]
 pub struct Manifest {
     /// Live segments, kept sorted by `(level, seq)`.
@@ -248,13 +272,20 @@ impl Manifest {
         victims
     }
 
-    /// Parse a manifest from its serialised [`TribleSet`] form.
-    pub fn from_tribles(set: &TribleSet) -> Self {
+    /// Parse the manifest for `kind` out of a branch-head [`TribleSet`].
+    ///
+    /// Selects exactly the segment entities tagged with `kind` via
+    /// [`seg_kind`]; every other trible in the set (branch metadata, other
+    /// kinds' segments) is ignored.
+    pub fn from_tribles(set: &TribleSet, kind: Id) -> Self {
         // Collect optional per-segment stats keyed by segment-entity id.
+        // Segment entities carry their kind tag, and we only look up stats
+        // for entities selected by the kind-scoped query below, so this
+        // map never leaks another kind's stats.
         let mut stats_map: HashMap<[u8; 32], Inline<Handle<UnknownBlob>>> = HashMap::new();
         for (e, st) in find!(
             (e: Inline<GenId>, st: Inline<Handle<UnknownBlob>>),
-            pattern!(set, [{ ?e @ seg_stats: ?st }])
+            pattern!(set, [{ ?e @ seg_kind: kind, seg_stats: ?st }])
         ) {
             stats_map.insert(e.raw, st);
         }
@@ -268,7 +299,7 @@ impl Manifest {
                 level: Inline<U256BE>,
                 seq: Inline<U256BE>
             ),
-            pattern!(set, [{ ?e @ seg_blob: ?blob, seg_level: ?level, seg_seq: ?seq }])
+            pattern!(set, [{ ?e @ seg_kind: kind, seg_blob: ?blob, seg_level: ?level, seg_seq: ?seq }])
         ) {
             let level = level.try_from_inline::<u64>().unwrap_or(0);
             let seq = seq.try_from_inline::<u64>().unwrap_or(0);
@@ -284,11 +315,14 @@ impl Manifest {
         }
     }
 
-    /// Serialise the manifest to a [`TribleSet`] (one entity per segment).
-    pub fn to_tribles(&self) -> TribleSet {
+    /// Serialise this kind's manifest to a [`TribleSet`] (one entity per
+    /// segment, each tagged with `kind` via [`seg_kind`]). These tribles
+    /// are unioned into the branch-head tribleset.
+    pub fn to_tribles(&self, kind: Id) -> TribleSet {
         let mut set = TribleSet::new();
         for e in &self.segments {
             set += entity! {
+                seg_kind: kind,
                 seg_blob: e.blob,
                 seg_level: e.level,
                 seg_seq: e.seq,
@@ -304,9 +338,10 @@ impl Manifest {
 pub enum IndexError {
     /// An underlying storage operation failed.
     Storage(Box<dyn Error + Send + Sync>),
-    /// The manifest pin advanced between read and CAS-write. The caller
-    /// may retry — segment blobs are content-addressed, so a retry
-    /// dedupes against already-uploaded blobs.
+    /// The branch pin advanced between read and CAS-write (a concurrent
+    /// commit or another index update). The caller may retry — segment
+    /// blobs are content-addressed, so a retry dedupes against
+    /// already-uploaded blobs.
     Conflict,
 }
 
@@ -325,38 +360,21 @@ fn boxed<E: Error + Send + Sync + 'static>(e: E) -> IndexError {
     IndexError::Storage(Box::new(e))
 }
 
-/// Deterministic manifest pin id for a `(source_branch, kind)` pair.
-///
-/// Derived by hashing a domain-separation tag with the two ids, so the
-/// manifest can always be re-found without extra bookkeeping and two
-/// kinds over the same branch never collide.
-pub fn manifest_pin_id(source_branch: Id, kind: Id) -> Id {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"triblespace.index_home.manifest.v1");
-    hasher.update(&source_branch.raw());
-    hasher.update(&kind.raw());
-    let digest = hasher.finalize();
-    let mut raw: RawId = [0u8; 16];
-    raw.copy_from_slice(&digest.as_bytes()[..16]);
-    // A blake3 digest is astronomically never all-zero, but keep the id
-    // non-nil unconditionally so this can't ever return `None`.
-    Id::new(raw).unwrap_or_else(|| {
-        raw[0] |= 1;
-        Id::new(raw).expect("non-nil after forcing low bit")
-    })
-}
-
 /// The index-home surface for one `(source_branch, kind)`: reads and
-/// maintains the LSMT of segments named by a manifest pin.
+/// maintains the LSMT of segments whose manifest lives as tribles inside
+/// the branch-head tribleset.
 ///
-/// Generic over any storage that is both a [`BlobStore`] (segments +
-/// manifest blobs) and a [`PinStore`] (the mutable manifest pin). GC of
-/// orphaned segments is the store's own reachability sweep — see
-/// [`Yard`](crate::repo::yard::Yard).
+/// Generic over any storage that is both a [`BlobStore`] (segment blobs +
+/// the branch-head tribleset blob) and a [`PinStore`] (the mutable branch
+/// pin). The manifest is unioned into the branch-head tribleset, so GC of
+/// orphaned segments is the store's own reachability sweep — the segment
+/// handles are values in the branch head, which is already a reachability
+/// root — see [`Yard`](crate::repo::yard::Yard). No separate pin.
 pub struct IndexHome<'s, S, K> {
     storage: &'s mut S,
     kind: K,
-    pin: Id,
+    /// The branch pin id whose head tribleset carries this kind's manifest.
+    branch: Id,
 }
 
 impl<'s, S, K> IndexHome<'s, S, K>
@@ -365,31 +383,36 @@ where
     K: IndexKind,
 {
     /// Open the index home for `kind` over `source_branch`, backed by
-    /// `storage`. Does not touch storage until a read or update.
+    /// `storage`. The manifest lives in `source_branch`'s head tribleset.
+    /// Does not touch storage until a read or update.
     pub fn new(storage: &'s mut S, source_branch: Id, kind: K) -> Self {
-        let pin = manifest_pin_id(source_branch, kind.kind_id());
-        Self { storage, kind, pin }
+        Self { storage, kind, branch: source_branch }
     }
 
-    /// The manifest pin id (the mutable head cell for this index).
-    pub fn pin(&self) -> Id {
-        self.pin
+    /// The branch pin id whose head tribleset carries this manifest.
+    pub fn branch(&self) -> Id {
+        self.branch
     }
 
     fn head(&mut self) -> Result<Option<Inline<Handle<SimpleArchive>>>, IndexError> {
-        self.storage.head(self.pin).map_err(boxed)
+        self.storage.head(self.branch).map_err(boxed)
+    }
+
+    /// Read the current branch-head tribleset (empty if the pin is unset).
+    fn head_set(&mut self) -> Result<TribleSet, IndexError> {
+        match self.head()? {
+            None => Ok(TribleSet::new()),
+            Some(handle) => {
+                let reader = self.storage.reader().map_err(boxed)?;
+                reader.get(handle).map_err(boxed)
+            }
+        }
     }
 
     /// Read the current manifest (empty if the index has no segments yet).
     pub fn read_manifest(&mut self) -> Result<Manifest, IndexError> {
-        match self.head()? {
-            None => Ok(Manifest::empty()),
-            Some(handle) => {
-                let reader = self.storage.reader().map_err(boxed)?;
-                let set: TribleSet = reader.get(handle).map_err(boxed)?;
-                Ok(Manifest::from_tribles(&set))
-            }
-        }
+        let set = self.head_set()?;
+        Ok(Manifest::from_tribles(&set, self.kind.kind_id()))
     }
 
     fn put_segment(&mut self, blob: Blob<UnknownBlob>) -> Result<Inline<Handle<UnknownBlob>>, IndexError> {
@@ -420,22 +443,24 @@ where
     /// commit hook).
     ///
     /// Builds a new level-0 segment from `source` (a bounded delta),
-    /// runs a size-tiered merge to bound fan-out, and CAS-overwrites the
-    /// manifest pin. Superseded segments and the old manifest become
+    /// runs a size-tiered merge to bound fan-out, and CAS-repoints the
+    /// branch pin at a new branch-head tribleset: this kind's old segment
+    /// tribles differenced out, the new ones unioned in — every other
+    /// trible (branch metadata, other kinds' segments) preserved verbatim.
+    /// Superseded segments and the old branch-head tribleset become
     /// unreachable and are reclaimed by the store's GC.
     ///
-    /// Returns [`IndexError::Conflict`] if the manifest pin advanced
+    /// Returns [`IndexError::Conflict`] if the branch pin advanced
     /// concurrently; the caller may retry.
     pub fn update_index(&mut self, source: &TribleSet) -> Result<(), IndexError> {
+        let kind_id = self.kind.kind_id();
         let old_head = self.head()?;
-        let mut manifest = match old_head {
-            None => Manifest::empty(),
-            Some(handle) => {
-                let reader = self.storage.reader().map_err(boxed)?;
-                let set: TribleSet = reader.get(handle).map_err(boxed)?;
-                Manifest::from_tribles(&set)
-            }
-        };
+        let old_set = self.head_set()?;
+        let mut manifest = Manifest::from_tribles(&old_set, kind_id);
+        // Snapshot this kind's current manifest tribles so we can subtract
+        // exactly them (round-trip fidelity: to_tribles reproduces the
+        // content-addressed entities that from_tribles just read).
+        let old_manifest_tribles = manifest.to_tribles(kind_id);
 
         // Build + append a fresh level-0 segment. Attach the just-built
         // blob (zero-copy) to derive its optional stats without a store
@@ -469,10 +494,15 @@ where
             manifest.push(merged_handle, level + 1, merged_stats_handle);
         }
 
-        // Overwrite the manifest pin via CAS.
-        let new_set = manifest.to_tribles();
+        // Rewrite this kind's manifest inside the branch-head tribleset:
+        // drop the old segment tribles, union the new ones in. All other
+        // tribles (branch metadata, other kinds' segments) are preserved
+        // because union only adds and the difference targets exactly this
+        // kind's old segment entities.
+        let mut new_set = old_set.difference(&old_manifest_tribles);
+        new_set += manifest.to_tribles(kind_id);
         let new_head: Inline<Handle<SimpleArchive>> = self.storage.put(new_set).map_err(boxed)?;
-        match self.storage.update(self.pin, old_head, Some(new_head)).map_err(boxed)? {
+        match self.storage.update(self.branch, old_head, Some(new_head)).map_err(boxed)? {
             PushResult::Success() => Ok(()),
             PushResult::Conflict(_) => Err(IndexError::Conflict),
         }
@@ -613,8 +643,10 @@ mod tests {
         entity! { &id @ literature::firstname: name }.into()
     }
 
-    // A trivial source branch id (index-home never reads it as a branch;
-    // it only seeds the manifest-pin derivation).
+    // A trivial branch pin id. For the mechanical LSMT tests the pin
+    // starts unset (empty head tribleset) and index-home unions the
+    // manifest tribles straight into it; the coexistence test below uses a
+    // real branch pin that already carries branch metadata.
     fn source_branch() -> Id {
         *fucid()
     }
@@ -628,7 +660,8 @@ mod tests {
         m.push(h0, 0, None);
         m.push(h1, 1, Some(st));
 
-        let parsed = Manifest::from_tribles(&m.to_tribles());
+        let kind = SuccinctRollup.kind_id();
+        let parsed = Manifest::from_tribles(&m.to_tribles(kind), kind);
         assert_eq!(parsed.segments.len(), 2);
         // Ordered by (level, seq).
         assert_eq!(parsed.segments[0].blob, h0);
@@ -652,7 +685,7 @@ mod tests {
             home.update_index(&da).unwrap();
             assert_eq!(home.read_manifest().unwrap().len(), 1);
         }
-        let first_head = storage.head(manifest_pin_id(branch, SuccinctRollup.kind_id())).unwrap();
+        let first_head = storage.head(branch).unwrap();
 
         {
             let mut home = IndexHome::new(&mut storage, branch, SuccinctRollup::new());
@@ -661,10 +694,88 @@ mod tests {
             // FANOUT is 4, so two updates leave two level-0 segments.
             assert_eq!(m.len(), 2);
         }
-        let second_head = storage.head(manifest_pin_id(branch, SuccinctRollup.kind_id())).unwrap();
+        let second_head = storage.head(branch).unwrap();
 
-        // The pin now names the newest manifest, not the first.
+        // The branch pin now names the newest branch-head tribleset, not
+        // the first.
         assert_ne!(first_head, second_head);
+    }
+
+    #[test]
+    fn union_into_branch_head_preserves_unrelated_queries() {
+        // JP's core point, proven directly: index-manifest tribles union
+        // into a branch-head tribleset that ALSO holds unrelated
+        // (branch-metadata) tribles. Afterwards (a) an index query reads
+        // exactly the manifest subset and (b) an unrelated query over the
+        // branch-metadata attributes returns identical results with the
+        // index tribles present as it did without them — union only adds,
+        // so existing subset queries don't change.
+        use crate::repo::Repository;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let branch = repo.create_branch("main", None).unwrap();
+
+        // Commit real content so the branch-head tribleset carries genuine
+        // branch metadata (name / head / signature / updated_at).
+        let mut ws = repo.pull(*branch).unwrap();
+        ws.commit(person("Ada"), "seed");
+        repo.push(&mut ws).unwrap();
+
+        // Snapshot the branch-head tribleset BEFORE any index tribles, and
+        // run an unrelated query over the branch-metadata subset.
+        let head_before = repo.storage_mut().head(*branch).unwrap().unwrap();
+        let set_before: TribleSet =
+            repo.storage_mut().reader().unwrap().get(head_before).unwrap();
+        let names_before: Vec<_> = find!(
+            (n: Inline<_>),
+            pattern!(&set_before, [{ crate::metadata::name: ?n }])
+        )
+        .collect();
+        // No index manifest present yet.
+        assert_eq!(
+            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).len(),
+            0
+        );
+
+        // Union index-manifest tribles into the SAME branch-head tribleset.
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+            home.update_index(&person("Grace")).unwrap();
+        }
+
+        let head_after = repo.storage_mut().head(*branch).unwrap().unwrap();
+        assert_ne!(head_before, head_after, "branch pin repointed to the new tribleset");
+        let set_after: TribleSet =
+            repo.storage_mut().reader().unwrap().get(head_after).unwrap();
+
+        // (a) The index query reads exactly the manifest subset.
+        let manifest = Manifest::from_tribles(&set_after, SuccinctRollup.kind_id());
+        assert_eq!(manifest.len(), 1, "index query sees exactly its one segment");
+
+        // (b) The unrelated branch-metadata query is IDENTICAL with the
+        // index tribles present — union didn't disturb the existing subset.
+        let names_after: Vec<_> = find!(
+            (n: Inline<_>),
+            pattern!(&set_after, [{ crate::metadata::name: ?n }])
+        )
+        .collect();
+        assert_eq!(names_before, names_after, "union doesn't change existing subset queries");
+        assert_eq!(names_after.len(), 1);
+
+        // The branch's committed content is untouched: the index segment
+        // (Grace) rode into the branch-head *metadata* tribleset without
+        // being committed to the branch. A checkout sees only Ada.
+        let checkout = repo.pull(*branch).unwrap().checkout(..).unwrap();
+        let people: Vec<_> = find!(
+            (n: Inline<_>),
+            pattern!(&*checkout, [{ _?p @ literature::firstname: ?n }])
+        )
+        .collect();
+        assert_eq!(people.len(), 1, "branch content intact; index segment not committed");
     }
 
     #[test]
@@ -817,8 +928,9 @@ mod tests {
     fn gc_reclaims_orphaned_segments() {
         // Drive the index over a Yard so the store's reachability GC runs.
         // After enough updates to trigger a merge, the merged-away level-0
-        // segments are unreachable from the manifest pin and must be
-        // reclaimed, while the live merged segment survives and the union
+        // segments are unreachable from the branch-head tribleset (the
+        // branch pin's reachability root) and must be reclaimed, while the
+        // live merged segment survives and the union
         // read still returns every fact.
         use crate::repo::yard::{Yard, YardConfig};
 
