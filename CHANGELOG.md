@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Want-record failures are errors, and wants are flushed durable.**
+  `Peer::get_or_fetch_async` now returns
+  `Result<Option<Bytes>, WantRecordError>` — a pin/flush failure while
+  recording the demand-born weak pin is an `Err` and no fetch is attempted
+  (never hand the caller bytes whose demand isn't on record); previously both
+  Peer want-record paths warned and continued. The transparent async read
+  surfaces the same failure as the new `PeerReaderGetError::WantRecord`
+  variant. Both paths flush after `pin_weak`, and `Peer<S>`'s store bound
+  gains `StorageFlush`. The want-on-record invariant now holds
+  unconditionally: on record-failure the read errors instead of proceeding.
 - **`Peer<S>` single-store collapse.** `Peer<Durable, Cache>` is now
   `Peer<S: BlobStore + BlobStorePut + PinStore + WeakPinStore + Send + 'static>`
   — the separate cache tier is gone, and any tiering (bounded retention,
@@ -38,6 +48,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Pile::restore()`.
 
 ### Added
+
+- **`Wanting<S>` / `LazyPile` — the no-network-by-construction lazy reader.**
+  New `triblespace_core::repo::wanting` module (exported from the prelude):
+  wraps a store Peer-style (`Arc<Mutex<S>>`) but answers a read miss with a
+  **durable want** instead of a swarm fetch — `pin_weak` + `flush` (the
+  marker must survive an immediate process exit; a faculty exits right after
+  its read), then `Err(WantGetError::NotYet)`. `NotYet` means "the want is
+  durably recorded; a sync daemon (`Peer` + `Reconciler`) services it; retry
+  later" — absence is always "not obtained yet", never definitely-absent. A
+  failed want-record is an error (`WantGetError::WantRecord`), never a silent
+  proceed. `Wanting::wait_for(handle, deadline, poll_every)` adds the blocking
+  poll loop (fresh reader per iteration so external appends become visible;
+  store refresh errors propagate immediately — fail loud, never auto-restore;
+  no tokio in core). The type lives in `triblespace-core`, which has no
+  network dependency, so "never networks" is enforced by the linker.
+  `Repository`/`Workspace` compose with it unchanged: a checkout over a
+  partially-absent closure fails `NotYet` while enqueueing durable wants for
+  exactly the missing blobs.
+- **`StorageFlush` trait.** The generic durability hook (mirrors
+  `StorageClose`): `flush(&mut self)` makes pending writes/markers
+  crash-durable. Implemented by `Pile` (delegates to the inherent
+  `Pile::flush`), `MemoryRepo` (no-op, `Infallible`), and `Yard` (flushes
+  every open generation pile). Required by `Wanting<S>` and now by
+  `Peer<S>` — recording a want without flushing it was a durability hole.
+- **End-to-end fetch deadline.** The on-demand blob fetch
+  (`Peer::fetch_blob`, `get_or_fetch_async`, the transparent `PeerReader`
+  async get) previously had per-stage deadlines only (3s DHT lookup, 10s
+  dial + 30s op per provider) and could stack them to 40s+ of caller hang
+  across a provider list. The whole resolution is now bounded: interactive
+  reads get a 5s overall budget (`host::INTERACTIVE_FETCH_DEADLINE`),
+  `Peer::fetch_blob_with_deadline` exposes the knob, and the background
+  want-reconciler keeps a generous 30s default
+  (`reconcile::RECONCILE_FETCH_DEADLINE`, tunable via
+  `Reconciler::with_fetch_budget`). Expiry is plain Unavailable — a recorded
+  want stays recorded, so an expired budget defers the fetch, never loses
+  the demand.
+- **Publisher-first shortcut for read-miss fetches.** The host keeps a small
+  gossip-known publisher registry (most-recent-first, capped at 8), noted on
+  every HEAD frame arrival; on-demand fetches try those publishers directly
+  before falling back to the DHT lookup. Previously the on-demand path always
+  paid the DHT round-trip — and on a dark DHT failed outright even with a
+  reachable publisher one gossip hop away.
 
 - **Durable weak pins.** Two new V3 pile record kinds — weak-pin and
   weak-unpin markers (fixed 256-byte headers, keyed by blob handle, no branch
