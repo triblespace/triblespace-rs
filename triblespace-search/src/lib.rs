@@ -101,6 +101,8 @@
 //! [`jerky`]: https://docs.rs/jerky
 
 pub mod bm25;
+#[cfg(feature = "succinct")]
+pub mod index_bm25;
 pub mod constraint;
 pub mod hnsw;
 #[cfg(feature = "succinct")]

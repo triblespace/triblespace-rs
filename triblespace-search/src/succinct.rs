@@ -498,6 +498,36 @@ fn width_for(n: usize) -> usize {
     }
 }
 
+/// Invert a stored BM25 posting score back to an integer term
+/// frequency (`>= 1`). Used by
+/// [`SuccinctBM25Index::reconstruct_docs`] to rebuild the source
+/// token multisets for an index-home segment merge.
+///
+/// The build-time score is
+/// `idf * tf * (k1 + 1) / (tf + k1 * norm)`; solving for `tf` gives
+/// `tf = s * k1 * norm / (k1 + 1 - s)` where `s = score / idf`. All
+/// of `idf`, `norm`, and `k1` are recomputed losslessly from the
+/// segment, so the only error is the u16 score quantisation — which
+/// is far smaller than the score gap between successive integer `tf`
+/// values in the small-`tf` regime, so recovery is exact there and
+/// only drifts once `tf` saturates (a token repeated many times in
+/// one document, where the exact count barely moves the score).
+fn recover_tf(score: f32, idf: f32, norm: f32, k1: f32) -> u32 {
+    if score <= 0.0 || idf <= 0.0 {
+        return 1;
+    }
+    let s = score / idf;
+    let denom = (k1 + 1.0) - s;
+    if denom <= 0.0 {
+        // Saturated tail: the quantised score sits at/above the
+        // `tf -> inf` asymptote. The exact count is immaterial here
+        // (the score is flat), so cap at a large-but-finite value.
+        return 1_024;
+    }
+    let tf = (s * k1 * norm) / denom;
+    (tf.round() as i64).max(1) as u32
+}
+
 /// Jerky-backed HNSW layer-graph component.
 ///
 /// Flat CSR over `(layer, node) → [neighbour_node_idx, ...]`:
@@ -1687,6 +1717,57 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         out
     }
 
+    /// Approximately reconstruct the per-document token multisets this
+    /// index was built from — the union-then-rebuild primitive for an
+    /// index-home segment merge (see
+    /// [`triblespace_search::index_bm25::Bm25Rollup`]).
+    ///
+    /// Returns one `(doc_key, tokens)` row per document, `doc_key`
+    /// being the raw `Inline<D>` bytes and `tokens` the recovered
+    /// `Inline<T>` term bag (with multiplicity). Document *presence*
+    /// of a term (hence its document frequency) and every document's
+    /// *length* are stored losslessly and reproduced exactly; only the
+    /// per-posting term frequency is inferred from the u16-quantised
+    /// score via [`recover_tf`], so it is exact in the common small-tf
+    /// regime and approximate in the saturated tail. A BM25 index
+    /// rebuilt from the union of several segments' reconstructions
+    /// therefore has exact global document frequencies and lengths and
+    /// recomputes IDF over the union — the LSMT merge is lossless in
+    /// everything the score's monotone part depends on.
+    ///
+    /// [`triblespace_search::index_bm25::Bm25Rollup`]: crate::index_bm25::Bm25Rollup
+    pub fn reconstruct_docs(&self) -> Vec<(RawInline, Vec<RawInline>)> {
+        let n = self.doc_count();
+        let nf = n as f32;
+        // Per-doc token accumulator, indexed by universe code (== the
+        // postings' doc_idx). Docs with no indexed terms keep an empty
+        // bag but still round-trip as a row.
+        let mut docs: Vec<Vec<RawInline>> = (0..n).map(|_| Vec::new()).collect();
+        for t in 0..self.terms.len() {
+            let term_raw: RawInline = self.terms[t];
+            let df = self.postings.posting_count(t).unwrap_or(0) as f32;
+            let idf = ((nf - df + 0.5) / (df + 0.5) + 1.0).ln();
+            if let Some(iter) = self.postings.postings_for(t) {
+                for (code, score) in iter {
+                    let dl = self.doc_lens.get(code as usize).unwrap_or(0) as f32;
+                    let norm = if self.avg_doc_len > 0.0 {
+                        1.0 - self.b + self.b * (dl / self.avg_doc_len)
+                    } else {
+                        1.0
+                    };
+                    let tf = recover_tf(score, idf, norm, self.k1);
+                    let slot = &mut docs[code as usize];
+                    for _ in 0..tf {
+                        slot.push(term_raw);
+                    }
+                }
+            }
+        }
+        docs.into_iter()
+            .enumerate()
+            .map(|(code, tokens)| (self.keys.access(code), tokens))
+            .collect()
+    }
 }
 
 
