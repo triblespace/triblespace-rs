@@ -173,7 +173,8 @@ fn lazy_read_lands_weak_pinned_in_store() {
         // the swarm, land the verified bytes in the store.
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 120)
             .await
-            .flatten()
+            .expect("fetch future completes")
+            .expect("want recorded (MemoryRepo pins are infallible)")
             .expect("B must obtain the blob from the swarm");
         assert_eq!(
             blake3::hash(&got).as_bytes(),
@@ -243,7 +244,8 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         for (_, hash) in &blobs {
             let got = drive_future(peer_b.get_or_fetch_async(*hash), || peer_a.refresh(), 120)
                 .await
-                .flatten()
+                .expect("fetch future completes")
+                .expect("want recorded")
                 .expect("swarm must serve each blob");
             assert_eq!(blake3::hash(&got).as_bytes(), hash);
         }
@@ -334,7 +336,9 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
             }
         };
 
-        let got = got.expect("async lazy read must obtain the blob from the swarm");
+        let got = got
+            .expect("want recorded")
+            .expect("async lazy read must obtain the blob from the swarm");
         assert_eq!(
             blake3::hash(&got).as_bytes(),
             &hash,
@@ -629,7 +633,8 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
 
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 200)
             .await
-            .flatten()
+            .expect("fetch future completes")
+            .expect("want recorded")
             .expect("the lazy read fetches from the swarm");
         assert_eq!(blake3::hash(&got).as_bytes(), &hash);
 
@@ -647,7 +652,8 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
             1,
         )
         .await
-        .flatten()
+        .expect("second read resolves on the first poll")
+        .expect("no want recorded on a local hit")
         .expect("second read is a local hit — no re-fetch");
         assert_eq!(blake3::hash(&again).as_bytes(), &hash);
     });

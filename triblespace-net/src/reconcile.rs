@@ -33,7 +33,9 @@ use std::time::Duration;
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, WeakPinStore};
+use triblespace_core::repo::{
+    BlobStore, BlobStoreGet, BlobStorePut, PinStore, StorageFlush, WeakPinStore,
+};
 
 use crate::peer::Peer;
 use crate::protocol::RawHash;
@@ -145,7 +147,7 @@ impl Reconciler {
     /// reachable, never an error.
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
     where
-        S: BlobStore + BlobStorePut + PinStore + WeakPinStore + Send + 'static,
+        S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
     {
         let mut stats = ReconcileStats::default();
 
