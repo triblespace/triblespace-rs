@@ -81,7 +81,17 @@ pub struct Reconciler {
     states: HashMap<RawHash, WantState>,
     initial_backoff: Duration,
     max_backoff: Duration,
+    /// End-to-end budget per fetch attempt. Background work, so more
+    /// generous than the interactive default
+    /// ([`crate::host::INTERACTIVE_FETCH_DEADLINE`]) — nobody is
+    /// blocked on a reconcile tick, and a slow multi-provider walk is
+    /// worth finishing. Still bounded: an expired budget resolves
+    /// Unavailable and the want retries with backoff on a later pass.
+    fetch_budget: Duration,
 }
+
+/// Default per-fetch budget for background reconcile ticks.
+pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
 
 impl Default for Reconciler {
     fn default() -> Self {
@@ -91,7 +101,8 @@ impl Default for Reconciler {
 
 impl Reconciler {
     /// Default backoff: first retry ~1s after a failed attempt,
-    /// doubling per failure to a 60s cap.
+    /// doubling per failure to a 60s cap. Per-fetch budget defaults to
+    /// [`RECONCILE_FETCH_DEADLINE`].
     pub fn new() -> Self {
         Self::with_backoff(Duration::from_secs(1), Duration::from_secs(60))
     }
@@ -103,7 +114,14 @@ impl Reconciler {
             states: HashMap::new(),
             initial_backoff: initial,
             max_backoff: max,
+            fetch_budget: RECONCILE_FETCH_DEADLINE,
         }
+    }
+
+    /// Override the end-to-end budget each fetch attempt gets.
+    pub fn with_fetch_budget(mut self, budget: Duration) -> Self {
+        self.fetch_budget = budget;
+        self
     }
 
     /// One reconcile pass.
@@ -189,7 +207,7 @@ impl Reconciler {
             }
 
             stats.attempted += 1;
-            match peer.fetch_blob(hash).await {
+            match peer.fetch_blob_with_deadline(hash, self.fetch_budget).await {
                 Some(bytes) => {
                     // Land the verified bytes (fetch_blob hash-checked
                     // them). The weak pin that expressed the want is

@@ -253,13 +253,33 @@ where
     /// Swarm-addressed on-demand blob fetch — the lazy-replication
     /// read-miss primitive, run **inline** (no command round-trip).
     /// Awaits the verified bytes or `None` (Unavailable); a host that
-    /// never came up also resolves to `None`, never a hang. Does NOT
-    /// persist the result and records no want — that is the caller's
-    /// policy choice (see [`get_or_fetch_async`](Self::get_or_fetch_async)
-    /// for the weak-pin-then-fetch-then-put composition). Used in
+    /// never came up also resolves to `None`, never a hang. Bounded
+    /// end-to-end by [`host::INTERACTIVE_FETCH_DEADLINE`] (the
+    /// per-stage dial/op deadlines alone could stack to 40s+ across a
+    /// provider list); use
+    /// [`fetch_blob_with_deadline`](Self::fetch_blob_with_deadline) to
+    /// pass a different budget. Does NOT persist the result and records
+    /// no want — that is the caller's policy choice (see
+    /// [`get_or_fetch_async`](Self::get_or_fetch_async) for the
+    /// weak-pin-then-fetch-then-put composition). Used in
     /// deterministic-sim drivers, polled while stepping the sim.
     pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
-        self.sender.fetch_blob(hash).await
+        self.sender
+            .fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE)
+            .await
+    }
+
+    /// [`fetch_blob`](Self::fetch_blob) with an explicit end-to-end
+    /// budget. Interactive reads keep the tight default; background
+    /// work (the want-reconciler's tick) passes a more generous one.
+    /// Expiry resolves to `None` — same Unavailable semantics, and any
+    /// recorded want stays recorded.
+    pub async fn fetch_blob_with_deadline(
+        &self,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        self.sender.fetch_blob(hash, budget).await
     }
 
     /// Reconcile this peer with the latest external state.
@@ -1358,8 +1378,14 @@ where
                     // it remains an outstanding want.
                     cap.sink.record_want(raw);
                     // Inline swarm fetch; the host verified
-                    // blake3(bytes) == raw before returning.
-                    match cap.sender.fetch_blob(raw).await {
+                    // blake3(bytes) == raw before returning. Interactive
+                    // budget: a transparent read is a caller actively
+                    // waiting.
+                    match cap
+                        .sender
+                        .fetch_blob(raw, crate::host::INTERACTIVE_FETCH_DEADLINE)
+                        .await
+                    {
                         Some(v) => {
                             let b = Bytes::from(v);
                             cap.sink.land(b.clone());

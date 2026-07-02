@@ -448,6 +448,50 @@ fn fetch_blob_unavailable_is_clean() {
     });
 }
 
+/// The END-TO-END fetch deadline. With a short explicit budget, an
+/// unavailable fetch resolves `None` as soon as the budget expires —
+/// well before the internal 3s DHT timeout (let alone a stack of
+/// per-provider dial/op deadlines) would. Regression test for the
+/// previously-unbounded on-demand path, where per-stage deadlines
+/// could stack to 40s+ across a provider list.
+#[test]
+fn fetch_deadline_bounds_unavailable_resolution() {
+    let _g = sim_guard();
+    run_paused(0xDEAD_0011, async {
+        let net = SimNet::new(
+            0xDEAD_0011,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let root = key(0xFB);
+        let ka = key(0xAB);
+        let team_root = root.verifying_key();
+        let cap_a = admin_cap(&root, &ka);
+
+        let store_a = store_with_caps(&[cap_a.clone()]);
+        let peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
+        let _ = net; // keep the sim alive for the fetch
+
+        let (_blob, hash) = content_blob(0x9A);
+        // Budget 500 ms; the internal DHT timeout alone is 3 s. 60 sim
+        // steps × 20 ms = 1.2 s of virtual time — enough to cross the
+        // budget, NOT enough to cross the DHT timeout — so completion
+        // within the step allowance proves the overall deadline fired.
+        let reply = drive_future(
+            peer_a.fetch_blob_with_deadline(hash, Duration::from_millis(500)),
+            || {},
+            60,
+        )
+        .await;
+        let reply = reply.expect(
+            "fetch must resolve within the overall budget, not hang to the DHT timeout",
+        );
+        assert!(reply.is_none(), "an expired budget is Unavailable, not bytes");
+    });
+}
+
 /// Lazy read degrades to Unavailable when the network partitions the
 /// reader from the only holder, and **recovers** once the link heals —
 /// the graceful-degradation property under a real fault. (The DHT find

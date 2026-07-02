@@ -241,6 +241,17 @@ impl<T: Transport> NetCapability for NetCap<T> {
 
 // ── Outgoing half ────────────────────────────────────────────────────
 
+/// Default overall budget for an **interactive** on-demand blob fetch
+/// (a lazy read a caller is actively waiting on). Bounds the WHOLE
+/// resolution — capability readiness, DHT lookup, every per-provider
+/// dial + op — where the per-stage deadlines alone ([`DIAL_DEADLINE`],
+/// [`OP_DEADLINE`]) could stack up to 40s+ across a provider list.
+/// Background work (the want-reconciler) passes its own, more generous
+/// budget; the want stays durably recorded either way, so an expired
+/// budget only defers the fetch, never loses the demand.
+pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// Send fire-and-forget commands to the host loop, refresh the serving
 /// snapshot, and invoke inline request/response capabilities (the swarm
 /// fetch). `update_snapshot` is a pure snapshot refresh; `fetch_blob`
@@ -288,19 +299,42 @@ impl NetSender {
         *self.snapshot.lock().unwrap() = Some(boxed);
     }
 
-    /// Issue a swarm-addressed on-demand blob fetch WITHOUT blocking.
-    /// Returns the reply receiver; the host fills it (with `Some(bytes)`
-    /// or `None`) once resolution completes. The caller decides how to
-    /// wait — [`fetch_blob`](Self::fetch_blob) blocks on it with a
-    /// deadline (production); deterministic-sim drivers step the sim
-    /// and `try_recv` (so the single host thread isn't frozen by a
-    /// blocking caller).
     /// Swarm-addressed on-demand blob fetch (lazy read-miss) — run
     /// **inline**, not via the command loop. Awaits the network
     /// capability becoming ready (published once the host's transport
     /// binds), then runs the fetch in this task. `None` is Unavailable:
-    /// no provider served it, or the host never came up.
-    pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
+    /// no provider served it, the host never came up, or `budget`
+    /// expired.
+    ///
+    /// `budget` is the END-TO-END deadline over the whole resolution
+    /// (capability readiness + DHT lookup + every provider attempt).
+    /// Interactive callers pass [`INTERACTIVE_FETCH_DEADLINE`];
+    /// background reconcile ticks pass a longer one. Expiry has the
+    /// same semantics as any other Unavailable — a recorded want stays
+    /// recorded.
+    pub async fn fetch_blob(
+        &self,
+        hash: RawHash,
+        budget: std::time::Duration,
+    ) -> Option<Vec<u8>> {
+        match tokio::time::timeout(budget, self.fetch_blob_unbounded(hash)).await {
+            Ok(result) => result,
+            Err(_) => {
+                debug!(
+                    hash = %hex::encode(&hash[..4]),
+                    budget = ?budget,
+                    "fetch_blob: overall budget exceeded; Unavailable"
+                );
+                None
+            }
+        }
+    }
+
+    /// The unbounded fetch [`fetch_blob`](Self::fetch_blob) wraps in its
+    /// overall budget. Kept private: every public path must carry an
+    /// end-to-end deadline (per-stage deadlines alone can stack to 40s+
+    /// across a provider list).
+    async fn fetch_blob_unbounded(&self, hash: RawHash) -> Option<Vec<u8>> {
         let mut rx = self.cap.clone();
         // Resolve the capability — immediate if already published, else
         // park until the transport binds. `Err` means the host dropped
