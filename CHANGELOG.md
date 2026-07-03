@@ -49,6 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live two-pile sync proven over the real iroh transport** (the v0.47.0
+  release gate). `tests/iroh_two_pile_sync.rs` runs two `Peer<Pile>`s over
+  real iroh endpoints (`iroh::test_utils` `TestNetwork` packet layer;
+  everything above it — DHT node, protocol router, OP_AUTH, gossip topic,
+  host loop — is the production stack via
+  `transport::iroh::bind_with_endpoint`): a commit on pile A gossips its
+  HEAD and B's "main" converges to A's head commit (eager), and a
+  never-committed blob held only by A is fetched by B's `Reconciler` from
+  a durable weak-pin want (lazy). `examples/two_pile_sync_demo.rs` proves
+  the same two properties as two OS processes over real UDP/QUIC on
+  loopback (relay-free, `MemoryLookup` direct addressing). To enable the
+  composition, the host wiring (`host::wire` / `host::run_host`) is now
+  public unconditionally rather than behind the `sim` feature —
+  `bind_with_endpoint` was already public for exactly this use.
+
 - **`Wanting<S>` / `LazyPile` — the no-network-by-construction lazy reader.**
   New `triblespace_core::repo::wanting` module (exported from the prelude):
   wraps a store Peer-style (`Arc<Mutex<S>>`) but answers a read miss with a

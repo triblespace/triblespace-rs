@@ -48,12 +48,13 @@ hifitime = "4.1.2"
 # API isn't stable yet — we only depend on it for the auth-handshake
 # e2e test, which is fine.
 iroh = { version = "1.0", features = ["test-utils", "unstable-custom-transports"] }
-
-
+tempfile = "3.15.0"
 
 [features]
 # Deterministic simulation testing: in-memory transport (transport::sim),
-# public host wiring (host::wire / host::run_host), seeded id minting.
+# seeded id minting. (Host wiring — host::wire / host::run_host — is
+# always public: it is also how integration tests run real Peers over an
+# iroh TestNetwork endpoint via transport::iroh::bind_with_endpoint.)
 # Test-only by design -- enables tokio test-util for paused-time control.
 sim = ["triblespace-core/deterministic", "tokio/test-util"]
 
