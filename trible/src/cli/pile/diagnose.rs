@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -281,19 +280,12 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
     Ok(())
 }
 
-fn padding_for_blob(blob_size: usize) -> usize {
-    // Match `triblespace_core::repo::pile::padding_for_blob` without depending on it.
-    (64 - ((64 + blob_size) % 64)) % 64
-}
-
 fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
-    use anyhow::Context as _;
     use memchr::memmem::Finder;
-    use triblespace_core::blob::Bytes;
-    use triblespace_core::id::id_hex;
     use triblespace_core::inline::encodings::hash::Blake3;
     use triblespace_core::inline::encodings::hash::Hash;
     use triblespace_core::inline::Inline;
+    use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
 
     let handle = handle.trim();
     let normalized = if !handle.contains(':') && handle.len() == 64 {
@@ -305,107 +297,74 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     let needle = target.raw;
     let needle_str: String = target.from_inline();
 
-    let file = File::open(pile_path)
-        .with_context(|| format!("open pile {}", pile_path.display()))?;
-    let mapped = unsafe { Bytes::map_file(&file)? };
-    let bytes: &[u8] = mapped.as_ref();
-
-    // Magic markers copied from `triblespace_core::repo::pile` so we can
-    // classify where the handle appears without mutating or indexing the pile.
-    let marker_blob = id_hex!("1E08B022FF2F47B6EBACF1D68EB35D96").raw();
-    let marker_branch = id_hex!("2BC991A7F5D5D2A3A468C53B0AA03504").raw();
-    let marker_branch_tombstone = id_hex!("E888CC787202D2AE4C654BFE9699C430").raw();
+    // Record-level walk shared with the pile replay path — understands every
+    // record format (V1 and V3), so no format constant is duplicated here.
+    let mut records = PileRecords::open(pile_path)?;
+    let bytes = records.bytes().clone();
 
     let finder = Finder::new(&needle);
-    let mut offset = 0usize;
     let mut blob_header_matches = 0usize;
     let mut branch_header_matches = 0usize;
+    let mut weak_marker_matches = 0usize;
     let mut payload_matches = 0usize;
-    let mut parse_error: Option<String> = None;
+    let mut parse_error = None;
 
-    while offset < bytes.len() {
-        if offset + 16 > bytes.len() {
-            break;
-        }
-        let magic = &bytes[offset..offset + 16];
-        if magic == marker_blob {
-            if offset + 64 > bytes.len() {
-                parse_error = Some(format!("truncated blob header at byte {offset}"));
+    for record in &mut records {
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                parse_error = Some(e);
                 break;
             }
-            let length = u64::from_le_bytes(
-                bytes[offset + 24..offset + 32]
-                    .try_into()
-                    .expect("u64 slice"),
-            ) as usize;
-            let hash_bytes: [u8; 32] = bytes[offset + 32..offset + 64]
-                .try_into()
-                .expect("hash slice");
-            if hash_bytes == needle {
-                blob_header_matches += 1;
-                println!("blob header match at byte {offset}");
-            }
-
-            let payload_start = offset + 64;
-            let pad = padding_for_blob(length);
-            let record_end = payload_start
-                .checked_add(length)
-                .and_then(|v| v.checked_add(pad))
-                .ok_or_else(|| anyhow::anyhow!("blob record length overflow at byte {offset}"))?;
-            if record_end > bytes.len() {
-                parse_error = Some(format!(
-                    "truncated blob payload at byte {offset} (declared {length} bytes)"
-                ));
-                break;
-            }
-
-            let payload = &bytes[payload_start..payload_start + length];
-            if let Some(_) = finder.find(payload) {
-                let container_hash = Inline::<Hash<Blake3>>::new(hash_bytes);
-                let container_str: String = container_hash.from_inline();
-                for pos in finder.find_iter(payload) {
-                    payload_matches += 1;
-                    let absolute = payload_start + pos;
-                    println!("payload reference in {container_str} at byte {absolute}");
+        };
+        match record.content {
+            PileRecordContent::Blob {
+                hash,
+                data_offset,
+                data_len,
+                ..
+            } => {
+                if hash.raw == needle {
+                    blob_header_matches += 1;
+                    println!("blob header match at byte {}", record.offset);
+                }
+                let payload = &bytes[data_offset..data_offset + data_len];
+                if finder.find(payload).is_some() {
+                    let container_str: String = hash.from_inline();
+                    for pos in finder.find_iter(payload) {
+                        payload_matches += 1;
+                        let absolute = data_offset + pos;
+                        println!("payload reference in {container_str} at byte {absolute}");
+                    }
                 }
             }
-
-            offset = record_end;
-        } else if magic == marker_branch {
-            if offset + 64 > bytes.len() {
-                parse_error = Some(format!("truncated branch header at byte {offset}"));
-                break;
+            PileRecordContent::Branch { branch_id, head } => {
+                if head.raw == needle {
+                    branch_header_matches += 1;
+                    println!(
+                        "branch head match at byte {} (branch_id {branch_id:X})",
+                        record.offset
+                    );
+                }
             }
-            let branch_id: [u8; 16] = bytes[offset + 16..offset + 32]
-                .try_into()
-                .expect("branch id slice");
-            let hash_bytes: [u8; 32] = bytes[offset + 32..offset + 64]
-                .try_into()
-                .expect("branch hash slice");
-            if hash_bytes == needle {
-                branch_header_matches += 1;
-                let branch_hex = hex::encode(branch_id).to_ascii_uppercase();
-                println!("branch head match at byte {offset} (branch_id {branch_hex})");
+            PileRecordContent::BranchTombstone { .. } => {}
+            PileRecordContent::WeakPin { handle } | PileRecordContent::WeakUnpin { handle } => {
+                if handle.raw == needle {
+                    weak_marker_matches += 1;
+                    println!("weak-pin marker match at byte {}", record.offset);
+                }
             }
-            offset += 64;
-        } else if magic == marker_branch_tombstone {
-            if offset + 64 > bytes.len() {
-                parse_error = Some(format!("truncated branch tombstone at byte {offset}"));
-                break;
-            }
-            offset += 64;
-        } else {
-            parse_error = Some(format!("unknown magic marker at byte {offset}"));
-            break;
         }
     }
 
     println!("\nSummary for {needle_str}:");
     println!("  blob headers:   {blob_header_matches}");
     println!("  branch headers: {branch_header_matches}");
+    println!("  weak markers:   {weak_marker_matches}");
     println!("  payload refs:   {payload_matches}");
     if let Some(err) = parse_error {
         println!("  parse stopped:  {err}");
+        anyhow::bail!("pile contains an unreadable record: {err}");
     }
     Ok(())
 }

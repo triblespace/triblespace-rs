@@ -2,7 +2,6 @@ use anyhow::Result;
 use clap::Parser;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 // DEFAULT_MAX_PILE_SIZE removed; the new Pile API no longer uses a size const generic
@@ -15,7 +14,6 @@ use triblespace::prelude::PinStore;
 use triblespace::prelude::View;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::IntoBlob;
-use triblespace_core::id::id_hex;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
@@ -27,17 +25,6 @@ use super::signing::load_signing_key;
 use triblespace_core::repo::BlobStoreMeta;
 
 type BranchNameHandle = Inline<Handle<LongString>>;
-
-// These markers are part of the stable on-disk pile format (see
-// triblespace-rs/book/src/pile-format.md). Copy them exactly; do not invent.
-#[allow(non_upper_case_globals)]
-const MAGIC_MARKER_BLOB: Id = id_hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
-#[allow(non_upper_case_globals)]
-const MAGIC_MARKER_BRANCH: Id = id_hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
-#[allow(non_upper_case_globals)]
-const MAGIC_MARKER_BRANCH_TOMBSTONE: Id = id_hex!("E888CC787202D2AE4C654BFE9699C430");
-
-const RECORD_LEN: u64 = 64;
 
 #[derive(Parser)]
 pub enum Command {
@@ -1798,60 +1785,36 @@ struct BranchState {
 }
 
 /// Scan the raw pile file for all branch update/tombstone records.
+///
+/// Uses [`PileRecords`], the record-level iterator exported by
+/// `triblespace-core` — the same decoder the pile replay path uses, so every
+/// record format (V1 and V3) is understood. A corrupt or unknown record is a
+/// hard error: decisions like consolidation must never be made off a
+/// truncated view of the log.
 fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+
     let mut records = Vec::new();
-    let mut offset: u64 = 0;
-    let mut buf = [0u8; RECORD_LEN as usize];
-
-    while offset + RECORD_LEN <= file_len {
-        file.seek(SeekFrom::Start(offset))?;
-        if file.read_exact(&mut buf).is_err() {
-            break;
-        }
-
-        let magic: [u8; 16] = buf[0..16].try_into().unwrap();
-        if magic == MAGIC_MARKER_BLOB.raw() {
-            let len = u64::from_ne_bytes(buf[24..32].try_into().unwrap());
-            let pad = blob_padding(len);
-            offset = offset
-                .checked_add(RECORD_LEN)
-                .and_then(|o| o.checked_add(len))
-                .and_then(|o| o.checked_add(pad))
-                .ok_or_else(|| anyhow::anyhow!("pile too large"))?;
-            continue;
-        }
-
-        if magic == MAGIC_MARKER_BRANCH.raw() {
-            let raw_id: [u8; 16] = buf[16..32].try_into().unwrap();
-            let Some(id) = Id::new(raw_id) else { break };
-            let raw_handle: [u8; 32] = buf[32..64].try_into().unwrap();
-            let meta: Inline<Handle<SimpleArchive>> = Inline::new(raw_handle);
-            records.push(RawBranchRecord {
-                offset,
-                branch_id: id,
+    for record in PileRecords::open(path)? {
+        let record = record
+            .map_err(|e| anyhow::anyhow!("scanning pile {}: {e}", path.display()))?;
+        match record.content {
+            PileRecordContent::Branch { branch_id, head } => records.push(RawBranchRecord {
+                offset: record.offset as u64,
+                branch_id,
                 kind: RecordKind::Set,
-                meta_handle: Some(meta),
-            });
-            offset += RECORD_LEN;
-            continue;
-        }
-
-        if magic == MAGIC_MARKER_BRANCH_TOMBSTONE.raw() {
-            let raw_id: [u8; 16] = buf[16..32].try_into().unwrap();
-            let Some(id) = Id::new(raw_id) else { break };
-            records.push(RawBranchRecord {
-                offset,
-                branch_id: id,
+                meta_handle: Some(head),
+            }),
+            PileRecordContent::BranchTombstone { branch_id } => records.push(RawBranchRecord {
+                offset: record.offset as u64,
+                branch_id,
                 kind: RecordKind::Tombstone,
                 meta_handle: None,
-            });
-            offset += RECORD_LEN;
-            continue;
+            }),
+            PileRecordContent::Blob { .. }
+            | PileRecordContent::WeakPin { .. }
+            | PileRecordContent::WeakUnpin { .. } => {}
         }
-
-        break;
     }
 
     Ok(records)
@@ -1944,16 +1907,6 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     }
 
     info
-}
-
-fn blob_padding(len: u64) -> u64 {
-    // The pile stores blobs padded so the next record begins on a 64-byte boundary.
-    let rem = len % RECORD_LEN;
-    if rem == 0 {
-        0
-    } else {
-        RECORD_LEN - rem
-    }
 }
 
 fn extract_repo_head(meta: &TribleSet) -> Option<Inline<Handle<SimpleArchive>>> {

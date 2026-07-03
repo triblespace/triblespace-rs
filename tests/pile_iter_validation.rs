@@ -11,8 +11,11 @@ use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::repo::BlobStorePut;
 
-// size of the blob header in the pile format
-const BLOB_HEADER_LEN: u64 = 16 + 8 + 8 + 32;
+// New writes use the V3 record format: a fixed 256-byte header with the blob
+// payload starting immediately after it. Corrupting the first payload byte
+// (not the reserved header padding, which is deliberately not content-hashed)
+// must surface as a validation error.
+const BLOB_HEADER_LEN: u64 = 256;
 
 #[test]
 fn iterator_errors_on_corrupt_blob() {

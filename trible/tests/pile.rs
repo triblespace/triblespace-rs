@@ -375,8 +375,8 @@ fn diagnose_reports_invalid_hash() {
         .write(true)
         .open(&pile_path)
         .unwrap();
-    // first blob starts after the 64 byte header
-    file.seek(std::io::SeekFrom::Start(64)).unwrap();
+    // first blob payload starts after the fixed 256-byte V3 header
+    file.seek(std::io::SeekFrom::Start(256)).unwrap();
     file.write_all(b"X").unwrap();
 
     Command::cargo_bin("trible")

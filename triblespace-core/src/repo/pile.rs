@@ -304,6 +304,269 @@ const _: () = {
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
 };
 
+/// A single record decoded from a pile file.
+///
+/// Yielded by [`PileRecords`], the raw record-level view of a pile. The
+/// record's header starts at `offset` and the whole record (header + payload +
+/// padding) spans `len` bytes, so `offset + len` is the offset of the next
+/// record. This is the same decoder the [`Pile`] itself replays on open, so it
+/// understands every record format ever written (V1 64-byte records and V3
+/// uniform 256-aligned records alike).
+#[derive(Debug, Clone, Copy)]
+pub struct PileRecord {
+    /// Byte offset of the record header within the pile file.
+    pub offset: usize,
+    /// Total on-disk length of the record (header + payload + padding).
+    pub len: usize,
+    /// The decoded record content.
+    pub content: PileRecordContent,
+}
+
+/// Decoded content of a [`PileRecord`], independent of on-disk format version.
+#[derive(Debug, Clone, Copy)]
+pub enum PileRecordContent {
+    /// A blob record. The payload bytes live at
+    /// `data_offset..data_offset + data_len` in the pile file; trailing
+    /// alignment padding after the payload is not content and is not covered
+    /// by `hash`.
+    Blob {
+        /// Insertion timestamp in milliseconds since the Unix epoch.
+        timestamp: u64,
+        /// Blake3 digest of the payload as recorded in the header.
+        hash: Inline<Hash<Blake3>>,
+        /// Byte offset of the payload within the pile file.
+        data_offset: usize,
+        /// Payload length in bytes (excluding padding).
+        data_len: usize,
+    },
+    /// A branch head update.
+    Branch {
+        /// The branch being updated.
+        branch_id: Id,
+        /// The new head (a branch-metadata blob handle).
+        head: Inline<Handle<SimpleArchive>>,
+    },
+    /// A branch tombstone (deletion marker).
+    BranchTombstone {
+        /// The branch being tombstoned.
+        branch_id: Id,
+    },
+    /// A weak-pin marker for a blob handle.
+    WeakPin {
+        /// The pinned blob handle.
+        handle: Inline<Handle<UnknownBlob>>,
+    },
+    /// A weak-unpin marker retracting a prior weak pin.
+    WeakUnpin {
+        /// The unpinned blob handle.
+        handle: Inline<Handle<UnknownBlob>>,
+    },
+}
+
+/// Decodes the record starting at the beginning of `bytes`, which is the pile
+/// file's content from `offset` onward. This is the single source of truth for
+/// record parsing: [`Pile::refresh`]/[`Pile::restore`] replay records through
+/// it, and [`PileRecords`] exposes it for raw inspection. An unknown magic
+/// marker or a truncated record yields [`ReadError::CorruptPile`] pointing at
+/// `offset` — never a silent stop.
+fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
+    let corrupt = || ReadError::CorruptPile {
+        valid_length: offset,
+    };
+    if bytes.len() < 16 {
+        return Err(corrupt());
+    }
+    let magic: RawId = bytes[0..16].try_into().unwrap();
+    match magic {
+        MAGIC_MARKER_BLOB => {
+            let (header, _) = BlobHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let data_len = header.length as usize;
+            let pad = padding_for_blob(data_len);
+            let len = BLOB_HEADER_LEN
+                .checked_add(data_len)
+                .and_then(|l| l.checked_add(pad))
+                .ok_or_else(corrupt)?;
+            if bytes.len() < len {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Blob {
+                    timestamp: header.timestamp,
+                    hash: Inline::new(header.hash),
+                    data_offset: offset + BLOB_HEADER_LEN,
+                    data_len,
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH => {
+            let (header, _) = BranchHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: std::mem::size_of::<BranchHeader>(),
+                content: PileRecordContent::Branch {
+                    branch_id,
+                    head: Inline::<Hash<Blake3>>::new(header.hash).into(),
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH_TOMBSTONE => {
+            let (header, _) =
+                BranchTombstoneHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: std::mem::size_of::<BranchTombstoneHeader>(),
+                content: PileRecordContent::BranchTombstone { branch_id },
+            })
+        }
+        MAGIC_MARKER_BLOB_V3 => {
+            // Fixed 256-byte header; data at a constant `record_start +
+            // V3_HEADER_LEN` (no offset-derived pad — position-independent),
+            // record padded to a 256-byte multiple.
+            let (header, _) = BlobHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let data_len = header.length as usize;
+            let post_pad = v3_post_pad(data_len);
+            let len = V3_HEADER_LEN
+                .checked_add(data_len)
+                .and_then(|l| l.checked_add(post_pad))
+                .ok_or_else(corrupt)?;
+            if bytes.len() < len {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Blob {
+                    timestamp: header.timestamp,
+                    hash: Inline::new(header.hash),
+                    data_offset: offset + V3_HEADER_LEN,
+                    data_len,
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH_V3 => {
+            let (header, _) =
+                BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Branch {
+                    branch_id,
+                    head: Inline::<Hash<Blake3>>::new(header.hash).into(),
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH_TOMBSTONE_V3 => {
+            let (header, _) =
+                BranchTombstoneHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::BranchTombstone { branch_id },
+            })
+        }
+        MAGIC_MARKER_WEAK_PIN_V3 => {
+            let (header, _) =
+                WeakPinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::WeakPin {
+                    handle: Inline::new(header.handle),
+                },
+            })
+        }
+        MAGIC_MARKER_WEAK_UNPIN_V3 => {
+            let (header, _) =
+                WeakUnpinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::WeakUnpin {
+                    handle: Inline::new(header.handle),
+                },
+            })
+        }
+        _ => Err(corrupt()),
+    }
+}
+
+/// Iterator over the raw records of a pile file, in log order.
+///
+/// This is the record-level view of the append-only log: every blob, branch
+/// update, branch tombstone, and weak-pin marker ever appended, including
+/// records that later ones supersede (superseded branch heads, tombstoned
+/// branches, retracted weak pins). It shares its decoder with the [`Pile`]
+/// replay path, so both V1 and V3 records are understood; tools that need
+/// history or forensics (reflogs, consolidation, corruption reports) should
+/// consume this instead of hand-rolling a parser.
+///
+/// The iterator yields `Err(`[`ReadError::CorruptPile`]`)` and then ends when
+/// it encounters an unknown magic marker or a truncated record — a partial
+/// tail after a crash surfaces as an error, never as a silently shortened
+/// record list.
+#[derive(Debug)]
+pub struct PileRecords {
+    bytes: Bytes,
+    offset: usize,
+    failed: bool,
+}
+
+impl PileRecords {
+    /// Opens the pile file at `path` read-only and returns an iterator over
+    /// its records. No index is built and nothing is validated eagerly; blob
+    /// payloads are not hashed.
+    pub fn open(path: &Path) -> Result<Self, ReadError> {
+        let file = File::open(path)?;
+        let length = file.metadata()?.len();
+        let bytes = if length == 0 {
+            // Mapping a zero-length file is an error on most platforms; an
+            // empty pile simply has no records.
+            Bytes::empty()
+        } else {
+            // SAFETY: the pile file is append-only by contract; existing
+            // bytes are never mutated, so the mapping stays valid.
+            unsafe { Bytes::map_file(&file)? }
+        };
+        Ok(Self {
+            bytes,
+            offset: 0,
+            failed: false,
+        })
+    }
+
+    /// The raw bytes of the pile file, e.g. to inspect a blob payload at the
+    /// `data_offset`/`data_len` reported by [`PileRecordContent::Blob`].
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+}
+
+impl Iterator for PileRecords {
+    type Item = Result<PileRecord, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed || self.offset >= self.bytes.len() {
+            return None;
+        }
+        match decode_record(&self.bytes[self.offset..], self.offset) {
+            Ok(record) => {
+                self.offset += record.len;
+                Some(Ok(record))
+            }
+            Err(e) => {
+                self.failed = true;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Applied {
     Blob { hash: Inline<Hash<Blake3>> },
@@ -698,47 +961,37 @@ impl Pile {
             self.mmap = Arc::new(mmap);
         }
         let start_offset = self.applied_length;
-        let mut bytes = unsafe {
-            let slice = slice_from_raw_parts(
+        let slice = unsafe {
+            slice_from_raw_parts(
                 self.mmap.as_ptr().add(start_offset),
                 file_len - start_offset,
             )
             .as_ref()
-            .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
+            .unwrap()
         };
-        if bytes.len() < 16 {
-            return Err(ReadError::CorruptPile {
-                valid_length: start_offset,
-            });
-        }
-        let magic = bytes[0..16].try_into().unwrap();
-        match magic {
-            MAGIC_MARKER_BLOB => {
-                let header =
-                    bytes
-                        .view_prefix::<BlobHeader>()
-                        .map_err(|_| ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        })?;
-                let data_len = header.length as usize;
-                let pad = padding_for_blob(data_len);
-                let data_offset = start_offset + BLOB_HEADER_LEN;
-                bytes.take_prefix(data_len).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                bytes.take_prefix(pad).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
-                let ts = header.timestamp;
-                let entry =
-                    Entry::with_value(&hash.raw, IndexEntry::new(data_offset, header.length, ts));
+        // Single decoder shared with [`PileRecords`] — understands every
+        // record format ever written (V1 and V3 alike).
+        let record = decode_record(slice, start_offset)?;
+        self.applied_length = start_offset + record.len;
+        match record.content {
+            PileRecordContent::Blob {
+                timestamp,
+                hash,
+                data_offset,
+                data_len,
+            } => {
+                let entry = Entry::with_value(
+                    &hash.raw,
+                    IndexEntry::new(data_offset, data_len as u64, timestamp),
+                );
                 match self.blobs.get(&hash.raw) {
                     None => {
                         self.blobs.insert(&entry);
                     }
                     Some(entry_ref) => {
+                        // Duplicate hash: keep the existing record unless it
+                        // turns out to be corrupt, in which case the fresh
+                        // copy replaces it.
                         let IndexEntry {
                             state, offset, len, ..
                         } = entry_ref.clone();
@@ -764,157 +1017,29 @@ impl Pile {
                         }
                     }
                 }
-                self.applied_length = start_offset + BLOB_HEADER_LEN + data_len + pad;
                 Ok(Some(Applied::Blob { hash }))
             }
-            MAGIC_MARKER_BRANCH => {
-                let header =
-                    bytes
-                        .view_prefix::<BranchHeader>()
-                        .map_err(|_| ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        })?;
-                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                // Interpret the stored raw value as a hash and transmute into a
-                // handle value for storage. Use Entry to insert/replace into the PATCH.
-                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
-                let handle_val: Inline<Handle<SimpleArchive>> = hash.into();
-                let entry = Entry::with_value(&header.branch_id, handle_val);
+            PileRecordContent::Branch { branch_id, head } => {
+                let entry = Entry::with_value(&branch_id.into(), head);
                 // Replace existing mapping (if any) with the new head.
                 self.branches.replace(&entry);
-                self.applied_length = start_offset + std::mem::size_of::<BranchHeader>();
                 Ok(Some(Applied::Branch {
                     id: branch_id,
-                    hash,
+                    hash: head.into(),
                 }))
             }
-            MAGIC_MARKER_BRANCH_TOMBSTONE => {
-                let header = bytes.view_prefix::<BranchTombstoneHeader>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                self.branches.remove(&header.branch_id);
-                self.applied_length = start_offset + std::mem::size_of::<BranchTombstoneHeader>();
+            PileRecordContent::BranchTombstone { branch_id } => {
+                self.branches.remove(&branch_id.into());
                 Ok(Some(Applied::BranchTombstone { id: branch_id }))
             }
-            MAGIC_MARKER_BLOB_V3 => {
-                // Fixed 256-byte header; data at a constant `record_start +
-                // V3_HEADER_LEN` (no offset-derived pad — position-independent),
-                // record padded to a 256-byte multiple.
-                let header = bytes.view_prefix::<BlobHeaderV3>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let data_len = header.length as usize;
-                let post_pad = v3_post_pad(data_len);
-                let data_offset = start_offset + V3_HEADER_LEN;
-                bytes.take_prefix(data_len).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                bytes.take_prefix(post_pad).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
-                let ts = header.timestamp;
-                let entry =
-                    Entry::with_value(&hash.raw, IndexEntry::new(data_offset, header.length, ts));
-                match self.blobs.get(&hash.raw) {
-                    None => {
-                        self.blobs.insert(&entry);
-                    }
-                    Some(entry_ref) => {
-                        let IndexEntry {
-                            state, offset, len, ..
-                        } = entry_ref.clone();
-                        let state = state.get_or_init(|| {
-                            let bytes = unsafe {
-                                let slice = slice_from_raw_parts(
-                                    self.mmap.as_ptr().add(offset),
-                                    len as usize,
-                                )
-                                .as_ref()
-                                .unwrap();
-                                Bytes::from_raw_parts(slice, self.mmap.clone())
-                            };
-                            let computed = Hash::<Blake3>::digest(&bytes);
-                            if computed == hash {
-                                ValidationState::Validated
-                            } else {
-                                ValidationState::Invalid
-                            }
-                        });
-                        if let ValidationState::Invalid = state {
-                            self.blobs.replace(&entry);
-                        }
-                    }
-                }
-                self.applied_length = start_offset + V3_HEADER_LEN + data_len + post_pad;
-                Ok(Some(Applied::Blob { hash }))
-            }
-            MAGIC_MARKER_BRANCH_V3 => {
-                let header = bytes.view_prefix::<BranchHeaderV3>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                let hash: Inline<Hash<Blake3>> = Inline::new(header.hash);
-                let handle_val: Inline<Handle<SimpleArchive>> = hash.into();
-                let entry = Entry::with_value(&header.branch_id, handle_val);
-                self.branches.replace(&entry);
-                self.applied_length = start_offset + V3_HEADER_LEN;
-                Ok(Some(Applied::Branch {
-                    id: branch_id,
-                    hash,
-                }))
-            }
-            MAGIC_MARKER_BRANCH_TOMBSTONE_V3 => {
-                let header = bytes.view_prefix::<BranchTombstoneHeaderV3>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let branch_id = Id::new(header.branch_id).ok_or(ReadError::CorruptPile {
-                    valid_length: start_offset,
-                })?;
-                self.branches.remove(&header.branch_id);
-                self.applied_length = start_offset + V3_HEADER_LEN;
-                Ok(Some(Applied::BranchTombstone { id: branch_id }))
-            }
-            MAGIC_MARKER_WEAK_PIN_V3 => {
-                let header = bytes.view_prefix::<WeakPinHeaderV3>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let handle: Inline<Handle<UnknownBlob>> = Inline::new(header.handle);
-                self.weak_pins.insert(&Entry::new(&header.handle));
-                self.applied_length = start_offset + V3_HEADER_LEN;
+            PileRecordContent::WeakPin { handle } => {
+                self.weak_pins.insert(&Entry::new(&handle.raw));
                 Ok(Some(Applied::WeakPin { handle }))
             }
-            MAGIC_MARKER_WEAK_UNPIN_V3 => {
-                let header = bytes.view_prefix::<WeakUnpinHeaderV3>().map_err(|_| {
-                    ReadError::CorruptPile {
-                        valid_length: start_offset,
-                    }
-                })?;
-                let handle: Inline<Handle<UnknownBlob>> = Inline::new(header.handle);
-                self.weak_pins.remove(&header.handle);
-                self.applied_length = start_offset + V3_HEADER_LEN;
+            PileRecordContent::WeakUnpin { handle } => {
+                self.weak_pins.remove(&handle.raw);
                 Ok(Some(Applied::WeakUnpin { handle }))
             }
-            _ => Err(ReadError::CorruptPile {
-                valid_length: start_offset,
-            }),
         }
     }
 
@@ -2706,6 +2831,138 @@ mod tests {
         assert!(pinned.contains(&want));
         assert!(!pinned.contains(&retracted));
         pile.close().unwrap();
+    }
+
+    /// [`PileRecords`] walks a mixed V1/V3 pile record-by-record: every
+    /// record kind appears in log order, offsets tile the file exactly, blob
+    /// payloads are addressable through `data_offset`/`data_len`, and a
+    /// garbage tail surfaces as `Err(CorruptPile)` — never a silent stop.
+    #[test]
+    fn pile_records_walks_mixed_pile_and_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "records.pile");
+
+        // Hand-write a legacy V1 blob record first (64-byte header + pad).
+        let v1_data = vec![9u8; 40];
+        let v1_blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(v1_data.clone()));
+        let v1_handle: Inline<Handle<UnknownBlob>> = v1_blob.get_handle();
+        {
+            let v1_hash: Inline<Hash<Blake3>> = v1_handle.into();
+            let header = BlobHeader::new(42, v1_data.len() as u64, v1_hash);
+            let pad = padding_for_blob(v1_data.len());
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(header.as_bytes()).unwrap();
+            f.write_all(&v1_data).unwrap();
+            f.write_all(&vec![0u8; pad]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let branch_id = Id::new([5u8; 16]).unwrap();
+        let want: Inline<Handle<UnknownBlob>> =
+            Blob::<UnknownBlob>::new(Bytes::from_source(vec![11u8; 13])).get_handle();
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        pile.restore().unwrap();
+        let d1 = vec![1u8; 300];
+        let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
+        let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
+        pile.update(branch_id, None, Some(h1.transmute())).unwrap();
+        pile.pin_weak(want).unwrap();
+        pile.unpin_weak(want).unwrap();
+        pile.update(branch_id, Some(h1.transmute()), None).unwrap();
+        pile.close().unwrap();
+
+        let mut records = PileRecords::open(&path).unwrap();
+        let bytes = records.bytes().clone();
+        let decoded: Vec<PileRecord> = (&mut records)
+            .map(|r| r.expect("well-formed pile decodes cleanly"))
+            .collect();
+
+        // Records tile the file: each starts where the previous ended.
+        let mut expected_offset = 0;
+        for record in &decoded {
+            assert_eq!(record.offset, expected_offset);
+            expected_offset += record.len;
+        }
+        assert_eq!(expected_offset, bytes.len());
+
+        // Exact sequence: V1 blob, V3 blob, branch set, weak-pin,
+        // weak-unpin, branch tombstone.
+        assert_eq!(decoded.len(), 6);
+        match decoded[0].content {
+            PileRecordContent::Blob {
+                timestamp,
+                hash,
+                data_offset,
+                data_len,
+            } => {
+                assert_eq!(timestamp, 42);
+                assert_eq!(hash, v1_handle.into());
+                assert_eq!(data_offset, BLOB_HEADER_LEN);
+                assert_eq!(&bytes[data_offset..data_offset + data_len], &v1_data[..]);
+            }
+            other => panic!("expected V1 blob record, got {other:?}"),
+        }
+        match decoded[1].content {
+            PileRecordContent::Blob {
+                hash,
+                data_offset,
+                data_len,
+                ..
+            } => {
+                assert_eq!(hash, h1.into());
+                assert_eq!(data_offset, decoded[1].offset + V3_HEADER_LEN);
+                assert_eq!(&bytes[data_offset..data_offset + data_len], &d1[..]);
+            }
+            other => panic!("expected V3 blob record, got {other:?}"),
+        }
+        match decoded[2].content {
+            PileRecordContent::Branch {
+                branch_id: bid,
+                head,
+            } => {
+                assert_eq!(bid, branch_id);
+                assert_eq!(head, h1.transmute());
+            }
+            other => panic!("expected branch record, got {other:?}"),
+        }
+        match decoded[3].content {
+            PileRecordContent::WeakPin { handle } => assert_eq!(handle, want),
+            other => panic!("expected weak-pin record, got {other:?}"),
+        }
+        match decoded[4].content {
+            PileRecordContent::WeakUnpin { handle } => assert_eq!(handle, want),
+            other => panic!("expected weak-unpin record, got {other:?}"),
+        }
+        match decoded[5].content {
+            PileRecordContent::BranchTombstone { branch_id: bid } => {
+                assert_eq!(bid, branch_id)
+            }
+            other => panic!("expected branch tombstone record, got {other:?}"),
+        }
+
+        // A garbage tail is an error at its offset, then the iterator ends.
+        let garbage_offset = std::fs::metadata(&path).unwrap().len() as usize;
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[0xFFu8; 32]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mut records = PileRecords::open(&path).unwrap();
+        let mut ok = 0;
+        let err = loop {
+            match records.next() {
+                Some(Ok(_)) => ok += 1,
+                Some(Err(e)) => break e,
+                None => panic!("iterator ended without reporting the corrupt tail"),
+            }
+        };
+        assert_eq!(ok, 6);
+        match err {
+            ReadError::CorruptPile { valid_length } => assert_eq!(valid_length, garbage_offset),
+            other => panic!("expected CorruptPile, got {other:?}"),
+        }
+        assert!(records.next().is_none(), "iterator must end after an error");
     }
 
     // recover_grow test removed as growth strategy no longer exists

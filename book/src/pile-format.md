@@ -156,6 +156,15 @@ below the `~1&nbsp;GiB` atomic-write threshold and are not supported in that
 mode. (Records above the threshold use the exclusive-lock fallback and don't
 rely on filesystem atomicity.) Using an atomicity-lacking filesystem for
 small records risks pile corruption.
+
+Tools that need the raw log rather than the collapsed state—reflogs,
+consolidation, forensics—should use
+[`PileRecords`](../../src/repo/pile.rs), an iterator over every record in a
+pile file in log order. It shares its decoder with the replay path described
+above, so it understands every record format ever written; do not hand-roll a
+parser against the layouts documented in this chapter. An unknown or
+truncated record is reported as an error, never skipped.
+
 ## Blob Storage
 ```text
                              8 byte  8 byte

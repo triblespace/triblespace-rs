@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One record decoder; the CLI no longer hand-rolls pile parsing.**
+  `triblespace-core` now exports `repo::pile::PileRecords` — a record-level
+  iterator over a pile file yielding `PileRecord { offset, len, content }`
+  with `PileRecordContent::{Blob, Branch, BranchTombstone, WeakPin,
+  WeakUnpin}` — backed by the same decoder the `Pile` replay path uses, so
+  V1 (64-byte) and V3 (uniform 256-aligned) records are both understood. An
+  unknown or truncated record surfaces as `ReadError::CorruptPile`, never a
+  silent stop. The `trible` CLI's two independent V1-only parsers
+  (`branch.rs::scan_pile_records` and `diagnose locate-hash`) — which
+  silently truncated their view at the first V3 record and fed
+  `branch consolidate` decisions from that truncated view — are rewritten on
+  top of `PileRecords`, and the duplicated V1 magic constants and stride
+  logic are deleted from the CLI. `diagnose locate-hash` additionally
+  reports weak-pin marker matches and now exits non-zero when parsing stops
+  on an unreadable record.
 - **Want-record failures are errors, and wants are flushed durable.**
   `Peer::get_or_fetch_async` now returns
   `Result<Option<Bytes>, WantRecordError>` — a pin/flush failure while
