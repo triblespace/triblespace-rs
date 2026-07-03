@@ -117,19 +117,27 @@ fn main() {
     let q5 = wd_entity("Q5");
 
     // A subject that certainly exists: the first subject line of the file.
-    let first_subject: String = {
-        let f = std::fs::File::open(&nt_path).expect("open nt");
-        let mut line = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(f), &mut line).unwrap();
-        let uri = line
-            .split('<')
-            .nth(1)
-            .and_then(|s| s.split('>').next())
-            .expect("first subject uri");
-        uri.to_string()
+    let subj = match std::fs::File::open(&nt_path) {
+        Ok(f) => {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(f), &mut line).unwrap();
+            let uri = line
+                .split('<')
+                .nth(1)
+                .and_then(|s| s.split('>').next())
+                .expect("first subject uri");
+            eprintln!("point-query subject: {uri}");
+            uri_to_id_pure(uri)
+        }
+        Err(_) => {
+            // .nt gone but cache present: any P31 subject from the archive works.
+            let (e, _c) = find!((e: Id, c: Id), pattern!(&archive, [{ ?e @ &p31: ?c }]))
+                .next()
+                .expect("archive has a P31 row");
+            eprintln!("point-query subject: (from cache) {e:x}");
+            e
+        }
     };
-    let subj = uri_to_id_pure(&first_subject);
-    eprintln!("point-query subject: {first_subject}");
 
     // Largest P31 class in the slice — the batch-size scaling point.
     let t0 = Instant::now();
