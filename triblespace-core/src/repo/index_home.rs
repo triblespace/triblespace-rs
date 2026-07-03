@@ -333,6 +333,56 @@ impl Manifest {
     }
 }
 
+/// Extract the index-home manifest subset of a branch-head tribleset: every
+/// segment entity across *all* kinds.
+///
+/// A branch-metadata rebuild ([`Repository::push`](crate::repo::Repository)
+/// after a commit, [`Repository::compute_rollup`](crate::repo::Repository))
+/// constructs a *fresh* branch-head tribleset from
+/// [`branch_metadata`](crate::repo::branch::branch_metadata) and would
+/// otherwise drop the manifest that lived in the previous head. Unioning the
+/// result of this function back into the freshly built head carries the LSMT
+/// manifest forward across the rebuild: segments then **accumulate across
+/// commits** (rather than each rebuild resetting the manifest to empty and
+/// forcing the next [`IndexHome::update_index`] to start a single fresh
+/// segment), so the size-tiered merge and reachability GC run on the live
+/// cadence.
+///
+/// The manifest stays ephemeral: it is still redundant with the commit chain
+/// and re-derivable by [`IndexHome::update_index`]; this only changes the
+/// rebuild *cadence* from wipe-every-commit to carry-and-compact. The segment
+/// blobs it references remain reachable from (and GC-able via) the branch
+/// head, exactly as before.
+///
+/// Each kind's manifest is round-tripped through
+/// [`Manifest::from_tribles`]/[`Manifest::to_tribles`], which reproduces the
+/// content-addressed segment entities verbatim (the same fidelity
+/// [`IndexHome::update_index`] relies on for its manifest difference).
+pub fn manifest_tribles(set: &TribleSet) -> TribleSet {
+    // Enumerate the distinct owning kinds present in the head, then carry
+    // each kind's manifest forward independently (two kinds over one branch
+    // keep independent manifests in the one tribleset).
+    let mut kinds: Vec<Id> = Vec::new();
+    for (k,) in find!(
+        (k: Inline<GenId>),
+        pattern!(set, [{ _?e @ seg_kind: ?k }])
+    ) {
+        if let Ok(raw) = k.try_from_inline::<crate::id::RawId>() {
+            if let Some(id) = Id::new(raw) {
+                if !kinds.contains(&id) {
+                    kinds.push(id);
+                }
+            }
+        }
+    }
+
+    let mut out = TribleSet::new();
+    for kind in kinds {
+        out += Manifest::from_tribles(set, kind).to_tribles(kind);
+    }
+    out
+}
+
 /// Error surfaced by the [`IndexHome`] surface.
 #[derive(Debug)]
 pub enum IndexError {
@@ -922,6 +972,89 @@ mod tests {
 
         assert_eq!(got, expected);
         assert_eq!(got.len(), 12);
+    }
+
+    #[test]
+    fn segments_accumulate_across_rollup_and_commit_cycles() {
+        // The keystone invariant: a `compute_rollup` rebuild AND a commit
+        // (`push`) must both carry the existing manifest forward, so segments
+        // ACCUMULATE across cycles instead of the branch-head rebuild wiping
+        // them (which would force every update_index to start a fresh single
+        // segment and keep the tiering/merge/GC from ever firing live).
+        use crate::repo::Repository;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let branch = repo.create_branch("main", None).unwrap();
+
+        // Seed a real commit so compute_rollup has a HEAD to roll up.
+        let mut ws = repo.pull(*branch).unwrap();
+        ws.commit(person("seed"), "seed");
+        repo.push(&mut ws).unwrap();
+
+        // Cycle 1: append a segment, then rebuild the rollup.
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+            home.update_index(&person("Ada")).unwrap();
+            assert_eq!(home.read_manifest().unwrap().len(), 1);
+        }
+        repo.compute_rollup(*branch).unwrap();
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+            assert_eq!(
+                home.read_manifest().unwrap().len(),
+                1,
+                "compute_rollup must carry the existing segment forward, not drop it"
+            );
+        }
+
+        // A commit (push) between updates must also preserve the manifest —
+        // this is the literal "accumulate across commits" invariant.
+        let mut ws = repo.pull(*branch).unwrap();
+        ws.commit(person("interleaved-commit"), "commit");
+        repo.push(&mut ws).unwrap();
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+            assert_eq!(
+                home.read_manifest().unwrap().len(),
+                1,
+                "a commit must carry the manifest forward, not wipe it"
+            );
+        }
+
+        // Cycle 2: append a second segment, rebuild the rollup again.
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+            home.update_index(&person("Grace")).unwrap();
+            assert_eq!(home.read_manifest().unwrap().len(), 2);
+        }
+        repo.compute_rollup(*branch).unwrap();
+
+        // Both segments survive across the two rollup cycles and the commit;
+        // they did NOT collapse to a single per-import segment.
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+        let manifest = home.read_manifest().unwrap();
+        assert_eq!(
+            manifest.len(),
+            2,
+            "both segments accumulate across rollup cycles; not collapsed to one"
+        );
+        // Two distinct level-0 segments (FANOUT=4, no merge yet).
+        assert!(manifest.segments.iter().all(|s| s.level == 0));
+
+        // Both appended facts remain queryable through the union read.
+        let segments = home.attach_all().unwrap();
+        let union = SuccinctRollup::union(&segments);
+        let mut names: Vec<_> = find!(
+            (name: Inline<_>),
+            pattern!(&union, [{ _?p @ literature::firstname: ?name }])
+        )
+        .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "both appended segments remain queryable");
     }
 
     #[test]

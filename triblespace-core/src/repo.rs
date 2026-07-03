@@ -1322,7 +1322,7 @@ where
 
         let Ok((branch_name,)) = find!(
             (name: Inline<Handle<LongString>>),
-            pattern!(base_branch_meta, [{ crate::metadata::name: ?name }])
+            pattern!(&base_branch_meta, [{ crate::metadata::name: ?name }])
         )
         .exactly_one() else {
             return Err(PushError::BadBranchMetadata());
@@ -1333,7 +1333,7 @@ where
             .get(head_handle)
             .map_err(PushError::StorageGet)?;
 
-        let branch_meta = branch_metadata(
+        let mut branch_meta = branch_metadata(
             &workspace.signing_key,
             workspace.base_branch_id,
             branch_name,
@@ -1343,6 +1343,13 @@ where
             // `compute_rollup` runs against the new HEAD.
             None,
         );
+        // Carry the index-home LSMT manifest forward across the commit rebuild
+        // so segments accumulate across commits instead of being wiped each
+        // one. branch_metadata builds a fresh head that omits the manifest, so
+        // union the previous head's manifest tribles back in. Manifest stays
+        // ephemeral (re-derivable by IndexHome::update_index); only the
+        // rebuild cadence changes.
+        branch_meta += crate::repo::index_home::manifest_tribles(&base_branch_meta);
 
         let branch_meta_handle = self
             .storage
@@ -1472,13 +1479,19 @@ where
             .get(head_handle)
             .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
 
-        let new_meta = branch::branch_metadata(
+        let mut new_meta = branch::branch_metadata(
             &ws.signing_key,
             branch_id,
             branch_name,
             Some(head_blob.to_blob()),
             Some(handle),
         );
+        // Carry the index-home LSMT manifest forward across the rebuild so
+        // segments accumulate instead of being wiped: branch_metadata builds
+        // a fresh head that omits the manifest, so union the previous head's
+        // manifest tribles back in. Manifest stays ephemeral (still
+        // re-derivable by IndexHome::update_index); only the cadence changes.
+        new_meta += crate::repo::index_home::manifest_tribles(&base_meta);
         let new_meta_handle = self
             .storage
             .put(new_meta)
