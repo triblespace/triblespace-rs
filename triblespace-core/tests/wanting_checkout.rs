@@ -1,11 +1,14 @@
 //! Repository over a `Wanting` store — the "lazy checkout" contract.
 //!
 //! `Repository`/`Workspace` need ZERO changes to run over a
-//! `Wanting<S>`: a checkout whose closure is only partially present
-//! fails with `WantGetError::NotYet` (bubbled through
+//! `Wanting<S>`: a checkout drives the reader's **sync probe**, so a
+//! closure that is only partially present fails with
+//! `WantGetError::NotYet` (bubbled through
 //! `WorkspaceCheckoutError::Storage`) while the miss has already
 //! enqueued a durable weak-pin want for the absent blob — exactly what
-//! a sync daemon needs to service the demand before a retry.
+//! a sync daemon needs to service the demand before a retry. (An async
+//! consumer would instead suspend on the reader's `AsyncBlobStoreGet`
+//! until the blob lands.)
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::UnknownBlob;

@@ -4,38 +4,79 @@
 //! does (shared behind `Arc<Mutex<S>>` so a `&self` read can record
 //! state), but where the Peer answers a read miss with a swarm fetch,
 //! `Wanting` answers it with a **durable want**: it weak-pins the missing
-//! handle, flushes the store so the marker survives an immediate process
-//! exit, and returns [`WantGetError::NotYet`]. It never blocks on I/O it
-//! doesn't own, and it never networks — this module lives in
-//! `triblespace-core`, which has no network dependency at all, so the
-//! guarantee is enforced by the linker, not by discipline.
+//! handle and flushes the store so the marker survives an immediate
+//! process exit. It never performs I/O it doesn't own, and it never
+//! networks — this module lives in `triblespace-core`, which has no
+//! network dependency at all, so the guarantee is enforced by the
+//! linker, not by discipline. Waiting for a blob is pure suspension:
+//! an async read parks until the bytes land locally.
+//!
+//! Like `PeerReader`, existence-vs-retrieval is split by *which trait
+//! you call*, not by a bespoke method:
+//!
+//! - the **sync** [`BlobStoreGet`] on [`WantingReader`] is the instant
+//!   probe: a hit serves from the snapshot; a miss durably records the
+//!   want and returns [`WantGetError::NotYet`] immediately — it never
+//!   waits.
+//! - the **async** [`AsyncBlobStoreGet`] on [`WantingReader`] is the
+//!   waiting read: a hit resolves immediately; a miss durably records
+//!   the SAME want and then suspends until the blob appears in the
+//!   store — landed by a sync daemon servicing the want, or by any
+//!   other writer. Compose deadlines externally
+//!   (`tokio::time::timeout`, a `select`); the future itself never
+//!   gives up. Dropping it abandons the wait — the want STAYS on
+//!   record.
 //!
 //! The intended division of labor:
 //!
 //! - A short-lived process (a faculty invocation) opens the shared pile
 //!   as a [`LazyPile`] and reads. Every miss leaves a crash-durable
 //!   weak-pin want on record (weak pins ARE the want-queue — see
-//!   [`WeakPinStore`]) and comes back `NotYet`.
+//!   [`WeakPinStore`]) and comes back `NotYet` (sync probe) or suspends
+//!   (async read).
 //! - A long-running daemon (`Peer` + `Reconciler` in `triblespace-net`,
 //!   or `trible pile net sync --lazy`) enumerates the weak pins, fetches
 //!   the absent blobs from the swarm, and lands them in the same pile.
-//! - The next read — or a [`Wanting::wait_for`] poll loop — finds the
-//!   bytes locally.
+//! - The next sync probe — or the still-suspended async read — finds
+//!   the bytes locally.
 //!
-//! `NotYet` therefore means "the want is durably recorded; retry later".
+//! *How* a suspended read wakes is an implementation detail, not API:
+//! a `put` through the same `Wanting` signals waiters directly, and a
+//! background cadence re-checks the store (with a refresh, so records
+//! appended by other handles or processes become visible) while any
+//! waiter is parked. No async runtime is required or assumed — the
+//! future is executor-agnostic, waking through the standard
+//! [`Waker`](std::task::Waker) contract.
+//!
 //! Absence is always "not obtained yet", never "definitely absent" —
 //! existence is semidecidable, same as everywhere else in the lazy-sync
 //! substrate.
 //!
 //! Failure posture is loud: if the want cannot be recorded (pin or flush
-//! fails), the read returns [`WantGetError::WantRecord`] — it never
-//! silently proceeds, because a silently-dropped want is a blob nobody
-//! will ever fetch. Likewise [`Wanting::wait_for`] propagates a store
-//! refresh error ([`WaitError::Store`]) immediately and never attempts
-//! auto-repair.
+//! fails), the read returns a want-record error ([`WantGetError::WantRecord`]
+//! on the probe, [`WantWaitError::WantRecord`] on the async read) — it
+//! never silently proceeds, because a silently-dropped want is a blob
+//! nobody will ever fetch. Likewise the async read propagates a store
+//! refresh error ([`WantWaitError::Store`], e.g. a corrupt pile tail)
+//! immediately and never attempts auto-repair.
+//!
+//! [`AsyncBlobStoreGet`]: crate::repo::async_store::AsyncBlobStoreGet
+//! [`BlobStoreGet`]: crate::repo::BlobStoreGet
+//! [`WantingReader`]: crate::repo::wanting::WantingReader
+//! [`Wanting`]: crate::repo::wanting::Wanting
+//! [`LazyPile`]: crate::repo::wanting::LazyPile
+//! [`WeakPinStore`]: crate::repo::WeakPinStore
+//! [`WantGetError::NotYet`]: crate::repo::wanting::WantGetError::NotYet
+//! [`WantGetError::WantRecord`]: crate::repo::wanting::WantGetError::WantRecord
+//! [`WantWaitError::Store`]: crate::repo::wanting::WantWaitError::Store
+//! [`WantWaitError::WantRecord`]: crate::repo::wanting::WantWaitError::WantRecord
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use anybytes::Bytes;
 
@@ -44,17 +85,27 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::{Inline, InlineEncoding};
+use crate::inline::{Inline, InlineEncoding, RawInline};
 
+use super::async_store::{
+    AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
+};
 use super::{
     BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult, StorageFlush,
     WeakPinStore,
 };
 
 /// A [`Wanting`] over the default on-disk store: the faculty-side view
-/// of a shared [`Pile`](super::pile::Pile) — local reads, durable wants,
-/// zero network.
+/// of a shared [`Pile`](crate::repo::pile::Pile) — local reads, durable
+/// wants, zero network.
 pub type LazyPile = Wanting<super::pile::Pile>;
+
+/// Fixed cadence at which a suspended async read re-checks the store
+/// for blobs landed by writers this `Wanting` cannot observe directly
+/// (another handle to the same pile, another process appending to it).
+/// Purely an implementation detail — in-process `put`s wake waiters
+/// immediately, so this bounds only the *cross-process* wake latency.
+const WANT_RECHECK_CADENCE: Duration = Duration::from_millis(100);
 
 /// The want-record failure of a store `S`: either the weak pin itself or
 /// the flush that makes it crash-durable failed.
@@ -94,15 +145,18 @@ where
     }
 }
 
-/// Error from a [`WantingReader`] get.
+/// Error from a [`WantingReader`]'s **sync probe** ([`BlobStoreGet`]).
 #[derive(Debug)]
 pub enum WantGetError<E, W> {
     /// The bytes were present locally but didn't convert to the
     /// requested type.
     Conversion(E),
     /// Local miss. The want is **durably on record** (weak pin, flushed)
-    /// — a sync daemon (`Peer` + `Reconciler`) services it; retry later.
-    /// Never "definitely absent".
+    /// — a sync daemon (`Peer` + `Reconciler`) services it. This is the
+    /// probe's "recorded, not present" outcome, never "definitely
+    /// absent"; to *wait* for the blob instead, use the async
+    /// [`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)
+    /// read, which suspends rather than erroring.
     NotYet,
     /// Local miss AND the want could not be durably recorded. The demand
     /// is NOT on record — the caller must not assume anyone will fetch
@@ -116,7 +170,7 @@ impl<E: std::error::Error, W: std::error::Error> std::fmt::Display for WantGetEr
             Self::Conversion(e) => write!(f, "blob conversion failed: {e}"),
             Self::NotYet => write!(
                 f,
-                "blob not obtained yet (want durably recorded; retry after a sync daemon services it)"
+                "blob not obtained yet (want durably recorded; a sync daemon services it)"
             ),
             Self::WantRecord(e) => write!(f, "blob missing and want not recorded: {e}"),
         }
@@ -137,40 +191,130 @@ where
     }
 }
 
-/// Error from [`Wanting::wait_for`].
+/// Error from a [`WantingReader`]'s **async waiting read**
+/// ([`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)).
+///
+/// There is deliberately no "not yet" variant: the async read *resolves*
+/// when the blob lands instead of erroring on absence. Bound the wait
+/// externally (`tokio::time::timeout`, a `select`) if you need a
+/// deadline — on timeout the want stays durably recorded.
 #[derive(Debug)]
-pub enum WaitError<R, W> {
-    /// The deadline elapsed without the blob appearing. The want stays
-    /// durably on record — a later wait (or read) can still succeed.
-    Deadline,
-    /// The store failed to refresh (e.g. a corrupt pile tail). Propagated
-    /// immediately — fail loud, never auto-restore.
+pub enum WantWaitError<E, R, W> {
+    /// The bytes landed but didn't convert to the requested type.
+    Conversion(E),
+    /// The store failed to refresh while re-checking (e.g. a corrupt
+    /// pile tail). Propagated immediately — fail loud, never
+    /// auto-restore.
     Store(R),
     /// The want could not be durably recorded (see [`WantRecordError`]).
+    /// The read errors instead of suspending: a wait without a recorded
+    /// want is a wait nobody will ever satisfy.
     WantRecord(W),
 }
 
-impl<R: std::error::Error, W: std::error::Error> std::fmt::Display for WaitError<R, W> {
+impl<E: std::error::Error, R: std::error::Error, W: std::error::Error> std::fmt::Display
+    for WantWaitError<E, R, W>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Deadline => write!(f, "deadline elapsed before the blob appeared (want stays recorded)"),
+            Self::Conversion(e) => write!(f, "blob conversion failed: {e}"),
             Self::Store(e) => write!(f, "store refresh failed: {e}"),
-            Self::WantRecord(e) => write!(f, "want not recorded: {e}"),
+            Self::WantRecord(e) => write!(f, "blob missing and want not recorded: {e}"),
         }
     }
 }
 
-impl<R, W> std::error::Error for WaitError<R, W>
+impl<E, R, W> std::error::Error for WantWaitError<E, R, W>
 where
+    E: std::error::Error + 'static,
     R: std::error::Error + 'static,
     W: std::error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Deadline => None,
+            Self::Conversion(e) => Some(e),
             Self::Store(e) => Some(e),
             Self::WantRecord(e) => Some(e),
         }
+    }
+}
+
+/// The wake channel between a `Wanting`'s put-side and its suspended
+/// async reads. Pure `std`: a parked-waker list drained by
+/// [`wake_all`](Self::wake_all) plus a lazily-spawned cadence ticker
+/// that covers landings from other handles/processes. No runtime, no
+/// non-`std` dependency — waking rides the standard [`Waker`] contract,
+/// so the futures work under any executor.
+///
+/// Lock order (where both are held): the store mutex first, then
+/// `wakers`. Registering under the store lock is what makes the
+/// in-process wake race-free: a `put` can only mutate the store *after*
+/// a waiter's miss-check-plus-registration completes, so its `wake_all`
+/// always sees the parked waker.
+struct WantSignal {
+    wakers: Mutex<Vec<Waker>>,
+    /// Whether a cadence ticker thread is currently alive.
+    ticker_alive: AtomicBool,
+}
+
+impl WantSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            wakers: Mutex::new(Vec::new()),
+            ticker_alive: AtomicBool::new(false),
+        })
+    }
+
+    /// Wake every parked waiter (drain-and-wake). Called by the
+    /// put-side after landing a blob, and by the cadence ticker.
+    fn wake_all(&self) {
+        let drained: Vec<Waker> = std::mem::take(&mut *self.wakers.lock().expect("wakers mutex"));
+        for waker in drained {
+            waker.wake();
+        }
+    }
+
+    /// Park `waker` until the next [`wake_all`](Self::wake_all).
+    fn register(&self, waker: &Waker) {
+        let mut wakers = self.wakers.lock().expect("wakers mutex");
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
+    /// Ensure the cadence ticker is running: a thread that wakes all
+    /// parked waiters every [`WANT_RECHECK_CADENCE`], causing them to
+    /// re-poll (which takes a fresh reader = a store refresh) and so
+    /// observe blobs landed by writers this `Wanting` cannot see
+    /// directly. Holds only a [`Weak`](std::sync::Weak) reference and
+    /// retires itself when no waiter is parked, so it never outlives
+    /// demand.
+    fn ensure_ticker(this: &Arc<Self>) {
+        if this.ticker_alive.swap(true, Ordering::AcqRel) {
+            return; // already running
+        }
+        let weak = Arc::downgrade(this);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(WANT_RECHECK_CADENCE);
+            let Some(signal) = weak.upgrade() else { break };
+            let drained: Vec<Waker> =
+                std::mem::take(&mut *signal.wakers.lock().expect("wakers mutex"));
+            if drained.is_empty() {
+                // Nobody is parked: retire. Re-check for a registration
+                // that raced the retirement and take the ticker back if
+                // one slipped in (unless a fresh ticker already spawned).
+                signal.ticker_alive.store(false, Ordering::Release);
+                if signal.wakers.lock().expect("wakers mutex").is_empty()
+                    || signal.ticker_alive.swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
+                continue;
+            }
+            for waker in drained {
+                waker.wake();
+            }
+        });
     }
 }
 
@@ -185,24 +329,30 @@ where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
     store: Arc<Mutex<S>>,
+    signal: Arc<WantSignal>,
 }
 
 impl<S> Wanting<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
-    /// Wrap a store. No thread is spawned, no network is opened —
-    /// `Wanting` is pure local mechanics.
+    /// Wrap a store. No network is opened — `Wanting` is pure local
+    /// mechanics. (A cadence re-check thread is spawned lazily only
+    /// while an async read is suspended, and retires itself when none
+    /// is.)
     pub fn new(store: S) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
+            signal: WantSignal::new(),
         }
     }
 
     /// Lock and borrow the underlying store, for store-specific methods
     /// that aren't part of the storage traits. Don't hold the guard
     /// across calls back into the `Wanting` — its own methods take the
-    /// same lock.
+    /// same lock. Note that blobs landed through this raw guard bypass
+    /// the immediate waiter wake-up; suspended async reads still observe
+    /// them at the next cadence re-check.
     pub fn store(&self) -> MutexGuard<'_, S> {
         self.store.lock().expect("store mutex")
     }
@@ -223,43 +373,6 @@ where
             ),
         }
     }
-
-    /// **Blocking** poll loop: wait until `handle`'s bytes appear in the
-    /// store (landed by a sync daemon servicing the want, or by any
-    /// other writer), or until `deadline` elapses.
-    ///
-    /// Each iteration takes a fresh reader — which refreshes the store,
-    /// so records appended by other processes become visible — and does
-    /// a local get. The first miss records the durable want (pin + flush,
-    /// exactly like the reader path), so `wait_for` is self-sufficient:
-    /// calling it without a prior `get` still enqueues the demand.
-    ///
-    /// A store refresh error (e.g. a corrupt pile tail) is propagated
-    /// immediately as [`WaitError::Store`] — fail loud, never
-    /// auto-restore. On [`WaitError::Deadline`] the want stays durably
-    /// recorded; retry later.
-    pub fn wait_for(
-        &mut self,
-        handle: Inline<Handle<UnknownBlob>>,
-        deadline: Duration,
-        poll_every: Duration,
-    ) -> Result<Bytes, WaitError<S::ReaderError, WantRecordErrorOf<S>>> {
-        let start = Instant::now();
-        loop {
-            let reader = self.reader().map_err(WaitError::Store)?;
-            match BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle) {
-                Ok(bytes) => return Ok(bytes),
-                Err(WantGetError::NotYet) => {}
-                Err(WantGetError::WantRecord(e)) => return Err(WaitError::WantRecord(e)),
-                // Bytes-from-UnknownBlob conversion is infallible.
-                Err(WantGetError::Conversion(never)) => match never {},
-            }
-            if start.elapsed() >= deadline {
-                return Err(WaitError::Deadline);
-            }
-            std::thread::sleep(poll_every);
-        }
-    }
 }
 
 impl<S> BlobStorePut for Wanting<S>
@@ -274,7 +387,13 @@ where
         T: IntoBlob<Sch>,
         Handle<Sch>: InlineEncoding,
     {
-        self.store.lock().expect("store mutex").put(item)
+        let result = self.store.lock().expect("store mutex").put(item);
+        if result.is_ok() {
+            // The landed blob may be exactly what a suspended async
+            // read is waiting for.
+            self.signal.wake_all();
+        }
+        result
     }
 }
 
@@ -290,6 +409,7 @@ where
         Ok(WantingReader {
             local,
             store: self.store.clone(),
+            signal: self.signal.clone(),
         })
     }
 }
@@ -378,13 +498,226 @@ where
     }
 }
 
+// ── Async surface ────────────────────────────────────────────────────
+
+/// Async put: semantically identical to the sync [`BlobStorePut`] (a
+/// local store write is genuinely synchronous — the future resolves on
+/// first poll), present so a generic async consumer can drive a
+/// `Wanting` end to end. Landing a blob wakes suspended async reads.
+impl<S> AsyncBlobStorePut for Wanting<S>
+where
+    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+{
+    type PutError = S::PutError;
+
+    fn put<Sch, T>(
+        &mut self,
+        item: T,
+    ) -> impl Future<Output = Result<Inline<Handle<Sch>>, Self::PutError>> + Send
+    where
+        Sch: BlobEncoding + 'static,
+        T: IntoBlob<Sch>,
+        Handle<Sch>: InlineEncoding,
+    {
+        // Serialise before the future so it captures only `Send` values
+        // (bytes + raw handle + shared handles) — never the
+        // phantom-typed item (mirrors `SyncAsAsync::put`).
+        let blob: Blob<Sch> = item.to_blob();
+        let raw = blob.get_handle().raw;
+        let bytes = blob.bytes;
+        let store = self.store.clone();
+        let signal = self.signal.clone();
+        async move {
+            let result = store
+                .lock()
+                .expect("store mutex")
+                .put::<Sch, Blob<Sch>>(Blob::new(bytes));
+            match result {
+                Ok(_) => {
+                    signal.wake_all();
+                    Ok(Inline::new(raw))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// Async reader creation: resolves on first poll (taking a reader is a
+/// local operation). The reader carries both read surfaces — the sync
+/// probe and the async waiting read.
+impl<S> AsyncBlobStore for Wanting<S>
+where
+    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S::Reader: Sync,
+{
+    type Reader = WantingReader<S>;
+    type ReaderError = S::ReaderError;
+
+    fn reader(
+        &mut self,
+    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+        let store = self.store.clone();
+        let signal = self.signal.clone();
+        async move {
+            let local = store.lock().expect("store mutex").reader()?;
+            Ok(WantingReader {
+                local,
+                store,
+                signal,
+            })
+        }
+    }
+}
+
+/// The suspension behind the async waiting read. Every poll takes a
+/// fresh reader from the live store — which refreshes it, so records
+/// appended by other processes become visible — and does a local get.
+/// The first miss records the durable want (pin + flush, exactly like
+/// the sync probe), then the future parks until woken: by an in-process
+/// `put` through the owning [`Wanting`], or by the cadence ticker.
+///
+/// Cancellation-safe: dropping the future abandons the wait; the
+/// durable want remains recorded.
+struct WaitForBlob<S>
+where
+    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+{
+    store: Arc<Mutex<S>>,
+    signal: Arc<WantSignal>,
+    raw: RawInline,
+    want_recorded: bool,
+}
+
+impl<S> Future for WaitForBlob<S>
+where
+    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+{
+    type Output = Result<
+        Bytes,
+        WantWaitError<std::convert::Infallible, S::ReaderError, WantRecordErrorOf<S>>,
+    >;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let handle = Inline::<Handle<UnknownBlob>>::new(this.raw);
+
+        // Fresh reader = store refresh; a refresh failure (corrupt pile
+        // tail) is loud and immediate, never spun on.
+        let mut store = this.store.lock().expect("store mutex");
+        let reader = match store.reader() {
+            Ok(reader) => reader,
+            Err(e) => return Poll::Ready(Err(WantWaitError::Store(e))),
+        };
+        // Universal byte read: any store-level failure is a miss.
+        if let Ok(bytes) = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle) {
+            return Poll::Ready(Ok(bytes));
+        }
+
+        // The durable want, recorded once: weak-pin the demand, then
+        // flush — the marker must survive an immediate process exit. Any
+        // failure is an ERROR: a silently dropped want is a blob nobody
+        // will ever fetch, and a wait without a recorded want is a wait
+        // nobody will ever satisfy.
+        if !this.want_recorded {
+            if let Err(e) = store.pin_weak(handle) {
+                return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Pin(e))));
+            }
+            if let Err(e) = store.flush() {
+                return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Flush(e))));
+            }
+            this.want_recorded = true;
+        }
+
+        // Park — registered while the store lock is still held, so an
+        // in-process `put` cannot land between our miss-check and our
+        // registration (its store mutation serializes after this poll's
+        // lock, and its wake_all after that).
+        this.signal.register(cx.waker());
+        drop(store);
+        // Cover landings this `Wanting` can't observe directly (another
+        // handle / another process): cadence re-check while parked.
+        WantSignal::ensure_ticker(&this.signal);
+        Poll::Pending
+    }
+}
+
+/// The async **waiting read**: present resolves immediately; missing
+/// records the durable want and suspends until the blob lands in the
+/// store. See the [module-level docs](self) for the probe/wait split.
+impl<S> AsyncBlobStoreGet for WantingReader<S>
+where
+    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+{
+    type GetError<E: std::error::Error + Send + Sync + 'static> =
+        WantWaitError<E, S::ReaderError, WantRecordErrorOf<S>>;
+
+    fn get<T, Sch>(
+        &self,
+        handle: Inline<Handle<Sch>>,
+    ) -> impl Future<Output = Result<T, Self::GetError<<T as TryFromBlob<Sch>>::Error>>> + Send
+    where
+        Sch: BlobEncoding + 'static,
+        T: TryFromBlob<Sch>,
+        Handle<Sch>: InlineEncoding,
+    {
+        // Capture only `Send` values — the raw 32 bytes and the shared
+        // store/signal handles, never the phantom-typed handle (mirrors
+        // `SyncAsAsync` / `PeerReader`). The typed conversion happens at
+        // completion, after the final await, so `T`/`Sch` are never part
+        // of the future's held state.
+        let wait = WaitForBlob {
+            store: self.store.clone(),
+            signal: self.signal.clone(),
+            raw: handle.raw,
+            want_recorded: false,
+        };
+        async move {
+            match wait.await {
+                Ok(bytes) => Blob::<Sch>::new(bytes)
+                    .try_from_blob()
+                    .map_err(WantWaitError::Conversion),
+                Err(WantWaitError::Store(e)) => Err(WantWaitError::Store(e)),
+                Err(WantWaitError::WantRecord(e)) => Err(WantWaitError::WantRecord(e)),
+                // Bytes-from-UnknownBlob conversion is infallible.
+                Err(WantWaitError::Conversion(never)) => match never {},
+            }
+        }
+    }
+}
+
+/// Async listing over the local snapshot — zero-await, resolves on
+/// first poll (enumeration is local; it never records wants).
+impl<S> AsyncBlobStoreList for WantingReader<S>
+where
+    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S::Reader: Sync,
+{
+    type Err = <S::Reader as BlobStoreList>::Err;
+
+    // Not an `async fn`: the desugared form would drop the explicit
+    // `Send` bound the trait contract requires.
+    #[allow(clippy::manual_async_fn)]
+    fn blobs(
+        &self,
+    ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send {
+        async move { self.local.blobs().collect() }
+    }
+}
+
 /// The read view of a [`Wanting`]: the store's own reader snapshot plus
 /// a want-recording handle into the shared store.
 ///
-/// The sync [`BlobStoreGet`] is *local-plus-want*: a hit is served from
-/// the snapshot; a miss durably records the demand (weak pin + flush)
-/// and returns [`WantGetError::NotYet`]. It never blocks and never
-/// networks.
+/// Two read surfaces with deliberately different semantics (see the
+/// [module-level docs](self)):
+/// - the sync [`BlobStoreGet`] is the *probe*: local-plus-want — a hit
+///   is served from the snapshot; a miss durably records the demand
+///   (weak pin + flush) and returns [`WantGetError::NotYet`]
+///   immediately.
+/// - the async [`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)
+///   is the *waiting read*: same durable want on miss, then suspension
+///   until the blob lands (checked against the live store, not this
+///   snapshot).
 ///
 /// Note that **every** miss records a want — including speculative
 /// probes. Don't drive conservative reference scans ([`super::BlobChildren`])
@@ -398,6 +731,9 @@ where
     /// Want-recording handle into the shared store: a `&self` read must
     /// be able to weak-pin the missed handle and flush the marker.
     store: Arc<Mutex<S>>,
+    /// Wake channel shared with the owning [`Wanting`], so a suspended
+    /// async read hears about in-process landings immediately.
+    signal: Arc<WantSignal>,
 }
 
 // Identity ignores the store handle: two readers are equal iff their
@@ -411,6 +747,7 @@ where
         Self {
             local: self.local.clone(),
             store: self.store.clone(),
+            signal: self.signal.clone(),
         }
     }
 }
@@ -486,6 +823,9 @@ mod tests {
     use super::*;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
+    use futures::executor::block_on;
+    use futures::task::{waker, ArcWake};
+    use std::sync::atomic::AtomicUsize;
 
     fn blob_of(bytes: &'static [u8]) -> (Blob<UnknownBlob>, Inline<Handle<UnknownBlob>>) {
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(bytes));
@@ -503,17 +843,19 @@ mod tests {
     fn local_hit_serves_without_recording_want() {
         let mut lazy = Wanting::new(MemoryRepo::default());
         let (blob, handle) = blob_of(b"resident");
-        lazy.put::<UnknownBlob, _>(blob).unwrap();
+        BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
 
-        let reader = lazy.reader().unwrap();
-        let bytes: Bytes = reader.get(handle).expect("resident blob serves locally");
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let bytes: Bytes =
+            BlobStoreGet::get(&reader, handle).expect("resident blob serves locally");
         assert_eq!(&bytes[..], b"resident");
         assert_eq!(lazy.weak_pins().unwrap().count(), 0, "a hit records no want");
     }
 
-    /// The core contract: a miss returns `NotYet` with the want durably
-    /// on record — visible through the same handle AND through a second
-    /// `Pile` opened fresh on the same file (the reader path flushed).
+    /// The core contract of the sync probe: a miss returns `NotYet` with
+    /// the want durably on record — visible through the same handle AND
+    /// through a second `Pile` opened fresh on the same file (the reader
+    /// path flushed).
     #[test]
     fn miss_records_durable_want_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -521,7 +863,7 @@ mod tests {
         let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"wanted but absent");
 
-        let reader = lazy.reader().unwrap();
+        let reader = BlobStore::reader(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("absent blob must not serve");
         assert!(matches!(err, WantGetError::NotYet), "miss is NotYet, got {err:?}");
@@ -643,7 +985,7 @@ mod tests {
         let mut lazy = Wanting::new(FailingPins::default());
         let (_, handle) = blob_of(b"unrecordable");
 
-        let reader = lazy.reader().unwrap();
+        let reader = BlobStore::reader(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("miss on a pin-refusing store must error");
         assert!(
@@ -652,13 +994,113 @@ mod tests {
         );
     }
 
-    // ── wait_for ─────────────────────────────────────────────────────
-
-    /// `wait_for` returns the bytes once another handle lands the blob
-    /// in the shared file — the faculty-blocks-while-daemon-fetches
-    /// round trip, with a plain second `Pile` standing in for the daemon.
+    /// Same posture on the async read: it errors instead of suspending
+    /// when the want cannot be recorded — a wait without a recorded want
+    /// is a wait nobody will ever satisfy.
     #[test]
-    fn wait_for_returns_blob_once_landed_by_second_handle() {
+    fn async_want_record_failure_is_an_error() {
+        let mut lazy = Wanting::new(FailingPins::default());
+        let (_, handle) = blob_of(b"unrecordable");
+
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle))
+            .expect_err("miss on a pin-refusing store must error, not suspend");
+        assert!(
+            matches!(err, WantWaitError::WantRecord(WantRecordError::Pin(PinRefused))),
+            "want-record failure must surface as WantRecord, got {err:?}"
+        );
+    }
+
+    // ── Async waiting read ───────────────────────────────────────────
+
+    /// Wake-counting waker: lets a test poll a future by hand and assert
+    /// exactly when it was signaled.
+    struct CountingWaker(AtomicUsize);
+    impl ArcWake for CountingWaker {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A present blob resolves the async read immediately — first poll,
+    /// no want recorded, no suspension.
+    #[test]
+    fn async_get_present_resolves_immediately() {
+        let mut lazy = Wanting::new(MemoryRepo::default());
+        let (blob, handle) = blob_of(b"already here");
+        BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
+
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let bytes: Bytes =
+            block_on(AsyncBlobStoreGet::get(&reader, handle)).expect("present blob resolves");
+        assert_eq!(&bytes[..], b"already here");
+        assert_eq!(lazy.weak_pins().unwrap().count(), 0, "a hit records no want");
+    }
+
+    /// The in-process wake path: the first poll records the durable want
+    /// and parks; a `put` through the same `Wanting` wakes the waiter;
+    /// the re-poll resolves.
+    #[test]
+    fn async_get_wakes_on_in_process_put() {
+        let mut lazy = Wanting::new(MemoryRepo::default());
+        let (blob, handle) = blob_of(b"lands in process");
+
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let mut fut =
+            Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle));
+
+        let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+        let waker = waker(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "absent blob suspends"
+        );
+        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(wants, vec![handle], "first pending poll recorded the want");
+        assert_eq!(counter.0.load(Ordering::SeqCst), 0, "no wake before the put");
+
+        BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "in-process put wakes the parked waiter"
+        );
+
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(bytes)) => assert_eq!(&bytes[..], b"lands in process"),
+            other => panic!("re-poll after landing must resolve, got {other:?}"),
+        }
+    }
+
+    /// Cancellation safety: dropping a suspended read abandons the wait,
+    /// but the durable want REMAINS recorded.
+    #[test]
+    fn dropped_wait_keeps_want_recorded() {
+        let mut lazy = Wanting::new(MemoryRepo::default());
+        let (_, handle) = blob_of(b"nobody lands this");
+
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        {
+            let mut fut =
+                Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle));
+            let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
+            let waker = waker(counter);
+            let mut cx = Context::from_waker(&waker);
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            // fut dropped here — the wait is abandoned.
+        }
+
+        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
+        assert_eq!(wants, vec![handle], "the want outlives the dropped future");
+    }
+
+    /// The cross-process path: a blob landed by a *second pile handle*
+    /// on the same file (standing in for a sync daemon in another
+    /// process) is observed by the cadence re-check — the suspended read
+    /// resolves without any in-process put.
+    #[test]
+    fn async_get_resolves_once_landed_by_second_handle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.pile");
         let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
@@ -666,48 +1108,34 @@ mod tests {
 
         let writer_path = path.clone();
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(150));
             let mut pile = Pile::open(&writer_path).unwrap();
             pile.put::<UnknownBlob, _>(blob).unwrap();
             pile.close().unwrap();
         });
 
-        let bytes = lazy
-            .wait_for(handle, Duration::from_secs(30), Duration::from_millis(10))
-            .expect("blob appears within the deadline");
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let bytes: Bytes = block_on(AsyncBlobStoreGet::get(&reader, handle))
+            .expect("blob appears and the wait resolves");
         assert_eq!(&bytes[..], b"landed later");
         writer.join().unwrap();
 
+        drop(reader);
         lazy.into_store().close().unwrap();
     }
 
-    /// Deadline expiry: `Deadline` comes back, and the want stays
-    /// durably recorded (wait_for is self-sufficient — no prior get
-    /// needed to enqueue the demand).
+    /// A corrupt pile tail fails loud and immediately
+    /// (`WantWaitError::Store(ReadError)`) — never auto-restored, never
+    /// suspended on.
     #[test]
-    fn wait_for_deadline_expires_and_want_stays_recorded() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
-        let (_, handle) = blob_of(b"nobody lands this");
-
-        let err = lazy
-            .wait_for(handle, Duration::from_millis(50), Duration::from_millis(5))
-            .expect_err("nobody lands the blob");
-        assert!(matches!(err, WaitError::Deadline), "expected Deadline, got {err:?}");
-
-        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "wait_for recorded the want");
-    }
-
-    /// A corrupt pile tail fails loud and immediately (`Store(ReadError)`)
-    /// — never auto-restored, never spun on until the deadline.
-    #[test]
-    fn wait_for_corrupt_tail_fails_loud() {
+    fn async_get_corrupt_tail_fails_loud() {
         use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.pile");
         let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"unreachable");
+        let reader = BlobStore::reader(&mut lazy).unwrap();
 
         // Corrupt the tail out-of-band: garbage that matches no record
         // magic.
@@ -716,20 +1144,54 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
 
-        let started = Instant::now();
-        let err = lazy
-            .wait_for(handle, Duration::from_secs(30), Duration::from_millis(10))
+        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle))
             .expect_err("corrupt tail must fail");
         assert!(
             matches!(
                 err,
-                WaitError::Store(crate::repo::pile::ReadError::CorruptPile { .. })
+                WantWaitError::Store(crate::repo::pile::ReadError::CorruptPile { .. })
             ),
             "expected Store(CorruptPile), got {err:?}"
         );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "corruption must fail immediately, not spin to the deadline"
-        );
+    }
+
+    /// A generic async consumer can drive a `Wanting` end to end through
+    /// the async traits alone: put → reader → get → blobs.
+    #[test]
+    fn async_traits_roundtrip() {
+        let mut lazy = Wanting::new(MemoryRepo::default());
+        let (blob, _) = blob_of(b"through the async surface");
+
+        let handle =
+            block_on(AsyncBlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob)).unwrap();
+        let reader = block_on(AsyncBlobStore::reader(&mut lazy)).unwrap();
+        let bytes: Bytes = block_on(AsyncBlobStoreGet::get(&reader, handle)).unwrap();
+        assert_eq!(&bytes[..], b"through the async surface");
+
+        let listed: Vec<_> = block_on(AsyncBlobStoreList::blobs(&reader))
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(listed, vec![handle]);
+    }
+
+    // Statically assert the futures are `Send` — required by the RPITIT
+    // contract of the async traits. If the waiting future ever captured
+    // something non-Send (the phantom-typed handle, a reader snapshot),
+    // this would stop compiling.
+    fn _assert_send<F: Send>(_: F) {}
+    #[allow(dead_code)]
+    fn _send_proof(
+        lazy: &mut Wanting<MemoryRepo>,
+        reader: &WantingReader<MemoryRepo>,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) {
+        _assert_send(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(reader, handle));
+        _assert_send(AsyncBlobStoreList::blobs(reader));
+        _assert_send(AsyncBlobStorePut::put::<UnknownBlob, _>(
+            lazy,
+            Blob::<UnknownBlob>::new(Bytes::from_source(&b"x"[..])),
+        ));
+        _assert_send(AsyncBlobStore::reader(lazy));
     }
 }

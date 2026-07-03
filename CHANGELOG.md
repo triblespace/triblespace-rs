@@ -69,15 +69,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wraps a store Peer-style (`Arc<Mutex<S>>`) but answers a read miss with a
   **durable want** instead of a swarm fetch — `pin_weak` + `flush` (the
   marker must survive an immediate process exit; a faculty exits right after
-  its read), then `Err(WantGetError::NotYet)`. `NotYet` means "the want is
-  durably recorded; a sync daemon (`Peer` + `Reconciler`) services it; retry
-  later" — absence is always "not obtained yet", never definitely-absent. A
-  failed want-record is an error (`WantGetError::WantRecord`), never a silent
-  proceed. `Wanting::wait_for(handle, deadline, poll_every)` adds the blocking
-  poll loop (fresh reader per iteration so external appends become visible;
-  store refresh errors propagate immediately — fail loud, never auto-restore;
-  no tokio in core). The type lives in `triblespace-core`, which has no
-  network dependency, so "never networks" is enforced by the linker.
+  its read). Two read surfaces, split by which trait you call (mirroring
+  `PeerReader`): the **sync probe** (`BlobStoreGet`) returns
+  `Err(WantGetError::NotYet)` on a miss — "the want is durably recorded; a
+  sync daemon (`Peer` + `Reconciler`) services it" — and never waits; the
+  **async waiting read** (`AsyncBlobStoreGet` on `WantingReader`, plus
+  `AsyncBlobStore`/`AsyncBlobStorePut` on `Wanting`) records the same
+  durable want and then *suspends* until the blob lands, resolving instead
+  of erroring (`WantWaitError` has no not-yet variant; compose deadlines
+  externally, e.g. `tokio::time::timeout` — the want stays recorded on
+  timeout or drop). Absence is always "not obtained yet", never
+  definitely-absent. A failed want-record is an error
+  (`WantGetError::WantRecord` / `WantWaitError::WantRecord`), never a
+  silent proceed, and store refresh errors propagate immediately
+  (`WantWaitError::Store` — fail loud, never auto-restore). Waking is an
+  implementation detail: in-process `put`s signal waiters directly; a
+  lazily-spawned, self-retiring cadence thread re-checks (with a store
+  refresh) for landings by other handles/processes — pure `std`, no tokio
+  in core, executor-agnostic futures. The type lives in `triblespace-core`,
+  which has no network dependency, so "never networks" is enforced by the
+  linker.
   `Repository`/`Workspace` compose with it unchanged: a checkout over a
   partially-absent closure fails `NotYet` while enqueueing durable wants for
   exactly the missing blobs.
