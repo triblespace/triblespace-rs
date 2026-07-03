@@ -57,7 +57,7 @@ use jerky::serialization::{Metadata, Serializable};
 /// wavelet matrix, enabling rank/select navigation between columns
 /// without materialising six separate indexes.
 ///
-/// Build from a [`TribleSet`] via [`IntoBlob`], then query through
+/// Build from a [`TribleSet`] via [`IntoBlob`](crate::blob::IntoBlob), then query through
 /// [`SuccinctArchive`] and its [`Constraint`](crate::query::Constraint)
 /// implementation. Suitable for large, read-heavy, mostly-static
 /// datasets where compact storage matters more than incremental updates.

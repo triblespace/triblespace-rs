@@ -157,7 +157,7 @@ pub enum WantGetError<E, W> {
     /// — a sync daemon (`Peer` + `Reconciler`) services it. This is the
     /// probe's "recorded, not present" outcome, never "definitely
     /// absent"; to *wait* for the blob instead, use the async
-    /// [`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)
+    /// [`AsyncBlobStoreGet`]
     /// read, which suspends rather than erroring.
     NotYet,
     /// Local miss AND the want could not be durably recorded. The demand
@@ -194,7 +194,7 @@ where
 }
 
 /// Error from a [`LazyReader`]'s **async waiting read**
-/// ([`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)).
+/// ([`AsyncBlobStoreGet`]).
 ///
 /// There is deliberately no "not yet" variant: the async read *resolves*
 /// when the blob lands instead of erroring on absence. Bound the wait
@@ -716,7 +716,7 @@ where
 ///   is served from the snapshot; a miss durably records the demand
 ///   (weak pin + flush) and returns [`WantGetError::NotYet`]
 ///   immediately.
-/// - the async [`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)
+/// - the async [`AsyncBlobStoreGet`]
 ///   is the *waiting read*: same durable want on miss, then suspension
 ///   until the blob lands (checked against the live store, not this
 ///   snapshot).

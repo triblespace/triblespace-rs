@@ -174,7 +174,7 @@ struct BlobHeader {
 impl BlobHeader {
     /// V1 blob constructor — retained only for the legacy-format backward-compat
     /// test (new writes are V3; V1 blob records are otherwise read, never written).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB,
@@ -798,40 +798,38 @@ impl From<ReadError> for InsertError {
     }
 }
 
-/// Error returned when updating a pin head in a [`Pile`].
-pub enum UpdateBranchError {
+/// Error returned when appending a pin-head update or weak-pin marker
+/// record to a [`Pile`].
+pub enum PileWriteError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
 }
 
-impl std::error::Error for UpdateBranchError {}
+impl std::error::Error for PileWriteError {}
 
-unsafe impl Send for UpdateBranchError {}
-unsafe impl Sync for UpdateBranchError {}
-
-impl std::fmt::Debug for UpdateBranchError {
+impl std::fmt::Debug for PileWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateBranchError::IoError(err) => write!(f, "IO error: {err}"),
+            PileWriteError::IoError(err) => write!(f, "IO error: {err}"),
         }
     }
 }
 
-impl std::fmt::Display for UpdateBranchError {
+impl std::fmt::Display for PileWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateBranchError::IoError(err) => write!(f, "IO error: {err}"),
+            PileWriteError::IoError(err) => write!(f, "IO error: {err}"),
         }
     }
 }
 
-impl From<std::io::Error> for UpdateBranchError {
+impl From<std::io::Error> for PileWriteError {
     fn from(err: std::io::Error) -> Self {
         Self::IoError(err)
     }
 }
 
-impl From<ReadError> for UpdateBranchError {
+impl From<ReadError> for PileWriteError {
     fn from(err: ReadError) -> Self {
         Self::IoError(err.into())
     }
@@ -1278,16 +1276,7 @@ impl BlobStorePut for Pile {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.put_impl(item, false)
-    }
-
-    fn put_aligned<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-    where
-        S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        self.put_impl(item, true)
+        self.put_impl(item)
     }
 }
 
@@ -1298,10 +1287,8 @@ impl Pile {
     /// shared-lock fast path for records up to `ATOMIC_WRITE_LIMIT` (no exclusive lock needed —
     /// a fixed header has no start offset to stabilize). The data is
     /// absolutely 256-aligned (zero-copy GPU-aliasable) in a pure-V3 pile, which
-    /// stays 256-aligned because every V3 record is a 256-byte multiple. The
-    /// `aligned` flag is now vestigial — every V3 blob is aligned; `put` and
-    /// `put_aligned` both route here.
-    fn put_impl<S, T>(&mut self, item: T, _aligned: bool) -> Result<Inline<Handle<S>>, InsertError>
+    /// stays 256-aligned because every V3 record is a 256-byte multiple.
+    fn put_impl<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, InsertError>
     where
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
@@ -1415,7 +1402,7 @@ impl PinStore for Pile
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
     type HeadError = ReadError;
-    type UpdateError = UpdateBranchError;
+    type UpdateError = PileWriteError;
 
     type ListIter<'a> = PileBranchStoreIter;
 
@@ -1466,7 +1453,7 @@ impl PinStore for Pile
     ) -> Result<super::PushResult, Self::UpdateError> {
         self.file.lock()?;
         let res = (|| {
-            self.refresh_locked().map_err(UpdateBranchError::from)?;
+            self.refresh_locked().map_err(PileWriteError::from)?;
             let current_hash = self.branches.get(&id.into()).copied();
             if current_hash != old {
                 return Ok(PushResult::Conflict(current_hash));
@@ -1498,25 +1485,25 @@ impl PinStore for Pile
             };
             let written = match write_res {
                 Ok(n) => n,
-                Err(e) => return Err(UpdateBranchError::IoError(e)),
+                Err(e) => return Err(PileWriteError::IoError(e)),
             };
             if written != expected {
-                return Err(UpdateBranchError::IoError(std::io::Error::new(
+                return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write branch header",
                 )));
             }
-            match self.apply_next().map_err(UpdateBranchError::from)? {
+            match self.apply_next().map_err(PileWriteError::from)? {
                 Some(Applied::Branch { id: bid, hash }) if matches!(new, Some(new) if bid == id && hash == new.into()) => {
                     Ok(PushResult::Success())
                 }
                 Some(Applied::BranchTombstone { id: bid }) if new.is_none() && bid == id => {
                     Ok(PushResult::Success())
                 }
-                Some(_) => Err(UpdateBranchError::IoError(std::io::Error::other(
+                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
                     "unexpected record after branch write",
                 ))),
-                None => Err(UpdateBranchError::IoError(std::io::Error::other(
+                None => Err(PileWriteError::IoError(std::io::Error::other(
                     "branch missing after write",
                 ))),
             }
@@ -1535,7 +1522,7 @@ pub struct PileWeakPinIter {
 }
 
 impl Iterator for PileWeakPinIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, UpdateBranchError>;
+    type Item = Result<Inline<Handle<UnknownBlob>>, PileWriteError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let raw = self.inner.next()?;
@@ -1554,10 +1541,10 @@ impl Pile {
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
         pin: bool,
-    ) -> Result<(), UpdateBranchError> {
+    ) -> Result<(), PileWriteError> {
         self.file.lock()?;
         let res = (|| {
-            self.refresh_locked().map_err(UpdateBranchError::from)?;
+            self.refresh_locked().map_err(PileWriteError::from)?;
 
             // No-op short-circuit: the weak set is logically a per-handle
             // LWW cell; re-asserting the current state carries no
@@ -1573,20 +1560,20 @@ impl Pile {
                 let header = WeakUnpinHeaderV3::new(handle);
                 self.file.write(header.as_bytes())
             };
-            let written = write_res.map_err(UpdateBranchError::IoError)?;
+            let written = write_res.map_err(PileWriteError::IoError)?;
             if written != V3_HEADER_LEN {
-                return Err(UpdateBranchError::IoError(std::io::Error::new(
+                return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write weak-pin header",
                 )));
             }
-            match self.apply_next().map_err(UpdateBranchError::from)? {
+            match self.apply_next().map_err(PileWriteError::from)? {
                 Some(Applied::WeakPin { handle: h }) if pin && h == handle => Ok(()),
                 Some(Applied::WeakUnpin { handle: h }) if !pin && h == handle => Ok(()),
-                Some(_) => Err(UpdateBranchError::IoError(std::io::Error::other(
+                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
                     "unexpected record after weak-pin write",
                 ))),
-                None => Err(UpdateBranchError::IoError(std::io::Error::other(
+                None => Err(PileWriteError::IoError(std::io::Error::other(
                     "weak-pin marker missing after write",
                 ))),
             }
@@ -1599,7 +1586,7 @@ impl Pile {
 }
 
 impl WeakPinStore for Pile {
-    type WeakPinError = UpdateBranchError;
+    type WeakPinError = PileWriteError;
     type WeakListIter<'a> = PileWeakPinIter;
 
     /// Appends a weak-pin record for `handle`. Durable across reopen (the
@@ -1728,7 +1715,10 @@ mod tests {
     }
 
     #[test]
-    fn put_aligned_v3_256_aligned_roundtrip() {
+    fn put_v3_256_aligned_roundtrip() {
+        // Every V3 record is a 256-byte multiple with the data at a fixed
+        // header offset, so plain `put` yields absolutely 256-aligned
+        // (GPU-aliasable) data in a pure-V3 pile.
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "v3.pile");
         // Sizes around the 64/256 boundaries to exercise the post-pad.
@@ -1740,7 +1730,7 @@ mod tests {
             for &sz in &sizes {
                 let data: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
                 let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-                let h = pile.put_aligned::<UnknownBlob, _>(blob).unwrap();
+                let h = pile.put::<UnknownBlob, _>(blob).unwrap();
                 let hash: Inline<Hash<Blake3>> = h.into();
                 hashes.push(hash);
                 datas.push(data);
@@ -1870,41 +1860,6 @@ mod tests {
         pile.close().unwrap();
     }
 
-    #[test]
-    fn put_aligned_and_put_interleave() {
-        // Interleaving put + put_aligned (both write V3 now): every record is
-        // 256-aligned and reads back correctly after a fresh scan.
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "mix.pile");
-        let mut entries: Vec<(Inline<Hash<Blake3>>, Vec<u8>, bool)> = Vec::new();
-        {
-            let mut pile: Pile = Pile::open(&path).unwrap();
-            for i in 0..20usize {
-                let d1: Vec<u8> = (0..13 + i * 37).map(|j| ((j + i) % 251) as u8).collect();
-                let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
-                let h1: Inline<Hash<Blake3>> = pile.put::<UnknownBlob, _>(b1).unwrap().into();
-                entries.push((h1, d1, false));
-                let d2: Vec<u8> = (0..17 + i * 53).map(|j| ((j * 3 + i) % 251) as u8).collect();
-                let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
-                let h2: Inline<Hash<Blake3>> = pile.put_aligned::<UnknownBlob, _>(b2).unwrap().into();
-                entries.push((h2, d2, true));
-            }
-            pile.close().unwrap();
-        }
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
-        for (hash, expected, via_aligned) in &entries {
-            let e = pile.blobs.get(&hash.raw).expect("blob missing after reopen").clone();
-            if *via_aligned {
-                assert_eq!(e.offset % GPU_DATA_ALIGNMENT, 0, "V3 record not aligned");
-            }
-            let got = unsafe {
-                std::slice::from_raw_parts(pile.mmap.as_ptr().add(e.offset), e.len as usize)
-            };
-            assert_eq!(got, &expected[..], "mismatch (aligned={via_aligned}, size {})", expected.len());
-        }
-        pile.close().unwrap();
-    }
 
     #[test]
     fn recover_shrink() {

@@ -4,7 +4,7 @@
 //!
 //! # The problem
 //!
-//! Derived indexes (a [`SuccinctArchive`] rollup, a BM25 term index, an
+//! Derived indexes (a [`SuccinctArchive`](crate::blob::encodings::succinctarchive::SuccinctArchive) rollup, a BM25 term index, an
 //! HNSW vector graph) go stale when the source branch changes, and a
 //! *monolithic* index over the whole branch is too expensive to rebuild
 //! on every commit. The current [`Repository::compute_rollup`] pays the
@@ -21,7 +21,7 @@
 //!   when unreferenced.
 //! - **Manifest** — a set of tribles (one entity per segment, tagged
 //!   with the owning kind, carrying the segment blob handle, its LSMT
-//!   level, a sequence number, and an optional stats-blob handle) unioned
+//!   level, and a sequence number) unioned
 //!   directly into the branch-head tribleset. Rewritten (this kind's old
 //!   segment tribles differenced out, the new ones unioned in) as the
 //!   index evolves; the old branch-head-tribleset version and its
@@ -29,7 +29,7 @@
 //! - **Read** — one branch-head lookup to the tribleset, select this
 //!   kind's manifest subset via `pattern!`, then union-query the
 //!   referenced segments (bounded fan-out). No commit walk, no checkout.
-//! - **Maintain** — [`IndexHome::update_index`] appends a small new
+//! - **Maintain** — [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index) appends a small new
 //!   segment (cheap) and runs a size-tiered merge to bound fan-out; a new
 //!   branch-head-tribleset version carries the rewritten manifest and the
 //!   superseded segments become orphans for GC.
@@ -67,8 +67,8 @@
 //! 3. **Ephemeral / soft-state.** The manifest is redundant with (and
 //!    re-derivable from) the commit chain; a `push` that rebuilds the
 //!    branch metadata simply drops it, exactly as it drops the `rollup`
-//!    attribute today, and [`IndexHome::update_index`] rebuilds it. Each
-//!    segment entity is tagged with its kind id ([`seg_kind`]), so two
+//!    attribute today, and [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index) rebuilds it. Each
+//!    segment entity is tagged with its kind id ([`seg_kind`](crate::repo::index_home::seg_kind)), so two
 //!    kinds over the same branch keep independent manifests in the one
 //!    tribleset. The existing single-blob `rollup` branch-metadata
 //!    attribute is the monolithic predecessor of this design; the
@@ -83,13 +83,13 @@
 //! shape applied to *indexes*: the manifest is the generation list, the
 //! segments are the generations, and GC is Yard's reclaim. We reuse the
 //! store's reachability GC directly and mirror the size-tiered tenuring
-//! policy in [`IndexHome::update_index`].
+//! policy in [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index).
 //!
 //! # Maintenance triggers
 //!
-//! Two entry points share one implementation ([`append_segment`]):
+//! Two entry points share one implementation ([`append_segment`](crate::repo::index_home::append_segment)):
 //!
-//! - **Explicit** — [`IndexHome::update_index`]: build a segment from a
+//! - **Explicit** — [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index): build a segment from a
 //!   caller-supplied delta and CAS the branch pin yourself.
 //! - **On commit** — [`Repository::register_index`]
 //!   (or the general [`Repository::on_commit`]): a hook runs inside the
@@ -101,18 +101,20 @@
 //! [`Repository::register_index`]: crate::repo::Repository::register_index
 //! [`Repository::on_commit`]: crate::repo::Repository::on_commit
 //!
+//! # Example
+//!
+//! `examples/index_home.rs` (`cargo run --example index_home` from the
+//! workspace root) shows the whole loop against a temp pile:
+//! `register_index` once, plain commits after, then a
+//! query-without-checkout via [`IndexHome::attach_all`](crate::repo::index_home::IndexHome::attach_all)
+//! and a union query over the attached segments.
+//!
 //! # Seams left for follow-up work
 //!
-//! - **GPU merge.** [`IndexKind::merge`] is CPU today (union-then-rebuild
+//! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (union-then-rebuild
 //!   for the SuccinctArchive rollup). The GPU-accelerated succinct merge
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.
-//! - **Per-segment stats.** The manifest schema carries an optional
-//!   opaque per-segment stats blob ([`IndexKind::stats`], default
-//!   `None`). The SuccinctArchive rollup leaves it empty; BM25
-//!   (`doc_frequency`/`n_docs`) and HNSW (per-segment count) will
-//!   populate it so a query can read a scalar without opening every
-//!   segment blob.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -155,9 +157,6 @@ attributes! {
     /// manifest. Gives a stable total order within a level and keeps
     /// content-addressed segment entities distinct.
     "DFE499897718CFB97497AA8504A5D48F" as pub seg_seq: U256BE;
-    /// Optional per-kind lightweight stats blob for a segment. Absent for
-    /// kinds (like the SuccinctArchive rollup) that don't use it.
-    "5387B92C012F03C705169A789347528F" as pub seg_stats: Handle<UnknownBlob>;
 }
 
 /// Number of segments a level may hold before a size-tiered merge
@@ -199,17 +198,10 @@ pub trait IndexKind {
     /// This is the LSMT maintenance primitive. The GPU-accelerated
     /// succinct merge drops in behind exactly this method.
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob>;
-
-    /// Optional lightweight per-segment stats, serialised into the
-    /// manifest so a query can read a scalar without opening the segment
-    /// blob. Default `None`; consumers that need it (BM25, HNSW) override.
-    fn stats(&self, _segment: &Self::Segment) -> Option<Blob<UnknownBlob>> {
-        None
-    }
 }
 
-/// One entry in a [`Manifest`]: a live segment, its LSMT level, its
-/// sequence number, and an optional stats-blob handle.
+/// One entry in a [`Manifest`]: a live segment, its LSMT level, and its
+/// sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentEntry {
     /// Handle of the immutable segment blob.
@@ -218,8 +210,6 @@ pub struct SegmentEntry {
     pub level: u64,
     /// Sequence number (total order within a level).
     pub seq: u64,
-    /// Optional per-kind stats blob handle.
-    pub stats: Option<Inline<Handle<UnknownBlob>>>,
 }
 
 /// The set of live segments for one index kind, ordered by `(level, seq)`.
@@ -238,27 +228,12 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// An empty manifest (no segments yet).
-    pub fn empty() -> Self {
-        Self { segments: Vec::new(), next_seq: 0 }
-    }
-
-    /// Number of live segments.
-    pub fn len(&self) -> usize {
-        self.segments.len()
-    }
-
-    /// Whether the manifest names no segments.
-    pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-
     /// Append a segment, assigning it the next sequence number, then keep
     /// the segment list ordered by `(level, seq)`.
-    fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64, stats: Option<Inline<Handle<UnknownBlob>>>) {
+    fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.segments.push(SegmentEntry { blob, level, seq, stats });
+        self.segments.push(SegmentEntry { blob, level, seq });
         self.segments.sort_by_key(|e| (e.level, e.seq));
     }
 
@@ -289,21 +264,9 @@ impl Manifest {
     /// [`seg_kind`]; every other trible in the set (branch metadata, other
     /// kinds' segments) is ignored.
     pub fn from_tribles(set: &TribleSet, kind: Id) -> Self {
-        // Collect optional per-segment stats keyed by segment-entity id.
-        // Segment entities carry their kind tag, and we only look up stats
-        // for entities selected by the kind-scoped query below, so this
-        // map never leaks another kind's stats.
-        let mut stats_map: HashMap<[u8; 32], Inline<Handle<UnknownBlob>>> = HashMap::new();
-        for (e, st) in find!(
-            (e: Inline<GenId>, st: Inline<Handle<UnknownBlob>>),
-            pattern!(set, [{ ?e @ seg_kind: kind, seg_stats: ?st }])
-        ) {
-            stats_map.insert(e.raw, st);
-        }
-
         let mut segments: Vec<SegmentEntry> = Vec::new();
         let mut max_seq: Option<u64> = None;
-        for (e, blob, level, seq) in find!(
+        for (_e, blob, level, seq) in find!(
             (
                 e: Inline<GenId>,
                 blob: Inline<Handle<UnknownBlob>>,
@@ -315,8 +278,7 @@ impl Manifest {
             let level = level.try_from_inline::<u64>().unwrap_or(0);
             let seq = seq.try_from_inline::<u64>().unwrap_or(0);
             max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
-            let stats = stats_map.get(&e.raw).copied();
-            segments.push(SegmentEntry { blob, level, seq, stats });
+            segments.push(SegmentEntry { blob, level, seq });
         }
         segments.sort_by_key(|e| (e.level, e.seq));
 
@@ -337,7 +299,6 @@ impl Manifest {
                 seg_blob: e.blob,
                 seg_level: e.level,
                 seg_seq: e.seq,
-                seg_stats?: e.stats,
             };
         }
         set
@@ -369,7 +330,7 @@ impl Manifest {
 /// [`Manifest::from_tribles`]/[`Manifest::to_tribles`], which reproduces the
 /// content-addressed segment entities verbatim (the same fidelity
 /// [`IndexHome::update_index`] relies on for its manifest difference).
-pub fn manifest_tribles(set: &TribleSet) -> TribleSet {
+pub(crate) fn manifest_tribles(set: &TribleSet) -> TribleSet {
     // Enumerate the distinct owning kinds present in the head, then carry
     // each kind's manifest forward independently (two kinds over one branch
     // keep independent manifests in the one tribleset).
@@ -453,20 +414,12 @@ where
     // content-addressed entities that from_tribles just read).
     let old_manifest_tribles = manifest.to_tribles(kind_id);
 
-    // Build + append a fresh level-0 segment. Attach the just-built
-    // blob (zero-copy) to derive its optional stats without a store
-    // round-trip.
+    // Build + append a fresh level-0 segment.
     let segment_blob = kind.build(source);
-    let attached = kind.attach(segment_blob.clone());
-    let stats_blob = kind.stats(&attached);
     let handle = storage
         .put::<UnknownBlob, _>(segment_blob)
         .map_err(boxed)?;
-    let stats_handle = match stats_blob {
-        Some(b) => Some(storage.put::<UnknownBlob, _>(b).map_err(boxed)?),
-        None => None,
-    };
-    manifest.push(handle, 0, stats_handle);
+    manifest.push(handle, 0);
 
     // Size-tiered merge: while a level overflows, tenure the whole
     // tier into a single merged segment one level up (Yard's shape).
@@ -479,16 +432,10 @@ where
             attached.push(kind.attach(blob));
         }
         let merged_blob = kind.merge(&attached);
-        let merged_seg = kind.attach(merged_blob.clone());
-        let merged_stats = kind.stats(&merged_seg);
         let merged_handle = storage
             .put::<UnknownBlob, _>(merged_blob)
             .map_err(boxed)?;
-        let merged_stats_handle = match merged_stats {
-            Some(b) => Some(storage.put::<UnknownBlob, _>(b).map_err(boxed)?),
-            None => None,
-        };
-        manifest.push(merged_handle, level + 1, merged_stats_handle);
+        manifest.push(merged_handle, level + 1);
     }
 
     // Rewrite this kind's manifest inside the branch-head tribleset:
@@ -529,11 +476,6 @@ where
     /// Does not touch storage until a read or update.
     pub fn new(storage: &'s mut S, source_branch: Id, kind: K) -> Self {
         Self { storage, kind, branch: source_branch }
-    }
-
-    /// The branch pin id whose head tribleset carries this manifest.
-    pub fn branch(&self) -> Id {
-        self.branch
     }
 
     fn head(&mut self) -> Result<Option<Inline<Handle<SimpleArchive>>>, IndexError> {
@@ -617,7 +559,13 @@ where
 pub struct SuccinctRollup;
 
 impl SuccinctRollup {
-    /// Stable kind id for the SuccinctArchive rollup.
+    /// Stable kind id of the SuccinctArchive rollup (minted via
+    /// `trible genid`), tagged onto every segment entity via [`seg_kind`].
+    /// Mirrors the `KIND_ID_HEX` consts on the BM25 and HNSW kinds in
+    /// `triblespace-search`.
+    pub const KIND_ID_HEX: &'static str = "9540D50DEDECA9CA948FD14474F86566";
+
+    /// Construct the SuccinctArchive rollup kind.
     pub fn new() -> Self {
         SuccinctRollup
     }
@@ -634,7 +582,7 @@ impl IndexKind for SuccinctRollup {
     type Segment = SuccinctArchive<OrderedUniverse>;
 
     fn kind_id(&self) -> Id {
-        Id::from_hex("9540D50DEDECA9CA948FD14474F86566").expect("valid kind id")
+        Id::from_hex(Self::KIND_ID_HEX).expect("valid kind id")
     }
 
     fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
@@ -741,12 +689,11 @@ mod tests {
 
     #[test]
     fn manifest_roundtrips_through_tribles() {
-        let mut m = Manifest::empty();
+        let mut m = Manifest::default();
         let h0 = Inline::<Handle<UnknownBlob>>::new([1u8; 32]);
         let h1 = Inline::<Handle<UnknownBlob>>::new([2u8; 32]);
-        let st = Inline::<Handle<UnknownBlob>>::new([3u8; 32]);
-        m.push(h0, 0, None);
-        m.push(h1, 1, Some(st));
+        m.push(h0, 0);
+        m.push(h1, 1);
 
         let kind = SuccinctRollup.kind_id();
         let parsed = Manifest::from_tribles(&m.to_tribles(kind), kind);
@@ -756,7 +703,6 @@ mod tests {
         assert_eq!(parsed.segments[0].level, 0);
         assert_eq!(parsed.segments[1].blob, h1);
         assert_eq!(parsed.segments[1].level, 1);
-        assert_eq!(parsed.segments[1].stats, Some(st));
         // next_seq continues past the max seq read back.
         assert_eq!(parsed.next_seq, 2);
     }
@@ -771,7 +717,7 @@ mod tests {
         {
             let mut home = IndexHome::new(&mut storage, branch, SuccinctRollup::new());
             home.update_index(&da).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 1);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
         }
         let first_head = storage.head(branch).unwrap();
 
@@ -780,7 +726,7 @@ mod tests {
             home.update_index(&db).unwrap();
             let m = home.read_manifest().unwrap();
             // FANOUT is 4, so two updates leave two level-0 segments.
-            assert_eq!(m.len(), 2);
+            assert_eq!(m.segments.len(), 2);
         }
         let second_head = storage.head(branch).unwrap();
 
@@ -825,7 +771,7 @@ mod tests {
         .collect();
         // No index manifest present yet.
         assert_eq!(
-            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).len(),
+            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).segments.len(),
             0
         );
 
@@ -842,7 +788,7 @@ mod tests {
 
         // (a) The index query reads exactly the manifest subset.
         let manifest = Manifest::from_tribles(&set_after, SuccinctRollup.kind_id());
-        assert_eq!(manifest.len(), 1, "index query sees exactly its one segment");
+        assert_eq!(manifest.segments.len(), 1, "index query sees exactly its one segment");
 
         // (b) The unrelated branch-metadata query is IDENTICAL with the
         // index tribles present — union didn't disturb the existing subset.
@@ -886,7 +832,7 @@ mod tests {
         home.update_index(&s1).unwrap();
         home.update_index(&s2).unwrap();
         let m = home.read_manifest().unwrap();
-        assert_eq!(m.len(), 2, "expected two independent segments");
+        assert_eq!(m.segments.len(), 2, "expected two independent segments");
 
         let segments = home.attach_all().unwrap();
         let union = SuccinctRollup::union(&segments);
@@ -942,7 +888,7 @@ mod tests {
             }
             assert!(per_level.values().all(|&n| n < FANOUT), "fan-out bounded");
             // A merge must have happened (fewer segments than updates).
-            assert!(m.len() < names.len());
+            assert!(m.segments.len() < names.len());
         }
 
         let mut home = IndexHome::new(&mut storage, branch, SuccinctRollup::new());
@@ -1037,13 +983,13 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             home.update_index(&person("Ada")).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 1);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
         }
         repo.compute_rollup(*branch).unwrap();
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             assert_eq!(
-                home.read_manifest().unwrap().len(),
+                home.read_manifest().unwrap().segments.len(),
                 1,
                 "compute_rollup must carry the existing segment forward, not drop it"
             );
@@ -1057,7 +1003,7 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             assert_eq!(
-                home.read_manifest().unwrap().len(),
+                home.read_manifest().unwrap().segments.len(),
                 1,
                 "a commit must carry the manifest forward, not wipe it"
             );
@@ -1067,7 +1013,7 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             home.update_index(&person("Grace")).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 2);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 2);
         }
         repo.compute_rollup(*branch).unwrap();
 
@@ -1076,7 +1022,7 @@ mod tests {
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         let manifest = home.read_manifest().unwrap();
         assert_eq!(
-            manifest.len(),
+            manifest.segments.len(),
             2,
             "both segments accumulate across rollup cycles; not collapsed to one"
         );
@@ -1131,7 +1077,7 @@ mod tests {
             }
             let m = home.read_manifest().unwrap();
             // A single tenured segment at level 1 (the merge fired).
-            assert_eq!(m.len(), 1);
+            assert_eq!(m.segments.len(), 1);
             assert_eq!(m.segments[0].level, 1);
         }
 
@@ -1203,7 +1149,7 @@ mod tests {
             let m = home.read_manifest().unwrap();
             if i + 1 < FANOUT {
                 // One level-0 segment per commit until the merge fires.
-                assert_eq!(m.len(), i + 1, "segment per commit before first merge");
+                assert_eq!(m.segments.len(), i + 1, "segment per commit before first merge");
                 assert!(m.segments.iter().all(|s| s.level == 0));
             }
             // Fan-out stays bounded at every step.
@@ -1218,7 +1164,7 @@ mod tests {
         let m = home.read_manifest().unwrap();
         // The tiered merge fired: fewer segments than commits, and a
         // tenured segment above level 0 exists.
-        assert!(m.len() < n, "merge collapsed level 0 at least once");
+        assert!(m.segments.len() < n, "merge collapsed level 0 at least once");
         assert!(m.segments.iter().any(|s| s.level > 0), "tenured segment exists");
 
         // The union read sees ALL committed data — attach the manifest's
@@ -1296,8 +1242,8 @@ mod tests {
         // Both manifests coexist at the head, one per kind.
         let head = repo.storage_mut().head(*branch).unwrap().unwrap();
         let head_set: TribleSet = repo.storage_mut().reader().unwrap().get(head).unwrap();
-        assert_eq!(Manifest::from_tribles(&head_set, SuccinctRollup.kind_id()).len(), n);
-        assert_eq!(Manifest::from_tribles(&head_set, TitlesRollup.kind_id()).len(), n);
+        assert_eq!(Manifest::from_tribles(&head_set, SuccinctRollup.kind_id()).segments.len(), n);
+        assert_eq!(Manifest::from_tribles(&head_set, TitlesRollup.kind_id()).segments.len(), n);
 
         // Each kind's union read selects exactly its own subset.
         let names_union_counts = {
@@ -1368,7 +1314,7 @@ mod tests {
 
         // The index hook registered after the failing one still ran.
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
-        assert_eq!(home.read_manifest().unwrap().len(), 1);
+        assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
 
         // The failure is recorded once and drained.
         let errors = repo.take_hook_errors();
@@ -1408,7 +1354,7 @@ mod tests {
         // Both facts are reachable through the union read.
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         let manifest = home.read_manifest().unwrap();
-        assert_eq!(manifest.len(), 2, "one segment per landed delta");
+        assert_eq!(manifest.segments.len(), 2, "one segment per landed delta");
         let segments = home.attach_all().unwrap();
         let union = SuccinctRollup::union(&segments);
         let mut names: Vec<_> = find!(

@@ -325,7 +325,7 @@ impl<T: InlineEncoding> Debug for Inline<T> {
 /// The [Handle](crate::inline::encodings::hash::Handle) type for example contains type information about the hash algorithm,
 /// and the schema of the referenced blob.
 ///
-/// See the [value](crate::value) module for more information.
+/// See the [inline](crate::inline) module for more information.
 /// See the [BlobEncoding](crate::blob::BlobEncoding) trait for the counterpart trait for blobs.
 pub trait InlineEncoding: MetaDescribe + Sized + 'static {
     /// The error type returned by [`validate`](InlineEncoding::validate).
@@ -466,7 +466,7 @@ where
 
 /// The two-shape sum an attribute's value can take when an
 /// `entity!{}` field is encoded: either a 32-byte [`Inline<V>`]
-/// payload that lives directly in the trible, or a [`Blob`] holding
+/// payload that lives directly in the trible, or a [`Blob`](crate::blob::Blob) holding
 /// the heavy content with a derivable handle.
 ///
 /// Replaces the older `(Inline<V>, Option<Blob>)` pair that carried

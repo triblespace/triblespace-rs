@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 /// A 32-byte node identity — the ed25519 pubkey bytes that double as
 /// the iroh endpoint id in production and as the node address in the
-/// simulator. Same value as [`crate::channel::PublisherKey`].
+/// simulator. Same value as `crate::channel::PublisherKey`.
 pub type PeerId = [u8; 32];
 
 /// Application-layer protocol identifier for a connection. Both of the

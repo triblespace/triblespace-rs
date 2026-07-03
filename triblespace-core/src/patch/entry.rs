@@ -67,7 +67,7 @@ impl<const KEY_LEN: usize, V> Drop for Entry<KEY_LEN, V> {
 /// Holds a thin pointer into an archive's bytes plus a *borrow* of
 /// the `Arc<dyn ArchiveOwner>` that keeps those bytes alive. When
 /// inserted via [`PATCH::insert_archive`], the entry's key becomes a
-/// [`Head::new_local_leaf`] under a Branch whose `owner` matches; on
+/// `Head::new_local_leaf` under a Branch whose `owner` matches; on
 /// owner mismatch the leaf is automatically reified into a heap-
 /// allocated `Leaf<KEY_LEN, ()>` so the result is owner-consistent.
 ///
@@ -96,7 +96,7 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     ///
     /// # Safety
     /// - `ptr` must remain valid for as long as `owner` is held.
-    /// - `ptr` must be 16-byte aligned (so [`Head::new_local_leaf`]'s
+    /// - `ptr` must be 16-byte aligned (so `Head::new_local_leaf`'s
     ///   tagged-pointer encoding has room for the `LocalLeaf` tag in
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
     ///   multiple of 16 from a 16-byte aligned base satisfies this.

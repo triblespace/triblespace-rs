@@ -156,7 +156,7 @@ pub enum BuildError {
 ///
 /// `parent = Some((parent_cap, parent_sig))` constructs a delegated
 /// capability: the parent's signature is embedded inline in the new cap
-/// blob (via [`cap_embedded_parent_sig`] pointing at a sub-entity carrying
+/// blob (via [`sig_embedded_parent_proof`] pointing at a sub-entity carrying
 /// `signed_by` + `signature_r` + `signature_s` reusing the existing
 /// commit-signature attribute conventions) so verifiers can walk one level
 /// up the chain without a separate fetch for the parent's signature.

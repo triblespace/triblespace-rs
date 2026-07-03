@@ -47,7 +47,7 @@ const BLOB_INFIX: &str = "blobs";
 /// All data is stored in an external service (e.g. S3, local filesystem)
 /// via the `object_store` crate, which is async at its core — so this
 /// type is **async-native**: it implements the
-/// [`AsyncBlobStore`](super::async_store::AsyncBlobStore) family
+/// [`AsyncBlobStore`] family
 /// directly, awaiting each operation, with no owned runtime.
 ///
 /// Synchronous callers wrap it in

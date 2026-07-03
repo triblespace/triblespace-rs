@@ -6,9 +6,10 @@
 //! triblespace `Id` across processes, so repeated imports converge.
 //!
 //! Predicate URIs become attribute ids by wrapping the IRI handle in
-//! [`entity!`] under [`metadata::iri`] and [`metadata::value_encoding`],
+//! [`entity!`] under [`metadata::iri`](crate::metadata::iri) and
+//! [`metadata::value_encoding`](crate::metadata::value_encoding),
 //! then taking the resulting fragment's root via
-//! [`Attribute::<S>::from`]. The inline encoding is chosen from the
+//! [`Attribute::<S>::from`](crate::attribute::Attribute). The inline encoding is chosen from the
 //! object's XSD datatype:
 //!
 //! - `xsd:integer` / `xsd:long` / `xsd:int` / `xsd:short` / `xsd:byte`

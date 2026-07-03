@@ -102,11 +102,12 @@ impl Default for Reconciler {
 }
 
 impl Reconciler {
-    /// Default backoff: first retry ~1s after a failed attempt,
-    /// doubling per failure to a 60s cap. Per-fetch budget defaults to
+    /// Default backoff: the crate-shared retry bounds — first retry
+    /// `RETRY_BACKOFF_BASE` after a failed attempt, doubling per failure
+    /// to the `RETRY_BACKOFF_CAP`. Per-fetch budget defaults to
     /// [`RECONCILE_FETCH_DEADLINE`].
     pub fn new() -> Self {
-        Self::with_backoff(Duration::from_secs(1), Duration::from_secs(60))
+        Self::with_backoff(crate::RETRY_BACKOFF_BASE, crate::RETRY_BACKOFF_CAP)
     }
 
     /// Custom backoff bounds — `initial` after the first failure,
