@@ -664,14 +664,12 @@ fn lazy_read_unavailable_under_crash_then_revives() {
     });
 }
 
-/// A default `Peer<S>` **retains** what it fetches: the lazy read lands
-/// the blob in the store under a weak pin, so a second read is a LOCAL
+/// A `Peer<S>` **retains** what it fetches: the lazy read lands the
+/// blob in the store under a weak pin, so a second read is a LOCAL
 /// hit — no re-fetch, no swarm dependency. Proven by crashing the only
 /// holder before the second read: it still succeeds, resolving on the
-/// first poll without a single sim step. (Under the old two-tier model
-/// a cache-less `Peer<S, NullCache>` re-fetched on every read; that
-/// behavior no longer exists — retention is the store's job, and every
-/// fetch stays resident until the store evicts it.)
+/// first poll without a single sim step. Retention is the store's job;
+/// every fetch stays resident until the store evicts it.
 #[test]
 fn fetched_blob_is_retained_second_read_hits_locally() {
     let _g = sim_guard();
