@@ -9,9 +9,12 @@ fn main() {
     let tmp = tempfile::tempdir().expect("tmp dir");
     let path = tmp.path().join("repo.pile");
 
-    // Create a local pile to store blobs and branches
+    // Create a local pile to store blobs and branches. `open` does not
+    // create missing files, and loading is fail-loud: `refresh` errors on
+    // a corrupt tail (repair is explicit via `Pile::restore`).
+    std::fs::File::create(&path).expect("create pile file");
     let mut pile = Pile::open(&path).expect("open pile");
-    pile.restore().expect("restore pile");
+    pile.refresh().expect("load pile");
 
     // Create a repository from the pile and initialize the main branch
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("create repo");
