@@ -252,6 +252,32 @@ attributes! {
     "D7D14C6737AA27A51E1E08D380D13EF9" as pub rollup: Handle<SuccinctArchiveBlob>;
 }
 
+/// Rebuild a branch-head metadata tribleset against a new commit head and
+/// rollup, carrying the index-home LSMT manifest forward from the previous
+/// head (`base_meta`).
+///
+/// [`branch_metadata`] builds a fresh head that omits the manifest, so a
+/// rebuild (a `push`, a `compute_rollup`) would otherwise wipe it each time
+/// — forcing every [`IndexHome::update_index`](index_home::IndexHome::update_index)
+/// to start over with a single fresh segment and keeping the tiered merge
+/// and reachability GC from ever firing live. Unioning the previous head's
+/// manifest tribles back in makes segments accumulate across rebuilds. The
+/// manifest stays ephemeral (still re-derivable from the commit chain);
+/// only the rebuild cadence changes from wipe-every-commit to
+/// carry-and-compact.
+fn rebuild_branch_meta(
+    signing_key: &SigningKey,
+    branch_id: Id,
+    name: Inline<Handle<LongString>>,
+    commit_head: Option<Blob<SimpleArchive>>,
+    rollup_handle: Option<Inline<Handle<SuccinctArchiveBlob>>>,
+    base_meta: &TribleSet,
+) -> TribleSet {
+    let mut meta = branch_metadata(signing_key, branch_id, name, commit_head, rollup_handle);
+    meta += index_home::manifest_tribles(base_meta);
+    meta
+}
+
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList {
     /// Iterator over blob handles in the store.
@@ -1462,7 +1488,7 @@ where
             .get(head_handle)
             .map_err(PushError::StorageGet)?;
 
-        let mut branch_meta = branch_metadata(
+        let mut branch_meta = rebuild_branch_meta(
             &workspace.signing_key,
             workspace.base_branch_id,
             branch_name,
@@ -1471,14 +1497,8 @@ where
             // against the old HEAD). Readers fall back to checkout until
             // `compute_rollup` runs against the new HEAD.
             None,
+            &base_branch_meta,
         );
-        // Carry the index-home LSMT manifest forward across the commit rebuild
-        // so segments accumulate across commits instead of being wiped each
-        // one. branch_metadata builds a fresh head that omits the manifest, so
-        // union the previous head's manifest tribles back in. Manifest stays
-        // ephemeral (re-derivable by IndexHome::update_index); only the
-        // rebuild cadence changes.
-        branch_meta += crate::repo::index_home::manifest_tribles(&base_branch_meta);
 
         // On-commit hooks: fold derived state (index-home segments) into
         // the SAME branch-head tribleset this push is about to CAS in —
@@ -1663,19 +1683,14 @@ where
             .get(head_handle)
             .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
 
-        let mut new_meta = branch::branch_metadata(
+        let new_meta = rebuild_branch_meta(
             &ws.signing_key,
             branch_id,
             branch_name,
             Some(head_blob.to_blob()),
             Some(handle),
+            &base_meta,
         );
-        // Carry the index-home LSMT manifest forward across the rebuild so
-        // segments accumulate instead of being wiped: branch_metadata builds
-        // a fresh head that omits the manifest, so union the previous head's
-        // manifest tribles back in. Manifest stays ephemeral (still
-        // re-derivable by IndexHome::update_index); only the cadence changes.
-        new_meta += crate::repo::index_home::manifest_tribles(&base_meta);
         let new_meta_handle = self
             .storage
             .put(new_meta)
