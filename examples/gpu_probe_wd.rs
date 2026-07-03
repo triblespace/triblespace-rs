@@ -19,7 +19,10 @@
 
 use std::time::Instant;
 
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+};
+use triblespace::core::blob::Blob;
 use triblespace::core::import::ntriples::{ingest_ntriples_file, uri_to_id_pure};
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::trible::TribleSet;
@@ -59,21 +62,46 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
 
-    let t0 = Instant::now();
-    let import = ingest_ntriples_file(std::path::Path::new(&nt_path)).expect("import");
-    let facts: &TribleSet = import.facts.facts();
-    eprintln!(
-        "loaded {} triples -> {} tribles in {:?}",
-        import.triples,
-        facts.len(),
-        t0.elapsed()
+    // Archive blob cache: building from 10M+ triples takes minutes, the
+    // blob round-trip takes milliseconds (zero-copy mmap).
+    let cache = format!(
+        "/tmp/{}.succinctarchive",
+        std::path::Path::new(&nt_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
     );
-
-    let t0 = Instant::now();
-    let mut archive: SuccinctArchive<OrderedUniverse> = facts.into();
+    let mut archive: SuccinctArchive<OrderedUniverse> = if std::path::Path::new(&cache).exists() {
+        let t0 = Instant::now();
+        // SAFETY: the cache file is created by this harness and not
+        // modified while mapped.
+        let bytes = unsafe {
+            anybytes::Bytes::map_file(&std::fs::File::open(&cache).expect("open cache"))
+                .expect("map cache")
+        };
+        let blob: Blob<SuccinctArchiveBlob> = Blob::new(bytes);
+        let archive: SuccinctArchive<OrderedUniverse> =
+            blob.try_from_blob().expect("decode cached archive");
+        eprintln!("archive loaded from cache in {:?}", t0.elapsed());
+        archive
+    } else {
+        let t0 = Instant::now();
+        let import = ingest_ntriples_file(std::path::Path::new(&nt_path)).expect("import");
+        let facts: &TribleSet = import.facts.facts();
+        eprintln!(
+            "loaded {} triples -> {} tribles in {:?}",
+            import.triples,
+            facts.len(),
+            t0.elapsed()
+        );
+        let t0 = Instant::now();
+        let archive: SuccinctArchive<OrderedUniverse> = facts.into();
+        eprintln!("archive built in {:?}", t0.elapsed());
+        std::fs::write(&cache, archive.bytes.as_ref()).expect("write cache");
+        archive
+    };
     eprintln!(
-        "archive built in {:?} (E {} / A {} / V {}, domain {})",
-        t0.elapsed(),
+        "archive: E {} / A {} / V {}, domain {}",
         archive.entity_count,
         archive.attribute_count,
         archive.value_count,
@@ -103,6 +131,21 @@ fn main() {
     let subj = uri_to_id_pure(&first_subject);
     eprintln!("point-query subject: {first_subject}");
 
+    // Largest P31 class in the slice — the batch-size scaling point.
+    let t0 = Instant::now();
+    let mut class_counts: std::collections::HashMap<Id, usize> = std::collections::HashMap::new();
+    for (c,) in find!((c: Id), pattern!(&archive, [{ &p31: ?c }])) {
+        *class_counts.entry(c).or_default() += 1;
+    }
+    let (&top_class, &top_count) = class_counts
+        .iter()
+        .max_by_key(|(_, c)| **c)
+        .expect("P31 present");
+    eprintln!(
+        "largest P31 class: {top_class:?} with {top_count} instances (census {:?})",
+        t0.elapsed()
+    );
+
     type Q = (&'static str, Box<dyn Fn(&SuccinctArchive<OrderedUniverse>) -> usize>);
     let queries: Vec<Q> = vec![
         (
@@ -123,6 +166,17 @@ fn main() {
                 let p31 = p31.clone();
                 move |a| {
                     find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: q5 }])).count()
+                }
+            }),
+        ),
+        (
+            // Same sweep on the largest class in the slice — how the win
+            // scales with batch size.
+            "sweepXL ?e P31 <top>",
+            Box::new({
+                let p31 = p31.clone();
+                move |a| {
+                    find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: top_class }])).count()
                 }
             }),
         ),
