@@ -26,7 +26,7 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::pile::{GetBlobError, InsertError, Pile, PileReader, ReadError, UpdateBranchError};
+use super::pile::{GetBlobError, InsertError, Pile, PileReader, ReadError, PileWriteError};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
@@ -361,7 +361,7 @@ impl Yard {
         let pile = self.generations[0].active_mut().pile_mut();
         for handle in pins {
             pile.pin_weak(handle).map_err(|err| match err {
-                UpdateBranchError::IoError(io) => io,
+                PileWriteError::IoError(io) => io,
             })?;
         }
         pile.flush().map_err(|err| match err {
@@ -635,9 +635,9 @@ impl PinStore for Yard {
 }
 
 impl WeakPinStore for Yard {
-    type WeakPinError = UpdateBranchError;
+    type WeakPinError = PileWriteError;
 
-    type WeakListIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, UpdateBranchError>>;
+    type WeakListIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PileWriteError>>;
 
     /// Weakly pin a blob: refresh its LRU recency in memory AND persist a
     /// weak-pin marker to the young generation's pile, so the want survives
@@ -691,7 +691,7 @@ impl WeakPinStore for Yard {
     }
 
     fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
-        let items: Vec<Result<Inline<Handle<UnknownBlob>>, UpdateBranchError>> = {
+        let items: Vec<Result<Inline<Handle<UnknownBlob>>, PileWriteError>> = {
             let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
             (&weak_state.pins)
                 .into_iter()
@@ -946,9 +946,9 @@ impl Iterator for YardListIter {
     }
 }
 
-fn update_err_io(err: UpdateBranchError) -> YardOpenError {
+fn update_err_io(err: PileWriteError) -> YardOpenError {
     match err {
-        UpdateBranchError::IoError(io) => YardOpenError::Io(io),
+        PileWriteError::IoError(io) => YardOpenError::Io(io),
     }
 }
 

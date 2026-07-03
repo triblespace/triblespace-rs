@@ -535,40 +535,38 @@ impl From<ReadError> for InsertError {
     }
 }
 
-/// Error returned when updating a pin head in a [`Pile`].
-pub enum UpdateBranchError {
+/// Error returned when appending a pin-head update or weak-pin marker
+/// record to a [`Pile`].
+pub enum PileWriteError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
 }
 
-impl std::error::Error for UpdateBranchError {}
+impl std::error::Error for PileWriteError {}
 
-unsafe impl Send for UpdateBranchError {}
-unsafe impl Sync for UpdateBranchError {}
-
-impl std::fmt::Debug for UpdateBranchError {
+impl std::fmt::Debug for PileWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateBranchError::IoError(err) => write!(f, "IO error: {err}"),
+            PileWriteError::IoError(err) => write!(f, "IO error: {err}"),
         }
     }
 }
 
-impl std::fmt::Display for UpdateBranchError {
+impl std::fmt::Display for PileWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateBranchError::IoError(err) => write!(f, "IO error: {err}"),
+            PileWriteError::IoError(err) => write!(f, "IO error: {err}"),
         }
     }
 }
 
-impl From<std::io::Error> for UpdateBranchError {
+impl From<std::io::Error> for PileWriteError {
     fn from(err: std::io::Error) -> Self {
         Self::IoError(err)
     }
 }
 
-impl From<ReadError> for UpdateBranchError {
+impl From<ReadError> for PileWriteError {
     fn from(err: ReadError) -> Self {
         Self::IoError(err.into())
     }
@@ -1279,7 +1277,7 @@ impl PinStore for Pile
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
     type HeadError = ReadError;
-    type UpdateError = UpdateBranchError;
+    type UpdateError = PileWriteError;
 
     type ListIter<'a> = PileBranchStoreIter;
 
@@ -1330,7 +1328,7 @@ impl PinStore for Pile
     ) -> Result<super::PushResult, Self::UpdateError> {
         self.file.lock()?;
         let res = (|| {
-            self.refresh_locked().map_err(UpdateBranchError::from)?;
+            self.refresh_locked().map_err(PileWriteError::from)?;
             let current_hash = self.branches.get(&id.into()).copied();
             if current_hash != old {
                 return Ok(PushResult::Conflict(current_hash));
@@ -1362,25 +1360,25 @@ impl PinStore for Pile
             };
             let written = match write_res {
                 Ok(n) => n,
-                Err(e) => return Err(UpdateBranchError::IoError(e)),
+                Err(e) => return Err(PileWriteError::IoError(e)),
             };
             if written != expected {
-                return Err(UpdateBranchError::IoError(std::io::Error::new(
+                return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write branch header",
                 )));
             }
-            match self.apply_next().map_err(UpdateBranchError::from)? {
+            match self.apply_next().map_err(PileWriteError::from)? {
                 Some(Applied::Branch { id: bid, hash }) if matches!(new, Some(new) if bid == id && hash == new.into()) => {
                     Ok(PushResult::Success())
                 }
                 Some(Applied::BranchTombstone { id: bid }) if new.is_none() && bid == id => {
                     Ok(PushResult::Success())
                 }
-                Some(_) => Err(UpdateBranchError::IoError(std::io::Error::other(
+                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
                     "unexpected record after branch write",
                 ))),
-                None => Err(UpdateBranchError::IoError(std::io::Error::other(
+                None => Err(PileWriteError::IoError(std::io::Error::other(
                     "branch missing after write",
                 ))),
             }
@@ -1399,7 +1397,7 @@ pub struct PileWeakPinIter {
 }
 
 impl Iterator for PileWeakPinIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, UpdateBranchError>;
+    type Item = Result<Inline<Handle<UnknownBlob>>, PileWriteError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let raw = self.inner.next()?;
@@ -1418,10 +1416,10 @@ impl Pile {
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
         pin: bool,
-    ) -> Result<(), UpdateBranchError> {
+    ) -> Result<(), PileWriteError> {
         self.file.lock()?;
         let res = (|| {
-            self.refresh_locked().map_err(UpdateBranchError::from)?;
+            self.refresh_locked().map_err(PileWriteError::from)?;
 
             // No-op short-circuit: the weak set is logically a per-handle
             // LWW cell; re-asserting the current state carries no
@@ -1437,20 +1435,20 @@ impl Pile {
                 let header = WeakUnpinHeaderV3::new(handle);
                 self.file.write(header.as_bytes())
             };
-            let written = write_res.map_err(UpdateBranchError::IoError)?;
+            let written = write_res.map_err(PileWriteError::IoError)?;
             if written != V3_HEADER_LEN {
-                return Err(UpdateBranchError::IoError(std::io::Error::new(
+                return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write weak-pin header",
                 )));
             }
-            match self.apply_next().map_err(UpdateBranchError::from)? {
+            match self.apply_next().map_err(PileWriteError::from)? {
                 Some(Applied::WeakPin { handle: h }) if pin && h == handle => Ok(()),
                 Some(Applied::WeakUnpin { handle: h }) if !pin && h == handle => Ok(()),
-                Some(_) => Err(UpdateBranchError::IoError(std::io::Error::other(
+                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
                     "unexpected record after weak-pin write",
                 ))),
-                None => Err(UpdateBranchError::IoError(std::io::Error::other(
+                None => Err(PileWriteError::IoError(std::io::Error::other(
                     "weak-pin marker missing after write",
                 ))),
             }
@@ -1463,7 +1461,7 @@ impl Pile {
 }
 
 impl WeakPinStore for Pile {
-    type WeakPinError = UpdateBranchError;
+    type WeakPinError = PileWriteError;
     type WeakListIter<'a> = PileWeakPinIter;
 
     /// Appends a weak-pin record for `handle`. Durable across reopen (the
