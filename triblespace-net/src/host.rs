@@ -1406,18 +1406,10 @@ pub(crate) struct RetryEntry {
 
 pub(crate) type RetryQueue = Arc<Mutex<std::collections::BTreeMap<RawPinId, RetryEntry>>>;
 
-/// Base backoff for failed-walk retries; doubles per attempt up to
-/// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer
-/// restarting, partition healing) is retried promptly while a
-/// persistently-dead publisher costs at most one dial per cap
-/// period.
-const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
-const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
-
 fn retry_backoff(attempt: u32) -> std::time::Duration {
-    RETRY_BACKOFF_BASE
+    crate::RETRY_BACKOFF_BASE
         .saturating_mul(1u32 << attempt.min(6))
-        .min(RETRY_BACKOFF_CAP)
+        .min(crate::RETRY_BACKOFF_CAP)
 }
 
 #[allow(clippy::too_many_arguments)]

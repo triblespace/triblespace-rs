@@ -9,6 +9,16 @@
 //! All store traits stay sync. Async is jailed inside the network thread.
 
 mod channel;
+
+/// Base backoff shared by the crate's retry loops (failed head-walk
+/// retries in [`host`], failed want-fetch retries in
+/// [`reconcile::Reconciler`]); doubles per attempt up to
+/// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer
+/// restarting, partition healing) is retried promptly while a
+/// persistently-dead source costs at most one attempt per cap period.
+pub(crate) const RETRY_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+/// Upper bound the exponential retry backoff saturates at.
+pub(crate) const RETRY_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
 pub mod clock;
 pub mod dht;
 pub mod handshake;
