@@ -1153,16 +1153,7 @@ impl BlobStorePut for Pile {
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding,
     {
-        self.put_impl(item, false)
-    }
-
-    fn put_aligned<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-    where
-        S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        self.put_impl(item, true)
+        self.put_impl(item)
     }
 }
 
@@ -1173,10 +1164,8 @@ impl Pile {
     /// shared-lock fast path for records up to `ATOMIC_WRITE_LIMIT` (no exclusive lock needed —
     /// a fixed header has no start offset to stabilize). The data is
     /// absolutely 256-aligned (zero-copy GPU-aliasable) in a pure-V3 pile, which
-    /// stays 256-aligned because every V3 record is a 256-byte multiple. The
-    /// `aligned` flag is now vestigial — every V3 blob is aligned; `put` and
-    /// `put_aligned` both route here.
-    fn put_impl<S, T>(&mut self, item: T, _aligned: bool) -> Result<Inline<Handle<S>>, InsertError>
+    /// stays 256-aligned because every V3 record is a 256-byte multiple.
+    fn put_impl<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, InsertError>
     where
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
@@ -1603,7 +1592,10 @@ mod tests {
     }
 
     #[test]
-    fn put_aligned_v3_256_aligned_roundtrip() {
+    fn put_v3_256_aligned_roundtrip() {
+        // Every V3 record is a 256-byte multiple with the data at a fixed
+        // header offset, so plain `put` yields absolutely 256-aligned
+        // (GPU-aliasable) data in a pure-V3 pile.
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "v3.pile");
         // Sizes around the 64/256 boundaries to exercise the post-pad.
@@ -1615,7 +1607,7 @@ mod tests {
             for &sz in &sizes {
                 let data: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
                 let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
-                let h = pile.put_aligned::<UnknownBlob, _>(blob).unwrap();
+                let h = pile.put::<UnknownBlob, _>(blob).unwrap();
                 let hash: Inline<Hash<Blake3>> = h.into();
                 hashes.push(hash);
                 datas.push(data);
@@ -1745,41 +1737,6 @@ mod tests {
         pile.close().unwrap();
     }
 
-    #[test]
-    fn put_aligned_and_put_interleave() {
-        // Interleaving put + put_aligned (both write V3 now): every record is
-        // 256-aligned and reads back correctly after a fresh scan.
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "mix.pile");
-        let mut entries: Vec<(Inline<Hash<Blake3>>, Vec<u8>, bool)> = Vec::new();
-        {
-            let mut pile: Pile = Pile::open(&path).unwrap();
-            for i in 0..20usize {
-                let d1: Vec<u8> = (0..13 + i * 37).map(|j| ((j + i) % 251) as u8).collect();
-                let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
-                let h1: Inline<Hash<Blake3>> = pile.put::<UnknownBlob, _>(b1).unwrap().into();
-                entries.push((h1, d1, false));
-                let d2: Vec<u8> = (0..17 + i * 53).map(|j| ((j * 3 + i) % 251) as u8).collect();
-                let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
-                let h2: Inline<Hash<Blake3>> = pile.put_aligned::<UnknownBlob, _>(b2).unwrap().into();
-                entries.push((h2, d2, true));
-            }
-            pile.close().unwrap();
-        }
-        let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
-        for (hash, expected, via_aligned) in &entries {
-            let e = pile.blobs.get(&hash.raw).expect("blob missing after reopen").clone();
-            if *via_aligned {
-                assert_eq!(e.offset % GPU_DATA_ALIGNMENT, 0, "V3 record not aligned");
-            }
-            let got = unsafe {
-                std::slice::from_raw_parts(pile.mmap.as_ptr().add(e.offset), e.len as usize)
-            };
-            assert_eq!(got, &expected[..], "mismatch (aligned={via_aligned}, size {})", expected.len());
-        }
-        pile.close().unwrap();
-    }
 
     #[test]
     fn recover_shrink() {

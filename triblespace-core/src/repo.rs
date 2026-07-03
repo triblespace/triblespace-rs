@@ -382,21 +382,6 @@ pub trait BlobStorePut {
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
         Handle<S>: InlineEncoding;
-
-    /// Like [`put`](Self::put), but requests the blob's data be stored so it can
-    /// be bound directly as a GPU storage buffer (bytes aligned for zero-copy
-    /// aliasing). Stores with no such notion (in-memory, etc.) fall back to a
-    /// normal `put`; on-disk piles write a 256-aligned (V2) record. Use only for
-    /// blobs that will actually be GPU-aliased — it costs a few hundred bytes of
-    /// padding per blob.
-    fn put_aligned<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
-    where
-        S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        self.put(item)
-    }
 }
 
 /// Combined read/write blob storage.
