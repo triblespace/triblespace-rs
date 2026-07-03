@@ -50,7 +50,7 @@
 //! document-frequency roll-up across segments at query time; that is a
 //! deliberate follow-up, not done here.
 //!
-//! [`query_across`]: Bm25Rollup::query_across
+//! [`query_across`]: crate::index_bm25::query_across
 //! [`merge`]: IndexKind::merge
 
 use std::collections::{HashMap, HashSet};

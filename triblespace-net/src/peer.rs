@@ -33,7 +33,7 @@
 //!
 //! Branch-state discovery is gossip-driven: HEAD updates for the
 //! team's branches flood the team topic and arrive via the
-//! [`NetEvent`] channel; the network thread autonomously walks
+//! `NetEvent` channel; the network thread autonomously walks
 //! reachable closures via DHT-routed blob fetches. There are no
 //! peer-targeted RPCs on the public surface — peers serve content
 //! but don't get asked "what branches do you have." That question
@@ -697,8 +697,8 @@ where
     /// 1. **Redispatch undelivered entries.** For each renewal-policy
     ///    entry that's not yet been ack'd by its subject, re-send the
     ///    same `(latest_cap, latest_sig)` blobs via
-    ///    [`crate::channel::NetCommand::DeliverCap`], rate-limited per
-    ///    entry by [`Self::UNDELIVERED_REDISPATCH_COOLDOWN`]. This is
+    ///    `crate::channel::NetCommand::DeliverCap`, rate-limited per
+    ///    entry by `Self::UNDELIVERED_REDISPATCH_COOLDOWN`. This is
     ///    what catches the case where the initial `team approve`
     ///    delivery failed (subject offline) and the subject comes back
     ///    later.

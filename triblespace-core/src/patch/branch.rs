@@ -19,7 +19,7 @@ const TABLE_ENTRY_SIZE: usize = 8;
 
 /// Marker trait for opaque owners of bytes referenced by archive-backed
 /// PATCH nodes. An `Option<Arc<dyn ArchiveOwner>>` lives on each
-/// [`Branch`]; when `Some(arc)`, the Arc keeps the underlying bytes
+/// `Branch`; when `Some(arc)`, the Arc keeps the underlying bytes
 /// (typically a memory-mapped archive blob) alive so that any
 /// `LocalLeaf` children — which are thin pointers into those bytes —
 /// remain valid for the Branch's lifetime. The trait is intentionally

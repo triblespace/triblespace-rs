@@ -229,7 +229,7 @@ impl<T: BlobEncoding> Debug for Blob<T> {
 }
 
 /// A trait for defining the abstract schema type of a blob.
-/// This is similar to the [`InlineEncoding`] trait in the [`value`](crate::value) module.
+/// This is similar to the [`InlineEncoding`] trait in the [`inline`](crate::inline) module.
 pub trait BlobEncoding: MetaDescribe + Sized + 'static {
     /// Converts a concrete Rust type to a blob with this schema via [`IntoBlob`].
     fn blob_from<T: IntoBlob<Self>>(t: T) -> Blob<Self> {
@@ -307,7 +307,7 @@ impl<S: BlobEncoding> TryFromBlob<S> for Blob<S> {
     }
 }
 
-/// `Blob<S>` is the identity source for [`IntoEncoded<S>`] in the
+/// `Blob<S>` is the identity source for [`IntoEncoded<S>`](crate::inline::IntoEncoded) in the
 /// blob path: it converts to itself with no allocation, and the
 /// cached handle inside lets every downstream step skip rehashing.
 impl<S: BlobEncoding> crate::inline::Encodes<Blob<S>> for S

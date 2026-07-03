@@ -1,10 +1,10 @@
 //! Generational collection of piles for lazy-retention blob storage.
 //!
-//! A [`Yard`] keeps an ordered young-to-old sequence of [`Pile`](super::pile::Pile)
+//! A [`Yard`](crate::repo::yard::Yard) keeps an ordered young-to-old sequence of [`Pile`](crate::repo::pile::Pile)
 //! generations. Writes land in the youngest generation, reads search the union
 //! of each generation's live PATCH set, and retention/compaction update those
 //! PATCH sets without changing Pile's append-only storage contract. Call
-//! [`Yard::reclaim`] after collection when the logically evicted blobs should
+//! [`Yard::reclaim`](crate::repo::yard::Yard::reclaim) after collection when the logically evicted blobs should
 //! also be physically removed from disk.
 
 use std::cmp::Reverse;

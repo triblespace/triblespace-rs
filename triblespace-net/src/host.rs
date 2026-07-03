@@ -295,8 +295,8 @@ impl<T: Transport> NetCapability for NetCap<T> {
 /// Default overall budget for an **interactive** on-demand blob fetch
 /// (a lazy read a caller is actively waiting on). Bounds the WHOLE
 /// resolution — capability readiness, DHT lookup, every per-provider
-/// dial + op — where the per-stage deadlines alone ([`DIAL_DEADLINE`],
-/// [`OP_DEADLINE`]) could stack up to 40s+ across a provider list.
+/// dial + op — where the per-stage deadlines alone (`DIAL_DEADLINE`,
+/// `OP_DEADLINE`) could stack up to 40s+ across a provider list.
 /// Background work (the want-reconciler) passes its own, more generous
 /// budget; the want stays durably recorded either way, so an expired
 /// budget only defers the fetch, never loses the demand.

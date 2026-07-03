@@ -3,22 +3,22 @@
 //! Every time read that can influence persisted facts or protocol
 //! behavior goes through this module
 //! instead of `std::time::Instant::now()` / `hifitime::Epoch::now()`.
-//! In production the default [`Source::Real`] is a thin shim over
-//! those. Under simulation, [`install_virtual`] swaps in a
-//! [`VirtualClock`] that only moves when the simulator's
+//! In production the default real source is a thin shim over
+//! those. Under simulation, [`install_virtual`](crate::clock::install_virtual) swaps in a
+//! [`VirtualClock`](crate::clock::VirtualClock) that only moves when the simulator's
 //! discrete-event scheduler advances it — so cooldown expiry, renewal
 //! windows, and rebroadcast ticks become deterministic functions of
 //! the event schedule rather than of wall time.
 //!
 //! Two kinds of time, deliberately distinct:
 //!
-//! - [`mono_now`] → [`Mono`]: monotonic nanoseconds since an arbitrary
+//! - [`mono_now`](crate::clock::mono_now) → [`Mono`](crate::clock::Mono): monotonic nanoseconds since an arbitrary
 //!   per-process origin. Replaces `std::time::Instant` for durations
 //!   and timeouts (redispatch cooldowns, quiescence tracking, the
 //!   gossip rebroadcast period). `Mono` is plain data (`u64` ns) so it
 //!   can cross thread and serialization boundaries freely, which
 //!   `Instant` cannot.
-//! - [`epoch_now`] → `hifitime::Epoch`: wall-clock TAI time. Used
+//! - [`epoch_now`](crate::clock::epoch_now) → `hifitime::Epoch`: wall-clock TAI time. Used
 //!   where the *absolute* date matters and ends up in persisted facts:
 //!   cap expiry checks, renewal-policy timestamps, retraction marks.
 //!

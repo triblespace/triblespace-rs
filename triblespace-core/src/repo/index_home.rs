@@ -4,7 +4,7 @@
 //!
 //! # The problem
 //!
-//! Derived indexes (a [`SuccinctArchive`] rollup, a BM25 term index, an
+//! Derived indexes (a [`SuccinctArchive`](crate::blob::encodings::succinctarchive::SuccinctArchive) rollup, a BM25 term index, an
 //! HNSW vector graph) go stale when the source branch changes, and a
 //! *monolithic* index over the whole branch is too expensive to rebuild
 //! on every commit. The current [`Repository::compute_rollup`] pays the
@@ -29,7 +29,7 @@
 //! - **Read** — one branch-head lookup to the tribleset, select this
 //!   kind's manifest subset via `pattern!`, then union-query the
 //!   referenced segments (bounded fan-out). No commit walk, no checkout.
-//! - **Maintain** — [`IndexHome::update_index`] appends a small new
+//! - **Maintain** — [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index) appends a small new
 //!   segment (cheap) and runs a size-tiered merge to bound fan-out; a new
 //!   branch-head-tribleset version carries the rewritten manifest and the
 //!   superseded segments become orphans for GC.
@@ -67,8 +67,8 @@
 //! 3. **Ephemeral / soft-state.** The manifest is redundant with (and
 //!    re-derivable from) the commit chain; a `push` that rebuilds the
 //!    branch metadata simply drops it, exactly as it drops the `rollup`
-//!    attribute today, and [`IndexHome::update_index`] rebuilds it. Each
-//!    segment entity is tagged with its kind id ([`seg_kind`]), so two
+//!    attribute today, and [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index) rebuilds it. Each
+//!    segment entity is tagged with its kind id ([`seg_kind`](crate::repo::index_home::seg_kind)), so two
 //!    kinds over the same branch keep independent manifests in the one
 //!    tribleset. The existing single-blob `rollup` branch-metadata
 //!    attribute is the monolithic predecessor of this design; the
@@ -83,13 +83,13 @@
 //! shape applied to *indexes*: the manifest is the generation list, the
 //! segments are the generations, and GC is Yard's reclaim. We reuse the
 //! store's reachability GC directly and mirror the size-tiered tenuring
-//! policy in [`IndexHome::update_index`].
+//! policy in [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index).
 //!
 //! # Maintenance triggers
 //!
-//! Two entry points share one implementation ([`append_segment`]):
+//! Two entry points share one implementation ([`append_segment`](crate::repo::index_home::append_segment)):
 //!
-//! - **Explicit** — [`IndexHome::update_index`]: build a segment from a
+//! - **Explicit** — [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index): build a segment from a
 //!   caller-supplied delta and CAS the branch pin yourself.
 //! - **On commit** — [`Repository::register_index`]
 //!   (or the general [`Repository::on_commit`]): a hook runs inside the
@@ -103,7 +103,7 @@
 //!
 //! # Seams left for follow-up work
 //!
-//! - **GPU merge.** [`IndexKind::merge`] is CPU today (union-then-rebuild
+//! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (union-then-rebuild
 //!   for the SuccinctArchive rollup). The GPU-accelerated succinct merge
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.

@@ -1,6 +1,6 @@
 //! Async store traits — the honest contract for *remote* backends.
 //!
-//! The sync [`BlobStore`](crate::repo::BlobStore) family is the right
+//! The sync [`BlobStore`] family is the right
 //! contract for *local* backends: `MemoryBlobStore` and a
 //! `Pile`-over-mmap are genuinely synchronous, and a sync `get` that
 //! returns a `Result` is the truth. But genuinely *remote* backends —
@@ -17,7 +17,7 @@
 //! trait, so the returned futures carry a `Send` bound.
 //!
 //! Two adapters bridge the worlds:
-//! - [`SyncAsAsync`] lifts any sync store into the async traits via
+//! - [`SyncAsAsync`](crate::repo::async_store::SyncAsAsync) lifts any sync store into the async traits via
 //!   zero-await futures — so an async consumer can read a local store
 //!   for free, with no runtime and no blocking (the futures resolve on
 //!   first poll).
@@ -43,7 +43,7 @@ use crate::repo::{
 #[cfg(feature = "object-store")]
 use crate::repo::{BlobChildren, StorageClose};
 
-/// Async counterpart of [`BlobStoreGet`](crate::repo::BlobStoreGet).
+/// Async counterpart of [`BlobStoreGet`].
 ///
 /// `get` returns a `Send` future so it can be driven on a multi-thread
 /// runtime. The output `T` need not be `Send` — it is produced at
@@ -73,7 +73,7 @@ pub trait AsyncBlobStoreGet {
         Handle<S>: InlineEncoding;
 }
 
-/// Async counterpart of [`BlobStorePut`](crate::repo::BlobStorePut).
+/// Async counterpart of [`BlobStorePut`].
 ///
 /// Bounds mirror the sync `put` exactly (no `T: Send`). Impls must
 /// serialise `item` to bytes *before* the first await and carry only
@@ -96,7 +96,7 @@ pub trait AsyncBlobStorePut {
         Handle<S>: InlineEncoding;
 }
 
-/// Async counterpart of [`BlobStoreList`](crate::repo::BlobStoreList).
+/// Async counterpart of [`BlobStoreList`].
 ///
 /// Returns the listing eagerly as a `Vec` rather than a `Stream` — that
 /// keeps the trait dependency-free (only `std::future`) and is fine for
@@ -112,7 +112,7 @@ pub trait AsyncBlobStoreList {
     ) -> impl Future<Output = Vec<Result<Inline<Handle<UnknownBlob>>, Self::Err>>> + Send;
 }
 
-/// Async counterpart of [`BlobStore`](crate::repo::BlobStore): combined
+/// Async counterpart of [`BlobStore`]: combined
 /// read/write with a shareable reader snapshot.
 pub trait AsyncBlobStore: AsyncBlobStorePut {
     /// A clonable async reader handle for concurrent blob lookups.
@@ -135,7 +135,7 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
     ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
 }
 
-/// Async counterpart of [`PinStore`](crate::repo::PinStore): named,
+/// Async counterpart of [`PinStore`]: named,
 /// atomically-updatable handles to `SimpleArchive` blobs.
 pub trait AsyncPinStore {
     /// Error type for listing pins.
@@ -166,7 +166,7 @@ pub trait AsyncPinStore {
     ) -> impl Future<Output = Result<PushResult, Self::UpdateError>> + Send;
 }
 
-/// Async counterpart of [`BlobStoreMeta`](crate::repo::BlobStoreMeta).
+/// Async counterpart of [`BlobStoreMeta`].
 pub trait AsyncBlobStoreMeta {
     /// Error type for metadata calls.
     type MetaError: Error + Send + Sync + 'static;
@@ -181,7 +181,7 @@ pub trait AsyncBlobStoreMeta {
         Handle<S>: InlineEncoding;
 }
 
-/// Async counterpart of [`BlobStoreForget`](crate::repo::BlobStoreForget).
+/// Async counterpart of [`BlobStoreForget`].
 pub trait AsyncBlobStoreForget {
     /// Error type for forget operations.
     type ForgetError: Error + Send + Sync + 'static;

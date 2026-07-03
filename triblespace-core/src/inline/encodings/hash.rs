@@ -23,7 +23,7 @@ use std::marker::PhantomData;
 /// triblespace's *storage* layer (handles, blob stores, piles) is
 /// fixed to [`Blake3`] — that's the content-addressing hash that
 /// produces every [`Handle<T>`]. This trait stays generic so
-/// [`Hash<H>`] can carry digests produced by *other* hash functions
+/// [`Hash<H>`](struct@Hash) can carry digests produced by *other* hash functions
 /// (e.g. an external system's SHA-256 fingerprints) alongside
 /// Blake3 in the same store, distinguished by their schema type at
 /// the value layer. Only the storage-side parameter went away; the
@@ -37,10 +37,10 @@ pub trait HashProtocol: Sized + 'static + MetaDescribe {
 }
 
 /// Blake3 hash protocol — the canonical content-addressing hash
-/// for triblespace blob storage. The [`MemoryBlobStore`], [`Pile`],
+/// for triblespace blob storage. The [`MemoryBlobStore`](crate::blob::MemoryBlobStore), [`Pile`](crate::repo::pile::Pile),
 /// and [`Handle`] types are all implicitly Blake3-backed.
 ///
-/// Implements [`HashProtocol`] so [`Hash<Blake3>`] is also a valid
+/// Implements [`HashProtocol`] so [`Hash<Blake3>`](struct@Hash) is also a valid
 /// "blake3 digest" inline encoding, parallel to hypothetical
 /// `Hash<Sha256>` etc. for foreign-hash fingerprints.
 pub struct Blake3 {
@@ -104,7 +104,7 @@ impl HashProtocol for Blake3 {
 /// digests, hypothetical `Hash<Sha256>` for foreign 256-bit
 /// fingerprints carried alongside. This stays parametric so a store
 /// can hold both kinds of digests with type-level distinction; only
-/// the storage-side wiring ([`Handle`], [`MemoryBlobStore`], piles)
+/// the storage-side wiring ([`Handle`], [`MemoryBlobStore`](crate::blob::MemoryBlobStore), piles)
 /// is fixed to Blake3.
 ///
 /// See the [crate::id] module documentation for a discussion on the

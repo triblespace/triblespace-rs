@@ -851,7 +851,7 @@ impl SuccinctHNSWIndex {
     /// [`anybytes::ByteArea`], the [`SuccinctHNSWMeta`] header
     /// sits as a typed suffix-section, and the area is frozen
     /// exactly once. The resulting `bytes: Bytes` field is the
-    /// blob — [`IntoBlob`] is then an `O(1)` refcounted clone.
+    /// blob — [`IntoBlob`](triblespace_core::blob::IntoBlob) is then an `O(1)` refcounted clone.
     pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
         let n = idx.doc_count();
         let dim = idx.dim();
@@ -1433,7 +1433,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// shared [`ByteArea`], the [`SuccinctBM25Meta`] header is
     /// appended as a typed suffix-section, and the area is
     /// frozen exactly once. The resulting `bytes` field is the
-    /// blob — [`IntoBlob`] is then an O(1) refcounted clone.
+    /// blob — [`IntoBlob`](triblespace_core::blob::IntoBlob) is then an O(1) refcounted clone.
     /// Mirrors the `SuccinctArchive` shape (the index *is* its
     /// blob).
     ///
@@ -1728,7 +1728,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// of a term (hence its document frequency) and every document's
     /// *length* are stored losslessly and reproduced exactly; only the
     /// per-posting term frequency is inferred from the u16-quantised
-    /// score via [`recover_tf`], so it is exact in the common small-tf
+    /// score via `recover_tf`, so it is exact in the common small-tf
     /// regime and approximate in the saturated tail. A BM25 index
     /// rebuilt from the union of several segments' reconstructions
     /// therefore has exact global document frequencies and lengths and
@@ -1802,7 +1802,7 @@ impl std::error::Error for SuccinctLoadError {}
 /// section (keys, doc_lens, terms, postings) lives in one
 /// shared [`anybytes::ByteArea`] and the [`SuccinctBM25Meta`]
 /// header sits at the suffix. The index *is* its blob, so
-/// [`IntoBlob`] is an `O(1)` refcounted clone.
+/// [`IntoBlob`](triblespace_core::blob::IntoBlob) is an `O(1)` refcounted clone.
 ///
 /// Schema id minted fresh via `trible genid`:
 /// `DA527A8FF09A3709B2AC6425CD5AF7A8`. Any breaking layout
@@ -1874,7 +1874,7 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob> for Suc
 /// HNSW blob format — canonical-bytes layout where handles +
 /// graph live in one shared [`anybytes::ByteArea`] and the
 /// [`SuccinctHNSWMeta`] header sits at the suffix. The index
-/// *is* its blob, so [`IntoBlob`] is an `O(1)` refcounted clone.
+/// *is* its blob, so [`IntoBlob`](triblespace_core::blob::IntoBlob) is an `O(1)` refcounted clone.
 /// Embeddings themselves still live as separate blobs in the
 /// pile, referenced by handle.
 ///

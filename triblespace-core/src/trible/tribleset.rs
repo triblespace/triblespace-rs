@@ -101,7 +101,7 @@ impl TribleSet {
     /// in place.
     ///
     /// With the `parallel` feature enabled and `other` above
-    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index unions
+    /// `PARALLEL_UNION_THRESHOLD` tribles, the six index unions
     /// (`eav`/`eva`/`aev`/`ave`/`vea`/`vae`) fan out via nested
     /// [`rayon::join`] — they touch disjoint memory so there's no
     /// contention. The threshold gates on `other.len()` because PATCH
@@ -162,7 +162,7 @@ impl TribleSet {
     /// Returns a new set containing only tribles present in both sets.
     ///
     /// With the `parallel` feature enabled and either side above
-    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index intersects
+    /// `PARALLEL_UNION_THRESHOLD` tribles, the six index intersects
     /// fan out via nested [`rayon::join`] on the same disjoint-memory
     /// property as `union`. Threshold gates on `min(self, other)`
     /// because intersect work is bounded by the smaller side.
@@ -217,7 +217,7 @@ impl TribleSet {
     /// Returns a new set containing tribles in `self` but not in `other`.
     ///
     /// With the `parallel` feature enabled and `self` above
-    /// [`PARALLEL_UNION_THRESHOLD`] tribles, the six index differences
+    /// `PARALLEL_UNION_THRESHOLD` tribles, the six index differences
     /// fan out via nested [`rayon::join`]. Threshold gates on
     /// `self.len()` because difference work is bounded by the left
     /// side (each key from `self` is either kept or filtered).

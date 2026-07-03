@@ -7,8 +7,8 @@
 //! with `metadata::value_encoding: <schema id>`). The attribute is the
 //! *abstract shared thing* multiple parties agree on; codebase-local
 //! annotations (the rust identifier, source location, doc comment)
-//! are emitted at the [`attributes!`] call site as usage facts —
-//! there is no [`AttributeUsage`] type, the macro inlines them.
+//! are emitted at the [`attributes!`](crate::macros::attributes) call site as usage facts —
+//! there is no `AttributeUsage` type, the macro inlines them.
 //!
 //! Construct via [`From<Fragment>`]:
 //!
@@ -132,12 +132,12 @@ impl<S: InlineEncoding> Attribute<S> {
 ///
 /// The fragment's `root()` is the attribute id; its facts (typically
 /// `metadata::iri | metadata::name` together with
-/// `metadata::value_encoding`) are carried through to [`Describe`] so the
+/// `metadata::value_encoding`) are carried through to [`Describe`](crate::metadata::Describe) so the
 /// attribute remains queryable in the metadata registry by its
 /// originating identity attribute.
 ///
 /// Pinning a schema's attribute ids (so local renames don't churn the
-/// schema) is what the [`attributes!`] macro is for — declare them with
+/// schema) is what the [`attributes!`](crate::macros::attributes) macro is for — declare them with
 /// explicit hex literals there.
 impl<S: InlineEncoding> From<Fragment> for Attribute<S> {
     fn from(fragment: Fragment) -> Self {
