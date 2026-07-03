@@ -1208,7 +1208,7 @@ mod tests {
             }
         }
 
-        fn keep(attr: Id) -> impl FnMut(&TribleSet) -> TribleSet + Send + 'static {
+        fn keep(attr: Id) -> impl FnMut(&TribleSet) -> TribleSet + Send + Sync + 'static {
             move |delta: &TribleSet| {
                 let mut out = TribleSet::new();
                 for t in delta.iter().filter(|t| *t.a() == attr) {

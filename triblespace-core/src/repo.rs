@@ -985,7 +985,8 @@ pub type CommitHook<Storage> = Box<
             &TribleSet,
             &mut TribleSet,
         ) -> Result<(), Box<dyn Error + Send + Sync>>
-        + Send,
+        + Send
+        + Sync,
 >;
 
 /// A hook failure recorded (and skipped) during a push. Drained via
@@ -1112,6 +1113,7 @@ where
                 &mut TribleSet,
             ) -> Result<(), Box<dyn Error + Send + Sync>>
             + Send
+            + Sync
             + 'static,
     {
         self.hooks.push(Box::new(hook));
@@ -1128,7 +1130,7 @@ where
     /// [`register_index_filtered`](Self::register_index_filtered).
     pub fn register_index<K>(&mut self, kind: K)
     where
-        K: index_home::IndexKind + Send + 'static,
+        K: index_home::IndexKind + Send + Sync + 'static,
     {
         self.register_index_filtered(kind, |delta: &TribleSet| delta.clone());
     }
@@ -1140,8 +1142,8 @@ where
     /// appends no segment at all.
     pub fn register_index_filtered<K, F>(&mut self, kind: K, mut filter: F)
     where
-        K: index_home::IndexKind + Send + 'static,
-        F: FnMut(&TribleSet) -> TribleSet + Send + 'static,
+        K: index_home::IndexKind + Send + Sync + 'static,
+        F: FnMut(&TribleSet) -> TribleSet + Send + Sync + 'static,
     {
         self.on_commit(move |storage, _branch, delta, head_meta| {
             let source = filter(delta);
