@@ -101,6 +101,14 @@
 //! [`Repository::register_index`]: crate::repo::Repository::register_index
 //! [`Repository::on_commit`]: crate::repo::Repository::on_commit
 //!
+//! # Example
+//!
+//! `examples/index_home.rs` (`cargo run --example index_home` from the
+//! workspace root) shows the whole loop against a temp pile:
+//! `register_index` once, plain commits after, then a
+//! query-without-checkout via [`IndexHome::attach_all`](crate::repo::index_home::IndexHome::attach_all)
+//! and a union query over the attached segments.
+//!
 //! # Seams left for follow-up work
 //!
 //! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (union-then-rebuild
