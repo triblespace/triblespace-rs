@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Yard` no longer auto-repairs generation piles (fail-loud, matching
+  `Pile`).** `Yard::open` used to call `Pile::restore()` on every generation
+  pile, silently truncating a corrupt tail on open; reclaim-recovery paths
+  swallowed restore failures entirely. `Yard::open` now loads each generation
+  with the non-mutating `Pile::refresh()` and fails loud with
+  `YardOpenError::Pile { path, err }` naming the corrupt generation file;
+  nothing is truncated. Repair is an explicit opt-in via the new
+  `Yard::restore(paths, config)` constructor (mirroring
+  `Pile::refresh`/`Pile::restore`). Rewrite (`reclaim`/`compact`) recovery
+  reopens the generation without repair and propagates a double failure as
+  the new `YardReclaimError::Reopen { path, primary, err }` instead of
+  silently leaving the segment closed.
 - **Want-record failures are errors, and wants are flushed durable.**
   `Peer::get_or_fetch_async` now returns
   `Result<Option<Bytes>, WantRecordError>` — a pin/flush failure while

@@ -177,8 +177,10 @@ impl Yard {
         for path in paths {
             let path = path.as_ref().to_path_buf();
             File::create(&path).map_err(YardOpenError::Io)?;
-            let mut pile = Pile::open(&path).map_err(YardOpenError::Pile)?;
-            pile.restore().map_err(YardOpenError::Pile)?;
+            let pile = Pile::open(&path).map_err(|err| YardOpenError::Pile {
+                path: path.clone(),
+                err,
+            })?;
             generations.push(Generation::one(Segment {
                 path,
                 pile: Some(pile),
@@ -198,6 +200,11 @@ impl Yard {
 
     /// Open an existing yard and treat all blobs in each pile as live.
     ///
+    /// Fails loud on corruption: a generation pile with an invalid tail
+    /// surfaces as [`YardOpenError::Pile`] naming the file, and **nothing is
+    /// truncated**. Repair is an explicit opt-in via [`Yard::restore`]
+    /// (mirroring [`Pile::refresh`] vs [`Pile::restore`]).
+    ///
     /// The weak-pin state is rebuilt from the durable weak-pin markers found
     /// in the generation piles (old to young, so the young generation's
     /// markers override older ones), fixing the restart amnesia the previous
@@ -209,12 +216,53 @@ impl Yard {
     where
         P: AsRef<Path>,
     {
+        Self::open_impl(paths, config, false)
+    }
+
+    /// Open an existing yard, **repairing** each generation pile first:
+    /// any invalid tail (for example a torn write left by a crash) is
+    /// truncated back to the last valid record, exactly like
+    /// [`Pile::restore`]. This is the explicit opt-in counterpart to the
+    /// fail-loud [`Yard::open`] — reach for it only after `open` reported
+    /// corruption and losing the invalid tail is acceptable.
+    pub fn restore<P>(
+        paths: impl IntoIterator<Item = P>,
+        config: YardConfig,
+    ) -> Result<Self, YardOpenError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_impl(paths, config, true)
+    }
+
+    fn open_impl<P>(
+        paths: impl IntoIterator<Item = P>,
+        config: YardConfig,
+        repair: bool,
+    ) -> Result<Self, YardOpenError>
+    where
+        P: AsRef<Path>,
+    {
         let mut generations = Vec::new();
         for path in paths {
             let path = path.as_ref().to_path_buf();
-            let mut pile = Pile::open(&path).map_err(YardOpenError::Pile)?;
-            pile.restore().map_err(YardOpenError::Pile)?;
-            let reader = pile.reader().map_err(YardOpenError::Pile)?;
+            let mut pile = Pile::open(&path).map_err(|err| YardOpenError::Pile {
+                path: path.clone(),
+                err,
+            })?;
+            let load = if repair {
+                pile.restore()
+            } else {
+                pile.refresh()
+            };
+            load.map_err(|err| YardOpenError::Pile {
+                path: path.clone(),
+                err,
+            })?;
+            let reader = pile.reader().map_err(|err| YardOpenError::Pile {
+                path: path.clone(),
+                err,
+            })?;
             let live = collect_list(reader.blobs()).map_err(YardOpenError::List)?;
             generations.push(Generation::one(Segment {
                 path,
@@ -412,24 +460,8 @@ impl Yard {
         // recycle its segment in place (crash-safe write-empty + atomic rename)
         // rather than leaving dead bytes for a separate reclaim() pass.
         for level in dumped {
-            let path = self.generations[level].segments[0].path.clone();
-            let temp_path = reclaim_temp_path(&path, level);
-            let live = self.generations[level].segments[0].live.clone();
-            let pile = self.generations[level].segments[0]
-                .pile
-                .take()
-                .expect("yard segment pile already closed");
-            match reclaim_generation(&path, &temp_path, &live, pile) {
-                Ok(pile) => self.generations[level].segments[0].pile = Some(pile),
-                Err(err) => {
-                    if let Ok(mut pile) = Pile::open(&path) {
-                        if pile.restore().is_ok() {
-                            self.generations[level].segments[0].pile = Some(pile);
-                        }
-                    }
-                    return Err(YardCollectError::Reclaim(err));
-                }
-            }
+            self.reclaim_segment(level, 0)
+                .map_err(YardCollectError::Reclaim)?;
             // The rewrite dropped the young pile's weak-pin markers along
             // with its dead bytes; re-record the surviving weak set.
             if level == 0 {
@@ -453,26 +485,7 @@ impl Yard {
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         for level in 0..self.generations.len() {
             for index in 0..self.generations[level].segments.len() {
-                let segment = &mut self.generations[level].segments[index];
-                let path = segment.path.clone();
-                let temp_path = reclaim_temp_path(&path, level);
-                let live = segment.live.clone();
-                let pile = segment
-                    .pile
-                    .take()
-                    .expect("yard segment pile already closed");
-
-                match reclaim_generation(&path, &temp_path, &live, pile) {
-                    Ok(pile) => self.generations[level].segments[index].pile = Some(pile),
-                    Err(err) => {
-                        if let Ok(mut pile) = Pile::open(&path) {
-                            if pile.restore().is_ok() {
-                                self.generations[level].segments[index].pile = Some(pile);
-                            }
-                        }
-                        return Err(err);
-                    }
-                }
+                self.reclaim_segment(level, index)?;
             }
             // The rewrite dropped the young pile's weak-pin markers along
             // with its dead bytes; re-record the surviving weak set so the
@@ -483,6 +496,48 @@ impl Yard {
             }
         }
         Ok(())
+    }
+
+    /// Rewrite the segment at `(level, index)` down to its live set via
+    /// [`reclaim_generation`]. If the rewrite fails, reopen the generation
+    /// file as-is (fail-loud: [`Pile::refresh`], no repair, no truncation)
+    /// so the yard stays usable and the rewrite error propagates. If even
+    /// the reopen fails — for example the file is corrupt — both errors
+    /// propagate together via [`YardReclaimError::Reopen`] and the segment
+    /// is left closed.
+    fn reclaim_segment(&mut self, level: usize, index: usize) -> Result<(), YardReclaimError> {
+        let segment = &mut self.generations[level].segments[index];
+        let path = segment.path.clone();
+        let temp_path = reclaim_temp_path(&path, level);
+        let live = segment.live.clone();
+        let pile = segment
+            .pile
+            .take()
+            .expect("yard segment pile already closed");
+
+        match reclaim_generation(&path, &temp_path, &live, pile) {
+            Ok(pile) => {
+                self.generations[level].segments[index].pile = Some(pile);
+                Ok(())
+            }
+            Err(primary) => {
+                let reopen = Pile::open(&path).and_then(|mut pile| {
+                    pile.refresh()?;
+                    Ok(pile)
+                });
+                match reopen {
+                    Ok(pile) => {
+                        self.generations[level].segments[index].pile = Some(pile);
+                        Err(primary)
+                    }
+                    Err(err) => Err(YardReclaimError::Reopen {
+                        path,
+                        primary: Box::new(primary),
+                        err,
+                    }),
+                }
+            }
+        }
     }
 
     fn strong_budget_for(&self, level: usize) -> usize {
@@ -939,7 +994,9 @@ fn reclaim_generation(
     fs::rename(temp_path, path).map_err(YardReclaimError::Io)?;
 
     let mut reopened = Pile::open(path).map_err(YardReclaimError::Pile)?;
-    reopened.restore().map_err(YardReclaimError::Pile)?;
+    // The rewritten pile was just written and closed by us; fail loud on
+    // any validation error rather than repair-truncating it.
+    reopened.refresh().map_err(YardReclaimError::Pile)?;
     Ok(reopened)
 }
 
@@ -958,7 +1015,16 @@ fn reclaim_temp_path(path: &Path, level: usize) -> PathBuf {
 pub enum YardOpenError {
     NoGenerations,
     Io(std::io::Error),
-    Pile(ReadError),
+    /// A generation pile failed to open or validate. A
+    /// [`ReadError::CorruptPile`] here means the named generation file has
+    /// an invalid tail; nothing was truncated — repair explicitly with
+    /// [`Yard::restore`] if losing the tail is acceptable.
+    Pile {
+        /// The generation pile file that failed.
+        path: PathBuf,
+        /// The underlying pile error.
+        err: ReadError,
+    },
     List(GetBlobError<Infallible>),
 }
 
@@ -967,7 +1033,9 @@ impl fmt::Display for YardOpenError {
         match self {
             Self::NoGenerations => write!(f, "yard requires at least one generation"),
             Self::Io(err) => write!(f, "failed to create yard pile file: {err}"),
-            Self::Pile(err) => write!(f, "failed to open yard pile: {err}"),
+            Self::Pile { path, err } => {
+                write!(f, "failed to open yard generation pile {}: {err}", path.display())
+            }
             Self::List(err) => write!(f, "failed to list yard pile: {err}"),
         }
     }
@@ -1056,6 +1124,17 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     Close(super::pile::FlushError),
     WeakMarkers(std::io::Error),
+    /// A generation rewrite failed (`primary`) and the subsequent
+    /// fail-loud reopen of the generation file also failed (`err`). The
+    /// segment is left closed; nothing was truncated.
+    Reopen {
+        /// The generation pile file that could not be reopened.
+        path: PathBuf,
+        /// The rewrite error that triggered the reopen.
+        primary: Box<YardReclaimError>,
+        /// The reopen/validation error.
+        err: ReadError,
+    },
 }
 
 impl fmt::Display for YardReclaimError {
@@ -1068,6 +1147,11 @@ impl fmt::Display for YardReclaimError {
             Self::WeakMarkers(err) => {
                 write!(f, "failed to re-record weak-pin markers: {err}")
             }
+            Self::Reopen { path, primary, err } => write!(
+                f,
+                "failed to reopen yard generation pile {} after failed rewrite ({primary}): {err}",
+                path.display()
+            ),
         }
     }
 }
@@ -1114,7 +1198,7 @@ mod tests {
 
     fn pile_blob_count(path: &Path) -> usize {
         let mut pile = Pile::open(path).unwrap();
-        pile.restore().unwrap();
+        pile.refresh().unwrap();
         let reader = pile.reader().unwrap();
         let count = reader.blobs().collect::<Result<Vec<_>, _>>().unwrap().len();
         drop(reader);
@@ -1352,7 +1436,7 @@ mod tests {
         ));
 
         let mut fresh_pile = Pile::open(&paths[0]).unwrap();
-        fresh_pile.restore().unwrap();
+        fresh_pile.refresh().unwrap();
         let fresh_reader = fresh_pile.reader().unwrap();
         assert_eq!(
             fresh_reader.get::<Bytes, RawBytes>(live).unwrap(),
@@ -1450,6 +1534,54 @@ mod tests {
         );
         let reader = reopened.reader().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
+    }
+
+    /// The fail-loud posture: opening a yard whose generation pile has a
+    /// corrupt tail must surface the corruption (naming the file) WITHOUT
+    /// truncating anything; `Yard::restore` is the explicit opt-in repair.
+    #[test]
+    fn open_fails_loud_on_corrupt_generation_without_truncating() {
+        use std::io::Write;
+
+        let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
+        let live = yard.put::<RawBytes, _>(raw_blob(b"survivor")).unwrap();
+        drop(yard); // closes (and flushes) the generation pile
+
+        // Corrupt the tail: append garbage that is not a valid record.
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&paths[0])
+                .unwrap();
+            file.write_all(&[0xFF; 64]).unwrap();
+            file.sync_all().unwrap();
+        }
+        let corrupt_len = fs::metadata(&paths[0]).unwrap().len();
+
+        // Fail-loud open: the corruption propagates, names the file, and
+        // the file is NOT truncated.
+        match Yard::open(paths.clone(), YardConfig::default()) {
+            Err(YardOpenError::Pile { path, err }) => {
+                assert_eq!(path, paths[0]);
+                assert!(
+                    matches!(err, ReadError::CorruptPile { .. }),
+                    "expected CorruptPile, got: {err}"
+                );
+            }
+            other => panic!("expected fail-loud corrupt open, got {other:?}"),
+        }
+        assert_eq!(
+            fs::metadata(&paths[0]).unwrap().len(),
+            corrupt_len,
+            "fail-loud open must not truncate the generation pile"
+        );
+
+        // Explicit repair: restore truncates the invalid tail and the
+        // valid prefix stays readable.
+        let mut repaired = Yard::restore(paths.clone(), YardConfig::default()).unwrap();
+        assert!(fs::metadata(&paths[0]).unwrap().len() < corrupt_len);
+        let reader = repaired.reader().unwrap();
+        assert_eq!(get_raw(&reader, live).unwrap(), raw_blob(b"survivor"));
     }
 
     /// Yard's PinStore impl: CAS semantics over the in-memory strong pins.
