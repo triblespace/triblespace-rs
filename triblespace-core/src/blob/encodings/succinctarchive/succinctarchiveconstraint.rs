@@ -35,7 +35,11 @@ where
     }
 }
 
-fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
+pub(super) fn base_range<U>(
+    universe: &U,
+    a: &BitVector<Rank9SelIndex>,
+    value: &RawInline,
+) -> Range<usize>
 where
     U: Universe,
 {
@@ -48,7 +52,7 @@ where
     }
 }
 
-fn restrict_range<U>(
+pub(super) fn restrict_range<U>(
     universe: &U,
     a: &BitVector<Rank9SelIndex>,
     c: &WaveletMatrix<Rank9SelIndex>,
@@ -174,6 +178,28 @@ where
         let e_bound = binding.get(self.variable_e);
         let a_bound = binding.get(self.variable_a);
         let v_bound = binding.get(self.variable_v);
+
+        // PROBE: batchable two-bound arms go to the GPU when enabled and
+        // the swept range is large enough; everything else stays CPU.
+        #[cfg(feature = "gpu")]
+        let len_before = proposals.len();
+        #[cfg(feature = "gpu")]
+        if let Some(ring) = &self.archive.gpu {
+            if super::gpu::gpu_propose(
+                self.archive,
+                ring,
+                e_bound,
+                a_bound,
+                v_bound,
+                e_var,
+                a_var,
+                v_var,
+                proposals,
+            ) {
+                super::gpu::stats::record_propose(proposals.len() - len_before);
+                return;
+            }
+        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -318,6 +344,9 @@ where
             }
             _ => unreachable!(),
         }
+
+        #[cfg(feature = "gpu")]
+        super::gpu::stats::record_propose(proposals.len() - len_before);
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
@@ -333,6 +362,29 @@ where
         let e_bound = binding.get(self.variable_e);
         let a_bound = binding.get(self.variable_a);
         let v_bound = binding.get(self.variable_v);
+
+        // PROBE: the confirm hot loop (per-candidate emptiness ranks on one
+        // wavelet matrix) is the most batchable probe stream the archive
+        // produces — route big candidate sets to the GPU when enabled.
+        #[cfg(feature = "gpu")]
+        {
+            super::gpu::stats::record_confirm(proposals.len());
+            if let Some(ring) = &self.archive.gpu {
+                if super::gpu::gpu_confirm(
+                    self.archive,
+                    ring,
+                    e_bound,
+                    a_bound,
+                    v_bound,
+                    e_var,
+                    a_var,
+                    v_var,
+                    proposals,
+                ) {
+                    return;
+                }
+            }
+        }
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {

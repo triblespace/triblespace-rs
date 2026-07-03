@@ -1,3 +1,6 @@
+/// GPU batch-probe adapter (PROBE — measurement lane, feature `gpu`).
+#[cfg(feature = "gpu")]
+pub mod gpu;
 mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
@@ -218,6 +221,12 @@ pub struct SuccinctArchive<U> {
     pub eva_c: WaveletMatrix<Rank9SelIndex>,
     /// Reverse ring: last column of AEV-sorted rotation (values).
     pub aev_c: WaveletMatrix<Rank9SelIndex>,
+
+    /// PROBE: GPU-resident mirror of the six wavelet matrices, used by the
+    /// constraint's batchable hot paths when present. `None` until
+    /// [`enable_gpu`](Self::enable_gpu) is called.
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<std::sync::Arc<gpu::GpuRing>>,
 }
 
 impl<U> SuccinctArchive<U>
@@ -369,6 +378,16 @@ where
             z = prefix.rank0(prefix.select1(id + 1).unwrap()).unwrap();
             Some(self.domain.access(id))
         })
+    }
+
+    /// PROBE: uploads the six ring wavelet matrices to the default wgpu
+    /// device (Metal on macOS) so the constraint's batchable hot paths run
+    /// as single-dispatch GPU batches. One-time upload; see
+    /// [`gpu`](self::gpu) for the adapter shape and thresholds.
+    #[cfg(feature = "gpu")]
+    pub fn enable_gpu(&mut self) -> jerky::Result<()> {
+        self.gpu = Some(std::sync::Arc::new(gpu::GpuRing::upload(self)?));
+        Ok(())
     }
 
     /// Returns the serialization metadata header for this archive.
@@ -705,6 +724,8 @@ where
             vae_c,
             eva_c,
             aev_c,
+            #[cfg(feature = "gpu")]
+            gpu: None,
         })
     }
 }

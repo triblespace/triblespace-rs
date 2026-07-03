@@ -77,6 +77,8 @@ telemetry = [
 net = ["dep:triblespace-net"]
 search = ["dep:triblespace-search"]
 parallel = ["triblespace-core/parallel"]
+# PROBE (gpu-adapter-probe): see triblespace-core's `gpu` feature.
+gpu = ["triblespace-core/gpu"]
 
 [[bench]]
 name = "benchmark"
@@ -126,3 +128,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 [package.metadata.kani.flags]
 default-unwind = "1"
 
+
+# PROBE (gpu-adapter-probe): the crates.io jerky 0.9.0 predates the `gpu`
+# feature; point at the local checkout (jerky main @ 4387ba7) which has it.
+[patch.crates-io]
+jerky = { path = "../../../../jerky" }
