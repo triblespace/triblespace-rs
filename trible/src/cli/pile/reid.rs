@@ -28,11 +28,9 @@ use super::signing::load_signing_key;
 pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Result<()> {
     let key = load_signing_key(&signing_key)?;
 
-    // Open source pile and load its indices.
-    let mut src_pile: Pile = Pile::open(&source)?;
-    src_pile
-        .restore()
-        .map_err(|e| anyhow!("restore source: {e:?}"))?;
+    // Open source pile and load its indices. Fail loud on a corrupt tail —
+    // reading the source must never mutate it (repair is `trible pile restore`).
+    let mut src_pile = super::open_refreshed(&source)?;
 
     // Enumerate branches (all pins).
     let branch_ids: Vec<Id> = src_pile

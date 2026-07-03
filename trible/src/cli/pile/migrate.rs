@@ -69,9 +69,8 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
 }
 
 fn list_migrations(pile_path: &PathBuf) -> Result<()> {
-    let mut pile: Pile = Pile::open(pile_path).context("open pile")?;
+    let mut pile = super::open_refreshed(pile_path)?;
     let res = (|| -> Result<(), anyhow::Error> {
-        pile.refresh().context("refresh pile")?;
         let reader = pile.reader().context("pile reader")?;
 
         let mut missing_name = 0usize;
@@ -141,8 +140,10 @@ fn migrate_branch_metadata_name(
     dry_run: bool,
     rename_duplicates: bool,
 ) -> Result<()> {
-    let mut pile: Pile = Pile::open(pile_path).context("open pile")?;
-    pile.restore().context("restore pile")?;
+    // The migration rewrites this pile in place, but opening it must still be
+    // fail-loud: a corrupt tail is repaired explicitly (`trible pile restore`),
+    // never as a silent side effect of running a migration.
+    let mut pile = super::open_refreshed(pile_path)?;
 
     let res = (|| -> Result<(), anyhow::Error> {
         let reader = pile.reader().context("pile reader")?;

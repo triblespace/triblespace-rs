@@ -522,3 +522,81 @@ fn pile_branch_create_outputs_id() {
         .success()
         .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tmain\\n$").unwrap());
 }
+
+/// A corrupt (torn-tail) source pile must make `reid`, `squash`, and
+/// `migrate` fail loud — pointing at `trible pile restore` — without
+/// truncating the source file. Silent auto-repair on open is reserved
+/// for the explicit `trible pile restore` command.
+#[test]
+fn corrupt_source_fails_loud_without_truncation() {
+    use std::io::Write;
+
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("corrupt_src.pile");
+    std::fs::File::create(&src_path).unwrap();
+
+    // Seed a valid pile with one branch.
+    {
+        let pile: Pile = Pile::open(&src_path).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        repo.create_branch("main", None).expect("create branch");
+        repo.into_storage().close().unwrap();
+    }
+
+    // Tear the tail: append garbage that decodes as no known record.
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&src_path)
+            .unwrap();
+        file.write_all(&[0xFFu8; 33]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let len_before = std::fs::metadata(&src_path).unwrap().len();
+
+    let fail_loud = predicate::str::contains("trible pile restore");
+
+    // reid: fails loud, source untouched, destination never created.
+    let dest = dir.path().join("reid_dst.pile");
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "reid",
+            src_path.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(fail_loud.clone());
+    assert!(!dest.exists(), "reid must not create dest on corrupt source");
+
+    // squash: same contract.
+    let dest = dir.path().join("squash_dst.pile");
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "squash",
+            src_path.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(fail_loud.clone());
+    assert!(!dest.exists(), "squash must not create dest on corrupt source");
+
+    // migrate (in-place rewrite): still refuses to open a corrupt pile.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate", src_path.to_str().unwrap(), "list"])
+        .assert()
+        .failure()
+        .stderr(fail_loud);
+
+    let len_after = std::fs::metadata(&src_path).unwrap().len();
+    assert_eq!(
+        len_before, len_after,
+        "source pile must not be truncated by a failed open"
+    );
+}

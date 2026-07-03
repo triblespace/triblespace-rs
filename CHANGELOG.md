@@ -58,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reopens the generation without repair and propagates a double failure as
   the new `YardReclaimError::Reopen { path, primary, err }` instead of
   silently leaving the segment closed.
+- **`trible pile reid`/`squash`/`migrate` no longer auto-truncate a corrupt
+  pile on open (fail-loud, last `restore()`-on-open holdouts).** All three
+  commands opened their pile with `Pile::restore()`, silently truncating a
+  torn or corrupt tail as a side effect — on the *source* pile for the
+  rewrite commands (`reid`, `squash`) and on the in-place-migrated pile for
+  `migrate`. They now open with the non-mutating `Pile::refresh()` and fail
+  loud with the standard repair pointer (`trible pile restore <path>`),
+  leaving the file byte-identical; `reid` and `squash` also never create the
+  destination when the source refuses to open. `trible pile restore` is now
+  genuinely the only entry point that calls `Pile::restore()`.
 - **Want-record failures are errors, and wants are flushed durable.**
   `Peer::get_or_fetch_async` now returns
   `Result<Option<Bytes>, WantRecordError>` — a pin/flush failure while

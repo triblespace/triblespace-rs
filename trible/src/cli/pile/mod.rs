@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clap::Parser;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use triblespace_core::repo::pile::Pile;
 
 pub mod blob;
 pub mod branch;
@@ -127,6 +129,24 @@ pub enum PileCommand {
     },
 }
 
+/// Open a pile and load its records via `refresh`, failing loud on a
+/// corrupt or torn tail instead of silently truncating it (which
+/// `Pile::restore` would do). Deliberate repair stays an explicit,
+/// separate step: `trible pile restore <path>`.
+pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
+    let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.refresh() {
+        let _ = pile.close();
+        return Err(anyhow!(
+            "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
+             truncate newer data). Repair a torn tail explicitly with: trible pile restore {}",
+            path.display(),
+            path.display()
+        ));
+    }
+    Ok(pile)
+}
+
 pub fn run(cmd: PileCommand) -> Result<()> {
     match cmd {
         PileCommand::Branch { cmd } => branch::run(cmd),
@@ -139,9 +159,6 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             signing_key,
         } => merge::run(pile, target, sources, signing_key),
         PileCommand::Create { path } => {
-            use triblespace_core::repo::pile::Pile;
-            
-
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -161,8 +178,6 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Restore { path } => {
-            use triblespace_core::repo::pile::Pile;
-
             let before = fs::metadata(&path)?.len();
             let mut pile = Pile::open(&path)?;
             // `restore` loads every valid record and, on a torn tail, truncates

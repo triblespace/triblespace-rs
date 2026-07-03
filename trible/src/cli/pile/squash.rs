@@ -25,9 +25,9 @@ pub fn run(
 ) -> Result<()> {
     let key = load_signing_key(&signing_key)?;
 
-    // Open source pile.
-    let mut src_pile: Pile = Pile::open(&source)?;
-    src_pile.restore().map_err(|e| anyhow!("restore source: {e:?}"))?;
+    // Open source pile. Fail loud on a corrupt tail — reading the source
+    // must never mutate it (repair is `trible pile restore`).
+    let mut src_pile = super::open_refreshed(&source)?;
 
     // Enumerate branches.
     let branch_ids: Vec<Id> = src_pile
