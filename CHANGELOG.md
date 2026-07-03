@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **V3 on-disk pile format: uniform 256-byte records.** Every new record —
+  blob, branch (pin) head, branch tombstone, weak-pin marker, weak-unpin
+  marker — is written with a FIXED 256-byte header and padded to a 256-byte
+  multiple. Consequences: blob data starts at the constant
+  `record_start + 256` (no offset-derived pre-pad), so records are
+  position-independent — they survive relocation and `cat a.pile >> b.pile`
+  remains a valid merge; a pure-V3 pile stays 256-aligned throughout under
+  the atomic lock-free append, so every blob's data is zero-copy
+  GPU-aliasable (CUDA/Metal `min_storage_buffer_offset_alignment`); and the
+  blob header carries 192 reserved zero bytes that are NOT part of the
+  content hash. The reader still accepts the original V1 records, so
+  existing piles read byte-identical with no migration. **Version skew is
+  fail-loud in one direction:** binaries from before V3 treat the new
+  markers as unknown records and report `CorruptPile` (they do not
+  truncate; repair stays explicit) — upgrade the binary, don't "repair"
+  the pile.
+- **`UpdateBranchError` is now `PileWriteError`.** The error covers every
+  non-blob pile append — pin-head CAS updates and weak-pin/unpin markers
+  (both `WeakPinStore` impls alias it as `WeakPinError`) — so the
+  branch-specific name was misleading. Its redundant
+  `unsafe impl Send/Sync` are gone (the payload is `std::io::Error`, which
+  already provides both).
 - **`Yard` no longer auto-repairs generation piles (fail-loud, matching
   `Pile`).** `Yard::open` used to call `Pile::restore()` on every generation
   pile, silently truncating a corrupt tail on open; reclaim-recovery paths
@@ -61,6 +83,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Index-home: derived indexes as an LSMT of segments, manifest in the
+  branch head.** New `triblespace_core::repo::index_home` module. Each
+  index *kind* (`IndexKind`: `build` / `attach` / `merge`) maintains a
+  log-structured merge tree of immutable, content-addressed segment blobs;
+  the *manifest* (one entity per segment: kind tag, blob handle, LSMT
+  level, sequence number) lives as tribles unioned directly into the
+  **branch-head tribleset** — no separate pin, and GC of superseded
+  segments is the store's existing reachability sweep because the branch
+  head is already a reachability root. Reads go branch-head → manifest
+  subset → bounded segment fetches (`IndexHome::attach_all`) — **query
+  without checkout**, no commit walk. Maintenance is a cheap level-0
+  append plus a size-tiered merge (`FANOUT = 4`) via
+  `IndexHome::update_index` (explicit, CAS-repoints the branch pin) or —
+  the usual path — **on-commit hooks**: `Repository::register_index` /
+  `register_index_filtered` / `on_commit` fold the new segment's manifest
+  into the same branch-head tribleset the push is about to CAS in, so a
+  commit and its index maintenance land in one atomic repoint (hooks re-run
+  per push attempt; content-addressed segments make that idempotent, and a
+  hook failure is recorded and drained via `take_hook_errors`, never
+  blocking the commit). Branch-metadata rebuilds (`push`,
+  `compute_rollup`) carry the manifest forward (`rebuild_branch_meta`), so
+  segments **accumulate across commits** instead of being wiped by each
+  rebuild. First kinds: `SuccinctRollup` in core (segments are
+  `SuccinctArchive`s; `SuccinctRollup::union` gives cross-segment joins via
+  `UnionConstraint`), and in `triblespace-search` the `Bm25Rollup` (term
+  search) and `HnswRollup` (vector search) kinds ride the same surface.
+- **Async blob-store trait family.** New
+  `triblespace_core::repo::async_store` module: `AsyncBlobStoreGet` /
+  `AsyncBlobStorePut` / `AsyncBlobStoreList` / `AsyncBlobStore` /
+  `AsyncPinStore` / `AsyncBlobStoreMeta` / `AsyncBlobStoreForget` — the
+  async counterparts of the sync storage traits, with `SyncAsAsync<S>`
+  lifting any sync store into them. Executor-agnostic (no tokio in core).
+  Implemented by the `object_store` backend (`ObjectStoreReader`),
+  `Lazy<S>`/`LazyReader` (the waiting read), and `triblespace-net`'s
+  `PeerReader` (the transparent local-then-swarm async get).
 - **Live two-pile sync proven over the real iroh transport** (the v0.47.0
   release gate). `tests/iroh_two_pile_sync.rs` runs two `Peer<Pile>`s over
   real iroh endpoints (`iroh::test_utils` `TestNetwork` packet layer;
@@ -184,6 +241,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add a PATCH branch fanout diagnostic histogram for inspecting real trie
   shapes in benchmark probes.
 - Add a PATCH traversal-depth diagnostic for read-side benchmark probes.
+
+### Removed
+
+- **`BlobStorePut::put_aligned`.** Vestigial since V3: every record is a
+  uniform 256-byte multiple with data at a fixed header offset, so every
+  `put` is already GPU-aliasably aligned; the method had collapsed into an
+  alias of `put`.
+- **Index-home per-segment stats slot.** The `seg_stats` attribute,
+  `SegmentEntry.stats`, and `IndexKind::stats` are gone — nothing populated
+  them (SuccinctRollup, BM25, and HNSW all left the default `None`). Also
+  trimmed: `Manifest::empty()` (use `Default`), `Manifest::len()`/
+  `is_empty()` (read `manifest.segments` directly), and the unused
+  `IndexHome::branch()` accessor; `manifest_tribles` is `pub(crate)`.
 
 ### Fixed
 
@@ -375,7 +445,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   happens only at owner-mismatch boundaries. Reduces resident memory
   from ~204 B/trible to ~109 B/trible (~47% saved) and drops
   per-trible allocation count by ~83% for `SimpleArchive` ingest.
-  See wiki:808DE2FAB3F6DB95272F53F1E720BDA0 in the Liora pile.
 - **`ArchiveEntry<'a, KEY_LEN>` + `PATCH::insert_archive` +
   `TribleSet::insert_archive`.** Ingest path that constructs a
   `LocalLeaf` head from a `(NonNull<[u8; KEY_LEN]>, &Arc<dyn
@@ -456,8 +525,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eviction = non-renewal. New `/triblespace/auth-handshake/1` ALPN with
   `OP_REQUEST_CAP` / `OP_DELIVER_CAP`, plus a renewal daemon in `pile net sync`
   that signs successors and dispatches them. Schema for local-only pins
-  (renewal policy, pending requests, team cap). See wiki:8766B938... in the
-  Liora pile for the architecture writeup.
+  (renewal policy, pending requests, team cap).
 - **`trible` CLI: `pile pin list/inspect/delete`** as generic primitive ops
   on the pin namespace. `pile branch list` now filters to pins carrying
   `metadata::name` (the named content-branch view) while `pile pin list`
@@ -1262,8 +1330,7 @@ unification release. Four related cleanups:
    `H::ID` / `T::ID`) is no longer needed: those types now derive their
    ids at runtime via the *entity-core* pattern (no-`@` `entity!` over
    a minimal identity-determining fact set; the fragment's intrinsic
-   root IS the schema id). See wiki:c14041b4e1996a4101a1e80a8bdaa4c4
-   ("Entity Core") for the mental model.
+   root IS the schema id) — the "entity core" mental model.
 4. **`Fragment` is now self-contained.** It carries an internal
    `MemoryBlobStore<Blake3>` alongside its exports and facts, so any
    handle that appears in a fragment's facts has its bytes available

@@ -494,11 +494,14 @@ fn merge_import_example(
     dst_path: &std::path::Path,
     dst_branch_id: triblespace::id::Id,
 ) -> anyhow::Result<()> {
-    // 1) Open source (read) and destination (write) piles
+    // 1) Open source (read) and destination (write) piles. `refresh`
+    //    loads the existing records and fails loud on a corrupt tail
+    //    (repair is a separate, explicit step: `Pile::restore` /
+    //    `trible pile restore`).
     let mut src = Pile::open(src_path)?;
-    src.restore()?;
+    src.refresh()?;
     let mut dst = Pile::open(dst_path)?;
-    dst.restore()?;
+    dst.refresh()?;
 
     // 2) Resolve source head commit handle
     let src_head: Inline<Handle<blobencodings::SimpleArchive>> =
