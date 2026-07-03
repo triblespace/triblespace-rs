@@ -1663,20 +1663,6 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         self.doc_lens.get(i)
     }
 
-    /// The raw doc-key bytes (`Inline<D>`) of document `i`, or `None`
-    /// if out of range. `O(1)` — lets callers enumerate a stored
-    /// segment's documents (e.g. to compute which entities an
-    /// index-home manifest already covers, so an incremental
-    /// `update_index` only re-indexes new documents) without decoding
-    /// the postings. Mirrors [`SuccinctHNSWIndex::handle`].
-    pub fn doc_key(&self, i: usize) -> Option<RawInline> {
-        if i < self.keys.len() {
-            Some(self.keys.access(i))
-        } else {
-            None
-        }
-    }
-
     /// Equality tolerance for bound-score matching, derived from
     /// the stored quantization scale. Postings store u16-bucket
     /// quantized scores, so equality checks against a recomputed

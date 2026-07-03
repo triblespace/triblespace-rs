@@ -259,7 +259,6 @@ mod tests {
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::BlobStore;
 
-    use crate::hnsw::FlatBuilder;
     use crate::schemas::put_embedding;
 
     /// `(id, embedding handle, vector)` staged for a test source set.
@@ -537,12 +536,5 @@ mod tests {
         let (_, probe_h, probe_v) = &table[0];
         let ranked = nearest_across(&segs, &reader, *probe_h, probe_v, 0.0);
         assert_eq!(ranked.first().unwrap().1, brute_top1(&table, probe_v));
-    }
-
-    // Sanity: the FlatBuilder oracle path we compare against is the
-    // same one HNSW recall tests use — keep the import exercised.
-    #[test]
-    fn flat_oracle_available() {
-        let _ = FlatBuilder::new(4);
     }
 }
