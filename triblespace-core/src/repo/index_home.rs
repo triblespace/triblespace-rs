@@ -322,7 +322,7 @@ impl Manifest {
 /// [`Manifest::from_tribles`]/[`Manifest::to_tribles`], which reproduces the
 /// content-addressed segment entities verbatim (the same fidelity
 /// [`IndexHome::update_index`] relies on for its manifest difference).
-pub fn manifest_tribles(set: &TribleSet) -> TribleSet {
+pub(crate) fn manifest_tribles(set: &TribleSet) -> TribleSet {
     // Enumerate the distinct owning kinds present in the head, then carry
     // each kind's manifest forward independently (two kinds over one branch
     // keep independent manifests in the one tribleset).
