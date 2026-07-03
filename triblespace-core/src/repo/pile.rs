@@ -174,7 +174,7 @@ struct BlobHeader {
 impl BlobHeader {
     /// V1 blob constructor — retained only for the legacy-format backward-compat
     /// test (new writes are V3; V1 blob records are otherwise read, never written).
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB,
