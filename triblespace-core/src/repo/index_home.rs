@@ -551,7 +551,13 @@ where
 pub struct SuccinctRollup;
 
 impl SuccinctRollup {
-    /// Stable kind id for the SuccinctArchive rollup.
+    /// Stable kind id of the SuccinctArchive rollup (minted via
+    /// `trible genid`), tagged onto every segment entity via [`seg_kind`].
+    /// Mirrors the `KIND_ID_HEX` consts on the BM25 and HNSW kinds in
+    /// `triblespace-search`.
+    pub const KIND_ID_HEX: &'static str = "9540D50DEDECA9CA948FD14474F86566";
+
+    /// Construct the SuccinctArchive rollup kind.
     pub fn new() -> Self {
         SuccinctRollup
     }
@@ -568,7 +574,7 @@ impl IndexKind for SuccinctRollup {
     type Segment = SuccinctArchive<OrderedUniverse>;
 
     fn kind_id(&self) -> Id {
-        Id::from_hex("9540D50DEDECA9CA948FD14474F86566").expect("valid kind id")
+        Id::from_hex(Self::KIND_ID_HEX).expect("valid kind id")
     }
 
     fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
