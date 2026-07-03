@@ -220,21 +220,6 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// An empty manifest (no segments yet).
-    pub fn empty() -> Self {
-        Self { segments: Vec::new(), next_seq: 0 }
-    }
-
-    /// Number of live segments.
-    pub fn len(&self) -> usize {
-        self.segments.len()
-    }
-
-    /// Whether the manifest names no segments.
-    pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-
     /// Append a segment, assigning it the next sequence number, then keep
     /// the segment list ordered by `(level, seq)`.
     fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
@@ -485,11 +470,6 @@ where
         Self { storage, kind, branch: source_branch }
     }
 
-    /// The branch pin id whose head tribleset carries this manifest.
-    pub fn branch(&self) -> Id {
-        self.branch
-    }
-
     fn head(&mut self) -> Result<Option<Inline<Handle<SimpleArchive>>>, IndexError> {
         self.storage.head(self.branch).map_err(boxed)
     }
@@ -695,7 +675,7 @@ mod tests {
 
     #[test]
     fn manifest_roundtrips_through_tribles() {
-        let mut m = Manifest::empty();
+        let mut m = Manifest::default();
         let h0 = Inline::<Handle<UnknownBlob>>::new([1u8; 32]);
         let h1 = Inline::<Handle<UnknownBlob>>::new([2u8; 32]);
         m.push(h0, 0);
@@ -723,7 +703,7 @@ mod tests {
         {
             let mut home = IndexHome::new(&mut storage, branch, SuccinctRollup::new());
             home.update_index(&da).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 1);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
         }
         let first_head = storage.head(branch).unwrap();
 
@@ -732,7 +712,7 @@ mod tests {
             home.update_index(&db).unwrap();
             let m = home.read_manifest().unwrap();
             // FANOUT is 4, so two updates leave two level-0 segments.
-            assert_eq!(m.len(), 2);
+            assert_eq!(m.segments.len(), 2);
         }
         let second_head = storage.head(branch).unwrap();
 
@@ -777,7 +757,7 @@ mod tests {
         .collect();
         // No index manifest present yet.
         assert_eq!(
-            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).len(),
+            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).segments.len(),
             0
         );
 
@@ -794,7 +774,7 @@ mod tests {
 
         // (a) The index query reads exactly the manifest subset.
         let manifest = Manifest::from_tribles(&set_after, SuccinctRollup.kind_id());
-        assert_eq!(manifest.len(), 1, "index query sees exactly its one segment");
+        assert_eq!(manifest.segments.len(), 1, "index query sees exactly its one segment");
 
         // (b) The unrelated branch-metadata query is IDENTICAL with the
         // index tribles present — union didn't disturb the existing subset.
@@ -838,7 +818,7 @@ mod tests {
         home.update_index(&s1).unwrap();
         home.update_index(&s2).unwrap();
         let m = home.read_manifest().unwrap();
-        assert_eq!(m.len(), 2, "expected two independent segments");
+        assert_eq!(m.segments.len(), 2, "expected two independent segments");
 
         let segments = home.attach_all().unwrap();
         let union = SuccinctRollup::union(&segments);
@@ -894,7 +874,7 @@ mod tests {
             }
             assert!(per_level.values().all(|&n| n < FANOUT), "fan-out bounded");
             // A merge must have happened (fewer segments than updates).
-            assert!(m.len() < names.len());
+            assert!(m.segments.len() < names.len());
         }
 
         let mut home = IndexHome::new(&mut storage, branch, SuccinctRollup::new());
@@ -989,13 +969,13 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             home.update_index(&person("Ada")).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 1);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
         }
         repo.compute_rollup(*branch).unwrap();
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             assert_eq!(
-                home.read_manifest().unwrap().len(),
+                home.read_manifest().unwrap().segments.len(),
                 1,
                 "compute_rollup must carry the existing segment forward, not drop it"
             );
@@ -1009,7 +989,7 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             assert_eq!(
-                home.read_manifest().unwrap().len(),
+                home.read_manifest().unwrap().segments.len(),
                 1,
                 "a commit must carry the manifest forward, not wipe it"
             );
@@ -1019,7 +999,7 @@ mod tests {
         {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
             home.update_index(&person("Grace")).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 2);
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 2);
         }
         repo.compute_rollup(*branch).unwrap();
 
@@ -1028,7 +1008,7 @@ mod tests {
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         let manifest = home.read_manifest().unwrap();
         assert_eq!(
-            manifest.len(),
+            manifest.segments.len(),
             2,
             "both segments accumulate across rollup cycles; not collapsed to one"
         );
@@ -1083,7 +1063,7 @@ mod tests {
             }
             let m = home.read_manifest().unwrap();
             // A single tenured segment at level 1 (the merge fired).
-            assert_eq!(m.len(), 1);
+            assert_eq!(m.segments.len(), 1);
             assert_eq!(m.segments[0].level, 1);
         }
 
@@ -1155,7 +1135,7 @@ mod tests {
             let m = home.read_manifest().unwrap();
             if i + 1 < FANOUT {
                 // One level-0 segment per commit until the merge fires.
-                assert_eq!(m.len(), i + 1, "segment per commit before first merge");
+                assert_eq!(m.segments.len(), i + 1, "segment per commit before first merge");
                 assert!(m.segments.iter().all(|s| s.level == 0));
             }
             // Fan-out stays bounded at every step.
@@ -1170,7 +1150,7 @@ mod tests {
         let m = home.read_manifest().unwrap();
         // The tiered merge fired: fewer segments than commits, and a
         // tenured segment above level 0 exists.
-        assert!(m.len() < n, "merge collapsed level 0 at least once");
+        assert!(m.segments.len() < n, "merge collapsed level 0 at least once");
         assert!(m.segments.iter().any(|s| s.level > 0), "tenured segment exists");
 
         // The union read sees ALL committed data — attach the manifest's
@@ -1248,8 +1228,8 @@ mod tests {
         // Both manifests coexist at the head, one per kind.
         let head = repo.storage_mut().head(*branch).unwrap().unwrap();
         let head_set: TribleSet = repo.storage_mut().reader().unwrap().get(head).unwrap();
-        assert_eq!(Manifest::from_tribles(&head_set, SuccinctRollup.kind_id()).len(), n);
-        assert_eq!(Manifest::from_tribles(&head_set, TitlesRollup.kind_id()).len(), n);
+        assert_eq!(Manifest::from_tribles(&head_set, SuccinctRollup.kind_id()).segments.len(), n);
+        assert_eq!(Manifest::from_tribles(&head_set, TitlesRollup.kind_id()).segments.len(), n);
 
         // Each kind's union read selects exactly its own subset.
         let names_union_counts = {
@@ -1320,7 +1300,7 @@ mod tests {
 
         // The index hook registered after the failing one still ran.
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
-        assert_eq!(home.read_manifest().unwrap().len(), 1);
+        assert_eq!(home.read_manifest().unwrap().segments.len(), 1);
 
         // The failure is recorded once and drained.
         let errors = repo.take_hook_errors();
@@ -1360,7 +1340,7 @@ mod tests {
         // Both facts are reachable through the union read.
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         let manifest = home.read_manifest().unwrap();
-        assert_eq!(manifest.len(), 2, "one segment per landed delta");
+        assert_eq!(manifest.segments.len(), 2, "one segment per landed delta");
         let segments = home.attach_all().unwrap();
         let union = SuccinctRollup::union(&segments);
         let mut names: Vec<_> = find!(

@@ -474,7 +474,7 @@ mod tests {
             let mut home = IndexHome::new(&mut storage, branch, kind.clone());
             home.update_index(&d0).unwrap();
             home.update_index(&d1).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 2, "two segments");
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 2, "two segments");
         }
 
         // Read back: attach every segment named by the manifest and
@@ -523,7 +523,7 @@ mod tests {
             }
             let m: Manifest = home.read_manifest().unwrap();
             // A merge fired: fewer segments than updates.
-            assert!(m.len() <= FANOUT, "size-tiered merge bounded fan-out");
+            assert!(m.segments.len() <= FANOUT, "size-tiered merge bounded fan-out");
         }
 
         let segs = {

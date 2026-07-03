@@ -406,7 +406,7 @@ mod tests {
             let mut home = IndexHome::new(&mut storage, branch, kind.clone());
             home.update_index(&d0).unwrap();
             home.update_index(&d1).unwrap();
-            assert_eq!(home.read_manifest().unwrap().len(), 2, "two segments");
+            assert_eq!(home.read_manifest().unwrap().segments.len(), 2, "two segments");
         }
 
         let segs = {
@@ -461,7 +461,7 @@ mod tests {
                 home.update_index(s).unwrap();
             }
             let m: Manifest = home.read_manifest().unwrap();
-            assert!(m.len() <= FANOUT, "size-tiered merge bounded fan-out");
+            assert!(m.segments.len() <= FANOUT, "size-tiered merge bounded fan-out");
         }
 
         let segs = {
@@ -537,7 +537,7 @@ mod tests {
         let reader = repo.storage_mut().reader().unwrap();
         let kind = Bm25Rollup::new(reader, content_attr);
         let mut home = IndexHome::new(repo.storage_mut(), *branch, kind);
-        assert_eq!(home.read_manifest().unwrap().len(), 2, "one segment per push");
+        assert_eq!(home.read_manifest().unwrap().segments.len(), 2, "one segment per push");
         let segs = home.attach_all().unwrap();
         let total: usize = segs.iter().map(|s| s.doc_count()).sum();
         assert_eq!(total, all.len(), "every pushed doc indexed");
@@ -559,7 +559,7 @@ mod tests {
         let mut succinct_home =
             IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         assert_eq!(
-            succinct_home.read_manifest().unwrap().len(),
+            succinct_home.read_manifest().unwrap().segments.len(),
             2,
             "second kind maintained on the same commits"
         );
