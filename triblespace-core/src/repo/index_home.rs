@@ -21,7 +21,7 @@
 //!   when unreferenced.
 //! - **Manifest** — a set of tribles (one entity per segment, tagged
 //!   with the owning kind, carrying the segment blob handle, its LSMT
-//!   level, a sequence number, and an optional stats-blob handle) unioned
+//!   level, and a sequence number) unioned
 //!   directly into the branch-head tribleset. Rewritten (this kind's old
 //!   segment tribles differenced out, the new ones unioned in) as the
 //!   index evolves; the old branch-head-tribleset version and its
@@ -107,12 +107,6 @@
 //!   for the SuccinctArchive rollup). The GPU-accelerated succinct merge
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.
-//! - **Per-segment stats.** The manifest schema carries an optional
-//!   opaque per-segment stats blob ([`IndexKind::stats`], default
-//!   `None`). The SuccinctArchive rollup leaves it empty; BM25
-//!   (`doc_frequency`/`n_docs`) and HNSW (per-segment count) will
-//!   populate it so a query can read a scalar without opening every
-//!   segment blob.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -155,9 +149,6 @@ attributes! {
     /// manifest. Gives a stable total order within a level and keeps
     /// content-addressed segment entities distinct.
     "DFE499897718CFB97497AA8504A5D48F" as pub seg_seq: U256BE;
-    /// Optional per-kind lightweight stats blob for a segment. Absent for
-    /// kinds (like the SuccinctArchive rollup) that don't use it.
-    "5387B92C012F03C705169A789347528F" as pub seg_stats: Handle<UnknownBlob>;
 }
 
 /// Number of segments a level may hold before a size-tiered merge
@@ -199,17 +190,10 @@ pub trait IndexKind {
     /// This is the LSMT maintenance primitive. The GPU-accelerated
     /// succinct merge drops in behind exactly this method.
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob>;
-
-    /// Optional lightweight per-segment stats, serialised into the
-    /// manifest so a query can read a scalar without opening the segment
-    /// blob. Default `None`; consumers that need it (BM25, HNSW) override.
-    fn stats(&self, _segment: &Self::Segment) -> Option<Blob<UnknownBlob>> {
-        None
-    }
 }
 
-/// One entry in a [`Manifest`]: a live segment, its LSMT level, its
-/// sequence number, and an optional stats-blob handle.
+/// One entry in a [`Manifest`]: a live segment, its LSMT level, and its
+/// sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentEntry {
     /// Handle of the immutable segment blob.
@@ -218,8 +202,6 @@ pub struct SegmentEntry {
     pub level: u64,
     /// Sequence number (total order within a level).
     pub seq: u64,
-    /// Optional per-kind stats blob handle.
-    pub stats: Option<Inline<Handle<UnknownBlob>>>,
 }
 
 /// The set of live segments for one index kind, ordered by `(level, seq)`.
@@ -255,10 +237,10 @@ impl Manifest {
 
     /// Append a segment, assigning it the next sequence number, then keep
     /// the segment list ordered by `(level, seq)`.
-    fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64, stats: Option<Inline<Handle<UnknownBlob>>>) {
+    fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.segments.push(SegmentEntry { blob, level, seq, stats });
+        self.segments.push(SegmentEntry { blob, level, seq });
         self.segments.sort_by_key(|e| (e.level, e.seq));
     }
 
@@ -289,21 +271,9 @@ impl Manifest {
     /// [`seg_kind`]; every other trible in the set (branch metadata, other
     /// kinds' segments) is ignored.
     pub fn from_tribles(set: &TribleSet, kind: Id) -> Self {
-        // Collect optional per-segment stats keyed by segment-entity id.
-        // Segment entities carry their kind tag, and we only look up stats
-        // for entities selected by the kind-scoped query below, so this
-        // map never leaks another kind's stats.
-        let mut stats_map: HashMap<[u8; 32], Inline<Handle<UnknownBlob>>> = HashMap::new();
-        for (e, st) in find!(
-            (e: Inline<GenId>, st: Inline<Handle<UnknownBlob>>),
-            pattern!(set, [{ ?e @ seg_kind: kind, seg_stats: ?st }])
-        ) {
-            stats_map.insert(e.raw, st);
-        }
-
         let mut segments: Vec<SegmentEntry> = Vec::new();
         let mut max_seq: Option<u64> = None;
-        for (e, blob, level, seq) in find!(
+        for (_e, blob, level, seq) in find!(
             (
                 e: Inline<GenId>,
                 blob: Inline<Handle<UnknownBlob>>,
@@ -315,8 +285,7 @@ impl Manifest {
             let level = level.try_from_inline::<u64>().unwrap_or(0);
             let seq = seq.try_from_inline::<u64>().unwrap_or(0);
             max_seq = Some(max_seq.map_or(seq, |m| m.max(seq)));
-            let stats = stats_map.get(&e.raw).copied();
-            segments.push(SegmentEntry { blob, level, seq, stats });
+            segments.push(SegmentEntry { blob, level, seq });
         }
         segments.sort_by_key(|e| (e.level, e.seq));
 
@@ -337,7 +306,6 @@ impl Manifest {
                 seg_blob: e.blob,
                 seg_level: e.level,
                 seg_seq: e.seq,
-                seg_stats?: e.stats,
             };
         }
         set
@@ -453,20 +421,12 @@ where
     // content-addressed entities that from_tribles just read).
     let old_manifest_tribles = manifest.to_tribles(kind_id);
 
-    // Build + append a fresh level-0 segment. Attach the just-built
-    // blob (zero-copy) to derive its optional stats without a store
-    // round-trip.
+    // Build + append a fresh level-0 segment.
     let segment_blob = kind.build(source);
-    let attached = kind.attach(segment_blob.clone());
-    let stats_blob = kind.stats(&attached);
     let handle = storage
         .put::<UnknownBlob, _>(segment_blob)
         .map_err(boxed)?;
-    let stats_handle = match stats_blob {
-        Some(b) => Some(storage.put::<UnknownBlob, _>(b).map_err(boxed)?),
-        None => None,
-    };
-    manifest.push(handle, 0, stats_handle);
+    manifest.push(handle, 0);
 
     // Size-tiered merge: while a level overflows, tenure the whole
     // tier into a single merged segment one level up (Yard's shape).
@@ -479,16 +439,10 @@ where
             attached.push(kind.attach(blob));
         }
         let merged_blob = kind.merge(&attached);
-        let merged_seg = kind.attach(merged_blob.clone());
-        let merged_stats = kind.stats(&merged_seg);
         let merged_handle = storage
             .put::<UnknownBlob, _>(merged_blob)
             .map_err(boxed)?;
-        let merged_stats_handle = match merged_stats {
-            Some(b) => Some(storage.put::<UnknownBlob, _>(b).map_err(boxed)?),
-            None => None,
-        };
-        manifest.push(merged_handle, level + 1, merged_stats_handle);
+        manifest.push(merged_handle, level + 1);
     }
 
     // Rewrite this kind's manifest inside the branch-head tribleset:
@@ -744,9 +698,8 @@ mod tests {
         let mut m = Manifest::empty();
         let h0 = Inline::<Handle<UnknownBlob>>::new([1u8; 32]);
         let h1 = Inline::<Handle<UnknownBlob>>::new([2u8; 32]);
-        let st = Inline::<Handle<UnknownBlob>>::new([3u8; 32]);
-        m.push(h0, 0, None);
-        m.push(h1, 1, Some(st));
+        m.push(h0, 0);
+        m.push(h1, 1);
 
         let kind = SuccinctRollup.kind_id();
         let parsed = Manifest::from_tribles(&m.to_tribles(kind), kind);
@@ -756,7 +709,6 @@ mod tests {
         assert_eq!(parsed.segments[0].level, 0);
         assert_eq!(parsed.segments[1].blob, h1);
         assert_eq!(parsed.segments[1].level, 1);
-        assert_eq!(parsed.segments[1].stats, Some(st));
         // next_seq continues past the max seq read back.
         assert_eq!(parsed.next_seq, 2);
     }
