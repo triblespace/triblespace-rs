@@ -64,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public unconditionally rather than behind the `sim` feature —
   `bind_with_endpoint` was already public for exactly this use.
 
-- **`Wanting<S>` / `LazyPile` — the no-network-by-construction lazy reader.**
-  New `triblespace_core::repo::wanting` module (exported from the prelude):
+- **`Lazy<S>` — the no-network-by-construction lazy reader.**
+  New `triblespace_core::repo::lazy` module (exported from the prelude):
   wraps a store Peer-style (`Arc<Mutex<S>>`) but answers a read miss with a
   **durable want** instead of a swarm fetch — `pin_weak` + `flush` (the
   marker must survive an immediate process exit; a faculty exits right after
@@ -73,8 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PeerReader`): the **sync probe** (`BlobStoreGet`) returns
   `Err(WantGetError::NotYet)` on a miss — "the want is durably recorded; a
   sync daemon (`Peer` + `Reconciler`) services it" — and never waits; the
-  **async waiting read** (`AsyncBlobStoreGet` on `WantingReader`, plus
-  `AsyncBlobStore`/`AsyncBlobStorePut` on `Wanting`) records the same
+  **async waiting read** (`AsyncBlobStoreGet` on `LazyReader`, plus
+  `AsyncBlobStore`/`AsyncBlobStorePut` on `Lazy`) records the same
   durable want and then *suspends* until the blob lands, resolving instead
   of erroring (`WantWaitError` has no not-yet variant; compose deadlines
   externally, e.g. `tokio::time::timeout` — the want stays recorded on
@@ -96,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StorageClose`): `flush(&mut self)` makes pending writes/markers
   crash-durable. Implemented by `Pile` (delegates to the inherent
   `Pile::flush`), `MemoryRepo` (no-op, `Infallible`), and `Yard` (flushes
-  every open generation pile). Required by `Wanting<S>` and now by
+  every open generation pile). Required by `Lazy<S>` and now by
   `Peer<S>` — recording a want without flushing it was a durability hole.
 - **End-to-end fetch deadline.** The on-demand blob fetch
   (`Peer::fetch_blob`, `get_or_fetch_async`, the transparent `PeerReader`

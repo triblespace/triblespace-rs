@@ -49,7 +49,7 @@ use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::wanting::WantRecordError;
+use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
     StorageFlush, WeakPinStore,

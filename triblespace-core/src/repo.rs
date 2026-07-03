@@ -128,8 +128,8 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
-/// No-network lazy reader: local get, durable want on miss ([`wanting::Wanting`]).
-pub mod wanting;
+/// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
+pub mod lazy;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 

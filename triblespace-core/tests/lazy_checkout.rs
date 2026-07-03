@@ -1,7 +1,7 @@
-//! Repository over a `Wanting` store — the "lazy checkout" contract.
+//! Repository over a `Lazy` store — the "lazy checkout" contract.
 //!
 //! `Repository`/`Workspace` need ZERO changes to run over a
-//! `Wanting<S>`: a checkout drives the reader's **sync probe**, so a
+//! `Lazy<S>`: a checkout drives the reader's **sync probe**, so a
 //! closure that is only partially present fails with
 //! `WantGetError::NotYet` (bubbled through
 //! `WorkspaceCheckoutError::Storage`) while the miss has already
@@ -15,7 +15,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::wanting::WantGetError;
+use triblespace_core::repo::lazy::WantGetError;
 use triblespace_core::repo::WorkspaceCheckoutError;
 
 mod test_ns {
@@ -26,7 +26,7 @@ mod test_ns {
 }
 
 #[test]
-fn checkout_over_wanting_fails_notyet_and_enqueues_wants() {
+fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     let key = SigningKey::from_bytes(&[7u8; 32]);
 
     // ── Source repo: one branch, one commit ──────────────────────────
@@ -68,10 +68,10 @@ fn checkout_over_wanting_fails_notyet_and_enqueues_wants() {
         .update(branch_id, None, Some(head))
         .expect("replica branch pin");
 
-    // ── Lazy checkout over the Wanting replica ────────────────────────
-    let wanting = Wanting::new(replica);
+    // ── Lazy checkout over the wrapped replica ─────────────────────
+    let lazy = Lazy::new(replica);
     let mut repo_b =
-        Repository::new(wanting, key, TribleSet::new()).expect("replica repo");
+        Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
     let mut ws_b = repo_b.pull(branch_id).expect("pull succeeds — branch meta + commit present");
 
     let err = ws_b

@@ -1,9 +1,11 @@
-//! `Wanting<S>`: the **no-network-by-construction** lazy reader.
+//! `Lazy<S>`: the **no-network-by-construction** lazy reader. A
+//! `Lazy<S>` records durable wants on miss — the type is the policy
+//! (lazy), wants are the mechanism it records.
 //!
-//! A [`Wanting`] wraps a store the same way a `triblespace-net` `Peer`
+//! A [`Lazy`] wraps a store the same way a `triblespace-net` `Peer`
 //! does (shared behind `Arc<Mutex<S>>` so a `&self` read can record
 //! state), but where the Peer answers a read miss with a swarm fetch,
-//! `Wanting` answers it with a **durable want**: it weak-pins the missing
+//! `Lazy` answers it with a **durable want**: it weak-pins the missing
 //! handle and flushes the store so the marker survives an immediate
 //! process exit. It never performs I/O it doesn't own, and it never
 //! networks — this module lives in `triblespace-core`, which has no
@@ -11,14 +13,20 @@
 //! linker, not by discipline. Waiting for a blob is pure suspension:
 //! an async read parks until the bytes land locally.
 //!
+//! Not to be confused with [`LazyLock`](std::sync::LazyLock) /
+//! [`LazyCell`](std::cell::LazyCell): std's lazies *compute* their
+//! value on first demand, so it always arrives. A `Lazy<S>` value is
+//! *delivered by another party* (a sync daemon, another writer) — it
+//! may never arrive, and the want persists durably either way.
+//!
 //! Like `PeerReader`, existence-vs-retrieval is split by *which trait
 //! you call*, not by a bespoke method:
 //!
-//! - the **sync** [`BlobStoreGet`] on [`WantingReader`] is the instant
+//! - the **sync** [`BlobStoreGet`] on [`LazyReader`] is the instant
 //!   probe: a hit serves from the snapshot; a miss durably records the
 //!   want and returns [`WantGetError::NotYet`] immediately — it never
 //!   waits.
-//! - the **async** [`AsyncBlobStoreGet`] on [`WantingReader`] is the
+//! - the **async** [`AsyncBlobStoreGet`] on [`LazyReader`] is the
 //!   waiting read: a hit resolves immediately; a miss durably records
 //!   the SAME want and then suspends until the blob appears in the
 //!   store — landed by a sync daemon servicing the want, or by any
@@ -30,7 +38,7 @@
 //! The intended division of labor:
 //!
 //! - A short-lived process (a faculty invocation) opens the shared pile
-//!   as a [`LazyPile`] and reads. Every miss leaves a crash-durable
+//!   as a `Lazy<Pile>` and reads. Every miss leaves a crash-durable
 //!   weak-pin want on record (weak pins ARE the want-queue — see
 //!   [`WeakPinStore`]) and comes back `NotYet` (sync probe) or suspends
 //!   (async read).
@@ -41,7 +49,7 @@
 //!   the bytes locally.
 //!
 //! *How* a suspended read wakes is an implementation detail, not API:
-//! a `put` through the same `Wanting` signals waiters directly, and a
+//! a `put` through the same `Lazy` signals waiters directly, and a
 //! background cadence re-checks the store (with a refresh, so records
 //! appended by other handles or processes become visible) while any
 //! waiter is parked. No async runtime is required or assumed — the
@@ -62,14 +70,13 @@
 //!
 //! [`AsyncBlobStoreGet`]: crate::repo::async_store::AsyncBlobStoreGet
 //! [`BlobStoreGet`]: crate::repo::BlobStoreGet
-//! [`WantingReader`]: crate::repo::wanting::WantingReader
-//! [`Wanting`]: crate::repo::wanting::Wanting
-//! [`LazyPile`]: crate::repo::wanting::LazyPile
+//! [`LazyReader`]: crate::repo::lazy::LazyReader
+//! [`Lazy`]: crate::repo::lazy::Lazy
 //! [`WeakPinStore`]: crate::repo::WeakPinStore
-//! [`WantGetError::NotYet`]: crate::repo::wanting::WantGetError::NotYet
-//! [`WantGetError::WantRecord`]: crate::repo::wanting::WantGetError::WantRecord
-//! [`WantWaitError::Store`]: crate::repo::wanting::WantWaitError::Store
-//! [`WantWaitError::WantRecord`]: crate::repo::wanting::WantWaitError::WantRecord
+//! [`WantGetError::NotYet`]: crate::repo::lazy::WantGetError::NotYet
+//! [`WantGetError::WantRecord`]: crate::repo::lazy::WantGetError::WantRecord
+//! [`WantWaitError::Store`]: crate::repo::lazy::WantWaitError::Store
+//! [`WantWaitError::WantRecord`]: crate::repo::lazy::WantWaitError::WantRecord
 
 use std::future::Future;
 use std::pin::Pin;
@@ -95,13 +102,8 @@ use super::{
     WeakPinStore,
 };
 
-/// A [`Wanting`] over the default on-disk store: the faculty-side view
-/// of a shared [`Pile`](crate::repo::pile::Pile) — local reads, durable
-/// wants, zero network.
-pub type LazyPile = Wanting<super::pile::Pile>;
-
 /// Fixed cadence at which a suspended async read re-checks the store
-/// for blobs landed by writers this `Wanting` cannot observe directly
+/// for blobs landed by writers this `Lazy` cannot observe directly
 /// (another handle to the same pile, another process appending to it).
 /// Purely an implementation detail — in-process `put`s wake waiters
 /// immediately, so this bounds only the *cross-process* wake latency.
@@ -145,7 +147,7 @@ where
     }
 }
 
-/// Error from a [`WantingReader`]'s **sync probe** ([`BlobStoreGet`]).
+/// Error from a [`LazyReader`]'s **sync probe** ([`BlobStoreGet`]).
 #[derive(Debug)]
 pub enum WantGetError<E, W> {
     /// The bytes were present locally but didn't convert to the
@@ -191,7 +193,7 @@ where
     }
 }
 
-/// Error from a [`WantingReader`]'s **async waiting read**
+/// Error from a [`LazyReader`]'s **async waiting read**
 /// ([`AsyncBlobStoreGet`](super::async_store::AsyncBlobStoreGet)).
 ///
 /// There is deliberately no "not yet" variant: the async read *resolves*
@@ -239,7 +241,7 @@ where
     }
 }
 
-/// The wake channel between a `Wanting`'s put-side and its suspended
+/// The wake channel between a `Lazy`'s put-side and its suspended
 /// async reads. Pure `std`: a parked-waker list drained by
 /// [`wake_all`](Self::wake_all) plus a lazily-spawned cadence ticker
 /// that covers landings from other handles/processes. No runtime, no
@@ -285,7 +287,7 @@ impl WantSignal {
     /// Ensure the cadence ticker is running: a thread that wakes all
     /// parked waiters every [`WANT_RECHECK_CADENCE`], causing them to
     /// re-poll (which takes a fresh reader = a store refresh) and so
-    /// observe blobs landed by writers this `Wanting` cannot see
+    /// observe blobs landed by writers this `Lazy` cannot see
     /// directly. Holds only a [`Weak`](std::sync::Weak) reference and
     /// retires itself when no waiter is parked, so it never outlives
     /// demand.
@@ -322,9 +324,9 @@ impl WantSignal {
 /// docs](self) for the full mental model.
 ///
 /// Mirrors the shared-store shape of `triblespace-net`'s `Peer`
-/// (`Arc<Mutex<S>>`) so a `&self` read on a [`WantingReader`] can record
+/// (`Arc<Mutex<S>>`) so a `&self` read on a [`LazyReader`] can record
 /// the weak-pin want — the one piece of state a read must mutate.
-pub struct Wanting<S>
+pub struct Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -332,11 +334,11 @@ where
     signal: Arc<WantSignal>,
 }
 
-impl<S> Wanting<S>
+impl<S> Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
-    /// Wrap a store. No network is opened — `Wanting` is pure local
+    /// Wrap a store. No network is opened — `Lazy` is pure local
     /// mechanics. (A cadence re-check thread is spawned lazily only
     /// while an async read is suspended, and retires itself when none
     /// is.)
@@ -349,7 +351,7 @@ where
 
     /// Lock and borrow the underlying store, for store-specific methods
     /// that aren't part of the storage traits. Don't hold the guard
-    /// across calls back into the `Wanting` — its own methods take the
+    /// across calls back into the `Lazy` — its own methods take the
     /// same lock. Note that blobs landed through this raw guard bypass
     /// the immediate waiter wake-up; suspended async reads still observe
     /// them at the next cadence re-check.
@@ -357,11 +359,11 @@ where
         self.store.lock().expect("store mutex")
     }
 
-    /// Consume the `Wanting` and return the underlying store.
+    /// Consume the `Lazy` and return the underlying store.
     ///
     /// # Panics
     ///
-    /// Panics if an outstanding [`WantingReader`] still shares the store
+    /// Panics if an outstanding [`LazyReader`] still shares the store
     /// — drop all readers first.
     pub fn into_store(self) -> S {
         match Arc::try_unwrap(self.store) {
@@ -369,13 +371,13 @@ where
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             Err(_) => panic!(
-                "Wanting::into_store: an outstanding WantingReader still shares the store; drop readers first"
+                "Lazy::into_store: an outstanding LazyReader still shares the store; drop readers first"
             ),
         }
     }
 }
 
-impl<S> BlobStorePut for Wanting<S>
+impl<S> BlobStorePut for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -397,16 +399,16 @@ where
     }
 }
 
-impl<S> BlobStore for Wanting<S>
+impl<S> BlobStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
-    type Reader = WantingReader<S>;
+    type Reader = LazyReader<S>;
     type ReaderError = S::ReaderError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         let local = self.store.lock().expect("store mutex").reader()?;
-        Ok(WantingReader {
+        Ok(LazyReader {
             local,
             store: self.store.clone(),
             signal: self.signal.clone(),
@@ -414,7 +416,7 @@ where
     }
 }
 
-impl<S> PinStore for Wanting<S>
+impl<S> PinStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -448,7 +450,7 @@ where
     }
 }
 
-impl<S> WeakPinStore for Wanting<S>
+impl<S> WeakPinStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -487,7 +489,7 @@ where
     }
 }
 
-impl<S> StorageFlush for Wanting<S>
+impl<S> StorageFlush for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -503,8 +505,8 @@ where
 /// Async put: semantically identical to the sync [`BlobStorePut`] (a
 /// local store write is genuinely synchronous — the future resolves on
 /// first poll), present so a generic async consumer can drive a
-/// `Wanting` end to end. Landing a blob wakes suspended async reads.
-impl<S> AsyncBlobStorePut for Wanting<S>
+/// `Lazy` end to end. Landing a blob wakes suspended async reads.
+impl<S> AsyncBlobStorePut for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -546,12 +548,12 @@ where
 /// Async reader creation: resolves on first poll (taking a reader is a
 /// local operation). The reader carries both read surfaces — the sync
 /// probe and the async waiting read.
-impl<S> AsyncBlobStore for Wanting<S>
+impl<S> AsyncBlobStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
     S::Reader: Sync,
 {
-    type Reader = WantingReader<S>;
+    type Reader = LazyReader<S>;
     type ReaderError = S::ReaderError;
 
     fn reader(
@@ -561,7 +563,7 @@ where
         let signal = self.signal.clone();
         async move {
             let local = store.lock().expect("store mutex").reader()?;
-            Ok(WantingReader {
+            Ok(LazyReader {
                 local,
                 store,
                 signal,
@@ -575,7 +577,7 @@ where
 /// appended by other processes become visible — and does a local get.
 /// The first miss records the durable want (pin + flush, exactly like
 /// the sync probe), then the future parks until woken: by an in-process
-/// `put` through the owning [`Wanting`], or by the cadence ticker.
+/// `put` through the owning [`Lazy`], or by the cadence ticker.
 ///
 /// Cancellation-safe: dropping the future abandons the wait; the
 /// durable want remains recorded.
@@ -635,7 +637,7 @@ where
         // lock, and its wake_all after that).
         this.signal.register(cx.waker());
         drop(store);
-        // Cover landings this `Wanting` can't observe directly (another
+        // Cover landings this `Lazy` can't observe directly (another
         // handle / another process): cadence re-check while parked.
         WantSignal::ensure_ticker(&this.signal);
         Poll::Pending
@@ -645,7 +647,7 @@ where
 /// The async **waiting read**: present resolves immediately; missing
 /// records the durable want and suspends until the blob lands in the
 /// store. See the [module-level docs](self) for the probe/wait split.
-impl<S> AsyncBlobStoreGet for WantingReader<S>
+impl<S> AsyncBlobStoreGet for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -688,7 +690,7 @@ where
 
 /// Async listing over the local snapshot — zero-await, resolves on
 /// first poll (enumeration is local; it never records wants).
-impl<S> AsyncBlobStoreList for WantingReader<S>
+impl<S> AsyncBlobStoreList for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
     S::Reader: Sync,
@@ -705,7 +707,7 @@ where
     }
 }
 
-/// The read view of a [`Wanting`]: the store's own reader snapshot plus
+/// The read view of a [`Lazy`]: the store's own reader snapshot plus
 /// a want-recording handle into the shared store.
 ///
 /// Two read surfaces with deliberately different semantics (see the
@@ -723,7 +725,7 @@ where
 /// probes. Don't drive conservative reference scans ([`super::BlobChildren`])
 /// through this reader; that's why it deliberately doesn't implement the
 /// trait.
-pub struct WantingReader<S>
+pub struct LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -731,7 +733,7 @@ where
     /// Want-recording handle into the shared store: a `&self` read must
     /// be able to weak-pin the missed handle and flush the marker.
     store: Arc<Mutex<S>>,
-    /// Wake channel shared with the owning [`Wanting`], so a suspended
+    /// Wake channel shared with the owning [`Lazy`], so a suspended
     /// async read hears about in-process landings immediately.
     signal: Arc<WantSignal>,
 }
@@ -739,7 +741,7 @@ where
 // Identity ignores the store handle: two readers are equal iff their
 // local snapshots are — the handle is a capability, not part of the
 // snapshot's value. (Mirrors `PeerReader` in triblespace-net.)
-impl<S> Clone for WantingReader<S>
+impl<S> Clone for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -751,7 +753,7 @@ where
         }
     }
 }
-impl<S> PartialEq for WantingReader<S>
+impl<S> PartialEq for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -759,9 +761,9 @@ where
         self.local == other.local
     }
 }
-impl<S> Eq for WantingReader<S> where S: BlobStore + WeakPinStore + StorageFlush + Send + 'static {}
+impl<S> Eq for LazyReader<S> where S: BlobStore + WeakPinStore + StorageFlush + Send + 'static {}
 
-impl<S> BlobStoreGet for WantingReader<S>
+impl<S> BlobStoreGet for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -806,7 +808,7 @@ where
     }
 }
 
-impl<S> BlobStoreList for WantingReader<S>
+impl<S> BlobStoreList for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
@@ -841,7 +843,7 @@ mod tests {
     /// A local hit serves from the snapshot: no want is recorded.
     #[test]
     fn local_hit_serves_without_recording_want() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
+        let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, handle) = blob_of(b"resident");
         BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
 
@@ -860,7 +862,7 @@ mod tests {
     fn miss_records_durable_want_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lazy.pile");
-        let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
+        let mut lazy: Lazy<Pile> = Lazy::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"wanted but absent");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
@@ -982,7 +984,7 @@ mod tests {
     /// because a failing-but-typed flush needs no separate mechanism.
     #[test]
     fn want_record_failure_is_an_error() {
-        let mut lazy = Wanting::new(FailingPins::default());
+        let mut lazy = Lazy::new(FailingPins::default());
         let (_, handle) = blob_of(b"unrecordable");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
@@ -999,7 +1001,7 @@ mod tests {
     /// is a wait nobody will ever satisfy.
     #[test]
     fn async_want_record_failure_is_an_error() {
-        let mut lazy = Wanting::new(FailingPins::default());
+        let mut lazy = Lazy::new(FailingPins::default());
         let (_, handle) = blob_of(b"unrecordable");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
@@ -1026,7 +1028,7 @@ mod tests {
     /// no want recorded, no suspension.
     #[test]
     fn async_get_present_resolves_immediately() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
+        let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, handle) = blob_of(b"already here");
         BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
 
@@ -1038,11 +1040,11 @@ mod tests {
     }
 
     /// The in-process wake path: the first poll records the durable want
-    /// and parks; a `put` through the same `Wanting` wakes the waiter;
+    /// and parks; a `put` through the same `Lazy` wakes the waiter;
     /// the re-poll resolves.
     #[test]
     fn async_get_wakes_on_in_process_put() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
+        let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, handle) = blob_of(b"lands in process");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
@@ -1077,7 +1079,7 @@ mod tests {
     /// but the durable want REMAINS recorded.
     #[test]
     fn dropped_wait_keeps_want_recorded() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
+        let mut lazy = Lazy::new(MemoryRepo::default());
         let (_, handle) = blob_of(b"nobody lands this");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
@@ -1103,7 +1105,7 @@ mod tests {
     fn async_get_resolves_once_landed_by_second_handle() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared.pile");
-        let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
+        let mut lazy: Lazy<Pile> = Lazy::new(fresh_pile(&path));
         let (blob, handle) = blob_of(b"landed later");
 
         let writer_path = path.clone();
@@ -1133,7 +1135,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("corrupt.pile");
-        let mut lazy: LazyPile = Wanting::new(fresh_pile(&path));
+        let mut lazy: Lazy<Pile> = Lazy::new(fresh_pile(&path));
         let (_, handle) = blob_of(b"unreachable");
         let reader = BlobStore::reader(&mut lazy).unwrap();
 
@@ -1155,11 +1157,11 @@ mod tests {
         );
     }
 
-    /// A generic async consumer can drive a `Wanting` end to end through
+    /// A generic async consumer can drive a `Lazy` end to end through
     /// the async traits alone: put → reader → get → blobs.
     #[test]
     fn async_traits_roundtrip() {
-        let mut lazy = Wanting::new(MemoryRepo::default());
+        let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, _) = blob_of(b"through the async surface");
 
         let handle =
@@ -1182,8 +1184,8 @@ mod tests {
     fn _assert_send<F: Send>(_: F) {}
     #[allow(dead_code)]
     fn _send_proof(
-        lazy: &mut Wanting<MemoryRepo>,
-        reader: &WantingReader<MemoryRepo>,
+        lazy: &mut Lazy<MemoryRepo>,
+        reader: &LazyReader<MemoryRepo>,
         handle: Inline<Handle<UnknownBlob>>,
     ) {
         _assert_send(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(reader, handle));
