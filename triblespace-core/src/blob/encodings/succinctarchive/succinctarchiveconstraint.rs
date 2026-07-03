@@ -2,8 +2,8 @@ use std::ops::Not;
 use std::ops::Range;
 
 use super::*;
-use crate::query::*;
 use crate::inline::encodings::genid::GenId;
+use crate::query::*;
 use jerky::bit_vector::Select;
 
 pub struct SuccinctArchiveConstraint<'a, U>
@@ -74,6 +74,30 @@ where
     }
 }
 
+/// Width of the [`restrict_range`] result without computing its position:
+/// the `select1` base shifts both endpoints equally, so the range's LENGTH
+/// (and emptiness) are pure rank differences — `rank(e,d) - rank(s,d)`.
+/// `confirm` and `estimate` only ever ask "how wide" / "is it empty", so
+/// they use this and skip the select entirely; only `propose` needs the
+/// positionally anchored range from [`restrict_range`].
+fn restrict_len<U>(
+    universe: &U,
+    c: &WaveletMatrix<Rank9SelIndex>,
+    value: &RawInline,
+    r: &Range<usize>,
+) -> usize
+where
+    U: Universe,
+{
+    if let Some(d) = universe.search(value) {
+        c.rank(r.end, d)
+            .unwrap()
+            .saturating_sub(c.rank(r.start, d).unwrap())
+    } else {
+        0
+    }
+}
+
 impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -130,36 +154,15 @@ where
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.aev_c,
-                    v,
-                    &r,
-                );
-                r.len()
+                restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r)
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.eav_c,
-                    v,
-                    &r,
-                );
-                r.len()
+                restrict_len(&self.archive.domain, &self.archive.eav_c, v, &r)
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.a_a,
-                    &self.archive.eva_c,
-                    a,
-                    &r,
-                );
-                r.len()
+                restrict_len(&self.archive.domain, &self.archive.eva_c, a, &r)
             }
             _ => unreachable!(),
         })
@@ -411,85 +414,37 @@ where
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 proposals.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.eva_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.eva_c, a, &r) != 0
                 });
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 proposals.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.eav_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.eav_c, v, &r) != 0
                 });
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
                 proposals.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.ave_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.ave_c, e, &r) != 0
                 });
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
                 proposals.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r) != 0
                 });
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
                 proposals.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.vae_c, e, &r) != 0
                 });
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
                 proposals.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.vea_c, a, &r) != 0
                 });
             }
             (None, Some(a), Some(v), true, false, false) => {
@@ -502,15 +457,7 @@ where
                     &r,
                 );
                 proposals.retain(|e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.vae_c, e, &r) != 0
                 });
             }
             (Some(e), None, Some(v), false, true, false) => {
@@ -523,15 +470,7 @@ where
                     &r,
                 );
                 proposals.retain(|a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.vea_c, a, &r) != 0
                 });
             }
             (Some(e), Some(a), None, false, false, true) => {
@@ -544,15 +483,7 @@ where
                     &r,
                 );
                 proposals.retain(|v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
+                    restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r) != 0
                 });
             }
             _ => unreachable!("invalid trible constraint state"),
