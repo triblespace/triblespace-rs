@@ -1848,7 +1848,7 @@ mod tests {
                 assert_readable_bytes(&reader, *raw, expected, seed, step);
             }
 
-            for raw in weak.intersection(&strong_keep) {
+            if let Some(raw) = weak.intersection(&strong_keep).next() {
                 panic!("seed {seed} step {step}: weak pin {raw:02X?} leaked into strong keep");
             }
 
