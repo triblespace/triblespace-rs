@@ -852,6 +852,9 @@ pub enum PushError<Storage: PinStore + BlobStore> {
     BranchUpdate(Storage::UpdateError),
     /// Malformed branch metadata.
     BadBranchMetadata(),
+    /// Malformed commit metadata encountered while computing the push's
+    /// content delta for on-commit hooks.
+    BadCommitMetadata(),
     /// Merge failed while retrying a push.
     MergeError(MergeError),
 }
@@ -933,6 +936,57 @@ where
     Create(BranchError<Storage>),
 }
 
+/// An on-commit hook, run by [`Repository::try_push`] once per push
+/// attempt, after the new branch-head tribleset has been assembled and
+/// before it is CAS'd in.
+///
+/// Arguments, in order:
+///
+/// 1. `&mut Storage` — the repository's storage, for uploading derived
+///    blobs (index segments). Blobs uploaded by a losing attempt are
+///    unreferenced and content-addressed: a retry dedupes against them
+///    and GC reclaims them otherwise.
+/// 2. [`Id`] — the branch being pushed.
+/// 3. `&TribleSet` — the push's **content delta**: the union of the
+///    content of every commit reachable from the new head but not from
+///    the base head. Incremental by construction — never the whole
+///    branch.
+/// 4. `&mut TribleSet` — the branch-head tribleset about to be CAS'd
+///    in. A hook folds its derived state (e.g. an index-home manifest)
+///    into this set, so commit and maintenance land in **one** atomic
+///    repoint; there is no second CAS to race.
+///
+/// Hooks run once per push *attempt*: after a CAS conflict the push
+/// merges and retries, and hooks re-run against the fresh base metadata
+/// and that attempt's delta (the mutated head tribleset of a losing
+/// attempt is discarded wholesale, so nothing a hook did leaks across
+/// attempts). Hooks must therefore be idempotent at the storage level —
+/// content-addressed blob uploads, as in
+/// [`Repository::register_index`], satisfy this for free.
+///
+/// A hook error never blocks or corrupts the commit: the hook's changes
+/// to the head tribleset are discarded, the error is recorded for
+/// [`Repository::take_hook_errors`], and the push proceeds.
+pub type CommitHook<Storage> = Box<
+    dyn FnMut(
+            &mut Storage,
+            Id,
+            &TribleSet,
+            &mut TribleSet,
+        ) -> Result<(), Box<dyn Error + Send + Sync>>
+        + Send,
+>;
+
+/// A hook failure recorded (and skipped) during a push. Drained via
+/// [`Repository::take_hook_errors`].
+#[derive(Debug)]
+pub struct HookError {
+    /// The branch that was being pushed when the hook failed.
+    pub branch: Id,
+    /// The hook's error.
+    pub error: Box<dyn Error + Send + Sync>,
+}
+
 /// High-level wrapper combining a blob store and branch store into a usable
 /// repository API.
 ///
@@ -943,6 +997,12 @@ pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,
     commit_metadata: MetadataHandle,
+    /// On-commit hooks (see [`CommitHook`]); empty by default, in which
+    /// case pushes take the plain path with zero added work.
+    hooks: Vec<CommitHook<Storage>>,
+    /// Hook failures skipped by pushes since the last
+    /// [`take_hook_errors`](Self::take_hook_errors).
+    hook_errors: Vec<HookError>,
 }
 
 /// Error returned by [`Repository::pull`].
@@ -1020,7 +1080,76 @@ where
             storage,
             signing_key,
             commit_metadata,
+            hooks: Vec::new(),
+            hook_errors: Vec::new(),
         })
+    }
+
+    /// Register an on-commit hook (see [`CommitHook`] for the contract:
+    /// arguments, per-attempt re-runs, and the skip-on-error policy).
+    ///
+    /// Hooks run in registration order inside every subsequent
+    /// [`push`](Self::push)/[`try_push`](Self::try_push) that lands a new
+    /// commit. For the common "maintain a derived index" case, prefer the
+    /// [`register_index`](Self::register_index) convenience.
+    pub fn on_commit<F>(&mut self, hook: F)
+    where
+        F: FnMut(
+                &mut Storage,
+                Id,
+                &TribleSet,
+                &mut TribleSet,
+            ) -> Result<(), Box<dyn Error + Send + Sync>>
+            + Send
+            + 'static,
+    {
+        self.hooks.push(Box::new(hook));
+    }
+
+    /// Register an [`IndexKind`](index_home::IndexKind) for automatic,
+    /// incremental on-commit maintenance: every push builds one level-0
+    /// segment from the push's content delta and folds the updated
+    /// manifest into the same branch-head tribleset the push CAS's in
+    /// (via [`index_home::append_segment`]); the size-tiered merge keeps
+    /// read fan-out bounded. Kinds that select their own source subset
+    /// during `build` (like `Bm25Rollup`) need nothing more; to restrict
+    /// what a kind even sees, use
+    /// [`register_index_filtered`](Self::register_index_filtered).
+    pub fn register_index<K>(&mut self, kind: K)
+    where
+        K: index_home::IndexKind + Send + 'static,
+    {
+        self.register_index_filtered(kind, |delta: &TribleSet| delta.clone());
+    }
+
+    /// Like [`register_index`](Self::register_index), but each commit's
+    /// content delta is first passed through `filter` to select the
+    /// kind's source subset (e.g. only tribles under the attributes the
+    /// index covers). When the filtered source is empty the commit
+    /// appends no segment at all.
+    pub fn register_index_filtered<K, F>(&mut self, kind: K, mut filter: F)
+    where
+        K: index_home::IndexKind + Send + 'static,
+        F: FnMut(&TribleSet) -> TribleSet + Send + 'static,
+    {
+        self.on_commit(move |storage, _branch, delta, head_meta| {
+            let source = filter(delta);
+            if source.is_empty() {
+                return Ok(());
+            }
+            index_home::append_segment(storage, &kind, &source, head_meta)
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        });
+    }
+
+    /// Drain the hook failures recorded (and skipped) by pushes since the
+    /// last call. An entry here means a commit landed *without* that
+    /// hook's contribution — for index hooks the index is soft state and
+    /// simply missing that delta; it can be repaired by an explicit
+    /// [`IndexHome::update_index`](index_home::IndexHome::update_index)
+    /// over the missed range (or a rebuild), never by re-writing history.
+    pub fn take_hook_errors(&mut self) -> Vec<HookError> {
+        std::mem::take(&mut self.hook_errors)
     }
 
     /// Consume the repository and return the underlying storage backend.
@@ -1350,6 +1479,61 @@ where
         // ephemeral (re-derivable by IndexHome::update_index); only the
         // rebuild cadence changes.
         branch_meta += crate::repo::index_home::manifest_tribles(&base_branch_meta);
+
+        // On-commit hooks: fold derived state (index-home segments) into
+        // the SAME branch-head tribleset this push is about to CAS in —
+        // one atomic repoint carries the commit and its index maintenance
+        // together, so hooks never race the branch pin with a second CAS.
+        // Runs once per push ATTEMPT (see [`CommitHook`] for the retry and
+        // failure contract); with no hooks registered this is a single
+        // `is_empty` check.
+        if !self.hooks.is_empty() {
+            let convert = |e: WorkspaceCheckoutError<
+                <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
+            >| match e {
+                WorkspaceCheckoutError::Storage(e) => PushError::StorageGet(e),
+                WorkspaceCheckoutError::BadCommitMetadata() => PushError::BadCommitMetadata(),
+            };
+
+            // The push's content delta: the union of the content of every
+            // commit reachable from the new head but not from the base
+            // head. Bounded by what this push adds — never the whole
+            // branch. (Stopping on the base head's full ancestor closure
+            // matters for merge commits: a conflict-retry merge reaches
+            // old history through the caller's side, and those commits
+            // are already covered by the winner's head.)
+            let new_commits = match workspace.base_head {
+                None => collect_reachable(workspace, head_handle).map_err(convert)?,
+                Some(base) => {
+                    let stop = collect_reachable(workspace, base).map_err(convert)?;
+                    let mut seeds = CommitSet::new();
+                    seeds.insert(&Entry::new(&head_handle.raw));
+                    collect_reachable_from_patch_until(workspace, seeds, &stop)
+                        .map_err(convert)?
+                }
+            };
+            let delta = workspace
+                .checkout_commits(new_commits.iter().map(|raw| Inline::new(*raw)))
+                .map_err(convert)?;
+
+            let branch_id = workspace.base_branch_id;
+            for hook in self.hooks.iter_mut() {
+                // Per-hook atomicity: run against a scratch copy (cheap —
+                // TribleSet is persistent) so a failing hook contributes
+                // nothing instead of leaving the head half-mutated. The
+                // commit is the user's data; the hook's output is derived,
+                // re-buildable soft state — so on error we skip the hook,
+                // record it for `take_hook_errors`, and push anyway.
+                let mut scratch = branch_meta.clone();
+                match hook(&mut self.storage, branch_id, &delta, &mut scratch) {
+                    Ok(()) => branch_meta = scratch,
+                    Err(error) => self.hook_errors.push(HookError {
+                        branch: branch_id,
+                        error,
+                    }),
+                }
+            }
+        }
 
         let branch_meta_handle = self
             .storage

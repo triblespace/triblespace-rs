@@ -483,4 +483,85 @@ mod tests {
             assert!(hits.contains(&key.raw), "doc {id:x} findable by `{first_tok}`");
         }
     }
+
+    #[test]
+    fn on_commit_hook_maintains_bm25_incrementally() {
+        // The on-commit trigger, end-to-end through a real `Repository`:
+        // the hook builds one BM25 segment per push from that push's
+        // content delta, resolving `Handle<LongString>` text through a
+        // reader taken FRESH inside the hook (readers are pinned
+        // snapshots, so a registration-time reader would never see the
+        // blobs later pushes upload). A SuccinctRollup registered
+        // alongside proves two real kinds coexist on one branch head.
+        use triblespace_core::repo::index_home::{append_segment, SuccinctRollup};
+        use triblespace_core::repo::Repository;
+
+        let storage = MemoryRepo::default();
+        let mut repo = Repository::new(
+            storage,
+            ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]),
+            TribleSet::new(),
+        )
+        .unwrap();
+
+        let content_attr = content.id();
+        repo.on_commit(move |storage, _branch, delta, head| {
+            let reader = storage
+                .reader()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let kind = Bm25Rollup::new(reader, content_attr);
+            append_segment(storage, &kind, delta, head)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        });
+        repo.register_index(SuccinctRollup::new());
+
+        let branch = repo.create_branch("main", None).unwrap();
+
+        // Two pushes, two content batches — the hook must index each
+        // push's delta as its own segment.
+        let all = synthetic(40);
+        for batch in all.chunks(20) {
+            let mut ws = repo.pull(*branch).unwrap();
+            let mut set = TribleSet::new();
+            for (id, text) in batch {
+                let h: Inline<Handle<LongString>> = ws.put(text.clone());
+                set += entity! { triblespace_core::id::ExclusiveId::force_ref(id) @ content: h };
+            }
+            ws.commit(set, "batch");
+            repo.push(&mut ws).unwrap();
+        }
+        assert!(repo.take_hook_errors().is_empty(), "hooks ran clean");
+
+        // Attach the BM25 segments straight off the branch head — no
+        // checkout, no explicit update_index ever ran.
+        let reader = repo.storage_mut().reader().unwrap();
+        let kind = Bm25Rollup::new(reader, content_attr);
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, kind);
+        assert_eq!(home.read_manifest().unwrap().len(), 2, "one segment per push");
+        let segs = home.attach_all().unwrap();
+        let total: usize = segs.iter().map(|s| s.doc_count()).sum();
+        assert_eq!(total, all.len(), "every pushed doc indexed");
+
+        // Matched-doc sets equal the monolithic oracle's.
+        for q in ["memory search", "alpha", "rollup segment merge"] {
+            let got: HashSet<RawInline> = query_across(&segs, &hash_tokens(q))
+                .into_iter()
+                .map(|(d, _)| d.raw)
+                .collect();
+            let want: HashSet<RawInline> = oracle_ranked(&all, q)
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            assert_eq!(got, want, "query `{q}`: hook-built index == oracle set");
+        }
+
+        // The SuccinctRollup manifest coexists on the same branch head.
+        let mut succinct_home =
+            IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+        assert_eq!(
+            succinct_home.read_manifest().unwrap().len(),
+            2,
+            "second kind maintained on the same commits"
+        );
+    }
 }

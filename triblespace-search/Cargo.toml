@@ -25,6 +25,10 @@ exclude = ["target/", "Cargo.lock", ".git/"]
 # transitively; declaring it here keeps the tests building even
 # if the transitive chain changes.
 tempfile = "3"
+# ed25519-dalek — tests that drive a full `Repository` (on-commit
+# index hooks) need a `SigningKey`. Already in the tree via
+# triblespace-core.
+ed25519-dalek = "2.1"
 
 [dependencies]
 # Depend directly on `triblespace-core` rather than the umbrella
