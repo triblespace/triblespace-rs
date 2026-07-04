@@ -495,11 +495,17 @@ where
     /// The three two-bound arms are contiguous wavelet sweeps
     /// (`restrict_range(..).map(|i| wm.access(i))`); across a block the
     /// sibling rows' sweeps concatenate into one ragged access stream on
-    /// a single ring column — one range computation per row, then either
-    /// a tight CPU access loop or a single `access_batch` GPU dispatch.
-    /// Per-row `unique()` and domain resolution stay on the CPU. All
-    /// other arms (`enumerate_in`'s select-strides are a sequential
-    /// dependent chain) keep the per-row sequential propose.
+    /// a single ring column, dispatched as one `access_batch`. Per-row
+    /// `unique()` and domain resolution stay on the CPU. All other arms
+    /// (`enumerate_in`'s select-strides are a sequential dependent chain)
+    /// keep the per-row sequential propose.
+    ///
+    /// The batched sweep is only taken when the GPU ring is present: on a
+    /// pure CPU archive the concatenated `access` loop does exactly the
+    /// sequential work plus the frontier-materialization overhead, with no
+    /// batching payoff — measured a net loss on isect/chain — so CPU falls
+    /// through to the per-row path. (Confirm is different: its batch is
+    /// cache-friendlier even on CPU, so `confirm_blocked` always batches.)
     fn propose_blocked(
         &self,
         variable: VariableId,
@@ -513,6 +519,31 @@ where
         }
         let stride = vars.len();
         debug_assert!(stride > 0);
+
+        // Per-row sequential propose — the CPU-optimal path and the
+        // fallback for non-sweep arms.
+        let sequential = |this: &Self, pairs: &mut Vec<(u32, RawInline)>| {
+            let mut binding = Binding::default();
+            let mut scratch: Vec<RawInline> = Vec::new();
+            for (i, row) in rows.chunks_exact(stride).enumerate() {
+                for (k, &v) in vars.iter().enumerate() {
+                    binding.set(v, &row[k]);
+                }
+                scratch.clear();
+                this.propose(variable, &binding, &mut scratch);
+                pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+            }
+        };
+
+        // No GPU consumer for the batch → CPU sequential is faster.
+        #[cfg(feature = "gpu")]
+        let gpu_present = self.archive.gpu.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let gpu_present = false;
+        if !gpu_present {
+            sequential(self, pairs);
+            return;
+        }
 
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
@@ -546,19 +577,9 @@ where
                 }),
             ),
             _ => {
-                // Non-sweep arm: per-row sequential propose (mirrors the
-                // trait default; kept local so the sweep arms above can
-                // stay on the batched path).
-                let mut binding = Binding::default();
-                let mut scratch: Vec<RawInline> = Vec::new();
-                for (i, row) in rows.chunks_exact(stride).enumerate() {
-                    for (k, &v) in vars.iter().enumerate() {
-                        binding.set(v, &row[k]);
-                    }
-                    scratch.clear();
-                    self.propose(variable, &binding, &mut scratch);
-                    pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
-                }
+                // Non-sweep arm (enumerate_in select-strides): per-row
+                // sequential propose.
+                sequential(self, pairs);
                 return;
             }
         };
