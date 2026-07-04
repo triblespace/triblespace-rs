@@ -101,3 +101,73 @@ fn gpu_paths_match_cpu() {
     assert_eq!(scan(&cpu), scan(&gpu), "scan mismatch");
     assert_eq!(scan(&cpu), set.len() as usize, "scan covers the set");
 }
+
+/// PROBE: the frontier-batched solver with the GPU ring enabled and
+/// `TRIBLES_GPU_MIN_BATCH=1` routes every blocked confirm through
+/// `rank_batch`; result multisets must match the sequential CPU engine.
+#[test]
+#[ignore = "needs a wgpu device"]
+fn blocked_gpu_paths_match_sequential_cpu() {
+    use std::collections::HashMap;
+    std::env::set_var("TRIBLES_GPU_MIN_BATCH", "1");
+
+    let set = fixture();
+    let cpu: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let mut gpu = cpu.clone();
+    gpu.enable_gpu().expect("gpu upload");
+
+    fn multiset<T: std::hash::Hash + Eq>(items: impl IntoIterator<Item = T>) -> HashMap<T, usize> {
+        let mut m = HashMap::new();
+        for item in items {
+            *m.entry(item).or_insert(0usize) += 1;
+        }
+        m
+    }
+
+    let kid: Id = find!((k: Id), pattern!(&cpu, [{ zoo::kind: ?k }]))
+        .map(|(k,)| k)
+        .next()
+        .expect("a kind exists");
+
+    // Star with value-bound clause.
+    let star_cpu = multiset(find!(
+        (e: Inline<GenId>, h: Inline<GenId>),
+        pattern!(&cpu, [{ ?e @ zoo::kind: kid, zoo::home: ?h }])
+    ));
+    let star_gpu = multiset(
+        find!(
+            (e: Inline<GenId>, h: Inline<GenId>),
+            pattern!(&gpu, [{ ?e @ zoo::kind: kid, zoo::home: ?h }])
+        )
+        .solve_blocked(),
+    );
+    assert_eq!(star_cpu, star_gpu, "blocked-gpu kind-star mismatch");
+
+    // Attribute intersection, nothing value-bound.
+    let isect_cpu = multiset(find!(
+        (e: Inline<GenId>, k: Inline<GenId>, h: Inline<GenId>),
+        pattern!(&cpu, [{ ?e @ zoo::kind: ?k, zoo::home: ?h }])
+    ));
+    let isect_gpu = multiset(
+        find!(
+            (e: Inline<GenId>, k: Inline<GenId>, h: Inline<GenId>),
+            pattern!(&gpu, [{ ?e @ zoo::kind: ?k, zoo::home: ?h }])
+        )
+        .solve_blocked(),
+    );
+    assert_eq!(isect_cpu, isect_gpu, "blocked-gpu intersection mismatch");
+
+    // Chain join across entities.
+    let chain_cpu = multiset(find!(
+        (e: Inline<GenId>, b: Inline<GenId>, k: Inline<GenId>),
+        pattern!(&cpu, [{ ?e @ zoo::boss: ?b }, { ?b @ zoo::kind: ?k }])
+    ));
+    let chain_gpu = multiset(
+        find!(
+            (e: Inline<GenId>, b: Inline<GenId>, k: Inline<GenId>),
+            pattern!(&gpu, [{ ?e @ zoo::boss: ?b }, { ?b @ zoo::kind: ?k }])
+        )
+        .solve_blocked(),
+    );
+    assert_eq!(chain_cpu, chain_gpu, "blocked-gpu chain mismatch");
+}

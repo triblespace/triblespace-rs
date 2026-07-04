@@ -489,4 +489,205 @@ where
             _ => unreachable!("invalid trible constraint state"),
         }
     }
+
+    /// PROBE: whole-frontier confirm for the blocked solver.
+    ///
+    /// The sequential [`confirm`](Self::confirm) computes one range per
+    /// call and then runs 2 wavelet ranks per candidate; called once per
+    /// branch, those ranks arrive in batches of 1–4 — far below any
+    /// batching break-even. Here the *entire frontier* of
+    /// `(row, candidate)` pairs shares the same arm (the bound-variable
+    /// set is uniform across a block), so all emptiness tests become one
+    /// ragged rank stream over a single wavelet matrix:
+    ///
+    /// - per **row**: one range computation (base or restricted), reused
+    ///   for all of the row's candidates;
+    /// - per **pair**: one `domain.search` + two rank probes
+    ///   (`rank(r.start, d)`, `rank(r.end, d)`) — the select1 base offset
+    ///   cancels in the emptiness comparison, exactly as in the
+    ///   sequential `restrict_len` path.
+    ///
+    /// The probe stream is evaluated CPU-batched by default, or as one
+    /// `rank_batch` GPU dispatch when the archive's GPU ring is enabled
+    /// and the stream is above the sync break-even threshold.
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+        {
+            return;
+        }
+        #[cfg(feature = "gpu")]
+        super::gpu::stats::record_confirm(pairs.len());
+        if pairs.is_empty() {
+            return;
+        }
+
+        let e_var = self.variable_e == variable;
+        let a_var = self.variable_a == variable;
+        let v_var = self.variable_v == variable;
+
+        let stride = vars.len();
+        debug_assert!(stride > 0);
+        let pe = vars.iter().position(|&x| x == self.variable_e);
+        let pa = vars.iter().position(|&x| x == self.variable_a);
+        let pv = vars.iter().position(|&x| x == self.variable_v);
+
+        let archive = self.archive;
+        type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
+        let (col, range_fn): (RingCol, RangeFn<'_>) = match (pe, pa, pv, e_var, a_var, v_var) {
+            // Nothing of this constraint bound: candidates are checked
+            // against the prefix bit vector only — row-independent, no
+            // wavelet work to batch.
+            (None, None, None, ..) => {
+                let prefix = if e_var {
+                    &archive.e_a
+                } else if a_var {
+                    &archive.a_a
+                } else {
+                    &archive.v_a
+                };
+                pairs.retain(|(_, val)| {
+                    base_range(&archive.domain, prefix, val).is_empty().not()
+                });
+                return;
+            }
+            (Some(pe), None, None, false, true, false) => (
+                RingCol::EvaC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.e_a, &row[pe])
+                }),
+            ),
+            (Some(pe), None, None, false, false, true) => (
+                RingCol::EavC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.e_a, &row[pe])
+                }),
+            ),
+            (None, Some(pa), None, true, false, false) => (
+                RingCol::AveC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.a_a, &row[pa])
+                }),
+            ),
+            (None, Some(pa), None, false, false, true) => (
+                RingCol::AevC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.a_a, &row[pa])
+                }),
+            ),
+            (None, None, Some(pv), true, false, false) => (
+                RingCol::VaeC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.v_a, &row[pv])
+                }),
+            ),
+            (None, None, Some(pv), false, true, false) => (
+                RingCol::VeaC,
+                Box::new(move |row: &[RawInline]| {
+                    base_range(&archive.domain, &archive.v_a, &row[pv])
+                }),
+            ),
+            (None, Some(pa), Some(pv), true, false, false) => (
+                RingCol::VaeC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
+                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                }),
+            ),
+            (Some(pe), None, Some(pv), false, true, false) => (
+                RingCol::VeaC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                }),
+            ),
+            (Some(pe), Some(pa), None, false, false, true) => (
+                RingCol::AevC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                }),
+            ),
+            _ => unreachable!("invalid trible constraint state"),
+        };
+
+        // Accumulate the ragged probe stream: 2 ranks per surviving pair,
+        // one range per distinct row (pairs are grouped by row).
+        let mut probe_pos: Vec<usize> = Vec::with_capacity(2 * pairs.len());
+        let mut probe_val: Vec<usize> = Vec::with_capacity(2 * pairs.len());
+        let mut has_probes: Vec<bool> = Vec::with_capacity(pairs.len());
+        let mut current_row: Option<u32> = None;
+        let mut r: Range<usize> = 0..0;
+        for &(row_idx, val) in pairs.iter() {
+            if current_row != Some(row_idx) {
+                current_row = Some(row_idx);
+                r = range_fn(&rows[row_idx as usize * stride..][..stride]);
+            }
+            if r.is_empty() {
+                has_probes.push(false);
+                continue;
+            }
+            match archive.domain.search(&val) {
+                None => has_probes.push(false),
+                Some(d) => {
+                    probe_pos.push(r.start);
+                    probe_val.push(d);
+                    probe_pos.push(r.end);
+                    probe_val.push(d);
+                    has_probes.push(true);
+                }
+            }
+        }
+
+        // Evaluate the stream: one GPU dispatch above the break-even
+        // threshold, otherwise a tight CPU loop over one matrix.
+        #[cfg(feature = "gpu")]
+        let gpu_ranks: Option<Vec<usize>> = archive.gpu.as_ref().and_then(|ring| {
+            if probe_pos.len() >= 2 * ring.min_batch {
+                let ranks = ring
+                    .col(col)
+                    .rank_batch(&probe_pos, &probe_val)
+                    .expect("gpu rank_batch failed");
+                super::gpu::stats::record_gpu_batch(probe_pos.len());
+                Some(
+                    ranks
+                        .into_iter()
+                        .map(|x| x.expect("in-range rank"))
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        });
+        #[cfg(not(feature = "gpu"))]
+        let gpu_ranks: Option<Vec<usize>> = None;
+        let ranks: Vec<usize> = gpu_ranks.unwrap_or_else(|| {
+            let wm = archive.ring_col(col);
+            probe_pos
+                .iter()
+                .zip(&probe_val)
+                .map(|(&p, &d)| wm.rank(p, d).unwrap())
+                .collect()
+        });
+
+        let mut i = 0usize;
+        let mut k = 0usize;
+        pairs.retain(|_| {
+            let keep = if has_probes[i] {
+                let lo = ranks[k];
+                let hi = ranks[k + 1];
+                k += 2;
+                lo != hi
+            } else {
+                false
+            };
+            i += 1;
+            keep
+        });
+    }
 }

@@ -70,6 +70,18 @@ impl std::fmt::Debug for GpuRing {
 }
 
 impl GpuRing {
+    /// Returns the GPU mirror of the ring column named by `col`.
+    pub fn col(&self, col: super::RingCol) -> &WgpuWaveletMatrix {
+        match col {
+            super::RingCol::EavC => &self.eav_c,
+            super::RingCol::VeaC => &self.vea_c,
+            super::RingCol::AveC => &self.ave_c,
+            super::RingCol::VaeC => &self.vae_c,
+            super::RingCol::EvaC => &self.eva_c,
+            super::RingCol::AevC => &self.aev_c,
+        }
+    }
+
     /// Uploads all six wavelet matrices of `archive` to the default wgpu
     /// device. One-time cost; every subsequent batch moves only query and
     /// result buffers.

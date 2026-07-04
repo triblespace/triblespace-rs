@@ -7,10 +7,11 @@
 //!
 //! Loads the slice with the built-in N-Triples importer, builds a
 //! `SuccinctArchive<OrderedUniverse>`, and runs a set of WDBench-shaped
-//! queries twice — once with the plain CPU constraint path, once with the
-//! GPU ring enabled — reporting per-query wall time, result parity, and
-//! the probe-batch sizes the query actually generated
-//! (`gpu::stats::report()`).
+//! queries in four modes — sequential vs frontier-batched
+//! (`Query::solve_blocked`), each with and without the GPU ring —
+//! reporting per-query wall time, result parity (count + order-independent
+//! row hash vs the sequential CPU engine), and the probe-batch sizes the
+//! query actually generated (`gpu::stats::report()`).
 //!
 //! Queries span the selectivity spectrum deliberately: `point` and `star2`
 //! on a single subject should never benefit (tiny batches, the GPU path
@@ -154,17 +155,35 @@ fn main() {
         t0.elapsed()
     );
 
-    type Q = (&'static str, Box<dyn Fn(&SuccinctArchive<OrderedUniverse>) -> usize>);
+    // (count, order-independent multiset hash) of a result stream — the
+    // parity signature compared across engines.
+    fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64) {
+        use std::hash::{DefaultHasher, Hasher};
+        let mut count = 0usize;
+        let mut acc = 0u64;
+        for item in items {
+            let mut h = DefaultHasher::new();
+            item.hash(&mut h);
+            acc = acc.wrapping_add(h.finish());
+            count += 1;
+        }
+        (count, acc)
+    }
+
+    type Q = (
+        &'static str,
+        Box<dyn Fn(&SuccinctArchive<OrderedUniverse>, bool) -> (usize, u64)>,
+    );
     let queries: Vec<Q> = vec![
         (
             // Maximally selective: one subject, all (a, v) pairs.
             "point   <s> ?a ?v",
-            Box::new(move |a| {
-                find!(
+            Box::new(move |a, blocked| {
+                let q = find!(
                     (e: Inline<GenId>, at: Inline<GenId>, v: Inline<UnknownInline>),
                     and!(e.is(subj.to_inline()), pattern!(a, [{ ?e @ ?at: ?v }]))
-                )
-                .count()
+                );
+                if blocked { tally(q.solve_blocked()) } else { tally(q) }
             }),
         ),
         (
@@ -172,8 +191,9 @@ fn main() {
             "sweep   ?e P31 Q5",
             Box::new({
                 let p31 = p31.clone();
-                move |a| {
-                    find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: q5 }])).count()
+                move |a, blocked| {
+                    let q = find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: q5 }]));
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
@@ -183,8 +203,9 @@ fn main() {
             "sweepXL ?e P31 <top>",
             Box::new({
                 let p31 = p31.clone();
-                move |a| {
-                    find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: top_class }])).count()
+                move |a, blocked| {
+                    let q = find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: top_class }]));
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
@@ -194,12 +215,12 @@ fn main() {
             "filter  ?e P31 Q5 . ?e P106 ?o",
             Box::new({
                 let (p31, p106) = (p31.clone(), p106.clone());
-                move |a| {
-                    find!(
+                move |a, blocked| {
+                    let q = find!(
                         (e: Inline<GenId>, o: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: q5, &p106: ?o }])
-                    )
-                    .count()
+                    );
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
@@ -208,12 +229,12 @@ fn main() {
             "star3   ?e P31 Q5 . P21 ?g . P27 ?c",
             Box::new({
                 let (p31, p21, p27) = (p31.clone(), p21.clone(), p27.clone());
-                move |a| {
-                    find!(
+                move |a, blocked| {
+                    let q = find!(
                         (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
-                    )
-                    .count()
+                    );
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
@@ -223,12 +244,12 @@ fn main() {
             "isect   ?e P31 ?c . ?e P17 ?k",
             Box::new({
                 let (p31, p17) = (p31.clone(), p17.clone());
-                move |a| {
-                    find!(
+                move |a, blocked| {
+                    let q = find!(
                         (e: Inline<GenId>, c: Inline<GenId>, k: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: ?c, &p17: ?k }])
-                    )
-                    .count()
+                    );
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
@@ -237,66 +258,60 @@ fn main() {
             "chain   ?e P131 ?x . ?x P131 ?y",
             Box::new({
                 let p131 = p131.clone();
-                move |a| {
-                    find!(
+                move |a, blocked| {
+                    let q = find!(
                         (e: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p131: ?x }, { ?x @ &p131: ?y }])
-                    )
-                    .count()
+                    );
+                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
                 }
             }),
         ),
     ];
 
-    // ---- CPU pass (gpu handle absent) --------------------------------
-    let mut cpu_times: Vec<Vec<f64>> = Vec::new();
-    let mut cpu_counts: Vec<usize> = Vec::new();
-    let mut cpu_stats: Vec<String> = Vec::new();
-    for (name, q) in &queries {
-        let mut times = Vec::new();
-        let mut count = 0;
-        stats::reset();
-        for rep in 0..reps {
-            if rep == 1 {
-                stats::reset(); // keep stats of a single steady-state rep set
-            }
-            let t = Instant::now();
-            count = q(&archive);
-            times.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        eprintln!("cpu  {name}: {count} rows, {times:.1?} ms");
-        cpu_times.push(times);
-        cpu_counts.push(count);
-        cpu_stats.push(stats::report());
+    struct Pass {
+        times: Vec<Vec<f64>>,
+        sigs: Vec<(usize, u64)>,
+        stats: Vec<String>,
     }
+    let run_pass = |label: &str, archive: &SuccinctArchive<OrderedUniverse>, blocked: bool| {
+        let mut pass = Pass {
+            times: Vec::new(),
+            sigs: Vec::new(),
+            stats: Vec::new(),
+        };
+        for (name, q) in &queries {
+            let mut times = Vec::new();
+            let mut sig = (0, 0);
+            stats::reset();
+            for rep in 0..reps {
+                if rep == 1 {
+                    stats::reset(); // keep stats of a single steady-state rep
+                }
+                let t = Instant::now();
+                sig = q(archive, blocked);
+                times.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!("{label}  {name}: {} rows, {times:.1?} ms", sig.0);
+            pass.times.push(times);
+            pass.sigs.push(sig);
+            pass.stats.push(stats::report());
+        }
+        pass
+    };
 
-    // ---- GPU pass -----------------------------------------------------
+    // ---- passes ---------------------------------------------------------
+    let cpu_seq = run_pass("cpu-seq", &archive, false);
+    let cpu_blk = run_pass("cpu-blk", &archive, true);
+
     let t0 = Instant::now();
     archive.enable_gpu().expect("gpu upload");
     eprintln!("gpu upload (six wavelet matrices): {:?}", t0.elapsed());
 
-    let mut gpu_times: Vec<Vec<f64>> = Vec::new();
-    let mut gpu_counts: Vec<usize> = Vec::new();
-    let mut gpu_stats: Vec<String> = Vec::new();
-    for (name, q) in &queries {
-        let mut times = Vec::new();
-        let mut count = 0;
-        stats::reset();
-        for rep in 0..reps {
-            if rep == 1 {
-                stats::reset();
-            }
-            let t = Instant::now();
-            count = q(&archive);
-            times.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        eprintln!("gpu  {name}: {count} rows, {times:.1?} ms");
-        gpu_times.push(times);
-        gpu_counts.push(count);
-        gpu_stats.push(stats::report());
-    }
+    let gpu_seq = run_pass("gpu-seq", &archive, false);
+    let gpu_blk = run_pass("gpu-blk", &archive, true);
 
-    // ---- table --------------------------------------------------------
+    // ---- table ----------------------------------------------------------
     fn median(v: &[f64]) -> f64 {
         let mut s = v.to_vec();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -304,22 +319,33 @@ fn main() {
     }
     println!();
     println!(
-        "{:<38} {:>10} {:>12} {:>12} {:>8}  parity",
-        "query", "rows", "cpu ms", "gpu ms", "speedup"
+        "{:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7} {:>7}  parity",
+        "query", "rows", "cpuseq ms", "cpublk ms", "gpuseq ms", "gpublk ms", "cblk x", "gseq x", "gblk x"
     );
     for (i, (name, _)) in queries.iter().enumerate() {
-        let c = median(&cpu_times[i]);
-        let g = median(&gpu_times[i]);
+        let cs = median(&cpu_seq.times[i]);
+        let cb = median(&cpu_blk.times[i]);
+        let gs = median(&gpu_seq.times[i]);
+        let gb = median(&gpu_blk.times[i]);
+        let parity = [&cpu_blk, &gpu_seq, &gpu_blk]
+            .iter()
+            .all(|p| p.sigs[i] == cpu_seq.sigs[i]);
         println!(
-            "{:<38} {:>10} {:>12.2} {:>12.2} {:>7.2}x  {}",
+            "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x  {}",
             name,
-            cpu_counts[i],
-            c,
-            g,
-            c / g,
-            if cpu_counts[i] == gpu_counts[i] { "ok" } else { "MISMATCH" }
+            cpu_seq.sigs[i].0,
+            cs,
+            cb,
+            gs,
+            gb,
+            cs / cb,
+            cs / gs,
+            cs / gb,
+            if parity { "ok" } else { "MISMATCH" }
         );
-        println!("  cpu probes: {}", cpu_stats[i]);
-        println!("  gpu probes: {}", gpu_stats[i]);
+        println!("  cpu-seq probes: {}", cpu_seq.stats[i]);
+        println!("  cpu-blk probes: {}", cpu_blk.stats[i]);
+        println!("  gpu-seq probes: {}", gpu_seq.stats[i]);
+        println!("  gpu-blk probes: {}", gpu_blk.stats[i]);
     }
 }

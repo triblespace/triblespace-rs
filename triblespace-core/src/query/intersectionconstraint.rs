@@ -95,6 +95,106 @@ where
         self.constraints.iter().all(|c| c.satisfied(binding))
     }
 
+    /// PROBE: frontier expansion for the blocked solver.
+    ///
+    /// Per row the tightest child proposes (same cardinality-aware choice
+    /// as [`propose`](Self::propose)), but the sibling confirms are **not**
+    /// run per row — they are deferred to whole-frontier
+    /// [`confirm_blocked`](Constraint::confirm_blocked) passes, one per
+    /// child, over all rows' candidates at once. That deferral is the
+    /// entire point of the blocked engine: it fuses the per-branch confirm
+    /// trickle into one ragged batch per (child, level).
+    ///
+    /// A child that proposed for *every* row skips its confirm pass (its
+    /// own proposals are consistent by construction). When proposers vary
+    /// across rows the pass runs over the full frontier, re-confirming the
+    /// child's own pairs — a wasted-work cost, never a correctness one.
+    fn propose_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let stride = vars.len();
+        debug_assert!(stride > 0);
+        let mut binding = Binding::default();
+        let mut scratch: Vec<RawInline> = Vec::new();
+        let mut propose_counts = vec![0usize; self.constraints.len()];
+        let mut rows_proposed = 0usize;
+        for (i, row) in rows.chunks_exact(stride).enumerate() {
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &row[k]);
+            }
+            let mut best: Option<(usize, usize)> = None;
+            for (ci, c) in self.constraints.iter().enumerate() {
+                if let Some(estimate) = c.estimate(variable, &binding) {
+                    if best.map_or(true, |(be, _)| estimate < be) {
+                        best = Some((estimate, ci));
+                    }
+                }
+            }
+            let Some((_, ci)) = best else {
+                // No child constrains this variable for this row; the
+                // branch dies, matching the sequential engine's empty
+                // proposal set.
+                continue;
+            };
+            propose_counts[ci] += 1;
+            rows_proposed += 1;
+            scratch.clear();
+            self.constraints[ci].propose(variable, &binding, &mut scratch);
+            pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+        }
+
+        // Whole-frontier confirm passes, cheapest child first (first-row
+        // estimates; participation is structural, so the child set is
+        // uniform across rows even though the estimate values are not).
+        for (k, &v) in vars.iter().enumerate() {
+            binding.set(v, &rows[k]);
+        }
+        let mut confirmers: SmallVec<[(usize, usize); 8]> = self
+            .constraints
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| Some((c.estimate(variable, &binding)?, ci)))
+            .collect();
+        confirmers.sort_unstable_by_key(|&(estimate, _)| estimate);
+        for (_, ci) in confirmers {
+            if propose_counts[ci] == rows_proposed {
+                continue;
+            }
+            self.constraints[ci].confirm_blocked(variable, vars, rows, pairs);
+        }
+    }
+
+    /// PROBE: confirms a whole frontier through every relevant child in
+    /// ascending (first-row) estimate order.
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let stride = vars.len();
+        debug_assert!(stride > 0);
+        let mut binding = Binding::default();
+        for (k, &v) in vars.iter().enumerate() {
+            binding.set(v, &rows[k]);
+        }
+        let mut relevant: SmallVec<[(usize, usize); 8]> = self
+            .constraints
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, c)| Some((c.estimate(variable, &binding)?, ci)))
+            .collect();
+        relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
+        for (_, ci) in relevant {
+            self.constraints[ci].confirm_blocked(variable, vars, rows, pairs);
+        }
+    }
+
     /// Returns the union of all children's influence sets for `variable`.
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.constraints

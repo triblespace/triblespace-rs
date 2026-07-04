@@ -372,6 +372,88 @@ pub trait Constraint<'a> {
             VariableSet::new_empty()
         }
     }
+
+    // -- PROBE: frontier-batched (block-at-a-time) protocol ---------------
+    //
+    // The blocked solver ([`Query::solve_blocked`]) carries a *block* of
+    // sibling partial bindings per search level instead of descending one
+    // binding at a time. A block is a flat row store: `vars` names the
+    // bound variables (identical for every row), `rows` holds
+    // `rows.len() / vars.len()` rows of `vars.len()` values each — row `i`'s
+    // value for `vars[j]` is `rows[i * vars.len() + j]`. Candidates for the
+    // variable being solved travel as `(row_index, value)` pairs, grouped
+    // by ascending row index. Both methods must preserve that grouping
+    // (filtering with `retain`-style order preservation does).
+    //
+    // The default implementations reconstruct a scratch [`Binding`] per row
+    // and delegate to [`propose`](Constraint::propose) /
+    // [`confirm`](Constraint::confirm), so every existing constraint is
+    // blocked-correct with zero changes; constraints with batchable probe
+    // streams (e.g. `SuccinctArchiveConstraint`) override `confirm_blocked`
+    // to evaluate the whole frontier in one pass.
+
+    /// Enumerates candidates for `variable` for **every row** of a binding
+    /// block, appending `(row_index, value)` pairs in ascending row order.
+    ///
+    /// Default: per-row scratch binding + [`propose`](Constraint::propose).
+    fn propose_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let stride = vars.len();
+        debug_assert!(stride > 0, "blocked propose needs at least one bound variable");
+        let mut binding = Binding::default();
+        let mut scratch = Vec::new();
+        for (i, row) in rows.chunks_exact(stride).enumerate() {
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &row[k]);
+            }
+            scratch.clear();
+            self.propose(variable, &binding, &mut scratch);
+            pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+        }
+    }
+
+    /// Filters a whole frontier of `(row_index, value)` candidates for
+    /// `variable` against this constraint, removing violating pairs while
+    /// preserving order.
+    ///
+    /// Default: group pairs by row, rebuild the row's binding, and delegate
+    /// to [`confirm`](Constraint::confirm).
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let stride = vars.len();
+        debug_assert!(stride > 0, "blocked confirm needs at least one bound variable");
+        let mut binding = Binding::default();
+        let mut scratch: Vec<RawInline> = Vec::new();
+        let mut out: Vec<(u32, RawInline)> = Vec::with_capacity(pairs.len());
+        let mut i = 0;
+        while i < pairs.len() {
+            let row_idx = pairs[i].0;
+            scratch.clear();
+            let mut j = i;
+            while j < pairs.len() && pairs[j].0 == row_idx {
+                scratch.push(pairs[j].1);
+                j += 1;
+            }
+            let row = &rows[row_idx as usize * stride..][..stride];
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &row[k]);
+            }
+            self.confirm(variable, &binding, &mut scratch);
+            out.extend(scratch.iter().map(|&val| (row_idx, val)));
+            i = j;
+        }
+        *pairs = out;
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -404,6 +486,28 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         let inner: &T = self;
         inner.influence(variable)
     }
+
+    fn propose_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let inner: &T = self;
+        inner.propose_blocked(variable, vars, rows, pairs)
+    }
+
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_blocked(variable, vars, rows, pairs)
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
@@ -435,6 +539,28 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
+    }
+
+    fn propose_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let inner: &T = self;
+        inner.propose_blocked(variable, vars, rows, pairs)
+    }
+
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        let inner: &T = self;
+        inner.confirm_blocked(variable, vars, rows, pairs)
     }
 }
 
@@ -537,6 +663,54 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         self.constraint.propose(variable, &self.binding, values);
     }
 
+    /// PROBE: frontier-batched (block-at-a-time) solver.
+    ///
+    /// The standard iterator descends one binding at a time, so on star or
+    /// filter shapes every sibling branch runs its own tiny
+    /// propose/confirm round — the per-branch candidate sets (≤ a few
+    /// values) are far below any batching break-even. `solve_blocked`
+    /// instead carries a **block** of sibling partial bindings per level
+    /// and hands whole frontiers of `(row, candidate)` pairs to the
+    /// constraints ([`Constraint::propose_blocked`] /
+    /// [`Constraint::confirm_blocked`]): one ragged batch per
+    /// (constraint, level) instead of one call per branch. Constraints
+    /// with batchable probe streams (wavelet ranks in
+    /// `SuccinctArchiveConstraint`) evaluate that batch cache-friendly on
+    /// the CPU or as a single GPU dispatch.
+    ///
+    /// Semantics: yields the same result **multiset** as the iterator;
+    /// row order may differ (block order instead of DFS order).
+    ///
+    /// Costs to be aware of (probe honesty):
+    /// - Variable order is chosen **per level per block** from the first
+    ///   row's estimates, not per branch; data where sibling branches want
+    ///   different orders can explode intermediate blocks.
+    /// - Blocks materialize intermediate rows (`depth × 32 B` per row),
+    ///   capped at [`BLOCK_ROW_CAP`] rows per descend chunk.
+    pub fn solve_blocked(self) -> Vec<R> {
+        let Query {
+            constraint,
+            postprocessing,
+            influences,
+            ..
+        } = self;
+        let variables = constraint.variables();
+        let mut unbound: Vec<VariableId> = variables.into_iter().collect();
+        let mut vars: Vec<VariableId> = Vec::new();
+        let mut results = Vec::new();
+        descend_blocked(
+            &constraint,
+            &postprocessing,
+            &influences,
+            &mut vars,
+            &mut unbound,
+            &[],
+            1,
+            &mut results,
+        );
+        results
+    }
+
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
@@ -589,6 +763,112 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             values: ArrayVec::from([const { None }; 128]),
         }
     }
+}
+
+/// PROBE: maximum rows per block chunk in [`Query::solve_blocked`]. Bounds
+/// peak memory (a chunk of D-deep rows costs `CAP × D × 32 B`) while
+/// staying far above every batching break-even.
+pub const BLOCK_ROW_CAP: usize = 1 << 20;
+
+/// PROBE: recursive frontier descent for [`Query::solve_blocked`].
+///
+/// One call = one search level for one block chunk: pick the next
+/// variable (first-row estimates, same magnitude/influence key as
+/// [`Query::push_next_variable`]), expand the frontier via
+/// [`Constraint::propose_blocked`] (level 0 with no bound variables uses a
+/// plain [`Constraint::propose`] on the empty binding — a single branch,
+/// nothing to batch), then recurse on the extended block in
+/// [`BLOCK_ROW_CAP`]-row chunks.
+#[allow(clippy::too_many_arguments)]
+fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
+    constraint: &C,
+    post: &P,
+    influences: &[VariableSet; 128],
+    vars: &mut Vec<VariableId>,
+    unbound: &mut Vec<VariableId>,
+    rows: &[RawInline],
+    n_rows: usize,
+    results: &mut Vec<R>,
+) {
+    if n_rows == 0 {
+        return;
+    }
+    let stride = vars.len();
+    let mut binding = Binding::default();
+
+    if unbound.is_empty() {
+        for i in 0..n_rows {
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &rows[i * stride + k]);
+            }
+            if let Some(r) = post(&binding) {
+                results.push(r);
+            }
+        }
+        return;
+    }
+
+    // Choose the next variable from the first row's estimates — the same
+    // (magnitude, influence-count) key the sequential engine sorts by,
+    // applied once per block instead of once per branch.
+    for (k, &v) in vars.iter().enumerate() {
+        binding.set(v, &rows[k]);
+    }
+    let (ui, _) = unbound
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &v)| {
+            let estimate = constraint
+                .estimate(v, &binding)
+                .expect("unconstrained variable in query");
+            (
+                Reverse(
+                    estimate
+                        .checked_ilog2()
+                        .map(|magnitude| magnitude + 1)
+                        .unwrap_or(0),
+                ),
+                influences[v].count(),
+            )
+        })
+        .expect("non-empty unbound");
+    let variable = unbound.swap_remove(ui);
+
+    // Expand the frontier: (parent row, candidate) pairs.
+    let mut pairs: Vec<(u32, RawInline)> = Vec::new();
+    if stride == 0 {
+        let empty = Binding::default();
+        let mut values = Vec::new();
+        constraint.propose(variable, &empty, &mut values);
+        pairs.extend(values.into_iter().map(|v| (0u32, v)));
+    } else {
+        constraint.propose_blocked(variable, vars, rows, &mut pairs);
+    }
+
+    // Descend on the extended block, chunked to bound memory.
+    let new_stride = stride + 1;
+    vars.push(variable);
+    let mut next_rows: Vec<RawInline> = Vec::new();
+    let mut it = pairs.into_iter().peekable();
+    while it.peek().is_some() {
+        next_rows.clear();
+        let mut count = 0usize;
+        while count < BLOCK_ROW_CAP {
+            let Some((row_idx, value)) = it.next() else {
+                break;
+            };
+            let base = row_idx as usize * stride;
+            next_rows.extend_from_slice(&rows[base..base + stride]);
+            next_rows.push(value);
+            count += 1;
+        }
+        debug_assert_eq!(next_rows.len(), count * new_stride);
+        descend_blocked(
+            constraint, post, influences, vars, unbound, &next_rows, count, results,
+        );
+    }
+    vars.pop();
+    unbound.push(variable);
 }
 
 /// The search mode of the query engine.

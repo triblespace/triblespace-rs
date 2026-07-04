@@ -49,6 +49,20 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         }
     }
 
+    /// PROBE: constant confirm is binding-independent, so the blocked form
+    /// is a single retain over the frontier — no per-row grouping needed.
+    fn confirm_blocked(
+        &self,
+        variable: VariableId,
+        _vars: &[VariableId],
+        _rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        if self.variable == variable {
+            pairs.retain(|(_, v)| *v == self.constant);
+        }
+    }
+
     /// Returns `false` when the variable is bound to a different value.
     fn satisfied(&self, binding: &Binding) -> bool {
         match binding.get(self.variable) {

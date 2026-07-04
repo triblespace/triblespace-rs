@@ -229,10 +229,41 @@ pub struct SuccinctArchive<U> {
     pub gpu: Option<std::sync::Arc<gpu::GpuRing>>,
 }
 
+/// Names one of the six ring wavelet-matrix columns of a
+/// [`SuccinctArchive`], so batched evaluation paths can select the same
+/// column on the CPU archive and (feature `gpu`) its GPU mirror.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RingCol {
+    /// [`SuccinctArchive::eav_c`]
+    EavC,
+    /// [`SuccinctArchive::vea_c`]
+    VeaC,
+    /// [`SuccinctArchive::ave_c`]
+    AveC,
+    /// [`SuccinctArchive::vae_c`]
+    VaeC,
+    /// [`SuccinctArchive::eva_c`]
+    EvaC,
+    /// [`SuccinctArchive::aev_c`]
+    AevC,
+}
+
 impl<U> SuccinctArchive<U>
 where
     U: Universe,
 {
+    /// Returns the ring wavelet-matrix column named by `col`.
+    pub fn ring_col(&self, col: RingCol) -> &WaveletMatrix<Rank9SelIndex> {
+        match col {
+            RingCol::EavC => &self.eav_c,
+            RingCol::VeaC => &self.vea_c,
+            RingCol::AveC => &self.ave_c,
+            RingCol::VaeC => &self.vae_c,
+            RingCol::EvaC => &self.eva_c,
+            RingCol::AevC => &self.aev_c,
+        }
+    }
+
     /// A value-range constraint that proposes only V-position values
     /// in the inclusive byte-lexicographic range `[min, max]`.
     ///
