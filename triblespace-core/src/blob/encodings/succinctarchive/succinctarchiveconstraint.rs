@@ -490,6 +490,147 @@ where
         }
     }
 
+    /// PROBE: whole-frontier propose for the blocked solver.
+    ///
+    /// The three two-bound arms are contiguous wavelet sweeps
+    /// (`restrict_range(..).map(|i| wm.access(i))`); across a block the
+    /// sibling rows' sweeps concatenate into one ragged access stream on
+    /// a single ring column — one range computation per row, then either
+    /// a tight CPU access loop or a single `access_batch` GPU dispatch.
+    /// Per-row `unique()` and domain resolution stay on the CPU. All
+    /// other arms (`enumerate_in`'s select-strides are a sequential
+    /// dependent chain) keep the per-row sequential propose.
+    fn propose_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        pairs: &mut Vec<(u32, RawInline)>,
+    ) {
+        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+        {
+            return;
+        }
+        let stride = vars.len();
+        debug_assert!(stride > 0);
+
+        let e_var = self.variable_e == variable;
+        let a_var = self.variable_a == variable;
+        let v_var = self.variable_v == variable;
+        let pe = vars.iter().position(|&x| x == self.variable_e);
+        let pa = vars.iter().position(|&x| x == self.variable_a);
+        let pv = vars.iter().position(|&x| x == self.variable_v);
+
+        let archive = self.archive;
+        type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
+        let (col, range_fn): (RingCol, RangeFn<'_>) = match (pe, pa, pv, e_var, a_var, v_var) {
+            (None, Some(pa), Some(pv), true, false, false) => (
+                RingCol::VaeC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
+                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                }),
+            ),
+            (Some(pe), None, Some(pv), false, true, false) => (
+                RingCol::VeaC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                }),
+            ),
+            (Some(pe), Some(pa), None, false, false, true) => (
+                RingCol::AevC,
+                Box::new(move |row: &[RawInline]| {
+                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                }),
+            ),
+            _ => {
+                // Non-sweep arm: per-row sequential propose (mirrors the
+                // trait default; kept local so the sweep arms above can
+                // stay on the batched path).
+                let mut binding = Binding::default();
+                let mut scratch: Vec<RawInline> = Vec::new();
+                for (i, row) in rows.chunks_exact(stride).enumerate() {
+                    for (k, &v) in vars.iter().enumerate() {
+                        binding.set(v, &row[k]);
+                    }
+                    scratch.clear();
+                    self.propose(variable, &binding, &mut scratch);
+                    pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+                }
+                return;
+            }
+        };
+
+        // One range per row, concatenated into a ragged access stream.
+        let mut row_ranges: Vec<Range<usize>> = Vec::with_capacity(rows.len() / stride);
+        let mut total = 0usize;
+        for row in rows.chunks_exact(stride) {
+            let r = range_fn(row);
+            total += r.len();
+            row_ranges.push(r);
+        }
+        pairs.reserve(total);
+
+        #[cfg(feature = "gpu")]
+        let len_before = pairs.len();
+        #[cfg(feature = "gpu")]
+        let gpu_codes: Option<Vec<usize>> = archive.gpu.as_ref().and_then(|ring| {
+            if total >= ring.min_batch {
+                let mut positions: Vec<usize> = Vec::with_capacity(total);
+                for r in &row_ranges {
+                    positions.extend(r.clone());
+                }
+                let codes = ring
+                    .col(col)
+                    .access_batch(&positions)
+                    .expect("gpu access_batch failed");
+                super::gpu::stats::record_gpu_batch(positions.len());
+                Some(
+                    codes
+                        .into_iter()
+                        .map(|c| c.expect("in-range access"))
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        });
+        #[cfg(not(feature = "gpu"))]
+        let gpu_codes: Option<Vec<usize>> = None;
+
+        match gpu_codes {
+            Some(codes) => {
+                let mut offset = 0usize;
+                for (i, r) in row_ranges.iter().enumerate() {
+                    let n = r.len();
+                    pairs.extend(
+                        codes[offset..offset + n]
+                            .iter()
+                            .copied()
+                            .unique()
+                            .map(|c| (i as u32, archive.domain.access(c))),
+                    );
+                    offset += n;
+                }
+            }
+            None => {
+                let wm = archive.ring_col(col);
+                for (i, r) in row_ranges.iter().enumerate() {
+                    pairs.extend(
+                        r.clone()
+                            .map(|p| wm.access(p).unwrap())
+                            .unique()
+                            .map(|c| (i as u32, archive.domain.access(c))),
+                    );
+                }
+            }
+        }
+        #[cfg(feature = "gpu")]
+        super::gpu::stats::record_propose(pairs.len() - len_before);
+    }
+
     /// PROBE: whole-frontier confirm for the blocked solver.
     ///
     /// The sequential [`confirm`](Self::confirm) computes one range per

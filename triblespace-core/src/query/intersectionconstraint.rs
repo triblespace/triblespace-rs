@@ -118,11 +118,15 @@ where
     ) {
         let stride = vars.len();
         debug_assert!(stride > 0);
+        let n_rows = rows.len() / stride;
         let mut binding = Binding::default();
-        let mut scratch: Vec<RawInline> = Vec::new();
         let mut propose_counts = vec![0usize; self.constraints.len()];
         let mut rows_proposed = 0usize;
-        for (i, row) in rows.chunks_exact(stride).enumerate() {
+
+        // Pass 1: per-row proposer choice (cardinality-aware, per-row
+        // estimates exactly like the sequential engine).
+        let mut proposers: Vec<Option<usize>> = Vec::with_capacity(n_rows);
+        for row in rows.chunks_exact(stride) {
             for (k, &v) in vars.iter().enumerate() {
                 binding.set(v, &row[k]);
             }
@@ -134,17 +138,35 @@ where
                     }
                 }
             }
-            let Some((_, ci)) = best else {
-                // No child constrains this variable for this row; the
-                // branch dies, matching the sequential engine's empty
-                // proposal set.
-                continue;
-            };
-            propose_counts[ci] += 1;
-            rows_proposed += 1;
-            scratch.clear();
-            self.constraints[ci].propose(variable, &binding, &mut scratch);
-            pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+            if let Some((_, ci)) = best {
+                propose_counts[ci] += 1;
+                rows_proposed += 1;
+            }
+            proposers.push(best.map(|(_, ci)| ci));
+        }
+
+        // Pass 2: expand the frontier. When one child proposes for every
+        // row (the common case — proposer choice is usually structural),
+        // hand it the whole block so its own `propose_blocked` batching
+        // kicks in; otherwise fall back to per-row proposes. Rows with no
+        // relevant child propose nothing — the branch dies, matching the
+        // sequential engine's empty proposal set.
+        let uniform = proposers.first().copied().flatten().filter(|&ci| {
+            rows_proposed == n_rows && propose_counts[ci] == n_rows
+        });
+        if let Some(ci) = uniform {
+            self.constraints[ci].propose_blocked(variable, vars, rows, pairs);
+        } else {
+            let mut scratch: Vec<RawInline> = Vec::new();
+            for (i, row) in rows.chunks_exact(stride).enumerate() {
+                let Some(ci) = proposers[i] else { continue };
+                for (k, &v) in vars.iter().enumerate() {
+                    binding.set(v, &row[k]);
+                }
+                scratch.clear();
+                self.constraints[ci].propose(variable, &binding, &mut scratch);
+                pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
+            }
         }
 
         // Whole-frontier confirm passes, cheapest child first (first-row
