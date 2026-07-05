@@ -121,6 +121,8 @@ pub mod commit;
 pub mod hybridstore;
 /// LSMT-of-segments derived-index home (manifest pin + SuccinctArchive rollup).
 pub mod index_home;
+/// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
+pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
@@ -128,8 +130,6 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
-/// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
-pub mod lazy;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
@@ -195,30 +195,30 @@ use crate::blob::encodings::simplearchive::UnarchiveError;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
-use crate::blob::MemoryBlobStore;
 use crate::blob::IntoBlob;
+use crate::blob::MemoryBlobStore;
 use crate::blob::TryFromBlob;
 use crate::find;
 use crate::id::genid;
 use crate::id::Id;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::inlineencodings::GenId;
 use crate::repo::branch::branch_metadata;
 use crate::trible::TribleSet;
-use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
-use crate::prelude::*;
 use crate::inline::encodings::ed25519 as ed;
 use crate::inline::encodings::shortstring::ShortString;
+use crate::prelude::*;
 
 attributes! {
     /// The actual data of the commit.
@@ -416,10 +416,7 @@ pub trait BlobStoreKeep {
 /// override this for efficiency.
 pub trait BlobChildren: BlobStoreGet {
     /// Return handles of blobs referenced by `handle` that exist in this store.
-    fn children(
-        &self,
-        handle: Inline<Handle<UnknownBlob>>,
-    ) -> Vec<Inline<Handle<UnknownBlob>>> {
+    fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
         let Ok(blob) = self.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
             return Vec::new();
         };
@@ -659,10 +656,7 @@ pub fn transfer<'a, BS, BT, Handles>(
     handles: Handles,
 ) -> impl Iterator<
     Item = Result<
-        (
-            Inline<Handle<UnknownBlob>>,
-            Inline<Handle<UnknownBlob>>,
-        ),
+        (Inline<Handle<UnknownBlob>>, Inline<Handle<UnknownBlob>>),
         TransferError<
             Infallible,
             <BS as BlobStoreGet>::GetError<Infallible>,
@@ -839,12 +833,19 @@ pub enum RollupError<Storage: PinStore + BlobStore> {
     /// Underlying push / storage error during the attach step.
     Push(PushError<Storage>),
     /// Could not pull the branch to obtain a workspace.
-    Pull(PullError<Storage::HeadError,
-                    <Storage as BlobStore>::ReaderError,
-                    <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>>),
+    Pull(
+        PullError<
+            Storage::HeadError,
+            <Storage as BlobStore>::ReaderError,
+            <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
+        >,
+    ),
     /// Could not check out the branch state to build the archive.
-    Checkout(WorkspaceCheckoutError<
-        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>>),
+    Checkout(
+        WorkspaceCheckoutError<
+            <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
+        >,
+    ),
 }
 
 #[derive(Debug)]
@@ -854,9 +855,7 @@ pub enum PushError<Storage: PinStore + BlobStore> {
     /// An error occurred while creating a blob reader.
     StorageReader(<Storage as BlobStore>::ReaderError),
     /// An error occurred while reading metadata blobs.
-    StorageGet(
-        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-    ),
+    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
     /// An error occurred while transferring blobs to the repository.
     StoragePut(<Storage as BlobStorePut>::PutError),
     /// An error occurred while updating the branch storage.
@@ -898,9 +897,7 @@ where
     /// An error occurred while creating a blob reader.
     StorageReader(<Storage as BlobStore>::ReaderError),
     /// An error occurred while reading metadata blobs.
-    StorageGet(
-        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-    ),
+    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
     /// An error occurred while storing blobs.
     StoragePut(<Storage as BlobStorePut>::PutError),
     /// An error occurred while retrieving branch heads.
@@ -926,9 +923,7 @@ where
     /// Failed to create a blob reader.
     StorageReader(<Storage as BlobStore>::ReaderError),
     /// Failed to read a metadata blob.
-    StorageGet(
-        <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-    ),
+    StorageGet(<<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>),
     /// Multiple branches were found with the given name.
     NameConflict(Vec<Id>),
     /// Branch metadata is malformed.
@@ -1515,8 +1510,7 @@ where
                     let stop = collect_reachable(workspace, base).map_err(convert)?;
                     let mut seeds = CommitSet::new();
                     seeds.insert(&Entry::new(&head_handle.raw));
-                    collect_reachable_from_patch_until(workspace, seeds, &stop)
-                        .map_err(convert)?
+                    collect_reachable_from_patch_until(workspace, seeds, &stop).map_err(convert)?
                 }
             };
             let delta = workspace
@@ -1644,12 +1638,10 @@ where
         // Upload the archive blob directly to storage — no workspace-local
         // staging needed; the CAS below references it by handle.
         let archive_blob = (&archive).to_blob();
-        let handle: Inline<
-            Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>,
-        > = self
-            .storage
-            .put(archive_blob)
-            .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
+        let handle: Inline<Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>> =
+            self.storage
+                .put(archive_blob)
+                .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
 
         // Construct a fresh branch meta that carries the same head as
         // `base_branch_meta` plus the new rollup attribute.
@@ -2489,14 +2481,12 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         <Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>,
     > {
         let base_meta: TribleSet = self.base_blobs.get(self.base_branch_meta)?;
-        Ok(
-            find!(
-                (r: Inline<Handle<SuccinctArchiveBlob>>),
-                pattern!(&base_meta, [{ rollup: ?r }])
-            )
-            .next()
-            .map(|(r,)| r),
+        Ok(find!(
+            (r: Inline<Handle<SuccinctArchiveBlob>>),
+            pattern!(&base_meta, [{ rollup: ?r }])
         )
+        .next()
+        .map(|(r,)| r))
     }
 
     /// Adds a blob to the workspace's local blob store.
@@ -2796,9 +2786,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                             {
                                 Ok(Some((c,))) => Some(c),
                                 Ok(None) => None,
-                                Err(_) => {
-                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
-                                }
+                                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
                             };
                             if let Some(c) = content_opt {
                                 let set: TribleSet = local
@@ -2882,9 +2870,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                             {
                                 Ok(Some((c,))) => Some(c),
                                 Ok(None) => None,
-                                Err(_) => {
-                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
-                                }
+                                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
                             };
                             if let Some(c) = metadata_opt {
                                 let set: TribleSet = local
@@ -2961,9 +2947,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                             {
                                 Ok(Some((c,))) => Some(c),
                                 Ok(None) => None,
-                                Err(_) => {
-                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
-                                }
+                                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
                             };
                             let data_set = if let Some(c) = content_opt {
                                 local
@@ -2981,9 +2965,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                             {
                                 Ok(Some((c,))) => Some(c),
                                 Ok(None) => None,
-                                Err(_) => {
-                                    return Err(WorkspaceCheckoutError::BadCommitMetadata())
-                                }
+                                Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
                             };
                             let metadata_set = if let Some(c) = metadata_opt {
                                 local
@@ -2998,9 +2980,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                     )
                     .try_reduce(
                         || (TribleSet::new(), TribleSet::new()),
-                        |(a_data, a_meta), (b_data, b_meta)| {
-                            Ok((a_data + b_data, a_meta + b_meta))
-                        },
+                        |(a_data, a_meta), (b_data, b_meta)| Ok((a_data + b_data, a_meta + b_meta)),
                     );
             }
         }

@@ -13,13 +13,13 @@ use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::Id;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::time::NsTAIInterval;
+use crate::inline::Inline;
+use crate::inline::TryToInline;
 use crate::metadata;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::trible::TribleSet;
-use crate::inline::encodings::hash::Handle;
-use crate::inline::encodings::time::NsTAIInterval;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
 
 /// Current TAI time as a collapsed `NsTAIInterval`. Used as
 /// `metadata::updated_at` on every branch metadata blob so that peers can
@@ -31,7 +31,9 @@ use crate::inline::Inline;
 /// and a fresher timestamp arrives.
 fn now_updated_at() -> Inline<NsTAIInterval> {
     let now = crate::clock::epoch_now();
-    (now, now).try_to_inline().expect("same epoch is a valid point interval")
+    (now, now)
+        .try_to_inline()
+        .expect("same epoch is a valid point interval")
 }
 
 /// Builds a metadata [`TribleSet`] describing a branch and signs it.
@@ -87,9 +89,7 @@ pub fn branch_unsigned(
     commit_head: Option<Blob<SimpleArchive>>,
     rollup: Option<Inline<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
-    let head_handle = commit_head
-        .as_ref()
-        .map(|blob| blob.get_handle());
+    let head_handle = commit_head.as_ref().map(|blob| blob.get_handle());
     let updated_at = now_updated_at();
 
     let fragment = entity! {

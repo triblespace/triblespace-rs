@@ -1,11 +1,11 @@
 use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::ID_LEN;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::inline::RawInline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 
 use super::Binding;
 use super::Constraint;
@@ -56,7 +56,9 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
     }
 }
 
-impl<'a, S: InlineEncoding> ContainsConstraint<'a, S> for &'a PATCH<INLINE_LEN, IdentitySchema, ()> {
+impl<'a, S: InlineEncoding> ContainsConstraint<'a, S>
+    for &'a PATCH<INLINE_LEN, IdentitySchema, ()>
+{
     type Constraint = PatchValueConstraint<'a, S>;
 
     fn has(self, v: Variable<S>) -> Self::Constraint {

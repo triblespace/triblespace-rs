@@ -26,7 +26,7 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::pile::{GetBlobError, InsertError, Pile, PileReader, ReadError, PileWriteError};
+use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
@@ -310,11 +310,9 @@ impl Yard {
         Handle<S>: InlineEncoding,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        self.generations.get(level).is_some_and(|g| {
-            g.segments
-                .iter()
-                .any(|s| s.live.get(&handle.raw).is_some())
-        })
+        self.generations
+            .get(level)
+            .is_some_and(|g| g.segments.iter().any(|s| s.live.get(&handle.raw).is_some()))
     }
 
     /// Strongly pin a blob as the current head for `pin`.
@@ -405,8 +403,9 @@ impl Yard {
             let strong_keep = self.strong_keep_set(&reader);
 
             for level in 0..last {
-                let strong_here =
-                    self.generations[level].segments[0].live.intersect(&strong_keep);
+                let strong_here = self.generations[level].segments[0]
+                    .live
+                    .intersect(&strong_keep);
                 if strong_here.len() as usize <= self.strong_budget_for(level) {
                     continue;
                 }
@@ -1034,7 +1033,11 @@ impl fmt::Display for YardOpenError {
             Self::NoGenerations => write!(f, "yard requires at least one generation"),
             Self::Io(err) => write!(f, "failed to create yard pile file: {err}"),
             Self::Pile { path, err } => {
-                write!(f, "failed to open yard generation pile {}: {err}", path.display())
+                write!(
+                    f,
+                    "failed to open yard generation pile {}: {err}",
+                    path.display()
+                )
             }
             Self::List(err) => write!(f, "failed to list yard pile: {err}"),
         }
@@ -1258,8 +1261,7 @@ mod tests {
         // `child` enters the cache the demand-born way: weak-pinned while
         // absent (the want), then fetched. It is reachable from a strong
         // parent, yet the weak veto still makes it evictable.
-        let child =
-            Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
+        let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
         yard.pin_weak(child).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
             .unwrap();
@@ -1461,8 +1463,7 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
 
         // A pure want: pinned while absent, never fetched.
-        let want =
-            Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
+        let want = Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
         yard.pin_weak(want).unwrap();
         // A demand-fetched cache entry: pinned while absent, then put.
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached")).get_handle();
@@ -1549,10 +1550,7 @@ mod tests {
 
         // Corrupt the tail: append garbage that is not a valid record.
         {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&paths[0])
-                .unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&paths[0]).unwrap();
             file.write_all(&[0xFF; 64]).unwrap();
             file.sync_all().unwrap();
         }

@@ -50,9 +50,9 @@ use constantconstraint::*;
 pub use ignore::IgnoreConstraint;
 
 use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -713,9 +713,7 @@ pub use parallel::QueryParIter;
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
-    };
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over the results of a [`Query`]. Obtained via
@@ -892,7 +890,6 @@ mod parallel {
             bridge_unindexed(self, consumer)
         }
     }
-
 }
 
 /// Iterate over query results, converting each variable via

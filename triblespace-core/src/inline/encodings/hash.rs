@@ -2,15 +2,15 @@ use crate::blob::BlobEncoding;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::RawInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 use anybytes::Bytes;
@@ -348,8 +348,8 @@ impl MetaDescribe for Blake3 {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
     use crate::inline::encodings::hash::HashError;
+    use crate::prelude::*;
     use rand;
 
     use super::{Blake3, Hash};

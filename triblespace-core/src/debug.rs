@@ -1,10 +1,10 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
+    use crate::inline::RawInline;
     use crate::query::Binding;
     use crate::query::Constraint;
     use crate::query::VariableId;
     use crate::query::VariableSet;
-    use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
 

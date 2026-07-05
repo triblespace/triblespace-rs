@@ -39,10 +39,7 @@ fn raw_to_id(raw: RawId) -> Id {
 
 impl Spread for Fragment {
     type Item = Id;
-    type Iter = std::iter::Map<
-        PATCHIntoOrderedIterator<16, IdentitySchema, ()>,
-        fn(RawId) -> Id,
-    >;
+    type Iter = std::iter::Map<PATCHIntoOrderedIterator<16, IdentitySchema, ()>, fn(RawId) -> Id>;
     fn spread(self) -> (Self::Iter, Fragment) {
         let (exports, facts, blobs) = self.into_parts();
         // Wrap the remaining facts + blobs as an extras fragment with

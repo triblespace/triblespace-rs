@@ -2,11 +2,11 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::inline::encodings::UnknownInline;
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (

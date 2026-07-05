@@ -84,17 +84,17 @@ use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::rawbytes::RawBytes;
 use crate::blob::{Blob, IntoBlob};
 use crate::id::{ExclusiveId, Id, ID_LEN};
-use crate::macros::entity;
-use crate::prelude::inlineencodings;
-use crate::trible::{Fragment, Trible, TribleSet};
+use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::f64::F64;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::encodings::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::inline::encodings::UnknownInline;
-use crate::inline::encodings::boolean::Boolean;
-use crate::inline::encodings::f64::F64;
-use crate::inline::{RawInline, IntoInline, TryToInline, Inline};
+use crate::inline::{Inline, IntoInline, RawInline, TryToInline};
+use crate::macros::entity;
+use crate::prelude::inlineencodings;
+use crate::trible::{Fragment, Trible, TribleSet};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -354,8 +354,7 @@ fn topo_sort(
     nodes: &HashSet<View<str>>,
     edges: &HashMap<View<str>, HashSet<View<str>>>,
 ) -> Result<Vec<View<str>>, Vec<View<str>>> {
-    let mut in_degree: HashMap<View<str>, usize> =
-        nodes.iter().map(|n| (n.clone(), 0)).collect();
+    let mut in_degree: HashMap<View<str>, usize> = nodes.iter().map(|n| (n.clone(), 0)).collect();
     for dsts in edges.values() {
         for dst in dsts {
             *in_degree.entry(dst.clone()).or_insert(0) += 1;
@@ -453,7 +452,11 @@ fn take_iri(bytes: &mut Bytes) -> Option<View<str>> {
         let mut take = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
             // Accept: anything that isn't terminator (`>`), escape
             // (`\\`), or one of the spec-forbidden literal chars.
-            b > 0x20 && !matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\')
+            b > 0x20
+                && !matches!(
+                    b,
+                    b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`' | b'\\'
+                )
         });
         if let Ok(prefix) = take.parse_next(&mut tentative) {
             if tentative.peek_token() == Some(b'>') {
@@ -840,9 +843,10 @@ fn parse_xsd_gyearmonth(s: &str) -> Option<(i128, i128)> {
     } else {
         (year, month + 1)
     };
-    let upper_excl = epoch_from_gregorian_with_offset(next_year, next_month, 1, 0, 0, 0, 0, offset)?
-        .to_tai_duration()
-        .total_nanoseconds();
+    let upper_excl =
+        epoch_from_gregorian_with_offset(next_year, next_month, 1, 0, 0, 0, 0, offset)?
+            .to_tai_duration()
+            .total_nanoseconds();
     Some((lower, upper_excl.checked_sub(1)?))
 }
 
@@ -899,8 +903,7 @@ fn parse_xsd_duration(s: &str) -> Option<i128> {
 /// machines, and repeated imports — so callers can derive ids for
 /// query constants that match what [`import_bytes`] inserts.
 pub fn uri_to_id_pure(uri: &str) -> Id {
-    let handle: Inline<Handle<LongString>> =
-        uri.to_owned().to_blob().get_handle();
+    let handle: Inline<Handle<LongString>> = uri.to_owned().to_blob().get_handle();
     let fragment = entity! { crate::import::rdf_uri: handle };
     fragment.root().expect("intrinsic URI entity")
 }
@@ -1346,7 +1349,8 @@ fn build_resolved_outgoing(
             // outgoing fact carries a GenId reference to it. Side
             // effects (the lang-entity tribles) land in `facts`
             // immediately since they don't depend on the parent id.
-            let Ok(lang_value): Result<Inline<ShortString>, _> = lang.as_ref().try_to_inline() else {
+            let Ok(lang_value): Result<Inline<ShortString>, _> = lang.as_ref().try_to_inline()
+            else {
                 return None;
             };
             let text_handle: Inline<Handle<LongString>> = facts.put(text);
@@ -1595,9 +1599,7 @@ mod tests {
         let iri = take_iri(&mut input).unwrap();
         assert_eq!(iri.as_ref(), "http://example.org/s");
         // Remaining bytes should start with " rest".
-        let remaining: Vec<u8> = (0..)
-            .scan(input.clone(), |b, _| b.pop_front())
-            .collect();
+        let remaining: Vec<u8> = (0..).scan(input.clone(), |b, _| b.pop_front()).collect();
         assert_eq!(&remaining[..5], b" rest");
     }
 
@@ -1770,10 +1772,8 @@ mod tests {
     fn xsd_duration_daytime_only() {
         // P1DT2H3M4.5S = 1 day + 2h + 3m + 4.5s
         let ns = parse_xsd_duration("P1DT2H3M4.5S").unwrap();
-        let expected = 86_400_000_000_000i128
-            + 2 * 3_600_000_000_000
-            + 3 * 60_000_000_000
-            + 4_500_000_000;
+        let expected =
+            86_400_000_000_000i128 + 2 * 3_600_000_000_000 + 3 * 60_000_000_000 + 4_500_000_000;
         assert_eq!(ns, expected);
     }
 

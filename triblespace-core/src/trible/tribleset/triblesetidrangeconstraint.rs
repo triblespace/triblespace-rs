@@ -3,14 +3,14 @@ use crate::id::id_into_value;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::RawInline;
 use crate::query::Binding;
 use crate::query::Constraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.

@@ -120,8 +120,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, Universe};
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, Universe,
+};
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
@@ -416,9 +418,7 @@ where
 
     // Build + append a fresh level-0 segment.
     let segment_blob = kind.build(source);
-    let handle = storage
-        .put::<UnknownBlob, _>(segment_blob)
-        .map_err(boxed)?;
+    let handle = storage.put::<UnknownBlob, _>(segment_blob).map_err(boxed)?;
     manifest.push(handle, 0);
 
     // Size-tiered merge: while a level overflows, tenure the whole
@@ -432,9 +432,7 @@ where
             attached.push(kind.attach(blob));
         }
         let merged_blob = kind.merge(&attached);
-        let merged_handle = storage
-            .put::<UnknownBlob, _>(merged_blob)
-            .map_err(boxed)?;
+        let merged_handle = storage.put::<UnknownBlob, _>(merged_blob).map_err(boxed)?;
         manifest.push(merged_handle, level + 1);
     }
 
@@ -475,7 +473,11 @@ where
     /// `storage`. The manifest lives in `source_branch`'s head tribleset.
     /// Does not touch storage until a read or update.
     pub fn new(storage: &'s mut S, source_branch: Id, kind: K) -> Self {
-        Self { storage, kind, branch: source_branch }
+        Self {
+            storage,
+            kind,
+            branch: source_branch,
+        }
     }
 
     fn head(&mut self) -> Result<Option<Inline<Handle<SimpleArchive>>>, IndexError> {
@@ -532,7 +534,11 @@ where
         let mut new_set = self.head_set()?;
         append_segment(&mut *self.storage, &self.kind, source, &mut new_set)?;
         let new_head: Inline<Handle<SimpleArchive>> = self.storage.put(new_set).map_err(boxed)?;
-        match self.storage.update(self.branch, old_head, Some(new_head)).map_err(boxed)? {
+        match self
+            .storage
+            .update(self.branch, old_head, Some(new_head))
+            .map_err(boxed)?
+        {
             PushResult::Success() => Ok(()),
             PushResult::Conflict(_) => Err(IndexError::Conflict),
         }
@@ -573,7 +579,9 @@ impl SuccinctRollup {
     /// A queryable view over a set of attached segments that unions them
     /// into one logical dataset — the correct LSMT read (a single match
     /// may span segments).
-    pub fn union<'a>(segments: &'a [SuccinctArchive<OrderedUniverse>]) -> UnionArchive<'a, OrderedUniverse> {
+    pub fn union<'a>(
+        segments: &'a [SuccinctArchive<OrderedUniverse>],
+    ) -> UnionArchive<'a, OrderedUniverse> {
         UnionArchive::new(segments)
     }
 }
@@ -762,8 +770,12 @@ mod tests {
         // Snapshot the branch-head tribleset BEFORE any index tribles, and
         // run an unrelated query over the branch-metadata subset.
         let head_before = repo.storage_mut().head(*branch).unwrap().unwrap();
-        let set_before: TribleSet =
-            repo.storage_mut().reader().unwrap().get(head_before).unwrap();
+        let set_before: TribleSet = repo
+            .storage_mut()
+            .reader()
+            .unwrap()
+            .get(head_before)
+            .unwrap();
         let names_before: Vec<_> = find!(
             (n: Inline<_>),
             pattern!(&set_before, [{ crate::metadata::name: ?n }])
@@ -771,7 +783,9 @@ mod tests {
         .collect();
         // No index manifest present yet.
         assert_eq!(
-            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id()).segments.len(),
+            Manifest::from_tribles(&set_before, SuccinctRollup.kind_id())
+                .segments
+                .len(),
             0
         );
 
@@ -782,13 +796,24 @@ mod tests {
         }
 
         let head_after = repo.storage_mut().head(*branch).unwrap().unwrap();
-        assert_ne!(head_before, head_after, "branch pin repointed to the new tribleset");
-        let set_after: TribleSet =
-            repo.storage_mut().reader().unwrap().get(head_after).unwrap();
+        assert_ne!(
+            head_before, head_after,
+            "branch pin repointed to the new tribleset"
+        );
+        let set_after: TribleSet = repo
+            .storage_mut()
+            .reader()
+            .unwrap()
+            .get(head_after)
+            .unwrap();
 
         // (a) The index query reads exactly the manifest subset.
         let manifest = Manifest::from_tribles(&set_after, SuccinctRollup.kind_id());
-        assert_eq!(manifest.segments.len(), 1, "index query sees exactly its one segment");
+        assert_eq!(
+            manifest.segments.len(),
+            1,
+            "index query sees exactly its one segment"
+        );
 
         // (b) The unrelated branch-metadata query is IDENTICAL with the
         // index tribles present — union didn't disturb the existing subset.
@@ -797,7 +822,10 @@ mod tests {
             pattern!(&set_after, [{ crate::metadata::name: ?n }])
         )
         .collect();
-        assert_eq!(names_before, names_after, "union doesn't change existing subset queries");
+        assert_eq!(
+            names_before, names_after,
+            "union doesn't change existing subset queries"
+        );
         assert_eq!(names_after.len(), 1);
 
         // The branch's committed content is untouched: the index segment
@@ -809,7 +837,11 @@ mod tests {
             pattern!(&*checkout, [{ _?p @ literature::firstname: ?n }])
         )
         .collect();
-        assert_eq!(people.len(), 1, "branch content intact; index segment not committed");
+        assert_eq!(
+            people.len(),
+            1,
+            "branch content intact; index segment not committed"
+        );
     }
 
     #[test]
@@ -909,7 +941,8 @@ mod tests {
         use rand::rngs::OsRng;
 
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
         let branch = repo.create_branch("main", None).unwrap();
 
         // Commit across three rounds; feed each round's delta to the
@@ -1149,7 +1182,11 @@ mod tests {
             let m = home.read_manifest().unwrap();
             if i + 1 < FANOUT {
                 // One level-0 segment per commit until the merge fires.
-                assert_eq!(m.segments.len(), i + 1, "segment per commit before first merge");
+                assert_eq!(
+                    m.segments.len(),
+                    i + 1,
+                    "segment per commit before first merge"
+                );
                 assert!(m.segments.iter().all(|s| s.level == 0));
             }
             // Fan-out stays bounded at every step.
@@ -1164,8 +1201,14 @@ mod tests {
         let m = home.read_manifest().unwrap();
         // The tiered merge fired: fewer segments than commits, and a
         // tenured segment above level 0 exists.
-        assert!(m.segments.len() < n, "merge collapsed level 0 at least once");
-        assert!(m.segments.iter().any(|s| s.level > 0), "tenured segment exists");
+        assert!(
+            m.segments.len() < n,
+            "merge collapsed level 0 at least once"
+        );
+        assert!(
+            m.segments.iter().any(|s| s.level > 0),
+            "tenured segment exists"
+        );
 
         // The union read sees ALL committed data — attach the manifest's
         // segments straight from the branch head, no checkout involved.
@@ -1242,8 +1285,18 @@ mod tests {
         // Both manifests coexist at the head, one per kind.
         let head = repo.storage_mut().head(*branch).unwrap().unwrap();
         let head_set: TribleSet = repo.storage_mut().reader().unwrap().get(head).unwrap();
-        assert_eq!(Manifest::from_tribles(&head_set, SuccinctRollup.kind_id()).segments.len(), n);
-        assert_eq!(Manifest::from_tribles(&head_set, TitlesRollup.kind_id()).segments.len(), n);
+        assert_eq!(
+            Manifest::from_tribles(&head_set, SuccinctRollup.kind_id())
+                .segments
+                .len(),
+            n
+        );
+        assert_eq!(
+            Manifest::from_tribles(&head_set, TitlesRollup.kind_id())
+                .segments
+                .len(),
+            n
+        );
 
         // Each kind's union read selects exactly its own subset.
         let names_union_counts = {
@@ -1262,7 +1315,11 @@ mod tests {
             .count();
             (names, titles)
         };
-        assert_eq!(names_union_counts, (n, 0), "firstname kind carries only names");
+        assert_eq!(
+            names_union_counts,
+            (n, 0),
+            "firstname kind carries only names"
+        );
 
         let titles_union_counts = {
             let mut home = IndexHome::new(repo.storage_mut(), *branch, TitlesRollup);
@@ -1280,7 +1337,11 @@ mod tests {
             .count();
             (names, titles)
         };
-        assert_eq!(titles_union_counts, (0, n), "title kind carries only titles");
+        assert_eq!(
+            titles_union_counts,
+            (0, n),
+            "title kind carries only titles"
+        );
     }
 
     #[test]

@@ -45,8 +45,8 @@ pub const PERM_WRITE: Id = id_hex!("C56AAF4191DD4FBB9F197B79435B881D");
 /// Tag indicating a scope grants admin (delegation) authority.
 pub const PERM_ADMIN: Id = id_hex!("EC68A0CBF9EF421F59A0A69ED80FD79F");
 
-use crate::inline::encodings::ed25519 as ed;
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::inline::encodings::ed25519 as ed;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 
@@ -110,23 +110,23 @@ pub const KIND_CAPABILITY_SIG: Id = id_hex!("E6BB52CE6E02D51C3676ECE1EEA9094F");
 
 // ── Builder ──────────────────────────────────────────────────────────
 
+use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
-use ed25519::signature::Signer;
 
+use crate::blob::encodings::simplearchive::UnarchiveError;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::blob::encodings::simplearchive::UnarchiveError;
 use crate::id::ExclusiveId;
+use crate::inline::encodings::time::NsTAIInterval;
+use crate::inline::Inline;
+use crate::inline::IntoInline;
 use crate::macros::entity;
 use crate::macros::pattern;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::inline::Inline;
-use crate::inline::IntoInline;
-use crate::inline::encodings::time::NsTAIInterval;
 
 /// Errors returned by [`build_capability`].
 #[derive(Debug)]
@@ -266,8 +266,7 @@ pub fn build_capability(
     .expect("just inserted our own outer sig entity");
 
     if let Some((parent_cap_blob, parent_sig_blob)) = parent {
-        let parent_cap_handle: Inline<Handle<SimpleArchive>> =
-            parent_cap_blob.get_handle();
+        let parent_cap_handle: Inline<Handle<SimpleArchive>> = parent_cap_blob.get_handle();
 
         let parent_sig_set: TribleSet =
             TryFromBlob::<SimpleArchive>::try_from_blob(parent_sig_blob)
@@ -279,10 +278,7 @@ pub fn build_capability(
             pattern!(&parent_sig_set, [{ ?sig @ sig_signs: ?_signed }])
         )
         .map(|(sig, _)| sig);
-        let parent_outer_id = match (
-            parent_outer_iter.next(),
-            parent_outer_iter.next(),
-        ) {
+        let parent_outer_id = match (parent_outer_iter.next(), parent_outer_iter.next()) {
             (Some(id), None) => id,
             _ => return Err(BuildError::ParentSigShape),
         };
@@ -364,10 +360,8 @@ pub fn scope_subsumes(
     child_set: &TribleSet,
     child_scope_root: crate::id::Id,
 ) -> bool {
-    let (parent_perms, parent_branches) =
-        collect_scope_facts(parent_set, parent_scope_root);
-    let (child_perms, child_branches) =
-        collect_scope_facts(child_set, child_scope_root);
+    let (parent_perms, parent_branches) = collect_scope_facts(parent_set, parent_scope_root);
+    let (child_perms, child_branches) = collect_scope_facts(child_set, child_scope_root);
 
     if parent_perms.contains(&PERM_ADMIN) {
         return true;
@@ -375,9 +369,7 @@ pub fn scope_subsumes(
 
     for perm in &child_perms {
         if *perm == PERM_READ {
-            if !parent_perms.contains(&PERM_READ)
-                && !parent_perms.contains(&PERM_WRITE)
-            {
+            if !parent_perms.contains(&PERM_READ) && !parent_perms.contains(&PERM_WRITE) {
                 return false;
             }
         } else if *perm == PERM_WRITE {
@@ -409,13 +401,12 @@ pub fn scope_subsumes(
     true
 }
 
-
 // ── Verifier ──────────────────────────────────────────────────────────
 
-use ed25519_dalek::Verifier;
-use std::collections::HashSet;
 use crate::inline::TryFromInline;
+use ed25519_dalek::Verifier;
 use hifitime::Epoch;
+use std::collections::HashSet;
 
 /// Errors returned by [`verify_chain`].
 #[derive(Debug)]
@@ -559,7 +550,11 @@ impl VerifiedCapability {
     /// (i.e. applies to every branch within the granted permission set).
     pub fn granted_branches(&self) -> Option<HashSet<crate::id::Id>> {
         let (_, branches) = collect_scope_facts(&self.cap_set, self.scope_root);
-        if branches.is_empty() { None } else { Some(branches) }
+        if branches.is_empty() {
+            None
+        } else {
+            Some(branches)
+        }
     }
 
     /// Returns `true` if the cap grants any read-equivalent permission
@@ -567,9 +562,7 @@ impl VerifiedCapability {
     /// subsumption rules in [`scope_subsumes`]).
     pub fn grants_read(&self) -> bool {
         let perms = self.permissions();
-        perms.contains(&PERM_READ)
-            || perms.contains(&PERM_WRITE)
-            || perms.contains(&PERM_ADMIN)
+        perms.contains(&PERM_READ) || perms.contains(&PERM_WRITE) || perms.contains(&PERM_ADMIN)
     }
 
     /// Returns `true` if the cap grants read-equivalent permission on
@@ -603,9 +596,7 @@ pub const MAX_CHAIN_DEPTH: usize = 32;
 /// root, expiry. Cap blobs are pure declarations now — chain
 /// references live in the sig blob, so this is just a four-field
 /// projection.
-fn extract_cap_fields(
-    cap_set: &TribleSet,
-) -> Result<CapFields, VerifyError> {
+fn extract_cap_fields(cap_set: &TribleSet) -> Result<CapFields, VerifyError> {
     let mut iter = find!(
         (cap: crate::id::Id,
          subject: VerifyingKey,
@@ -774,13 +765,11 @@ where
         (sig: crate::id::Id, h: Inline<Handle<SimpleArchive>>),
         pattern!(&sig_set, [{ ?sig @ sig_signs: ?h }])
     );
-    let (mut current_outer_id, leaf_cap_handle) = match (
-        leaf_outer_iter.next(),
-        leaf_outer_iter.next(),
-    ) {
-        (Some(row), None) => row,
-        _ => return Err(VerifyError::MalformedSig),
-    };
+    let (mut current_outer_id, leaf_cap_handle) =
+        match (leaf_outer_iter.next(), leaf_outer_iter.next()) {
+            (Some(row), None) => row,
+            _ => return Err(VerifyError::MalformedSig),
+        };
 
     // Fetch + decode the leaf cap.
     let leaf_cap_blob = fetch_blob(leaf_cap_handle).ok_or(VerifyError::LeafCapMissing)?;
@@ -797,11 +786,7 @@ where
 
     // Verify the outer signature attests to the leaf cap's bytes,
     // signed by the leaf's claimed issuer.
-    let outer_signer = extract_and_verify_sig_at(
-        &sig_set,
-        current_outer_id,
-        &leaf_cap_blob,
-    )?;
+    let outer_signer = extract_and_verify_sig_at(&sig_set, current_outer_id, &leaf_cap_blob)?;
     if outer_signer != leaf_fields.issuer {
         return Err(VerifyError::IssuerMismatch);
     }
@@ -845,27 +830,19 @@ where
                 sig_embedded_parent_proof: ?pid,
             }])
         );
-        let (parent_cap_handle, parent_proof_id) = match (
-            parent_iter.next(),
-            parent_iter.next(),
-        ) {
+        let (parent_cap_handle, parent_proof_id) = match (parent_iter.next(), parent_iter.next()) {
             (Some(row), None) => row,
             _ => return Err(VerifyError::NonRootMissingParent),
         };
 
         // Fetch + decode the parent cap.
         let parent_cap_blob = fetch_blob(parent_cap_handle).ok_or(VerifyError::Fetch)?;
-        let parent_cap_set: TribleSet =
-            TryFromBlob::try_from_blob(parent_cap_blob.clone())?;
+        let parent_cap_set: TribleSet = TryFromBlob::try_from_blob(parent_cap_blob.clone())?;
         let parent_fields = extract_cap_fields(&parent_cap_set)?;
 
         // Verify the parent proof's sig attests to the parent cap's
         // bytes, signed by some authority.
-        let parent_signer = extract_and_verify_sig_at(
-            &sig_set,
-            parent_proof_id,
-            &parent_cap_blob,
-        )?;
+        let parent_signer = extract_and_verify_sig_at(&sig_set, parent_proof_id, &parent_cap_blob)?;
         if parent_signer != parent_fields.issuer {
             return Err(VerifyError::IssuerMismatch);
         }
@@ -944,7 +921,9 @@ mod tests {
         let now = Epoch::now().expect("system time");
         let past_start = now - hifitime::Duration::from_seconds(7200.0);
         let past_end = now - hifitime::Duration::from_seconds(3600.0);
-        (past_start, past_end).try_to_inline().expect("valid interval")
+        (past_start, past_end)
+            .try_to_inline()
+            .expect("valid interval")
     }
 
     fn empty_scope() -> (Id, TribleSet) {
@@ -1003,8 +982,13 @@ mod tests {
 
     // ── Length-N chain ────────────────────────────────────────────────
 
-    fn three_level_chain()
-    -> (SigningKey, SigningKey, SigningKey, Vec<Blob<SimpleArchive>>, Inline<Handle<SimpleArchive>>) {
+    fn three_level_chain() -> (
+        SigningKey,
+        SigningKey,
+        SigningKey,
+        Vec<Blob<SimpleArchive>>,
+        Inline<Handle<SimpleArchive>>,
+    ) {
         let team_root = key();
         let a = key();
         let b = key();

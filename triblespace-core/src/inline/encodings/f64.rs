@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use serde_json::Number as JsonNumber;
 use std::convert::Infallible;
 use std::fmt;
@@ -69,8 +69,7 @@ impl TryFromInline<'_, F64> for f64 {
     }
 }
 
-impl Encodes<f64> for F64
-{
+impl Encodes<f64> for F64 {
     type Output = Inline<F64>;
     fn encode(source: f64) -> Inline<F64> {
         let mut raw = [0u8; 32];

@@ -260,7 +260,7 @@ mod tests {
     use crate::repo::BlobStore;
     use crate::repo::BlobStorePut;
     use crate::trible::TribleSet;
-    
+
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
 
@@ -308,8 +308,7 @@ mod tests {
             metadata::value_formatter: handle,
         };
 
-        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> =
-            BlobCache::new(reader);
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(reader);
         let formatter = formatter_cache
             .get(formatter_handle(&space, schema_id).expect("formatter handle"))
             .expect("formatter loaded");
@@ -377,8 +376,7 @@ mod tests {
 
         let (space, mut store) = bundle.into_facts_and_blobs();
         let reader = store.reader().expect("blob reader");
-        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> =
-            BlobCache::new(reader);
+        let formatter_cache: BlobCache<_, WasmCode, WasmValueFormatter> = BlobCache::new(reader);
         let limits = WasmLimits::default();
         let formatter_for = |schema| {
             formatter_cache

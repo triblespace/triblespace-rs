@@ -1,14 +1,14 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::TryFromInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::num::TryFromIntError;
 
@@ -376,8 +376,7 @@ mod wasm_formatter {
     }
 }
 
-impl Encodes<ethnum::U256> for U256BE
-{
+impl Encodes<ethnum::U256> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: ethnum::U256) -> Inline<U256BE> {
         Inline::new(source.to_be_bytes())
@@ -391,8 +390,7 @@ impl TryFromInline<'_, U256BE> for ethnum::U256 {
     }
 }
 
-impl Encodes<ethnum::U256> for U256LE
-{
+impl Encodes<ethnum::U256> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: ethnum::U256) -> Inline<U256LE> {
         Inline::new(source.to_le_bytes())
@@ -406,8 +404,7 @@ impl TryFromInline<'_, U256LE> for ethnum::U256 {
     }
 }
 
-impl Encodes<ethnum::I256> for I256BE
-{
+impl Encodes<ethnum::I256> for I256BE {
     type Output = Inline<I256BE>;
     fn encode(source: ethnum::I256) -> Inline<I256BE> {
         Inline::new(source.to_be_bytes())
@@ -421,8 +418,7 @@ impl TryFromInline<'_, I256BE> for ethnum::I256 {
     }
 }
 
-impl Encodes<ethnum::I256> for I256LE
-{
+impl Encodes<ethnum::I256> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: ethnum::I256) -> Inline<I256LE> {
         Inline::new(source.to_le_bytes())
@@ -436,152 +432,133 @@ impl TryFromInline<'_, I256LE> for ethnum::I256 {
     }
 }
 
-impl Encodes<u8> for U256LE
-{
+impl Encodes<u8> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: u8) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<u16> for U256LE
-{
+impl Encodes<u16> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: u16) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<u32> for U256LE
-{
+impl Encodes<u32> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: u32) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<u64> for U256LE
-{
+impl Encodes<u64> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: u64) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<u128> for U256LE
-{
+impl Encodes<u128> for U256LE {
     type Output = Inline<U256LE>;
     fn encode(source: u128) -> Inline<U256LE> {
         Inline::new(ethnum::U256::new(source).to_le_bytes())
     }
 }
 
-impl Encodes<u8> for U256BE
-{
+impl Encodes<u8> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: u8) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<u16> for U256BE
-{
+impl Encodes<u16> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: u16) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<u32> for U256BE
-{
+impl Encodes<u32> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: u32) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<u64> for U256BE
-{
+impl Encodes<u64> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: u64) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<u128> for U256BE
-{
+impl Encodes<u128> for U256BE {
     type Output = Inline<U256BE>;
     fn encode(source: u128) -> Inline<U256BE> {
         Inline::new(ethnum::U256::new(source).to_be_bytes())
     }
 }
 
-impl Encodes<i8> for I256LE
-{
+impl Encodes<i8> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: i8) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<i16> for I256LE
-{
+impl Encodes<i16> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: i16) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<i32> for I256LE
-{
+impl Encodes<i32> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: i32) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<i64> for I256LE
-{
+impl Encodes<i64> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: i64) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(source.into()).to_le_bytes())
     }
 }
 
-impl Encodes<i128> for I256LE
-{
+impl Encodes<i128> for I256LE {
     type Output = Inline<I256LE>;
     fn encode(source: i128) -> Inline<I256LE> {
         Inline::new(ethnum::I256::new(source).to_le_bytes())
     }
 }
 
-impl Encodes<i8> for I256BE
-{
+impl Encodes<i8> for I256BE {
     type Output = Inline<I256BE>;
     fn encode(source: i8) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<i32> for I256BE
-{
+impl Encodes<i32> for I256BE {
     type Output = Inline<I256BE>;
     fn encode(source: i32) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<i64> for I256BE
-{
+impl Encodes<i64> for I256BE {
     type Output = Inline<I256BE>;
     fn encode(source: i64) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(source.into()).to_be_bytes())
     }
 }
 
-impl Encodes<i128> for I256BE
-{
+impl Encodes<i128> for I256BE {
     type Output = Inline<I256BE>;
     fn encode(source: i128) -> Inline<I256BE> {
         Inline::new(ethnum::I256::new(source).to_be_bytes())

@@ -12,9 +12,9 @@
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::Blob;
 use triblespace_core::id::rngid;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::{BlobStore, BlobStoreGet};
-use triblespace_core::inline::encodings::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;
@@ -65,9 +65,7 @@ fn entity_still_accepts_precomputed_value() {
     // the right behaviour — the caller is responsible for making
     // sure the bytes live somewhere else if they want them resolvable.
     let e = rngid();
-    let precomputed = "already put elsewhere"
-        .to_blob()
-        .get_handle();
+    let precomputed = "already put elsewhere".to_blob().get_handle();
     let frag = entity! { &e @ ns::note: precomputed };
 
     // Handle is in the facts.

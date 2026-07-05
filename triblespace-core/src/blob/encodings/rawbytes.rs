@@ -1,10 +1,10 @@
-use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -50,7 +50,8 @@ impl TryFromBlob<RawBytes> for Bytes {
 }
 
 impl Encodes<Bytes> for RawBytes
-where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Bytes) -> Blob<RawBytes> {
@@ -59,7 +60,8 @@ where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEnc
 }
 
 impl Encodes<Vec<u8>> for RawBytes
-where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: Vec<u8>) -> Blob<RawBytes> {
@@ -68,7 +70,8 @@ where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEnc
 }
 
 impl Encodes<&[u8]> for RawBytes
-where crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<RawBytes>: crate::inline::InlineEncoding,
 {
     type Output = Blob<RawBytes>;
     fn encode(source: &[u8]) -> Blob<RawBytes> {

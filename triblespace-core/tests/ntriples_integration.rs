@@ -14,6 +14,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;
+use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::prelude::inlineencodings::{self, Handle};
@@ -22,7 +23,6 @@ use triblespace_core::prelude::BlobStoreGet as _;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::{TryToInline, Inline};
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
@@ -146,7 +146,6 @@ fn uri_to_id_is_deterministic_across_workspaces() {
 
 #[test]
 fn xsd_datatypes_map_to_native_schemas() {
-
     let data = br#"
 <http://ex/a> <http://ex/i> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 <http://ex/a> <http://ex/u> "100"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> .
@@ -210,7 +209,6 @@ fn xsd_datatypes_map_to_native_schemas() {
 fn xsd_temporal_and_binary_types() {
     use triblespace_core::blob::encodings::rawbytes::RawBytes;
     use triblespace_core::inline::encodings::time::{NsDuration, NsTAIInterval};
-
 
     let data = br#"
 <http://ex/a> <http://ex/born> "1879-03-14T11:30:00Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
@@ -324,7 +322,6 @@ fn xsd_temporal_and_binary_types() {
 #[test]
 fn lang_tagged_literals_reify_into_entities() {
     use triblespace_core::import::{rdf_lang, rdf_text};
-
 
     // Same `(en, "human")` pair appears twice — should dedupe via the
     // intrinsic-id derivation. `(de, "Mensch")` is a separate entity.
@@ -464,7 +461,6 @@ _:b1 <http://ex/q> "x" .
 
 #[test]
 fn bnode_cycle_is_an_error() {
-
     let data = br#"
 _:a <http://ex/p> _:b .
 _:b <http://ex/p> _:a .

@@ -1,6 +1,6 @@
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::macros::pattern;
-use crate::inline::TryToInline;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;
@@ -13,11 +13,10 @@ use ed25519::signature::Signer;
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
+use crate::inline::Inline;
 use crate::prelude::inlineencodings::Handle;
 use crate::query::find;
 use crate::trible::TribleSet;
-use crate::inline::Inline;
-
 
 /// Error returned when commit signature verification fails.
 pub enum ValidationError {
@@ -66,8 +65,7 @@ pub fn commit_metadata(
             // simulated executions mint deterministic, virtual-time
             // commit timestamps — bit-identical commits per seed.
             let now = crate::clock::epoch_now();
-            let timestamp: Inline<_> =
-                (now, now).try_to_inline().expect("point interval");
+            let timestamp: Inline<_> = (now, now).try_to_inline().expect("point interval");
             (
                 Some(blob.get_handle()),
                 Some(signing_key.verifying_key()),

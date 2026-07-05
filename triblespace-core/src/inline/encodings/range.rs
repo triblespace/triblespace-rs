@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::RawInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::ops::{Range, RangeInclusive};
 
@@ -131,8 +131,7 @@ fn decode_range_value<S: InlineEncoding>(value: &Inline<S>) -> (u128, u128) {
     decode_pair(&value.raw)
 }
 
-impl Encodes<(u128, u128)> for RangeU128
-{
+impl Encodes<(u128, u128)> for RangeU128 {
     type Output = Inline<RangeU128>;
     fn encode(source: (u128, u128)) -> Inline<RangeU128> {
         encode_range_value(source)
@@ -146,8 +145,7 @@ impl TryFromInline<'_, RangeU128> for (u128, u128) {
     }
 }
 
-impl Encodes<(u128, u128)> for RangeInclusiveU128
-{
+impl Encodes<(u128, u128)> for RangeInclusiveU128 {
     type Output = Inline<RangeInclusiveU128>;
     fn encode(source: (u128, u128)) -> Inline<RangeInclusiveU128> {
         encode_range_value(source)

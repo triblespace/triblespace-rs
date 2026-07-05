@@ -34,6 +34,8 @@ pub use rngid::rngid;
 /// Re-export of [`ufoid::ufoid`].
 pub use ufoid::ufoid;
 
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
@@ -41,8 +43,6 @@ use crate::prelude::inlineencodings::GenId;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
-use crate::inline::RawInline;
-use crate::inline::INLINE_LEN;
 
 thread_local!(static OWNED_IDS: IdOwner = IdOwner::new());
 
@@ -659,11 +659,11 @@ impl ContainsConstraint<'static, GenId> for &IdOwner {
 mod tests {
     use crate::examples::literature;
     use crate::id::ExclusiveId;
+    use crate::inline::encodings::genid::GenId;
+    use crate::inline::encodings::shortstring::ShortString;
     use crate::prelude::*;
     use crate::query::Query;
     use crate::query::VariableContext;
-    use crate::inline::encodings::genid::GenId;
-    use crate::inline::encodings::shortstring::ShortString;
 
     #[test]
     fn id_formatting() {

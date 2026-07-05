@@ -102,8 +102,7 @@ impl VirtualClock {
     /// Advance virtual time by `d`. Called only by the simulation
     /// scheduler, between event deliveries.
     pub fn advance(&self, d: Duration) {
-        self.now_ns
-            .fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
+        self.now_ns.fetch_add(d.as_nanos() as u64, Ordering::SeqCst);
     }
 
     /// Current virtual nanoseconds.
@@ -124,9 +123,7 @@ impl VirtualClock {
 }
 
 enum Source {
-    Real {
-        origin: std::time::Instant,
-    },
+    Real { origin: std::time::Instant },
     Virtual(Arc<VirtualClock>),
 }
 
@@ -163,12 +160,9 @@ pub fn mono_now() -> Mono {
 /// Virtual source: `epoch_base + virtual elapsed`.
 pub fn epoch_now() -> hifitime::Epoch {
     match source() {
-        Source::Real { .. } => {
-            hifitime::Epoch::now().expect("system wall clock unreadable")
-        }
+        Source::Real { .. } => hifitime::Epoch::now().expect("system wall clock unreadable"),
         Source::Virtual(vc) => {
-            vc.epoch_base
-                + hifitime::Duration::from_total_nanoseconds(vc.now_ns() as i128)
+            vc.epoch_base + hifitime::Duration::from_total_nanoseconds(vc.now_ns() as i128)
         }
     }
 }

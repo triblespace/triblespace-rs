@@ -425,7 +425,10 @@ where
     type UpdateError = S::UpdateError;
     // Collected eagerly: the inner store's iterator would borrow the
     // mutex guard, which cannot leave this call.
-    type ListIter<'a> = std::vec::IntoIter<Result<Id, S::PinsError>> where S: 'a;
+    type ListIter<'a>
+        = std::vec::IntoIter<Result<Id, S::PinsError>>
+    where
+        S: 'a;
 
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
         let mut store = self.store.lock().expect("store mutex");
@@ -433,10 +436,7 @@ where
         Ok(ids.into_iter())
     }
 
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         self.store.lock().expect("store mutex").head(id)
     }
 
@@ -456,8 +456,10 @@ where
 {
     type WeakPinError = S::WeakPinError;
     // Collected eagerly, same rationale as `pins`.
-    type WeakListIter<'a> =
-        std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, S::WeakPinError>> where S: 'a;
+    type WeakListIter<'a>
+        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, S::WeakPinError>>
+    where
+        S: 'a;
 
     /// Passthrough to the inner store. Note the durability contract of
     /// the *read* path (pin + flush) does not apply here — this is the
@@ -556,9 +558,7 @@ where
     type Reader = LazyReader<S>;
     type ReaderError = S::ReaderError;
 
-    fn reader(
-        &mut self,
-    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         let store = self.store.clone();
         let signal = self.signal.clone();
         async move {
@@ -812,7 +812,10 @@ impl<S> BlobStoreList for LazyReader<S>
 where
     S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
 {
-    type Iter<'a> = <S::Reader as BlobStoreList>::Iter<'a> where Self: 'a;
+    type Iter<'a>
+        = <S::Reader as BlobStoreList>::Iter<'a>
+    where
+        Self: 'a;
     type Err = <S::Reader as BlobStoreList>::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
@@ -851,7 +854,11 @@ mod tests {
         let bytes: Bytes =
             BlobStoreGet::get(&reader, handle).expect("resident blob serves locally");
         assert_eq!(&bytes[..], b"resident");
-        assert_eq!(lazy.weak_pins().unwrap().count(), 0, "a hit records no want");
+        assert_eq!(
+            lazy.weak_pins().unwrap().count(),
+            0,
+            "a hit records no want"
+        );
     }
 
     /// The core contract of the sync probe: a miss returns `NotYet` with
@@ -868,7 +875,10 @@ mod tests {
         let reader = BlobStore::reader(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("absent blob must not serve");
-        assert!(matches!(err, WantGetError::NotYet), "miss is NotYet, got {err:?}");
+        assert!(
+            matches!(err, WantGetError::NotYet),
+            "miss is NotYet, got {err:?}"
+        );
         drop(reader);
 
         let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
@@ -948,8 +958,7 @@ mod tests {
 
     impl WeakPinStore for FailingPins {
         type WeakPinError = PinRefused;
-        type WeakListIter<'a> =
-            std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PinRefused>>;
+        type WeakListIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PinRefused>>;
 
         fn pin_weak<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), PinRefused>
         where
@@ -991,7 +1000,10 @@ mod tests {
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
             .expect_err("miss on a pin-refusing store must error");
         assert!(
-            matches!(err, WantGetError::WantRecord(WantRecordError::Pin(PinRefused))),
+            matches!(
+                err,
+                WantGetError::WantRecord(WantRecordError::Pin(PinRefused))
+            ),
             "want-record failure must surface as WantRecord, got {err:?}"
         );
     }
@@ -1005,10 +1017,15 @@ mod tests {
         let (_, handle) = blob_of(b"unrecordable");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
-        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle))
-            .expect_err("miss on a pin-refusing store must error, not suspend");
+        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
+            &reader, handle,
+        ))
+        .expect_err("miss on a pin-refusing store must error, not suspend");
         assert!(
-            matches!(err, WantWaitError::WantRecord(WantRecordError::Pin(PinRefused))),
+            matches!(
+                err,
+                WantWaitError::WantRecord(WantRecordError::Pin(PinRefused))
+            ),
             "want-record failure must surface as WantRecord, got {err:?}"
         );
     }
@@ -1036,7 +1053,11 @@ mod tests {
         let bytes: Bytes =
             block_on(AsyncBlobStoreGet::get(&reader, handle)).expect("present blob resolves");
         assert_eq!(&bytes[..], b"already here");
-        assert_eq!(lazy.weak_pins().unwrap().count(), 0, "a hit records no want");
+        assert_eq!(
+            lazy.weak_pins().unwrap().count(),
+            0,
+            "a hit records no want"
+        );
     }
 
     /// The in-process wake path: the first poll records the durable want
@@ -1048,8 +1069,9 @@ mod tests {
         let (blob, handle) = blob_of(b"lands in process");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
-        let mut fut =
-            Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle));
+        let mut fut = Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
+            &reader, handle,
+        ));
 
         let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
         let waker = waker(counter.clone());
@@ -1061,7 +1083,11 @@ mod tests {
         );
         let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
         assert_eq!(wants, vec![handle], "first pending poll recorded the want");
-        assert_eq!(counter.0.load(Ordering::SeqCst), 0, "no wake before the put");
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "no wake before the put"
+        );
 
         BlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob).unwrap();
         assert!(
@@ -1084,8 +1110,9 @@ mod tests {
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
         {
-            let mut fut =
-                Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle));
+            let mut fut = Box::pin(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
+                &reader, handle,
+            ));
             let counter = Arc::new(CountingWaker(AtomicUsize::new(0)));
             let waker = waker(counter);
             let mut cx = Context::from_waker(&waker);
@@ -1141,13 +1168,18 @@ mod tests {
 
         // Corrupt the tail out-of-band: garbage that matches no record
         // magic.
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         file.write_all(&[0xAB; 256]).unwrap();
         file.sync_all().unwrap();
         drop(file);
 
-        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle))
-            .expect_err("corrupt tail must fail");
+        let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
+            &reader, handle,
+        ))
+        .expect_err("corrupt tail must fail");
         assert!(
             matches!(
                 err,
@@ -1164,8 +1196,7 @@ mod tests {
         let mut lazy = Lazy::new(MemoryRepo::default());
         let (blob, _) = blob_of(b"through the async surface");
 
-        let handle =
-            block_on(AsyncBlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob)).unwrap();
+        let handle = block_on(AsyncBlobStorePut::put::<UnknownBlob, _>(&mut lazy, blob)).unwrap();
         let reader = block_on(AsyncBlobStore::reader(&mut lazy)).unwrap();
         let bytes: Bytes = block_on(AsyncBlobStoreGet::get(&reader, handle)).unwrap();
         assert_eq!(&bytes[..], b"through the async surface");

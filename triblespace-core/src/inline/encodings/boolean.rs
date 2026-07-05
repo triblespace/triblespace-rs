@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::INLINE_LEN;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 
 use std::convert::Infallible;
 
@@ -124,16 +124,14 @@ impl TryToInline<Boolean> for &bool {
     }
 }
 
-impl Encodes<bool> for Boolean
-{
+impl Encodes<bool> for Boolean {
     type Output = Inline<Boolean>;
     fn encode(source: bool) -> Inline<Boolean> {
         Boolean::encode(source)
     }
 }
 
-impl Encodes<&bool> for Boolean
-{
+impl Encodes<&bool> for Boolean {
     type Output = Inline<Boolean>;
     fn encode(source: &bool) -> Inline<Boolean> {
         Boolean::encode(*source)

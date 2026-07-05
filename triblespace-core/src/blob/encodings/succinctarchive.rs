@@ -2,7 +2,6 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
-use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -11,6 +10,12 @@ use crate::id::id_into_value;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::UnknownInline;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -18,11 +23,6 @@ use crate::query::TriblePattern;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::UnknownInline;
-use crate::inline::RawInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use succinctarchiveconstraint::*;
 
 /// Re-export all universe types and traits.
@@ -771,11 +771,11 @@ mod tests {
 
     use crate::blob::IntoBlob;
     use crate::id::fucid;
+    use crate::inline::IntoInline;
+    use crate::inline::TryToInline;
     use crate::prelude::*;
     use crate::query::find;
     use crate::trible::Trible;
-    use crate::inline::IntoInline;
-    use crate::inline::TryToInline;
 
     use super::*;
     use anybytes::area::ByteArea;

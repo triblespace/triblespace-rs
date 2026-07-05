@@ -2,15 +2,15 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::INLINE_LEN;
 use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
 use crate::repo::BlobStoreList;
 use crate::repo::BlobStorePut;
-use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
-use crate::inline::INLINE_LEN;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -159,7 +159,7 @@ impl MemoryBlobStore {
         self.len() == 0
     }
 
-/// Structurally merge `other` into this store, consuming `other`.
+    /// Structurally merge `other` into this store, consuming `other`.
     ///
     /// Handle bytes match by content-addressing — duplicate keys
     /// collapse via PATCH's union semantics (idempotent). Faster
@@ -382,18 +382,19 @@ mod tests {
     #[test]
     fn reader_is_a_pinned_snapshot() {
         let mut store = MemoryBlobStore::new();
-        let blob_a: Inline<Handle<LongString>> =
-            store.put(Bytes::from_source("hello".to_string()).view().unwrap()).unwrap();
+        let blob_a: Inline<Handle<LongString>> = store
+            .put(Bytes::from_source("hello".to_string()).view().unwrap())
+            .unwrap();
         let snapshot = store.reader().unwrap();
         assert_eq!(snapshot.len(), 1);
 
-        let _blob_b: Inline<Handle<LongString>> =
-            store.put(Bytes::from_source("world".to_string()).view().unwrap()).unwrap();
+        let _blob_b: Inline<Handle<LongString>> = store
+            .put(Bytes::from_source("world".to_string()).view().unwrap())
+            .unwrap();
         // The snapshot still has only the original blob.
         assert_eq!(snapshot.len(), 1);
         use anybytes::View;
-        let recovered: View<str> =
-            snapshot.get::<View<str>, LongString>(blob_a).unwrap();
+        let recovered: View<str> = snapshot.get::<View<str>, LongString>(blob_a).unwrap();
         assert_eq!(&*recovered, "hello");
 
         // A fresh reader sees both.
@@ -419,7 +420,11 @@ mod tests {
             .unwrap();
 
         a.union(b);
-        assert_eq!(a.reader().unwrap().len(), 2, "duplicates collapse via union");
+        assert_eq!(
+            a.reader().unwrap().len(),
+            2,
+            "duplicates collapse via union"
+        );
 
         use anybytes::View;
         let recovered_hello: View<str> = a

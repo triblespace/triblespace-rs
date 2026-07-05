@@ -212,8 +212,7 @@ pub(crate) mod key_ops {
         if !has_prefix::<KEY_LEN, O>(key, at_depth, prefix) {
             return;
         }
-        let infix: [u8; INFIX_LEN] =
-            core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+        let infix: [u8; INFIX_LEN] = core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
         f(&infix);
     }
 
@@ -237,8 +236,7 @@ pub(crate) mod key_ops {
         if !has_prefix::<KEY_LEN, O>(key, at_depth, prefix) {
             return;
         }
-        let infix: [u8; INFIX_LEN] =
-            core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+        let infix: [u8; INFIX_LEN] = core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
         if &infix >= min_infix && &infix <= max_infix {
             f(&infix);
         }
@@ -260,8 +258,7 @@ pub(crate) mod key_ops {
         if !has_prefix::<KEY_LEN, O>(key, at_depth, prefix) {
             return 0;
         }
-        let infix: [u8; INFIX_LEN] =
-            core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+        let infix: [u8; INFIX_LEN] = core::array::from_fn(|i| key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
         if &infix >= min_infix && &infix <= max_infix {
             1
         } else {
@@ -270,11 +267,7 @@ pub(crate) mod key_ops {
     }
 
     #[inline]
-    pub fn segmented_len<
-        const KEY_LEN: usize,
-        const PREFIX_LEN: usize,
-        O: KeySchema<KEY_LEN>,
-    >(
+    pub fn segmented_len<const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>>(
         key: &[u8; KEY_LEN],
         at_depth: usize,
         prefix: &[u8; PREFIX_LEN],

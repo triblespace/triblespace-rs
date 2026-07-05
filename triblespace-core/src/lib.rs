@@ -10,17 +10,19 @@ extern crate proc_macro;
 #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
 compile_error!("triblespace-rs requires a 64-bit little-endian target");
 
-/// Attribute definition and usage metadata.
-pub mod clock;
 pub mod attribute;
 /// Blob storage, schemas, and conversion traits.
 pub mod blob;
+/// Attribute definition and usage metadata.
+pub mod clock;
 /// Export utilities for serialising trible data.
 pub mod export;
 /// Identifier types and generation strategies.
 pub mod id;
 /// Import utilities for deserialising external data into tribles.
 pub mod import;
+/// Inline types, schemas, and conversion traits.
+pub mod inline;
 /// Bootstrap metadata namespace for describing schemas and attributes.
 pub mod metadata;
 /// Adaptive radix tree (PATCH) used as the backing store for trible indexes.
@@ -33,8 +35,6 @@ pub mod query;
 pub mod repo;
 /// Trible representation, sets, fragments, and spread helpers.
 pub mod trible;
-/// Inline types, schemas, and conversion traits.
-pub mod inline;
 
 #[cfg(feature = "wasm")]
 /// WebAssembly integration helpers.

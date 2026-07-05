@@ -22,8 +22,8 @@ use triblespace_core::blob::encodings::array::{
 };
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::rawbytes::RawBytes;
-use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle};
+use triblespace_core::metadata::MetaDescribe;
 
 #[test]
 fn handle_id_is_deterministic() {
@@ -87,10 +87,10 @@ fn array_describe_root_matches_id() {
 #[test]
 fn array_describe_carries_element_schema_annotations() {
     use triblespace_core::id::Id;
-    use triblespace_core::macros::{find, pattern};
-    use triblespace_core::metadata;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 
@@ -115,7 +115,11 @@ fn array_describe_carries_element_schema_annotations() {
     )
     .map(|(n,)| n)
     .collect();
-    assert_eq!(f32_names.len(), 1, "F32's name annotation reaches the registry");
+    assert_eq!(
+        f32_names.len(),
+        1,
+        "F32's name annotation reaches the registry"
+    );
 
     // And the Array's own annotation under array_id is also present.
     let array_names: Vec<Inline<Handle<_>>> = find!(
@@ -124,7 +128,11 @@ fn array_describe_carries_element_schema_annotations() {
     )
     .map(|(n,)| n)
     .collect();
-    assert_eq!(array_names.len(), 1, "Array's own name annotation reaches the registry");
+    assert_eq!(
+        array_names.len(),
+        1,
+        "Array's own name annotation reaches the registry"
+    );
 }
 
 /// `Handle<H, T>::describe` spreads *two* sub-schemas (blob and hash)
@@ -136,9 +144,9 @@ fn array_describe_carries_element_schema_annotations() {
 #[test]
 fn handle_describe_carries_blob_and_hash_schema_annotations() {
     use triblespace_core::id::Id;
+    use triblespace_core::inline::Inline;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
-    use triblespace_core::inline::Inline;
 
     let frag = <Handle<LongString> as MetaDescribe>::describe();
 
@@ -172,7 +180,11 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     )
     .map(|(n,)| n)
     .collect();
-    assert_eq!(blob_names.len(), 1, "LongString's name annotation reaches the registry");
+    assert_eq!(
+        blob_names.len(),
+        1,
+        "LongString's name annotation reaches the registry"
+    );
 
     let hash_names: Vec<Inline<Handle<_>>> = find!(
         (n: Inline<Handle<_>>),
@@ -180,7 +192,11 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     )
     .map(|(n,)| n)
     .collect();
-    assert_eq!(hash_names.len(), 1, "Blake3's name annotation reaches the registry");
+    assert_eq!(
+        hash_names.len(),
+        1,
+        "Blake3's name annotation reaches the registry"
+    );
 
     // Plus the handle's own annotation under handle_id.
     let handle_names: Vec<Inline<Handle<_>>> = find!(
@@ -189,7 +205,11 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
     )
     .map(|(n,)| n)
     .collect();
-    assert_eq!(handle_names.len(), 1, "Handle's own name annotation reaches the registry");
+    assert_eq!(
+        handle_names.len(),
+        1,
+        "Handle's own name annotation reaches the registry"
+    );
 }
 
 /// The `entity!{}` macro's `*:` spread must propagate not just facts
@@ -204,12 +224,12 @@ fn handle_describe_carries_blob_and_hash_schema_annotations() {
 #[test]
 fn entity_spread_propagates_blobs() {
     use triblespace_core::id::Id;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
-    use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::inline::Inline;
 
     let frag = <Array<F32> as MetaDescribe>::describe();
 

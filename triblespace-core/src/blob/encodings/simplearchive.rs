@@ -1,10 +1,10 @@
-use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -42,7 +42,8 @@ impl MetaDescribe for SimpleArchive {
 }
 
 impl Encodes<TribleSet> for SimpleArchive
-where crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
@@ -54,7 +55,8 @@ where crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::Inli
 }
 
 impl Encodes<&TribleSet> for SimpleArchive
-where crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {
@@ -112,9 +114,7 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
 /// heap-`Leaf` ingest path (no `LocalLeaf`). Exposed for measurement
 /// so the LocalLeaf path can be compared against the legacy heap
 /// behaviour on identical input.
-pub fn try_from_blob_heap_only(
-    blob: Blob<SimpleArchive>,
-) -> Result<TribleSet, UnarchiveError> {
+pub fn try_from_blob_heap_only(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
     try_from_blob_inner(blob, /*archive_backed:*/ false)
 }
 

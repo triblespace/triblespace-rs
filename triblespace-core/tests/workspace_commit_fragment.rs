@@ -12,11 +12,11 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::id::rngid;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, Repository};
 use triblespace_core::trible::Fragment;
-use triblespace_core::inline::encodings::hash::Handle;
 
 mod ns {
     use triblespace_core::prelude::*;
@@ -28,12 +28,8 @@ mod ns {
 #[test]
 fn commit_fragment_absorbs_blobs() {
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(
-        storage,
-        SigningKey::generate(&mut OsRng),
-        TribleSet::new(),
-    )
-    .expect("repo");
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
     let branch_id = repo.create_branch("main", None).expect("branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -76,12 +72,8 @@ fn commit_tribleset_auto_promotes() {
     // `impl From<TribleSet> for Fragment` (lossless promotion: no
     // exports, empty blob store).
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(
-        storage,
-        SigningKey::generate(&mut OsRng),
-        TribleSet::new(),
-    )
-    .expect("repo");
+    let mut repo =
+        Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("repo");
     let branch_id = repo.create_branch("main", None).expect("branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -89,8 +81,7 @@ fn commit_tribleset_auto_promotes() {
     let e = rngid();
     // Put the blob via the workspace's staged store the old way,
     // pass a bare TribleSet to commit.
-    let h: triblespace_core::inline::Inline<Handle<LongString>> =
-        ws.put("tribleset-side bytes");
+    let h: triblespace_core::inline::Inline<Handle<LongString>> = ws.put("tribleset-side bytes");
     data += entity! { &e @ ns::note: h };
     ws.commit(data, "tribleset commit");
 

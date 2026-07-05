@@ -28,12 +28,12 @@ pub mod time;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 /// An inline encoding for unknown values.

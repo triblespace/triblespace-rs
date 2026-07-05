@@ -1,15 +1,15 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 use indxvec::Printing;
 use std::str::Utf8Error;
@@ -149,24 +149,21 @@ impl TryToInline<ShortString> for String {
     }
 }
 
-impl Encodes<&str> for ShortString
-{
+impl Encodes<&str> for ShortString {
     type Output = Inline<ShortString>;
     fn encode(source: &str) -> Inline<ShortString> {
         source.try_to_inline().unwrap()
     }
 }
 
-impl Encodes<String> for ShortString
-{
+impl Encodes<String> for ShortString {
     type Output = Inline<ShortString>;
     fn encode(source: String) -> Inline<ShortString> {
         source.try_to_inline().unwrap()
     }
 }
 
-impl Encodes<&String> for ShortString
-{
+impl Encodes<&String> for ShortString {
     type Output = Inline<ShortString>;
     fn encode(source: &String) -> Inline<ShortString> {
         source.to_str().try_to_inline().unwrap()

@@ -130,9 +130,7 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
     type ReaderError: Error + Send + Sync + 'static;
 
     /// Create a shareable reader snapshot of the current store state.
-    fn reader(
-        &mut self,
-    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
+    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
 }
 
 /// Async counterpart of [`PinStore`]: named,
@@ -299,9 +297,7 @@ where
     type Reader = SyncAsAsync<S::Reader>;
     type ReaderError = S::ReaderError;
 
-    fn reader(
-        &mut self,
-    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         async move { self.0.reader().map(SyncAsAsync) }
     }
 }
@@ -316,7 +312,8 @@ where
 
     fn pins(
         &mut self,
-    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send {
+    ) -> impl Future<Output = Result<Vec<Result<Id, Self::PinsError>>, Self::PinsError>> + Send
+    {
         async move { self.0.pins().map(|it| it.collect()) }
     }
 
@@ -411,7 +408,9 @@ impl<A: Clone> Clone for Blocking<A> {
 impl<A: std::fmt::Debug> std::fmt::Debug for Blocking<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The runtime is a driver, not state — show only the inner store.
-        f.debug_struct("Blocking").field("inner", &self.inner).finish()
+        f.debug_struct("Blocking")
+            .field("inner", &self.inner)
+            .finish()
     }
 }
 
@@ -528,10 +527,7 @@ impl<A: AsyncPinStore> PinStore for Blocking<A> {
         self.rt.block_on(self.inner.pins()).map(|v| v.into_iter())
     }
 
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         self.rt.block_on(self.inner.head(id))
     }
 
@@ -672,7 +668,11 @@ mod tests {
         let reader = store.reader().unwrap();
         let got: Blob<SimpleArchive> = reader.get(h).unwrap();
         assert_eq!(got.bytes, b.bytes);
-        let listed: Vec<_> = reader.blobs().filter_map(Result::ok).map(|h| h.raw).collect();
+        let listed: Vec<_> = reader
+            .blobs()
+            .filter_map(Result::ok)
+            .map(|h| h.raw)
+            .collect();
         assert!(listed.contains(&h.raw));
     }
 

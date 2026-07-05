@@ -46,16 +46,16 @@ use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
+use crate::inline::encodings::hash::Blake3;
+use crate::inline::encodings::hash::Hash;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
-use crate::inline::encodings::hash::Blake3;
-use crate::inline::encodings::hash::Hash;
-use crate::inline::RawInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -448,8 +448,7 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             })
         }
         MAGIC_MARKER_BRANCH_V3 => {
-            let (header, _) =
-                BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let (header, _) = BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
@@ -612,7 +611,8 @@ fn padding_for_blob(blob_size: usize) -> usize {
 /// the same underlying pile data.
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
-    blobs: PATCH<32, IdentitySchema, IndexEntry>,}
+    blobs: PATCH<32, IdentitySchema, IndexEntry>,
+}
 
 impl PartialEq for PileReader {
     fn eq(&self, other: &Self) -> bool {
@@ -624,9 +624,7 @@ impl Eq for PileReader {}
 
 impl PileReader {
     fn new(mmap: Arc<MmapRaw>, blobs: PATCH<32, IdentitySchema, IndexEntry>) -> Self {
-        Self {
-            mmap,
-            blobs,        }
+        Self { mmap, blobs }
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -643,7 +641,8 @@ impl PileReader {
         PileBlobStoreIter {
             mmap: self.mmap.clone(),
             inner,
-            lookup,        }
+            lookup,
+        }
     }
 
     // metadata moved into BlobStoreMeta impl below
@@ -1144,11 +1143,11 @@ pub struct PileBlobStoreIter {
     mmap: Arc<MmapRaw>,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
     /// Owned clone of the PATCH used for lookups of IndexEntry by key.
-    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,}
+    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,
+}
 
 impl Iterator for PileBlobStoreIter {
-    type Item =
-        Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
+    type Item = Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?; // [u8;32]
@@ -1180,8 +1179,7 @@ impl Iterator for PileBlobStoreIter {
                     // We just validated against `hash`; pre-seed the
                     // cached handle so downstream `get_handle` /
                     // `insert` skip the Blake3 recompute.
-                    let blob: Blob<UnknownBlob> =
-                        Blob::with_handle(bytes.clone(), handle);
+                    let blob: Blob<UnknownBlob> = Blob::with_handle(bytes.clone(), handle);
                     Some(Ok((handle, blob)))
                 }
                 ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes.clone()))),
@@ -1197,7 +1195,8 @@ impl Iterator for PileBlobStoreIter {
 /// Adapter that yields only the blob handles. The iterator owns the handle
 /// list and does not borrow the backing [`PATCH`].
 pub struct PileBlobStoreListIter {
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,}
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
+}
 
 impl Iterator for PileBlobStoreListIter {
     type Item = Result<Inline<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
@@ -1220,8 +1219,7 @@ impl BlobStoreList for PileReader {
         // being cheap (PATCH clone is copy-on-write).
         let cloned = self.blobs.clone();
         let inner = cloned.into_iter();
-        PileBlobStoreListIter {
-            inner,        }
+        PileBlobStoreListIter { inner }
     }
 
     /// Cheap PATCH-level set difference between this reader's blob index
@@ -1231,7 +1229,8 @@ impl BlobStoreList for PileReader {
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         let diff = self.blobs.difference(&old.blobs);
         PileBlobStoreListIter {
-            inner: diff.into_iter(),        }
+            inner: diff.into_iter(),
+        }
     }
 }
 
@@ -1395,9 +1394,7 @@ impl Pile {
     }
 }
 
-impl PinStore for Pile
-{
-
+impl PinStore for Pile {
     type PinsError = ReadError;
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
@@ -1741,7 +1738,11 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.restore().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
-            let entry = pile.blobs.get(&hash.raw).expect("V3 blob missing after reopen").clone();
+            let entry = pile
+                .blobs
+                .get(&hash.raw)
+                .expect("V3 blob missing after reopen")
+                .clone();
             let IndexEntry { offset, len, .. } = entry;
             assert_eq!(
                 offset % GPU_DATA_ALIGNMENT,
@@ -1749,10 +1750,14 @@ mod tests {
                 "V3 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
                 expected.len()
             );
-            let got = unsafe {
-                std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize)
-            };
-            assert_eq!(got, &expected[..], "V3 roundtrip mismatch (size {})", expected.len());
+            let got =
+                unsafe { std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize) };
+            assert_eq!(
+                got,
+                &expected[..],
+                "V3 roundtrip mismatch (size {})",
+                expected.len()
+            );
         }
         pile.close().unwrap();
     }
@@ -1793,13 +1798,22 @@ mod tests {
 
         // Each pure-V3 pile is a whole number of 256-byte units — the precondition
         // that makes the appended pile land on a 256-aligned offset.
-        assert_eq!(std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64, 0);
-        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        assert_eq!(
+            std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
 
         // cat a.pile >> b.pile
         {
             let a_bytes = std::fs::read(&path_a).unwrap();
-            let mut bf = std::fs::OpenOptions::new().append(true).open(&path_b).unwrap();
+            let mut bf = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path_b)
+                .unwrap();
             bf.write_all(&a_bytes).unwrap();
             bf.sync_all().unwrap();
         }
@@ -1819,13 +1833,21 @@ mod tests {
                 .expect("blob lost after cat-merge")
                 .clone();
             let IndexEntry { offset, len, .. } = entry;
-            assert_eq!(offset % V3_ALIGNMENT, 0, "post-cat data offset not 256-aligned");
-            let got =
-                unsafe { std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize) };
+            assert_eq!(
+                offset % V3_ALIGNMENT,
+                0,
+                "post-cat data offset not 256-aligned"
+            );
+            let got = unsafe {
+                std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize)
+            };
             assert_eq!(got, &expected[..], "blob bytes wrong after cat-merge");
         }
         // Still 256-aligned, so it can be cat'd again.
-        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        assert_eq!(
+            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
         merged.close().unwrap();
     }
 
@@ -1859,7 +1881,6 @@ mod tests {
         );
         pile.close().unwrap();
     }
-
 
     #[test]
     fn recover_shrink() {
@@ -2736,7 +2757,10 @@ mod tests {
             let v1_hash: Inline<Hash<Blake3>> = v1_handle.into();
             let header = BlobHeader::new(42, v1_data.len() as u64, v1_hash);
             let pad = padding_for_blob(v1_data.len());
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(header.as_bytes()).unwrap();
             f.write_all(&v1_data).unwrap();
             f.write_all(&vec![0u8; pad]).unwrap();
@@ -2805,7 +2829,10 @@ mod tests {
             let v1_hash: Inline<Hash<Blake3>> = v1_handle.into();
             let header = BlobHeader::new(42, v1_data.len() as u64, v1_hash);
             let pad = padding_for_blob(v1_data.len());
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(header.as_bytes()).unwrap();
             f.write_all(&v1_data).unwrap();
             f.write_all(&vec![0u8; pad]).unwrap();
@@ -2899,7 +2926,10 @@ mod tests {
         // A garbage tail is an error at its offset, then the iterator ends.
         let garbage_offset = std::fs::metadata(&path).unwrap().len() as usize;
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(&[0xFFu8; 32]).unwrap();
             f.sync_all().unwrap();
         }

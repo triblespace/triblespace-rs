@@ -4,10 +4,12 @@ pub mod triblesetrangeconstraint;
 
 use triblesetconstraint::*;
 
-use crate::query::TriblePattern;
 use crate::inline::Inline;
+use crate::query::TriblePattern;
 
 use crate::id::Id;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
 use crate::patch::Entry;
 use crate::patch::PATCH;
@@ -20,8 +22,6 @@ use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::InlineEncoding;
 
 use std::iter::FromIterator;
 use std::iter::Map;
@@ -132,20 +132,13 @@ impl TribleSet {
                 // Nested join trees the six tasks across rayon workers
                 // with much lower per-call overhead than `scope`.
                 rayon::join(
-                    || rayon::join(
-                        || eav.union(oeav),
-                        || eva.union(oeva),
-                    ),
-                    || rayon::join(
-                        || rayon::join(
-                            || aev.union(oaev),
-                            || ave.union(oave),
-                        ),
-                        || rayon::join(
-                            || vea.union(ovea),
-                            || vae.union(ovae),
-                        ),
-                    ),
+                    || rayon::join(|| eav.union(oeav), || eva.union(oeva)),
+                    || {
+                        rayon::join(
+                            || rayon::join(|| aev.union(oaev), || ave.union(oave)),
+                            || rayon::join(|| vea.union(ovea), || vae.union(ovae)),
+                        )
+                    },
                 );
                 return;
             }

@@ -4,8 +4,8 @@ use std::convert::Infallible;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
-use crate::blob::MemoryBlobStore;
 use crate::blob::IntoBlob;
+use crate::blob::MemoryBlobStore;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
@@ -79,10 +79,7 @@ impl PinStore for MemoryRepo {
         Ok(ids.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
 
-    fn head(
-        &mut self,
-        id: Id,
-    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
         Ok(self.branches.get(&id).cloned())
     }
 
@@ -138,11 +135,7 @@ impl WeakPinStore for MemoryRepo {
         // would break deterministic simulation replay.
         let mut handles: Vec<Inline<Handle<UnknownBlob>>> = self.weak.iter().copied().collect();
         handles.sort();
-        Ok(handles
-            .into_iter()
-            .map(Ok)
-            .collect::<Vec<_>>()
-            .into_iter())
+        Ok(handles.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
 }
 

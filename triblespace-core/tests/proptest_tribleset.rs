@@ -1,10 +1,10 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
+use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
-use triblespace_core::inline::encodings::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;

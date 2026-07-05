@@ -1,20 +1,20 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id::NilUuidError;
 use crate::id::OwnedId;
 use crate::id::RawId;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
+use crate::inline::INLINE_LEN;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 
 use std::convert::TryInto;
 
@@ -114,8 +114,7 @@ impl TryFromInline<'_, GenId> for RawId {
     }
 }
 
-impl Encodes<RawId> for GenId
-{
+impl Encodes<RawId> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: RawId) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
@@ -156,8 +155,7 @@ impl TryFromInline<'_, GenId> for Id {
     }
 }
 
-impl Encodes<&Id> for GenId
-{
+impl Encodes<&Id> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: &Id) -> Inline<GenId> {
         let mut data = [0; INLINE_LEN];
@@ -166,8 +164,7 @@ impl Encodes<&Id> for GenId
     }
 }
 
-impl Encodes<Id> for GenId
-{
+impl Encodes<Id> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: Id) -> Inline<GenId> {
         (&source).to_inline()
@@ -211,16 +208,14 @@ impl<'a> TryFromInline<'a, GenId> for ExclusiveId {
     }
 }
 
-impl Encodes<ExclusiveId> for GenId
-{
+impl Encodes<ExclusiveId> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: ExclusiveId) -> Inline<GenId> {
         source.id.to_inline()
     }
 }
 
-impl Encodes<&ExclusiveId> for GenId
-{
+impl Encodes<&ExclusiveId> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: &ExclusiveId) -> Inline<GenId> {
         source.id.to_inline()
@@ -239,16 +234,14 @@ impl TryFromInline<'_, GenId> for String {
     }
 }
 
-impl Encodes<OwnedId<'_>> for GenId
-{
+impl Encodes<OwnedId<'_>> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: OwnedId<'_>) -> Inline<GenId> {
         source.id.to_inline()
     }
 }
 
-impl Encodes<&OwnedId<'_>> for GenId
-{
+impl Encodes<&OwnedId<'_>> for GenId {
     type Output = Inline<GenId>;
     fn encode(source: &OwnedId<'_>) -> Inline<GenId> {
         source.id.to_inline()
@@ -347,9 +340,9 @@ impl proptest::strategy::ValueTree for IdValueTree {
 mod tests {
     use super::GenId;
     use crate::id::rngid;
+    use crate::inline::InlineEncoding;
     use crate::inline::TryFromInline;
     use crate::inline::TryToInline;
-    use crate::inline::InlineEncoding;
 
     #[test]
     fn unique() {
@@ -361,7 +354,8 @@ mod tests {
         let uuid = uuid::Uuid::nil();
         let value = uuid.try_to_inline().expect("uuid packing should succeed");
         GenId::validate(value).expect("schema validation");
-        let round_trip = uuid::Uuid::try_from_inline(&value).expect("uuid unpacking should succeed");
+        let round_trip =
+            uuid::Uuid::try_from_inline(&value).expect("uuid unpacking should succeed");
         assert_eq!(uuid, round_trip);
     }
 }

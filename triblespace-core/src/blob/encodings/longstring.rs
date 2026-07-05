@@ -1,10 +1,10 @@
-use crate::inline::Encodes;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
@@ -43,7 +43,8 @@ impl TryFromBlob<LongString> for View<str> {
 }
 
 impl Encodes<View<str>> for LongString
-where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: View<str>) -> Blob<LongString> {
@@ -52,7 +53,8 @@ where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineE
 }
 
 impl Encodes<&'static str> for LongString
-where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: &'static str) -> Blob<LongString> {
@@ -61,7 +63,8 @@ where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineE
 }
 
 impl Encodes<String> for LongString
-where crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<LongString>: crate::inline::InlineEncoding,
 {
     type Output = Blob<LongString>;
     fn encode(source: String) -> Blob<LongString> {
@@ -76,7 +79,7 @@ mod tests {
 
     use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
-    
+
     use crate::inline::encodings::hash::Handle;
     use crate::inline::Inline;
 

@@ -1,14 +1,14 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::id::Id;
+use crate::inline::encodings::hash::Handle;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
-use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 /// Store that delegates blob and branch operations to two independent stores.
 ///

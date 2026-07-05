@@ -48,7 +48,7 @@ pub use crate::inline::encodings::r256::R256LE;
 pub use crate::inline::encodings::range::{RangeInclusiveU128, RangeU128};
 /// Re-export of [`ShortString`].
 pub use crate::inline::encodings::shortstring::ShortString;
-/// Re-export of [`NsTAIInterval`].
-pub use crate::inline::encodings::time::NsTAIInterval;
 /// Re-export of [`NsDuration`].
 pub use crate::inline::encodings::time::NsDuration;
+/// Re-export of [`NsTAIInterval`].
+pub use crate::inline::encodings::time::NsTAIInterval;
