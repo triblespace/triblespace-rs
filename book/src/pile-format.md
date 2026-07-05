@@ -69,13 +69,13 @@ refreshing state.
    `reader`, `pins`, `head`, and `update` call `refresh` internally before they
    inspect or apply records, so external writers are visible without a
    standalone scan.
-3. **Repair only when asked to.** `restore` is the explicit, opt-in repair
+3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
    back to the last valid record, discarding a torn tail left by a crash. It
    is deliberately **not** part of the normal open sequence — implicit repair
    under version skew is a silent data-loss hazard (an old binary would "eat"
    every newer-format record past the first one it misreads as corruption).
-   The `trible pile restore <path>` command wraps it for operators.
+   The `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait) and pin
    update helpers extend the file via a single `write_vectored` call. Each
    append immediately feeds the bytes back through the record scanner so
@@ -84,7 +84,7 @@ refreshing state.
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
    an exclusive file lock and issues plain `write_all` calls — still
-   append-only, still repairable by an explicit `restore` if a crash leaves a
+   append-only, still repairable by an explicit `amputate` if a crash leaves a
    partial tail, but serialised against other writers for the duration of the
    append.
 5. **Read through a snapshot.** `reader` clones the memory map and PATCH
@@ -143,7 +143,7 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let mut pile = Pile::open(&path)?;
     // Load and validate the existing records. This FAILS LOUD on a corrupt
     // or torn tail and never mutates the file. Repair is a separate,
-    // explicit decision (`Pile::restore` / `trible pile restore`), typically
+    // explicit decision (`Pile::amputate` / `trible pile amputate`), typically
     // made by an operator after checking that the binary isn't simply older
     // than the pile's records.
     match pile.refresh() {
@@ -172,7 +172,7 @@ the built-in refreshes performed by `reader` and pin helpers, mutate via
 pin heads requires a brief critical section—`flush → refresh → lock →
 refresh → append → unlock`—so a caller observes a consistent head even when
 multiple processes contend for the same file descriptor. `refresh` acquires a
-shared lock so it cannot race with an explicit `restore`, which takes an
+shared lock so it cannot race with an explicit `amputate`, which takes an
 exclusive lock before truncating a corrupted tail.
 
 Filesystems lacking atomic `write`/`vwrite` appends—such as some network or
@@ -276,12 +276,12 @@ and continuing could cause undefined behavior, so truncation into validated
 data is treated as unrecoverable.
 
 `refresh` holds a shared file lock while scanning. This prevents a concurrent
-`restore` call from truncating the file out from under the reader.
+`amputate` call from truncating the file out from under the reader.
 
-The `restore` helper is the explicit repair path: it re-runs the same
+The `amputate` helper is the explicit, destructive repair path: it re-runs the same
 validation under an exclusive lock and truncates the file to the valid length
 if corruption is encountered, discarding incomplete data left by an
-interrupted write. Run it deliberately (e.g. via `trible pile restore <path>`)
+interrupted write. Run it deliberately (e.g. via `trible pile amputate <path>`)
 — never as a routine part of opening — and only once you know the "corruption"
 isn't just an older binary meeting newer record kinds. Hash verification
 happens lazily only when individual blobs are loaded so that opening a large

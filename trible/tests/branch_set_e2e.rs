@@ -17,7 +17,7 @@ fn branch_set_creates_and_updates_with_cas() {
 
     let (h1, h2) = {
         let mut pile: Pile = Pile::open(&pile_path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
 
         let mut a = TribleSet::new();
         let a_name = pile
@@ -86,7 +86,7 @@ fn branch_set_creates_and_updates_with_cas() {
 
     // Verify the head is set to h2.
     let mut pile: Pile = Pile::open(&pile_path).unwrap();
-    pile.restore().unwrap();
+    pile.amputate().unwrap();
     assert_eq!(pile.head(branch_id).unwrap(), Some(h2));
     pile.close().unwrap();
 }
@@ -101,7 +101,7 @@ fn branch_list_all_deleted_lists_deleted_branches() {
 
     {
         let mut pile: Pile = Pile::open(&pile_path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
 
         let mut a = TribleSet::new();
         let a_name = pile

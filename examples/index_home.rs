@@ -17,7 +17,7 @@ fn main() {
     std::fs::File::create(&path).expect("create pile file");
 
     // Open the pile fail-loud: `refresh` loads existing records and errors
-    // on a corrupt tail (repair is explicit — `Pile::restore`).
+    // on a corrupt tail (repair is explicit — `Pile::amputate`).
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 

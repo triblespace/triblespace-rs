@@ -29,7 +29,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
     let key = load_signing_key(&signing_key)?;
 
     // Open source pile and load its indices. Fail loud on a corrupt tail —
-    // reading the source must never mutate it (repair is `trible pile restore`).
+    // reading the source must never mutate it (destructive repair is `trible pile amputate`).
     let mut src_pile = super::open_refreshed(&source)?;
 
     // Enumerate branches (all pins).
@@ -141,13 +141,8 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
         // Mint a fresh branch id, keep the same name + head + rollup.
         let branch_id = triblespace_core::id::genid();
-        let new_meta = repo::branch::branch_metadata(
-            &key,
-            *branch_id,
-            name_handle,
-            head_blob,
-            rollup_handle,
-        );
+        let new_meta =
+            repo::branch::branch_metadata(&key, *branch_id, name_handle, head_blob, rollup_handle);
 
         let new_meta_handle = dst_pile
             .put(new_meta)
@@ -171,7 +166,9 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
     }
 
     dst_pile.close().map_err(|e| anyhow!("close dest: {e:?}"))?;
-    src_pile.close().map_err(|e| anyhow!("close source: {e:?}"))?;
+    src_pile
+        .close()
+        .map_err(|e| anyhow!("close source: {e:?}"))?;
 
     println!("\nRe-id'd {total_branches} branches, {total_blobs} blobs copied");
 

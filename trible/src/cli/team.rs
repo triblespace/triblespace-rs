@@ -20,13 +20,13 @@ use std::path::PathBuf;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::Blob;
 use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::repo::capability;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStore;
 use triblespace_core::repo::BlobStorePut;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::Inline;
 
 type PileBlake3 = Pile;
 
@@ -228,9 +228,12 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::ListPending { pile } => run_list_pending(pile),
         Command::ListIssued { pile } => run_list_issued(pile),
         Command::Retract { pile, entry } => run_retract(pile, entry),
-        Command::RequestJoin { admin, scope, key, pile } => {
-            run_request_join(admin, scope, key, pile)
-        }
+        Command::RequestJoin {
+            admin,
+            scope,
+            key,
+            pile,
+        } => run_request_join(admin, scope, key, pile),
         Command::Approve {
             pile,
             entry,
@@ -250,13 +253,13 @@ pub fn run(cmd: Command) -> Result<()> {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
-    let mut pile = PileBlake3::open(path)
-        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        PileBlake3::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(anyhow!(
             "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
-             truncate newer data). Repair a torn tail explicitly with: trible pile restore {}",
+             truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
             path.display(),
             path.display()
         ));
@@ -264,7 +267,7 @@ fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
     Ok(pile)
 }
 
-/// Open + restore the pile at `path`, run `f`, close the pile, propagate.
+/// Open + refresh the pile at `path`, run `f`, close the pile, propagate.
 ///
 /// Calls `pile.close()` unconditionally on the way out — both happy
 /// path and any `Err` returned by `f`. `Pile`'s `Drop` impl warns
@@ -278,10 +281,7 @@ fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
 /// If both `f` returns Err AND `close` fails, the user-facing error
 /// (f's) wins — close errors are appended to the message so they're
 /// still visible but don't shadow the original cause.
-fn with_pile<T>(
-    path: &PathBuf,
-    f: impl FnOnce(&mut PileBlake3) -> Result<T>,
-) -> Result<T> {
+fn with_pile<T>(path: &PathBuf, f: impl FnOnce(&mut PileBlake3) -> Result<T>) -> Result<T> {
     let mut pile = open_pile(path)?;
     let result = f(&mut pile);
     let close_err = pile.close().err();
@@ -289,16 +289,13 @@ fn with_pile<T>(
         (Ok(t), None) => Ok(t),
         (Ok(_), Some(e)) => Err(anyhow!("pile close: {e:?}")),
         (Err(e), None) => Err(e),
-        (Err(e), Some(close_e)) => {
-            Err(anyhow!("{e:#}; additionally pile close failed: {close_e:?}"))
-        }
+        (Err(e), Some(close_e)) => Err(anyhow!(
+            "{e:#}; additionally pile close failed: {close_e:?}"
+        )),
     }
 }
 
-fn load_or_generate_signing_key(
-    path: Option<PathBuf>,
-    pile_path: &PathBuf,
-) -> Result<SigningKey> {
+fn load_or_generate_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
     let parent = pile_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -368,9 +365,7 @@ fn fetch_cap_blob_pair(
     use triblespace_core::repo::BlobStore;
     use triblespace_core::repo::BlobStoreGet;
 
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
     // Fetch the sig blob, locate the cap handle it signs.
     let sig_blob: Blob<SimpleArchive> = reader
@@ -445,7 +440,10 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
         Ok(())
     })?;
 
-    println!("team root pubkey:  {}", hex::encode(team_root_pubkey.to_bytes()));
+    println!(
+        "team root pubkey:  {}",
+        hex::encode(team_root_pubkey.to_bytes())
+    );
     print_warning_box(&[
         "TEAM ROOT SECRET — STORE OFFLINE NOW",
         "Loss of this key means losing team admin authority forever.",
@@ -457,7 +455,10 @@ fn run_create(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
     println!("expires:           {}", format_expiry(&expiry));
     println!();
     println!("Set these in your environment to use the team:");
-    println!("  export TRIBLE_TEAM_ROOT={}", hex::encode(team_root_pubkey.to_bytes()));
+    println!(
+        "  export TRIBLE_TEAM_ROOT={}",
+        hex::encode(team_root_pubkey.to_bytes())
+    );
     println!("  export TRIBLE_TEAM_CAP={}", hex::encode(sig_handle.raw));
 
     Ok(())
@@ -484,8 +485,7 @@ fn run_invite(
                 .as_slice()
                 .try_into()
                 .map_err(|_| anyhow!("--branch '{h}' must be 16 bytes (32 hex chars)"))?;
-            Id::new(bytes)
-                .ok_or_else(|| anyhow!("--branch '{h}' is the all-zeros nil id"))
+            Id::new(bytes).ok_or_else(|| anyhow!("--branch '{h}' is the all-zeros nil id"))
         })
         .collect::<Result<_>>()?;
 
@@ -497,8 +497,7 @@ fn run_invite(
         let issuer_pubkey = issuer_key.verifying_key();
         let snap_reader = {
             use triblespace_core::repo::BlobStore;
-            pile.reader()
-                .map_err(|e| anyhow!("pile reader: {e:?}"))?
+            pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?
         };
         let _ = capability::verify_chain(
             team_root,
@@ -514,8 +513,7 @@ fn run_invite(
         .map_err(|e| anyhow!("issuer's cap does not verify: {e:?}"))?;
         drop(snap_reader);
 
-        let (parent_cap_blob, parent_sig_blob) =
-            fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
+        let (parent_cap_blob, parent_sig_blob) = fetch_cap_blob_pair(pile, issuer_cap_sig_handle)?;
 
         // Build the invitee's scope: a permission tag plus zero or
         // more `scope_branch` restrictions. Caller is responsible for
@@ -562,12 +560,7 @@ fn run_invite(
         // OP_DELIVER_CAP event — the first delivery and the daemon's
         // later renewals are indistinguishable on B's side.
         let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile,
-            invitee,
-            scope_root,
-            expiry,
-            cap_handle,
-            sig_handle,
+            pile, invitee, scope_root, expiry, cap_handle, sig_handle,
         );
 
         Ok((sig_handle, expiry, policy_entry))
@@ -639,82 +632,77 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
     use triblespace_core::repo::BlobStoreList;
 
     let mut caps: Vec<CapSummary> = with_pile(&pile_path, |pile| {
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
-    let mut caps: Vec<CapSummary> = Vec::new();
+        let mut caps: Vec<CapSummary> = Vec::new();
 
-    use triblespace_core::blob::TryFromBlob;
-    for handle_result in reader.blobs() {
-        let handle = match handle_result {
-            Ok(h) => h,
-            Err(_) => continue,
-        };
-        let typed_handle: Inline<Handle<SimpleArchive>> =
-            Inline::new(handle.raw);
-        let blob: Blob<SimpleArchive> = match reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(typed_handle)
-        {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let set: TribleSet = match TryFromBlob::try_from_blob(blob) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        use triblespace_core::blob::TryFromBlob;
+        for handle_result in reader.blobs() {
+            let handle = match handle_result {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let typed_handle: Inline<Handle<SimpleArchive>> = Inline::new(handle.raw);
+            let blob: Blob<SimpleArchive> =
+                match reader.get::<Blob<SimpleArchive>, SimpleArchive>(typed_handle) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+            let set: TribleSet = match TryFromBlob::try_from_blob(blob) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-        // Each cap blob has exactly one entity carrying these
-        // attributes (the cap itself); embedded parent sigs are
-        // sub-entities with `signed_by`/`signature_*` and don't
-        // match this shape.
-        for (_e, subject, issuer, scope_root, expires_at) in find!(
-            (
-                e: Id,
-                subject: VerifyingKey,
-                issuer: VerifyingKey,
-                root: Id,
-                exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
-            ),
-            pattern!(&set, [{
-                ?e @
-                capability::cap_subject: ?subject,
-                capability::cap_issuer: ?issuer,
-                capability::cap_scope_root: ?root,
-                triblespace_core::metadata::expires_at: ?exp,
-            }])
-        ) {
-            // Walk the scope sub-graph for permission tags AND any
-            // `scope_branch` restrictions. A scope can carry zero or
-            // more of either; a malformed cap with no perms surfaces
-            // as an empty list rather than breaking the whole
-            // listing.
-            let perms: Vec<Id> = find!(
-                (perm: Id),
+            // Each cap blob has exactly one entity carrying these
+            // attributes (the cap itself); embedded parent sigs are
+            // sub-entities with `signed_by`/`signature_*` and don't
+            // match this shape.
+            for (_e, subject, issuer, scope_root, expires_at) in find!(
+                (
+                    e: Id,
+                    subject: VerifyingKey,
+                    issuer: VerifyingKey,
+                    root: Id,
+                    exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>,
+                ),
                 pattern!(&set, [{
-                    scope_root @ triblespace_core::metadata::tag: ?perm
+                    ?e @
+                    capability::cap_subject: ?subject,
+                    capability::cap_issuer: ?issuer,
+                    capability::cap_scope_root: ?root,
+                    triblespace_core::metadata::expires_at: ?exp,
                 }])
-            )
-            .map(|(p,)| p)
-            .collect();
-            let branches: Vec<Id> = find!(
-                (b: Id),
-                pattern!(&set, [{
-                    scope_root @ capability::scope_branch: ?b
-                }])
-            )
-            .map(|(b,)| b)
-            .collect();
-            caps.push(CapSummary {
-                subject,
-                issuer,
-                perms,
-                branches,
-                expires_at: Some(expires_at),
-            });
+            ) {
+                // Walk the scope sub-graph for permission tags AND any
+                // `scope_branch` restrictions. A scope can carry zero or
+                // more of either; a malformed cap with no perms surfaces
+                // as an empty list rather than breaking the whole
+                // listing.
+                let perms: Vec<Id> = find!(
+                    (perm: Id),
+                    pattern!(&set, [{
+                        scope_root @ triblespace_core::metadata::tag: ?perm
+                    }])
+                )
+                .map(|(p,)| p)
+                .collect();
+                let branches: Vec<Id> = find!(
+                    (b: Id),
+                    pattern!(&set, [{
+                        scope_root @ capability::scope_branch: ?b
+                    }])
+                )
+                .map(|(b,)| b)
+                .collect();
+                caps.push(CapSummary {
+                    subject,
+                    issuer,
+                    perms,
+                    branches,
+                    expires_at: Some(expires_at),
+                });
+            }
         }
-
-    }
 
         Ok(caps)
     })?;
@@ -763,14 +751,8 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
                 .as_ref()
                 .map(format_expiry)
                 .unwrap_or_else(|| "<no expiry>".to_string());
-            println!(
-                "    issuer:  {}",
-                hex::encode(cap.issuer.to_bytes()),
-            );
-            println!(
-                "    subject: {}",
-                hex::encode(cap.subject.to_bytes()),
-            );
+            println!("    issuer:  {}", hex::encode(cap.issuer.to_bytes()),);
+            println!("    subject: {}", hex::encode(cap.subject.to_bytes()),);
             println!("    scope:   {perm_str}{branch_str}");
             println!("    expires: {expiry_str}");
             println!();
@@ -795,271 +777,275 @@ fn run_show(
     let leaf_sig = parse_handle_hex(&cap_hex)?;
 
     with_pile(&pile_path, |pile| {
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
 
-    // Walk the chain via the leaf sig blob's recursive embedded
-    // proofs. In the new (descriptive-caps) model, all chain
-    // references live in the sig blob — cap blobs are pure
-    // declarations. State carried between iterations:
-    //   current_outer_id: the entity in `sig_set` whose attached
-    //     signature attests to the cap we're about to print. Starts
-    //     at the leaf-outer entity (the one carrying `sig_signs`);
-    //     advances to embedded sub-entities via
-    //     `sig_embedded_parent_proof` as we walk upward.
-    //   current_cap_handle: cap blob to decode + print this iter.
-    let leaf_sig_blob: Blob<SimpleArchive> = reader
-        .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
-        .map_err(|e| anyhow!("fetch sig blob {}: {e:?}", hex::encode(leaf_sig.raw)))?;
-    let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
-        .map_err(|e| anyhow!("parse sig blob: {e:?}"))?;
-    let mut leaf_iter = find!(
-        (
-            sig: Id,
-            signed: Inline<Handle<SimpleArchive>>,
-            signer: VerifyingKey
-        ),
-        pattern!(&sig_set, [{
-            ?sig @
-            capability::sig_signs: ?signed,
-            triblespace_core::repo::signed_by: ?signer,
-        }])
-    );
-    let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
-        match (leaf_iter.next(), leaf_iter.next()) {
-            (Some(row), None) => row,
-            _ => return Err(anyhow!(
-                "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
-            )),
-        };
-    let mut depth = 0usize;
-    const MAX_DEPTH: usize = 32;
-
-    loop {
-        if depth > MAX_DEPTH {
-            return Err(anyhow!("chain exceeds MAX_DEPTH={MAX_DEPTH} — refusing to walk further"));
-        }
-        let cap_handle = current_cap_handle;
-        let signer = current_signer;
-
-        let cap_blob: Blob<SimpleArchive> = reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
-            .map_err(|e| anyhow!("fetch cap blob {}: {e:?}", hex::encode(cap_handle.raw)))?;
-        let cap_set: TribleSet = TryFromBlob::try_from_blob(cap_blob)
-            .map_err(|e| anyhow!("parse cap blob: {e:?}"))?;
-        let mut cap_iter = find!(
+        // Walk the chain via the leaf sig blob's recursive embedded
+        // proofs. In the new (descriptive-caps) model, all chain
+        // references live in the sig blob — cap blobs are pure
+        // declarations. State carried between iterations:
+        //   current_outer_id: the entity in `sig_set` whose attached
+        //     signature attests to the cap we're about to print. Starts
+        //     at the leaf-outer entity (the one carrying `sig_signs`);
+        //     advances to embedded sub-entities via
+        //     `sig_embedded_parent_proof` as we walk upward.
+        //   current_cap_handle: cap blob to decode + print this iter.
+        let leaf_sig_blob: Blob<SimpleArchive> = reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
+            .map_err(|e| anyhow!("fetch sig blob {}: {e:?}", hex::encode(leaf_sig.raw)))?;
+        let sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
+            .map_err(|e| anyhow!("parse sig blob: {e:?}"))?;
+        let mut leaf_iter = find!(
             (
-                e: Id,
-                subject: VerifyingKey,
-                issuer: VerifyingKey,
-                root: Id,
-                exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>
+                sig: Id,
+                signed: Inline<Handle<SimpleArchive>>,
+                signer: VerifyingKey
             ),
-            pattern!(&cap_set, [{
-                ?e @
-                capability::cap_subject: ?subject,
-                capability::cap_issuer: ?issuer,
-                capability::cap_scope_root: ?root,
-                triblespace_core::metadata::expires_at: ?exp,
+            pattern!(&sig_set, [{
+                ?sig @
+                capability::sig_signs: ?signed,
+                triblespace_core::repo::signed_by: ?signer,
             }])
         );
-        let (_, subject, issuer, scope_root, expiry) = match (cap_iter.next(), cap_iter.next()) {
+        let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
+            match (leaf_iter.next(), leaf_iter.next()) {
+                (Some(row), None) => row,
+                _ => {
+                    return Err(anyhow!(
+                "malformed sig blob — expected exactly one outer entity with (sig_signs, signed_by)"
+            ))
+                }
+            };
+        let mut depth = 0usize;
+        const MAX_DEPTH: usize = 32;
+
+        loop {
+            if depth > MAX_DEPTH {
+                return Err(anyhow!(
+                    "chain exceeds MAX_DEPTH={MAX_DEPTH} — refusing to walk further"
+                ));
+            }
+            let cap_handle = current_cap_handle;
+            let signer = current_signer;
+
+            let cap_blob: Blob<SimpleArchive> = reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(cap_handle)
+                .map_err(|e| anyhow!("fetch cap blob {}: {e:?}", hex::encode(cap_handle.raw)))?;
+            let cap_set: TribleSet = TryFromBlob::try_from_blob(cap_blob)
+                .map_err(|e| anyhow!("parse cap blob: {e:?}"))?;
+            let mut cap_iter = find!(
+                (
+                    e: Id,
+                    subject: VerifyingKey,
+                    issuer: VerifyingKey,
+                    root: Id,
+                    exp: Inline<triblespace_core::inline::encodings::time::NsTAIInterval>
+                ),
+                pattern!(&cap_set, [{
+                    ?e @
+                    capability::cap_subject: ?subject,
+                    capability::cap_issuer: ?issuer,
+                    capability::cap_scope_root: ?root,
+                    triblespace_core::metadata::expires_at: ?exp,
+                }])
+            );
+            let (_, subject, issuer, scope_root, expiry) = match (cap_iter.next(), cap_iter.next()) {
             (Some(row), None) => row,
             _ => return Err(anyhow!("malformed cap blob — expected exactly one (subject, issuer, scope_root, expires_at) tuple")),
         };
 
-        // Permissions hung off the scope root.
-        let perms: Vec<Id> = find!(
-            (perm: Id),
-            pattern!(&cap_set, [{
-                scope_root @ triblespace_core::metadata::tag: ?perm
-            }])
-        )
-        .map(|(p,)| p)
-        .collect();
-        let branches: Vec<Id> = find!(
-            (b: Id),
-            pattern!(&cap_set, [{
-                scope_root @ capability::scope_branch: ?b
-            }])
-        )
-        .map(|(b,)| b)
-        .collect();
+            // Permissions hung off the scope root.
+            let perms: Vec<Id> = find!(
+                (perm: Id),
+                pattern!(&cap_set, [{
+                    scope_root @ triblespace_core::metadata::tag: ?perm
+                }])
+            )
+            .map(|(p,)| p)
+            .collect();
+            let branches: Vec<Id> = find!(
+                (b: Id),
+                pattern!(&cap_set, [{
+                    scope_root @ capability::scope_branch: ?b
+                }])
+            )
+            .map(|(b,)| b)
+            .collect();
 
-        let perm_str = if perms.is_empty() {
-            "no perms".to_string()
-        } else {
-            perms.iter().map(perm_label).collect::<Vec<_>>().join("|")
-        };
-        let branch_str = if branches.is_empty() {
-            String::new()
-        } else {
-            let mut bs: Vec<String> = branches
-                .iter()
-                .map(|b| {
-                    let bytes: [u8; 16] = (*b).into();
-                    hex::encode(bytes)
-                })
-                .collect();
-            bs.sort();
-            format!(", branches=[{}]", bs.join(","))
-        };
-        let signer_matches_issuer = if signer == issuer { "✓" } else { "✗ MISMATCH" };
+            let perm_str = if perms.is_empty() {
+                "no perms".to_string()
+            } else {
+                perms.iter().map(perm_label).collect::<Vec<_>>().join("|")
+            };
+            let branch_str = if branches.is_empty() {
+                String::new()
+            } else {
+                let mut bs: Vec<String> = branches
+                    .iter()
+                    .map(|b| {
+                        let bytes: [u8; 16] = (*b).into();
+                        hex::encode(bytes)
+                    })
+                    .collect();
+                bs.sort();
+                format!(", branches=[{}]", bs.join(","))
+            };
+            let signer_matches_issuer = if signer == issuer {
+                "✓"
+            } else {
+                "✗ MISMATCH"
+            };
 
-        println!("level {depth}:");
-        println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
-        println!("  subject:  {}", hex::encode(subject.to_bytes()));
-        println!("  scope:    {perm_str}{branch_str}");
-        println!("  expires:  {}", format_expiry(&expiry));
-        println!("  cap blob: {}", hex::encode(cap_handle.raw));
-        println!("  signer matches cap_issuer: {signer_matches_issuer}");
+            println!("level {depth}:");
+            println!("  issuer:   {}", hex::encode(issuer.to_bytes()));
+            println!("  subject:  {}", hex::encode(subject.to_bytes()));
+            println!("  scope:    {perm_str}{branch_str}");
+            println!("  expires:  {}", format_expiry(&expiry));
+            println!("  cap blob: {}", hex::encode(cap_handle.raw));
+            println!("  signer matches cap_issuer: {signer_matches_issuer}");
 
-        // Look for sig_parent_cap + sig_embedded_parent_proof on the
-        // CURRENT outer entity inside the SIG blob's tribleset (these
-        // live in the sig blob, not the cap blob, in the new model).
-        let parent_pair = find!(
-            (
-                parent_cap: Inline<Handle<SimpleArchive>>,
-                parent_proof_id: Id,
-            ),
-            pattern!(&sig_set, [{
-                current_outer_id @
-                capability::sig_parent_cap: ?parent_cap,
-                capability::sig_embedded_parent_proof: ?parent_proof_id,
-            }])
-        )
-        .next();
+            // Look for sig_parent_cap + sig_embedded_parent_proof on the
+            // CURRENT outer entity inside the SIG blob's tribleset (these
+            // live in the sig blob, not the cap blob, in the new model).
+            let parent_pair = find!(
+                (
+                    parent_cap: Inline<Handle<SimpleArchive>>,
+                    parent_proof_id: Id,
+                ),
+                pattern!(&sig_set, [{
+                    current_outer_id @
+                    capability::sig_parent_cap: ?parent_cap,
+                    capability::sig_embedded_parent_proof: ?parent_proof_id,
+                }])
+            )
+            .next();
 
-        match parent_pair {
-            None => {
-                println!("  ↳ root link (no sig_parent_cap — signer should be team root)");
-                println!();
-                break;
-            }
-            Some((parent_cap, parent_proof_id)) => {
-                // Pull the next-level signer out of the embedded
-                // parent proof sub-entity.
-                let mut iter = find!(
-                    (next_signer: VerifyingKey),
-                    pattern!(&sig_set, [{
-                        parent_proof_id @
-                        triblespace_core::repo::signed_by: ?next_signer
-                    }])
-                );
-                let next_signer = match iter.next() {
-                    Some((s,)) => s,
-                    None => {
-                        println!("  ⚠ embedded parent proof missing signed_by — chain broken");
-                        println!();
-                        break;
-                    }
-                };
-                println!("  ↳ chained from parent (embedded proof)");
-                println!();
-                current_outer_id = parent_proof_id;
-                current_cap_handle = parent_cap;
-                current_signer = next_signer;
-                depth += 1;
-            }
-        }
-    }
-
-    // Optional: full cryptographic verification via verify_chain.
-    if let Some(root_hex) = verify_team_root {
-        println!("== Verification ==");
-        let team_root = parse_pubkey_hex(&root_hex)
-            .map_err(|e| anyhow!("--verify (or TRIBLE_TEAM_ROOT): {e}"))?;
-
-        // Determine which subject to verify against. Default to
-        // the leaf cap's own cap_subject (re-decode it) — matches
-        // what the relay would check against the connecting peer.
-        let leaf_subject: VerifyingKey = match expected_subject_hex {
-            Some(s) => parse_pubkey_hex(&s)
-                .map_err(|e| anyhow!("--expected-subject: {e}"))?,
-            None => {
-                // Re-fetch the leaf sig blob to find what cap it
-                // signs, then extract that cap's subject. Yes,
-                // this is a redundant fetch — verify_chain will
-                // also do it — but it keeps the diagnostic
-                // self-contained and the cost is one blob read.
-                use triblespace_core::blob::TryFromBlob;
-                use triblespace_core::macros::pattern;
-                use triblespace_core::query::find;
-                let leaf_sig_blob: Blob<SimpleArchive> = reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
-                    .map_err(|e| anyhow!("re-fetch leaf sig: {e:?}"))?;
-                let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
-                    .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
-                let raw_iter = find!(
-                    (sig: Id, h: Inline<Handle<SimpleArchive>>),
-                    pattern!(&leaf_sig_set, [{
-                        ?sig @ capability::sig_signs: ?h
-                    }])
-                );
-                let mut iter = raw_iter.map(|(_sig, h)| (h,));
-                let cap_h: Inline<Handle<SimpleArchive>> = match iter.next() {
-                    Some((h,)) => h,
-                    None => return Err(anyhow!("leaf sig blob malformed")),
-                };
-                let cap_b: Blob<SimpleArchive> = reader
-                    .get::<Blob<SimpleArchive>, SimpleArchive>(cap_h)
-                    .map_err(|e| anyhow!("re-fetch leaf cap: {e:?}"))?;
-                let cap_s: TribleSet = TryFromBlob::try_from_blob(cap_b)
-                    .map_err(|e| anyhow!("parse leaf cap: {e:?}"))?;
-                let mut subj_iter = find!(
-                    (e: Id, s: VerifyingKey),
-                    pattern!(&cap_s, [{
-                        ?e @ capability::cap_subject: ?s
-                    }])
-                );
-                match subj_iter.next() {
-                    Some((_e, s)) => s,
-                    None => return Err(anyhow!("leaf cap missing cap_subject")),
+            match parent_pair {
+                None => {
+                    println!("  ↳ root link (no sig_parent_cap — signer should be team root)");
+                    println!();
+                    break;
+                }
+                Some((parent_cap, parent_proof_id)) => {
+                    // Pull the next-level signer out of the embedded
+                    // parent proof sub-entity.
+                    let mut iter = find!(
+                        (next_signer: VerifyingKey),
+                        pattern!(&sig_set, [{
+                            parent_proof_id @
+                            triblespace_core::repo::signed_by: ?next_signer
+                        }])
+                    );
+                    let next_signer = match iter.next() {
+                        Some((s,)) => s,
+                        None => {
+                            println!("  ⚠ embedded parent proof missing signed_by — chain broken");
+                            println!();
+                            break;
+                        }
+                    };
+                    println!("  ↳ chained from parent (embedded proof)");
+                    println!();
+                    current_outer_id = parent_proof_id;
+                    current_cap_handle = parent_cap;
+                    current_signer = next_signer;
+                    depth += 1;
                 }
             }
-        };
+        }
 
-        // Build the fetch_blob closure verify_chain expects, backed
-        // by the same pile reader the structural walk used.
-        let fetch = |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
-            use triblespace_core::repo::BlobStoreGet;
-            reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(h)
-                .ok()
-        };
+        // Optional: full cryptographic verification via verify_chain.
+        if let Some(root_hex) = verify_team_root {
+            println!("== Verification ==");
+            let team_root = parse_pubkey_hex(&root_hex)
+                .map_err(|e| anyhow!("--verify (or TRIBLE_TEAM_ROOT): {e}"))?;
 
-        match capability::verify_chain(
-            team_root,
-            leaf_sig,
-            leaf_subject,
-            fetch,
-        ) {
-            Ok(verified) => {
-                println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
-                println!("  expected_subject: {}", hex::encode(leaf_subject.to_bytes()));
-                println!("  scope_root:       {:?}", verified.scope_root);
-                println!("  result:           ✓ VERIFIED");
-                println!();
-                println!(
-                    "  This chain WOULD pass `OP_AUTH` against a relay configured \
+            // Determine which subject to verify against. Default to
+            // the leaf cap's own cap_subject (re-decode it) — matches
+            // what the relay would check against the connecting peer.
+            let leaf_subject: VerifyingKey = match expected_subject_hex {
+                Some(s) => parse_pubkey_hex(&s).map_err(|e| anyhow!("--expected-subject: {e}"))?,
+                None => {
+                    // Re-fetch the leaf sig blob to find what cap it
+                    // signs, then extract that cap's subject. Yes,
+                    // this is a redundant fetch — verify_chain will
+                    // also do it — but it keeps the diagnostic
+                    // self-contained and the cost is one blob read.
+                    use triblespace_core::blob::TryFromBlob;
+                    use triblespace_core::macros::pattern;
+                    use triblespace_core::query::find;
+                    let leaf_sig_blob: Blob<SimpleArchive> = reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(leaf_sig)
+                        .map_err(|e| anyhow!("re-fetch leaf sig: {e:?}"))?;
+                    let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)
+                        .map_err(|e| anyhow!("parse leaf sig: {e:?}"))?;
+                    let raw_iter = find!(
+                        (sig: Id, h: Inline<Handle<SimpleArchive>>),
+                        pattern!(&leaf_sig_set, [{
+                            ?sig @ capability::sig_signs: ?h
+                        }])
+                    );
+                    let mut iter = raw_iter.map(|(_sig, h)| (h,));
+                    let cap_h: Inline<Handle<SimpleArchive>> = match iter.next() {
+                        Some((h,)) => h,
+                        None => return Err(anyhow!("leaf sig blob malformed")),
+                    };
+                    let cap_b: Blob<SimpleArchive> = reader
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(cap_h)
+                        .map_err(|e| anyhow!("re-fetch leaf cap: {e:?}"))?;
+                    let cap_s: TribleSet = TryFromBlob::try_from_blob(cap_b)
+                        .map_err(|e| anyhow!("parse leaf cap: {e:?}"))?;
+                    let mut subj_iter = find!(
+                        (e: Id, s: VerifyingKey),
+                        pattern!(&cap_s, [{
+                            ?e @ capability::cap_subject: ?s
+                        }])
+                    );
+                    match subj_iter.next() {
+                        Some((_e, s)) => s,
+                        None => return Err(anyhow!("leaf cap missing cap_subject")),
+                    }
+                }
+            };
+
+            // Build the fetch_blob closure verify_chain expects, backed
+            // by the same pile reader the structural walk used.
+            let fetch = |h: Inline<Handle<SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                use triblespace_core::repo::BlobStoreGet;
+                reader.get::<Blob<SimpleArchive>, SimpleArchive>(h).ok()
+            };
+
+            match capability::verify_chain(team_root, leaf_sig, leaf_subject, fetch) {
+                Ok(verified) => {
+                    println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
+                    println!(
+                        "  expected_subject: {}",
+                        hex::encode(leaf_subject.to_bytes())
+                    );
+                    println!("  scope_root:       {:?}", verified.scope_root);
+                    println!("  result:           ✓ VERIFIED");
+                    println!();
+                    println!(
+                        "  This chain WOULD pass `OP_AUTH` against a relay configured \
                      with the given team root."
-                );
-            }
-            Err(e) => {
-                println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
-                println!("  expected_subject: {}", hex::encode(leaf_subject.to_bytes()));
-                println!("  result:           ✗ FAILED — {e:?}");
-                println!();
-                println!(
-                    "  This is the SAME error the relay would raise on \
+                    );
+                }
+                Err(e) => {
+                    println!("  team_root:        {}", hex::encode(team_root.to_bytes()));
+                    println!(
+                        "  expected_subject: {}",
+                        hex::encode(leaf_subject.to_bytes())
+                    );
+                    println!("  result:           ✗ FAILED — {e:?}");
+                    println!();
+                    println!(
+                        "  This is the SAME error the relay would raise on \
                      `OP_AUTH`. Check that the team root matches what the \
                      relay was configured with, and that no link in the \
                      chain has expired."
-                );
+                    );
+                }
             }
         }
-    }
 
         Ok(())
     })
@@ -1149,16 +1135,21 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id = Id::new(entry_bytes)
-        .ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
+    let entry_id =
+        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
 
     let outcome = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::retract_policy_entry(pile, entry_id))
+        Ok(triblespace_net::policy::retract_policy_entry(
+            pile, entry_id,
+        ))
     })?;
 
     match outcome {
         Some(()) => {
-            println!("retracted entry {}", hex::encode(<[u8; 16]>::from(entry_id)));
+            println!(
+                "retracted entry {}",
+                hex::encode(<[u8; 16]>::from(entry_id))
+            );
             println!("(the subject's cap chain will die at its current cap's expiry; no revocation propagates)");
             Ok(())
         }
@@ -1258,9 +1249,9 @@ fn run_request_join(
             Ok(())
         }
         triblespace_net::handshake::STATUS_REJECTED => bail!("admin rejected the request"),
-        triblespace_net::handshake::STATUS_MALFORMED => bail!(
-            "admin rejected the request as malformed (version mismatch or bad payload)"
-        ),
+        triblespace_net::handshake::STATUS_MALFORMED => {
+            bail!("admin rejected the request as malformed (version mismatch or bad payload)")
+        }
         other => bail!("admin returned unknown status code {other:#x}"),
     }
 }
@@ -1282,8 +1273,8 @@ fn run_approve(
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("entry id must be 16 bytes (32 hex chars)"))?;
-    let entry_id = Id::new(entry_bytes)
-        .ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
+    let entry_id =
+        Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
 
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
@@ -1291,7 +1282,6 @@ fn run_approve(
     let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
 
     let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
-
         // Look up the pending request entry. Read the partial cap
         // blob, its subject pubkey, scope_root, and expiry — those
         // are what the requester proposed. We pass them through to
@@ -1304,9 +1294,7 @@ fn run_approve(
             .ok_or_else(|| anyhow!("pending request {entry_hex} not found"))?;
 
         if request.status != triblespace_net::policy::STATUS_PENDING {
-            bail!(
-                "request {entry_hex} is not PENDING (current status: another state)"
-            );
+            bail!("request {entry_hex} is not PENDING (current status: another state)");
         }
 
         let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
@@ -1374,9 +1362,7 @@ fn run_approve(
             .map_err(|e| anyhow!("fetch issuer cap blob: {e:?}"))?;
         // Verify the issuer's chain before signing — refuse to delegate
         // off an invalid chain.
-        let snap_reader = pile
-            .reader()
-            .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+        let snap_reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
         let _ = capability::verify_chain(
             team_root,
             issuer_cap_sig_handle,
@@ -1437,12 +1423,7 @@ fn run_approve(
         store_blob(pile, sig_blob)?;
 
         let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile,
-            subject,
-            scope_root,
-            expiry,
-            cap_handle,
-            sig_handle,
+            pile, subject, scope_root, expiry, cap_handle, sig_handle,
         );
 
         let _ = triblespace_net::policy::set_request_status(

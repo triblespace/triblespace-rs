@@ -206,7 +206,7 @@ pub enum WantWaitError<E, R, W> {
     Conversion(E),
     /// The store failed to refresh while re-checking (e.g. a corrupt
     /// pile tail). Propagated immediately — fail loud, never
-    /// auto-restore.
+    /// auto-amputate.
     Store(R),
     /// The want could not be durably recorded (see [`WantRecordError`]).
     /// The read errors instead of suspending: a wait without a recorded
@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     /// A corrupt pile tail fails loud and immediately
-    /// (`WantWaitError::Store(ReadError)`) — never auto-restored, never
+    /// (`WantWaitError::Store(ReadError)`) — never auto-amputated, never
     /// suspended on.
     #[test]
     fn async_get_corrupt_tail_fails_loud() {

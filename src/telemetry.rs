@@ -108,14 +108,15 @@ impl TelemetryInner {
         self.workspaces.get_or(|| {
             let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
             let repo = repo_guard.as_mut().expect("telemetry repo not closed");
-            let ws = repo
-                .pull(self.branch_id)
-                .expect("telemetry pull workspace");
+            let ws = repo.pull(self.branch_id).expect("telemetry pull workspace");
             let arc = Arc::new(Mutex::new(ThreadTelemetry {
                 workspace: ws,
                 last_flush: Instant::now(),
             }));
-            self.registry.lock().expect("telemetry registry lock").push(arc.clone());
+            self.registry
+                .lock()
+                .expect("telemetry registry lock")
+                .push(arc.clone());
             arc
         })
     }
@@ -327,12 +328,20 @@ impl Telemetry {
         let base = Instant::now();
         let session_id = *ufoid();
 
-        // Open and restore pile.
+        // Open the pile with the non-mutating refresh — never amputate on
+        // open. A corrupt telemetry pile disables telemetry (fail loud in
+        // the log) instead of truncating data; repair is an explicit
+        // operator decision (`trible pile amputate`).
         if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).ok()?;
         }
         let mut pile = Pile::open(&pile_path).ok()?;
-        if pile.restore().is_err() {
+        if let Err(err) = pile.refresh() {
+            log::warn!(
+                "telemetry pile {} failed to load ({err:?}); telemetry disabled. \
+                 Repair explicitly with `trible pile amputate` if the tail is torn.",
+                pile_path.display()
+            );
             let _ = pile.close();
             return None;
         }

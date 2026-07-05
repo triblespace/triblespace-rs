@@ -202,8 +202,8 @@ impl Yard {
     ///
     /// Fails loud on corruption: a generation pile with an invalid tail
     /// surfaces as [`YardOpenError::Pile`] naming the file, and **nothing is
-    /// truncated**. Repair is an explicit opt-in via [`Yard::restore`]
-    /// (mirroring [`Pile::refresh`] vs [`Pile::restore`]).
+    /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
+    /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
     /// The weak-pin state is rebuilt from the durable weak-pin markers found
     /// in the generation piles (old to young, so the young generation's
@@ -219,13 +219,12 @@ impl Yard {
         Self::open_impl(paths, config, false)
     }
 
-    /// Open an existing yard, **repairing** each generation pile first:
-    /// any invalid tail (for example a torn write left by a crash) is
-    /// truncated back to the last valid record, exactly like
-    /// [`Pile::restore`]. This is the explicit opt-in counterpart to the
-    /// fail-loud [`Yard::open`] — reach for it only after `open` reported
+    /// Open an existing yard, **amputating** each generation pile first:
+    /// every generation file is **TRUNCATED at its first invalid record,
+    /// destroying everything after it**, exactly like [`Pile::amputate`].
+    /// This is the explicit opt-in counterpart to the fail-loud [`Yard::open`] — reach for it only after `open` reported
     /// corruption and losing the invalid tail is acceptable.
-    pub fn restore<P>(
+    pub fn amputate<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
     ) -> Result<Self, YardOpenError>
@@ -251,7 +250,7 @@ impl Yard {
                 err,
             })?;
             let load = if repair {
-                pile.restore()
+                pile.amputate()
             } else {
                 pile.refresh()
             };
@@ -1017,7 +1016,7 @@ pub enum YardOpenError {
     /// A generation pile failed to open or validate. A
     /// [`ReadError::CorruptPile`] here means the named generation file has
     /// an invalid tail; nothing was truncated — repair explicitly with
-    /// [`Yard::restore`] if losing the tail is acceptable.
+    /// [`Yard::amputate`] if losing the tail is acceptable.
     Pile {
         /// The generation pile file that failed.
         path: PathBuf,
@@ -1539,7 +1538,7 @@ mod tests {
 
     /// The fail-loud posture: opening a yard whose generation pile has a
     /// corrupt tail must surface the corruption (naming the file) WITHOUT
-    /// truncating anything; `Yard::restore` is the explicit opt-in repair.
+    /// truncating anything; `Yard::amputate` is the explicit opt-in repair.
     #[test]
     fn open_fails_loud_on_corrupt_generation_without_truncating() {
         use std::io::Write;
@@ -1574,9 +1573,9 @@ mod tests {
             "fail-loud open must not truncate the generation pile"
         );
 
-        // Explicit repair: restore truncates the invalid tail and the
+        // Explicit repair: amputate truncates the invalid tail and the
         // valid prefix stays readable.
-        let mut repaired = Yard::restore(paths.clone(), YardConfig::default()).unwrap();
+        let mut repaired = Yard::amputate(paths.clone(), YardConfig::default()).unwrap();
         assert!(fs::metadata(&paths[0]).unwrap().len() < corrupt_len);
         let reader = repaired.reader().unwrap();
         assert_eq!(get_raw(&reader, live).unwrap(), raw_blob(b"survivor"));

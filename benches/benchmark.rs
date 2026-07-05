@@ -836,7 +836,8 @@ fn pile_benchmark(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile = Pile::open(&tmp_pile).unwrap();
                 data.iter().for_each(|data| {
-                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone())).unwrap();
+                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone()))
+                        .unwrap();
                     pile.flush().unwrap();
                 });
                 pile.close().unwrap();
@@ -859,7 +860,8 @@ fn pile_benchmark(c: &mut Criterion) {
                     rng.fill_bytes(&mut record);
 
                     let data = Bytes::from_source(record);
-                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone())).unwrap();
+                    pile.put::<UnknownBlob, _>(UnknownBlob::blob_from(data.clone()))
+                        .unwrap();
                 });
 
                 pile.flush().unwrap();
@@ -870,7 +872,7 @@ fn pile_benchmark(c: &mut Criterion) {
             |tmp_dir: TempDir| {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile = Pile::open(&tmp_pile).unwrap();
-                pile.restore().unwrap();
+                pile.amputate().unwrap();
                 pile.close().unwrap();
                 drop(tmp_dir)
             },
@@ -955,12 +957,8 @@ fn checkout_benchmark(c: &mut Criterion) {
     for &n_commits in &[10usize, 100, 1000] {
         let entities_per_commit = 100;
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(
-            storage,
-            SigningKey::generate(&mut OsRng),
-            TribleSet::new(),
-        )
-        .expect("repo");
+        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())
+            .expect("repo");
         let branch_id = repo.create_branch("bench", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull");
 

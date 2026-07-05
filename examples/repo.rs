@@ -11,13 +11,14 @@ fn main() {
 
     // Create a local pile to store blobs and branches. `open` does not
     // create missing files, and loading is fail-loud: `refresh` errors on
-    // a corrupt tail (repair is explicit via `Pile::restore`).
+    // a corrupt tail (repair is explicit via `Pile::amputate`).
     std::fs::File::create(&path).expect("create pile file");
     let mut pile = Pile::open(&path).expect("open pile");
     pile.refresh().expect("load pile");
 
     // Create a repository from the pile and initialize the main branch
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new()).expect("create repo");
+    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .expect("create repo");
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
 

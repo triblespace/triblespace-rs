@@ -2,13 +2,13 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 
 use triblespace::prelude::*;
-use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
-use triblespace_core::repo;
-use triblespace_core::repo::pile::Pile;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
+use triblespace_core::repo;
+use triblespace_core::repo::pile::Pile;
 
 use super::signing::load_signing_key;
 
@@ -26,7 +26,7 @@ pub fn run(
     let key = load_signing_key(&signing_key)?;
 
     // Open source pile. Fail loud on a corrupt tail — reading the source
-    // must never mutate it (repair is `trible pile restore`).
+    // must never mutate it (destructive repair is `trible pile amputate`).
     let mut src_pile = super::open_refreshed(&source)?;
 
     // Enumerate branches.
@@ -171,9 +171,10 @@ pub fn run(
             let chunk_blob: Blob<SimpleArchive> = Blob::new(chunk_bytes);
 
             // Store the chunk content blob.
-            let _content_handle: Inline<Handle<SimpleArchive>> = dst_pile
-                .put(chunk_blob.clone())
-                .map_err(|e| anyhow!("put chunk: {e:?}"))?;
+            let _content_handle: Inline<Handle<SimpleArchive>> =
+                dst_pile
+                    .put(chunk_blob.clone())
+                    .map_err(|e| anyhow!("put chunk: {e:?}"))?;
 
             // Build commit metadata.
             let msg_text = if num_chunks == 1 {
@@ -204,7 +205,12 @@ pub fn run(
 
             if num_chunks > 1 {
                 let chunk_tribles = (end - start) / TRIBLE_LEN;
-                println!("  chunk {}/{}: {} tribles", i + 1, num_chunks, chunk_tribles);
+                println!(
+                    "  chunk {}/{}: {} tribles",
+                    i + 1,
+                    num_chunks,
+                    chunk_tribles
+                );
             }
         }
 
@@ -253,13 +259,13 @@ pub fn run(
     }
 
     dst_pile.close().map_err(|e| anyhow!("close dest: {e:?}"))?;
-    src_repo.close().map_err(|e| anyhow!("close source: {e:?}"))?;
+    src_repo
+        .close()
+        .map_err(|e| anyhow!("close source: {e:?}"))?;
 
     let src_size = std::fs::metadata(&source)?.len();
     let dst_size = std::fs::metadata(&dest)?.len();
-    println!(
-        "\nSquashed {total_branches} branches, {total_blobs} blobs",
-    );
+    println!("\nSquashed {total_branches} branches, {total_blobs} blobs",);
     if src_size > 0 {
         println!(
             "Size: {} → {} ({:.1}%)",
