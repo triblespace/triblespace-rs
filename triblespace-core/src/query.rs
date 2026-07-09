@@ -454,6 +454,57 @@ pub trait Constraint<'a> {
         }
         *pairs = out;
     }
+
+    /// PROBE (group-by-ordering): estimates the candidate count for
+    /// `variable` for **every row** of a binding block, appending one
+    /// estimate per row to `out` in row order.
+    ///
+    /// Returns `false` (leaving `out` untouched) when `variable` is not
+    /// constrained by this constraint. Relevance is assumed to be
+    /// **structural** — a constraint either estimates the variable for
+    /// every binding or for none, independent of the bound *values*. Every
+    /// in-tree constraint satisfies this (`estimate` returns `None` purely
+    /// on variable identity); the blocked intersection already leans on
+    /// the same assumption for its confirm passes.
+    ///
+    /// Default: per-row scratch binding + [`estimate`](Constraint::estimate)
+    /// — the correct baseline. Constraints with batchable estimate probes
+    /// (the archive's `distinct_in` bitvector ranks / `restrict_len`
+    /// wavelet ranks) can override this with a single pass that hoists the
+    /// arm dispatch out of the row loop and batches the rank stream.
+    fn estimate_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        out: &mut Vec<usize>,
+    ) -> bool {
+        let stride = vars.len();
+        debug_assert!(stride > 0, "blocked estimate needs at least one bound variable");
+        let mut binding = Binding::default();
+        let mut chunks = rows.chunks_exact(stride);
+        let Some(first) = chunks.next() else {
+            // Empty block: report structural relevance from variables().
+            return self.variables().is_set(variable);
+        };
+        for (k, &v) in vars.iter().enumerate() {
+            binding.set(v, &first[k]);
+        }
+        let Some(estimate) = self.estimate(variable, &binding) else {
+            return false;
+        };
+        out.push(estimate);
+        for row in chunks {
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &row[k]);
+            }
+            out.push(
+                self.estimate(variable, &binding)
+                    .expect("estimate relevance must be structural across a block"),
+            );
+        }
+        true
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -508,6 +559,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         let inner: &T = self;
         inner.confirm_blocked(variable, vars, rows, pairs)
     }
+
+    fn estimate_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        out: &mut Vec<usize>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.estimate_blocked(variable, vars, rows, out)
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
@@ -561,6 +623,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) {
         let inner: &T = self;
         inner.confirm_blocked(variable, vars, rows, pairs)
+    }
+
+    fn estimate_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        out: &mut Vec<usize>,
+    ) -> bool {
+        let inner: &T = self;
+        inner.estimate_blocked(variable, vars, rows, out)
     }
 }
 
@@ -713,6 +786,60 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         results
     }
 
+    /// PROBE (group-by-ordering): frontier-batched solver with **per-row**
+    /// variable choice.
+    ///
+    /// [`solve_blocked`](Self::solve_blocked) picks one next variable per
+    /// level from the *first row's* estimates — cheap, but wrong for every
+    /// row that would have preferred a different variable, and those rows'
+    /// branches can explode (the ordering-quality loss JP diagnosed:
+    /// smallest-estimate-first minimizes work AND batch size; the
+    /// objectives coincide on CPU and diverge under fixed-cost batch
+    /// primitives). This solver batches the *estimation* too
+    /// ([`Constraint::estimate_blocked`]: one estimate column per unbound
+    /// variable over the whole block), computes each row's preferred next
+    /// variable (argmin of the same `(log2-magnitude, influence)` key the
+    /// sequential engine sorts by), **partitions** the block by preferred
+    /// variable (stable counting sort), and descends each group with *its*
+    /// variable.
+    ///
+    /// Properties: per-branch ordering quality is restored while batches
+    /// stay level-wide within groups; fragmentation is bounded by
+    /// `|unbound|` groups per level (never per-branch collapse); the block
+    /// invariant deepens from same-bound-*set* to same-*ordering-history*
+    /// (each group's rows chose identically at every ancestor level, by
+    /// construction). Degenerate case: uniform preferences ⇒ one group ⇒
+    /// identical schedule to `solve_blocked` (and the block itself is
+    /// borrowed, not copied).
+    ///
+    /// Semantics: same result **multiset** as the sequential iterator;
+    /// row order may differ.
+    pub fn solve_blocked_grouped(self) -> Vec<R> {
+        let Query {
+            constraint,
+            postprocessing,
+            influences,
+            ..
+        } = self;
+        let variables = constraint.variables();
+        let mut unbound: Vec<VariableId> = variables.into_iter().collect();
+        let mut vars: Vec<VariableId> = Vec::new();
+        let mut results = Vec::new();
+        let mut binding = Binding::default();
+        descend_grouped(
+            &constraint,
+            &postprocessing,
+            &influences,
+            &mut vars,
+            &mut unbound,
+            &[],
+            1,
+            &mut binding,
+            &mut results,
+        );
+        results
+    }
+
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
@@ -785,6 +912,108 @@ pub fn block_row_cap() -> usize {
             .filter(|&c| c > 0)
             .unwrap_or(BLOCK_ROW_CAP)
     })
+}
+
+/// PROBE (group-by-ordering): cheap instrumentation for the blocked
+/// solvers. Off by default; benches call
+/// [`set_enabled`](blocked_stats::set_enabled) and
+/// [`reset`](blocked_stats::reset) around a measured run and print
+/// [`report`](blocked_stats::report). One mutex lock per *descend level*
+/// (not per row), so the enabled overhead is negligible next to the
+/// propose/confirm work it describes.
+pub mod blocked_stats {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// One record per `descend_*` call that expanded a frontier.
+    #[derive(Clone, Debug)]
+    pub struct LevelRecord {
+        /// Number of variables bound on entry (search depth).
+        pub depth: usize,
+        /// Rows in the block this call handled.
+        pub rows: usize,
+        /// Per-group row counts (the v1 solver always reports one group).
+        pub group_sizes: Vec<usize>,
+        /// Frontier size (candidate pairs) produced per group's propose.
+        pub batch_sizes: Vec<usize>,
+    }
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static RECORDS: Mutex<Vec<LevelRecord>> = Mutex::new(Vec::new());
+    static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
+
+    /// Turns recording on/off (off by default).
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Clears all recorded data.
+    pub fn reset() {
+        RECORDS.lock().unwrap().clear();
+        MATERIALIZED.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_level(rec: LevelRecord) {
+        RECORDS.lock().unwrap().push(rec);
+    }
+
+    pub(crate) fn record_materialized(rows: usize) {
+        MATERIALIZED.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    /// Total intermediate rows materialized into child blocks — the
+    /// blocked-v1 vs grouped "intermediate block size" comparison number.
+    pub fn materialized_rows() -> u64 {
+        MATERIALIZED.load(Ordering::Relaxed)
+    }
+
+    /// Raw per-level records, for benches that want full distributions.
+    pub fn records() -> Vec<LevelRecord> {
+        RECORDS.lock().unwrap().clone()
+    }
+
+    /// Terse per-depth aggregate: calls, rows, group count/sizes, batch
+    /// size distribution, plus the global materialized-row total.
+    pub fn report() -> String {
+        use std::fmt::Write;
+        let records = RECORDS.lock().unwrap();
+        let mut depths: Vec<usize> = records.iter().map(|r| r.depth).collect();
+        depths.sort_unstable();
+        depths.dedup();
+        let mut out = String::new();
+        for d in depths {
+            let recs: Vec<&LevelRecord> = records.iter().filter(|r| r.depth == d).collect();
+            let calls = recs.len();
+            let rows: usize = recs.iter().map(|r| r.rows).sum();
+            let groups: usize = recs.iter().map(|r| r.group_sizes.len()).sum();
+            let max_groups = recs.iter().map(|r| r.group_sizes.len()).max().unwrap_or(0);
+            let mut batches: Vec<usize> =
+                recs.iter().flat_map(|r| r.batch_sizes.iter().copied()).collect();
+            batches.sort_unstable();
+            let (bmin, bmed, bmax, btot) = if batches.is_empty() {
+                (0, 0, 0, 0)
+            } else {
+                (
+                    batches[0],
+                    batches[batches.len() / 2],
+                    *batches.last().unwrap(),
+                    batches.iter().sum(),
+                )
+            };
+            let _ = write!(
+                out,
+                "d{d}: {calls} calls / {rows} rows / {groups} groups (max {max_groups}/call), \
+                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}]; ",
+                batches.len()
+            );
+        }
+        let _ = write!(out, "materialized rows: {}", materialized_rows());
+        out
+    }
 }
 
 /// PROBE: recursive frontier descent for [`Query::solve_blocked`].
@@ -872,6 +1101,14 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     } else {
         constraint.propose_blocked(variable, vars, rows, &mut pairs);
     }
+    if blocked_stats::enabled() {
+        blocked_stats::record_level(blocked_stats::LevelRecord {
+            depth: stride,
+            rows: n_rows,
+            group_sizes: vec![n_rows],
+            batch_sizes: vec![pairs.len()],
+        });
+    }
 
     // Descend on the extended block, chunked to bound memory.
     let row_cap = block_row_cap();
@@ -892,12 +1129,259 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             count += 1;
         }
         debug_assert_eq!(next_rows.len(), count * new_stride);
+        if blocked_stats::enabled() {
+            blocked_stats::record_materialized(count);
+        }
         descend_blocked(
             constraint, post, influences, vars, unbound, &next_rows, count, binding, results,
         );
     }
     vars.pop();
     unbound.push(variable);
+}
+
+/// PROBE (group-by-ordering): recursive grouped frontier descent for
+/// [`Query::solve_blocked_grouped`].
+///
+/// One call = one search level for one block chunk:
+/// 1. **Estimate blocked** — one estimate column per unbound variable over
+///    the whole block ([`Constraint::estimate_blocked`]).
+/// 2. **Prefer per row** — argmax of the sequential engine's sort key
+///    `(Reverse(log2-magnitude), influence-count)` over the row's column
+///    entries (identical key, applied per row instead of per level).
+/// 3. **Partition** — stable counting sort of rows by preferred variable:
+///    up to `|unbound|` groups. A single group borrows the parent block
+///    (no copy) — the non-skewed fast path.
+/// 4. **Descend each group with its own variable** — propose_blocked over
+///    the group's rows, then recurse in [`block_row_cap`]-row chunks.
+///
+/// STRETCH (designed, not built — the tree-becomes-DAG upgrade): rows in
+/// *different* groups that bind the same variable-SET in different orders
+/// reach the same lattice node and could coalesce into one block. That
+/// needs (a) a frontier keyed by bound-variable-set — a map
+/// `VariableSet -> pending row store` instead of this call stack, (b)
+/// deepest-first scheduling (pop the largest bound-set first) to keep
+/// memory DFS-like, and (c) row provenance no longer implied by the
+/// parent chunk, so result emission must not assume contiguous ancestry.
+/// Deliberately out of v0: cross-parent merging only pays when sibling
+/// groups' orders *reconverge* (bushy joins), and the frontier map's
+/// bookkeeping would obscure the grouping measurement this probe is for.
+#[allow(clippy::too_many_arguments)]
+fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
+    constraint: &C,
+    post: &P,
+    influences: &[VariableSet; 128],
+    vars: &mut Vec<VariableId>,
+    unbound: &mut Vec<VariableId>,
+    rows: &[RawInline],
+    n_rows: usize,
+    binding: &mut Binding,
+    results: &mut Vec<R>,
+) {
+    if n_rows == 0 {
+        return;
+    }
+    let stride = vars.len();
+    // Same shared-binding discipline as `descend_blocked`: re-establish
+    // this level's bound-set; stale values of unbound variables are never
+    // read.
+    let mut bound = VariableSet::new_empty();
+    for &v in vars.iter() {
+        bound.set(v);
+    }
+    binding.bound = bound;
+
+    if unbound.is_empty() {
+        for i in 0..n_rows {
+            for (k, &v) in vars.iter().enumerate() {
+                binding.set(v, &rows[i * stride + k]);
+            }
+            if let Some(r) = post(binding) {
+                results.push(r);
+            }
+        }
+        return;
+    }
+
+    let row_cap = block_row_cap();
+
+    // Level 0: a single empty branch — grouping is vacuous. Choose by the
+    // global estimates and expand with a plain propose, exactly like v1.
+    if stride == 0 {
+        let (ui, _) = unbound
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &v)| {
+                let estimate = constraint
+                    .estimate(v, binding)
+                    .expect("unconstrained variable in query");
+                (
+                    Reverse(
+                        estimate
+                            .checked_ilog2()
+                            .map(|magnitude| magnitude + 1)
+                            .unwrap_or(0),
+                    ),
+                    influences[v].count(),
+                )
+            })
+            .expect("non-empty unbound");
+        let variable = unbound.swap_remove(ui);
+        let mut values: Vec<RawInline> = Vec::new();
+        constraint.propose(variable, binding, &mut values);
+        if blocked_stats::enabled() {
+            blocked_stats::record_level(blocked_stats::LevelRecord {
+                depth: 0,
+                rows: 1,
+                group_sizes: vec![1],
+                batch_sizes: vec![values.len()],
+            });
+        }
+        vars.push(variable);
+        // Child rows are single values — chunk the proposal vec directly.
+        for chunk in values.chunks(row_cap) {
+            if blocked_stats::enabled() {
+                blocked_stats::record_materialized(chunk.len());
+            }
+            descend_grouped(
+                constraint,
+                post,
+                influences,
+                vars,
+                unbound,
+                chunk,
+                chunk.len(),
+                binding,
+                results,
+            );
+        }
+        vars.pop();
+        unbound.push(variable);
+        return;
+    }
+
+    // 1. Estimate blocked: one column per unbound variable.
+    let n_unbound = unbound.len();
+    let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
+    for &v in unbound.iter() {
+        let mut col = Vec::with_capacity(n_rows);
+        let relevant = constraint.estimate_blocked(v, vars, rows, &mut col);
+        assert!(relevant, "unconstrained variable in query");
+        debug_assert_eq!(col.len(), n_rows);
+        est_cols.push(col);
+    }
+
+    // 2. Per-row preferred variable: argmax of the engine's ordering key.
+    let mut preferred: Vec<u32> = Vec::with_capacity(n_rows);
+    let mut group_counts: Vec<usize> = vec![0; n_unbound];
+    for i in 0..n_rows {
+        let j = (0..n_unbound)
+            .max_by_key(|&j| {
+                let estimate = est_cols[j][i];
+                (
+                    Reverse(
+                        estimate
+                            .checked_ilog2()
+                            .map(|magnitude| magnitude + 1)
+                            .unwrap_or(0),
+                    ),
+                    influences[unbound[j]].count(),
+                )
+            })
+            .expect("non-empty unbound");
+        preferred.push(j as u32);
+        group_counts[j] += 1;
+    }
+    drop(est_cols);
+
+    // 3. Partition (stable counting sort by preferred variable). One
+    //    group ⇒ borrow the parent block, no copy.
+    let n_groups = group_counts.iter().filter(|&&c| c > 0).count();
+    let mut starts: Vec<usize> = Vec::with_capacity(n_unbound);
+    let mut acc = 0usize;
+    for &c in &group_counts {
+        starts.push(acc);
+        acc += c;
+    }
+    let mut part: Vec<RawInline> = Vec::new();
+    if n_groups > 1 {
+        part = vec![[0u8; 32]; n_rows * stride];
+        let mut cursors = starts.clone();
+        for i in 0..n_rows {
+            let j = preferred[i] as usize;
+            let dst = cursors[j];
+            cursors[j] += 1;
+            part[dst * stride..(dst + 1) * stride]
+                .copy_from_slice(&rows[i * stride..(i + 1) * stride]);
+        }
+    }
+    drop(preferred);
+
+    // 4. Descend each non-empty group with its preferred variable.
+    // `unbound` mutates (remove/push) per group, so snapshot the
+    // group-index → variable mapping first.
+    let group_vars: Vec<VariableId> = unbound.clone();
+    let stats = blocked_stats::enabled();
+    let mut group_sizes_rec: Vec<usize> = Vec::new();
+    let mut batch_sizes_rec: Vec<usize> = Vec::new();
+    for (j, &variable) in group_vars.iter().enumerate() {
+        let g_count = group_counts[j];
+        if g_count == 0 {
+            continue;
+        }
+        let g_rows: &[RawInline] = if n_groups == 1 {
+            rows
+        } else {
+            &part[starts[j] * stride..(starts[j] + g_count) * stride]
+        };
+
+        let mut pairs: Vec<(u32, RawInline)> = Vec::new();
+        constraint.propose_blocked(variable, vars, g_rows, &mut pairs);
+        if stats {
+            group_sizes_rec.push(g_count);
+            batch_sizes_rec.push(pairs.len());
+        }
+
+        let pos = unbound
+            .iter()
+            .position(|&x| x == variable)
+            .expect("group variable still unbound");
+        unbound.swap_remove(pos);
+        vars.push(variable);
+        let new_stride = stride + 1;
+        let mut next_rows: Vec<RawInline> = Vec::new();
+        let mut it = pairs.into_iter().peekable();
+        while it.peek().is_some() {
+            next_rows.clear();
+            let mut count = 0usize;
+            while count < row_cap {
+                let Some((row_idx, value)) = it.next() else {
+                    break;
+                };
+                let base = row_idx as usize * stride;
+                next_rows.extend_from_slice(&g_rows[base..base + stride]);
+                next_rows.push(value);
+                count += 1;
+            }
+            debug_assert_eq!(next_rows.len(), count * new_stride);
+            if stats {
+                blocked_stats::record_materialized(count);
+            }
+            descend_grouped(
+                constraint, post, influences, vars, unbound, &next_rows, count, binding, results,
+            );
+        }
+        vars.pop();
+        unbound.push(variable);
+    }
+    if stats {
+        blocked_stats::record_level(blocked_stats::LevelRecord {
+            depth: stride,
+            rows: n_rows,
+            group_sizes: group_sizes_rec,
+            batch_sizes: batch_sizes_rec,
+        });
+    }
 }
 
 /// The search mode of the query engine.

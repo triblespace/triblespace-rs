@@ -217,6 +217,36 @@ where
         }
     }
 
+    /// PROBE (group-by-ordering): whole-block estimates — the elementwise
+    /// **minimum** across children, mirroring [`estimate`](Self::estimate)'s
+    /// min semantics per row. Each relevant child contributes via its own
+    /// `estimate_blocked`, so a child with a batched override (hoisted arm
+    /// dispatch, rank streams) keeps that advantage under composition.
+    fn estimate_blocked(
+        &self,
+        variable: VariableId,
+        vars: &[VariableId],
+        rows: &[RawInline],
+        out: &mut Vec<usize>,
+    ) -> bool {
+        let base = out.len();
+        let mut any = false;
+        let mut scratch: Vec<usize> = Vec::new();
+        for c in &self.constraints {
+            if !any {
+                any = c.estimate_blocked(variable, vars, rows, out);
+            } else {
+                scratch.clear();
+                if c.estimate_blocked(variable, vars, rows, &mut scratch) {
+                    for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
+                        *o = (*o).min(s);
+                    }
+                }
+            }
+        }
+        any
+    }
+
     /// Returns the union of all children's influence sets for `variable`.
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.constraints

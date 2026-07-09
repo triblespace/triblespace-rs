@@ -852,4 +852,22 @@ where
             keep
         });
     }
+
+    // PROBE (group-by-ordering): `estimate_blocked` deliberately stays on
+    // the trait default (per-row scratch binding + `estimate`) in v0 — the
+    // correct baseline the design calls for. A batched override is
+    // possible and DEFERRED:
+    //   - the arm dispatch (the 11-way match in `estimate`) is uniform
+    //     across a block (bound-set is structural), so it can be hoisted
+    //     out of the row loop exactly like `confirm_blocked`'s `range_fn`;
+    //   - the per-row probes are then either `distinct_in` rank pairs on a
+    //     `changed_*` bit vector or `restrict_len` rank pairs on a wavelet
+    //     matrix — both concatenate into one ragged rank stream;
+    //   - the wavelet arms could ride the existing GPU `rank_batch` ring
+    //     columns; the `changed_*` bit vectors are NOT uploaded to the
+    //     ring today, so their batch would be CPU-only (still wins the
+    //     hoisted dispatch + cache locality, loses the sync amortization).
+    // Deferred rather than built because v0's measurement question is
+    // whether GROUPING pays at all; the estimate pass is the same
+    // per-probe work either way and the override only changes constants.
 }
