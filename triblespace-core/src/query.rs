@@ -1673,6 +1673,18 @@ pub mod dag_stats {
     }
 }
 
+/// PROBE (dag-frontier): scheduling ablation — when
+/// `TRIBLES_DAG_STRICT_DEEPEST` is set, [`Query::solve_dag`] pops the
+/// globally deepest bucket **without** the readiness gate (the
+/// whiteboard's original rule). Prediction, checkable via
+/// [`dag_stats`]: cross-parent merge events collapse to ~0, because a
+/// reconvergent bucket is popped right after its first parent files —
+/// its children out-deepen every pending sibling route.
+pub fn dag_strict_deepest() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var("TRIBLES_DAG_STRICT_DEEPEST").is_ok())
+}
+
 /// PROBE (dag-frontier): one pending row store in the bucket worklist.
 ///
 /// `vars` is the bound-variable set in **ascending `VariableId` order** —
@@ -1772,11 +1784,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             // pop always exists. O(buckets²) scan — bucket count is
             // bounded by the number of distinct bound-sets in flight
             // (lattice antichains in practice: a handful).
+            let strict = dag_strict_deepest();
             let mut best: Option<(usize, usize)> = None;
             for (i, b) in buckets.iter().enumerate() {
-                let ready = buckets.iter().enumerate().all(|(j, o)| {
-                    j == i || !(o.set != b.set && o.set.is_subset_of(&b.set))
-                });
+                let ready = strict
+                    || buckets.iter().enumerate().all(|(j, o)| {
+                        j == i || !(o.set != b.set && o.set.is_subset_of(&b.set))
+                    });
                 if !ready {
                     continue;
                 }
