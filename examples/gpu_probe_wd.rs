@@ -54,6 +54,25 @@ fn wd_entity(q: &str) -> Id {
 }
 
 #[cfg(feature = "gpu")]
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Seq,
+    Blk,
+    Grp,
+}
+
+#[cfg(feature = "gpu")]
+macro_rules! run {
+    ($q:expr, $mode:expr) => {
+        match $mode {
+            Mode::Seq => tally($q),
+            Mode::Blk => tally($q.solve_blocked()),
+            Mode::Grp => tally($q.solve_blocked_grouped()),
+        }
+    };
+}
+
+#[cfg(feature = "gpu")]
 fn main() {
     use triblespace::core::blob::encodings::succinctarchive::gpu::stats;
 
@@ -172,18 +191,18 @@ fn main() {
 
     type Q = (
         &'static str,
-        Box<dyn Fn(&SuccinctArchive<OrderedUniverse>, bool) -> (usize, u64)>,
+        Box<dyn Fn(&SuccinctArchive<OrderedUniverse>, Mode) -> (usize, u64)>,
     );
     let queries: Vec<Q> = vec![
         (
             // Maximally selective: one subject, all (a, v) pairs.
             "point   <s> ?a ?v",
-            Box::new(move |a, blocked| {
+            Box::new(move |a, mode| {
                 let q = find!(
                     (e: Inline<GenId>, at: Inline<GenId>, v: Inline<UnknownInline>),
                     and!(e.is(subj.to_inline()), pattern!(a, [{ ?e @ ?at: ?v }]))
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
@@ -191,9 +210,9 @@ fn main() {
             "sweep   ?e P31 Q5",
             Box::new({
                 let p31 = p31.clone();
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: q5 }]));
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -203,9 +222,9 @@ fn main() {
             "sweepXL ?e P31 <top>",
             Box::new({
                 let p31 = p31.clone();
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!((e: Inline<GenId>), pattern!(a, [{ ?e @ &p31: top_class }]));
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -215,12 +234,12 @@ fn main() {
             "filter  ?e P31 Q5 . ?e P106 ?o",
             Box::new({
                 let (p31, p106) = (p31.clone(), p106.clone());
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!(
                         (e: Inline<GenId>, o: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: q5, &p106: ?o }])
                     );
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -229,12 +248,12 @@ fn main() {
             "star3   ?e P31 Q5 . P21 ?g . P27 ?c",
             Box::new({
                 let (p31, p21, p27) = (p31.clone(), p21.clone(), p27.clone());
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!(
                         (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
                     );
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -244,12 +263,12 @@ fn main() {
             "isect   ?e P31 ?c . ?e P17 ?k",
             Box::new({
                 let (p31, p17) = (p31.clone(), p17.clone());
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!(
                         (e: Inline<GenId>, c: Inline<GenId>, k: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p31: ?c, &p17: ?k }])
                     );
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -258,12 +277,12 @@ fn main() {
             "chain   ?e P131 ?x . ?x P131 ?y",
             Box::new({
                 let p131 = p131.clone();
-                move |a, blocked| {
+                move |a, mode| {
                     let q = find!(
                         (e: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
                         pattern!(a, [{ ?e @ &p131: ?x }, { ?x @ &p131: ?y }])
                     );
-                    if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                    run!(q, mode)
                 }
             }),
         ),
@@ -274,7 +293,7 @@ fn main() {
         sigs: Vec<(usize, u64)>,
         stats: Vec<String>,
     }
-    let run_pass = |label: &str, archive: &SuccinctArchive<OrderedUniverse>, blocked: bool| {
+    let run_pass = |label: &str, archive: &SuccinctArchive<OrderedUniverse>, mode: Mode| {
         let mut pass = Pass {
             times: Vec::new(),
             sigs: Vec::new(),
@@ -289,7 +308,7 @@ fn main() {
                     stats::reset(); // keep stats of a single steady-state rep
                 }
                 let t = Instant::now();
-                sig = q(archive, blocked);
+                sig = q(archive, mode);
                 times.push(t.elapsed().as_secs_f64() * 1e3);
             }
             eprintln!("{label}  {name}: {} rows, {times:.1?} ms", sig.0);
@@ -307,19 +326,21 @@ fn main() {
     );
     let cpu_only = std::env::var("TRIBLES_PROBE_CPU_ONLY").is_ok();
 
-    let cpu_seq = run_pass("cpu-seq", &archive, false);
-    let cpu_blk = run_pass("cpu-blk", &archive, true);
+    let cpu_seq = run_pass("cpu-seq", &archive, Mode::Seq);
+    let cpu_blk = run_pass("cpu-blk", &archive, Mode::Blk);
+    let cpu_grp = run_pass("cpu-grp", &archive, Mode::Grp);
 
-    let (gpu_seq, gpu_blk) = if cpu_only {
+    let (gpu_seq, gpu_blk, gpu_grp) = if cpu_only {
         eprintln!("TRIBLES_PROBE_CPU_ONLY set: skipping gpu passes");
-        (None, None)
+        (None, None, None)
     } else {
         let t0 = Instant::now();
         archive.enable_gpu().expect("gpu upload");
         eprintln!("gpu upload (six wavelet matrices): {:?}", t0.elapsed());
         (
-            Some(run_pass("gpu-seq", &archive, false)),
-            Some(run_pass("gpu-blk", &archive, true)),
+            Some(run_pass("gpu-seq", &archive, Mode::Seq)),
+            Some(run_pass("gpu-blk", &archive, Mode::Blk)),
+            Some(run_pass("gpu-grp", &archive, Mode::Grp)),
         )
     };
 
@@ -331,38 +352,54 @@ fn main() {
     }
     println!();
     println!(
-        "{:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7} {:>7}  parity",
-        "query", "rows", "cpuseq ms", "cpublk ms", "gpuseq ms", "gpublk ms", "cblk x", "gseq x", "gblk x"
+        "{:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7}  parity",
+        "query", "rows", "cpuseq ms", "cpublk ms", "cpugrp ms", "gpuseq ms", "gpublk ms", "gpugrp ms", "cblk x", "cgrp x", "gseq x", "gblk x", "ggrp x"
     );
     for (i, (name, _)) in queries.iter().enumerate() {
         let cs = median(&cpu_seq.times[i]);
         let cb = median(&cpu_blk.times[i]);
+        let cg = median(&cpu_grp.times[i]);
         let gs = gpu_seq.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
         let gb = gpu_blk.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
-        let parity = [Some(&cpu_blk), gpu_seq.as_ref(), gpu_blk.as_ref()]
-            .into_iter()
-            .flatten()
-            .all(|p| p.sigs[i] == cpu_seq.sigs[i]);
+        let gg = gpu_grp.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
+        let parity = [
+            Some(&cpu_blk),
+            Some(&cpu_grp),
+            gpu_seq.as_ref(),
+            gpu_blk.as_ref(),
+            gpu_grp.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|p| p.sigs[i] == cpu_seq.sigs[i]);
         println!(
-            "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x  {}",
+            "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x  {}",
             name,
             cpu_seq.sigs[i].0,
             cs,
             cb,
+            cg,
             gs,
             gb,
+            gg,
             cs / cb,
+            cs / cg,
             cs / gs,
             cs / gb,
+            cs / gg,
             if parity { "ok" } else { "MISMATCH" }
         );
         println!("  cpu-seq probes: {}", cpu_seq.stats[i]);
         println!("  cpu-blk probes: {}", cpu_blk.stats[i]);
+        println!("  cpu-grp probes: {}", cpu_grp.stats[i]);
         if let Some(p) = &gpu_seq {
             println!("  gpu-seq probes: {}", p.stats[i]);
         }
         if let Some(p) = &gpu_blk {
             println!("  gpu-blk probes: {}", p.stats[i]);
+        }
+        if let Some(p) = &gpu_grp {
+            println!("  gpu-grp probes: {}", p.stats[i]);
         }
     }
 }

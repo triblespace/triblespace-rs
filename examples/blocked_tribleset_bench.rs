@@ -45,6 +45,23 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
     (count, acc)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Seq,
+    Blk,
+    Grp,
+}
+
+macro_rules! run {
+    ($q:expr, $mode:expr) => {
+        match $mode {
+            Mode::Seq => tally($q),
+            Mode::Blk => tally($q.solve_blocked()),
+            Mode::Grp => tally($q.solve_blocked_grouped()),
+        }
+    };
+}
+
 fn main() {
     let n_people: usize = std::env::args()
         .nth(1)
@@ -97,11 +114,11 @@ fn main() {
     );
     eprintln!("block row cap: {}", block_row_cap());
 
-    type Q = (&'static str, Box<dyn Fn(&TribleSet, bool) -> (usize, u64)>);
+    type Q = (&'static str, Box<dyn Fn(&TribleSet, Mode) -> (usize, u64)>);
     let queries: Vec<Q> = vec![
         (
             "point   <s> gender ?g",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!(
                     (e: Inline<_>, g: Inline<_>),
                     and!(
@@ -109,54 +126,54 @@ fn main() {
                         pattern!(kb, [{ ?e @ world::gender: ?g }])
                     )
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
             "sweep   ?e kind human",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!((e: Inline<_>), pattern!(kb, [{ ?e @ world::kind: human }]));
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
             "filter  ?e kind human . ?e occupation ?o",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!(
                     (e: Inline<_>, o: Inline<_>),
                     pattern!(kb, [{ ?e @ world::kind: human, world::occupation: ?o }])
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
             "star3   ?e kind human . gender ?g . country ?c",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!(
                     (e: Inline<_>, g: Inline<_>, c: Inline<_>),
                     pattern!(kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
             "isect   ?e kind ?t . ?e country ?k",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!(
                     (e: Inline<_>, t: Inline<_>, k: Inline<_>),
                     pattern!(kb, [{ ?e @ world::kind: ?t, world::country: ?k }])
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
         (
             "chain   ?e located_in ?x . ?x located_in ?y",
-            Box::new(move |kb, blocked| {
+            Box::new(move |kb, mode| {
                 let q = find!(
                     (e: Inline<_>, x: Inline<_>, y: Inline<_>),
                     pattern!(kb, [{ ?e @ world::located_in: ?x }, { ?x @ world::located_in: ?y }])
                 );
-                if blocked { tally(q.solve_blocked()) } else { tally(q) }
+                run!(q, mode)
             }),
         ),
     ];
@@ -168,32 +185,56 @@ fn main() {
     }
 
     println!(
-        "{:<48} {:>10} {:>10} {:>10} {:>8}  parity",
-        "query", "rows", "seq ms", "blk ms", "blk/seq"
+        "{:<48} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}  parity",
+        "query", "rows", "seq ms", "blk ms", "grp ms", "blk/seq", "grp/seq"
     );
     for (name, q) in &queries {
         let mut seq_times = Vec::new();
         let mut blk_times = Vec::new();
+        let mut grp_times = Vec::new();
         let mut seq_sig = (0, 0);
         let mut blk_sig = (0, 0);
+        let mut grp_sig = (0, 0);
         for _ in 0..reps {
             let t = Instant::now();
-            seq_sig = q(&kb, false);
+            seq_sig = q(&kb, Mode::Seq);
             seq_times.push(t.elapsed().as_secs_f64() * 1e3);
             let t = Instant::now();
-            blk_sig = q(&kb, true);
+            blk_sig = q(&kb, Mode::Blk);
             blk_times.push(t.elapsed().as_secs_f64() * 1e3);
+            let t = Instant::now();
+            grp_sig = q(&kb, Mode::Grp);
+            grp_times.push(t.elapsed().as_secs_f64() * 1e3);
         }
         let s = median(&seq_times);
         let b = median(&blk_times);
+        let g = median(&grp_times);
         println!(
-            "{:<48} {:>10} {:>10.2} {:>10.2} {:>7.3}x  {}",
+            "{:<48} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>7.3}x {:>7.3}x  {}",
             name,
             seq_sig.0,
             s,
             b,
+            g,
             b / s,
-            if seq_sig == blk_sig { "ok" } else { "MISMATCH" }
+            g / s,
+            if seq_sig == blk_sig && seq_sig == grp_sig {
+                "ok"
+            } else {
+                "MISMATCH"
+            }
         );
+        // One instrumented pass per blocked mode: group/batch structure.
+        use triblespace::core::query::blocked_stats;
+        blocked_stats::set_enabled(true);
+        blocked_stats::reset();
+        q(&kb, Mode::Blk);
+        let blk_stats = blocked_stats::report();
+        blocked_stats::reset();
+        q(&kb, Mode::Grp);
+        let grp_stats = blocked_stats::report();
+        blocked_stats::set_enabled(false);
+        println!("  blk: {blk_stats}");
+        println!("  grp: {grp_stats}");
     }
 }
