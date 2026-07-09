@@ -39,7 +39,6 @@ pub mod sortedsliceconstraint;
 pub mod unionconstraint;
 mod variableset;
 
-use std::cmp::Reverse;
 use std::fmt;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
@@ -715,19 +714,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     .expect("unconstrained variable in query");
             }
             self.unbound.sort_unstable_by_key(|v| {
-                (
-                    Reverse(
-                        self.estimates[*v]
-                            .checked_ilog2()
-                            .map(|magnitude| magnitude + 1)
-                            .unwrap_or(0),
-                    ),
-                    self.influences[*v].count(),
-                )
+                variable_order_key(self.estimates[*v], self.influences[*v].count())
             });
         }
 
         let variable = self.unbound.pop().expect("non-empty unbound");
+        if order_trace::enabled() {
+            order_trace::record(self.stack.len(), variable, 1);
+        }
         let estimate = self.estimates[variable];
         self.stack.push(variable);
         let values = self.values[variable].get_or_insert(Vec::new());
@@ -867,17 +861,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             }
         });
         let mut unbound = ArrayVec::from_iter(variables);
-        unbound.sort_unstable_by_key(|v| {
-            (
-                Reverse(
-                    estimates[*v]
-                        .checked_ilog2()
-                        .map(|magnitude| magnitude + 1)
-                        .unwrap_or(0),
-                ),
-                influences[*v].count(),
-            )
-        });
+        unbound
+            .sort_unstable_by_key(|v| variable_order_key(estimates[*v], influences[*v].count()));
 
         Query {
             constraint,
@@ -891,6 +876,103 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             unbound,
             values: ArrayVec::from([const { None }; 128]),
         }
+    }
+}
+
+/// PROBE (order-key experiment): whether the engine's variable-order key
+/// puts influence-count first. Default `false`: smallest estimate
+/// magnitude first, influence as tiebreak. Set
+/// `TRIBLES_ORDER_KEY=influence_first` to flip: highest influence first
+/// (hub variables bind early — they constrain more of the remaining
+/// search), magnitude as tiebreak. Read once per process.
+pub fn influence_first() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("TRIBLES_ORDER_KEY")
+            .map(|s| s == "influence_first")
+            .unwrap_or(false)
+    })
+}
+
+/// The engine's variable-order key. **Larger key = picked next**: every
+/// site either takes `max_by_key` over the unbound set or pops the tail
+/// of a key-ascending sort.
+///
+/// Default key: `(inverted log2-magnitude, influence-count)` — smallest
+/// estimate first, influence as tiebreak (identical ordering to the old
+/// inline `(Reverse(ilog2+1), influence)` tuples). With
+/// [`influence_first`]: `(influence-count, inverted log2-magnitude)`.
+#[inline]
+fn variable_order_key(estimate: usize, influence_count: usize) -> (u64, u64) {
+    let magnitude = estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64;
+    let inv_magnitude = u64::MAX - magnitude;
+    if influence_first() {
+        (influence_count as u64, inv_magnitude)
+    } else {
+        (inv_magnitude, influence_count as u64)
+    }
+}
+
+/// PROBE (order-key experiment): cheap realized-variable-order trace. Off
+/// by default; harnesses enable it around an untimed run. Each pick of a
+/// next variable records `(depth, variable, weight)` — weight 1 per
+/// branch in the sequential engine and per block in `solve_blocked`, and
+/// the group's row count in `solve_blocked_grouped` (per-row preference
+/// mass). [`report`](order_trace::report) aggregates counts per
+/// `(depth, variable)` so "which variable did the engine actually bind at
+/// each level, how often" is visible per query.
+pub mod order_trace {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static COUNTS: Mutex<Vec<((usize, usize), u64)>> = Mutex::new(Vec::new());
+
+    /// Turns recording on/off (off by default).
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Clears all recorded picks.
+    pub fn reset() {
+        COUNTS.lock().unwrap().clear();
+    }
+
+    pub(crate) fn record(depth: usize, variable: usize, weight: u64) {
+        let mut counts = COUNTS.lock().unwrap();
+        if let Some(entry) = counts
+            .iter_mut()
+            .find(|((d, v), _)| *d == depth && *v == variable)
+        {
+            entry.1 += weight;
+        } else {
+            counts.push(((depth, variable), weight));
+        }
+    }
+
+    /// Terse per-depth pick histogram: `d0: v2 x1; d1: v0 x13056, v3 x2`.
+    pub fn report() -> String {
+        use std::fmt::Write;
+        let mut counts = COUNTS.lock().unwrap().clone();
+        counts.sort_by_key(|&((d, _), n)| (d, std::cmp::Reverse(n)));
+        let mut out = String::new();
+        let mut last_depth = usize::MAX;
+        for ((d, v), n) in counts {
+            if d != last_depth {
+                if !out.is_empty() {
+                    let _ = write!(out, "; ");
+                }
+                let _ = write!(out, "d{d}: v{v} x{n}");
+                last_depth = d;
+            } else {
+                let _ = write!(out, ", v{v} x{n}");
+            }
+        }
+        out
     }
 }
 
@@ -1078,18 +1160,13 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             let estimate = constraint
                 .estimate(v, &binding)
                 .expect("unconstrained variable in query");
-            (
-                Reverse(
-                    estimate
-                        .checked_ilog2()
-                        .map(|magnitude| magnitude + 1)
-                        .unwrap_or(0),
-                ),
-                influences[v].count(),
-            )
+            variable_order_key(estimate, influences[v].count())
         })
         .expect("non-empty unbound");
     let variable = unbound.swap_remove(ui);
+    if order_trace::enabled() {
+        order_trace::record(stride, variable, 1);
+    }
 
     // Expand the frontier: (parent row, candidate) pairs.
     let mut pairs: Vec<(u32, RawInline)> = Vec::new();
@@ -1146,9 +1223,9 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 /// One call = one search level for one block chunk:
 /// 1. **Estimate blocked** — one estimate column per unbound variable over
 ///    the whole block ([`Constraint::estimate_blocked`]).
-/// 2. **Prefer per row** — argmax of the sequential engine's sort key
-///    `(Reverse(log2-magnitude), influence-count)` over the row's column
-///    entries (identical key, applied per row instead of per level).
+/// 2. **Prefer per row** — argmax of the sequential engine's
+///    [`variable_order_key`] over the row's column entries (identical
+///    key, applied per row instead of per level).
 /// 3. **Partition** — stable counting sort of rows by preferred variable:
 ///    up to `|unbound|` groups. A single group borrows the parent block
 ///    (no copy) — the non-skewed fast path.
@@ -1215,18 +1292,13 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
                 let estimate = constraint
                     .estimate(v, binding)
                     .expect("unconstrained variable in query");
-                (
-                    Reverse(
-                        estimate
-                            .checked_ilog2()
-                            .map(|magnitude| magnitude + 1)
-                            .unwrap_or(0),
-                    ),
-                    influences[v].count(),
-                )
+                variable_order_key(estimate, influences[v].count())
             })
             .expect("non-empty unbound");
         let variable = unbound.swap_remove(ui);
+        if order_trace::enabled() {
+            order_trace::record(0, variable, 1);
+        }
         let mut values: Vec<RawInline> = Vec::new();
         constraint.propose(variable, binding, &mut values);
         if blocked_stats::enabled() {
@@ -1276,18 +1348,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     let mut group_counts: Vec<usize> = vec![0; n_unbound];
     for i in 0..n_rows {
         let j = (0..n_unbound)
-            .max_by_key(|&j| {
-                let estimate = est_cols[j][i];
-                (
-                    Reverse(
-                        estimate
-                            .checked_ilog2()
-                            .map(|magnitude| magnitude + 1)
-                            .unwrap_or(0),
-                    ),
-                    influences[unbound[j]].count(),
-                )
-            })
+            .max_by_key(|&j| variable_order_key(est_cols[j][i], influences[unbound[j]].count()))
             .expect("non-empty unbound");
         preferred.push(j as u32);
         group_counts[j] += 1;
@@ -1335,6 +1396,9 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             &part[starts[j] * stride..(starts[j] + g_count) * stride]
         };
 
+        if order_trace::enabled() {
+            order_trace::record(stride, variable, g_count as u64);
+        }
         let mut pairs: Vec<(u32, RawInline)> = Vec::new();
         constraint.propose_blocked(variable, vars, g_rows, &mut pairs);
         if stats {

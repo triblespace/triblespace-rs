@@ -293,14 +293,16 @@ fn main() {
         sigs: Vec<(usize, u64)>,
         stats: Vec<String>,
         block_stats: Vec<String>,
+        orders: Vec<String>,
     }
     let run_pass = |label: &str, archive: &SuccinctArchive<OrderedUniverse>, mode: Mode| {
-        use triblespace::core::query::blocked_stats;
+        use triblespace::core::query::{blocked_stats, order_trace};
         let mut pass = Pass {
             times: Vec::new(),
             sigs: Vec::new(),
             stats: Vec::new(),
             block_stats: Vec::new(),
+            orders: Vec::new(),
         };
         for (name, q) in &queries {
             let mut times = Vec::new();
@@ -319,7 +321,10 @@ fn main() {
             pass.sigs.push(sig);
             pass.stats.push(stats::report());
             // One instrumented (untimed) run: group counts / batch sizes /
-            // materialized intermediate rows for the blocked engines.
+            // materialized intermediate rows for the blocked engines, plus
+            // the realized variable order (all engines).
+            order_trace::set_enabled(true);
+            order_trace::reset();
             if mode != Mode::Seq {
                 blocked_stats::set_enabled(true);
                 blocked_stats::reset();
@@ -327,8 +332,11 @@ fn main() {
                 pass.block_stats.push(blocked_stats::report());
                 blocked_stats::set_enabled(false);
             } else {
+                q(archive, mode);
                 pass.block_stats.push(String::new());
             }
+            pass.orders.push(order_trace::report());
+            order_trace::set_enabled(false);
         }
         pass
     };
@@ -337,6 +345,14 @@ fn main() {
     eprintln!(
         "block row cap: {}",
         triblespace::core::query::block_row_cap()
+    );
+    eprintln!(
+        "order key: {}",
+        if triblespace::core::query::influence_first() {
+            "influence_first (influence-count, then magnitude)"
+        } else {
+            "default (magnitude, then influence-count)"
+        }
     );
     let cpu_only = std::env::var("TRIBLES_PROBE_CPU_ONLY").is_ok();
 
@@ -417,5 +433,8 @@ fn main() {
         }
         println!("  cpu-blk blocks: {}", cpu_blk.block_stats[i]);
         println!("  cpu-grp blocks: {}", cpu_grp.block_stats[i]);
+        println!("  cpu-seq order:  {}", cpu_seq.orders[i]);
+        println!("  cpu-blk order:  {}", cpu_blk.orders[i]);
+        println!("  cpu-grp order:  {}", cpu_grp.orders[i]);
     }
 }
