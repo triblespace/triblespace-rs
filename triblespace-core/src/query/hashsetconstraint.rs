@@ -42,26 +42,26 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
         // The current set length estimates the proposal count, per row.
-        out.extend(std::iter::repeat_n(self.set.len(), view.len()));
+        out.fill(self.set.len(), view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
-                candidates.extend(self.set.iter().map(|v| (i, IntoInline::to_inline(v).raw)));
+                candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
             }
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
-            candidates.retain(|(_, v)| {
+            candidates.retain(|_, v| {
                 match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.set.contains(&t),
                     Err(_) => false,

@@ -1,7 +1,8 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
-    use crate::query::Candidates;
+    use crate::query::CandidateSink;
     use crate::query::Constraint;
+    use crate::query::EstimateSink;
     use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
@@ -28,16 +29,16 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
             self.constraint.estimate(variable, view, out)
         }
 
-        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.record.borrow_mut().push(variable);
             self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.confirm(variable, view, candidates);
         }
 
@@ -86,20 +87,20 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
             if let Some(estimate) = self.estimates[variable] {
-                out.extend(std::iter::repeat_n(estimate, view.len()));
+                out.fill(estimate, view.len());
                 true
             } else {
                 self.constraint.estimate(variable, view, out)
             }
         }
 
-        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.confirm(variable, view, candidates);
         }
 

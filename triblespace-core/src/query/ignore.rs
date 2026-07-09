@@ -36,17 +36,17 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
     /// Delegates to the inner constraint. Ignored variables are still
     /// estimated normally — they participate internally, just not in the
     /// outer variable set.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         self.constraint.estimate(variable, view, out)
     }
 
     /// Delegates to the inner constraint.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         self.constraint.propose(variable, view, candidates);
     }
 
     /// Delegates to the inner constraint.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         self.constraint.confirm(variable, view, candidates)
     }
 }

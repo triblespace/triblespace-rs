@@ -4,8 +4,9 @@ use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
-use crate::query::Candidates;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
@@ -208,10 +209,12 @@ impl TribleSetConstraint {
     }
 
     /// Enumerates matching values for one row from the most selective
-    /// covering index via `infixes`, pushing `(row, value)` candidates.
+    /// covering index via `infixes`, feeding a monomorphized `push` — the
+    /// sink dispatch happens once per protocol call in
+    /// [`Constraint::propose`], never in the enumeration loops.
     /// The index is chosen to match the bound positions, so proposals are
     /// generated directly from a prefix scan.
-    fn propose_row(&self, p: &Positions, i: u32, row: &[RawInline], candidates: &mut Candidates) {
+    fn propose_row<F: FnMut(RawInline)>(&self, p: &Positions, row: &[RawInline], push: &mut F) {
         let Positions {
             e_var,
             a_var,
@@ -234,65 +237,64 @@ impl TribleSetConstraint {
         };
         let v_bound = p.pv.map(|i| &row[i]);
 
-        let mut proposals = PushPairs { row: i, candidates };
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Distinct-position combinations: the queried variable
             // appears in exactly one trible slot. Drive enumeration
             // from the most selective covering index.
             (None, None, None, true, false, false) => {
                 self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
-                    proposals.push(id_into_value(e))
+                    push(id_into_value(e))
                 });
             }
             (None, None, None, false, true, false) => {
                 self.set.aev.infixes(&[0; 0], &mut |a: &[u8; 16]| {
-                    proposals.push(id_into_value(a))
+                    push(id_into_value(a))
                 });
             }
             (None, None, None, false, false, true) => {
                 self.set
                     .vea
-                    .infixes(&[0; 0], &mut |&v: &[u8; 32]| proposals.push(v));
+                    .infixes(&[0; 0], &mut |&v: &[u8; 32]| push(v));
             }
 
             (Some(e), None, None, false, true, false) => {
                 self.set
                     .eav
-                    .infixes(&e, &mut |a: &[u8; 16]| proposals.push(id_into_value(a)));
+                    .infixes(&e, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (Some(e), None, None, false, false, true) => {
                 self.set
                     .eva
-                    .infixes(&e, &mut |&v: &[u8; 32]| proposals.push(v));
+                    .infixes(&e, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, Some(a), None, true, false, false) => {
                 self.set
                     .aev
-                    .infixes(&a, &mut |e: &[u8; 16]| proposals.push(id_into_value(e)));
+                    .infixes(&a, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, Some(a), None, false, false, true) => {
                 self.set
                     .ave
-                    .infixes(&a, &mut |&v: &[u8; 32]| proposals.push(v));
+                    .infixes(&a, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, None, Some(v), true, false, false) => {
                 self.set
                     .vea
-                    .infixes(v, &mut |e: &[u8; 16]| proposals.push(id_into_value(e)));
+                    .infixes(v, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, None, Some(v), false, true, false) => {
                 self.set
                     .vae
-                    .infixes(v, &mut |a: &[u8; 16]| proposals.push(id_into_value(a)));
+                    .infixes(v, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.ave.infixes(&prefix, &mut |e: &[u8; 16]| {
-                    proposals.push(id_into_value(e))
+                    push(id_into_value(e))
                 });
             }
             (Some(e), None, Some(v), false, true, false) => {
@@ -300,7 +302,7 @@ impl TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
                 self.set.eva.infixes(&prefix, &mut |a: &[u8; 16]| {
-                    proposals.push(id_into_value(a))
+                    push(id_into_value(a))
                 });
             }
             (Some(e), Some(a), None, false, false, true) => {
@@ -309,7 +311,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
                 self.set
                     .eav
-                    .infixes(&prefix, &mut |&v: &[u8; 32]| proposals.push(v));
+                    .infixes(&prefix, &mut |&v: &[u8; 32]| push(v));
             }
 
             // Same-Variable arms. The covering indexes already
@@ -324,7 +326,7 @@ impl TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -336,7 +338,7 @@ impl TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(e);
                     prefix[ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eva.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -348,7 +350,7 @@ impl TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -359,7 +361,7 @@ impl TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -371,7 +373,7 @@ impl TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(a));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -382,7 +384,7 @@ impl TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN..].copy_from_slice(&id_into_value(a));
                     if self.set.ave.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -396,7 +398,7 @@ impl TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(e);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -595,20 +597,6 @@ impl TribleSetConstraint {
     }
 }
 
-/// Adapter that turns the covering-index enumeration's per-value pushes
-/// into `(row, value)` candidate pairs.
-struct PushPairs<'c> {
-    row: u32,
-    candidates: &'c mut Candidates,
-}
-
-impl PushPairs<'_> {
-    #[inline]
-    fn push(&mut self, value: RawInline) {
-        self.candidates.push((self.row, value));
-    }
-}
-
 impl<'a> Constraint<'a> for TribleSetConstraint {
     /// Returns the set `{entity, attribute, value}` (three variables).
     fn variables(&self) -> VariableSet {
@@ -621,7 +609,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
     /// One [`segmented_len`](crate::patch::PATCH::segmented_len) count per
     /// row; the index dispatch is hoisted out of the row loop.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return false;
@@ -631,22 +619,34 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         true
     }
 
-    /// Per-row prefix scans of the most selective covering index.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    /// Per-row prefix scans of the most selective covering index. The
+    /// sink variant is matched once; each arm drives the enumeration with
+    /// a monomorphized push (the sequential `Values` arm never touches a
+    /// row tag).
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
         }
         let p = self.positions(variable, view);
-        for (i, row) in view.iter().enumerate() {
-            self.propose_row(&p, i as u32, row, candidates);
+        match candidates {
+            CandidateSink::Tagged(pairs) => {
+                for (i, row) in view.iter().enumerate() {
+                    self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                }
+            }
+            CandidateSink::Values(values) => {
+                for row in view.iter() {
+                    self.propose_row(&p, row, &mut |v| values.push(v));
+                }
+            }
         }
     }
 
     /// One `has_prefix` probe per candidate; each row's bound positions
     /// are decoded once (candidates are grouped by row). A row whose
     /// bound id fails to decode rejects all of its candidates.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -657,7 +657,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         let mut a_bound: Option<RawId> = None;
         let mut v_bound: Option<RawInline> = None;
         let mut row_ok = true;
-        candidates.retain(|&(row_idx, value)| {
+        candidates.retain(|row_idx, value| {
             if current_row != Some(row_idx) {
                 current_row = Some(row_idx);
                 let row = view.row(row_idx as usize);
@@ -681,7 +681,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     v_bound = Some(row[i]);
                 }
             }
-            row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, &value)
+            row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, value)
         });
     }
 

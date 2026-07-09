@@ -1,5 +1,6 @@
-use crate::query::Candidates;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
@@ -64,15 +65,15 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_v {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.cached_estimate, view.len()));
+        out.fill(self.cached_estimate, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_v {
             return;
         }
@@ -84,14 +85,14 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
             self.set
                 .vea
                 .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
-                    candidates.push((i, *v));
+                    candidates.push(i, *v);
                 });
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_v {
-            candidates.retain(|(_, v)| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 
@@ -218,7 +219,11 @@ mod tests {
 
         use crate::query::RowsView;
         let mut est = Vec::new();
-        assert!(constraint.estimate(v.index, RowsView::EMPTY, &mut est));
+        assert!(constraint.estimate(
+            v.index,
+            RowsView::EMPTY,
+            &mut crate::query::EstimateSink::Column(&mut est)
+        ));
         // Three distinct values in range. Before the fix this returned 6.
         assert_eq!(est, vec![3], "estimate must count distinct values");
     }

@@ -28,7 +28,7 @@
 
 use std::collections::HashSet;
 
-use triblespace_core::query::{Candidates, Constraint, RowsView, Variable, VariableId, VariableSet};
+use triblespace_core::query::{CandidateSink, Constraint, EstimateSink, RowsView, Variable, VariableId, VariableSet};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{RawInline, Inline};
@@ -335,29 +335,29 @@ where
         VariableSet::new_singleton(self.doc.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.doc.index {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.entries.len(), view.len()));
+        out.fill(self.entries.len(), view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.doc.index {
             return;
         }
         for i in 0..view.len() as u32 {
-            candidates.extend(self.entries.iter().map(|&raw| (i, raw)));
+            candidates.extend_row(i, self.entries.iter().copied());
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.doc.index {
             return;
         }
         let valid: HashSet<RawInline> = self.entries.iter().copied().collect();
-        candidates.retain(|(_, raw)| valid.contains(raw));
+        candidates.retain(|_, raw| valid.contains(raw));
     }
 
     fn satisfied(&self, view: RowsView<'_>) -> bool {
@@ -510,7 +510,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.a.index && variable != self.b.index {
             return false;
         }
@@ -531,12 +531,12 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
             // the join — signal "expensive" so it picks a
             // cheaper constraint first, rather than `false` which
             // would flag the variable as unconstrained.
-            None => out.extend(std::iter::repeat_n(usize::MAX, view.len())),
+            None => out.fill(usize::MAX, view.len()),
         }
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -551,16 +551,17 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
             return;
         };
         for (i, row) in view.iter().enumerate() {
-            for h in self
-                .index
-                .neighbours_above(Inline::new(row[col]), self.score_floor)
-            {
-                candidates.push((i as u32, h.raw));
-            }
+            candidates.extend_row(
+                i as u32,
+                self.index
+                    .neighbours_above(Inline::new(row[col]), self.score_floor)
+                    .into_iter()
+                    .map(|h| h.raw),
+            );
         }
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -578,7 +579,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         };
         let mut current_row: Option<u32> = None;
         let mut allowed: HashSet<RawInline> = HashSet::new();
-        candidates.retain(|&(row_idx, raw)| {
+        candidates.retain(|row_idx, raw| {
             if current_row != Some(row_idx) {
                 current_row = Some(row_idx);
                 let from = view.row(row_idx as usize)[col];
@@ -589,7 +590,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
                     .map(|h| h.raw)
                     .collect();
             }
-            allowed.contains(&raw)
+            allowed.contains(raw)
         });
     }
 
@@ -700,29 +701,29 @@ impl<'a> Constraint<'a> for SimilarTo {
         VariableSet::new_singleton(self.var.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.var.index {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.candidates.len(), view.len()));
+        out.fill(self.candidates.len(), view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.var.index {
             return;
         }
         for i in 0..view.len() as u32 {
-            candidates.extend(self.candidates.iter().map(|&raw| (i, raw)));
+            candidates.extend_row(i, self.candidates.iter().copied());
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.var.index {
             return;
         }
         let allowed: HashSet<RawInline> = self.candidates.iter().copied().collect();
-        candidates.retain(|(_, raw)| allowed.contains(raw));
+        candidates.retain(|_, raw| allowed.contains(raw));
     }
 
     fn satisfied(&self, view: RowsView<'_>) -> bool {
@@ -739,6 +740,7 @@ impl<'a> Constraint<'a> for SimilarTo {
 mod tests {
     use super::*;
     use crate::bm25::BM25Builder;
+    use triblespace_core::query::Candidates;
     use crate::tokens::hash_tokens;
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
@@ -753,7 +755,7 @@ mod tests {
     /// Option<usize>` shape, reconstructed over a view.
     fn est<'a>(c: &impl Constraint<'a>, v: VariableId, view: RowsView<'_>) -> Option<usize> {
         let mut out = Vec::new();
-        if c.estimate(v, view, &mut out) {
+        if c.estimate(v, view, &mut EstimateSink::Column(&mut out)) {
             Some(out[0])
         } else {
             None
@@ -821,7 +823,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut props);
+        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert_eq!(props.len(), 2);
 
         let ids: HashSet<Id> = props
@@ -845,7 +847,7 @@ mod tests {
             (0, id_to_raw_value(id(2))),
             (0, id_to_raw_value(id(3))),
         ];
-        c.confirm(doc.index, RowsView::EMPTY, &mut props);
+        c.confirm(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         let ids: HashSet<Id> = props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));
@@ -882,7 +884,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut props);
+        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         let ids: HashSet<Id> = props
             .iter()
             .map(|(_, r)| raw_value_to_id(r).expect("genid"))
@@ -907,8 +909,8 @@ mod tests {
 
         let mut props_a: Candidates = Vec::new();
         let mut props_b: Candidates = Vec::new();
-        explicit.propose(doc_a.index, RowsView::EMPTY, &mut props_a);
-        sugar.propose(doc_b.index, RowsView::EMPTY, &mut props_b);
+        explicit.propose(doc_a.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_a));
+        sugar.propose(doc_b.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_b));
 
         let set_a: HashSet<Id> = props_a
             .iter()
@@ -958,14 +960,14 @@ mod tests {
         let c_mid = idx.matches(doc, &terms, (s1 + s2) / 2.0);
 
         let mut low_props: Candidates = Vec::new();
-        c_low.propose(doc.index, RowsView::EMPTY, &mut low_props);
+        c_low.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut low_props));
         let low_ids: HashSet<Id> =
             low_props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert!(low_ids.contains(&id(1)));
         assert!(low_ids.contains(&id(2)));
 
         let mut mid_props: Candidates = Vec::new();
-        c_mid.propose(doc.index, RowsView::EMPTY, &mut mid_props);
+        c_mid.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut mid_props));
         let mid_ids: HashSet<Id> =
             mid_props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert!(mid_ids.contains(&id(1)));
@@ -1016,7 +1018,7 @@ mod tests {
         assert_eq!(est(&c, doc.index, RowsView::EMPTY), Some(0));
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut props);
+        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert!(props.is_empty());
     }
 
@@ -1030,7 +1032,7 @@ mod tests {
 
         assert_eq!(est(&c, doc.index, RowsView::EMPTY), Some(0));
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut props);
+        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert!(props.is_empty());
     }
 
@@ -1084,7 +1086,7 @@ mod tests {
         let row = [handles[0].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(b.index, RowsView::new(&vars, &row), &mut props);
+        c.propose(b.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
@@ -1106,7 +1108,7 @@ mod tests {
         let row = [handles[2].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(a.index, RowsView::new(&vars, &row), &mut props);
+        c.propose(a.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
@@ -1146,7 +1148,7 @@ mod tests {
         let row = [handles[0].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(b.index, RowsView::new(&vars, &row), &mut props);
+        c.propose(b.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));

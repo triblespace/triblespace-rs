@@ -5,9 +5,10 @@ use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::query::confirm_per_row;
+use crate::query::CandidateSink;
+use crate::query::EstimateSink;
 use crate::query::Binding;
 use crate::query::intersectionconstraint::IntersectionConstraint;
-use crate::query::Candidates;
 use crate::query::Constraint;
 use crate::query::RowsView;
 use crate::query::Query;
@@ -668,9 +669,13 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
             let (constraint, dest_idx) = build_join(set, body, start);
             let vars = [0usize];
             let row = [*start];
-            let mut out = Vec::with_capacity(1);
-            if constraint.estimate(dest_idx, RowsView::new(&vars, &row), &mut out) {
-                out[0]
+            let mut out = 0usize;
+            if constraint.estimate(
+                dest_idx,
+                RowsView::new(&vars, &row),
+                &mut EstimateSink::Scalar(&mut out),
+            ) {
+                out
             } else {
                 0
             }
@@ -1166,7 +1171,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         vars
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.start && variable != self.end {
             return false;
         }
@@ -1178,7 +1183,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.start && variable != self.end {
             return;
         }
@@ -1193,11 +1198,11 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 pe.map(|c| &row[c]),
                 &mut scratch,
             );
-            candidates.extend(scratch.iter().map(|&v| (i as u32, v)));
+            candidates.extend_row(i as u32, scratch.iter().copied());
         }
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.start && variable != self.end {
             return;
         }

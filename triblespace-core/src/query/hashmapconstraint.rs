@@ -3,8 +3,9 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::query::Candidates;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RowsView;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
@@ -50,26 +51,26 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
         // The estimated proposal count equals the current number of keys.
-        out.extend(std::iter::repeat_n(self.map.len(), view.len()));
+        out.fill(self.map.len(), view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
-                candidates.extend(self.map.keys().map(|k| (i, IntoInline::to_inline(k).raw)));
+                candidates.extend_row(i, self.map.keys().map(|k| IntoInline::to_inline(k).raw));
             }
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
-            candidates.retain(|(_, v)| {
+            candidates.retain(|_, v| {
                 self.map.contains_key(&match TryFromInline::try_from_inline(
                     Inline::<S>::as_transmute_raw(v),
                 ) {

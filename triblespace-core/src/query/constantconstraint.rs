@@ -27,26 +27,28 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Always estimates exactly one candidate, for every row.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable != variable {
             return false;
         }
-        out.extend(std::iter::repeat_n(1, view.len()));
+        out.fill(1, view.len());
         true
     }
 
     /// Proposes the single constant value for every row.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable == variable {
-            candidates.extend((0..view.len()).map(|i| (i as u32, self.constant)));
+            for i in 0..view.len() as u32 {
+                candidates.push(i, self.constant);
+            }
         }
     }
 
     /// The constant is binding-independent, so confirm is a single retain
     /// over the whole frontier — no per-row work at all.
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable == variable {
-            candidates.retain(|(_, v)| *v == self.constant);
+            candidates.retain(|_, v| *v == self.constant);
         }
     }
 

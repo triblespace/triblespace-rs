@@ -51,24 +51,24 @@ impl<'a> Constraint<'a> for InlineRange {
 
     /// Estimates `usize::MAX` so the intersection never chooses this
     /// constraint as the proposer — it only confirms.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable != variable {
             return false;
         }
-        out.extend(std::iter::repeat_n(usize::MAX, view.len()));
+        out.fill(usize::MAX, view.len());
         true
     }
 
     /// Does not propose — the paired TribleSet constraint handles proposals.
-    fn propose(&self, _variable: VariableId, _view: RowsView<'_>, _candidates: &mut Candidates) {
+    fn propose(&self, _variable: VariableId, _view: RowsView<'_>, _candidates: &mut CandidateSink<'_>) {
         // Intentionally empty: this constraint only confirms.
     }
 
     /// Retains only candidates whose raw bytes fall within [min, max]
     /// inclusive — value-only, so one retain over the whole frontier.
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable == variable {
-            candidates.retain(|(_, v)| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 

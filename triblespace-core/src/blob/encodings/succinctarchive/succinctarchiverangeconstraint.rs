@@ -1,6 +1,7 @@
 use super::*;
-use crate::query::Candidates;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
@@ -84,31 +85,31 @@ where
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_v {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.cached_estimate, view.len()));
+        out.fill(self.cached_estimate, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_v {
             return;
         }
         for i in 0..view.len() as u32 {
             let code_range = self.archive.domain.search_range(&self.min, &self.max);
-            candidates.extend(
+            candidates.extend_row(
+                i,
                 self.archive
-                    .enumerate_domain_in_range(&self.archive.v_a, code_range)
-                    .map(|v| (i, v)),
+                    .enumerate_domain_in_range(&self.archive.v_a, code_range),
             );
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_v {
-            candidates.retain(|(_, v)| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 

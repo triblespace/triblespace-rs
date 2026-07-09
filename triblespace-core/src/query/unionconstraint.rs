@@ -62,23 +62,42 @@ where
     /// Appends the elementwise **sum** of estimates across all variants.
     /// A union can produce candidates from any branch, so the
     /// cardinalities add.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
-        let base = out.len();
-        let mut any = false;
-        let mut scratch: Vec<usize> = Vec::new();
-        for c in &self.constraints {
-            if !any {
-                any = c.estimate(variable, view, out);
-            } else {
-                scratch.clear();
-                if c.estimate(variable, view, &mut scratch) {
-                    for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
-                        *o = o.saturating_add(s);
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+        match out {
+            EstimateSink::Scalar(slot) => {
+                let mut any = false;
+                let mut acc = 0usize;
+                for c in &self.constraints {
+                    let mut e = 0usize;
+                    if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
+                        any = true;
+                        acc = acc.saturating_add(e);
                     }
                 }
+                if any {
+                    **slot = acc;
+                }
+                any
+            }
+            EstimateSink::Column(out) => {
+                let base = out.len();
+                let mut any = false;
+                let mut scratch: Vec<usize> = Vec::new();
+                for c in &self.constraints {
+                    if !any {
+                        any = c.estimate(variable, view, &mut EstimateSink::Column(out));
+                    } else {
+                        scratch.clear();
+                        if c.estimate(variable, view, &mut EstimateSink::Column(&mut scratch)) {
+                            for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
+                                *o = o.saturating_add(s);
+                            }
+                        }
+                    }
+                }
+                any
             }
         }
-        any
     }
 
     /// Per row: collects proposals from every *satisfied* variant (via a
@@ -86,18 +105,20 @@ where
     /// group. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false` for the row) are skipped so their stale bindings
     /// cannot inject values that no live variant would produce.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
-        let mut scratch: Candidates = Vec::new();
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        let mut scratch: Vec<RawInline> = Vec::new();
         for (i, row) in view.iter().enumerate() {
             let row_view = RowsView::new(view.vars, row);
             scratch.clear();
             self.constraints
                 .iter()
                 .filter(|c| c.satisfied(row_view))
-                .for_each(|c| c.propose(variable, row_view, &mut scratch));
+                .for_each(|c| {
+                    c.propose(variable, row_view, &mut CandidateSink::Values(&mut scratch))
+                });
             scratch.sort_unstable();
             scratch.dedup();
-            candidates.extend(scratch.iter().map(|&(_, v)| (i as u32, v)));
+            candidates.extend_row(i as u32, scratch.iter().copied());
         }
     }
 
@@ -105,7 +126,7 @@ where
     /// variant independently, then merges the per-variant survivors via
     /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
     /// passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         confirm_per_row(view, candidates, |row, values| {
             let row_view = RowsView::new(view.vars, row);
             values.sort_unstable();
@@ -115,13 +136,12 @@ where
                 .iter()
                 .filter(|c| c.satisfied(row_view))
                 .map(|c| {
-                    let mut vs: Candidates = values.iter().map(|&v| (0, v)).collect();
-                    c.confirm(variable, row_view, &mut vs);
+                    let mut vs: Vec<RawInline> = values.clone();
+                    c.confirm(variable, row_view, &mut CandidateSink::Values(&mut vs));
                     vs
                 })
                 .kmerge()
                 .dedup()
-                .map(|(_, v)| v)
                 .collect();
 
             _ = mem::replace(values, union);

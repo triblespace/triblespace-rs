@@ -130,10 +130,10 @@ fn estimate_is_universe_code_range_upper_bound() {
     let max: Inline<R256BE> = 100i128.to_inline();
     let constraint = archive.value_in_range(v, min, max);
 
-    use triblespace::core::query::{Candidates, RowsView};
+    use triblespace::core::query::{CandidateSink, Candidates, EstimateSink, RowsView};
     let mut est = Vec::new();
     assert!(
-        constraint.estimate(v.index, RowsView::EMPTY, &mut est),
+        constraint.estimate(v.index, RowsView::EMPTY, &mut EstimateSink::Column(&mut est)),
         "estimate is relevant for the V variable"
     );
     let estimate = est[0];
@@ -143,7 +143,7 @@ fn estimate_is_universe_code_range_upper_bound() {
     );
     // Verify propose enumerates exactly the 3 distinct V values.
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(v.index, RowsView::EMPTY, &mut proposals);
+    constraint.propose(v.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(
         proposals.len(),
         3,

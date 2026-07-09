@@ -43,27 +43,50 @@ where
             .fold(VariableSet::new_empty(), |vs, c| vs.union(c.variables()))
     }
 
-    /// Appends the elementwise **minimum** estimate across children that
+    /// Pushes the elementwise **minimum** estimate across children that
     /// constrain `variable`. The tightest child bounds the search per
     /// row, reflecting the intersection semantics: every child must
     /// agree, so the smallest candidate set dominates.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
-        let base = out.len();
-        let mut any = false;
-        let mut scratch: Vec<usize> = Vec::new();
-        for c in &self.constraints {
-            if !any {
-                any = c.estimate(variable, view, out);
-            } else {
-                scratch.clear();
-                if c.estimate(variable, view, &mut scratch) {
-                    for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
-                        *o = (*o).min(s);
+    ///
+    /// The scalar (single-row cursor) arm folds child estimates through
+    /// stack slots — no column scratch is ever allocated on the
+    /// sequential engine's path.
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+        match out {
+            EstimateSink::Scalar(slot) => {
+                let mut any = false;
+                let mut acc = usize::MAX;
+                for c in &self.constraints {
+                    let mut e = 0usize;
+                    if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
+                        any = true;
+                        acc = acc.min(e);
                     }
                 }
+                if any {
+                    **slot = acc;
+                }
+                any
+            }
+            EstimateSink::Column(out) => {
+                let base = out.len();
+                let mut any = false;
+                let mut scratch: Vec<usize> = Vec::new();
+                for c in &self.constraints {
+                    if !any {
+                        any = c.estimate(variable, view, &mut EstimateSink::Column(out));
+                    } else {
+                        scratch.clear();
+                        if c.estimate(variable, view, &mut EstimateSink::Column(&mut scratch)) {
+                            for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
+                                *o = (*o).min(s);
+                            }
+                        }
+                    }
+                }
+                any
             }
         }
-        any
     }
 
     /// Frontier expansion: per row the tightest child proposes (one
@@ -79,7 +102,29 @@ where
     /// borrowed view, and every relevant child confirms the full frontier
     /// — re-confirming a child's own pairs is a wasted-work cost, never a
     /// correctness one.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        // The sequential cursor (a Values sink is always a block of 1):
+        // scalar child estimates in stack slots, argmin, propose, ordered
+        // confirms — no estimate columns, no heap scratch.
+        if matches!(candidates, CandidateSink::Values(_)) {
+            let mut relevant: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+            for (ci, c) in self.constraints.iter().enumerate() {
+                let mut e = 0usize;
+                if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
+                    relevant.push((e, ci));
+                }
+            }
+            let Some(&(_, proposer)) = relevant.iter().min_by_key(|&&(e, _)| e) else {
+                return;
+            };
+            self.constraints[proposer].propose(variable, view, candidates);
+            relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
+            for &(_, ci) in relevant.iter().filter(|&&(_, ci)| ci != proposer) {
+                self.constraints[ci].confirm(variable, view, candidates);
+            }
+            return;
+        }
+
         let n_rows = view.len();
 
         // Pass 1: per-child estimate columns (flat, child-major) — the
@@ -87,7 +132,7 @@ where
         let mut cols: Vec<usize> = Vec::new();
         let mut relevant: SmallVec<[usize; 8]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {
-            if c.estimate(variable, view, &mut cols) {
+            if c.estimate(variable, view, &mut EstimateSink::Column(&mut cols)) {
                 relevant.push(ci);
             }
         }
@@ -115,9 +160,7 @@ where
                 let row_view = view.row_view(i);
                 let base = candidates.len();
                 self.constraints[relevant[k as usize]].propose(variable, row_view, candidates);
-                for pair in &mut candidates[base..] {
-                    pair.0 = i as u32;
-                }
+                candidates.retag_from(base, i as u32);
             }
         }
 
@@ -137,14 +180,13 @@ where
 
     /// Confirms a whole frontier through every relevant child in
     /// ascending (first-row) estimate order.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let first = view.row_view(0);
-        let mut est: Vec<usize> = Vec::with_capacity(1);
         let mut relevant: SmallVec<[(usize, usize); 8]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {
-            est.clear();
-            if c.estimate(variable, first, &mut est) {
-                relevant.push((est[0], ci));
+            let mut est = 0usize;
+            if c.estimate(variable, first, &mut EstimateSink::Scalar(&mut est)) {
+                relevant.push((est, ci));
             }
         }
         relevant.sort_unstable_by_key(|&(estimate, _)| estimate);

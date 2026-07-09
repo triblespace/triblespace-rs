@@ -337,50 +337,212 @@ impl<'v> RowsView<'v> {
     }
 }
 
-/// The ragged candidate matrix of the blocked protocol: `(row, value)`
-/// pairs in COO form, **grouped by ascending row index**. Every protocol
-/// method that filters candidates must preserve that grouping
-/// (`retain`-style order preservation does).
+/// The ragged candidate matrix of the blocked engines: `(row, value)`
+/// pairs in COO form, **grouped by ascending row index**. The blocked /
+/// grouped / DAG solvers own buffers of this type and lend them to the
+/// protocol through [`CandidateSink::Tagged`].
 pub type Candidates = Vec<(u32, RawInline)>;
 
-/// Drives a per-row proposer over a block — the derived (scalar) case of
-/// the blocked protocol, for constraints whose enumeration has no batch
-/// structure. `f` receives the row index and the row's values and appends
-/// that row's `(row, value)` candidates directly.
-pub fn propose_per_row<'v>(
-    view: RowsView<'v>,
-    candidates: &mut Candidates,
-    mut f: impl FnMut(u32, &'v [RawInline], &mut Candidates),
-) {
-    for (i, row) in view.iter().enumerate() {
-        f(i as u32, row, candidates);
+/// The output sink of [`Constraint::propose`] / [`Constraint::confirm`] —
+/// the representation-generic seam that lets one protocol serve both
+/// engine families with zero ceremony on either side:
+///
+/// - [`Tagged`](Self::Tagged) lends a [`Candidates`] pair buffer — the
+///   blocked engines' ragged COO frontier, `(row, value)` grouped by
+///   ascending row index.
+/// - [`Values`](Self::Values) lends a plain `Vec<RawInline>` — the
+///   sequential engine's block-of-1 proposal buffer. The row index is
+///   statically 0 and **no `u32` tag is ever materialized**; callers
+///   must pass single-row views (`view.len() == 1`).
+///
+/// A trait with generic verbs would say the same thing, but the protocol
+/// must stay object-safe (`and!`/`or!` compose `Box<dyn Constraint>`
+/// trees), so the sink is a concrete two-variant type instead. The
+/// closure-taking methods ([`extend_row`](Self::extend_row),
+/// [`retain`](Self::retain), [`for_each`](Self::for_each)) match on the
+/// variant **once per call** and run a monomorphized loop per arm, so
+/// nothing representation-dependent survives into the hot loops.
+pub enum CandidateSink<'s> {
+    /// `(row, value)` pairs, grouped by ascending row — blocked engines.
+    Tagged(&'s mut Candidates),
+    /// Plain values for a single-row view — the sequential cursor.
+    Values(&'s mut Vec<RawInline>),
+}
+
+impl CandidateSink<'_> {
+    /// Appends one candidate for parent row `row`.
+    #[inline]
+    pub fn push(&mut self, row: u32, value: RawInline) {
+        match self {
+            Self::Tagged(pairs) => pairs.push((row, value)),
+            Self::Values(values) => values.push(value),
+        }
+    }
+
+    /// Appends a run of candidates for parent row `row`. The variant
+    /// match is hoisted out of the iteration.
+    #[inline]
+    pub fn extend_row(&mut self, row: u32, values: impl IntoIterator<Item = RawInline>) {
+        match self {
+            Self::Tagged(pairs) => pairs.extend(values.into_iter().map(|v| (row, v))),
+            Self::Values(out) => out.extend(values),
+        }
+    }
+
+    /// Number of candidates currently in the sink.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tagged(pairs) => pairs.len(),
+            Self::Values(values) => values.len(),
+        }
+    }
+
+    /// `true` when the sink holds no candidates.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reserves capacity for at least `additional` more candidates.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        match self {
+            Self::Tagged(pairs) => pairs.reserve(additional),
+            Self::Values(values) => values.reserve(additional),
+        }
+    }
+
+    /// Visits every `(row, value)` candidate in order.
+    #[inline]
+    pub fn for_each(&self, mut f: impl FnMut(u32, &RawInline)) {
+        match self {
+            Self::Tagged(pairs) => {
+                for (row, value) in pairs.iter() {
+                    f(*row, value);
+                }
+            }
+            Self::Values(values) => {
+                for value in values.iter() {
+                    f(0, value);
+                }
+            }
+        }
+    }
+
+    /// Order-preserving retain by `(row, &value)` predicate — the confirm
+    /// primitive. Preserves the row grouping by construction.
+    #[inline]
+    pub fn retain(&mut self, mut f: impl FnMut(u32, &RawInline) -> bool) {
+        match self {
+            Self::Tagged(pairs) => pairs.retain(|(row, value)| f(*row, value)),
+            Self::Values(values) => values.retain(|value| f(0, value)),
+        }
+    }
+
+    /// Rewrites the row tag of every candidate from index `base` onward to
+    /// `row` — used when a caller proposes through a single-row sub-view
+    /// (whose pushes carry row 0) into a multi-row frontier. A no-op for
+    /// [`Values`](Self::Values) sinks, where the row is statically 0.
+    #[inline]
+    pub fn retag_from(&mut self, base: usize, row: u32) {
+        match self {
+            Self::Tagged(pairs) => {
+                for pair in &mut pairs[base..] {
+                    pair.0 = row;
+                }
+            }
+            Self::Values(_) => debug_assert_eq!(row, 0, "Values sink is single-row"),
+        }
+    }
+}
+
+/// The output sink of [`Constraint::estimate`]: one estimate per row of
+/// the block.
+///
+/// - [`Column`](Self::Column) appends per-row estimates to a column
+///   vector — the blocked engines' shape.
+/// - [`Scalar`](Self::Scalar) writes a single-row view's estimate
+///   straight into a stack slot — the sequential engine's shape, with no
+///   `Vec` round-trip.
+pub enum EstimateSink<'s> {
+    /// One estimate per row, appended — blocked engines.
+    Column(&'s mut Vec<usize>),
+    /// A single-row view's estimate, written in place.
+    Scalar(&'s mut usize),
+}
+
+impl EstimateSink<'_> {
+    /// Appends one row's estimate.
+    #[inline]
+    pub fn push(&mut self, estimate: usize) {
+        match self {
+            Self::Column(col) => col.push(estimate),
+            Self::Scalar(slot) => **slot = estimate,
+        }
+    }
+
+    /// Appends one estimate per row from an iterator. The variant match
+    /// is hoisted out of the iteration.
+    #[inline]
+    pub fn extend(&mut self, estimates: impl IntoIterator<Item = usize>) {
+        match self {
+            Self::Column(col) => col.extend(estimates),
+            Self::Scalar(slot) => {
+                if let Some(e) = estimates.into_iter().next() {
+                    **slot = e;
+                }
+            }
+        }
+    }
+
+    /// Appends the same estimate for `n` rows — the uniform
+    /// (binding-independent) case.
+    #[inline]
+    pub fn fill(&mut self, estimate: usize, n: usize) {
+        match self {
+            Self::Column(col) => col.extend(std::iter::repeat_n(estimate, n)),
+            Self::Scalar(slot) => {
+                debug_assert_eq!(n, 1, "Scalar sink is single-row");
+                **slot = estimate;
+            }
+        }
     }
 }
 
 /// Groups a candidate frontier by row and lets `f` filter each row's
 /// value group in place — the derived (scalar) case of blocked confirm.
 /// `f` receives the row's values and the row's candidate values.
+///
+/// For a [`CandidateSink::Values`] sink (the sequential engine's
+/// block-of-1) this is a direct call on the borrowed buffer — no
+/// grouping, no scratch, no copies.
 pub fn confirm_per_row(
     view: RowsView<'_>,
-    candidates: &mut Candidates,
+    candidates: &mut CandidateSink<'_>,
     mut f: impl FnMut(&[RawInline], &mut Vec<RawInline>),
 ) {
-    let mut scratch: Vec<RawInline> = Vec::new();
-    let mut out: Candidates = Vec::with_capacity(candidates.len());
-    let mut i = 0;
-    while i < candidates.len() {
-        let row_idx = candidates[i].0;
-        scratch.clear();
-        let mut j = i;
-        while j < candidates.len() && candidates[j].0 == row_idx {
-            scratch.push(candidates[j].1);
-            j += 1;
+    match candidates {
+        CandidateSink::Values(values) => f(view.row(0), values),
+        CandidateSink::Tagged(pairs) => {
+            let mut scratch: Vec<RawInline> = Vec::new();
+            let mut out: Candidates = Vec::with_capacity(pairs.len());
+            let mut i = 0;
+            while i < pairs.len() {
+                let row_idx = pairs[i].0;
+                scratch.clear();
+                let mut j = i;
+                while j < pairs.len() && pairs[j].0 == row_idx {
+                    scratch.push(pairs[j].1);
+                    j += 1;
+                }
+                f(view.row(row_idx as usize), &mut scratch);
+                out.extend(scratch.iter().map(|&val| (row_idx, val)));
+                i = j;
+            }
+            **pairs = out;
         }
-        f(view.row(row_idx as usize), &mut scratch);
-        out.extend(scratch.iter().map(|&val| (row_idx, val)));
-        i = j;
     }
-    *candidates = out;
 }
 
 /// The cooperative protocol that every query participant implements.
@@ -390,10 +552,12 @@ pub fn confirm_per_row(
 /// consults constraints directly during a search over partial bindings.
 /// The protocol is **block-native**: every method operates on a
 /// [`RowsView`] — a block of sibling partial bindings that share the same
-/// bound-variable set — and candidates travel as a ragged [`Candidates`]
-/// matrix. One binding at a time is simply the one-row special case (the
-/// sequential engine passes single-row views); whole-frontier batches are
-/// the general case (the blocked/DAG solvers pass thousands of rows), so
+/// bound-variable set — and candidates travel through a representation-
+/// generic [`CandidateSink`]. One binding at a time is simply the one-row
+/// special case (the sequential engine passes single-row views with a
+/// plain-value [`CandidateSink::Values`] sink, paying no row tags); whole-
+/// frontier batches are the general case (the blocked/DAG solvers pass
+/// thousands of rows with a [`CandidateSink::Tagged`] pair sink), so
 /// constraints with batchable probe streams evaluate them in one pass —
 /// cache-friendly on the CPU or as a single GPU dispatch.
 ///
@@ -440,8 +604,9 @@ pub fn confirm_per_row(
 /// A new constraint needs [`variables`](Constraint::variables),
 /// [`estimate`](Constraint::estimate), [`propose`](Constraint::propose),
 /// and [`confirm`](Constraint::confirm). Constraints without batch
-/// structure implement the row loop with the [`propose_per_row`] /
-/// [`confirm_per_row`] adapters. Override
+/// structure loop over [`RowsView::iter`] and push per row (see
+/// [`CandidateSink::extend_row`]), or filter per row with the
+/// [`confirm_per_row`] adapter. Override
 /// [`satisfied`](Constraint::satisfied) when the constraint can detect
 /// unsatisfiability early (e.g. a fully-bound triple lookup that found no
 /// match). Override [`influence`](Constraint::influence) when binding one
@@ -455,7 +620,7 @@ pub trait Constraint<'a> {
     fn variables(&self) -> VariableSet;
 
     /// Estimates the number of candidate values for `variable` for
-    /// **every row** of the block, appending one estimate per row to
+    /// **every row** of the block, pushing one estimate per row into
     /// `out`.
     ///
     /// Returns `false` (leaving `out` untouched) when `variable` is not
@@ -464,25 +629,26 @@ pub trait Constraint<'a> {
     /// ordering, not correctness. Tighter estimates lead to better search
     /// pruning; see the [Atreides join](crate) family for how estimate
     /// fidelity affects performance.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool;
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>)
+        -> bool;
 
     /// Enumerates candidate values for `variable` for every row of the
-    /// block, appending `(row, value)` pairs to `candidates` grouped by
+    /// block, pushing `(row, value)` candidates into the sink grouped by
     /// ascending row index.
     ///
     /// Called on the constraint with the lowest estimate for the variable
     /// being bound. Does nothing when `variable` is not constrained by
     /// this constraint.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates);
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>);
 
-    /// Filters `candidates`, removing `(row, value)` pairs whose value
-    /// violates this constraint under that row's bindings, while
-    /// preserving the row grouping.
+    /// Filters `candidates`, removing `(row, value)` candidates whose
+    /// value violates this constraint under that row's bindings, while
+    /// preserving the row grouping ([`CandidateSink::retain`] does).
     ///
     /// Called on every constraint *except* the one that proposed, in
     /// order of increasing estimate. Does nothing when `variable` is not
     /// constrained by this constraint.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates);
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>);
 
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
@@ -526,17 +692,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
@@ -558,17 +724,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
@@ -619,12 +785,13 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Bitset mirror of `stack` (estimate-staleness bookkeeping).
     bound: VariableSet,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<Candidates>, 128>,
+    /// Per-variable proposal buffers — plain values, no row tags: the
+    /// cursor is a block of one, so the row index is statically 0
+    /// ([`CandidateSink::Values`]).
+    values: ArrayVec<Option<Vec<RawInline>>, 128>,
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
-    /// Reusable one-entry estimate column.
-    est_scratch: Vec<usize>,
     /// PROBE (dag-as-main): lazily initialized DAG engine state when
     /// `TRIBLES_ENGINE=dag` — the [`Iterator`] impl delegates every
     /// `next()` here once it exists. `None` on the sequential path.
@@ -655,7 +822,6 @@ where
             unbound: self.unbound.clone(),
             values: self.values.clone(),
             binding: self.binding.clone(),
-            est_scratch: Vec::new(),
             // DAG state is not cloneable (the emit buffer holds `R`s, which
             // aren't `Clone` here). Rayon's producer `split` only clones
             // queries that have never been driven through `next()` (folding
@@ -688,12 +854,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         if !stale_estimates.is_empty() {
             let view = RowsView::new(&self.stack, &self.row);
             while let Some(v) = stale_estimates.drain_next_ascending() {
-                self.est_scratch.clear();
+                let mut estimate = 0usize;
                 assert!(
-                    self.constraint.estimate(v, view, &mut self.est_scratch),
+                    self.constraint
+                        .estimate(v, view, &mut EstimateSink::Scalar(&mut estimate)),
                     "unconstrained variable in query"
                 );
-                self.estimates[v] = self.est_scratch[0];
+                self.estimates[v] = estimate;
             }
             self.unbound.sort_unstable_by_key(|v| {
                 variable_order_key(
@@ -712,8 +879,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let values = self.values[variable].get_or_insert(Vec::new());
         values.clear();
         values.reserve_exact(estimate.saturating_sub(values.capacity()));
-        self.constraint
-            .propose(variable, RowsView::new(&self.stack, &self.row), values);
+        self.constraint.propose(
+            variable,
+            RowsView::new(&self.stack, &self.row),
+            &mut CandidateSink::Values(values),
+        );
         self.stack.push(variable);
         self.row.push([0; 32]);
         self.bound.set(variable);
@@ -850,15 +1020,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 VariableSet::new_empty()
             }
         });
-        let mut est_scratch = Vec::new();
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
-                est_scratch.clear();
+                let mut estimate = 0usize;
                 assert!(
-                    constraint.estimate(v, RowsView::EMPTY, &mut est_scratch),
+                    constraint
+                        .estimate(v, RowsView::EMPTY, &mut EstimateSink::Scalar(&mut estimate)),
                     "unconstrained variable in query"
                 );
-                est_scratch[0]
+                estimate
             } else {
                 usize::MAX
             }
@@ -885,7 +1055,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             unbound,
             values: ArrayVec::from([const { None }; 128]),
             binding: Binding::default(),
-            est_scratch,
             dag: None,
         }
     }
@@ -1214,15 +1383,14 @@ fn choose_variable<'a, C: Constraint<'a>>(
     influences: &[VariableSet; 128],
     base_estimates: &[usize; 128],
 ) -> usize {
-    let mut est: Vec<usize> = Vec::with_capacity(1);
     let mut best: Option<(usize, (u64, u64, u64))> = None;
     for (ui, &v) in unbound.iter().enumerate() {
-        est.clear();
+        let mut est = 0usize;
         assert!(
-            constraint.estimate(v, first, &mut est),
+            constraint.estimate(v, first, &mut EstimateSink::Scalar(&mut est)),
             "unconstrained variable in query"
         );
-        let key = variable_order_key(est[0], base_estimates[v], influences[v].count());
+        let key = variable_order_key(est, base_estimates[v], influences[v].count());
         if best.is_none_or(|(_, bk)| key > bk) {
             best = Some((ui, key));
         }
@@ -1277,7 +1445,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 
     // Expand the frontier: (parent row, candidate) pairs.
     let mut pairs: Candidates = Vec::new();
-    constraint.propose(variable, view, &mut pairs);
+    constraint.propose(variable, view, &mut CandidateSink::Tagged(&mut pairs));
     if blocked_stats::enabled() {
         blocked_stats::record_level(blocked_stats::LevelRecord {
             depth: stride,
@@ -1393,7 +1561,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
     for &v in unbound.iter() {
         let mut col = Vec::with_capacity(n_rows);
-        let relevant = constraint.estimate(v, view, &mut col);
+        let relevant = constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
         assert!(relevant, "unconstrained variable in query");
         debug_assert_eq!(col.len(), n_rows);
         est_cols.push(col);
@@ -1465,7 +1633,11 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             order_trace::record(stride, variable, g_count as u64);
         }
         let mut pairs: Candidates = Vec::new();
-        constraint.propose(variable, RowsView::new(vars, g_rows), &mut pairs);
+        constraint.propose(
+            variable,
+            RowsView::new(vars, g_rows),
+            &mut CandidateSink::Tagged(&mut pairs),
+        );
         if stats {
             group_sizes_rec.push(g_count);
             batch_sizes_rec.push(pairs.len());
@@ -1869,7 +2041,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
                 for &v in unbound.iter() {
                     let mut col = Vec::with_capacity(c_rows);
-                    let relevant = constraint.estimate(v, view, &mut col);
+                    let relevant =
+                        constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
                     assert!(relevant, "unconstrained variable in query");
                     debug_assert_eq!(col.len(), c_rows);
                     est_cols.push(col);
@@ -1934,7 +2107,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                         order_trace::record(stride, variable, g_count as u64);
                     }
                     let mut pairs: Candidates = Vec::new();
-                    constraint.propose(variable, RowsView::new(&bucket.vars, g_rows), &mut pairs);
+                    constraint.propose(
+                        variable,
+                        RowsView::new(&bucket.vars, g_rows),
+                        &mut CandidateSink::Tagged(&mut pairs),
+                    );
                     if stats {
                         group_sizes_rec.push(g_count);
                         batch_sizes_rec.push(pairs.len());
@@ -2291,7 +2468,7 @@ impl<R> DagState<R> {
         let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
         for &v in unbound.iter() {
             let mut col = Vec::with_capacity(c_rows);
-            let relevant = constraint.estimate(v, view, &mut col);
+            let relevant = constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
             assert!(relevant, "unconstrained variable in query");
             debug_assert_eq!(col.len(), c_rows);
             est_cols.push(col);
@@ -2356,7 +2533,11 @@ impl<R> DagState<R> {
                 order_trace::record(stride, variable, g_count as u64);
             }
             let mut pairs: Candidates = Vec::new();
-            constraint.propose(variable, RowsView::new(&parent_vars, g_rows), &mut pairs);
+            constraint.propose(
+                variable,
+                RowsView::new(&parent_vars, g_rows),
+                &mut CandidateSink::Tagged(&mut pairs),
+            );
             self.file(parent_set, &parent_vars, variable, g_rows, pairs);
         }
         if stats {
@@ -2478,7 +2659,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::NextValue => {
                     if let Some(&variable) = self.stack.last() {
-                        if let Some((_, assignment)) = self.values[variable]
+                        if let Some(assignment) = self.values[variable]
                             .as_mut()
                             .expect("values should be initialized")
                             .pop()
@@ -2685,7 +2866,7 @@ mod parallel {
                         // Descend: pop the single value, bind it,
                         // transition to NextVariable so the outer loop
                         // runs propose.
-                        let (_, assignment) = q.values[top].as_mut().unwrap().pop().unwrap();
+                        let assignment = q.values[top].as_mut().unwrap().pop().unwrap();
                         *q.row.last_mut().expect("cursor row parallel to stack") = assignment;
                         q.touched_variables.set(top);
                         q.mode = Search::NextVariable;
@@ -2698,7 +2879,7 @@ mod parallel {
                         // stealing pressure.
                         let vals = q.values[top].as_mut().unwrap();
                         let mid = vals.len() / 2;
-                        let right_vals: Candidates = vals.drain(mid..).collect();
+                        let right_vals: Vec<RawInline> = vals.drain(mid..).collect();
                         let mut right = q.clone();
                         right.values[top] = Some(right_vals);
 

@@ -3,8 +3,9 @@ use crate::id::id_into_value;
 use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
-use crate::query::Candidates;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
@@ -48,7 +49,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         VariableSet::new_singleton(self.variable_e)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_e {
             return false;
         }
@@ -56,14 +57,11 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
             .set
             .eav
             .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
-        out.extend(std::iter::repeat_n(
-            count.min(usize::MAX as u64) as usize,
-            view.len(),
-        ));
+        out.fill(count.min(usize::MAX as u64) as usize, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_e {
             return;
         }
@@ -71,14 +69,14 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
             self.set
                 .eav
                 .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
-                    candidates.push((i, id_into_value(e)));
+                    candidates.push(i, id_into_value(e));
                 });
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_e {
-            candidates.retain(|(_, v)| {
+            candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };
@@ -136,7 +134,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         VariableSet::new_singleton(self.variable_a)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_a {
             return false;
         }
@@ -144,14 +142,11 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
             .set
             .aev
             .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
-        out.extend(std::iter::repeat_n(
-            count.min(usize::MAX as u64) as usize,
-            view.len(),
-        ));
+        out.fill(count.min(usize::MAX as u64) as usize, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_a {
             return;
         }
@@ -159,14 +154,14 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
             self.set
                 .aev
                 .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
-                    candidates.push((i, id_into_value(a)));
+                    candidates.push(i, id_into_value(a));
                 });
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_a {
-            candidates.retain(|(_, v)| {
+            candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };

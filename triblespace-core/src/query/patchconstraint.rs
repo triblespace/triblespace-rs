@@ -6,8 +6,9 @@ use crate::patch::PATCH;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
 
-use super::Candidates;
+use super::CandidateSink;
 use super::Constraint;
+use super::EstimateSink;
 use super::RowsView;
 use super::ContainsConstraint;
 use super::Variable;
@@ -34,26 +35,26 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.patch.len() as usize, view.len()));
+        out.fill(self.patch.len() as usize, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch
-                    .infixes(&[0; 0], &mut |&k: &[u8; 32]| candidates.push((i, k)));
+                    .infixes(&[0; 0], &mut |&k: &[u8; 32]| candidates.push(i, k));
             }
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
-            candidates.retain(|(_, v)| self.patch.has_prefix(v));
+            candidates.retain(|_, v| self.patch.has_prefix(v));
         }
     }
 }
@@ -97,26 +98,26 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
-        out.extend(std::iter::repeat_n(self.patch.len() as usize, view.len()));
+        out.fill(self.patch.len() as usize, view.len());
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
-                    candidates.push((i, id_into_value(id)))
+                    candidates.push(i, id_into_value(id))
                 });
             }
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
-        candidates.retain(|(_, v)| {
+    fn confirm(&self, _variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        candidates.retain(|_, v| {
             if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)
             } else {

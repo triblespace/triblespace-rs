@@ -49,28 +49,30 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     /// cardinality and defers to other constraints in the intersection.
     /// This is safe as long as each variable also appears in at least
     /// one other constraint (which the macro desugaring guarantees).
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.peer_col(variable, view).is_none() {
             return false;
         }
-        out.extend(std::iter::repeat_n(1, view.len()));
+        out.fill(1, view.len());
         true
     }
 
     /// Proposes each row's peer value.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let Some(col) = self.peer_col(variable, view) else {
             return;
         };
-        candidates.extend(view.iter().enumerate().map(|(i, row)| (i as u32, row[col])));
+        for (i, row) in view.iter().enumerate() {
+            candidates.push(i as u32, row[col]);
+        }
     }
 
     /// Retains only candidates matching their row's peer value.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let Some(col) = self.peer_col(variable, view) else {
             return;
         };
-        candidates.retain(|&(row, v)| v == view.row(row as usize)[col]);
+        candidates.retain(|row, v| *v == view.row(row as usize)[col]);
     }
 
     /// Returns `false` when any row binds the pair to different values.

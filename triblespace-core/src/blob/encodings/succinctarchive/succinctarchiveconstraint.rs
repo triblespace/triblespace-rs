@@ -187,8 +187,10 @@ where
 
     /// Enumerates one row's candidates: `enumerate_domain` /
     /// `enumerate_in` select-strides for the zero/one-bound arms,
-    /// `restrict_range` wavelet sweeps for the two-bound arms.
-    fn propose_row(&self, p: &Positions, i: u32, row: &[RawInline], candidates: &mut Candidates) {
+    /// `restrict_range` wavelet sweeps for the two-bound arms. Feeds a
+    /// monomorphized `push`; the sink dispatch happens once per protocol
+    /// call in [`Constraint::propose`].
+    fn propose_row<F: FnMut(RawInline)>(&self, p: &Positions, row: &[RawInline], push: &mut F) {
         let Positions {
             e_var,
             a_var,
@@ -200,25 +202,18 @@ where
         let v_bound = p.pv.map(|i| &row[i]);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => candidates.extend(
-                self.archive
-                    .enumerate_domain(&self.archive.e_a)
-                    .map(|v| (i, v)),
-            ),
-            (None, None, None, false, true, false) => candidates.extend(
-                self.archive
-                    .enumerate_domain(&self.archive.a_a)
-                    .map(|v| (i, v)),
-            ),
-            (None, None, None, false, false, true) => candidates.extend(
-                self.archive
-                    .enumerate_domain(&self.archive.v_a)
-                    .map(|v| (i, v)),
-            ),
+            (None, None, None, true, false, false) => self.archive
+                .enumerate_domain(&self.archive.e_a)
+                .for_each(&mut *push),
+            (None, None, None, false, true, false) => self.archive
+                .enumerate_domain(&self.archive.a_a)
+                .for_each(&mut *push),
+            (None, None, None, false, false, true) => self.archive
+                .enumerate_domain(&self.archive.v_a)
+                .for_each(&mut *push),
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_e_a,
                             &r,
@@ -226,13 +221,11 @@ where
                             &self.archive.v_a,
                         )
                         .map(|x| self.archive.vea_c.access(x).unwrap())
-                        .map(|a| (i, self.archive.domain.access(a))),
-                )
+                        .for_each(|a| push(self.archive.domain.access(a)))
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_e_v,
                             &r,
@@ -240,13 +233,11 @@ where
                             &self.archive.a_a,
                         )
                         .map(|x| self.archive.aev_c.access(x).unwrap())
-                        .map(|v| (i, self.archive.domain.access(v))),
-                )
+                        .for_each(|v| push(self.archive.domain.access(v)))
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_a_e,
                             &r,
@@ -254,13 +245,11 @@ where
                             &self.archive.v_a,
                         )
                         .map(|x| self.archive.vae_c.access(x).unwrap())
-                        .map(|e| (i, self.archive.domain.access(e))),
-                )
+                        .for_each(|e| push(self.archive.domain.access(e)))
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_a_v,
                             &r,
@@ -268,13 +257,11 @@ where
                             &self.archive.e_a,
                         )
                         .map(|x| self.archive.eav_c.access(x).unwrap())
-                        .map(|v| (i, self.archive.domain.access(v))),
-                )
+                        .for_each(|v| push(self.archive.domain.access(v)))
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_v_e,
                             &r,
@@ -282,13 +269,11 @@ where
                             &self.archive.a_a,
                         )
                         .map(|x| self.archive.ave_c.access(x).unwrap())
-                        .map(|e| (i, self.archive.domain.access(e))),
-                )
+                        .for_each(|e| push(self.archive.domain.access(e)))
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                candidates.extend(
-                    self.archive
+                self.archive
                         .enumerate_in(
                             &self.archive.changed_v_a,
                             &r,
@@ -296,13 +281,11 @@ where
                             &self.archive.e_a,
                         )
                         .map(|x| self.archive.eva_c.access(x).unwrap())
-                        .map(|a| (i, self.archive.domain.access(a))),
-                )
+                        .for_each(|a| push(self.archive.domain.access(a)))
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                candidates.extend(
-                    restrict_range(
+                restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
                         &self.archive.aev_c,
@@ -311,13 +294,11 @@ where
                     )
                     .map(|e| self.archive.vae_c.access(e).unwrap())
                     .unique()
-                    .map(|e| (i, self.archive.domain.access(e))),
-                )
+                    .for_each(|e| push(self.archive.domain.access(e)))
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                candidates.extend(
-                    restrict_range(
+                restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
                         &self.archive.eav_c,
@@ -326,13 +307,11 @@ where
                     )
                     .map(|a| self.archive.vea_c.access(a).unwrap())
                     .unique()
-                    .map(|a| (i, self.archive.domain.access(a))),
-                )
+                    .for_each(|a| push(self.archive.domain.access(a)))
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                candidates.extend(
-                    restrict_range(
+                restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
                         &self.archive.eva_c,
@@ -341,8 +320,7 @@ where
                     )
                     .map(|v| self.archive.aev_c.access(v).unwrap())
                     .unique()
-                    .map(|v| (i, self.archive.domain.access(v))),
-                )
+                    .for_each(|v| push(self.archive.domain.access(v)))
             }
             _ => unreachable!(),
         }
@@ -365,7 +343,7 @@ where
     /// loop. Batching the resulting rank stream (CPU-fused or on the GPU
     /// ring) is possible exactly like confirm's and remains deferred —
     /// it only changes constants, not calls.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return false;
@@ -392,7 +370,7 @@ where
     /// falls through to the per-row path. (Confirm is different: its
     /// batch is cache-friendlier even on CPU, so `confirm` always
     /// batches.)
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -407,8 +385,17 @@ where
         #[cfg(feature = "gpu")]
         let len_before = candidates.len();
         if !gpu_present {
-            for (i, row) in view.iter().enumerate() {
-                self.propose_row(&p, i as u32, row, candidates);
+            match candidates {
+                CandidateSink::Tagged(pairs) => {
+                    for (i, row) in view.iter().enumerate() {
+                        self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                    }
+                }
+                CandidateSink::Values(values) => {
+                    for row in view.iter() {
+                        self.propose_row(&p, row, &mut |v| values.push(v));
+                    }
+                }
             }
             #[cfg(feature = "gpu")]
             super::gpu::stats::record_propose(candidates.len() - len_before);
@@ -442,8 +429,17 @@ where
                 ),
                 _ => {
                     // Non-sweep arm (enumerate_in select-strides): per row.
-                    for (i, row) in view.iter().enumerate() {
-                        self.propose_row(&p, i as u32, row, candidates);
+                    match candidates {
+                        CandidateSink::Tagged(pairs) => {
+                            for (i, row) in view.iter().enumerate() {
+                                self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                            }
+                        }
+                        CandidateSink::Values(values) => {
+                            for row in view.iter() {
+                                self.propose_row(&p, row, &mut |v| values.push(v));
+                            }
+                        }
                     }
                     #[cfg(feature = "gpu")]
                     super::gpu::stats::record_propose(candidates.len() - len_before);
@@ -491,12 +487,13 @@ where
                 let mut offset = 0usize;
                 for (i, r) in row_ranges.iter().enumerate() {
                     let n = r.len();
-                    candidates.extend(
+                    candidates.extend_row(
+                        i as u32,
                         codes[offset..offset + n]
                             .iter()
                             .copied()
                             .unique()
-                            .map(|c| (i as u32, archive.domain.access(c))),
+                            .map(|c| archive.domain.access(c)),
                     );
                     offset += n;
                 }
@@ -504,11 +501,12 @@ where
             None => {
                 let wm = archive.ring_col(col);
                 for (i, r) in row_ranges.iter().enumerate() {
-                    candidates.extend(
+                    candidates.extend_row(
+                        i as u32,
                         r.clone()
                             .map(|pos| wm.access(pos).unwrap())
                             .unique()
-                            .map(|c| (i as u32, archive.domain.access(c))),
+                            .map(|c| archive.domain.access(c)),
                     );
                 }
             }
@@ -535,7 +533,7 @@ where
     /// The probe stream is evaluated CPU-batched by default, or as one
     /// `rank_batch` GPU dispatch when the archive's GPU ring is enabled
     /// and the stream is above the sync break-even threshold.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -562,7 +560,7 @@ where
                     } else {
                         &archive.v_a
                     };
-                    candidates.retain(|(_, val)| {
+                    candidates.retain(|_, val| {
                         base_range(&archive.domain, prefix, val).is_empty().not()
                     });
                     return;
@@ -634,16 +632,16 @@ where
         let mut has_probes: Vec<bool> = Vec::with_capacity(candidates.len());
         let mut current_row: Option<u32> = None;
         let mut r: Range<usize> = 0..0;
-        for &(row_idx, val) in candidates.iter() {
+        candidates.for_each(|row_idx, val| {
             if current_row != Some(row_idx) {
                 current_row = Some(row_idx);
                 r = range_fn(view.row(row_idx as usize));
             }
             if r.is_empty() {
                 has_probes.push(false);
-                continue;
+                return;
             }
-            match archive.domain.search(&val) {
+            match archive.domain.search(val) {
                 None => has_probes.push(false),
                 Some(d) => {
                     probe_pos.push(r.start);
@@ -653,7 +651,7 @@ where
                     has_probes.push(true);
                 }
             }
-        }
+        });
 
         // Evaluate the stream: one GPU dispatch above the break-even
         // threshold, otherwise a tight CPU loop over one matrix.
@@ -688,7 +686,7 @@ where
 
         let mut i = 0usize;
         let mut k = 0usize;
-        candidates.retain(|_| {
+        candidates.retain(|_, _| {
             let keep = if has_probes[i] {
                 let lo = ranks[k];
                 let hi = ranks[k + 1];
