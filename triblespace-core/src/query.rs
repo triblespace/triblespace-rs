@@ -279,6 +279,10 @@ pub struct RowsView<'v> {
     /// [`col`](Self::col) scan over whole blocks, while the block-of-1
     /// caller pays it per verb call without the index.
     cols: Option<&'v [u8; 128]>,
+    /// Row count, computed once at construction. Kept as a field so
+    /// [`len`](Self::len) — called on every verb of every constraint —
+    /// is a load instead of an integer division (`rows.len() / stride`).
+    n_rows: usize,
 }
 
 /// Sentinel in a [`RowsView`] column index: variable not bound.
@@ -290,12 +294,22 @@ impl<'v> RowsView<'v> {
         vars: &[],
         rows: &[],
         cols: None,
+        n_rows: 1,
     };
 
     /// Creates a view over `rows` laid out in `vars` column order.
     pub fn new(vars: &'v [VariableId], rows: &'v [RawInline]) -> Self {
         debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
-        RowsView { vars, rows, cols: None }
+        let n_rows = match vars.len() {
+            0 => 1,
+            stride => rows.len() / stride,
+        };
+        RowsView {
+            vars,
+            rows,
+            cols: None,
+            n_rows,
+        }
     }
 
     /// Creates a view with a caller-maintained variable→column index
@@ -311,10 +325,15 @@ impl<'v> RowsView<'v> {
             .iter()
             .enumerate()
             .all(|(i, &v)| cols[v] as usize == i));
+        let n_rows = match vars.len() {
+            0 => 1,
+            stride => rows.len() / stride,
+        };
         RowsView {
             vars,
             rows,
             cols: Some(cols),
+            n_rows,
         }
     }
 
@@ -327,10 +346,7 @@ impl<'v> RowsView<'v> {
     /// Number of rows. A zero-column view has exactly one (virtual) row.
     #[inline]
     pub fn len(&self) -> usize {
-        match self.vars.len() {
-            0 => 1,
-            stride => self.rows.len() / stride,
-        }
+        self.n_rows
     }
 
     /// `true` when the view holds no rows (only possible with columns).
@@ -353,6 +369,7 @@ impl<'v> RowsView<'v> {
             vars: self.vars,
             rows: self.row(i),
             cols: self.cols,
+            n_rows: 1,
         }
     }
 
@@ -375,7 +392,7 @@ impl<'v> RowsView<'v> {
     pub fn iter(&self) -> impl Iterator<Item = &'v [RawInline]> + use<'v> {
         let stride = self.vars.len();
         let rows = self.rows;
-        let len = self.len();
+        let len = self.n_rows;
         (0..len).map(move |i| &rows[i * stride..(i + 1) * stride])
     }
 }
