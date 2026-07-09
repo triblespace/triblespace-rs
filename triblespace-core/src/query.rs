@@ -625,6 +625,11 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     binding: Binding,
     /// Reusable one-entry estimate column.
     est_scratch: Vec<usize>,
+    /// PROBE (dag-as-main): lazily initialized DAG engine state when
+    /// `TRIBLES_ENGINE=dag` — the [`Iterator`] impl delegates every
+    /// `next()` here once it exists. `None` on the sequential path.
+    /// Boxed so the (per-split memcpy'd) query state doesn't grow.
+    dag: Option<Box<DagState<R>>>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -651,6 +656,12 @@ where
             values: self.values.clone(),
             binding: self.binding.clone(),
             est_scratch: Vec::new(),
+            // DAG state is not cloneable (the emit buffer holds `R`s, which
+            // aren't `Clone` here). Rayon's producer `split` only clones
+            // queries that have never been driven through `next()` (folding
+            // starts after splitting), so this is always `None` there; a
+            // manual mid-iteration clone in dag mode restarts from scratch.
+            dag: None,
         }
     }
 }
@@ -875,6 +886,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             values: ArrayVec::from([const { None }; 128]),
             binding: Binding::default(),
             est_scratch,
+            dag: None,
         }
     }
 }
@@ -1587,6 +1599,12 @@ pub mod dag_stats {
         MERGE_EVENTS.load(Ordering::Relaxed)
     }
 
+    /// Number of bucket pops — nonzero iff the DAG engine ran (the
+    /// `TRIBLES_ENGINE=dag` seam test's observable).
+    pub fn pops() -> u64 {
+        POPS.load(Ordering::Relaxed)
+    }
+
     /// Terse counter summary.
     pub fn report() -> String {
         let widths = WIDTHS.lock().unwrap();
@@ -1989,27 +2007,26 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             ..
         } = self;
         let full = constraint.variables();
-        let cap = block_row_cap();
         DagIter {
             constraint,
             postprocessing,
             influences,
             base_estimates,
-            full,
-            buckets: vec![DagBucket {
-                set: VariableSet::new_empty(),
-                vars: Vec::new(),
-                rows: Vec::new(),
-                writer: 0,
-            }],
-            pop_id: 0,
-            binding: Binding::default(),
-            emit: std::collections::VecDeque::new(),
-            width: lazy_start_width().clamp(1, cap),
-            growth: lazy_growth(),
-            cap,
+            state: DagState::new(full),
         }
     }
+}
+
+/// PROBE (dag-as-main): selects the production evaluation strategy for
+/// [`Query`]'s [`Iterator`] impl — `TRIBLES_ENGINE=dag` routes fresh
+/// queries through an internal [`DagState`] (the lazy DAG engine);
+/// anything else (or unset) keeps the sequential DFS engine. Read once
+/// per process.
+pub fn engine_dag() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("TRIBLES_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("dag"))
+    })
 }
 
 /// PROBE (lazy-dag): initial chunk width for [`Query::solve_dag_lazy`] —
@@ -2046,6 +2063,48 @@ pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
     postprocessing: P,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
+    state: DagState<R>,
+}
+
+impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
+    /// Overrides the initial chunk width (clamped to `1..=cap`).
+    pub fn start_width(mut self, width: usize) -> Self {
+        self.state.width = width.clamp(1, self.state.cap);
+        self
+    }
+
+    /// Overrides the per-resumption width growth factor (min 1 = fixed).
+    pub fn growth(mut self, growth: usize) -> Self {
+        self.state.growth = growth.max(1);
+        self
+    }
+
+    /// Overrides the width saturation cap (default [`block_row_cap`]).
+    /// Tests use a tiny cap to force the *harvest* regime (gated
+    /// scheduling at saturated width), which real workloads only reach
+    /// after ~20 doublings; the env cap is process-global and cached.
+    pub fn cap(mut self, cap: usize) -> Self {
+        self.state.cap = cap.max(1);
+        self.state.width = self.state.width.min(self.state.cap);
+        self
+    }
+
+    /// The chunk width the *next* engine resumption will use — the
+    /// slow-start observable (tests sample this per pull; benches use the
+    /// process-global [`dag_stats::widths`] trajectory instead).
+    pub fn current_width(&self) -> usize {
+        self.state.width
+    }
+}
+
+/// PROBE (dag-as-main): the constraint-agnostic core of the lazy DAG
+/// engine — exactly the resumable state (`{worklist buckets, emit
+/// buffer, binding scratch, slow-start width}`), with the constraint,
+/// postprocessing, and the frozen `influences`/`base_estimates` tables
+/// passed in per call. Split out of [`DagIter`] so [`Query`]'s
+/// [`Iterator`] impl can host the same engine behind the
+/// `TRIBLES_ENGINE=dag` seam without double-owning the constraint.
+pub(crate) struct DagState<R> {
     full: VariableSet,
     buckets: Vec<DagBucket>,
     pop_id: u64,
@@ -2056,38 +2115,28 @@ pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
     cap: usize,
 }
 
-impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
-    /// Overrides the initial chunk width (clamped to `1..=cap`).
-    pub fn start_width(mut self, width: usize) -> Self {
-        self.width = width.clamp(1, self.cap);
-        self
-    }
-
-    /// Overrides the per-resumption width growth factor (min 1 = fixed).
-    pub fn growth(mut self, growth: usize) -> Self {
-        self.growth = growth.max(1);
-        self
-    }
-
-    /// Overrides the width saturation cap (default [`block_row_cap`]).
-    /// Tests use a tiny cap to force the *harvest* regime (gated
-    /// scheduling at saturated width), which real workloads only reach
-    /// after ~20 doublings; the env cap is process-global and cached.
-    pub fn cap(mut self, cap: usize) -> Self {
-        self.cap = cap.max(1);
-        self.width = self.width.min(self.cap);
-        self
-    }
-
-    /// The chunk width the *next* engine resumption will use — the
-    /// slow-start observable (tests sample this per pull; benches use the
-    /// process-global [`dag_stats::widths`] trajectory instead).
-    pub fn current_width(&self) -> usize {
-        self.width
+impl<R> DagState<R> {
+    fn new(full: VariableSet) -> Self {
+        let cap = block_row_cap();
+        DagState {
+            full,
+            buckets: vec![DagBucket {
+                set: VariableSet::new_empty(),
+                vars: Vec::new(),
+                rows: Vec::new(),
+                writer: 0,
+            }],
+            pop_id: 0,
+            binding: Binding::default(),
+            emit: std::collections::VecDeque::new(),
+            width: lazy_start_width().clamp(1, cap),
+            growth: lazy_growth(),
+            cap,
+        }
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
+impl<R> DagState<R> {
     /// Files one group's `(row, value)` pairs into the bucket keyed by
     /// `parent_set ∪ {variable}`, creating or (in merge mode — always, for
     /// the lazy probe) appending. Identical to the eager solver's `file`
@@ -2161,7 +2210,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
     /// deepest-ready), take at most `width` rows off its tail (full-bound
     /// and seed buckets are consumed whole), and either emit (full-bound)
     /// or estimate → prefer → partition → propose → file.
-    fn pop_once(&mut self, width: usize) {
+    fn pop_once<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
+        &mut self,
+        constraint: &C,
+        postprocessing: &P,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+        width: usize,
+    ) {
         let stats = blocked_stats::enabled();
         let dstats = dag_stats::enabled();
         // Harvest gating: only once the width has saturated does holding
@@ -2198,7 +2254,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
                 for (k, &v) in bucket.vars.iter().enumerate() {
                     self.binding.set(v, &row[k]);
                 }
-                if let Some(r) = (self.postprocessing)(&self.binding) {
+                if let Some(r) = postprocessing(&self.binding) {
                     self.emit.push_back(r);
                 }
             }
@@ -2235,7 +2291,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
         let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
         for &v in unbound.iter() {
             let mut col = Vec::with_capacity(c_rows);
-            let relevant = self.constraint.estimate(v, view, &mut col);
+            let relevant = constraint.estimate(v, view, &mut col);
             assert!(relevant, "unconstrained variable in query");
             debug_assert_eq!(col.len(), c_rows);
             est_cols.push(col);
@@ -2249,8 +2305,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
                 .max_by_key(|&j| {
                     variable_order_key(
                         est_cols[j][i],
-                        self.base_estimates[unbound[j]],
-                        self.influences[unbound[j]].count(),
+                        base_estimates[unbound[j]],
+                        influences[unbound[j]].count(),
                     )
                 })
                 .expect("non-empty unbound");
@@ -2300,8 +2356,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
                 order_trace::record(stride, variable, g_count as u64);
             }
             let mut pairs: Candidates = Vec::new();
-            self.constraint
-                .propose(variable, RowsView::new(&parent_vars, g_rows), &mut pairs);
+            constraint.propose(variable, RowsView::new(&parent_vars, g_rows), &mut pairs);
             self.file(parent_set, &parent_vars, variable, g_rows, pairs);
         }
         if stats {
@@ -2313,10 +2368,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIter<C, P, R> {
-    type Item = R;
-
-    fn next(&mut self) -> Option<R> {
+impl<R> DagState<R> {
+    /// One consumer pull: drain the emit buffer, else resume the engine —
+    /// run pops at the current width until something reaches the emit
+    /// buffer (or the worklist drains), then grow the width (TCP slow
+    /// start on consumer demand).
+    fn pull<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
+        &mut self,
+        constraint: &C,
+        postprocessing: &P,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<R> {
         loop {
             if let Some(r) = self.emit.pop_front() {
                 return Some(r);
@@ -2324,18 +2387,28 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIte
             if self.buckets.is_empty() {
                 return None;
             }
-            // Engine resumption: run pops at the current width until
-            // something reaches the emit buffer (or the worklist drains),
-            // then grow the width — TCP slow start on consumer demand.
             let width = self.width;
             if dag_stats::enabled() {
                 dag_stats::record_width(width);
             }
             while self.emit.is_empty() && !self.buckets.is_empty() {
-                self.pop_once(width);
+                self.pop_once(constraint, postprocessing, influences, base_estimates, width);
             }
             self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
         }
+    }
+}
+
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIter<C, P, R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<R> {
+        self.state.pull(
+            &self.constraint,
+            &self.postprocessing,
+            &self.influences,
+            &self.base_estimates,
+        )
     }
 }
 
@@ -2360,6 +2433,35 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // PROBE (dag-as-main): `TRIBLES_ENGINE=dag` routes *fresh* queries
+        // through the lazy DAG engine. The freshness guard (never-touched
+        // DFS state) keeps rayon's post-`split` leaves — which carry a
+        // partial cursor the DAG engine would ignore — on the
+        // sequential path; an unsplit par-iter leaf is a whole query, for
+        // which the DAG multiset is identical.
+        if let Some(state) = &mut self.dag {
+            return state.pull(
+                &self.constraint,
+                &self.postprocessing,
+                &self.influences,
+                &self.base_estimates,
+            );
+        }
+        if engine_dag()
+            && matches!(self.mode, Search::NextVariable)
+            && self.stack.is_empty()
+            && self.bound.is_empty()
+        {
+            let state = self
+                .dag
+                .insert(Box::new(DagState::new(self.constraint.variables())));
+            return state.pull(
+                &self.constraint,
+                &self.postprocessing,
+                &self.influences,
+                &self.base_estimates,
+            );
+        }
         loop {
             match &self.mode {
                 Search::NextVariable => {
