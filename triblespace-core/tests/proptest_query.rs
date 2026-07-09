@@ -5,7 +5,8 @@ use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
+    Binding, Candidates, Constraint, ContainsConstraint, RowsView, TriblePattern, Variable,
+    VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -45,6 +46,17 @@ fn arb_tribleset(max: usize) -> impl Strategy<Value = TribleSet> {
     })
 }
 
+/// Single-row estimate helper: the old `estimate(v, &binding) -> Option<usize>`
+/// shape, reconstructed over a view.
+fn est<'a>(c: &impl Constraint<'a>, v: usize, view: RowsView<'_>) -> Option<usize> {
+    let mut out = Vec::new();
+    if c.estimate(v, view, &mut out) {
+        Some(out[0])
+    } else {
+        None
+    }
+}
+
 proptest! {
     // ── TribleSetConstraint: estimate accuracy ─────────────────────────
 
@@ -56,12 +68,11 @@ proptest! {
         let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
-        let binding = Binding::default();
-        let estimate = constraint.estimate(e.index, &binding).unwrap();
+        let estimate = est(&constraint, e.index, RowsView::EMPTY).unwrap();
 
         // Estimate should be >= actual distinct entity count
-        let mut proposals = Vec::new();
-        constraint.propose(e.index, &binding, &mut proposals);
+        let mut proposals: Candidates = Vec::new();
+        constraint.propose(e.index, RowsView::EMPTY, &mut proposals);
         prop_assert!(estimate >= proposals.len(),
             "estimate {} < actual proposals {}", estimate, proposals.len());
     }
@@ -74,12 +85,11 @@ proptest! {
         let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
-        let binding = Binding::default();
-        let mut proposals = Vec::new();
-        constraint.propose(e.index, &binding, &mut proposals);
+        let mut proposals: Candidates = Vec::new();
+        constraint.propose(e.index, RowsView::EMPTY, &mut proposals);
 
         // Every proposed entity must appear in at least one trible
-        for entity_raw in &proposals {
+        for (_, entity_raw) in &proposals {
             let found = set.iter().any(|t| &t.data[0..16] == &entity_raw[16..32]);
             prop_assert!(found,
                 "proposed entity not found in any trible");
@@ -120,16 +130,15 @@ proptest! {
             let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
-            let mut binding = Binding::default();
             let mut e_val = [0u8; 32];
             e_val[16..32].copy_from_slice(&t.data[0..16]);
-            binding.set(e.index, &e_val);
             let mut a_val = [0u8; 32];
             a_val[16..32].copy_from_slice(&t.data[16..32]);
-            binding.set(a.index, &a_val);
-            binding.set(v.index, &t.data[32..64].try_into().unwrap());
+            let v_val: [u8; 32] = t.data[32..64].try_into().unwrap();
+            let vars = [e.index, a.index, v.index];
+            let row = [e_val, a_val, v_val];
 
-            prop_assert!(constraint.satisfied(&binding),
+            prop_assert!(constraint.satisfied(RowsView::new(&vars, &row)),
                 "existing triple should satisfy constraint");
         }
     }
@@ -147,16 +156,15 @@ proptest! {
             let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
-            let mut binding = Binding::default();
             let mut e_val = [0u8; 32];
             e_val[16..32].copy_from_slice(&fake.data[0..16]);
-            binding.set(e.index, &e_val);
             let mut a_val = [0u8; 32];
             a_val[16..32].copy_from_slice(&fake.data[16..32]);
-            binding.set(a.index, &a_val);
-            binding.set(v.index, &fake.data[32..64].try_into().unwrap());
+            let v_val: [u8; 32] = fake.data[32..64].try_into().unwrap();
+            let vars = [e.index, a.index, v.index];
+            let row = [e_val, a_val, v_val];
 
-            prop_assert!(!constraint.satisfied(&binding),
+            prop_assert!(!constraint.satisfied(RowsView::new(&vars, &row)),
                 "absent triple should not satisfy constraint");
         }
     }
@@ -288,14 +296,12 @@ proptest! {
             Variable::<UnknownInline>::new(0),
             Inline::<UnknownInline>::new(val),
         );
-        let binding = Binding::default();
+        prop_assert_eq!(est(&c, 0, RowsView::EMPTY), Some(1));
 
-        prop_assert_eq!(c.estimate(0, &binding), Some(1));
-
-        let mut proposals = Vec::new();
-        c.propose(0, &binding, &mut proposals);
+        let mut proposals: Candidates = Vec::new();
+        c.propose(0, RowsView::EMPTY, &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
-        prop_assert_eq!(proposals[0], val);
+        prop_assert_eq!(proposals[0], (0u32, val));
     }
 
     #[test]
@@ -309,10 +315,8 @@ proptest! {
             Variable::<UnknownInline>::new(0),
             Inline::<UnknownInline>::new(constant),
         );
-        let binding = Binding::default();
-
-        let mut proposals = vec![candidate];
-        c.confirm(0, &binding, &mut proposals);
+        let mut proposals: Candidates = vec![(0, candidate)];
+        c.confirm(0, RowsView::EMPTY, &mut proposals);
 
         if constant == candidate {
             prop_assert_eq!(proposals.len(), 1);
@@ -636,17 +640,18 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &val);
+        let vars = [0usize];
+        let row = [val];
+        let view = RowsView::new(&vars, &row);
 
         // With peer bound, estimate should be 1
-        prop_assert_eq!(eq.estimate(1, &binding), Some(1));
+        prop_assert_eq!(est(&eq, 1, view), Some(1));
 
         // Propose should yield the peer's value
-        let mut proposals = Vec::new();
-        eq.propose(1, &binding, &mut proposals);
+        let mut proposals: Candidates = Vec::new();
+        eq.propose(1, view, &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
-        prop_assert_eq!(proposals[0], val);
+        prop_assert_eq!(proposals[0], (0u32, val));
     }
 
     #[test]
@@ -657,17 +662,18 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &peer_val);
+        let vars = [0usize];
+        let row = [peer_val];
+        let view = RowsView::new(&vars, &row);
 
-        let mut proposals = vec![peer_val, other_val];
-        eq.confirm(1, &binding, &mut proposals);
+        let mut proposals: Candidates = vec![(0, peer_val), (0, other_val)];
+        eq.confirm(1, view, &mut proposals);
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.len(), 2); // both match
         } else {
             prop_assert_eq!(proposals.len(), 1);
-            prop_assert_eq!(proposals[0], peer_val);
+            prop_assert_eq!(proposals[0], (0u32, peer_val));
         }
     }
 
@@ -679,11 +685,10 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &a_val);
-        binding.set(1, &b_val);
+        let vars = [0usize, 1];
+        let row = [a_val, b_val];
 
-        prop_assert_eq!(eq.satisfied(&binding), a_val == b_val);
+        prop_assert_eq!(eq.satisfied(RowsView::new(&vars, &row)), a_val == b_val);
     }
 
     #[test]
@@ -693,13 +698,12 @@ proptest! {
         let eq = EqualityConstraint::new(0, 1);
 
         // Neither bound — optimistically true
-        let binding = Binding::default();
-        prop_assert!(eq.satisfied(&binding));
+        prop_assert!(eq.satisfied(RowsView::EMPTY));
 
         // One bound — optimistically true
-        let mut binding = Binding::default();
-        binding.set(0, &[42; 32]);
-        prop_assert!(eq.satisfied(&binding));
+        let vars = [0usize];
+        let row = [[42u8; 32]];
+        prop_assert!(eq.satisfied(RowsView::new(&vars, &row)));
     }
 
     #[test]
@@ -709,18 +713,17 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
+        let row = [val];
 
         // Bind a=val, propose for b → val
-        let mut binding_a = Binding::default();
-        binding_a.set(0, &val);
-        let mut props_b = Vec::new();
-        eq.propose(1, &binding_a, &mut props_b);
+        let vars_a = [0usize];
+        let mut props_b: Candidates = Vec::new();
+        eq.propose(1, RowsView::new(&vars_a, &row), &mut props_b);
 
         // Bind b=val, propose for a → val
-        let mut binding_b = Binding::default();
-        binding_b.set(1, &val);
-        let mut props_a = Vec::new();
-        eq.propose(0, &binding_b, &mut props_a);
+        let vars_b = [1usize];
+        let mut props_a: Candidates = Vec::new();
+        eq.propose(0, RowsView::new(&vars_b, &row), &mut props_a);
 
         prop_assert_eq!(props_a, props_b);
     }

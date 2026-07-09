@@ -98,33 +98,50 @@ where
     }
 }
 
-impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
+/// The hoisted per-call context of one [`SuccinctArchiveConstraint`]
+/// protocol call: which positions hold the queried variable (`*_var`) and
+/// which columns of the block bind the other positions (`p*`). The arm
+/// dispatch this drives is structural — uniform across a block — so it is
+/// computed once per call and the per-row work is pure column reads.
+struct Positions {
+    e_var: bool,
+    a_var: bool,
+    v_var: bool,
+    pe: Option<usize>,
+    pa: Option<usize>,
+    pv: Option<usize>,
+}
+
+impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    fn variables(&self) -> VariableSet {
-        let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
-        variables
+    fn positions(&self, variable: VariableId, view: RowsView<'_>) -> Positions {
+        Positions {
+            e_var: self.variable_e == variable,
+            a_var: self.variable_a == variable,
+            v_var: self.variable_v == variable,
+            pe: view.col(self.variable_e),
+            pa: view.col(self.variable_a),
+            pv: view.col(self.variable_v),
+        }
     }
 
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
-            return None;
-        }
+    /// Candidate count for one row: `distinct_in` bitvector ranks for the
+    /// one-bound arms, `restrict_len` wavelet ranks for the two-bound
+    /// arms.
+    fn estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = p.pe.map(|i| &row[i]);
+        let a_bound = p.pa.map(|i| &row[i]);
+        let v_bound = p.pv.map(|i| &row[i]);
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
-
-        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => self.archive.entity_count,
             (None, None, None, false, true, false) => self.archive.attribute_count,
             (None, None, None, false, false, true) => self.archive.value_count,
@@ -165,58 +182,42 @@ where
                 restrict_len(&self.archive.domain, &self.archive.eva_c, a, &r)
             }
             _ => unreachable!(),
-        })
+        }
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
-            return;
-        }
-
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
-
-        // PROBE: batchable two-bound arms go to the GPU when enabled and
-        // the swept range is large enough; everything else stays CPU.
-        #[cfg(feature = "gpu")]
-        let len_before = proposals.len();
-        #[cfg(feature = "gpu")]
-        if let Some(ring) = &self.archive.gpu {
-            if super::gpu::gpu_propose(
-                self.archive,
-                ring,
-                e_bound,
-                a_bound,
-                v_bound,
-                e_var,
-                a_var,
-                v_var,
-                proposals,
-            ) {
-                super::gpu::stats::record_propose(proposals.len() - len_before);
-                return;
-            }
-        }
+    /// Enumerates one row's candidates: `enumerate_domain` /
+    /// `enumerate_in` select-strides for the zero/one-bound arms,
+    /// `restrict_range` wavelet sweeps for the two-bound arms.
+    fn propose_row(&self, p: &Positions, i: u32, row: &[RawInline], candidates: &mut Candidates) {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = p.pe.map(|i| &row[i]);
+        let a_bound = p.pa.map(|i| &row[i]);
+        let v_bound = p.pv.map(|i| &row[i]);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => {
-                proposals.extend(self.archive.enumerate_domain(&self.archive.e_a))
-            }
-            (None, None, None, false, true, false) => {
-                proposals.extend(self.archive.enumerate_domain(&self.archive.a_a))
-            }
-            (None, None, None, false, false, true) => {
-                proposals.extend(self.archive.enumerate_domain(&self.archive.v_a))
-            }
+            (None, None, None, true, false, false) => candidates.extend(
+                self.archive
+                    .enumerate_domain(&self.archive.e_a)
+                    .map(|v| (i, v)),
+            ),
+            (None, None, None, false, true, false) => candidates.extend(
+                self.archive
+                    .enumerate_domain(&self.archive.a_a)
+                    .map(|v| (i, v)),
+            ),
+            (None, None, None, false, false, true) => candidates.extend(
+                self.archive
+                    .enumerate_domain(&self.archive.v_a)
+                    .map(|v| (i, v)),
+            ),
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_e_a,
@@ -224,13 +225,13 @@ where
                             &self.archive.eav_c,
                             &self.archive.v_a,
                         )
-                        .map(|i| self.archive.vea_c.access(i).unwrap())
-                        .map(|a| self.archive.domain.access(a)),
+                        .map(|x| self.archive.vea_c.access(x).unwrap())
+                        .map(|a| (i, self.archive.domain.access(a))),
                 )
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_e_v,
@@ -238,14 +239,13 @@ where
                             &self.archive.eva_c,
                             &self.archive.a_a,
                         )
-                        .map(|i| self.archive.aev_c.access(i).unwrap())
-                        .map(|v| self.archive.domain.access(v)),
+                        .map(|x| self.archive.aev_c.access(x).unwrap())
+                        .map(|v| (i, self.archive.domain.access(v))),
                 )
             }
-
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_a_e,
@@ -253,13 +253,13 @@ where
                             &self.archive.aev_c,
                             &self.archive.v_a,
                         )
-                        .map(|i| self.archive.vae_c.access(i).unwrap())
-                        .map(|e| self.archive.domain.access(e)),
+                        .map(|x| self.archive.vae_c.access(x).unwrap())
+                        .map(|e| (i, self.archive.domain.access(e))),
                 )
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_a_v,
@@ -267,14 +267,13 @@ where
                             &self.archive.ave_c,
                             &self.archive.e_a,
                         )
-                        .map(|i| self.archive.eav_c.access(i).unwrap())
-                        .map(|v| self.archive.domain.access(v)),
+                        .map(|x| self.archive.eav_c.access(x).unwrap())
+                        .map(|v| (i, self.archive.domain.access(v))),
                 )
             }
-
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_v_e,
@@ -282,13 +281,13 @@ where
                             &self.archive.vea_c,
                             &self.archive.a_a,
                         )
-                        .map(|i| self.archive.ave_c.access(i).unwrap())
-                        .map(|e| self.archive.domain.access(e)),
+                        .map(|x| self.archive.ave_c.access(x).unwrap())
+                        .map(|e| (i, self.archive.domain.access(e))),
                 )
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                proposals.extend(
+                candidates.extend(
                     self.archive
                         .enumerate_in(
                             &self.archive.changed_v_a,
@@ -296,13 +295,13 @@ where
                             &self.archive.vae_c,
                             &self.archive.e_a,
                         )
-                        .map(|i| self.archive.eva_c.access(i).unwrap())
-                        .map(|a| self.archive.domain.access(a)),
+                        .map(|x| self.archive.eva_c.access(x).unwrap())
+                        .map(|a| (i, self.archive.domain.access(a))),
                 )
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                proposals.extend(
+                candidates.extend(
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -312,12 +311,12 @@ where
                     )
                     .map(|e| self.archive.vae_c.access(e).unwrap())
                     .unique()
-                    .map(|e| self.archive.domain.access(e)),
+                    .map(|e| (i, self.archive.domain.access(e))),
                 )
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.extend(
+                candidates.extend(
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -327,12 +326,12 @@ where
                     )
                     .map(|a| self.archive.vea_c.access(a).unwrap())
                     .unique()
-                    .map(|a| self.archive.domain.access(a)),
+                    .map(|a| (i, self.archive.domain.access(a))),
                 )
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.extend(
+                candidates.extend(
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -342,155 +341,41 @@ where
                     )
                     .map(|v| self.archive.aev_c.access(v).unwrap())
                     .unique()
-                    .map(|v| self.archive.domain.access(v)),
+                    .map(|v| (i, self.archive.domain.access(v))),
                 )
             }
             _ => unreachable!(),
         }
+    }
+}
 
-        #[cfg(feature = "gpu")]
-        super::gpu::stats::record_propose(proposals.len() - len_before);
+impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    fn variables(&self) -> VariableSet {
+        let mut variables = VariableSet::new_empty();
+        variables.set(self.variable_e);
+        variables.set(self.variable_a);
+        variables.set(self.variable_v);
+        variables
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// Per-row rank probes with the arm dispatch hoisted out of the row
+    /// loop. Batching the resulting rank stream (CPU-fused or on the GPU
+    /// ring) is possible exactly like confirm's and remains deferred —
+    /// it only changes constants, not calls.
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
-            return;
+            return false;
         }
-
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
-
-        // PROBE: the confirm hot loop (per-candidate emptiness ranks on one
-        // wavelet matrix) is the most batchable probe stream the archive
-        // produces — route big candidate sets to the GPU when enabled.
-        #[cfg(feature = "gpu")]
-        {
-            super::gpu::stats::record_confirm(proposals.len());
-            if let Some(ring) = &self.archive.gpu {
-                if super::gpu::gpu_confirm(
-                    self.archive,
-                    ring,
-                    e_bound,
-                    a_bound,
-                    v_bound,
-                    e_var,
-                    a_var,
-                    v_var,
-                    proposals,
-                ) {
-                    return;
-                }
-            }
-        }
-
-        match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => {
-                proposals.retain(|e| {
-                    base_range(&self.archive.domain, &self.archive.e_a, e)
-                        .is_empty()
-                        .not()
-                });
-            }
-            (None, None, None, false, true, false) => {
-                proposals.retain(|a| {
-                    base_range(&self.archive.domain, &self.archive.a_a, a)
-                        .is_empty()
-                        .not()
-                });
-            }
-            (None, None, None, false, false, true) => {
-                proposals.retain(|v| {
-                    base_range(&self.archive.domain, &self.archive.v_a, v)
-                        .is_empty()
-                        .not()
-                });
-            }
-            (Some(e), None, None, false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.retain(|a| {
-                    restrict_len(&self.archive.domain, &self.archive.eva_c, a, &r) != 0
-                });
-            }
-            (Some(e), None, None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                proposals.retain(|v| {
-                    restrict_len(&self.archive.domain, &self.archive.eav_c, v, &r) != 0
-                });
-            }
-            (None, Some(a), None, true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                proposals.retain(|e| {
-                    restrict_len(&self.archive.domain, &self.archive.ave_c, e, &r) != 0
-                });
-            }
-            (None, Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                proposals.retain(|v| {
-                    restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r) != 0
-                });
-            }
-            (None, None, Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                proposals.retain(|e| {
-                    restrict_len(&self.archive.domain, &self.archive.vae_c, e, &r) != 0
-                });
-            }
-            (None, None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                proposals.retain(|a| {
-                    restrict_len(&self.archive.domain, &self.archive.vea_c, a, &r) != 0
-                });
-            }
-            (None, Some(a), Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.aev_c,
-                    v,
-                    &r,
-                );
-                proposals.retain(|e| {
-                    restrict_len(&self.archive.domain, &self.archive.vae_c, e, &r) != 0
-                });
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.eav_c,
-                    v,
-                    &r,
-                );
-                proposals.retain(|a| {
-                    restrict_len(&self.archive.domain, &self.archive.vea_c, a, &r) != 0
-                });
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.a_a,
-                    &self.archive.eva_c,
-                    a,
-                    &r,
-                );
-                proposals.retain(|v| {
-                    restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r) != 0
-                });
-            }
-            _ => unreachable!("invalid trible constraint state"),
-        }
+        let p = self.positions(variable, view);
+        out.extend(view.iter().map(|row| self.estimate_row(&p, row)));
+        true
     }
 
-    /// PROBE: whole-frontier propose for the blocked solver.
+    /// Whole-frontier propose.
     ///
     /// The three two-bound arms are contiguous wavelet sweeps
     /// (`restrict_range(..).map(|i| wm.access(i))`); across a block the
@@ -498,104 +383,84 @@ where
     /// a single ring column, dispatched as one `access_batch`. Per-row
     /// `unique()` and domain resolution stay on the CPU. All other arms
     /// (`enumerate_in`'s select-strides are a sequential dependent chain)
-    /// keep the per-row sequential propose.
+    /// run per row.
     ///
     /// The batched sweep is only taken when the GPU ring is present: on a
     /// pure CPU archive the concatenated `access` loop does exactly the
-    /// sequential work plus the frontier-materialization overhead, with no
-    /// batching payoff — measured a net loss on isect/chain — so CPU falls
-    /// through to the per-row path. (Confirm is different: its batch is
-    /// cache-friendlier even on CPU, so `confirm_blocked` always batches.)
-    fn propose_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
+    /// per-row work plus frontier-materialization overhead, with no
+    /// batching payoff — measured a net loss on isect/chain — so CPU
+    /// falls through to the per-row path. (Confirm is different: its
+    /// batch is cache-friendlier even on CPU, so `confirm` always
+    /// batches.)
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
         }
-        let stride = vars.len();
-        debug_assert!(stride > 0);
+        let p = self.positions(variable, view);
 
-        // Per-row sequential propose — the CPU-optimal path and the
-        // fallback for non-sweep arms.
-        let sequential = |this: &Self, pairs: &mut Vec<(u32, RawInline)>| {
-            let mut binding = Binding::default();
-            let mut scratch: Vec<RawInline> = Vec::new();
-            for (i, row) in rows.chunks_exact(stride).enumerate() {
-                for (k, &v) in vars.iter().enumerate() {
-                    binding.set(v, &row[k]);
-                }
-                scratch.clear();
-                this.propose(variable, &binding, &mut scratch);
-                pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
-            }
-        };
-
-        // No GPU consumer for the batch → CPU sequential is faster.
+        // No GPU consumer for the batch → per-row is faster.
         #[cfg(feature = "gpu")]
         let gpu_present = self.archive.gpu.is_some();
         #[cfg(not(feature = "gpu"))]
         let gpu_present = false;
+        #[cfg(feature = "gpu")]
+        let len_before = candidates.len();
         if !gpu_present {
-            sequential(self, pairs);
+            for (i, row) in view.iter().enumerate() {
+                self.propose_row(&p, i as u32, row, candidates);
+            }
+            #[cfg(feature = "gpu")]
+            super::gpu::stats::record_propose(candidates.len() - len_before);
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-        let pe = vars.iter().position(|&x| x == self.variable_e);
-        let pa = vars.iter().position(|&x| x == self.variable_a);
-        let pv = vars.iter().position(|&x| x == self.variable_v);
-
         let archive = self.archive;
         type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
-        let (col, range_fn): (RingCol, RangeFn<'_>) = match (pe, pa, pv, e_var, a_var, v_var) {
-            (None, Some(pa), Some(pv), true, false, false) => (
-                RingCol::VaeC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
-                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
-                }),
-            ),
-            (Some(pe), None, Some(pv), false, true, false) => (
-                RingCol::VeaC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
-                }),
-            ),
-            (Some(pe), Some(pa), None, false, false, true) => (
-                RingCol::AevC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
-                }),
-            ),
-            _ => {
-                // Non-sweep arm (enumerate_in select-strides): per-row
-                // sequential propose.
-                sequential(self, pairs);
-                return;
-            }
-        };
+        let (col, range_fn): (RingCol, RangeFn<'_>) =
+            match (p.pe, p.pa, p.pv, p.e_var, p.a_var, p.v_var) {
+                (None, Some(pa), Some(pv), true, false, false) => (
+                    RingCol::VaeC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
+                        restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                    }),
+                ),
+                (Some(pe), None, Some(pv), false, true, false) => (
+                    RingCol::VeaC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                        restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                    }),
+                ),
+                (Some(pe), Some(pa), None, false, false, true) => (
+                    RingCol::AevC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                        restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                    }),
+                ),
+                _ => {
+                    // Non-sweep arm (enumerate_in select-strides): per row.
+                    for (i, row) in view.iter().enumerate() {
+                        self.propose_row(&p, i as u32, row, candidates);
+                    }
+                    #[cfg(feature = "gpu")]
+                    super::gpu::stats::record_propose(candidates.len() - len_before);
+                    return;
+                }
+            };
 
         // One range per row, concatenated into a ragged access stream.
-        let mut row_ranges: Vec<Range<usize>> = Vec::with_capacity(rows.len() / stride);
+        let mut row_ranges: Vec<Range<usize>> = Vec::with_capacity(view.len());
         let mut total = 0usize;
-        for row in rows.chunks_exact(stride) {
+        for row in view.iter() {
             let r = range_fn(row);
             total += r.len();
             row_ranges.push(r);
         }
-        pairs.reserve(total);
+        candidates.reserve(total);
 
-        #[cfg(feature = "gpu")]
-        let len_before = pairs.len();
         #[cfg(feature = "gpu")]
         let gpu_codes: Option<Vec<usize>> = archive.gpu.as_ref().and_then(|ring| {
             if total >= ring.min_batch {
@@ -626,7 +491,7 @@ where
                 let mut offset = 0usize;
                 for (i, r) in row_ranges.iter().enumerate() {
                     let n = r.len();
-                    pairs.extend(
+                    candidates.extend(
                         codes[offset..offset + n]
                             .iter()
                             .copied()
@@ -639,9 +504,9 @@ where
             None => {
                 let wm = archive.ring_col(col);
                 for (i, r) in row_ranges.iter().enumerate() {
-                    pairs.extend(
+                    candidates.extend(
                         r.clone()
-                            .map(|p| wm.access(p).unwrap())
+                            .map(|pos| wm.access(pos).unwrap())
                             .unique()
                             .map(|c| (i as u32, archive.domain.access(c))),
                     );
@@ -649,15 +514,13 @@ where
             }
         }
         #[cfg(feature = "gpu")]
-        super::gpu::stats::record_propose(pairs.len() - len_before);
+        super::gpu::stats::record_propose(candidates.len() - len_before);
     }
 
-    /// PROBE: whole-frontier confirm for the blocked solver.
+    /// Whole-frontier confirm.
     ///
-    /// The sequential [`confirm`](Self::confirm) computes one range per
-    /// call and then runs 2 wavelet ranks per candidate; called once per
-    /// branch, those ranks arrive in batches of 1–4 — far below any
-    /// batching break-even. Here the *entire frontier* of
+    /// Per branch, the emptiness tests would arrive in batches of 1–4 —
+    /// far below any batching break-even. Here the *entire frontier* of
     /// `(row, candidate)` pairs shares the same arm (the bound-variable
     /// set is uniform across a block), so all emptiness tests become one
     /// ragged rank stream over a single wavelet matrix:
@@ -666,129 +529,115 @@ where
     ///   for all of the row's candidates;
     /// - per **pair**: one `domain.search` + two rank probes
     ///   (`rank(r.start, d)`, `rank(r.end, d)`) — the select1 base offset
-    ///   cancels in the emptiness comparison, exactly as in the
-    ///   sequential `restrict_len` path.
+    ///   cancels in the emptiness comparison, exactly as in
+    ///   [`restrict_len`].
     ///
     /// The probe stream is evaluated CPU-batched by default, or as one
     /// `rank_batch` GPU dispatch when the archive's GPU ring is enabled
     /// and the stream is above the sync break-even threshold.
-    fn confirm_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
         }
         #[cfg(feature = "gpu")]
-        super::gpu::stats::record_confirm(pairs.len());
-        if pairs.is_empty() {
+        super::gpu::stats::record_confirm(candidates.len());
+        if candidates.is_empty() {
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let stride = vars.len();
-        debug_assert!(stride > 0);
-        let pe = vars.iter().position(|&x| x == self.variable_e);
-        let pa = vars.iter().position(|&x| x == self.variable_a);
-        let pv = vars.iter().position(|&x| x == self.variable_v);
-
+        let p = self.positions(variable, view);
         let archive = self.archive;
         type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
-        let (col, range_fn): (RingCol, RangeFn<'_>) = match (pe, pa, pv, e_var, a_var, v_var) {
-            // Nothing of this constraint bound: candidates are checked
-            // against the prefix bit vector only — row-independent, no
-            // wavelet work to batch.
-            (None, None, None, ..) => {
-                let prefix = if e_var {
-                    &archive.e_a
-                } else if a_var {
-                    &archive.a_a
-                } else {
-                    &archive.v_a
-                };
-                pairs.retain(|(_, val)| {
-                    base_range(&archive.domain, prefix, val).is_empty().not()
-                });
-                return;
-            }
-            (Some(pe), None, None, false, true, false) => (
-                RingCol::EvaC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.e_a, &row[pe])
-                }),
-            ),
-            (Some(pe), None, None, false, false, true) => (
-                RingCol::EavC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.e_a, &row[pe])
-                }),
-            ),
-            (None, Some(pa), None, true, false, false) => (
-                RingCol::AveC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.a_a, &row[pa])
-                }),
-            ),
-            (None, Some(pa), None, false, false, true) => (
-                RingCol::AevC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.a_a, &row[pa])
-                }),
-            ),
-            (None, None, Some(pv), true, false, false) => (
-                RingCol::VaeC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.v_a, &row[pv])
-                }),
-            ),
-            (None, None, Some(pv), false, true, false) => (
-                RingCol::VeaC,
-                Box::new(move |row: &[RawInline]| {
-                    base_range(&archive.domain, &archive.v_a, &row[pv])
-                }),
-            ),
-            (None, Some(pa), Some(pv), true, false, false) => (
-                RingCol::VaeC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
-                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
-                }),
-            ),
-            (Some(pe), None, Some(pv), false, true, false) => (
-                RingCol::VeaC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
-                }),
-            ),
-            (Some(pe), Some(pa), None, false, false, true) => (
-                RingCol::AevC,
-                Box::new(move |row: &[RawInline]| {
-                    let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
-                }),
-            ),
-            _ => unreachable!("invalid trible constraint state"),
-        };
+        let (col, range_fn): (RingCol, RangeFn<'_>) =
+            match (p.pe, p.pa, p.pv, p.e_var, p.a_var, p.v_var) {
+                // Nothing of this constraint bound: candidates are checked
+                // against the prefix bit vector only — row-independent, no
+                // wavelet work to batch.
+                (None, None, None, ..) => {
+                    let prefix = if p.e_var {
+                        &archive.e_a
+                    } else if p.a_var {
+                        &archive.a_a
+                    } else {
+                        &archive.v_a
+                    };
+                    candidates.retain(|(_, val)| {
+                        base_range(&archive.domain, prefix, val).is_empty().not()
+                    });
+                    return;
+                }
+                (Some(pe), None, None, false, true, false) => (
+                    RingCol::EvaC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.e_a, &row[pe])
+                    }),
+                ),
+                (Some(pe), None, None, false, false, true) => (
+                    RingCol::EavC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.e_a, &row[pe])
+                    }),
+                ),
+                (None, Some(pa), None, true, false, false) => (
+                    RingCol::AveC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.a_a, &row[pa])
+                    }),
+                ),
+                (None, Some(pa), None, false, false, true) => (
+                    RingCol::AevC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.a_a, &row[pa])
+                    }),
+                ),
+                (None, None, Some(pv), true, false, false) => (
+                    RingCol::VaeC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.v_a, &row[pv])
+                    }),
+                ),
+                (None, None, Some(pv), false, true, false) => (
+                    RingCol::VeaC,
+                    Box::new(move |row: &[RawInline]| {
+                        base_range(&archive.domain, &archive.v_a, &row[pv])
+                    }),
+                ),
+                (None, Some(pa), Some(pv), true, false, false) => (
+                    RingCol::VaeC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
+                        restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                    }),
+                ),
+                (Some(pe), None, Some(pv), false, true, false) => (
+                    RingCol::VeaC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                        restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                    }),
+                ),
+                (Some(pe), Some(pa), None, false, false, true) => (
+                    RingCol::AevC,
+                    Box::new(move |row: &[RawInline]| {
+                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
+                        restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                    }),
+                ),
+                _ => unreachable!("invalid trible constraint state"),
+            };
 
         // Accumulate the ragged probe stream: 2 ranks per surviving pair,
         // one range per distinct row (pairs are grouped by row).
-        let mut probe_pos: Vec<usize> = Vec::with_capacity(2 * pairs.len());
-        let mut probe_val: Vec<usize> = Vec::with_capacity(2 * pairs.len());
-        let mut has_probes: Vec<bool> = Vec::with_capacity(pairs.len());
+        let mut probe_pos: Vec<usize> = Vec::with_capacity(2 * candidates.len());
+        let mut probe_val: Vec<usize> = Vec::with_capacity(2 * candidates.len());
+        let mut has_probes: Vec<bool> = Vec::with_capacity(candidates.len());
         let mut current_row: Option<u32> = None;
         let mut r: Range<usize> = 0..0;
-        for &(row_idx, val) in pairs.iter() {
+        for &(row_idx, val) in candidates.iter() {
             if current_row != Some(row_idx) {
                 current_row = Some(row_idx);
-                r = range_fn(&rows[row_idx as usize * stride..][..stride]);
+                r = range_fn(view.row(row_idx as usize));
             }
             if r.is_empty() {
                 has_probes.push(false);
@@ -833,13 +682,13 @@ where
             probe_pos
                 .iter()
                 .zip(&probe_val)
-                .map(|(&p, &d)| wm.rank(p, d).unwrap())
+                .map(|(&pos, &d)| wm.rank(pos, d).unwrap())
                 .collect()
         });
 
         let mut i = 0usize;
         let mut k = 0usize;
-        pairs.retain(|_| {
+        candidates.retain(|_| {
             let keep = if has_probes[i] {
                 let lo = ranks[k];
                 let hi = ranks[k + 1];
@@ -852,22 +701,4 @@ where
             keep
         });
     }
-
-    // PROBE (group-by-ordering): `estimate_blocked` deliberately stays on
-    // the trait default (per-row scratch binding + `estimate`) in v0 — the
-    // correct baseline the design calls for. A batched override is
-    // possible and DEFERRED:
-    //   - the arm dispatch (the 11-way match in `estimate`) is uniform
-    //     across a block (bound-set is structural), so it can be hoisted
-    //     out of the row loop exactly like `confirm_blocked`'s `range_fn`;
-    //   - the per-row probes are then either `distinct_in` rank pairs on a
-    //     `changed_*` bit vector or `restrict_len` rank pairs on a wavelet
-    //     matrix — both concatenate into one ragged rank stream;
-    //   - the wavelet arms could ride the existing GPU `rank_batch` ring
-    //     columns; the `changed_*` bit vectors are NOT uploaded to the
-    //     ring today, so their batch would be CPU-only (still wins the
-    //     hoisted dispatch + cache locality, loses the sync amortization).
-    // Deferred rather than built because v0's measurement question is
-    // whether GROUPING pays at all; the estimate pass is the same
-    // per-probe work either way and the override only changes constants.
 }

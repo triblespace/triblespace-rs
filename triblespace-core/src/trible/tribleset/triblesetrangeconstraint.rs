@@ -1,5 +1,6 @@
-use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
+use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -63,14 +64,15 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
         if variable != self.variable_v {
-            return None;
+            return false;
         }
-        Some(self.cached_estimate)
+        out.extend(std::iter::repeat_n(self.cached_estimate, view.len()));
+        true
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if variable != self.variable_v {
             return;
         }
@@ -78,22 +80,26 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // VEA tree order: V(32) → E(16) → A(16).
         // With empty prefix, infixes_range on V(32 bytes) gives us all
         // values in [min, max]. The trie prunes branches outside the range.
-        self.set
-            .vea
-            .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
-                proposals.push(*v);
-            });
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if variable == self.variable_v {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+        for i in 0..view.len() as u32 {
+            self.set
+                .vea
+                .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
+                    candidates.push((i, *v));
+                });
         }
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable_v) {
-            Some(v) => *v >= self.min && *v <= self.max,
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+        if variable == self.variable_v {
+            candidates.retain(|(_, v)| *v >= self.min && *v <= self.max);
+        }
+    }
+
+    fn satisfied(&self, view: RowsView<'_>) -> bool {
+        match view.col(self.variable_v) {
+            Some(col) => view
+                .iter()
+                .all(|row| row[col] >= self.min && row[col] <= self.max),
             None => true,
         }
     }
@@ -210,8 +216,10 @@ mod tests {
         let max: Inline<R256BE> = 100i128.to_inline();
         let constraint = data.value_in_range(v, min, max);
 
-        let estimate = constraint.estimate(v.index, &Default::default());
+        use crate::query::RowsView;
+        let mut est = Vec::new();
+        assert!(constraint.estimate(v.index, RowsView::EMPTY, &mut est));
         // Three distinct values in range. Before the fix this returned 6.
-        assert_eq!(estimate, Some(3), "estimate must count distinct values");
+        assert_eq!(est, vec![3], "estimate must count distinct values");
     }
 }

@@ -3,13 +3,13 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
+use crate::query::RowsView;
 use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::inline::RawInline;
 use crate::inline::IntoInline;
 use crate::inline::TryFromInline;
 use crate::inline::Inline;
@@ -50,24 +50,26 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        // The estimated proposal count equals the current number of keys.
+        out.extend(std::iter::repeat_n(self.map.len(), view.len()));
+        true
+    }
+
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            // the estimated proposal count equals the current number of keys
-            Some(self.map.len())
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                candidates.extend(self.map.keys().map(|k| (i, IntoInline::to_inline(k).raw)));
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            proposals.extend(self.map.keys().map(|k| IntoInline::to_inline(k).raw));
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            proposals.retain(|v| {
+            candidates.retain(|(_, v)| {
                 self.map.contains_key(&match TryFromInline::try_from_inline(
                     Inline::<S>::as_transmute_raw(v),
                 ) {

@@ -3,12 +3,12 @@ use crate::id::id_into_value;
 use crate::id::ID_LEN;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
-use crate::inline::RawInline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
 
-use super::Binding;
+use super::Candidates;
 use super::Constraint;
+use super::RowsView;
 use super::ContainsConstraint;
 use super::Variable;
 use super::VariableId;
@@ -34,24 +34,26 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        out.extend(std::iter::repeat_n(self.patch.len() as usize, view.len()));
+        true
+    }
+
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            Some(self.patch.len() as usize)
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                self.patch
+                    .infixes(&[0; 0], &mut |&k: &[u8; 32]| candidates.push((i, k)));
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            self.patch
-                .infixes(&[0; 0], &mut |&k: &[u8; 32]| proposals.push(k));
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            proposals.retain(|v| self.patch.has_prefix(v));
+            candidates.retain(|(_, v)| self.patch.has_prefix(v));
         }
     }
 }
@@ -95,24 +97,26 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        out.extend(std::iter::repeat_n(self.patch.len() as usize, view.len()));
+        true
+    }
+
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            Some(self.patch.len() as usize)
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
+                    candidates.push((i, id_into_value(id)))
+                });
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
-                proposals.push(id_into_value(id))
-            });
-        }
-    }
-
-    fn confirm(&self, _variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        proposals.retain(|v| {
+    fn confirm(&self, _variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
+        candidates.retain(|(_, v)| {
             if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)
             } else {

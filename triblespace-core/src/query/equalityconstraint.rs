@@ -20,6 +20,19 @@ impl EqualityConstraint {
     pub fn new(a: VariableId, b: VariableId) -> Self {
         EqualityConstraint { a, b }
     }
+
+    /// Column of the peer of `variable` in `view`, when `variable` is
+    /// one of the constrained pair and the peer is bound.
+    fn peer_col(&self, variable: VariableId, view: RowsView<'_>) -> Option<usize> {
+        let peer = if variable == self.a {
+            self.b
+        } else if variable == self.b {
+            self.a
+        } else {
+            return None;
+        };
+        view.col(peer)
+    }
 }
 
 impl<'c> Constraint<'c> for EqualityConstraint {
@@ -30,61 +43,40 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         vs
     }
 
-    /// Returns `Some(1)` when the peer variable is already bound
-    /// (exactly one candidate). Returns `None` when the peer is
-    /// unbound — the constraint has no independent opinion about the
-    /// variable's cardinality and defers to other constraints in the
-    /// intersection. This is safe as long as each variable also appears
-    /// in at least one other constraint (which the macro desugaring
-    /// guarantees).
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        if variable == self.a {
-            if binding.get(self.b).is_some() {
-                Some(1)
-            } else {
-                None
-            }
-        } else if variable == self.b {
-            if binding.get(self.a).is_some() {
-                Some(1)
-            } else {
-                None
-            }
-        } else {
-            None
+    /// Estimates exactly one candidate per row when the peer variable is
+    /// already bound. Returns `false` when the peer is unbound — the
+    /// constraint has no independent opinion about the variable's
+    /// cardinality and defers to other constraints in the intersection.
+    /// This is safe as long as each variable also appears in at least
+    /// one other constraint (which the macro desugaring guarantees).
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        if self.peer_col(variable, view).is_none() {
+            return false;
         }
+        out.extend(std::iter::repeat_n(1, view.len()));
+        true
     }
 
-    /// When the peer variable is bound, proposes its value.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if variable == self.a {
-            if let Some(v) = binding.get(self.b) {
-                proposals.push(*v);
-            }
-        } else if variable == self.b {
-            if let Some(v) = binding.get(self.a) {
-                proposals.push(*v);
-            }
-        }
+    /// Proposes each row's peer value.
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        let Some(col) = self.peer_col(variable, view) else {
+            return;
+        };
+        candidates.extend(view.iter().enumerate().map(|(i, row)| (i as u32, row[col])));
     }
 
-    /// Retains only proposals that match the peer variable's binding.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if variable == self.a {
-            if let Some(peer) = binding.get(self.b) {
-                proposals.retain(|v| v == peer);
-            }
-        } else if variable == self.b {
-            if let Some(peer) = binding.get(self.a) {
-                proposals.retain(|v| v == peer);
-            }
-        }
+    /// Retains only candidates matching their row's peer value.
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        let Some(col) = self.peer_col(variable, view) else {
+            return;
+        };
+        candidates.retain(|&(row, v)| v == view.row(row as usize)[col]);
     }
 
-    /// Returns `false` when both variables are bound to different values.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match (binding.get(self.a), binding.get(self.b)) {
-            (Some(a), Some(b)) => a == b,
+    /// Returns `false` when any row binds the pair to different values.
+    fn satisfied(&self, view: RowsView<'_>) -> bool {
+        match (view.col(self.a), view.col(self.b)) {
+            (Some(ca), Some(cb)) => view.iter().all(|row| row[ca] == row[cb]),
             _ => true,
         }
     }

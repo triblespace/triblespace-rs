@@ -1,10 +1,10 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
-    use crate::query::Binding;
+    use crate::query::Candidates;
     use crate::query::Constraint;
+    use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
-    use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -28,17 +28,21 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-            self.constraint.estimate(variable, binding)
+        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+            self.constraint.estimate(variable, view, out)
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
             self.record.borrow_mut().push(variable);
-            self.constraint.propose(variable, binding, proposals);
+            self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+            self.constraint.confirm(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: RowsView<'_>) -> bool {
+            self.constraint.satisfied(view)
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {
@@ -82,16 +86,25 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-            self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
+        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+            if let Some(estimate) = self.estimates[variable] {
+                out.extend(std::iter::repeat_n(estimate, view.len()));
+                true
+            } else {
+                self.constraint.estimate(variable, view, out)
+            }
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.propose(variable, binding, proposals);
+        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+            self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+            self.constraint.confirm(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: RowsView<'_>) -> bool {
+            self.constraint.satisfied(view)
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {

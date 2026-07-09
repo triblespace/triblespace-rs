@@ -7,11 +7,13 @@ use smallvec::SmallVec;
 /// [`and!`](crate::and) macro or directly via [`new`](Self::new).
 ///
 /// The intersection delegates to its children using cardinality-aware
-/// ordering: the child with the lowest [`estimate`](Constraint::estimate)
-/// proposes candidates, and the remaining children
-/// [`confirm`](Constraint::confirm) them in order of increasing estimate.
-/// This strategy keeps the candidate set small from the start and avoids
-/// materialising cross products.
+/// ordering: per row, the child with the lowest
+/// [`estimate`](Constraint::estimate) proposes candidates, and the
+/// remaining children [`confirm`](Constraint::confirm) them — not per
+/// branch, but in whole-frontier passes, one per child. That deferral is
+/// what fuses the per-branch confirm trickle into one ragged batch per
+/// (child, level), which is what makes batched probe streams (and GPU
+/// dispatch) possible in the first place.
 ///
 /// Variables from all children are exposed as a single union, so the
 /// engine sees one flat set of variables regardless of how many
@@ -41,214 +43,20 @@ where
             .fold(VariableSet::new_empty(), |vs, c| vs.union(c.variables()))
     }
 
-    /// Returns the **minimum** estimate across children that constrain
-    /// `variable`. The tightest child bounds the search, reflecting the
-    /// intersection semantics: every child must agree, so the smallest
-    /// candidate set dominates.
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.constraints
-            .iter()
-            .filter_map(|c| c.estimate(variable, binding))
-            .min()
-    }
-
-    /// Sorts children by estimate, lets the tightest one propose, then
-    /// confirms through the rest in ascending estimate order. Children
-    /// that return `None` for this variable are skipped entirely.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
-            .constraints
-            .iter()
-            .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
-            .collect();
-        if relevant_constraints.is_empty() {
-            return;
-        }
-        relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
-
-        relevant_constraints[0]
-            .1
-            .propose(variable, binding, proposals);
-
-        relevant_constraints[1..]
-            .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, proposals));
-    }
-
-    /// Confirms proposals through all children that constrain `variable`,
-    /// in order of increasing estimate.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
-            .constraints
-            .iter()
-            .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
-            .collect();
-        relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
-
-        relevant_constraints
-            .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, proposals));
-    }
-
-    /// Returns `true` only when **every** child is satisfied.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        self.constraints.iter().all(|c| c.satisfied(binding))
-    }
-
-    /// PROBE: frontier expansion for the blocked solver.
-    ///
-    /// Per row the tightest child proposes (same cardinality-aware choice
-    /// as [`propose`](Self::propose)), but the sibling confirms are **not**
-    /// run per row — they are deferred to whole-frontier
-    /// [`confirm_blocked`](Constraint::confirm_blocked) passes, one per
-    /// child, over all rows' candidates at once. That deferral is the
-    /// entire point of the blocked engine: it fuses the per-branch confirm
-    /// trickle into one ragged batch per (child, level).
-    ///
-    /// A child that proposed for *every* row skips its confirm pass (its
-    /// own proposals are consistent by construction). When proposers vary
-    /// across rows the pass runs over the full frontier, re-confirming the
-    /// child's own pairs — a wasted-work cost, never a correctness one.
-    fn propose_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let stride = vars.len();
-        debug_assert!(stride > 0);
-        let n_rows = rows.len() / stride;
-        let mut binding = Binding::default();
-        let mut propose_counts = vec![0usize; self.constraints.len()];
-        let mut rows_proposed = 0usize;
-
-        // Pass 1: per-row proposer choice (cardinality-aware, per-row
-        // estimates exactly like the sequential engine).
-        let mut proposers: Vec<Option<usize>> = Vec::with_capacity(n_rows);
-        for row in rows.chunks_exact(stride) {
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            let mut best: Option<(usize, usize)> = None;
-            for (ci, c) in self.constraints.iter().enumerate() {
-                if let Some(estimate) = c.estimate(variable, &binding) {
-                    if best.map_or(true, |(be, _)| estimate < be) {
-                        best = Some((estimate, ci));
-                    }
-                }
-            }
-            if let Some((_, ci)) = best {
-                propose_counts[ci] += 1;
-                rows_proposed += 1;
-            }
-            proposers.push(best.map(|(_, ci)| ci));
-        }
-
-        // Pass 2: expand the frontier. When one child proposes for every
-        // row (the common case — proposer choice is usually structural),
-        // hand it the whole block so its own `propose_blocked` batching
-        // kicks in; otherwise fall back to per-row proposes. Rows with no
-        // relevant child propose nothing — the branch dies, matching the
-        // sequential engine's empty proposal set.
-        //
-        // PROBE finding (group-by-ordering measurements, wd star3): the
-        // per-row fallback is the grouped solver's remaining batching
-        // hole. When a group's rows bind (a, v) pairs whose tightest
-        // proposer VARIES by row (P21-clause for some, P27-clause for
-        // others), this branch degrades to thousands of 1-item proposes
-        // and no GPU dispatch. The same counting-sort trick the grouped
-        // solver applies per variable applies here per proposer child:
-        // partition `pairs`' source rows by `proposers[i]` and hand each
-        // child its sub-block. Not built in v0 — it is the intersection's
-        // analogue of grouping, one layer down the constraint tree.
-        let uniform = proposers.first().copied().flatten().filter(|&ci| {
-            rows_proposed == n_rows && propose_counts[ci] == n_rows
-        });
-        if let Some(ci) = uniform {
-            self.constraints[ci].propose_blocked(variable, vars, rows, pairs);
-        } else {
-            let mut scratch: Vec<RawInline> = Vec::new();
-            for (i, row) in rows.chunks_exact(stride).enumerate() {
-                let Some(ci) = proposers[i] else { continue };
-                for (k, &v) in vars.iter().enumerate() {
-                    binding.set(v, &row[k]);
-                }
-                scratch.clear();
-                self.constraints[ci].propose(variable, &binding, &mut scratch);
-                pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
-            }
-        }
-
-        // Whole-frontier confirm passes, cheapest child first (first-row
-        // estimates; participation is structural, so the child set is
-        // uniform across rows even though the estimate values are not).
-        for (k, &v) in vars.iter().enumerate() {
-            binding.set(v, &rows[k]);
-        }
-        let mut confirmers: SmallVec<[(usize, usize); 8]> = self
-            .constraints
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, c)| Some((c.estimate(variable, &binding)?, ci)))
-            .collect();
-        confirmers.sort_unstable_by_key(|&(estimate, _)| estimate);
-        for (_, ci) in confirmers {
-            if propose_counts[ci] == rows_proposed {
-                continue;
-            }
-            self.constraints[ci].confirm_blocked(variable, vars, rows, pairs);
-        }
-    }
-
-    /// PROBE: confirms a whole frontier through every relevant child in
-    /// ascending (first-row) estimate order.
-    fn confirm_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let stride = vars.len();
-        debug_assert!(stride > 0);
-        let mut binding = Binding::default();
-        for (k, &v) in vars.iter().enumerate() {
-            binding.set(v, &rows[k]);
-        }
-        let mut relevant: SmallVec<[(usize, usize); 8]> = self
-            .constraints
-            .iter()
-            .enumerate()
-            .filter_map(|(ci, c)| Some((c.estimate(variable, &binding)?, ci)))
-            .collect();
-        relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
-        for (_, ci) in relevant {
-            self.constraints[ci].confirm_blocked(variable, vars, rows, pairs);
-        }
-    }
-
-    /// PROBE (group-by-ordering): whole-block estimates — the elementwise
-    /// **minimum** across children, mirroring [`estimate`](Self::estimate)'s
-    /// min semantics per row. Each relevant child contributes via its own
-    /// `estimate_blocked`, so a child with a batched override (hoisted arm
-    /// dispatch, rank streams) keeps that advantage under composition.
-    fn estimate_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        out: &mut Vec<usize>,
-    ) -> bool {
+    /// Appends the elementwise **minimum** estimate across children that
+    /// constrain `variable`. The tightest child bounds the search per
+    /// row, reflecting the intersection semantics: every child must
+    /// agree, so the smallest candidate set dominates.
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
         let base = out.len();
         let mut any = false;
         let mut scratch: Vec<usize> = Vec::new();
         for c in &self.constraints {
             if !any {
-                any = c.estimate_blocked(variable, vars, rows, out);
+                any = c.estimate(variable, view, out);
             } else {
                 scratch.clear();
-                if c.estimate_blocked(variable, vars, rows, &mut scratch) {
+                if c.estimate(variable, view, &mut scratch) {
                     for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
                         *o = (*o).min(s);
                     }
@@ -256,6 +64,98 @@ where
             }
         }
         any
+    }
+
+    /// Frontier expansion: per row the tightest child proposes (one
+    /// estimate column per relevant child, argmin per row), then the
+    /// sibling confirms run as **whole-frontier passes** — one per child,
+    /// cheapest (first-row estimate) first.
+    ///
+    /// When one child proposes for *every* row (the common case —
+    /// proposer choice is usually structural), it receives the whole
+    /// block so its own batching kicks in, and it skips its confirm pass
+    /// (its own proposals are consistent by construction). When proposers
+    /// vary across rows each row is proposed through a single-row
+    /// borrowed view, and every relevant child confirms the full frontier
+    /// — re-confirming a child's own pairs is a wasted-work cost, never a
+    /// correctness one.
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        let n_rows = view.len();
+
+        // Pass 1: per-child estimate columns (flat, child-major) — the
+        // same cardinality data drives proposer choice AND confirm order.
+        let mut cols: Vec<usize> = Vec::new();
+        let mut relevant: SmallVec<[usize; 8]> = SmallVec::new();
+        for (ci, c) in self.constraints.iter().enumerate() {
+            if c.estimate(variable, view, &mut cols) {
+                relevant.push(ci);
+            }
+        }
+        if relevant.is_empty() {
+            return;
+        }
+
+        // Pass 2: per-row proposer = argmin across the columns.
+        let mut propose_counts: SmallVec<[usize; 8]> = SmallVec::from_elem(0, relevant.len());
+        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let k = (0..relevant.len())
+                .min_by_key(|&k| cols[k * n_rows + i])
+                .expect("non-empty relevant");
+            propose_counts[k] += 1;
+            proposers.push(k as u32);
+        }
+
+        // Pass 3: expand the frontier.
+        let uniform = (0..relevant.len()).find(|&k| propose_counts[k] == n_rows);
+        if let Some(k) = uniform {
+            self.constraints[relevant[k]].propose(variable, view, candidates);
+        } else {
+            for (i, &k) in proposers.iter().enumerate() {
+                let row_view = view.row_view(i);
+                let base = candidates.len();
+                self.constraints[relevant[k as usize]].propose(variable, row_view, candidates);
+                for pair in &mut candidates[base..] {
+                    pair.0 = i as u32;
+                }
+            }
+        }
+
+        // Pass 4: whole-frontier confirms, cheapest (first-row estimate)
+        // child first. The uniform proposer skips its own pass.
+        let mut confirmers: SmallVec<[(usize, usize); 8]> = relevant
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| uniform != Some(k))
+            .map(|(k, &ci)| (cols[k * n_rows], ci))
+            .collect();
+        confirmers.sort_unstable_by_key(|&(estimate, _)| estimate);
+        for (_, ci) in confirmers {
+            self.constraints[ci].confirm(variable, view, candidates);
+        }
+    }
+
+    /// Confirms a whole frontier through every relevant child in
+    /// ascending (first-row) estimate order.
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
+        let first = view.row_view(0);
+        let mut est: Vec<usize> = Vec::with_capacity(1);
+        let mut relevant: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+        for (ci, c) in self.constraints.iter().enumerate() {
+            est.clear();
+            if c.estimate(variable, first, &mut est) {
+                relevant.push((est[0], ci));
+            }
+        }
+        relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
+        for (_, ci) in relevant {
+            self.constraints[ci].confirm(variable, view, candidates);
+        }
+    }
+
+    /// Returns `true` only when **every** child is satisfied.
+    fn satisfied(&self, view: RowsView<'_>) -> bool {
+        self.constraints.iter().all(|c| c.satisfied(view))
     }
 
     /// Returns the union of all children's influence sets for `variable`.

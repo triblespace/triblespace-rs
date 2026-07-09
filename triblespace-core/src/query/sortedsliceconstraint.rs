@@ -85,23 +85,25 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        out.extend(std::iter::repeat_n(self.slice.0.len(), view.len()));
+        true
+    }
+
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            Some(self.slice.0.len())
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                candidates.extend(self.slice.0.iter().map(|v| (i, IntoInline::to_inline(v).raw)));
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut Candidates) {
         if self.variable.index == variable {
-            proposals.extend(self.slice.0.iter().map(|v| IntoInline::to_inline(v).raw));
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            proposals.retain(|v| {
+            candidates.retain(|(_, v)| {
                 match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.slice.0.binary_search(&t).is_ok(),
                     Err(_) => false,

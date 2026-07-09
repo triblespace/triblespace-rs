@@ -247,39 +247,184 @@ impl Default for Binding {
     }
 }
 
+/// A borrowed, row-major view over a block of partial bindings — the
+/// operand of the [`Constraint`] protocol.
+///
+/// `vars` names the bound variables (one column per entry) and `rows`
+/// holds [`len`](Self::len) rows of [`stride`](Self::stride) values each:
+/// row `i`'s value for `vars[j]` is `rows[i * stride + j]`. Column order
+/// is caller-chosen — the sequential engine uses binding order, the DAG
+/// solver canonical ascending order — so constraints locate their columns
+/// with [`col`](Self::col) and never assume a layout.
+///
+/// A view with **no columns is the seed block: a single zero-width row**
+/// (the empty binding). This is what makes level 0 an ordinary block
+/// instead of a special case in every engine.
+///
+/// The view is `Copy` and borrows the engine's row storage directly. A
+/// single-row view ([`row_view`](Self::row_view)) is a subslice of the
+/// parent block, not a copy — the borrowed cursor that lets per-row
+/// fallbacks (and the sequential engine, which is literally a block-of-1
+/// caller) run without any scratch [`Binding`].
+#[derive(Clone, Copy, Debug)]
+pub struct RowsView<'v> {
+    /// The bound variables — the column layout of `rows`.
+    pub vars: &'v [VariableId],
+    /// Row-major value store: `len() * stride()` entries.
+    pub rows: &'v [RawInline],
+}
+
+impl<'v> RowsView<'v> {
+    /// The seed view: no bound variables, one zero-width row.
+    pub const EMPTY: RowsView<'static> = RowsView { vars: &[], rows: &[] };
+
+    /// Creates a view over `rows` laid out in `vars` column order.
+    pub fn new(vars: &'v [VariableId], rows: &'v [RawInline]) -> Self {
+        debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
+        RowsView { vars, rows }
+    }
+
+    /// Number of values per row (= number of bound variables).
+    #[inline]
+    pub fn stride(&self) -> usize {
+        self.vars.len()
+    }
+
+    /// Number of rows. A zero-column view has exactly one (virtual) row.
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self.vars.len() {
+            0 => 1,
+            stride => self.rows.len() / stride,
+        }
+    }
+
+    /// `true` when the view holds no rows (only possible with columns).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The `i`-th row as a value slice.
+    #[inline]
+    pub fn row(&self, i: usize) -> &'v [RawInline] {
+        let stride = self.vars.len();
+        &self.rows[i * stride..(i + 1) * stride]
+    }
+
+    /// A single-row view of row `i` — a borrowed cursor, no copy.
+    #[inline]
+    pub fn row_view(&self, i: usize) -> RowsView<'v> {
+        RowsView {
+            vars: self.vars,
+            rows: self.row(i),
+        }
+    }
+
+    /// The column index of `variable`, or `None` when it is unbound.
+    #[inline]
+    pub fn col(&self, variable: VariableId) -> Option<usize> {
+        self.vars.iter().position(|&v| v == variable)
+    }
+
+    /// Iterates the rows as value slices (one empty slice for the seed).
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &'v [RawInline]> + use<'v> {
+        let stride = self.vars.len();
+        let rows = self.rows;
+        let len = self.len();
+        (0..len).map(move |i| &rows[i * stride..(i + 1) * stride])
+    }
+}
+
+/// The ragged candidate matrix of the blocked protocol: `(row, value)`
+/// pairs in COO form, **grouped by ascending row index**. Every protocol
+/// method that filters candidates must preserve that grouping
+/// (`retain`-style order preservation does).
+pub type Candidates = Vec<(u32, RawInline)>;
+
+/// Drives a per-row proposer over a block — the derived (scalar) case of
+/// the blocked protocol, for constraints whose enumeration has no batch
+/// structure. `f` receives the row index and the row's values and appends
+/// that row's `(row, value)` candidates directly.
+pub fn propose_per_row<'v>(
+    view: RowsView<'v>,
+    candidates: &mut Candidates,
+    mut f: impl FnMut(u32, &'v [RawInline], &mut Candidates),
+) {
+    for (i, row) in view.iter().enumerate() {
+        f(i as u32, row, candidates);
+    }
+}
+
+/// Groups a candidate frontier by row and lets `f` filter each row's
+/// value group in place — the derived (scalar) case of blocked confirm.
+/// `f` receives the row's values and the row's candidate values.
+pub fn confirm_per_row(
+    view: RowsView<'_>,
+    candidates: &mut Candidates,
+    mut f: impl FnMut(&[RawInline], &mut Vec<RawInline>),
+) {
+    let mut scratch: Vec<RawInline> = Vec::new();
+    let mut out: Candidates = Vec::with_capacity(candidates.len());
+    let mut i = 0;
+    while i < candidates.len() {
+        let row_idx = candidates[i].0;
+        scratch.clear();
+        let mut j = i;
+        while j < candidates.len() && candidates[j].0 == row_idx {
+            scratch.push(candidates[j].1);
+            j += 1;
+        }
+        f(view.row(row_idx as usize), &mut scratch);
+        out.extend(scratch.iter().map(|&val| (row_idx, val)));
+        i = j;
+    }
+    *candidates = out;
+}
+
 /// The cooperative protocol that every query participant implements.
 ///
-/// A constraint restricts the values that can be assigned to query variables.
-/// The query engine does not plan joins in advance; instead it consults
-/// constraints directly during a depth-first search over partial bindings.
-/// Each constraint reports which variables it touches, estimates how many
-/// candidates remain, enumerates concrete values on demand, and signals
-/// whether its requirements are still satisfiable. This protocol is the
-/// sole interface between the engine and the data — whether that data lives
-/// in a [`TribleSet`](crate::trible::TribleSet), a [`HashMap`](std::collections::HashMap),
-/// or a custom application predicate.
+/// A constraint restricts the values that can be assigned to query
+/// variables. The query engine does not plan joins in advance; instead it
+/// consults constraints directly during a search over partial bindings.
+/// The protocol is **block-native**: every method operates on a
+/// [`RowsView`] — a block of sibling partial bindings that share the same
+/// bound-variable set — and candidates travel as a ragged [`Candidates`]
+/// matrix. One binding at a time is simply the one-row special case (the
+/// sequential engine passes single-row views); whole-frontier batches are
+/// the general case (the blocked/DAG solvers pass thousands of rows), so
+/// constraints with batchable probe streams evaluate them in one pass —
+/// cache-friendly on the CPU or as a single GPU dispatch.
 ///
 /// # The protocol
 ///
-/// The engine drives the search by calling five methods in a fixed rhythm:
-///
-/// | Method | Role | Called when |
-/// |--------|------|------------|
+/// | Method | Role | Called |
+/// |--------|------|--------|
 /// | [`variables`](Constraint::variables) | Declares which variables the constraint touches. | Once, at query start. |
-/// | [`estimate`](Constraint::estimate) | Predicts the candidate count for a variable. | Before each binding decision. |
-/// | [`propose`](Constraint::propose) | Enumerates candidate values for a variable. | On the most selective constraint. |
+/// | [`estimate`](Constraint::estimate) | Predicts per-row candidate counts for a variable. | Before each binding decision. |
+/// | [`propose`](Constraint::propose) | Enumerates candidate values per row. | On the most selective constraint. |
 /// | [`confirm`](Constraint::confirm) | Filters candidates proposed by another constraint. | On all remaining constraints. |
-/// | [`satisfied`](Constraint::satisfied) | Checks whether fully-bound sub-constraints still hold. | Before propose/confirm in composite constraints. |
+/// | [`satisfied`](Constraint::satisfied) | Checks whether fully-bound sub-constraints still hold. | Inside composite constraints. |
 ///
-/// [`influence`](Constraint::influence) completes the picture by telling the
-/// engine which estimates to refresh when a variable is bound or unbound.
+/// [`influence`](Constraint::influence) completes the picture by telling
+/// the engine which estimates to refresh when a variable is bound or
+/// unbound.
 ///
 /// # Statelessness
 ///
-/// Constraints are stateless: every method receives the current [`Binding`]
-/// as a parameter rather than maintaining internal bookkeeping. This lets
-/// the engine backtrack freely by unsetting variables in the binding
-/// without notifying the constraints.
+/// Constraints are stateless: every method receives the current block as
+/// a borrowed view rather than maintaining internal bookkeeping. This
+/// lets the engines backtrack (sequential), chunk (blocked), or reorder
+/// work (DAG worklist) freely without notifying the constraints.
+///
+/// # Structural relevance
+///
+/// Whether a constraint has an opinion about a variable is **structural**:
+/// it depends only on the variable's identity (and which variables are
+/// bound), never on the bound *values*. [`estimate`](Constraint::estimate)
+/// therefore answers relevance once per block, and a constraint either
+/// estimates a variable for every row or for none.
 ///
 /// # Composability
 ///
@@ -292,12 +437,14 @@ impl Default for Binding {
 ///
 /// # Implementing a custom constraint
 ///
-/// A new constraint only needs to implement [`variables`](Constraint::variables),
-/// [`estimate`](Constraint::estimate), [`propose`](Constraint::propose), and
-/// [`confirm`](Constraint::confirm). Override [`satisfied`](Constraint::satisfied)
-/// when the constraint can detect unsatisfiability before the engine asks
-/// about individual variables (e.g. a fully-bound triple lookup that found
-/// no match). Override [`influence`](Constraint::influence) when binding one
+/// A new constraint needs [`variables`](Constraint::variables),
+/// [`estimate`](Constraint::estimate), [`propose`](Constraint::propose),
+/// and [`confirm`](Constraint::confirm). Constraints without batch
+/// structure implement the row loop with the [`propose_per_row`] /
+/// [`confirm_per_row`] adapters. Override
+/// [`satisfied`](Constraint::satisfied) when the constraint can detect
+/// unsatisfiability early (e.g. a fully-bound triple lookup that found no
+/// match). Override [`influence`](Constraint::influence) when binding one
 /// variable changes the estimates for a non-obvious set of others.
 pub trait Constraint<'a> {
     /// Returns the set of variables this constraint touches.
@@ -307,52 +454,52 @@ pub trait Constraint<'a> {
     /// particular variable is being bound.
     fn variables(&self) -> VariableSet;
 
-    /// Estimates the number of candidate values for `variable` given the
-    /// current partial `binding`.
+    /// Estimates the number of candidate values for `variable` for
+    /// **every row** of the block, appending one estimate per row to
+    /// `out`.
     ///
-    /// Returns `None` when `variable` is not constrained by this constraint.
-    /// The estimate need not be exact — it guides variable ordering, not
-    /// correctness. Tighter estimates lead to better search pruning; see the
-    /// [Atreides join](crate) family for how different estimate fidelities
-    /// affect performance.
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize>;
+    /// Returns `false` (leaving `out` untouched) when `variable` is not
+    /// constrained by this constraint — a structural answer, uniform
+    /// across the block. Estimates need not be exact: they guide variable
+    /// ordering, not correctness. Tighter estimates lead to better search
+    /// pruning; see the [Atreides join](crate) family for how estimate
+    /// fidelity affects performance.
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool;
 
-    /// Enumerates candidate values for `variable` into `proposals`.
+    /// Enumerates candidate values for `variable` for every row of the
+    /// block, appending `(row, value)` pairs to `candidates` grouped by
+    /// ascending row index.
     ///
     /// Called on the constraint with the lowest estimate for the variable
-    /// being bound. Values are appended to `proposals`; the engine may
-    /// already have values in the vector from a previous round.
-    ///
-    /// Does nothing when `variable` is not constrained by this constraint.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
-
-    /// Filters `proposals` to remove values for `variable` that violate
+    /// being bound. Does nothing when `variable` is not constrained by
     /// this constraint.
-    ///
-    /// Called on every constraint *except* the one that proposed, in order
-    /// of increasing estimate. Implementations remove entries from
-    /// `proposals` that are inconsistent with the current `binding`.
-    ///
-    /// Does nothing when `variable` is not constrained by this constraint.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates);
 
-    /// Returns whether this constraint is consistent with the current
-    /// `binding`.
+    /// Filters `candidates`, removing `(row, value)` pairs whose value
+    /// violates this constraint under that row's bindings, while
+    /// preserving the row grouping.
+    ///
+    /// Called on every constraint *except* the one that proposed, in
+    /// order of increasing estimate. Does nothing when `variable` is not
+    /// constrained by this constraint.
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates);
+
+    /// Returns whether **every row** of the block is consistent with this
+    /// constraint.
     ///
     /// The default implementation returns `true`. Override this when the
-    /// constraint can cheaply detect that no solution exists — for example,
-    /// a `TribleSetConstraint`
-    /// whose entity, attribute, and value are all bound but the triple is
-    /// absent from the dataset.
+    /// constraint can cheaply detect that no solution exists — for
+    /// example, a `TribleSetConstraint` whose entity, attribute, and
+    /// value are all bound but the triple is absent from the dataset.
     ///
-    /// Composite constraints propagate this check to their children:
-    /// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
+    /// Composite constraints propagate this check to their children with
+    /// single-row views: [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
     /// requires *all* children to be satisfied, while
     /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
-    /// requires *at least one*. The union uses this to skip dead variants
-    /// in propose and confirm, preventing values from a satisfied variant
-    /// from leaking through a dead one.
-    fn satisfied(&self, _binding: &Binding) -> bool {
+    /// requires *at least one* per row. The union uses this to skip dead
+    /// variants in propose and confirm, preventing values from a
+    /// satisfied variant from leaking through a dead one.
+    fn satisfied(&self, _view: RowsView<'_>) -> bool {
         true
     }
 
@@ -371,139 +518,6 @@ pub trait Constraint<'a> {
             VariableSet::new_empty()
         }
     }
-
-    // -- PROBE: frontier-batched (block-at-a-time) protocol ---------------
-    //
-    // The blocked solver ([`Query::solve_blocked`]) carries a *block* of
-    // sibling partial bindings per search level instead of descending one
-    // binding at a time. A block is a flat row store: `vars` names the
-    // bound variables (identical for every row), `rows` holds
-    // `rows.len() / vars.len()` rows of `vars.len()` values each — row `i`'s
-    // value for `vars[j]` is `rows[i * vars.len() + j]`. Candidates for the
-    // variable being solved travel as `(row_index, value)` pairs, grouped
-    // by ascending row index. Both methods must preserve that grouping
-    // (filtering with `retain`-style order preservation does).
-    //
-    // The default implementations reconstruct a scratch [`Binding`] per row
-    // and delegate to [`propose`](Constraint::propose) /
-    // [`confirm`](Constraint::confirm), so every existing constraint is
-    // blocked-correct with zero changes; constraints with batchable probe
-    // streams (e.g. `SuccinctArchiveConstraint`) override `confirm_blocked`
-    // to evaluate the whole frontier in one pass.
-
-    /// Enumerates candidates for `variable` for **every row** of a binding
-    /// block, appending `(row_index, value)` pairs in ascending row order.
-    ///
-    /// Default: per-row scratch binding + [`propose`](Constraint::propose).
-    fn propose_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let stride = vars.len();
-        debug_assert!(stride > 0, "blocked propose needs at least one bound variable");
-        let mut binding = Binding::default();
-        let mut scratch = Vec::new();
-        for (i, row) in rows.chunks_exact(stride).enumerate() {
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            scratch.clear();
-            self.propose(variable, &binding, &mut scratch);
-            pairs.extend(scratch.iter().map(|&val| (i as u32, val)));
-        }
-    }
-
-    /// Filters a whole frontier of `(row_index, value)` candidates for
-    /// `variable` against this constraint, removing violating pairs while
-    /// preserving order.
-    ///
-    /// Default: group pairs by row, rebuild the row's binding, and delegate
-    /// to [`confirm`](Constraint::confirm).
-    fn confirm_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let stride = vars.len();
-        debug_assert!(stride > 0, "blocked confirm needs at least one bound variable");
-        let mut binding = Binding::default();
-        let mut scratch: Vec<RawInline> = Vec::new();
-        let mut out: Vec<(u32, RawInline)> = Vec::with_capacity(pairs.len());
-        let mut i = 0;
-        while i < pairs.len() {
-            let row_idx = pairs[i].0;
-            scratch.clear();
-            let mut j = i;
-            while j < pairs.len() && pairs[j].0 == row_idx {
-                scratch.push(pairs[j].1);
-                j += 1;
-            }
-            let row = &rows[row_idx as usize * stride..][..stride];
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            self.confirm(variable, &binding, &mut scratch);
-            out.extend(scratch.iter().map(|&val| (row_idx, val)));
-            i = j;
-        }
-        *pairs = out;
-    }
-
-    /// PROBE (group-by-ordering): estimates the candidate count for
-    /// `variable` for **every row** of a binding block, appending one
-    /// estimate per row to `out` in row order.
-    ///
-    /// Returns `false` (leaving `out` untouched) when `variable` is not
-    /// constrained by this constraint. Relevance is assumed to be
-    /// **structural** — a constraint either estimates the variable for
-    /// every binding or for none, independent of the bound *values*. Every
-    /// in-tree constraint satisfies this (`estimate` returns `None` purely
-    /// on variable identity); the blocked intersection already leans on
-    /// the same assumption for its confirm passes.
-    ///
-    /// Default: per-row scratch binding + [`estimate`](Constraint::estimate)
-    /// — the correct baseline. Constraints with batchable estimate probes
-    /// (the archive's `distinct_in` bitvector ranks / `restrict_len`
-    /// wavelet ranks) can override this with a single pass that hoists the
-    /// arm dispatch out of the row loop and batches the rank stream.
-    fn estimate_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        out: &mut Vec<usize>,
-    ) -> bool {
-        let stride = vars.len();
-        debug_assert!(stride > 0, "blocked estimate needs at least one bound variable");
-        let mut binding = Binding::default();
-        let mut chunks = rows.chunks_exact(stride);
-        let Some(first) = chunks.next() else {
-            // Empty block: report structural relevance from variables().
-            return self.variables().is_set(variable);
-        };
-        for (k, &v) in vars.iter().enumerate() {
-            binding.set(v, &first[k]);
-        }
-        let Some(estimate) = self.estimate(variable, &binding) else {
-            return false;
-        };
-        out.push(estimate);
-        for row in chunks {
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            out.push(
-                self.estimate(variable, &binding)
-                    .expect("estimate relevance must be structural across a block"),
-            );
-        }
-        true
-    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -512,62 +526,29 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
         let inner: &T = self;
-        inner.estimate(variable, binding)
+        inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         let inner: &T = self;
-        inner.propose(variable, binding, proposals)
+        inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         let inner: &T = self;
-        inner.confirm(variable, binding, proposals)
+        inner.confirm(variable, view, candidates)
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
+    fn satisfied(&self, view: RowsView<'_>) -> bool {
         let inner: &T = self;
-        inner.satisfied(binding)
+        inner.satisfied(view)
     }
 
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
-    }
-
-    fn propose_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let inner: &T = self;
-        inner.propose_blocked(variable, vars, rows, pairs)
-    }
-
-    fn confirm_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let inner: &T = self;
-        inner.confirm_blocked(variable, vars, rows, pairs)
-    }
-
-    fn estimate_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        out: &mut Vec<usize>,
-    ) -> bool {
-        let inner: &T = self;
-        inner.estimate_blocked(variable, vars, rows, out)
     }
 }
 
@@ -577,62 +558,29 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut Vec<usize>) -> bool {
         let inner: &T = self;
-        inner.estimate(variable, binding)
+        inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         let inner: &T = self;
-        inner.propose(variable, binding, proposals)
+        inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposal: &mut Vec<RawInline>) {
+    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut Candidates) {
         let inner: &T = self;
-        inner.confirm(variable, binding, proposal)
+        inner.confirm(variable, view, candidates)
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
+    fn satisfied(&self, view: RowsView<'_>) -> bool {
         let inner: &T = self;
-        inner.satisfied(binding)
+        inner.satisfied(view)
     }
 
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
-    }
-
-    fn propose_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let inner: &T = self;
-        inner.propose_blocked(variable, vars, rows, pairs)
-    }
-
-    fn confirm_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        pairs: &mut Vec<(u32, RawInline)>,
-    ) {
-        let inner: &T = self;
-        inner.confirm_blocked(variable, vars, rows, pairs)
-    }
-
-    fn estimate_blocked(
-        &self,
-        variable: VariableId,
-        vars: &[VariableId],
-        rows: &[RawInline],
-        out: &mut Vec<usize>,
-    ) -> bool {
-        let inner: &T = self;
-        inner.estimate_blocked(variable, vars, rows, out)
     }
 }
 
@@ -655,7 +603,6 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     mode: Search,
-    binding: Binding,
     influences: [VariableSet; 128],
     estimates: [usize; 128],
     /// PROBE (order-key experiment): each variable's estimate against the
@@ -663,9 +610,21 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// the `ratio_first` / `influenced_only` keys compare against.
     base_estimates: [usize; 128],
     touched_variables: VariableSet,
+    /// The borrowed cursor, half one: bound variables in binding order.
     stack: ArrayVec<VariableId, 128>,
+    /// The borrowed cursor, half two: bound values parallel to `stack`.
+    /// `RowsView::new(&stack, &row)` is the engine's single-row block —
+    /// the sequential engine is literally a block-of-1 caller.
+    row: ArrayVec<RawInline, 128>,
+    /// Bitset mirror of `stack` (estimate-staleness bookkeeping).
+    bound: VariableSet,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<Vec<RawInline>>, 128>,
+    values: ArrayVec<Option<Candidates>, 128>,
+    /// Emit-only scratch: filled from the cursor when a full row is
+    /// postprocessed. The only place a [`Binding`] still exists.
+    binding: Binding,
+    /// Reusable one-entry estimate column.
+    est_scratch: Vec<usize>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -681,24 +640,28 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             mode: self.mode,
-            binding: self.binding.clone(),
             influences: self.influences,
             estimates: self.estimates,
             base_estimates: self.base_estimates,
             touched_variables: self.touched_variables,
             stack: self.stack.clone(),
+            row: self.row.clone(),
+            bound: self.bound,
             unbound: self.unbound.clone(),
             values: self.values.clone(),
+            binding: self.binding.clone(),
+            est_scratch: Vec::new(),
         }
     }
 }
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Picks the next unbound variable, refreshes estimates touched by
-    /// the most recent binding, re-sorts `unbound`, pushes the chosen
-    /// variable onto the stack, and fills its proposal vector via
-    /// [`Constraint::propose`]. Leaves `mode = NextValue`. The caller is
-    /// responsible for ensuring `unbound` is non-empty.
+    /// the most recent binding, re-sorts `unbound`, fills the variable's
+    /// proposal vector via [`Constraint::propose`] (on the single-row
+    /// cursor view), and pushes it onto the cursor. Leaves
+    /// `mode = NextValue`. The caller is responsible for ensuring
+    /// `unbound` is non-empty.
     ///
     /// Shared between [`Iterator::next`]'s `NextVariable` branch and the
     /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
@@ -709,14 +672,17 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             stale_estimates = stale_estimates.union(self.influences[variable]);
         }
         // Bound variables can't be influenced by the unbound ones, so skip.
-        stale_estimates = stale_estimates.subtract(self.binding.bound);
+        stale_estimates = stale_estimates.subtract(self.bound);
 
         if !stale_estimates.is_empty() {
+            let view = RowsView::new(&self.stack, &self.row);
             while let Some(v) = stale_estimates.drain_next_ascending() {
-                self.estimates[v] = self
-                    .constraint
-                    .estimate(v, &self.binding)
-                    .expect("unconstrained variable in query");
+                self.est_scratch.clear();
+                assert!(
+                    self.constraint.estimate(v, view, &mut self.est_scratch),
+                    "unconstrained variable in query"
+                );
+                self.estimates[v] = self.est_scratch[0];
             }
             self.unbound.sort_unstable_by_key(|v| {
                 variable_order_key(
@@ -732,11 +698,23 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             order_trace::record(self.stack.len(), variable, 1);
         }
         let estimate = self.estimates[variable];
-        self.stack.push(variable);
         let values = self.values[variable].get_or_insert(Vec::new());
         values.clear();
         values.reserve_exact(estimate.saturating_sub(values.capacity()));
-        self.constraint.propose(variable, &self.binding, values);
+        self.constraint
+            .propose(variable, RowsView::new(&self.stack, &self.row), values);
+        self.stack.push(variable);
+        self.row.push([0; 32]);
+        self.bound.set(variable);
+    }
+
+    /// Fills the emit-only [`Binding`] from the cursor and runs the
+    /// postprocessing closure on it.
+    fn emit(&mut self) -> Option<R> {
+        for (k, &v) in self.stack.iter().enumerate() {
+            self.binding.set(v, &self.row[k]);
+        }
+        (self.postprocessing)(&self.binding)
     }
 
     /// PROBE: frontier-batched (block-at-a-time) solver.
@@ -747,8 +725,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// values) are far below any batching break-even. `solve_blocked`
     /// instead carries a **block** of sibling partial bindings per level
     /// and hands whole frontiers of `(row, candidate)` pairs to the
-    /// constraints ([`Constraint::propose_blocked`] /
-    /// [`Constraint::confirm_blocked`]): one ragged batch per
+    /// constraints ([`Constraint::propose`] / [`Constraint::confirm`]
+    /// over multi-row [`RowsView`]s): one ragged batch per
     /// (constraint, level) instead of one call per branch. Constraints
     /// with batchable probe streams (wavelet ranks in
     /// `SuccinctArchiveConstraint`) evaluate that batch cache-friendly on
@@ -784,7 +762,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &mut vars,
             &mut unbound,
             &[],
-            1,
             &mut binding,
             &mut results,
         );
@@ -801,7 +778,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// smallest-estimate-first minimizes work AND batch size; the
     /// objectives coincide on CPU and diverge under fixed-cost batch
     /// primitives). This solver batches the *estimation* too
-    /// ([`Constraint::estimate_blocked`]: one estimate column per unbound
+    /// ([`Constraint::estimate`]: one estimate column per unbound
     /// variable over the whole block), computes each row's preferred next
     /// variable (argmin of the same `(log2-magnitude, influence)` key the
     /// sequential engine sorts by), **partitions** the block by preferred
@@ -840,7 +817,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &mut vars,
             &mut unbound,
             &[],
-            1,
             &mut binding,
             &mut results,
         );
@@ -863,12 +839,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 VariableSet::new_empty()
             }
         });
-        let binding = Binding::default();
+        let mut est_scratch = Vec::new();
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
-                constraint
-                    .estimate(v, &binding)
-                    .expect("unconstrained variable in query")
+                est_scratch.clear();
+                assert!(
+                    constraint.estimate(v, RowsView::EMPTY, &mut est_scratch),
+                    "unconstrained variable in query"
+                );
+                est_scratch[0]
             } else {
                 usize::MAX
             }
@@ -885,14 +864,17 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             mode: Search::NextVariable,
-            binding,
             influences,
             estimates,
             base_estimates,
             touched_variables: VariableSet::new_empty(),
             stack: ArrayVec::new(),
+            row: ArrayVec::new(),
+            bound: VariableSet::new_empty(),
             unbound,
             values: ArrayVec::from([const { None }; 128]),
+            binding: Binding::default(),
+            est_scratch,
         }
     }
 }
@@ -1209,14 +1191,40 @@ pub mod blocked_stats {
     }
 }
 
+/// Chooses the next variable for a block from a single row's estimates —
+/// the same `(magnitude, influence-count)` key the sequential engine
+/// sorts by, applied once per block instead of once per branch. Returns
+/// the index into `unbound`.
+fn choose_variable<'a, C: Constraint<'a>>(
+    constraint: &C,
+    unbound: &[VariableId],
+    first: RowsView<'_>,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+) -> usize {
+    let mut est: Vec<usize> = Vec::with_capacity(1);
+    let mut best: Option<(usize, (u64, u64, u64))> = None;
+    for (ui, &v) in unbound.iter().enumerate() {
+        est.clear();
+        assert!(
+            constraint.estimate(v, first, &mut est),
+            "unconstrained variable in query"
+        );
+        let key = variable_order_key(est[0], base_estimates[v], influences[v].count());
+        if best.is_none_or(|(_, bk)| key > bk) {
+            best = Some((ui, key));
+        }
+    }
+    best.expect("non-empty unbound").0
+}
+
 /// PROBE: recursive frontier descent for [`Query::solve_blocked`].
 ///
 /// One call = one search level for one block chunk: pick the next
 /// variable (first-row estimates, same magnitude/influence key as
 /// [`Query::push_next_variable`]), expand the frontier via
-/// [`Constraint::propose_blocked`] (level 0 with no bound variables uses a
-/// plain [`Constraint::propose`] on the empty binding — a single branch,
-/// nothing to batch), then recurse on the extended block in
+/// [`Constraint::propose`] over the whole block (the seed level is just
+/// the one-virtual-row block), then recurse on the extended block in
 /// [`BLOCK_ROW_CAP`]-row chunks.
 #[allow(clippy::too_many_arguments)]
 fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
@@ -1227,69 +1235,37 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     vars: &mut Vec<VariableId>,
     unbound: &mut Vec<VariableId>,
     rows: &[RawInline],
-    n_rows: usize,
     binding: &mut Binding,
     results: &mut Vec<R>,
 ) {
+    let view = RowsView::new(vars, rows);
+    let n_rows = view.len();
     if n_rows == 0 {
         return;
     }
-    let stride = vars.len();
-    // PROBE (fix experiment): one Binding is threaded through the whole
-    // descent instead of `Binding::default()` per call — the fresh
-    // construction zeroes a 4 KiB value array, which sampling showed as
-    // the single largest block-of-1 overhead. Deeper recursion levels
-    // mutate the shared binding, so re-establish this level's bound-set
-    // (exactly `vars`; stale *values* of unbound variables are never read).
-    let mut bound = VariableSet::new_empty();
-    for &v in vars.iter() {
-        bound.set(v);
-    }
-    binding.bound = bound;
+    let stride = view.stride();
 
     if unbound.is_empty() {
-        for i in 0..n_rows {
+        for row in view.iter() {
             for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &rows[i * stride + k]);
+                binding.set(v, &row[k]);
             }
-            if let Some(r) = post(&binding) {
+            if let Some(r) = post(binding) {
                 results.push(r);
             }
         }
         return;
     }
 
-    // Choose the next variable from the first row's estimates — the same
-    // (magnitude, influence-count) key the sequential engine sorts by,
-    // applied once per block instead of once per branch.
-    for (k, &v) in vars.iter().enumerate() {
-        binding.set(v, &rows[k]);
-    }
-    let (ui, _) = unbound
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, &v)| {
-            let estimate = constraint
-                .estimate(v, &binding)
-                .expect("unconstrained variable in query");
-            variable_order_key(estimate, base_estimates[v], influences[v].count())
-        })
-        .expect("non-empty unbound");
+    let ui = choose_variable(constraint, unbound, view.row_view(0), influences, base_estimates);
     let variable = unbound.swap_remove(ui);
     if order_trace::enabled() {
         order_trace::record(stride, variable, 1);
     }
 
     // Expand the frontier: (parent row, candidate) pairs.
-    let mut pairs: Vec<(u32, RawInline)> = Vec::new();
-    if stride == 0 {
-        let empty = Binding::default();
-        let mut values = Vec::new();
-        constraint.propose(variable, &empty, &mut values);
-        pairs.extend(values.into_iter().map(|v| (0u32, v)));
-    } else {
-        constraint.propose_blocked(variable, vars, rows, &mut pairs);
-    }
+    let mut pairs: Candidates = Vec::new();
+    constraint.propose(variable, view, &mut pairs);
     if blocked_stats::enabled() {
         blocked_stats::record_level(blocked_stats::LevelRecord {
             depth: stride,
@@ -1330,7 +1306,6 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             vars,
             unbound,
             &next_rows,
-            count,
             binding,
             results,
         );
@@ -1346,16 +1321,16 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 /// [`Query::solve_blocked_grouped`].
 ///
 /// One call = one search level for one block chunk:
-/// 1. **Estimate blocked** — one estimate column per unbound variable over
-///    the whole block ([`Constraint::estimate_blocked`]).
+/// 1. **Estimate** — one estimate column per unbound variable over
+///    the whole block ([`Constraint::estimate`]).
 /// 2. **Prefer per row** — argmax of the sequential engine's
 ///    [`variable_order_key`] over the row's column entries (identical
 ///    key, applied per row instead of per level).
 /// 3. **Partition** — stable counting sort of rows by preferred variable:
 ///    up to `|unbound|` groups. A single group borrows the parent block
 ///    (no copy) — the non-skewed fast path.
-/// 4. **Descend each group with its own variable** — propose_blocked over
-///    the group's rows, then recurse in [`block_row_cap`]-row chunks.
+/// 4. **Descend each group with its own variable** — one batched propose
+///    over the group's rows, then recurse in [`block_row_cap`]-row chunks.
 ///
 /// STRETCH (designed, not built — the tree-becomes-DAG upgrade): rows in
 /// *different* groups that bind the same variable-SET in different orders
@@ -1377,27 +1352,20 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     vars: &mut Vec<VariableId>,
     unbound: &mut Vec<VariableId>,
     rows: &[RawInline],
-    n_rows: usize,
     binding: &mut Binding,
     results: &mut Vec<R>,
 ) {
+    let view = RowsView::new(vars, rows);
+    let n_rows = view.len();
     if n_rows == 0 {
         return;
     }
-    let stride = vars.len();
-    // Same shared-binding discipline as `descend_blocked`: re-establish
-    // this level's bound-set; stale values of unbound variables are never
-    // read.
-    let mut bound = VariableSet::new_empty();
-    for &v in vars.iter() {
-        bound.set(v);
-    }
-    binding.bound = bound;
+    let stride = view.stride();
 
     if unbound.is_empty() {
-        for i in 0..n_rows {
+        for row in view.iter() {
             for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &rows[i * stride + k]);
+                binding.set(v, &row[k]);
             }
             if let Some(r) = post(binding) {
                 results.push(r);
@@ -1408,67 +1376,12 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 
     let row_cap = block_row_cap();
 
-    // Level 0: a single empty branch — grouping is vacuous. Choose by the
-    // global estimates and expand with a plain propose, exactly like v1.
-    if stride == 0 {
-        let (ui, _) = unbound
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, &v)| {
-                let estimate = constraint
-                    .estimate(v, binding)
-                    .expect("unconstrained variable in query");
-                variable_order_key(estimate, base_estimates[v], influences[v].count())
-            })
-            .expect("non-empty unbound");
-        let variable = unbound.swap_remove(ui);
-        if order_trace::enabled() {
-            order_trace::record(0, variable, 1);
-        }
-        let mut values: Vec<RawInline> = Vec::new();
-        constraint.propose(variable, binding, &mut values);
-        if blocked_stats::enabled() {
-            blocked_stats::record_level(blocked_stats::LevelRecord {
-                depth: 0,
-                rows: 1,
-                group_sizes: vec![1],
-                batch_sizes: vec![values.len()],
-            });
-        }
-        vars.push(variable);
-        // Child rows are single values — chunk the proposal vec directly.
-        for chunk in values.chunks(row_cap) {
-            if blocked_stats::enabled() {
-                blocked_stats::record_materialized(chunk.len());
-                blocked_stats::cells_add(chunk.len());
-            }
-            descend_grouped(
-                constraint,
-                post,
-                influences,
-                base_estimates,
-                vars,
-                unbound,
-                chunk,
-                chunk.len(),
-                binding,
-                results,
-            );
-            if blocked_stats::enabled() {
-                blocked_stats::cells_sub(chunk.len());
-            }
-        }
-        vars.pop();
-        unbound.push(variable);
-        return;
-    }
-
-    // 1. Estimate blocked: one column per unbound variable.
+    // 1. Estimate: one column per unbound variable over the whole block.
     let n_unbound = unbound.len();
     let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
     for &v in unbound.iter() {
         let mut col = Vec::with_capacity(n_rows);
-        let relevant = constraint.estimate_blocked(v, vars, rows, &mut col);
+        let relevant = constraint.estimate(v, view, &mut col);
         assert!(relevant, "unconstrained variable in query");
         debug_assert_eq!(col.len(), n_rows);
         est_cols.push(col);
@@ -1539,8 +1452,8 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
         if order_trace::enabled() {
             order_trace::record(stride, variable, g_count as u64);
         }
-        let mut pairs: Vec<(u32, RawInline)> = Vec::new();
-        constraint.propose_blocked(variable, vars, g_rows, &mut pairs);
+        let mut pairs: Candidates = Vec::new();
+        constraint.propose(variable, RowsView::new(vars, g_rows), &mut pairs);
         if stats {
             group_sizes_rec.push(g_count);
             batch_sizes_rec.push(pairs.len());
@@ -1580,7 +1493,6 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
                 vars,
                 unbound,
                 &next_rows,
-                count,
                 binding,
                 results,
             );
@@ -1835,27 +1747,16 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 dag_stats::record_pop();
             }
             let stride = bucket.vars.len();
-            let n_rows = if stride == 0 {
-                1 // the virtual seed row
-            } else {
-                bucket.rows.len() / stride
-            };
-            binding.bound = bucket.set;
+            let n_rows = RowsView::new(&bucket.vars, &bucket.rows).len();
 
             // Full-bound bucket: emit.
             if bucket.set == full {
-                if stride == 0 {
+                for row in RowsView::new(&bucket.vars, &bucket.rows).iter() {
+                    for (k, &v) in bucket.vars.iter().enumerate() {
+                        binding.set(v, &row[k]);
+                    }
                     if let Some(r) = postprocessing(&binding) {
                         results.push(r);
-                    }
-                } else {
-                    for i in 0..n_rows {
-                        for (k, &v) in bucket.vars.iter().enumerate() {
-                            binding.set(v, &bucket.rows[i * stride + k]);
-                        }
-                        if let Some(r) = postprocessing(&binding) {
-                            results.push(r);
-                        }
                     }
                 }
                 if stats {
@@ -1932,50 +1833,25 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     }
                 };
 
-            // Seed level: a single empty branch — plain propose.
-            if stride == 0 {
-                let (ui, _) = unbound
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, &v)| {
-                        let estimate = constraint
-                            .estimate(v, &binding)
-                            .expect("unconstrained variable in query");
-                        variable_order_key(estimate, base_estimates[v], influences[v].count())
-                    })
-                    .expect("non-empty unbound");
-                let variable = unbound[ui];
-                if order_trace::enabled() {
-                    order_trace::record(0, variable, 1);
-                }
-                let mut values: Vec<RawInline> = Vec::new();
-                constraint.propose(variable, &binding, &mut values);
-                if stats {
-                    blocked_stats::record_level(blocked_stats::LevelRecord {
-                        depth: 0,
-                        rows: 1,
-                        group_sizes: vec![1],
-                        batch_sizes: vec![values.len()],
-                    });
-                }
-                let pairs: Vec<(u32, RawInline)> =
-                    values.into_iter().map(|v| (0u32, v)).collect();
-                file(&mut buckets, variable, &[], pairs);
-                continue;
-            }
-
             // Process the bucket's rows in cap-sized chunks: estimate,
             // prefer, partition, one batched propose per group, file.
+            // The seed bucket (no columns) is one chunk of one virtual
+            // zero-width row — no special case.
             let mut group_sizes_rec: Vec<usize> = Vec::new();
             let mut batch_sizes_rec: Vec<usize> = Vec::new();
-            for chunk in bucket.rows.chunks(row_cap * stride) {
-                let c_rows = chunk.len() / stride;
+            let mut start_row = 0usize;
+            while start_row < n_rows {
+                let end_row = (start_row + row_cap).min(n_rows);
+                let chunk = &bucket.rows[start_row * stride..end_row * stride];
+                let view = RowsView::new(&bucket.vars, chunk);
+                let c_rows = end_row - start_row;
+                start_row = end_row;
 
                 // 1. Estimate columns.
                 let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
                 for &v in unbound.iter() {
                     let mut col = Vec::with_capacity(c_rows);
-                    let relevant = constraint.estimate_blocked(v, &bucket.vars, chunk, &mut col);
+                    let relevant = constraint.estimate(v, view, &mut col);
                     assert!(relevant, "unconstrained variable in query");
                     debug_assert_eq!(col.len(), c_rows);
                     est_cols.push(col);
@@ -2039,8 +1915,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     if order_trace::enabled() {
                         order_trace::record(stride, variable, g_count as u64);
                     }
-                    let mut pairs: Vec<(u32, RawInline)> = Vec::new();
-                    constraint.propose_blocked(variable, &bucket.vars, g_rows, &mut pairs);
+                    let mut pairs: Candidates = Vec::new();
+                    constraint.propose(variable, RowsView::new(&bucket.vars, g_rows), &mut pairs);
                     if stats {
                         group_sizes_rec.push(g_count);
                         batch_sizes_rec.push(pairs.len());
@@ -2318,20 +2194,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
         // the iterator discards the rest for free).
         if self.buckets[idx].set == self.full {
             let bucket = self.buckets.swap_remove(idx);
-            let stride = bucket.vars.len();
-            self.binding.bound = bucket.set;
-            if stride == 0 {
+            for row in RowsView::new(&bucket.vars, &bucket.rows).iter() {
+                for (k, &v) in bucket.vars.iter().enumerate() {
+                    self.binding.set(v, &row[k]);
+                }
                 if let Some(r) = (self.postprocessing)(&self.binding) {
                     self.emit.push_back(r);
-                }
-            } else {
-                for row in bucket.rows.chunks_exact(stride) {
-                    for (k, &v) in bucket.vars.iter().enumerate() {
-                        self.binding.set(v, &row[k]);
-                    }
-                    if let Some(r) = (self.postprocessing)(&self.binding) {
-                        self.emit.push_back(r);
-                    }
                 }
             }
             if stats {
@@ -2342,41 +2210,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
 
         let stride = self.buckets[idx].vars.len();
 
-        // Seed level: a single virtual empty row — plain propose. Not
-        // width-capped: `propose` has no streaming form, and the
-        // sequential engine materializes the same level-0 candidate Vec.
-        if stride == 0 {
-            let bucket = self.buckets.swap_remove(idx);
-            self.binding.bound = VariableSet::new_empty();
-            let unbound: Vec<VariableId> = self.full.subtract(bucket.set).into_iter().collect();
-            let (ui, _) = unbound
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, &v)| {
-                    let estimate = self
-                        .constraint
-                        .estimate(v, &self.binding)
-                        .expect("unconstrained variable in query");
-                    variable_order_key(estimate, self.base_estimates[v], self.influences[v].count())
-                })
-                .expect("non-empty unbound");
-            let variable = unbound[ui];
-            if order_trace::enabled() {
-                order_trace::record(0, variable, 1);
-            }
-            let mut values: Vec<RawInline> = Vec::new();
-            self.constraint.propose(variable, &self.binding, &mut values);
-            let pairs: Vec<(u32, RawInline)> = values.into_iter().map(|v| (0u32, v)).collect();
-            self.file(bucket.set, &[], variable, &[], pairs);
-            return;
-        }
-
         // Partial pop: take up to `width` rows off the tail; a remainder
         // stays live under the same key (it is its own future feeder —
         // in harvest mode the gate holds its children until it drains,
         // in sprint mode its children out-deepen it and dive first).
-        let n_rows = self.buckets[idx].rows.len() / stride;
-        let take = n_rows.min(width);
+        // The seed bucket is a single virtual zero-width row, so it is
+        // always consumed whole and flows through the generic path.
+        let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
+        let take = n_rows.min(width.max(1));
         let (parent_set, parent_vars, work) = if take == n_rows {
             let b = self.buckets.swap_remove(idx);
             (b.set, b.vars, b.rows)
@@ -2385,6 +2226,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
             let work = b.rows.split_off((n_rows - take) * stride);
             (b.set, b.vars.clone(), work)
         };
+        let view = RowsView::new(&parent_vars, &work);
         let c_rows = take;
         let unbound: Vec<VariableId> = self.full.subtract(parent_set).into_iter().collect();
         let n_unbound = unbound.len();
@@ -2393,9 +2235,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
         let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
         for &v in unbound.iter() {
             let mut col = Vec::with_capacity(c_rows);
-            let relevant = self
-                .constraint
-                .estimate_blocked(v, &parent_vars, &work, &mut col);
+            let relevant = self.constraint.estimate(v, view, &mut col);
             assert!(relevant, "unconstrained variable in query");
             debug_assert_eq!(col.len(), c_rows);
             est_cols.push(col);
@@ -2459,9 +2299,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
             if order_trace::enabled() {
                 order_trace::record(stride, variable, g_count as u64);
             }
-            let mut pairs: Vec<(u32, RawInline)> = Vec::new();
+            let mut pairs: Candidates = Vec::new();
             self.constraint
-                .propose_blocked(variable, &parent_vars, g_rows, &mut pairs);
+                .propose(variable, RowsView::new(&parent_vars, g_rows), &mut pairs);
             self.file(parent_set, &parent_vars, variable, g_rows, pairs);
         }
         if stats {
@@ -2525,7 +2365,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 Search::NextVariable => {
                     self.mode = Search::NextValue;
                     if self.unbound.is_empty() {
-                        if let Some(result) = (self.postprocessing)(&self.binding) {
+                        if let Some(result) = self.emit() {
                             return Some(result);
                         }
                         // Post-processing rejected this binding; continue
@@ -2536,12 +2376,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::NextValue => {
                     if let Some(&variable) = self.stack.last() {
-                        if let Some(assignment) = self.values[variable]
+                        if let Some((_, assignment)) = self.values[variable]
                             .as_mut()
                             .expect("values should be initialized")
                             .pop()
                         {
-                            self.binding.set(variable, &assignment);
+                            *self.row.last_mut().expect("cursor row parallel to stack") =
+                                assignment;
                             self.touched_variables.set(variable);
                             self.mode = Search::NextVariable;
                         } else {
@@ -2554,7 +2395,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::Backtrack => {
                     if let Some(variable) = self.stack.pop() {
-                        self.binding.unset(variable);
+                        self.row.pop();
+                        self.bound.unset(variable);
                         // Note that we did not update estiamtes for the unbound variables
                         // as we are backtracking, so the estimates are still valid.
                         // Since we choose this variable before, we know that it would
@@ -2585,7 +2427,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
             .field("mode", &self.mode)
-            .field("binding", &self.binding)
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
             .finish()
@@ -2715,7 +2556,8 @@ mod parallel {
                         }
                         Search::Backtrack => {
                             if let Some(variable) = q.stack.pop() {
-                                q.binding.unset(variable);
+                                q.row.pop();
+                                q.bound.unset(variable);
                                 q.unbound.push(variable);
                                 q.touched_variables.set(variable);
                                 q.mode = Search::NextValue;
@@ -2741,8 +2583,8 @@ mod parallel {
                         // Descend: pop the single value, bind it,
                         // transition to NextVariable so the outer loop
                         // runs propose.
-                        let assignment = q.values[top].as_mut().unwrap().pop().unwrap();
-                        q.binding.set(top, &assignment);
+                        let (_, assignment) = q.values[top].as_mut().unwrap().pop().unwrap();
+                        *q.row.last_mut().expect("cursor row parallel to stack") = assignment;
                         q.touched_variables.set(top);
                         q.mode = Search::NextVariable;
                     }
@@ -2754,7 +2596,7 @@ mod parallel {
                         // stealing pressure.
                         let vals = q.values[top].as_mut().unwrap();
                         let mid = vals.len() / 2;
-                        let right_vals: Vec<RawInline> = vals.drain(mid..).collect();
+                        let right_vals: Candidates = vals.drain(mid..).collect();
                         let mut right = q.clone();
                         right.values[top] = Some(right_vals);
 
