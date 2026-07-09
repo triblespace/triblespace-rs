@@ -1781,7 +1781,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     continue;
                 }
                 let depth = b.set.count();
-                if best.map_or(true, |(_, bd)| depth > bd) {
+                if best.is_none_or(|(_, bd)| depth > bd) {
                     best = Some((i, depth));
                 }
             }
