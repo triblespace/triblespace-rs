@@ -698,6 +698,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let mut unbound: Vec<VariableId> = variables.into_iter().collect();
         let mut vars: Vec<VariableId> = Vec::new();
         let mut results = Vec::new();
+        let mut binding = Binding::default();
         descend_blocked(
             &constraint,
             &postprocessing,
@@ -706,6 +707,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &mut unbound,
             &[],
             1,
+            &mut binding,
             &mut results,
         );
         results
@@ -803,13 +805,24 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     unbound: &mut Vec<VariableId>,
     rows: &[RawInline],
     n_rows: usize,
+    binding: &mut Binding,
     results: &mut Vec<R>,
 ) {
     if n_rows == 0 {
         return;
     }
     let stride = vars.len();
-    let mut binding = Binding::default();
+    // PROBE (fix experiment): one Binding is threaded through the whole
+    // descent instead of `Binding::default()` per call — the fresh
+    // construction zeroes a 4 KiB value array, which sampling showed as
+    // the single largest block-of-1 overhead. Deeper recursion levels
+    // mutate the shared binding, so re-establish this level's bound-set
+    // (exactly `vars`; stale *values* of unbound variables are never read).
+    let mut bound = VariableSet::new_empty();
+    for &v in vars.iter() {
+        bound.set(v);
+    }
+    binding.bound = bound;
 
     if unbound.is_empty() {
         for i in 0..n_rows {
@@ -880,7 +893,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
         }
         debug_assert_eq!(next_rows.len(), count * new_stride);
         descend_blocked(
-            constraint, post, influences, vars, unbound, &next_rows, count, results,
+            constraint, post, influences, vars, unbound, &next_rows, count, binding, results,
         );
     }
     vars.pop();
