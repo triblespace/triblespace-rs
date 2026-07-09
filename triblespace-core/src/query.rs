@@ -578,7 +578,7 @@ impl EstimateSink<'_> {
 /// block-of-1) this is a direct call on the borrowed buffer — no
 /// grouping, no scratch, no copies.
 pub fn confirm_per_row(
-    view: RowsView<'_>,
+    view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
     mut f: impl FnMut(&[RawInline], &mut Vec<RawInline>),
 ) {
@@ -689,7 +689,7 @@ pub trait Constraint<'a> {
     /// ordering, not correctness. Tighter estimates lead to better search
     /// pruning; see the [Atreides join](crate) family for how estimate
     /// fidelity affects performance.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>)
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>)
         -> bool;
 
     /// Enumerates candidate values for `variable` for every row of the
@@ -699,7 +699,7 @@ pub trait Constraint<'a> {
     /// Called on the constraint with the lowest estimate for the variable
     /// being bound. Does nothing when `variable` is not constrained by
     /// this constraint.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>);
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>);
 
     /// Filters `candidates`, removing `(row, value)` candidates whose
     /// value violates this constraint under that row's bindings, while
@@ -708,7 +708,7 @@ pub trait Constraint<'a> {
     /// Called on every constraint *except* the one that proposed, in
     /// order of increasing estimate. Does nothing when `variable` is not
     /// constrained by this constraint.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>);
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>);
 
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
@@ -725,7 +725,7 @@ pub trait Constraint<'a> {
     /// requires *at least one* per row. The union uses this to skip dead
     /// variants in propose and confirm, preventing values from a
     /// satisfied variant from leaking through a dead one.
-    fn satisfied(&self, _view: RowsView<'_>) -> bool {
+    fn satisfied(&self, _view: &RowsView<'_>) -> bool {
         true
     }
 
@@ -752,22 +752,22 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.satisfied(view)
     }
@@ -784,22 +784,22 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.satisfied(view)
     }
@@ -924,7 +924,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 let mut estimate = 0usize;
                 assert!(
                     self.constraint
-                        .estimate(v, view, &mut EstimateSink::Scalar(&mut estimate)),
+                        .estimate(v, &view, &mut EstimateSink::Scalar(&mut estimate)),
                     "unconstrained variable in query"
                 );
                 self.estimates[v] = estimate;
@@ -948,7 +948,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         values.reserve_exact(estimate.saturating_sub(values.capacity()));
         self.constraint.propose(
             variable,
-            RowsView::new_indexed(&self.stack, &self.row, &self.cols),
+            &RowsView::new_indexed(&self.stack, &self.row, &self.cols),
             &mut CandidateSink::Values(values),
         );
         self.cols[variable] = self.stack.len() as u8;
@@ -1093,7 +1093,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 let mut estimate = 0usize;
                 assert!(
                     constraint
-                        .estimate(v, RowsView::EMPTY, &mut EstimateSink::Scalar(&mut estimate)),
+                        .estimate(v, &RowsView::EMPTY, &mut EstimateSink::Scalar(&mut estimate)),
                     "unconstrained variable in query"
                 );
                 estimate
@@ -1456,7 +1456,7 @@ fn choose_variable<'a, C: Constraint<'a>>(
     for (ui, &v) in unbound.iter().enumerate() {
         let mut est = 0usize;
         assert!(
-            constraint.estimate(v, first, &mut EstimateSink::Scalar(&mut est)),
+            constraint.estimate(v, &first, &mut EstimateSink::Scalar(&mut est)),
             "unconstrained variable in query"
         );
         let key = variable_order_key(est, base_estimates[v], influences[v].count());
@@ -1514,7 +1514,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 
     // Expand the frontier: (parent row, candidate) pairs.
     let mut pairs: Candidates = Vec::new();
-    constraint.propose(variable, view, &mut CandidateSink::Tagged(&mut pairs));
+    constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut pairs));
     if blocked_stats::enabled() {
         blocked_stats::record_level(blocked_stats::LevelRecord {
             depth: stride,
@@ -1630,7 +1630,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
     for &v in unbound.iter() {
         let mut col = Vec::with_capacity(n_rows);
-        let relevant = constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
+        let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
         assert!(relevant, "unconstrained variable in query");
         debug_assert_eq!(col.len(), n_rows);
         est_cols.push(col);
@@ -1704,7 +1704,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
         let mut pairs: Candidates = Vec::new();
         constraint.propose(
             variable,
-            RowsView::new(vars, g_rows),
+            &RowsView::new(vars, g_rows),
             &mut CandidateSink::Tagged(&mut pairs),
         );
         if stats {
@@ -2111,7 +2111,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 for &v in unbound.iter() {
                     let mut col = Vec::with_capacity(c_rows);
                     let relevant =
-                        constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
+                        constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
                     assert!(relevant, "unconstrained variable in query");
                     debug_assert_eq!(col.len(), c_rows);
                     est_cols.push(col);
@@ -2178,7 +2178,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     let mut pairs: Candidates = Vec::new();
                     constraint.propose(
                         variable,
-                        RowsView::new(&bucket.vars, g_rows),
+                        &RowsView::new(&bucket.vars, g_rows),
                         &mut CandidateSink::Tagged(&mut pairs),
                     );
                     if stats {
@@ -2537,7 +2537,7 @@ impl<R> DagState<R> {
         let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
         for &v in unbound.iter() {
             let mut col = Vec::with_capacity(c_rows);
-            let relevant = constraint.estimate(v, view, &mut EstimateSink::Column(&mut col));
+            let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
             assert!(relevant, "unconstrained variable in query");
             debug_assert_eq!(col.len(), c_rows);
             est_cols.push(col);
@@ -2604,7 +2604,7 @@ impl<R> DagState<R> {
             let mut pairs: Candidates = Vec::new();
             constraint.propose(
                 variable,
-                RowsView::new(&parent_vars, g_rows),
+                &RowsView::new(&parent_vars, g_rows),
                 &mut CandidateSink::Tagged(&mut pairs),
             );
             self.file(parent_set, &parent_vars, variable, g_rows, pairs);

@@ -35,7 +35,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
@@ -43,7 +43,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch
@@ -52,7 +52,7 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             candidates.retain(|_, v| self.patch.has_prefix(v));
         }
@@ -98,7 +98,7 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
@@ -106,7 +106,7 @@ where
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
@@ -116,7 +116,7 @@ where
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, _variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         candidates.retain(|_, v| {
             if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)

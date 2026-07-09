@@ -58,14 +58,14 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     // The intersection's estimate is the minimum of the two
     // children's estimates — both are 2, so 2.
     let mut est = Vec::new();
-    assert!(intersection.estimate(doc.index, RowsView::EMPTY, &mut EstimateSink::Column(&mut est)));
+    assert!(intersection.estimate(doc.index, &RowsView::EMPTY, &mut EstimateSink::Column(&mut est)));
     assert_eq!(est, vec![2]);
 
     // `propose` should yield the intersection of the two posting
     // lists. "fox" is in docs {1,3}; "quick" is in docs {1,3};
     // both sets happen to be identical → proposes both.
     let mut props: Candidates = Vec::new();
-    intersection.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+    intersection.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
     let ids: std::collections::HashSet<Id> =
         props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
     assert!(ids.contains(&id(1)));
@@ -95,11 +95,11 @@ fn intersection_with_absent_term_proposes_nothing() {
     // The "banana" constraint's estimate is 0, so the
     // intersection's minimum-estimate is 0.
     let mut est = Vec::new();
-    assert!(intersection.estimate(doc.index, RowsView::EMPTY, &mut EstimateSink::Column(&mut est)));
+    assert!(intersection.estimate(doc.index, &RowsView::EMPTY, &mut EstimateSink::Column(&mut est)));
     assert_eq!(est, vec![0]);
 
     let mut props: Candidates = Vec::new();
-    intersection.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+    intersection.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
     assert!(
         props.is_empty(),
         "no proposals for absent-term intersection"
@@ -128,9 +128,9 @@ fn satisfied_respects_both_clauses() {
 
     // doc = 1: has both "quick" and "fox" → satisfied.
     let row1 = [id_as_raw_value(id(1))];
-    assert!(intersection.satisfied(RowsView::new(&vars, &row1)));
+    assert!(intersection.satisfied(&RowsView::new(&vars, &row1)));
 
     // doc = 2: has "quick" but not "fox" → unsatisfied.
     let row2 = [id_as_raw_value(id(2))];
-    assert!(!intersection.satisfied(RowsView::new(&vars, &row2)));
+    assert!(!intersection.satisfied(&RowsView::new(&vars, &row2)));
 }

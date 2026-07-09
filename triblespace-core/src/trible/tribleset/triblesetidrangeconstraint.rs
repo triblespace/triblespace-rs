@@ -49,7 +49,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         VariableSet::new_singleton(self.variable_e)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_e {
             return false;
         }
@@ -61,7 +61,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_e {
             return;
         }
@@ -74,7 +74,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_e {
             candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
@@ -85,7 +85,7 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_e) {
             Some(col) => view.iter().all(|row| {
                 let Some(id) = id_from_value(&row[col]) else {
@@ -134,7 +134,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         VariableSet::new_singleton(self.variable_a)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_a {
             return false;
         }
@@ -146,7 +146,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_a {
             return;
         }
@@ -159,7 +159,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_a {
             candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
@@ -170,7 +170,7 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         }
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_a) {
             Some(col) => view.iter().all(|row| {
                 let Some(id) = id_from_value(&row[col]) else {

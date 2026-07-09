@@ -45,7 +45,7 @@ fn propose_and_confirm() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(a_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(a_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     let attrs: HashSet<_> = proposals.iter().map(|&(_, v)| v).collect();
     assert_eq!(
         attrs,
@@ -53,7 +53,7 @@ fn propose_and_confirm() {
     );
 
     proposals.push((0, GenId::inline_from(e1).raw));
-    constraint.confirm(a_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(a_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 2);
 }
 
@@ -91,14 +91,14 @@ fn propose_and_confirm_bound_attribute() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     let entities: HashSet<_> = proposals.iter().map(|&(_, v)| v).collect();
     assert_eq!(
         entities,
         [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw].into_iter().collect()
     );
 
-    constraint.confirm(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 2);
 }
 
@@ -136,11 +136,11 @@ fn propose_and_confirm_bound_value() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     let ents: HashSet<_> = proposals.iter().map(|&(_, v)| v).collect();
     assert_eq!(ents, [GenId::inline_from(e1).raw].into_iter().collect());
 
-    constraint.confirm(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 1);
 }
 
@@ -179,11 +179,11 @@ fn propose_and_confirm_two_bound() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(v_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(v_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     let values: HashSet<_> = proposals.iter().map(|&(_, v)| v).collect();
     assert_eq!(values, [v1.raw, v2.raw].into_iter().collect());
 
-    constraint.confirm(v_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(v_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 2);
 
     // entity and value bound -> expect attributes
@@ -192,10 +192,10 @@ fn propose_and_confirm_two_bound() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(a_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(a_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals, vec![(0, GenId::inline_from(a2).raw)]);
 
-    constraint.confirm(a_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(a_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 1);
 
     // attribute and value bound -> expect entities
@@ -204,9 +204,9 @@ fn propose_and_confirm_two_bound() {
     let view = RowsView::new(&vars, &row);
 
     let mut proposals: Candidates = Vec::new();
-    constraint.propose(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.propose(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals, vec![(0, GenId::inline_from(e2).raw)]);
 
-    constraint.confirm(e_var.index, view, &mut CandidateSink::Tagged(&mut proposals));
+    constraint.confirm(e_var.index, &view, &mut CandidateSink::Tagged(&mut proposals));
     assert_eq!(proposals.len(), 1);
 }

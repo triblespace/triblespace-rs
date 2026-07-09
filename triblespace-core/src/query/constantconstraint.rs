@@ -27,7 +27,7 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Always estimates exactly one candidate, for every row.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable != variable {
             return false;
         }
@@ -36,7 +36,7 @@ impl<'a> Constraint<'a> for ConstantConstraint {
     }
 
     /// Proposes the single constant value for every row.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable == variable {
             for i in 0..view.len() as u32 {
                 candidates.push(i, self.constant);
@@ -46,14 +46,14 @@ impl<'a> Constraint<'a> for ConstantConstraint {
 
     /// The constant is binding-independent, so confirm is a single retain
     /// over the whole frontier — no per-row work at all.
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable == variable {
             candidates.retain(|_, v| *v == self.constant);
         }
     }
 
     /// Returns `false` when any row binds the variable to another value.
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable) {
             Some(col) => view.iter().all(|row| row[col] == self.constant),
             None => true,

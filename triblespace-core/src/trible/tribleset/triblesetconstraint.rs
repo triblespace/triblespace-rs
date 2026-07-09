@@ -69,7 +69,7 @@ struct Positions {
 }
 
 impl TribleSetConstraint {
-    fn positions(&self, variable: VariableId, view: RowsView<'_>) -> Positions {
+    fn positions(&self, variable: VariableId, view: &RowsView<'_>) -> Positions {
         Positions {
             e_var: self.variable_e == variable,
             a_var: self.variable_a == variable,
@@ -609,7 +609,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
     /// One [`segmented_len`](crate::patch::PATCH::segmented_len) count per
     /// row; the index dispatch is hoisted out of the row loop.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return false;
@@ -623,7 +623,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// sink variant is matched once; each arm drives the enumeration with
     /// a monomorphized push (the sequential `Values` arm never touches a
     /// row tag).
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -646,7 +646,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// One `has_prefix` probe per candidate; each row's bound positions
     /// are decoded once (candidates are grouped by row). A row whose
     /// bound id fails to decode rejects all of its candidates.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -688,7 +688,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// When all three positions are bound, checks whether each row's
     /// triple exists in the EAV index. Returns `true` optimistically when
     /// any position is still unbound.
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match (
             view.col(self.variable_e),
             view.col(self.variable_a),

@@ -48,7 +48,7 @@ fn arb_tribleset(max: usize) -> impl Strategy<Value = TribleSet> {
 
 /// Single-row estimate helper: the old `estimate(v, &binding) -> Option<usize>`
 /// shape, reconstructed over a view.
-fn est<'a>(c: &impl Constraint<'a>, v: usize, view: RowsView<'_>) -> Option<usize> {
+fn est<'a>(c: &impl Constraint<'a>, v: usize, view: &RowsView<'_>) -> Option<usize> {
     let mut out = Vec::new();
     if c.estimate(v, view, &mut EstimateSink::Column(&mut out)) {
         Some(out[0])
@@ -68,11 +68,11 @@ proptest! {
         let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
-        let estimate = est(&constraint, e.index, RowsView::EMPTY).unwrap();
+        let estimate = est(&constraint, e.index, &RowsView::EMPTY).unwrap();
 
         // Estimate should be >= actual distinct entity count
         let mut proposals: Candidates = Vec::new();
-        constraint.propose(e.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
+        constraint.propose(e.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
         prop_assert!(estimate >= proposals.len(),
             "estimate {} < actual proposals {}", estimate, proposals.len());
     }
@@ -86,7 +86,7 @@ proptest! {
         let constraint = set.pattern(e, a, v);
 
         let mut proposals: Candidates = Vec::new();
-        constraint.propose(e.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
+        constraint.propose(e.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
 
         // Every proposed entity must appear in at least one trible
         for (_, entity_raw) in &proposals {
@@ -138,7 +138,7 @@ proptest! {
             let vars = [e.index, a.index, v.index];
             let row = [e_val, a_val, v_val];
 
-            prop_assert!(constraint.satisfied(RowsView::new(&vars, &row)),
+            prop_assert!(constraint.satisfied(&RowsView::new(&vars, &row)),
                 "existing triple should satisfy constraint");
         }
     }
@@ -164,7 +164,7 @@ proptest! {
             let vars = [e.index, a.index, v.index];
             let row = [e_val, a_val, v_val];
 
-            prop_assert!(!constraint.satisfied(RowsView::new(&vars, &row)),
+            prop_assert!(!constraint.satisfied(&RowsView::new(&vars, &row)),
                 "absent triple should not satisfy constraint");
         }
     }
@@ -296,10 +296,10 @@ proptest! {
             Variable::<UnknownInline>::new(0),
             Inline::<UnknownInline>::new(val),
         );
-        prop_assert_eq!(est(&c, 0, RowsView::EMPTY), Some(1));
+        prop_assert_eq!(est(&c, 0, &RowsView::EMPTY), Some(1));
 
         let mut proposals: Candidates = Vec::new();
-        c.propose(0, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
+        c.propose(0, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], (0u32, val));
     }
@@ -316,7 +316,7 @@ proptest! {
             Inline::<UnknownInline>::new(constant),
         );
         let mut proposals: Candidates = vec![(0, candidate)];
-        c.confirm(0, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
+        c.confirm(0, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut proposals));
 
         if constant == candidate {
             prop_assert_eq!(proposals.len(), 1);
@@ -645,11 +645,11 @@ proptest! {
         let view = RowsView::new(&vars, &row);
 
         // With peer bound, estimate should be 1
-        prop_assert_eq!(est(&eq, 1, view), Some(1));
+        prop_assert_eq!(est(&eq, 1, &view), Some(1));
 
         // Propose should yield the peer's value
         let mut proposals: Candidates = Vec::new();
-        eq.propose(1, view, &mut CandidateSink::Tagged(&mut proposals));
+        eq.propose(1, &view, &mut CandidateSink::Tagged(&mut proposals));
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], (0u32, val));
     }
@@ -667,7 +667,7 @@ proptest! {
         let view = RowsView::new(&vars, &row);
 
         let mut proposals: Candidates = vec![(0, peer_val), (0, other_val)];
-        eq.confirm(1, view, &mut CandidateSink::Tagged(&mut proposals));
+        eq.confirm(1, &view, &mut CandidateSink::Tagged(&mut proposals));
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.len(), 2); // both match
@@ -688,7 +688,7 @@ proptest! {
         let vars = [0usize, 1];
         let row = [a_val, b_val];
 
-        prop_assert_eq!(eq.satisfied(RowsView::new(&vars, &row)), a_val == b_val);
+        prop_assert_eq!(eq.satisfied(&RowsView::new(&vars, &row)), a_val == b_val);
     }
 
     #[test]
@@ -698,12 +698,12 @@ proptest! {
         let eq = EqualityConstraint::new(0, 1);
 
         // Neither bound — optimistically true
-        prop_assert!(eq.satisfied(RowsView::EMPTY));
+        prop_assert!(eq.satisfied(&RowsView::EMPTY));
 
         // One bound — optimistically true
         let vars = [0usize];
         let row = [[42u8; 32]];
-        prop_assert!(eq.satisfied(RowsView::new(&vars, &row)));
+        prop_assert!(eq.satisfied(&RowsView::new(&vars, &row)));
     }
 
     #[test]
@@ -718,12 +718,12 @@ proptest! {
         // Bind a=val, propose for b → val
         let vars_a = [0usize];
         let mut props_b: Candidates = Vec::new();
-        eq.propose(1, RowsView::new(&vars_a, &row), &mut CandidateSink::Tagged(&mut props_b));
+        eq.propose(1, &RowsView::new(&vars_a, &row), &mut CandidateSink::Tagged(&mut props_b));
 
         // Bind b=val, propose for a → val
         let vars_b = [1usize];
         let mut props_a: Candidates = Vec::new();
-        eq.propose(0, RowsView::new(&vars_b, &row), &mut CandidateSink::Tagged(&mut props_a));
+        eq.propose(0, &RowsView::new(&vars_b, &row), &mut CandidateSink::Tagged(&mut props_a));
 
         prop_assert_eq!(props_a, props_b);
     }

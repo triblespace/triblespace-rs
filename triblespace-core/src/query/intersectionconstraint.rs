@@ -51,7 +51,7 @@ where
     /// The scalar (single-row cursor) arm folds child estimates through
     /// stack slots — no column scratch is ever allocated on the
     /// sequential engine's path.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         match out {
             EstimateSink::Scalar(slot) => {
                 let mut any = false;
@@ -102,24 +102,24 @@ where
     /// borrowed view, and every relevant child confirms the full frontier
     /// — re-confirming a child's own pairs is a wasted-work cost, never a
     /// correctness one.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         // The sequential cursor (a Values sink is always a block of 1):
         // scalar child estimates in stack slots, argmin, propose, ordered
         // confirms — no estimate columns, no heap scratch.
         if matches!(candidates, CandidateSink::Values(_)) {
-            let mut relevant: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+            let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
             for (ci, c) in self.constraints.iter().enumerate() {
                 let mut e = 0usize;
                 if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
                     relevant.push((e, ci));
                 }
             }
-            let Some(&(_, proposer)) = relevant.iter().min_by_key(|&&(e, _)| e) else {
+            if relevant.is_empty() {
                 return;
-            };
-            self.constraints[proposer].propose(variable, view, candidates);
+            }
             relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
-            for &(_, ci) in relevant.iter().filter(|&&(_, ci)| ci != proposer) {
+            self.constraints[relevant[0].1].propose(variable, view, candidates);
+            for &(_, ci) in &relevant[1..] {
                 self.constraints[ci].confirm(variable, view, candidates);
             }
             return;
@@ -130,7 +130,7 @@ where
         // Pass 1: per-child estimate columns (flat, child-major) — the
         // same cardinality data drives proposer choice AND confirm order.
         let mut cols: Vec<usize> = Vec::new();
-        let mut relevant: SmallVec<[usize; 8]> = SmallVec::new();
+        let mut relevant: SmallVec<[usize; 16]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {
             if c.estimate(variable, view, &mut EstimateSink::Column(&mut cols)) {
                 relevant.push(ci);
@@ -141,7 +141,7 @@ where
         }
 
         // Pass 2: per-row proposer = argmin across the columns.
-        let mut propose_counts: SmallVec<[usize; 8]> = SmallVec::from_elem(0, relevant.len());
+        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::from_elem(0, relevant.len());
         let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
         for i in 0..n_rows {
             let k = (0..relevant.len())
@@ -159,14 +159,14 @@ where
             for (i, &k) in proposers.iter().enumerate() {
                 let row_view = view.row_view(i);
                 let base = candidates.len();
-                self.constraints[relevant[k as usize]].propose(variable, row_view, candidates);
+                self.constraints[relevant[k as usize]].propose(variable, &row_view, candidates);
                 candidates.retag_from(base, i as u32);
             }
         }
 
         // Pass 4: whole-frontier confirms, cheapest (first-row estimate)
         // child first. The uniform proposer skips its own pass.
-        let mut confirmers: SmallVec<[(usize, usize); 8]> = relevant
+        let mut confirmers: SmallVec<[(usize, usize); 16]> = relevant
             .iter()
             .enumerate()
             .filter(|&(k, _)| uniform != Some(k))
@@ -180,12 +180,12 @@ where
 
     /// Confirms a whole frontier through every relevant child in
     /// ascending (first-row) estimate order.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let first = view.row_view(0);
-        let mut relevant: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+        let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {
             let mut est = 0usize;
-            if c.estimate(variable, first, &mut EstimateSink::Scalar(&mut est)) {
+            if c.estimate(variable, &first, &mut EstimateSink::Scalar(&mut est)) {
                 relevant.push((est, ci));
             }
         }
@@ -196,7 +196,7 @@ where
     }
 
     /// Returns `true` only when **every** child is satisfied.
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.constraints.iter().all(|c| c.satisfied(view))
     }
 

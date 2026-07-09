@@ -23,7 +23,7 @@ impl EqualityConstraint {
 
     /// Column of the peer of `variable` in `view`, when `variable` is
     /// one of the constrained pair and the peer is bound.
-    fn peer_col(&self, variable: VariableId, view: RowsView<'_>) -> Option<usize> {
+    fn peer_col(&self, variable: VariableId, view: &RowsView<'_>) -> Option<usize> {
         let peer = if variable == self.a {
             self.b
         } else if variable == self.b {
@@ -49,7 +49,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     /// cardinality and defers to other constraints in the intersection.
     /// This is safe as long as each variable also appears in at least
     /// one other constraint (which the macro desugaring guarantees).
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.peer_col(variable, view).is_none() {
             return false;
         }
@@ -58,7 +58,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// Proposes each row's peer value.
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let Some(col) = self.peer_col(variable, view) else {
             return;
         };
@@ -68,7 +68,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// Retains only candidates matching their row's peer value.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         let Some(col) = self.peer_col(variable, view) else {
             return;
         };
@@ -76,7 +76,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
     }
 
     /// Returns `false` when any row binds the pair to different values.
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match (view.col(self.a), view.col(self.b)) {
             (Some(ca), Some(cb)) => view.iter().all(|row| row[ca] == row[cb]),
             _ => true,

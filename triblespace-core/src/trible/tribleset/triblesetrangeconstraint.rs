@@ -65,7 +65,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_v {
             return false;
         }
@@ -73,7 +73,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_v {
             return;
         }
@@ -90,13 +90,13 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_v {
             candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
             Some(col) => view
                 .iter()
@@ -221,7 +221,7 @@ mod tests {
         let mut est = Vec::new();
         assert!(constraint.estimate(
             v.index,
-            RowsView::EMPTY,
+            &RowsView::EMPTY,
             &mut crate::query::EstimateSink::Column(&mut est)
         ));
         // Three distinct values in range. Before the fix this returned 6.

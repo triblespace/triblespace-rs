@@ -116,7 +116,7 @@ impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    fn positions(&self, variable: VariableId, view: RowsView<'_>) -> Positions {
+    fn positions(&self, variable: VariableId, view: &RowsView<'_>) -> Positions {
         Positions {
             e_var: self.variable_e == variable,
             a_var: self.variable_a == variable,
@@ -343,7 +343,7 @@ where
     /// loop. Batching the resulting rank stream (CPU-fused or on the GPU
     /// ring) is possible exactly like confirm's and remains deferred —
     /// it only changes constants, not calls.
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return false;
@@ -370,7 +370,7 @@ where
     /// falls through to the per-row path. (Confirm is different: its
     /// batch is cache-friendlier even on CPU, so `confirm` always
     /// batches.)
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -533,7 +533,7 @@ where
     /// The probe stream is evaluated CPU-batched by default, or as one
     /// `rank_batch` GPU dispatch when the archive's GPU ring is enabled
     /// and the stream is above the sync break-even threshold.
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;

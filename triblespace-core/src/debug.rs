@@ -29,20 +29,20 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+        fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
             self.constraint.estimate(variable, view, out)
         }
 
-        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.record.borrow_mut().push(variable);
             self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.confirm(variable, view, candidates);
         }
 
-        fn satisfied(&self, view: RowsView<'_>) -> bool {
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.constraint.satisfied(view)
         }
 
@@ -87,7 +87,7 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+        fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
             if let Some(estimate) = self.estimates[variable] {
                 out.fill(estimate, view.len());
                 true
@@ -96,15 +96,15 @@ pub mod query {
             }
         }
 
-        fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+        fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
             self.constraint.confirm(variable, view, candidates);
         }
 
-        fn satisfied(&self, view: RowsView<'_>) -> bool {
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.constraint.satisfied(view)
         }
 

@@ -85,7 +85,7 @@ where
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.variable_v {
             return false;
         }
@@ -93,7 +93,7 @@ where
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.variable_v {
             return;
         }
@@ -107,13 +107,13 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable == self.variable_v {
             candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.variable_v) {
             Some(col) => view
                 .iter()

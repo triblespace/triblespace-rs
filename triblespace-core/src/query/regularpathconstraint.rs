@@ -672,7 +672,7 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
             let mut out = 0usize;
             if constraint.estimate(
                 dest_idx,
-                RowsView::new(&vars, &row),
+                &RowsView::new(&vars, &row),
                 &mut EstimateSink::Scalar(&mut out),
             ) {
                 out
@@ -1171,7 +1171,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         vars
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.start && variable != self.end {
             return false;
         }
@@ -1183,7 +1183,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.start && variable != self.end {
             return;
         }
@@ -1202,7 +1202,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.start && variable != self.end {
             return;
         }

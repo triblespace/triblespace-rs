@@ -335,7 +335,7 @@ where
         VariableSet::new_singleton(self.doc.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.doc.index {
             return false;
         }
@@ -343,7 +343,7 @@ where
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.doc.index {
             return;
         }
@@ -352,7 +352,7 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.doc.index {
             return;
         }
@@ -360,7 +360,7 @@ where
         candidates.retain(|_, raw| valid.contains(raw));
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.doc.index) {
             Some(col) => view
                 .iter()
@@ -510,7 +510,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.a.index && variable != self.b.index {
             return false;
         }
@@ -536,7 +536,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -561,7 +561,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         }
     }
 
-    fn confirm(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
@@ -594,7 +594,7 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
         });
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match (view.col(self.a.index), view.col(self.b.index)) {
             (Some(ca), Some(cb)) => view.iter().all(|row| {
                 // Both bound: compute cosine directly. No engine
@@ -701,7 +701,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         VariableSet::new_singleton(self.var.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if variable != self.var.index {
             return false;
         }
@@ -709,7 +709,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.var.index {
             return;
         }
@@ -718,7 +718,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if variable != self.var.index {
             return;
         }
@@ -726,7 +726,7 @@ impl<'a> Constraint<'a> for SimilarTo {
         candidates.retain(|_, raw| allowed.contains(raw));
     }
 
-    fn satisfied(&self, view: RowsView<'_>) -> bool {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match view.col(self.var.index) {
             Some(col) => view
                 .iter()
@@ -753,7 +753,7 @@ mod tests {
 
     /// Single-row estimate helper: the old `estimate(v, &binding) ->
     /// Option<usize>` shape, reconstructed over a view.
-    fn est<'a>(c: &impl Constraint<'a>, v: VariableId, view: RowsView<'_>) -> Option<usize> {
+    fn est<'a>(c: &impl Constraint<'a>, v: VariableId, view: &RowsView<'_>) -> Option<usize> {
         let mut out = Vec::new();
         if c.estimate(v, view, &mut EstimateSink::Column(&mut out)) {
             Some(out[0])
@@ -810,8 +810,8 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         // "fox" appears in doc 1 and doc 3.
-        assert_eq!(est(&c, doc.index, RowsView::EMPTY), Some(2));
-        assert_eq!(est(&c, 255, RowsView::EMPTY), None);
+        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(2));
+        assert_eq!(est(&c, 255, &RowsView::EMPTY), None);
     }
 
     #[test]
@@ -823,7 +823,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+        c.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert_eq!(props.len(), 2);
 
         let ids: HashSet<Id> = props
@@ -847,7 +847,7 @@ mod tests {
             (0, id_to_raw_value(id(2))),
             (0, id_to_raw_value(id(3))),
         ];
-        c.confirm(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+        c.confirm(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         let ids: HashSet<Id> = props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));
@@ -863,14 +863,14 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert!(c.satisfied(RowsView::EMPTY));
+        assert!(c.satisfied(&RowsView::EMPTY));
 
         let vars = [doc.index];
         let bound = [id_to_raw_value(id(1))];
-        assert!(c.satisfied(RowsView::new(&vars, &bound)));
+        assert!(c.satisfied(&RowsView::new(&vars, &bound)));
 
         let unmatching = [id_to_raw_value(id(2))];
-        assert!(!c.satisfied(RowsView::new(&vars, &unmatching)));
+        assert!(!c.satisfied(&RowsView::new(&vars, &unmatching)));
     }
 
     #[test]
@@ -884,7 +884,7 @@ mod tests {
         let c = idx.matches(doc, &terms, 0.0);
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+        c.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         let ids: HashSet<Id> = props
             .iter()
             .map(|(_, r)| raw_value_to_id(r).expect("genid"))
@@ -909,8 +909,8 @@ mod tests {
 
         let mut props_a: Candidates = Vec::new();
         let mut props_b: Candidates = Vec::new();
-        explicit.propose(doc_a.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_a));
-        sugar.propose(doc_b.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_b));
+        explicit.propose(doc_a.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_a));
+        sugar.propose(doc_b.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props_b));
 
         let set_a: HashSet<Id> = props_a
             .iter()
@@ -960,14 +960,14 @@ mod tests {
         let c_mid = idx.matches(doc, &terms, (s1 + s2) / 2.0);
 
         let mut low_props: Candidates = Vec::new();
-        c_low.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut low_props));
+        c_low.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut low_props));
         let low_ids: HashSet<Id> =
             low_props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert!(low_ids.contains(&id(1)));
         assert!(low_ids.contains(&id(2)));
 
         let mut mid_props: Candidates = Vec::new();
-        c_mid.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut mid_props));
+        c_mid.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut mid_props));
         let mid_ids: HashSet<Id> =
             mid_props.iter().map(|(_, r)| raw_value_to_id(r).unwrap()).collect();
         assert!(mid_ids.contains(&id(1)));
@@ -1015,10 +1015,10 @@ mod tests {
         let terms: Vec<triblespace_core::inline::Inline<crate::tokens::WordHash>> = Vec::new();
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert_eq!(est(&c, doc.index, RowsView::EMPTY), Some(0));
+        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(0));
 
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+        c.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert!(props.is_empty());
     }
 
@@ -1030,9 +1030,9 @@ mod tests {
         let terms = hash_tokens("aardvark zeppelin");
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert_eq!(est(&c, doc.index, RowsView::EMPTY), Some(0));
+        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(0));
         let mut props: Candidates = Vec::new();
-        c.propose(doc.index, RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
+        c.propose(doc.index, &RowsView::EMPTY, &mut CandidateSink::Tagged(&mut props));
         assert!(props.is_empty());
     }
 
@@ -1086,7 +1086,7 @@ mod tests {
         let row = [handles[0].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(b.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
+        c.propose(b.index, &RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
@@ -1108,7 +1108,7 @@ mod tests {
         let row = [handles[2].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(a.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
+        c.propose(a.index, &RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
@@ -1127,10 +1127,10 @@ mod tests {
 
         let vars = [a.index, b.index];
         let good = [handles[0].raw, handles[2].raw];
-        assert!(c.satisfied(RowsView::new(&vars, &good)));
+        assert!(c.satisfied(&RowsView::new(&vars, &good)));
 
         let bad = [handles[0].raw, handles[1].raw];
-        assert!(!c.satisfied(RowsView::new(&vars, &bad)));
+        assert!(!c.satisfied(&RowsView::new(&vars, &bad)));
     }
 
     #[test]
@@ -1148,7 +1148,7 @@ mod tests {
         let row = [handles[0].raw];
 
         let mut props: Candidates = Vec::new();
-        c.propose(b.index, RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
+        c.propose(b.index, &RowsView::new(&vars, &row), &mut CandidateSink::Tagged(&mut props));
         let got: HashSet<RawInline> = props.iter().map(|&(_, v)| v).collect();
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
@@ -1167,8 +1167,8 @@ mod tests {
         let unrelated: Variable<GenId> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
 
-        assert_eq!(est(&c, a.index, RowsView::EMPTY), Some(usize::MAX));
-        assert_eq!(est(&c, b.index, RowsView::EMPTY), Some(usize::MAX));
-        assert_eq!(est(&c, unrelated.index, RowsView::EMPTY), None);
+        assert_eq!(est(&c, a.index, &RowsView::EMPTY), Some(usize::MAX));
+        assert_eq!(est(&c, b.index, &RowsView::EMPTY), Some(usize::MAX));
+        assert_eq!(est(&c, unrelated.index, &RowsView::EMPTY), None);
     }
 }

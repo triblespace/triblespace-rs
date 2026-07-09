@@ -42,7 +42,7 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
         if self.variable.index != variable {
             return false;
         }
@@ -51,7 +51,7 @@ where
         true
     }
 
-    fn propose(&self, variable: VariableId, view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
@@ -59,7 +59,7 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         if self.variable.index == variable {
             candidates.retain(|_, v| {
                 match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
