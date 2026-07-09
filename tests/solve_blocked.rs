@@ -27,6 +27,17 @@ mod world {
         "FDD49F6E08AC2CCB79EE6C8B1256AD02" as p: inlineencodings::GenId;
         "A4D08AA59273B336F5B977CE1511D141" as q: inlineencodings::GenId;
         "27791B9EFCFADF397CFDBCDEE0B1FB22" as r: inlineencodings::GenId;
+        // PROBE (dag-frontier) reconvergence fixture attributes:
+        "3C3FCF6D97AE8EBF7C0927B5E317A4B8" as rp1: inlineencodings::GenId;
+        "E0D70C1FB8E95BE40A6A02218DA7C8C0" as rp2: inlineencodings::GenId;
+        "9398CD61E3D8A87B8C26B9647473F8E0" as rp3: inlineencodings::GenId;
+        "A771D8F7C3BE63EB0EC6BA6682C2A412" as rp4: inlineencodings::GenId;
+        "92C2F2C22151123A359A2F7F51F3519A" as rt1: inlineencodings::GenId;
+        "357DC9D201D1A0FDC4569C740219F831" as rt2: inlineencodings::GenId;
+        "8FB9F5E089C3212D899E8787DC1FA0AD" as rt3: inlineencodings::GenId;
+        "10515585D7503F3EFCCCB994A3418577" as rt4: inlineencodings::GenId;
+        "0EFC41641FCD73A30E2414AE78DEC219" as rs: inlineencodings::GenId;
+        "BCB248E3850EA6ACF22E7B175B574E12" as rtz: inlineencodings::GenId;
     }
 }
 
@@ -91,6 +102,18 @@ macro_rules! gate {
         assert_eq!(
             sequential, grouped,
             "solve_blocked_grouped diverged from the sequential engine on {}",
+            $name
+        );
+        let dag = multiset($q.solve_dag());
+        assert_eq!(
+            sequential, dag,
+            "solve_dag diverged from the sequential engine on {}",
+            $name
+        );
+        let dag_unmerged = multiset($q.solve_dag_unmerged());
+        assert_eq!(
+            sequential, dag_unmerged,
+            "solve_dag_unmerged diverged from the sequential engine on {}",
             $name
         );
         assert!(
@@ -228,6 +251,172 @@ fn gate_skew<S: TriblePattern>(kb: &S, expected: usize) {
             (e: Inline<_>, x: Inline<_>, y: Inline<_>),
             pattern!(kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
         )
+    );
+}
+
+/// PROBE (dag-frontier) reconvergence world: sub-populations whose rows
+/// bind the middle variables in **all 24 orders**, so their routes through
+/// the bound-set lattice reconverge pairwise at every level and totally at
+/// `{e, x1..x4}` — with the expensive shared variable `?z` still unbound.
+///
+/// Per entity of pop σ (a permutation of the four p-attributes): attribute
+/// `p_{σ(k)}` carries `fans[k] ∈ {1,2,4,8}` values, exactly one of which
+/// has the marker edge `t_i → K_i`. After `?e` binds, the row's estimates
+/// for the x-variables are its fan assignment, so it walks σ exactly
+/// (ascending fans), and each level's marker confirm prunes the frontier
+/// back to one row per entity — routes stay THIN (n rows each) while
+/// there are many (24) of them. `?z` has `z_fan > 8` candidates per row
+/// (chosen last everywhere) pruned to one by its own marker: the final
+/// expensive shared work whose batch the merge re-fattens 24×.
+///
+/// Expected results: exactly one row per entity.
+fn build_reconverge_world(
+    n_per_pop: usize,
+    z_fan: usize,
+) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
+    assert!(z_fan > 8, "z must be chosen after every x (fans go up to 8)");
+    let mut kb = TribleSet::new();
+    let markers: Vec<_> = (0..4).map(|_| ufoid()).collect();
+    let z_marker = ufoid();
+    let fans = [1usize, 2, 4, 8];
+
+    // All 24 permutations of [0, 1, 2, 3].
+    let mut perms: Vec<[usize; 4]> = Vec::new();
+    for a in 0..4 {
+        for b in 0..4 {
+            if b == a {
+                continue;
+            }
+            for c in 0..4 {
+                if c == a || c == b {
+                    continue;
+                }
+                let d = 6 - a - b - c;
+                perms.push([a, b, c, d]);
+            }
+        }
+    }
+    assert_eq!(perms.len(), 24);
+
+    for sigma in &perms {
+        for _ in 0..n_per_pop {
+            let e = ufoid();
+            for (k, &attr_idx) in sigma.iter().enumerate() {
+                let values: Vec<_> = (0..fans[k]).map(|_| ufoid()).collect();
+                for v in &values {
+                    kb += match attr_idx {
+                        0 => entity! { &e @ world::rp1: v },
+                        1 => entity! { &e @ world::rp2: v },
+                        2 => entity! { &e @ world::rp3: v },
+                        _ => entity! { &e @ world::rp4: v },
+                    };
+                }
+                let real = &values[0];
+                let marker = &markers[attr_idx];
+                kb += match attr_idx {
+                    0 => entity! { real @ world::rt1: marker },
+                    1 => entity! { real @ world::rt2: marker },
+                    2 => entity! { real @ world::rt3: marker },
+                    _ => entity! { real @ world::rt4: marker },
+                };
+            }
+            let z_values: Vec<_> = (0..z_fan).map(|_| ufoid()).collect();
+            for v in &z_values {
+                kb += entity! { &e @ world::rs: v };
+            }
+            kb += entity! { &z_values[0] @ world::rtz: &z_marker };
+        }
+    }
+    let expected = 24 * n_per_pop;
+    (
+        kb,
+        (
+            *markers[0],
+            *markers[1],
+            *markers[2],
+            *markers[3],
+            *z_marker,
+        ),
+        expected,
+    )
+}
+
+fn gate_reconverge<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    expected: usize,
+) {
+    let (k1, k2, k3, k4, kz) = markers;
+    let seq: Vec<_> = find!(
+        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+        pattern!(kb, [
+            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+            { ?x1 @ world::rt1: k1 },
+            { ?x2 @ world::rt2: k2 },
+            { ?x3 @ world::rt3: k3 },
+            { ?x4 @ world::rt4: k4 },
+            { ?z @ world::rtz: kz }
+        ])
+    )
+    .collect();
+    assert_eq!(
+        seq.len(),
+        expected,
+        "reconvergence world must yield one row per entity"
+    );
+    gate!(
+        "reconverge ?e p1-4 ?x1-4 . markers . ?e s ?z . marker",
+        find!(
+            (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+            pattern!(kb, [
+                { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+                { ?x1 @ world::rt1: k1 },
+                { ?x2 @ world::rt2: k2 },
+                { ?x3 @ world::rt3: k3 },
+                { ?x4 @ world::rt4: k4 },
+                { ?z @ world::rtz: kz }
+            ])
+        )
+    );
+}
+
+#[test]
+fn dag_matches_sequential_on_reconverge_tribleset() {
+    let (kb, markers, expected) = build_reconverge_world(3, 16);
+    gate_reconverge(&kb, markers, expected);
+}
+
+#[test]
+fn dag_matches_sequential_on_reconverge_succinctarchive() {
+    let (kb, markers, expected) = build_reconverge_world(3, 16);
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    gate_reconverge(&archive, markers, expected);
+}
+
+#[test]
+fn dag_merges_on_reconverge_fixture() {
+    use triblespace::core::query::dag_stats;
+    let (kb, (k1, k2, k3, k4, kz), expected) = build_reconverge_world(3, 16);
+    dag_stats::set_enabled(true);
+    dag_stats::reset();
+    let rows = find!(
+        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+        pattern!(&kb, [
+            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+            { ?x1 @ world::rt1: k1 },
+            { ?x2 @ world::rt2: k2 },
+            { ?x3 @ world::rt3: k3 },
+            { ?x4 @ world::rt4: k4 },
+            { ?z @ world::rtz: kz }
+        ])
+    )
+    .solve_dag();
+    dag_stats::set_enabled(false);
+    assert_eq!(rows.len(), expected);
+    assert!(
+        dag_stats::merge_events() > 0,
+        "the reconvergence fixture must actually exercise cross-parent merging \
+         (got 0 merge events — the fixture or the scheduler is broken)"
     );
 }
 

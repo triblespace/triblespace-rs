@@ -29,7 +29,7 @@
 use std::time::Instant;
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::query::{blocked_stats, TriblePattern};
+use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::*;
 
@@ -114,6 +114,8 @@ enum Mode {
     Seq,
     Blk,
     Grp,
+    Dag,
+    DagU,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
@@ -125,6 +127,8 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
         Mode::Seq => tally(q),
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
+        Mode::Dag => tally(q.solve_dag()),
+        Mode::DagU => tally(q.solve_dag_unmerged()),
     }
 }
 
@@ -135,7 +139,13 @@ fn median(v: &[f64]) -> f64 {
 }
 
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
-    let modes = [("seq", Mode::Seq), ("blk", Mode::Blk), ("grp", Mode::Grp)];
+    let modes = [
+        ("seq", Mode::Seq),
+        ("blk", Mode::Blk),
+        ("grp", Mode::Grp),
+        ("dag", Mode::Dag),
+        ("dagu", Mode::DagU),
+    ];
     let mut sigs = Vec::new();
     let mut meds = Vec::new();
     for &(_, mode) in &modes {
@@ -151,25 +161,33 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
-        "{label:<28} rows {:>8}  seq {:>9.2} ms  blk {:>9.2} ms  grp {:>9.2} ms  \
-         blk/seq {:>6.3}x  grp/seq {:>6.3}x  grp/blk {:>6.3}x  {}",
+        "{label:<28} rows {:>8}  seq {:>9.2} ms  blk {:>9.2}  grp {:>9.2}  dag {:>9.2}  dagu {:>9.2}  \
+         grp/seq {:>6.3}x  dag/grp {:>6.3}x  dag/dagu {:>6.3}x  {}",
         sigs[0].0,
         meds[0],
         meds[1],
         meds[2],
-        meds[1] / meds[0],
+        meds[3],
+        meds[4],
         meds[2] / meds[0],
-        meds[2] / meds[1],
+        meds[3] / meds[2],
+        meds[3] / meds[4],
         if parity { "ok" } else { "MISMATCH" }
     );
     // Instrumented single passes: group/batch structure + intermediates.
     blocked_stats::set_enabled(true);
+    dag_stats::set_enabled(true);
     for &(name, mode) in &modes[1..] {
         blocked_stats::reset();
+        dag_stats::reset();
         run_query(kb, mode);
         println!("  {name}: {}", blocked_stats::report());
+        if mode == Mode::Dag || mode == Mode::DagU {
+            println!("  {name} buckets: {}", dag_stats::report());
+        }
     }
     blocked_stats::set_enabled(false);
+    dag_stats::set_enabled(false);
 }
 
 fn main() {

@@ -59,6 +59,8 @@ enum Mode {
     Seq,
     Blk,
     Grp,
+    Dag,
+    DagU,
 }
 
 #[cfg(feature = "gpu")]
@@ -68,6 +70,8 @@ macro_rules! run {
             Mode::Seq => tally($q),
             Mode::Blk => tally($q.solve_blocked()),
             Mode::Grp => tally($q.solve_blocked_grouped()),
+            Mode::Dag => tally($q.solve_dag()),
+            Mode::DagU => tally($q.solve_dag_unmerged()),
         }
     };
 }
@@ -326,10 +330,19 @@ fn main() {
             order_trace::set_enabled(true);
             order_trace::reset();
             if mode != Mode::Seq {
+                use triblespace::core::query::dag_stats;
                 blocked_stats::set_enabled(true);
+                dag_stats::set_enabled(true);
                 blocked_stats::reset();
+                dag_stats::reset();
                 q(archive, mode);
-                pass.block_stats.push(blocked_stats::report());
+                if mode == Mode::Dag || mode == Mode::DagU {
+                    pass.block_stats
+                        .push(format!("{} | {}", blocked_stats::report(), dag_stats::report()));
+                } else {
+                    pass.block_stats.push(blocked_stats::report());
+                }
+                dag_stats::set_enabled(false);
                 blocked_stats::set_enabled(false);
             } else {
                 q(archive, mode);
@@ -355,6 +368,8 @@ fn main() {
     let cpu_seq = run_pass("cpu-seq", &archive, Mode::Seq);
     let cpu_blk = run_pass("cpu-blk", &archive, Mode::Blk);
     let cpu_grp = run_pass("cpu-grp", &archive, Mode::Grp);
+    let cpu_dag = run_pass("cpu-dag", &archive, Mode::Dag);
+    let cpu_dagu = run_pass("cpu-dagu", &archive, Mode::DagU);
 
     let (gpu_seq, gpu_blk, gpu_grp) = if cpu_only {
         eprintln!("TRIBLES_PROBE_CPU_ONLY set: skipping gpu passes");
@@ -378,19 +393,23 @@ fn main() {
     }
     println!();
     println!(
-        "{:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7}  parity",
-        "query", "rows", "cpuseq ms", "cpublk ms", "cpugrp ms", "gpuseq ms", "gpublk ms", "gpugrp ms", "cblk x", "cgrp x", "gseq x", "gblk x", "ggrp x"
+        "{:<38} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  parity",
+        "query", "rows", "cpuseq ms", "cpublk ms", "cpugrp ms", "cpudag ms", "cpudagu ms", "gpuseq ms", "gpublk ms", "gpugrp ms", "cblk x", "cgrp x", "cdag x", "cdagu x", "gseq x", "gblk x", "ggrp x"
     );
     for (i, (name, _)) in queries.iter().enumerate() {
         let cs = median(&cpu_seq.times[i]);
         let cb = median(&cpu_blk.times[i]);
         let cg = median(&cpu_grp.times[i]);
+        let cd = median(&cpu_dag.times[i]);
+        let cdu = median(&cpu_dagu.times[i]);
         let gs = gpu_seq.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
         let gb = gpu_blk.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
         let gg = gpu_grp.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
         let parity = [
             Some(&cpu_blk),
             Some(&cpu_grp),
+            Some(&cpu_dag),
+            Some(&cpu_dagu),
             gpu_seq.as_ref(),
             gpu_blk.as_ref(),
             gpu_grp.as_ref(),
@@ -399,17 +418,21 @@ fn main() {
         .flatten()
         .all(|p| p.sigs[i] == cpu_seq.sigs[i]);
         println!(
-            "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x  {}",
+            "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x {:>6.2}x  {}",
             name,
             cpu_seq.sigs[i].0,
             cs,
             cb,
             cg,
+            cd,
+            cdu,
             gs,
             gb,
             gg,
             cs / cb,
             cs / cg,
+            cs / cd,
+            cs / cdu,
             cs / gs,
             cs / gb,
             cs / gg,
@@ -429,6 +452,8 @@ fn main() {
         }
         println!("  cpu-blk blocks: {}", cpu_blk.block_stats[i]);
         println!("  cpu-grp blocks: {}", cpu_grp.block_stats[i]);
+        println!("  cpu-dag blocks: {}", cpu_dag.block_stats[i]);
+        println!("  cpu-dagu blocks: {}", cpu_dagu.block_stats[i]);
         println!("  cpu-seq order:  {}", cpu_seq.orders[i]);
         println!("  cpu-blk order:  {}", cpu_blk.orders[i]);
         println!("  cpu-grp order:  {}", cpu_grp.orders[i]);
