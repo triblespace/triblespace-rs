@@ -292,12 +292,15 @@ fn main() {
         times: Vec<Vec<f64>>,
         sigs: Vec<(usize, u64)>,
         stats: Vec<String>,
+        block_stats: Vec<String>,
     }
     let run_pass = |label: &str, archive: &SuccinctArchive<OrderedUniverse>, mode: Mode| {
+        use triblespace::core::query::blocked_stats;
         let mut pass = Pass {
             times: Vec::new(),
             sigs: Vec::new(),
             stats: Vec::new(),
+            block_stats: Vec::new(),
         };
         for (name, q) in &queries {
             let mut times = Vec::new();
@@ -315,6 +318,17 @@ fn main() {
             pass.times.push(times);
             pass.sigs.push(sig);
             pass.stats.push(stats::report());
+            // One instrumented (untimed) run: group counts / batch sizes /
+            // materialized intermediate rows for the blocked engines.
+            if mode != Mode::Seq {
+                blocked_stats::set_enabled(true);
+                blocked_stats::reset();
+                q(archive, mode);
+                pass.block_stats.push(blocked_stats::report());
+                blocked_stats::set_enabled(false);
+            } else {
+                pass.block_stats.push(String::new());
+            }
         }
         pass
     };
@@ -401,5 +415,7 @@ fn main() {
         if let Some(p) = &gpu_grp {
             println!("  gpu-grp probes: {}", p.stats[i]);
         }
+        println!("  cpu-blk blocks: {}", cpu_blk.block_stats[i]);
+        println!("  cpu-grp blocks: {}", cpu_grp.block_stats[i]);
     }
 }
