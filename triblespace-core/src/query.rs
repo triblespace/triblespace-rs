@@ -770,6 +770,21 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 /// staying far above every batching break-even.
 pub const BLOCK_ROW_CAP: usize = 1 << 20;
 
+/// PROBE: effective block-row cap — [`BLOCK_ROW_CAP`] unless overridden by
+/// the `TRIBLES_BLOCK_ROW_CAP` environment variable (read once; for the
+/// blocked-vs-sequential convergence experiment, e.g. cap = 1 to measure
+/// scalar-as-block-of-1 overhead).
+pub fn block_row_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("TRIBLES_BLOCK_ROW_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(BLOCK_ROW_CAP)
+    })
+}
+
 /// PROBE: recursive frontier descent for [`Query::solve_blocked`].
 ///
 /// One call = one search level for one block chunk: pick the next
@@ -846,6 +861,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     }
 
     // Descend on the extended block, chunked to bound memory.
+    let row_cap = block_row_cap();
     let new_stride = stride + 1;
     vars.push(variable);
     let mut next_rows: Vec<RawInline> = Vec::new();
@@ -853,7 +869,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     while it.peek().is_some() {
         next_rows.clear();
         let mut count = 0usize;
-        while count < BLOCK_ROW_CAP {
+        while count < row_cap {
             let Some((row_idx, value)) = it.next() else {
                 break;
             };

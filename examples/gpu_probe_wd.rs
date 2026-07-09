@@ -301,15 +301,27 @@ fn main() {
     };
 
     // ---- passes ---------------------------------------------------------
+    eprintln!(
+        "block row cap: {}",
+        triblespace::core::query::block_row_cap()
+    );
+    let cpu_only = std::env::var("TRIBLES_PROBE_CPU_ONLY").is_ok();
+
     let cpu_seq = run_pass("cpu-seq", &archive, false);
     let cpu_blk = run_pass("cpu-blk", &archive, true);
 
-    let t0 = Instant::now();
-    archive.enable_gpu().expect("gpu upload");
-    eprintln!("gpu upload (six wavelet matrices): {:?}", t0.elapsed());
-
-    let gpu_seq = run_pass("gpu-seq", &archive, false);
-    let gpu_blk = run_pass("gpu-blk", &archive, true);
+    let (gpu_seq, gpu_blk) = if cpu_only {
+        eprintln!("TRIBLES_PROBE_CPU_ONLY set: skipping gpu passes");
+        (None, None)
+    } else {
+        let t0 = Instant::now();
+        archive.enable_gpu().expect("gpu upload");
+        eprintln!("gpu upload (six wavelet matrices): {:?}", t0.elapsed());
+        (
+            Some(run_pass("gpu-seq", &archive, false)),
+            Some(run_pass("gpu-blk", &archive, true)),
+        )
+    };
 
     // ---- table ----------------------------------------------------------
     fn median(v: &[f64]) -> f64 {
@@ -325,10 +337,11 @@ fn main() {
     for (i, (name, _)) in queries.iter().enumerate() {
         let cs = median(&cpu_seq.times[i]);
         let cb = median(&cpu_blk.times[i]);
-        let gs = median(&gpu_seq.times[i]);
-        let gb = median(&gpu_blk.times[i]);
-        let parity = [&cpu_blk, &gpu_seq, &gpu_blk]
-            .iter()
+        let gs = gpu_seq.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
+        let gb = gpu_blk.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
+        let parity = [Some(&cpu_blk), gpu_seq.as_ref(), gpu_blk.as_ref()]
+            .into_iter()
+            .flatten()
             .all(|p| p.sigs[i] == cpu_seq.sigs[i]);
         println!(
             "{:<38} {:>10} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>6.2}x {:>6.2}x {:>6.2}x  {}",
@@ -345,7 +358,11 @@ fn main() {
         );
         println!("  cpu-seq probes: {}", cpu_seq.stats[i]);
         println!("  cpu-blk probes: {}", cpu_blk.stats[i]);
-        println!("  gpu-seq probes: {}", gpu_seq.stats[i]);
-        println!("  gpu-blk probes: {}", gpu_blk.stats[i]);
+        if let Some(p) = &gpu_seq {
+            println!("  gpu-seq probes: {}", p.stats[i]);
+        }
+        if let Some(p) = &gpu_blk {
+            println!("  gpu-blk probes: {}", p.stats[i]);
+        }
     }
 }
