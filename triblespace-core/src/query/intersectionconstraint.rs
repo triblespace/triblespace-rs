@@ -151,6 +151,17 @@ where
         // kicks in; otherwise fall back to per-row proposes. Rows with no
         // relevant child propose nothing — the branch dies, matching the
         // sequential engine's empty proposal set.
+        //
+        // PROBE finding (group-by-ordering measurements, wd star3): the
+        // per-row fallback is the grouped solver's remaining batching
+        // hole. When a group's rows bind (a, v) pairs whose tightest
+        // proposer VARIES by row (P21-clause for some, P27-clause for
+        // others), this branch degrades to thousands of 1-item proposes
+        // and no GPU dispatch. The same counting-sort trick the grouped
+        // solver applies per variable applies here per proposer child:
+        // partition `pairs`' source rows by `proposers[i]` and hand each
+        // child its sub-block. Not built in v0 — it is the intersection's
+        // analogue of grouping, one layer down the constraint tree.
         let uniform = proposers.first().copied().flatten().filter(|&ci| {
             rows_proposed == n_rows && propose_counts[ci] == n_rows
         });
