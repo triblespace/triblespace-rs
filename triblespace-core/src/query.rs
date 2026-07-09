@@ -658,6 +658,10 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     binding: Binding,
     influences: [VariableSet; 128],
     estimates: [usize; 128],
+    /// PROBE (order-key experiment): each variable's estimate against the
+    /// **empty** binding, frozen at [`Query::new`] — the static baseline
+    /// the `ratio_first` / `influenced_only` keys compare against.
+    base_estimates: [usize; 128],
     touched_variables: VariableSet,
     stack: ArrayVec<VariableId, 128>,
     unbound: ArrayVec<VariableId, 128>,
@@ -680,6 +684,7 @@ where
             binding: self.binding.clone(),
             influences: self.influences,
             estimates: self.estimates,
+            base_estimates: self.base_estimates,
             touched_variables: self.touched_variables,
             stack: self.stack.clone(),
             unbound: self.unbound.clone(),
@@ -714,7 +719,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                     .expect("unconstrained variable in query");
             }
             self.unbound.sort_unstable_by_key(|v| {
-                variable_order_key(self.estimates[*v], self.influences[*v].count())
+                variable_order_key(
+                    self.estimates[*v],
+                    self.base_estimates[*v],
+                    self.influences[*v].count(),
+                )
             });
         }
 
@@ -759,6 +768,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             influences,
+            base_estimates,
             ..
         } = self;
         let variables = constraint.variables();
@@ -770,6 +780,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &constraint,
             &postprocessing,
             &influences,
+            &base_estimates,
             &mut vars,
             &mut unbound,
             &[],
@@ -813,6 +824,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             influences,
+            base_estimates,
             ..
         } = self;
         let variables = constraint.variables();
@@ -824,6 +836,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             &constraint,
             &postprocessing,
             &influences,
+            &base_estimates,
             &mut vars,
             &mut unbound,
             &[],
@@ -860,9 +873,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 usize::MAX
             }
         });
+        // The estimates just computed ARE the empty-binding baseline —
+        // freeze a copy before iteration refreshes them in place.
+        let base_estimates = estimates;
         let mut unbound = ArrayVec::from_iter(variables);
-        unbound
-            .sort_unstable_by_key(|v| variable_order_key(estimates[*v], influences[*v].count()));
+        unbound.sort_unstable_by_key(|v| {
+            variable_order_key(estimates[*v], base_estimates[*v], influences[*v].count())
+        });
 
         Query {
             constraint,
@@ -871,6 +888,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             binding,
             influences,
             estimates,
+            base_estimates,
             touched_variables: VariableSet::new_empty(),
             stack: ArrayVec::new(),
             unbound,
@@ -879,37 +897,101 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     }
 }
 
-/// PROBE (order-key experiment): whether the engine's variable-order key
-/// puts influence-count first. Default `false`: smallest estimate
-/// magnitude first, influence as tiebreak. Set
-/// `TRIBLES_ORDER_KEY=influence_first` to flip: highest influence first
-/// (hub variables bind early — they constrain more of the remaining
-/// search), magnitude as tiebreak. Read once per process.
-pub fn influence_first() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("TRIBLES_ORDER_KEY")
-            .map(|s| s == "influence_first")
-            .unwrap_or(false)
-    })
+/// PROBE (order-key experiment): which variable-order key the engine
+/// uses. Selected by `TRIBLES_ORDER_KEY`, read once per process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrderKeyMode {
+    /// `(inverted log2-magnitude, influence-count)` — smallest estimate
+    /// first, influence as tiebreak. The shipped engine key.
+    Default,
+    /// `(influence-count, inverted log2-magnitude)` — highest influence
+    /// first. Measured 2026-07-09: loses decisively (blind to *being*
+    /// constrained; binds hubs before neighbors shrink them).
+    InfluenceFirst,
+    /// Most-constrained-*relative-to-its-domain* first: primary key is the
+    /// drop `estimate(v, ∅) / estimate(v, binding)` (descending, i.e. the
+    /// ratio `estimate/unconstrained` ascending), current magnitude as
+    /// tiebreak. Targets the "estimate DROP not estimate SIZE" signal: a
+    /// var that is small *because the binding constrained it* (?e:
+    /// 2.9M→14.7k) outranks a var that is small unconditionally (?g: 13).
+    RatioFirst,
+    /// Default `(magnitude, influence)` key, but the candidate set is
+    /// restricted to variables whose estimate has actually dropped below
+    /// its unconstrained (empty-binding) value — i.e. vars the bound set
+    /// demonstrably constrains — falling back to the full unbound set when
+    /// none qualifies (first pick, disconnected components). The cheap
+    /// approximation of "don't bind a second small var that shares no
+    /// constraint with the bound set".
+    InfluencedOnly,
+}
+
+/// PROBE (order-key experiment): the active [`OrderKeyMode`].
+/// `TRIBLES_ORDER_KEY` ∈ {`influence_first`, `ratio_first`,
+/// `influenced_only`}; anything else (or unset) is [`OrderKeyMode::Default`].
+pub fn order_key_mode() -> OrderKeyMode {
+    static MODE: std::sync::OnceLock<OrderKeyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("TRIBLES_ORDER_KEY").as_deref() {
+            Ok("influence_first") => OrderKeyMode::InfluenceFirst,
+            Ok("ratio_first") => OrderKeyMode::RatioFirst,
+            Ok("influenced_only") => OrderKeyMode::InfluencedOnly,
+            _ => OrderKeyMode::Default,
+        },
+    )
 }
 
 /// The engine's variable-order key. **Larger key = picked next**: every
 /// site either takes `max_by_key` over the unbound set or pops the tail
 /// of a key-ascending sort.
 ///
-/// Default key: `(inverted log2-magnitude, influence-count)` — smallest
-/// estimate first, influence as tiebreak (identical ordering to the old
-/// inline `(Reverse(ilog2+1), influence)` tuples). With
-/// [`influence_first`]: `(influence-count, inverted log2-magnitude)`.
+/// `base_estimate` is the variable's estimate against the **empty**
+/// binding, computed once at [`Query::new`] (they are static — the
+/// constraint tree doesn't change during a solve) and threaded to every
+/// key site.
+///
+/// Per-mode keys (lexicographic triples):
+/// - [`Default`](OrderKeyMode::Default): `(inv_mag, influence, 0)` —
+///   identical ordering to the old inline `(Reverse(ilog2+1), influence)`
+///   tuples.
+/// - [`InfluenceFirst`](OrderKeyMode::InfluenceFirst): `(influence,
+///   inv_mag, 0)`.
+/// - [`RatioFirst`](OrderKeyMode::RatioFirst): `(drop, inv_mag,
+///   influence)` where `drop = mag(base) − mag(estimate)` (saturating).
+///   Rationale: the spec key is the raw ratio `estimate/base` ascending;
+///   in the engine's ilog2-bucket style `⌊log2(base/estimate)⌋ = mag(base)
+///   − mag(estimate)`, so the magnitude *difference* IS the log-bucketed
+///   ratio — no division, so `estimate = 0` (mag 0, maximal drop) and
+///   `base = 0` need no special-casing, and buckets stay consistent with
+///   the default key's granularity. Tiebreak: current magnitude ascending
+///   (per spec), then influence for determinism.
+/// - [`InfluencedOnly`](OrderKeyMode::InfluencedOnly): `(dropped, inv_mag,
+///   influence)` where `dropped = (estimate < base_estimate)`. The
+///   candidate-set restriction is implemented *as* the lexicographic key:
+///   any dropped var beats every undropped var, ties broken by the exact
+///   default key — and when **no** var has dropped (first pick,
+///   disconnected components) all primaries are 0 and the key degenerates
+///   to precisely the default key, which is the required fallback.
 #[inline]
-fn variable_order_key(estimate: usize, influence_count: usize) -> (u64, u64) {
+fn variable_order_key(
+    estimate: usize,
+    base_estimate: usize,
+    influence_count: usize,
+) -> (u64, u64, u64) {
     let magnitude = estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64;
     let inv_magnitude = u64::MAX - magnitude;
-    if influence_first() {
-        (influence_count as u64, inv_magnitude)
-    } else {
-        (inv_magnitude, influence_count as u64)
+    let influence = influence_count as u64;
+    match order_key_mode() {
+        OrderKeyMode::Default => (inv_magnitude, influence, 0),
+        OrderKeyMode::InfluenceFirst => (influence, inv_magnitude, 0),
+        OrderKeyMode::RatioFirst => {
+            let base_magnitude = base_estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64;
+            let drop = base_magnitude.saturating_sub(magnitude);
+            (drop, inv_magnitude, influence)
+        }
+        OrderKeyMode::InfluencedOnly => {
+            let dropped = (estimate < base_estimate) as u64;
+            (dropped, inv_magnitude, influence)
+        }
     }
 }
 
@@ -1112,6 +1194,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     constraint: &C,
     post: &P,
     influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
     vars: &mut Vec<VariableId>,
     unbound: &mut Vec<VariableId>,
     rows: &[RawInline],
@@ -1160,7 +1243,7 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             let estimate = constraint
                 .estimate(v, &binding)
                 .expect("unconstrained variable in query");
-            variable_order_key(estimate, influences[v].count())
+            variable_order_key(estimate, base_estimates[v], influences[v].count())
         })
         .expect("non-empty unbound");
     let variable = unbound.swap_remove(ui);
@@ -1210,7 +1293,16 @@ fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
             blocked_stats::record_materialized(count);
         }
         descend_blocked(
-            constraint, post, influences, vars, unbound, &next_rows, count, binding, results,
+            constraint,
+            post,
+            influences,
+            base_estimates,
+            vars,
+            unbound,
+            &next_rows,
+            count,
+            binding,
+            results,
         );
     }
     vars.pop();
@@ -1248,6 +1340,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     constraint: &C,
     post: &P,
     influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
     vars: &mut Vec<VariableId>,
     unbound: &mut Vec<VariableId>,
     rows: &[RawInline],
@@ -1292,7 +1385,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
                 let estimate = constraint
                     .estimate(v, binding)
                     .expect("unconstrained variable in query");
-                variable_order_key(estimate, influences[v].count())
+                variable_order_key(estimate, base_estimates[v], influences[v].count())
             })
             .expect("non-empty unbound");
         let variable = unbound.swap_remove(ui);
@@ -1319,6 +1412,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
                 constraint,
                 post,
                 influences,
+                base_estimates,
                 vars,
                 unbound,
                 chunk,
@@ -1348,7 +1442,13 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
     let mut group_counts: Vec<usize> = vec![0; n_unbound];
     for i in 0..n_rows {
         let j = (0..n_unbound)
-            .max_by_key(|&j| variable_order_key(est_cols[j][i], influences[unbound[j]].count()))
+            .max_by_key(|&j| {
+                variable_order_key(
+                    est_cols[j][i],
+                    base_estimates[unbound[j]],
+                    influences[unbound[j]].count(),
+                )
+            })
             .expect("non-empty unbound");
         preferred.push(j as u32);
         group_counts[j] += 1;
@@ -1432,7 +1532,16 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
                 blocked_stats::record_materialized(count);
             }
             descend_grouped(
-                constraint, post, influences, vars, unbound, &next_rows, count, binding, results,
+                constraint,
+                post,
+                influences,
+                base_estimates,
+                vars,
+                unbound,
+                &next_rows,
+                count,
+                binding,
+                results,
             );
         }
         vars.pop();

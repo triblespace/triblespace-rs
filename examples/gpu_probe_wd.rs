@@ -347,12 +347,8 @@ fn main() {
         triblespace::core::query::block_row_cap()
     );
     eprintln!(
-        "order key: {}",
-        if triblespace::core::query::influence_first() {
-            "influence_first (influence-count, then magnitude)"
-        } else {
-            "default (magnitude, then influence-count)"
-        }
+        "order key: {:?}",
+        triblespace::core::query::order_key_mode()
     );
     let cpu_only = std::env::var("TRIBLES_PROBE_CPU_ONLY").is_ok();
 
