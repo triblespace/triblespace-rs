@@ -272,16 +272,50 @@ pub struct RowsView<'v> {
     pub vars: &'v [VariableId],
     /// Row-major value store: `len() * stride()` entries.
     pub rows: &'v [RawInline],
+    /// Optional O(1) variable→column index: `cols[v]` is the column of
+    /// variable `v`, [`COL_UNBOUND`] when unbound. The sequential engine
+    /// maintains one incrementally (its cursor changes one variable at a
+    /// time); the blocked engines pass `None` — they amortize the
+    /// [`col`](Self::col) scan over whole blocks, while the block-of-1
+    /// caller pays it per verb call without the index.
+    cols: Option<&'v [u8; 128]>,
 }
+
+/// Sentinel in a [`RowsView`] column index: variable not bound.
+pub const COL_UNBOUND: u8 = u8::MAX;
 
 impl<'v> RowsView<'v> {
     /// The seed view: no bound variables, one zero-width row.
-    pub const EMPTY: RowsView<'static> = RowsView { vars: &[], rows: &[] };
+    pub const EMPTY: RowsView<'static> = RowsView {
+        vars: &[],
+        rows: &[],
+        cols: None,
+    };
 
     /// Creates a view over `rows` laid out in `vars` column order.
     pub fn new(vars: &'v [VariableId], rows: &'v [RawInline]) -> Self {
         debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
-        RowsView { vars, rows }
+        RowsView { vars, rows, cols: None }
+    }
+
+    /// Creates a view with a caller-maintained variable→column index
+    /// (`cols[v]` = column of `v`, [`COL_UNBOUND`] otherwise), making
+    /// [`col`](Self::col) O(1). The single-row cursor engine uses this.
+    pub fn new_indexed(
+        vars: &'v [VariableId],
+        rows: &'v [RawInline],
+        cols: &'v [u8; 128],
+    ) -> Self {
+        debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
+        debug_assert!(vars
+            .iter()
+            .enumerate()
+            .all(|(i, &v)| cols[v] as usize == i));
+        RowsView {
+            vars,
+            rows,
+            cols: Some(cols),
+        }
     }
 
     /// Number of values per row (= number of bound variables).
@@ -318,13 +352,22 @@ impl<'v> RowsView<'v> {
         RowsView {
             vars: self.vars,
             rows: self.row(i),
+            cols: self.cols,
         }
     }
 
     /// The column index of `variable`, or `None` when it is unbound.
+    /// O(1) with a column index ([`new_indexed`](Self::new_indexed)),
+    /// otherwise a scan of `vars`.
     #[inline]
     pub fn col(&self, variable: VariableId) -> Option<usize> {
-        self.vars.iter().position(|&v| v == variable)
+        match self.cols {
+            Some(cols) => match cols[variable] {
+                COL_UNBOUND => None,
+                c => Some(c as usize),
+            },
+            None => self.vars.iter().position(|&v| v == variable),
+        }
     }
 
     /// Iterates the rows as value slices (one empty slice for the seed).
@@ -779,9 +822,15 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// The borrowed cursor, half one: bound variables in binding order.
     stack: ArrayVec<VariableId, 128>,
     /// The borrowed cursor, half two: bound values parallel to `stack`.
-    /// `RowsView::new(&stack, &row)` is the engine's single-row block —
-    /// the sequential engine is literally a block-of-1 caller.
+    /// `RowsView::new_indexed(&stack, &row, &cols)` is the engine's
+    /// single-row block — the sequential engine is literally a block-of-1
+    /// caller.
     row: ArrayVec<RawInline, 128>,
+    /// Variable→column index for the cursor ([`RowsView::new_indexed`]):
+    /// `cols[v]` = position of `v` in `stack`, [`COL_UNBOUND`] otherwise.
+    /// Maintained incrementally on push/pop, so constraints locate their
+    /// columns in O(1) instead of scanning the stack per verb call.
+    cols: [u8; 128],
     /// Bitset mirror of `stack` (estimate-staleness bookkeeping).
     bound: VariableSet,
     unbound: ArrayVec<VariableId, 128>,
@@ -818,6 +867,7 @@ where
             touched_variables: self.touched_variables,
             stack: self.stack.clone(),
             row: self.row.clone(),
+            cols: self.cols,
             bound: self.bound,
             unbound: self.unbound.clone(),
             values: self.values.clone(),
@@ -852,7 +902,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         stale_estimates = stale_estimates.subtract(self.bound);
 
         if !stale_estimates.is_empty() {
-            let view = RowsView::new(&self.stack, &self.row);
+            let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
             while let Some(v) = stale_estimates.drain_next_ascending() {
                 let mut estimate = 0usize;
                 assert!(
@@ -881,9 +931,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         values.reserve_exact(estimate.saturating_sub(values.capacity()));
         self.constraint.propose(
             variable,
-            RowsView::new(&self.stack, &self.row),
+            RowsView::new_indexed(&self.stack, &self.row, &self.cols),
             &mut CandidateSink::Values(values),
         );
+        self.cols[variable] = self.stack.len() as u8;
         self.stack.push(variable);
         self.row.push([0; 32]);
         self.bound.set(variable);
@@ -1051,6 +1102,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             touched_variables: VariableSet::new_empty(),
             stack: ArrayVec::new(),
             row: ArrayVec::new(),
+            cols: [COL_UNBOUND; 128],
             bound: VariableSet::new_empty(),
             unbound,
             values: ArrayVec::from([const { None }; 128]),
@@ -2679,6 +2731,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 Search::Backtrack => {
                     if let Some(variable) = self.stack.pop() {
                         self.row.pop();
+                        self.cols[variable] = COL_UNBOUND;
                         self.bound.unset(variable);
                         // Note that we did not update estiamtes for the unbound variables
                         // as we are backtracking, so the estimates are still valid.
@@ -2840,6 +2893,7 @@ mod parallel {
                         Search::Backtrack => {
                             if let Some(variable) = q.stack.pop() {
                                 q.row.pop();
+                                q.cols[variable] = COL_UNBOUND;
                                 q.bound.unset(variable);
                                 q.unbound.push(variable);
                                 q.touched_variables.set(variable);
