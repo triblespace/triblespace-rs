@@ -116,6 +116,37 @@ macro_rules! gate {
             "solve_dag_unmerged diverged from the sequential engine on {}",
             $name
         );
+        // Lazy DAG iterator, fully drained: env-default slow start
+        // (1, ×2), a pure-sprint ablation (fixed width 1 — the harvest
+        // gate never engages), and an off-pattern start/growth combo.
+        let lazy = multiset($q.solve_dag_lazy());
+        assert_eq!(
+            sequential, lazy,
+            "solve_dag_lazy diverged from the sequential engine on {}",
+            $name
+        );
+        let lazy_w1 = multiset($q.solve_dag_lazy().start_width(1).growth(1));
+        assert_eq!(
+            sequential, lazy_w1,
+            "solve_dag_lazy (fixed width 1, pure sprint) diverged from the sequential engine on {}",
+            $name
+        );
+        let lazy_w7g3 = multiset($q.solve_dag_lazy().start_width(7).growth(3));
+        assert_eq!(
+            sequential, lazy_w7g3,
+            "solve_dag_lazy (start 7, growth 3) diverged from the sequential engine on {}",
+            $name
+        );
+        // Tiny cap: width saturates after two resumptions, so the bulk of
+        // the run exercises the *harvest* regime (readiness-gated
+        // scheduling + partial pops of saturated width) that the default
+        // 1<<20 cap never reaches on test-sized data.
+        let lazy_harvest = multiset($q.solve_dag_lazy().cap(3));
+        assert_eq!(
+            sequential, lazy_harvest,
+            "solve_dag_lazy (cap 3, harvest regime) diverged from the sequential engine on {}",
+            $name
+        );
         assert!(
             !sequential.is_empty() || $name.contains("empty"),
             "{} matched nothing — gate is vacuous",
@@ -454,4 +485,128 @@ fn blocked_no_variables_yields_one_unit_row() {
     assert_eq!(rows, vec![()]);
     let rows = find!((), a.is(I256BE::inline_from(42))).solve_blocked_grouped();
     assert_eq!(rows, vec![()]);
+    let rows: Vec<()> = find!((), a.is(I256BE::inline_from(42)))
+        .solve_dag_lazy()
+        .collect();
+    assert_eq!(rows, vec![()]);
+}
+
+/// Every item of `sub` (with multiplicity) must appear in `sup`.
+fn assert_sub_multiset<T: Hash + Eq + std::fmt::Debug>(
+    sub: &HashMap<T, usize>,
+    sup: &HashMap<T, usize>,
+    what: &str,
+) {
+    for (item, &count) in sub {
+        let have = sup.get(item).copied().unwrap_or(0);
+        assert!(
+            count <= have,
+            "{what}: item {item:?} appears {count}× in the partial result but {have}× in the full one"
+        );
+    }
+}
+
+/// PROBE (lazy-dag) partial consumption: `take(1)`, `take(k)`, an
+/// exists-style first-match-then-drop, and drop-without-consuming must
+/// all terminate cleanly (dropping the iterator drops the worklist) and
+/// yield rows that are a sub-multiset of the sequential result.
+fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
+    macro_rules! star3 {
+        () => {
+            find!(
+                (e: Inline<_>, g: Inline<_>, c: Inline<_>),
+                pattern!(kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
+            )
+        };
+    }
+    let sequential = multiset(star3!());
+    assert!(!sequential.is_empty(), "partial gate is vacuous");
+
+    // take(1) — first-result path, narrow sprint width only.
+    let one = multiset(star3!().solve_dag_lazy().take(1));
+    assert_eq!(one.values().sum::<usize>(), 1);
+    assert_sub_multiset(&one, &sequential, "take(1)");
+
+    // take(k) across the slow-start ramp.
+    for k in [3usize, 17, 64] {
+        let some = multiset(star3!().solve_dag_lazy().take(k));
+        assert_eq!(
+            some.values().sum::<usize>(),
+            k.min(sequential.values().sum()),
+            "take({k}) yielded the wrong number of rows"
+        );
+        assert_sub_multiset(&some, &sequential, "take(k)");
+    }
+
+    // exists-style: first match, then drop the iterator mid-flight.
+    let mut it = star3!().solve_dag_lazy();
+    assert!(it.next().is_some(), "exists-style probe found no match");
+    drop(it);
+
+    // Drop without consuming anything.
+    let it = star3!().solve_dag_lazy();
+    drop(it);
+
+    // Empty query: first pull returns None, repeatedly (fused-in-practice).
+    let missing = ufoid();
+    let mut it = find!(
+        (e: Inline<_>, g: Inline<_>),
+        and!(
+            e.is(missing.to_inline()),
+            pattern!(kb, [{ ?e @ world::gender: ?g }])
+        )
+    )
+    .solve_dag_lazy();
+    assert!(it.next().is_none());
+    assert!(it.next().is_none());
+}
+
+#[test]
+fn lazy_partial_consumption_tribleset() {
+    let (kb, human, _anchor) = build_world();
+    gate_partial(&kb, human);
+}
+
+#[test]
+fn lazy_partial_consumption_succinctarchive() {
+    let (kb, human, _anchor) = build_world();
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    gate_partial(&archive, human);
+}
+
+/// PROBE (lazy-dag): the slow-start trajectory is observable per iterator
+/// (via `current_width`, no global state — dag_stats is process-wide and
+/// parallel tests would pollute it) and only ever grows by the configured
+/// factor, saturating at the block-row cap.
+#[test]
+fn lazy_slow_start_trajectory() {
+    let (kb, human, _anchor) = build_world();
+    let mut it = find!(
+        (e: Inline<_>, g: Inline<_>, c: Inline<_>),
+        pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
+    )
+    .solve_dag_lazy()
+    .start_width(1)
+    .growth(2);
+    assert_eq!(it.current_width(), 1, "start width must be 1");
+    let cap = triblespace::core::query::block_row_cap();
+    let mut widths = vec![it.current_width()];
+    let mut n = 0usize;
+    while it.next().is_some() {
+        n += 1;
+        widths.push(it.current_width());
+    }
+    assert!(n > 0);
+    for (i, pair) in widths.windows(2).enumerate() {
+        assert!(
+            pair[1] == pair[0] * 2 || pair[1] == pair[0],
+            "width not slow-start at pull {i}: {widths:?}"
+        );
+        assert!(pair[1] <= cap, "width exceeded cap at pull {i}: {widths:?}");
+    }
+    let peak = *widths.iter().max().unwrap();
+    assert!(
+        peak > 1,
+        "width never grew — the engine was never resumed twice: {widths:?}"
+    );
 }

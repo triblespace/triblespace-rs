@@ -1614,6 +1614,7 @@ fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
 /// whose routes through the variable lattice reconverged).
 pub mod dag_stats {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
     static POPS: AtomicU64 = AtomicU64::new(0);
@@ -1621,6 +1622,9 @@ pub mod dag_stats {
     static MAX_LIVE_BUCKETS: AtomicU64 = AtomicU64::new(0);
     static MERGE_EVENTS: AtomicU64 = AtomicU64::new(0);
     static MERGED_ROWS: AtomicU64 = AtomicU64::new(0);
+    /// PROBE (lazy-dag): chunk width per engine resumption, in resumption
+    /// order — the slow-start trajectory.
+    static WIDTHS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
     /// Turns recording on/off (off by default).
     pub fn set_enabled(on: bool) {
@@ -1638,6 +1642,17 @@ pub mod dag_stats {
         MAX_LIVE_BUCKETS.store(0, Ordering::Relaxed);
         MERGE_EVENTS.store(0, Ordering::Relaxed);
         MERGED_ROWS.store(0, Ordering::Relaxed);
+        WIDTHS.lock().unwrap().clear();
+    }
+
+    pub(crate) fn record_width(width: usize) {
+        WIDTHS.lock().unwrap().push(width as u64);
+    }
+
+    /// PROBE (lazy-dag): the chunk-width trajectory — one entry per engine
+    /// resumption of a [`DagIter`](super::DagIter), in order.
+    pub fn widths() -> Vec<u64> {
+        WIDTHS.lock().unwrap().clone()
     }
 
     pub(crate) fn record_pop() {
@@ -1662,13 +1677,27 @@ pub mod dag_stats {
 
     /// Terse counter summary.
     pub fn report() -> String {
+        let widths = WIDTHS.lock().unwrap();
+        let widths_str = if widths.is_empty() {
+            String::new()
+        } else {
+            let shown: Vec<String> = widths.iter().take(24).map(|w| w.to_string()).collect();
+            let ellipsis = if widths.len() > 24 { ", …" } else { "" };
+            format!(
+                " / widths[{}]: {}{}",
+                widths.len(),
+                shown.join(","),
+                ellipsis
+            )
+        };
         format!(
-            "pops {} / buckets created {} / max live {} / merge events {} ({} rows merged)",
+            "pops {} / buckets created {} / max live {} / merge events {} ({} rows merged){}",
             POPS.load(Ordering::Relaxed),
             BUCKETS_CREATED.load(Ordering::Relaxed),
             MAX_LIVE_BUCKETS.load(Ordering::Relaxed),
             MERGE_EVENTS.load(Ordering::Relaxed),
             MERGED_ROWS.load(Ordering::Relaxed),
+            widths_str,
         )
     }
 }
@@ -2033,6 +2062,440 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             }
         }
         results
+    }
+
+    /// PROBE (lazy-dag): resumable-iterator form of
+    /// [`solve_dag`](Self::solve_dag) with **demand-adaptive chunk width**
+    /// (TCP slow start).
+    ///
+    /// The worklist is explicit state, so there is no recursion to
+    /// suspend: [`DagIter`] holds `{buckets, emit buffer, postprocessing}`
+    /// and `next()` drains the buffer, else runs pop → group → batch →
+    /// file until a full-bound bucket emits rows, buffers them, and yields
+    /// one. Dropping the iterator drops the worklist — this is the
+    /// streaming yield catch-5 called for: `exists!`-class consumers stop
+    /// the engine at the first match instead of paying for full
+    /// enumeration.
+    ///
+    /// **Slow start.** A per-iterator chunk width starts tiny
+    /// (`TRIBLES_LAZY_START_WIDTH`, default 1) and multiplies by
+    /// `TRIBLES_LAZY_GROWTH` (default 2) on each engine *resumption* (a
+    /// `next()` call that finds the emit buffer empty), saturating at
+    /// [`block_row_cap`]. Each pop takes at most `width` rows off the
+    /// chosen bucket's tail; the remainder stays live under the same key.
+    /// Narrow pops keep first-result latency sequential-class; sustained
+    /// pulling widens to full harvest batches.
+    ///
+    /// **Scheduling — sprint vs harvest.** Width and schedule are both
+    /// correctness-free (per-row variable choice is unchanged; any pop
+    /// order yields the same result multiset), but they interact: a
+    /// partially drained bucket's remainder is a strict subset of its own
+    /// children, so the eager engine's readiness gate would refuse to
+    /// descend past it and partial pops would degenerate to level-drain —
+    /// exactly the latency the laziness exists to avoid. The gate is
+    /// therefore demand-adaptive too: while `width < cap` (*sprint*) the
+    /// scheduler pops strict-deepest-first, which at width 1 is the DFS
+    /// dive (the cap=1 isomorphism), at the cost of cross-parent merging
+    /// (the ablation showed strict-deepest never merges — a GPU-currency
+    /// loss, not a CPU one); once width saturates (*harvest*) the
+    /// strict-subset readiness gate switches on and the residual
+    /// computation is the eager [`solve_dag`](Self::solve_dag) algorithm
+    /// on the remaining state.
+    ///
+    /// Semantics: fully drained, the same result **multiset** as the
+    /// sequential iterator and the eager DAG solver; row order differs.
+    pub fn solve_dag_lazy(self) -> DagIter<C, P, R> {
+        let Query {
+            constraint,
+            postprocessing,
+            influences,
+            base_estimates,
+            ..
+        } = self;
+        let full = constraint.variables();
+        let cap = block_row_cap();
+        DagIter {
+            constraint,
+            postprocessing,
+            influences,
+            base_estimates,
+            full,
+            buckets: vec![DagBucket {
+                set: VariableSet::new_empty(),
+                vars: Vec::new(),
+                rows: Vec::new(),
+                writer: 0,
+            }],
+            pop_id: 0,
+            binding: Binding::default(),
+            emit: std::collections::VecDeque::new(),
+            width: lazy_start_width().clamp(1, cap),
+            growth: lazy_growth(),
+            cap,
+        }
+    }
+}
+
+/// PROBE (lazy-dag): initial chunk width for [`Query::solve_dag_lazy`] —
+/// `TRIBLES_LAZY_START_WIDTH`, default 1. Read per iterator (not cached),
+/// so experiments can vary it within one process.
+fn lazy_start_width() -> usize {
+    std::env::var("TRIBLES_LAZY_START_WIDTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(1)
+}
+
+/// PROBE (lazy-dag): width growth factor per engine resumption for
+/// [`Query::solve_dag_lazy`] — `TRIBLES_LAZY_GROWTH`, default 2 (1 =
+/// fixed width). Read per iterator.
+fn lazy_growth() -> usize {
+    std::env::var("TRIBLES_LAZY_GROWTH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&g| g > 0)
+        .unwrap_or(2)
+}
+
+/// PROBE (lazy-dag): the resumable bucket-worklist engine behind
+/// [`Query::solve_dag_lazy`]. See there for the design; per-instance state
+/// is exactly `{worklist buckets, emit buffer, postprocessing, width}`.
+///
+/// Builder-style [`start_width`](Self::start_width) /
+/// [`growth`](Self::growth) override the env defaults (tests need
+/// per-instance settings; env vars are process-global).
+pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
+    constraint: C,
+    postprocessing: P,
+    influences: [VariableSet; 128],
+    base_estimates: [usize; 128],
+    full: VariableSet,
+    buckets: Vec<DagBucket>,
+    pop_id: u64,
+    binding: Binding,
+    emit: std::collections::VecDeque<R>,
+    width: usize,
+    growth: usize,
+    cap: usize,
+}
+
+impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
+    /// Overrides the initial chunk width (clamped to `1..=cap`).
+    pub fn start_width(mut self, width: usize) -> Self {
+        self.width = width.clamp(1, self.cap);
+        self
+    }
+
+    /// Overrides the per-resumption width growth factor (min 1 = fixed).
+    pub fn growth(mut self, growth: usize) -> Self {
+        self.growth = growth.max(1);
+        self
+    }
+
+    /// Overrides the width saturation cap (default [`block_row_cap`]).
+    /// Tests use a tiny cap to force the *harvest* regime (gated
+    /// scheduling at saturated width), which real workloads only reach
+    /// after ~20 doublings; the env cap is process-global and cached.
+    pub fn cap(mut self, cap: usize) -> Self {
+        self.cap = cap.max(1);
+        self.width = self.width.min(self.cap);
+        self
+    }
+
+    /// The chunk width the *next* engine resumption will use — the
+    /// slow-start observable (tests sample this per pull; benches use the
+    /// process-global [`dag_stats::widths`] trajectory instead).
+    pub fn current_width(&self) -> usize {
+        self.width
+    }
+}
+
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
+    /// Files one group's `(row, value)` pairs into the bucket keyed by
+    /// `parent_set ∪ {variable}`, creating or (in merge mode — always, for
+    /// the lazy probe) appending. Identical to the eager solver's `file`
+    /// closure; a method because the lazy engine needs it across pops.
+    ///
+    /// Note on merge stats: with partial pops, the same parent's remainder
+    /// files into the same child across *different* pop ids, so
+    /// [`dag_stats`] merge events count self-refills as merges here.
+    fn file(
+        &mut self,
+        parent_set: VariableSet,
+        parent_vars: &[VariableId],
+        variable: VariableId,
+        g_rows: &[RawInline],
+        pairs: Vec<(u32, RawInline)>,
+    ) {
+        if pairs.is_empty() {
+            return;
+        }
+        let stats = blocked_stats::enabled();
+        let dstats = dag_stats::enabled();
+        let stride = parent_vars.len();
+        let mut child_set = parent_set;
+        child_set.set(variable);
+        let vpos = parent_vars
+            .iter()
+            .position(|&x| x > variable)
+            .unwrap_or(stride);
+        let child_stride = stride + 1;
+        let target = match self.buckets.iter().position(|b| b.set == child_set) {
+            Some(t) => {
+                if dstats && !self.buckets[t].rows.is_empty() && self.buckets[t].writer != self.pop_id
+                {
+                    dag_stats::record_merge(pairs.len());
+                }
+                self.buckets[t].writer = self.pop_id;
+                t
+            }
+            None => {
+                let mut child_vars = parent_vars.to_vec();
+                child_vars.insert(vpos, variable);
+                self.buckets.push(DagBucket {
+                    set: child_set,
+                    vars: child_vars,
+                    rows: Vec::new(),
+                    writer: self.pop_id,
+                });
+                if dstats {
+                    dag_stats::record_bucket_created(self.buckets.len());
+                }
+                self.buckets.len() - 1
+            }
+        };
+        let store = &mut self.buckets[target].rows;
+        store.reserve(pairs.len() * child_stride);
+        let mut filed = 0usize;
+        for (row_idx, value) in pairs {
+            let base = row_idx as usize * stride;
+            store.extend_from_slice(&g_rows[base..base + vpos]);
+            store.push(value);
+            store.extend_from_slice(&g_rows[base + vpos..base + stride]);
+            filed += 1;
+        }
+        if stats {
+            blocked_stats::record_materialized(filed);
+            blocked_stats::cells_add(filed * child_stride);
+        }
+    }
+
+    /// One pop: choose a bucket (sprint: strict deepest; harvest:
+    /// deepest-ready), take at most `width` rows off its tail (full-bound
+    /// and seed buckets are consumed whole), and either emit (full-bound)
+    /// or estimate → prefer → partition → propose → file.
+    fn pop_once(&mut self, width: usize) {
+        let stats = blocked_stats::enabled();
+        let dstats = dag_stats::enabled();
+        // Harvest gating: only once the width has saturated does holding
+        // buckets for merging make sense (see `solve_dag_lazy` docs). The
+        // strict-deepest env ablation forces sprint scheduling throughout.
+        let gated = width >= self.cap && !dag_strict_deepest();
+        let mut best: Option<(usize, usize)> = None;
+        for (i, b) in self.buckets.iter().enumerate() {
+            if gated {
+                let ready = self.buckets.iter().enumerate().all(|(j, o)| {
+                    j == i || !(o.set != b.set && o.set.is_subset_of(&b.set))
+                });
+                if !ready {
+                    continue;
+                }
+            }
+            let depth = b.set.count();
+            if best.is_none_or(|(_, bd)| depth > bd) {
+                best = Some((i, depth));
+            }
+        }
+        let (idx, _) = best.expect("a minimal live bucket is always ready");
+        self.pop_id += 1;
+        if dstats {
+            dag_stats::record_pop();
+        }
+
+        // Full-bound bucket: consume whole, postprocess into the emit
+        // buffer (finished rows — buffering them is cheap and dropping
+        // the iterator discards the rest for free).
+        if self.buckets[idx].set == self.full {
+            let bucket = self.buckets.swap_remove(idx);
+            let stride = bucket.vars.len();
+            self.binding.bound = bucket.set;
+            if stride == 0 {
+                if let Some(r) = (self.postprocessing)(&self.binding) {
+                    self.emit.push_back(r);
+                }
+            } else {
+                for row in bucket.rows.chunks_exact(stride) {
+                    for (k, &v) in bucket.vars.iter().enumerate() {
+                        self.binding.set(v, &row[k]);
+                    }
+                    if let Some(r) = (self.postprocessing)(&self.binding) {
+                        self.emit.push_back(r);
+                    }
+                }
+            }
+            if stats {
+                blocked_stats::cells_sub(bucket.rows.len());
+            }
+            return;
+        }
+
+        let stride = self.buckets[idx].vars.len();
+
+        // Seed level: a single virtual empty row — plain propose. Not
+        // width-capped: `propose` has no streaming form, and the
+        // sequential engine materializes the same level-0 candidate Vec.
+        if stride == 0 {
+            let bucket = self.buckets.swap_remove(idx);
+            self.binding.bound = VariableSet::new_empty();
+            let unbound: Vec<VariableId> = self.full.subtract(bucket.set).into_iter().collect();
+            let (ui, _) = unbound
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &v)| {
+                    let estimate = self
+                        .constraint
+                        .estimate(v, &self.binding)
+                        .expect("unconstrained variable in query");
+                    variable_order_key(estimate, self.base_estimates[v], self.influences[v].count())
+                })
+                .expect("non-empty unbound");
+            let variable = unbound[ui];
+            if order_trace::enabled() {
+                order_trace::record(0, variable, 1);
+            }
+            let mut values: Vec<RawInline> = Vec::new();
+            self.constraint.propose(variable, &self.binding, &mut values);
+            let pairs: Vec<(u32, RawInline)> = values.into_iter().map(|v| (0u32, v)).collect();
+            self.file(bucket.set, &[], variable, &[], pairs);
+            return;
+        }
+
+        // Partial pop: take up to `width` rows off the tail; a remainder
+        // stays live under the same key (it is its own future feeder —
+        // in harvest mode the gate holds its children until it drains,
+        // in sprint mode its children out-deepen it and dive first).
+        let n_rows = self.buckets[idx].rows.len() / stride;
+        let take = n_rows.min(width);
+        let (parent_set, parent_vars, work) = if take == n_rows {
+            let b = self.buckets.swap_remove(idx);
+            (b.set, b.vars, b.rows)
+        } else {
+            let b = &mut self.buckets[idx];
+            let work = b.rows.split_off((n_rows - take) * stride);
+            (b.set, b.vars.clone(), work)
+        };
+        let c_rows = take;
+        let unbound: Vec<VariableId> = self.full.subtract(parent_set).into_iter().collect();
+        let n_unbound = unbound.len();
+
+        // 1. Estimate columns.
+        let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
+        for &v in unbound.iter() {
+            let mut col = Vec::with_capacity(c_rows);
+            let relevant = self
+                .constraint
+                .estimate_blocked(v, &parent_vars, &work, &mut col);
+            assert!(relevant, "unconstrained variable in query");
+            debug_assert_eq!(col.len(), c_rows);
+            est_cols.push(col);
+        }
+
+        // 2. Per-row preferred variable.
+        let mut preferred: Vec<u32> = Vec::with_capacity(c_rows);
+        let mut group_counts: Vec<usize> = vec![0; n_unbound];
+        for i in 0..c_rows {
+            let j = (0..n_unbound)
+                .max_by_key(|&j| {
+                    variable_order_key(
+                        est_cols[j][i],
+                        self.base_estimates[unbound[j]],
+                        self.influences[unbound[j]].count(),
+                    )
+                })
+                .expect("non-empty unbound");
+            preferred.push(j as u32);
+            group_counts[j] += 1;
+        }
+        drop(est_cols);
+
+        // 3. Partition (stable counting sort); single group borrows the
+        //    popped rows.
+        let n_groups = group_counts.iter().filter(|&&c| c > 0).count();
+        let mut starts: Vec<usize> = Vec::with_capacity(n_unbound);
+        let mut acc = 0usize;
+        for &c in &group_counts {
+            starts.push(acc);
+            acc += c;
+        }
+        let mut part: Vec<RawInline> = Vec::new();
+        if n_groups > 1 {
+            if stats {
+                blocked_stats::cells_add(work.len());
+            }
+            part = vec![[0u8; 32]; work.len()];
+            let mut cursors = starts.clone();
+            for i in 0..c_rows {
+                let j = preferred[i] as usize;
+                let dst = cursors[j];
+                cursors[j] += 1;
+                part[dst * stride..(dst + 1) * stride]
+                    .copy_from_slice(&work[i * stride..(i + 1) * stride]);
+            }
+        }
+        drop(preferred);
+
+        // 4. One batched propose per group; file into buckets.
+        for (j, &variable) in unbound.iter().enumerate() {
+            let g_count = group_counts[j];
+            if g_count == 0 {
+                continue;
+            }
+            let g_rows: &[RawInline] = if n_groups == 1 {
+                &work
+            } else {
+                &part[starts[j] * stride..(starts[j] + g_count) * stride]
+            };
+            if order_trace::enabled() {
+                order_trace::record(stride, variable, g_count as u64);
+            }
+            let mut pairs: Vec<(u32, RawInline)> = Vec::new();
+            self.constraint
+                .propose_blocked(variable, &parent_vars, g_rows, &mut pairs);
+            self.file(parent_set, &parent_vars, variable, g_rows, pairs);
+        }
+        if stats {
+            if n_groups > 1 {
+                blocked_stats::cells_sub(work.len());
+            }
+            blocked_stats::cells_sub(work.len());
+        }
+    }
+}
+
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIter<C, P, R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<R> {
+        loop {
+            if let Some(r) = self.emit.pop_front() {
+                return Some(r);
+            }
+            if self.buckets.is_empty() {
+                return None;
+            }
+            // Engine resumption: run pops at the current width until
+            // something reaches the emit buffer (or the worklist drains),
+            // then grow the width — TCP slow start on consumer demand.
+            let width = self.width;
+            if dag_stats::enabled() {
+                dag_stats::record_width(width);
+            }
+            while self.emit.is_empty() && !self.buckets.is_empty() {
+                self.pop_once(width);
+            }
+            self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
+        }
     }
 }
 
