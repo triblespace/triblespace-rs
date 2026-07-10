@@ -99,8 +99,11 @@ where
     /// block so its own batching kicks in, and it skips its confirm pass
     /// (its own proposals are consistent by construction). When proposers
     /// vary across rows each row is proposed through a single-row
-    /// borrowed view, and every relevant child confirms the full frontier
-    /// — re-confirming a child's own pairs is a wasted-work cost, never a
+    /// borrowed view into an **isolated** scratch sink — a child must
+    /// never see candidates owned by another row, because composite
+    /// children confirm whatever sink they are handed in its entirety —
+    /// and every relevant child then confirms the full frontier.
+    /// Re-confirming a child's own pairs is a wasted-work cost, never a
     /// correctness one.
     fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
         // The sequential cursor (a Values sink is always a block of 1):
@@ -156,11 +159,28 @@ where
         if let Some(k) = uniform {
             self.constraints[relevant[k]].propose(variable, view, candidates);
         } else {
+            // Non-uniform proposers: each row's child proposes into an
+            // isolated, cleared single-row scratch — never into the
+            // shared, already-populated frontier sink. `propose` is not
+            // append-only for composite children: a nested intersection
+            // runs its sibling confirms over the ENTIRE sink it is
+            // handed, interpreting every row tag through the one-row
+            // view — which deletes other rows' legitimate candidates
+            // under the wrong bindings, or indexes past the end of the
+            // one-row view for tags ≥ 1. A single-row view with a
+            // Values sink is exactly the sequential-cursor contract
+            // every constraint already honors, so isolation is free;
+            // `extend_row` then applies this row's tag on the way out.
+            let mut scratch: Vec<RawInline> = Vec::new();
             for (i, &k) in proposers.iter().enumerate() {
                 let row_view = view.row_view(i);
-                let base = candidates.len();
-                self.constraints[relevant[k as usize]].propose(variable, &row_view, candidates);
-                candidates.retag_from(base, i as u32);
+                scratch.clear();
+                self.constraints[relevant[k as usize]].propose(
+                    variable,
+                    &row_view,
+                    &mut CandidateSink::Values(&mut scratch),
+                );
+                candidates.extend_row(i as u32, scratch.iter().copied());
             }
         }
 

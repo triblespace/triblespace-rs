@@ -38,6 +38,11 @@ mod world {
         "10515585D7503F3EFCCCB994A3418577" as rt4: inlineencodings::GenId;
         "0EFC41641FCD73A30E2414AE78DEC219" as rs: inlineencodings::GenId;
         "BCB248E3850EA6ACF22E7B175B574E12" as rtz: inlineencodings::GenId;
+        // REGRESSION (nested-intersection sink isolation) fixture attributes:
+        "6599D7516B0D523477A352689E11152D" as fp: inlineencodings::GenId;
+        "A7CD8D153BF7F97127CFF2C746C20678" as fq: inlineencodings::GenId;
+        "A42F5D01FF1C5F78E6B55889A4BCDA8D" as fr: inlineencodings::GenId;
+        "F40F01CE5C2FCC7E9E0B2B6FE096F8E3" as fs: inlineencodings::GenId;
     }
 }
 
@@ -409,6 +414,132 @@ fn gate_reconverge<S: TriblePattern>(
             ])
         )
     );
+}
+
+/// REGRESSION (nested-intersection sink isolation): rows that flip the
+/// outer intersection's per-row proposer between two **composite**
+/// children.
+///
+/// Query: `and!(pattern![{?y @ fp:?x, fq:?x}], pattern![{?y @ fr:?x, fs:?x}])`.
+///
+/// - Flavor A rows (even): wide `fp`/`fq` fan (8), tight `fr`/`fs` fan
+///   (2) → outer proposer = the fr/fs pattern; one genuine common `x`.
+/// - Flavor B rows (odd): mirrored — tight `fp`/`fq` (2, **both**
+///   genuine), wide `fr`/`fs` (8) → outer proposer = the fp/fq pattern;
+///   two surviving candidates.
+///
+/// Alternating flavors force the non-uniform (per-row proposer) path
+/// with composite children. Before the isolation fix, the outer loop
+/// handed each row's child the SHARED already-populated candidate sink:
+/// the nested intersection's sibling-confirm then ran over the whole
+/// sink through a one-row view, deleting other rows' candidates under
+/// the wrong bindings and mis-tagging survivors (2 rows: silently wrong
+/// results), and — once a surviving pair carried a row tag ≥ 1 — made
+/// `confirm_per_row` index row 1 of a one-row view (≥ 3 rows: panic).
+fn build_flip_world(n_rows: usize) -> (TribleSet, usize) {
+    let mut kb = TribleSet::new();
+    let mut expected = 0usize;
+    for i in 0..n_rows {
+        let y = ufoid();
+        if i % 2 == 0 {
+            // Flavor A: tight fr/fs (estimate 2), wide fp/fq (estimate 8).
+            let x = ufoid();
+            kb += entity! { &y @ world::fp: &x, world::fq: &x, world::fr: &x, world::fs: &x };
+            for _ in 0..7 {
+                let pf = ufoid();
+                let qf = ufoid();
+                kb += entity! { &y @ world::fp: &pf };
+                kb += entity! { &y @ world::fq: &qf };
+            }
+            let rf = ufoid();
+            let sf = ufoid();
+            kb += entity! { &y @ world::fr: &rf };
+            kb += entity! { &y @ world::fs: &sf };
+            expected += 1;
+        } else {
+            // Flavor B: tight fp/fq (estimate 2, both genuine), wide
+            // fr/fs (estimate 8). Two survivors set up the tag-≥1 pair
+            // that panicked pre-fix with a third row behind them.
+            let x = ufoid();
+            let w = ufoid();
+            for v in [&x, &w] {
+                kb += entity! { &y @ world::fp: v, world::fq: v, world::fr: v, world::fs: v };
+            }
+            for _ in 0..6 {
+                let rf = ufoid();
+                let sf = ufoid();
+                kb += entity! { &y @ world::fr: &rf };
+                kb += entity! { &y @ world::fs: &sf };
+            }
+            expected += 2;
+        }
+    }
+    (kb, expected)
+}
+
+fn gate_flip<S: TriblePattern>(kb: &S, expected: usize) {
+    let seq: Vec<_> = find!(
+        (y: Inline<_>, x: Inline<_>),
+        and!(
+            pattern!(kb, [{ ?y @ world::fp: ?x, world::fq: ?x }]),
+            pattern!(kb, [{ ?y @ world::fr: ?x, world::fs: ?x }])
+        )
+    )
+    .collect();
+    assert_eq!(
+        seq.len(),
+        expected,
+        "flip world must yield one row per flavor-A entity and two per flavor-B entity"
+    );
+    gate!(
+        "flip ?y (fp&fq) ?x AND ?y (fr&fs) ?x",
+        find!(
+            (y: Inline<_>, x: Inline<_>),
+            and!(
+                pattern!(kb, [{ ?y @ world::fp: ?x, world::fq: ?x }]),
+                pattern!(kb, [{ ?y @ world::fr: ?x, world::fs: ?x }])
+            )
+        )
+    );
+}
+
+/// Two rows, flipped proposers: pre-fix this silently corrupted the
+/// frontier (row 0's candidate deleted by row 1's nested confirm, row
+/// 1's survivor mis-tagged to row 0, then killed by the outer confirm).
+#[test]
+fn nested_intersection_isolation_two_rows_tribleset() {
+    let (kb, expected) = build_flip_world(2);
+    gate_flip(&kb, expected);
+}
+
+/// Three rows: pre-fix, row 1's second survivor kept a row tag of 1 in
+/// the shared sink, and row 2's nested sibling-confirm indexed row 1 of
+/// a one-row view — an out-of-bounds panic, not just wrong results.
+#[test]
+fn nested_intersection_isolation_three_rows_tribleset() {
+    let (kb, expected) = build_flip_world(3);
+    gate_flip(&kb, expected);
+}
+
+/// Wider frontier: many alternating flips in a single block.
+#[test]
+fn nested_intersection_isolation_eight_rows_tribleset() {
+    let (kb, expected) = build_flip_world(8);
+    gate_flip(&kb, expected);
+}
+
+#[test]
+fn nested_intersection_isolation_three_rows_succinctarchive() {
+    let (kb, expected) = build_flip_world(3);
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    gate_flip(&archive, expected);
+}
+
+#[test]
+fn nested_intersection_isolation_eight_rows_succinctarchive() {
+    let (kb, expected) = build_flip_world(8);
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    gate_flip(&archive, expected);
 }
 
 #[test]

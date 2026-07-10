@@ -500,21 +500,6 @@ impl CandidateSink<'_> {
         }
     }
 
-    /// Rewrites the row tag of every candidate from index `base` onward to
-    /// `row` — used when a caller proposes through a single-row sub-view
-    /// (whose pushes carry row 0) into a multi-row frontier. A no-op for
-    /// [`Values`](Self::Values) sinks, where the row is statically 0.
-    #[inline]
-    pub fn retag_from(&mut self, base: usize, row: u32) {
-        match self {
-            Self::Tagged(pairs) => {
-                for pair in &mut pairs[base..] {
-                    pair.0 = row;
-                }
-            }
-            Self::Values(_) => debug_assert_eq!(row, 0, "Values sink is single-row"),
-        }
-    }
 }
 
 /// The output sink of [`Constraint::estimate`]: one estimate per row of
