@@ -585,8 +585,12 @@ pub fn confirm_per_row(
     match candidates {
         CandidateSink::Values(values) => f(view.row(0), values),
         CandidateSink::Tagged(pairs) => {
+            // In-place compaction: survivors of each row group are written
+            // back over the already-consumed prefix (confirm only ever
+            // filters, so the write cursor can never overtake the read
+            // cursor), and one value scratch is reused across groups.
             let mut scratch: Vec<RawInline> = Vec::new();
-            let mut out: Candidates = Vec::with_capacity(pairs.len());
+            let mut write = 0usize;
             let mut i = 0;
             while i < pairs.len() {
                 let row_idx = pairs[i].0;
@@ -597,10 +601,17 @@ pub fn confirm_per_row(
                     j += 1;
                 }
                 f(view.row(row_idx as usize), &mut scratch);
-                out.extend(scratch.iter().map(|&val| (row_idx, val)));
+                debug_assert!(
+                    scratch.len() <= j - i,
+                    "confirm must filter candidates, never add them"
+                );
+                for &val in &scratch {
+                    pairs[write] = (row_idx, val);
+                    write += 1;
+                }
                 i = j;
             }
-            **pairs = out;
+            pairs.truncate(write);
         }
     }
 }
@@ -1263,14 +1274,14 @@ pub fn block_row_cap() -> usize {
 /// solvers. Off by default; benches call
 /// [`set_enabled`](blocked_stats::set_enabled) and
 /// [`reset`](blocked_stats::reset) around a measured run and print
-/// [`report`](blocked_stats::report). One mutex lock per *descend level*
-/// (not per row), so the enabled overhead is negligible next to the
+/// [`report`](blocked_stats::report). One mutex lock per *pop* (not per
+/// row), so the enabled overhead is negligible next to the
 /// propose/confirm work it describes.
 pub mod blocked_stats {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    /// One record per `descend_*` call that expanded a frontier.
+    /// One record per worklist pop that expanded a frontier.
     #[derive(Clone, Debug)]
     pub struct LevelRecord {
         /// Number of variables bound on entry (search depth).
