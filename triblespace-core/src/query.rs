@@ -2108,19 +2108,29 @@ impl<R> DagState<R> {
         scratch.unbound.extend(self.full.subtract(parent_set));
         let n_unbound = scratch.unbound.len();
 
-        if !self.grouped {
+        // A single unbound variable means there is no choice to make and
+        // no partition to build — skip the estimate pass entirely and
+        // propose over the whole block. This is every query's deepest
+        // level, which at sprint widths is also the most-popped one.
+        let single = n_unbound == 1;
+        if single || !self.grouped {
             // Trivial partition: one group, next variable chosen once per
-            // block from the first row's estimates (blocked-v1).
-            let ui = choose_variable(
-                constraint,
-                &scratch.unbound,
-                view.row_view(0),
-                influences,
-                base_estimates,
-            );
+            // block from the first row's estimates (blocked-v1), or the
+            // only variable left.
+            let ui = if single {
+                0
+            } else {
+                choose_variable(
+                    constraint,
+                    &scratch.unbound,
+                    view.row_view(0),
+                    influences,
+                    base_estimates,
+                )
+            };
             let variable = scratch.unbound[ui];
             if order_trace::enabled() {
-                order_trace::record(stride, variable, 1);
+                order_trace::record(stride, variable, if self.grouped { c_rows as u64 } else { 1 });
             }
             scratch.pairs.clear();
             constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut scratch.pairs));
