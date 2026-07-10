@@ -966,7 +966,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         (self.postprocessing)(&self.binding)
     }
 
-    /// PROBE: frontier-batched (block-at-a-time) solver.
+    /// PROBE: frontier-batched (block-at-a-time) solver — the **trivial
+    /// partition** configuration of the worklist core (ungrouped,
+    /// unmerged, saturated width).
     ///
     /// The standard iterator descends one binding at a time, so on star or
     /// filter shapes every sibling branch runs its own tiny
@@ -976,100 +978,47 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// and hands whole frontiers of `(row, candidate)` pairs to the
     /// constraints ([`Constraint::propose`] / [`Constraint::confirm`]
     /// over multi-row [`RowsView`]s): one ragged batch per
-    /// (constraint, level) instead of one call per branch. Constraints
-    /// with batchable probe streams (wavelet ranks in
-    /// `SuccinctArchiveConstraint`) evaluate that batch cache-friendly on
-    /// the CPU or as a single GPU dispatch.
+    /// (constraint, level) instead of one call per branch. The next
+    /// variable is chosen **once per block** from the first row's
+    /// estimates — cheap, but wrong for every row that would have
+    /// preferred a different variable (the ordering-quality loss the
+    /// grouped configuration repairs).
     ///
     /// Semantics: yields the same result **multiset** as the iterator;
     /// row order may differ (block order instead of DFS order).
-    ///
-    /// Costs to be aware of (probe honesty):
-    /// - Variable order is chosen **per level per block** from the first
-    ///   row's estimates, not per branch; data where sibling branches want
-    ///   different orders can explode intermediate blocks.
-    /// - Blocks materialize intermediate rows (`depth × 32 B` per row),
-    ///   capped at [`BLOCK_ROW_CAP`] rows per descend chunk.
     pub fn solve_blocked(self) -> Vec<R> {
-        let Query {
-            constraint,
-            postprocessing,
-            influences,
-            base_estimates,
-            ..
-        } = self;
-        let variables = constraint.variables();
-        let mut unbound: Vec<VariableId> = variables.into_iter().collect();
-        let mut vars: Vec<VariableId> = Vec::new();
-        let mut results = Vec::new();
-        let mut binding = Binding::default();
-        descend_blocked(
-            &constraint,
-            &postprocessing,
-            &influences,
-            &base_estimates,
-            &mut vars,
-            &mut unbound,
-            &[],
-            &mut binding,
-            &mut results,
-        );
-        results
+        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
+        it.state.merge = false;
+        it.state.grouped = false;
+        it.collect()
     }
 
     /// PROBE (group-by-ordering): frontier-batched solver with **per-row**
-    /// variable choice.
+    /// variable choice — the grouped, unmerged configuration of the
+    /// worklist core at saturated width.
     ///
     /// [`solve_blocked`](Self::solve_blocked) picks one next variable per
-    /// level from the *first row's* estimates — cheap, but wrong for every
-    /// row that would have preferred a different variable, and those rows'
-    /// branches can explode (the ordering-quality loss JP diagnosed:
-    /// smallest-estimate-first minimizes work AND batch size; the
-    /// objectives coincide on CPU and diverge under fixed-cost batch
-    /// primitives). This solver batches the *estimation* too
-    /// ([`Constraint::estimate`]: one estimate column per unbound
-    /// variable over the whole block), computes each row's preferred next
-    /// variable (argmin of the same `(log2-magnitude, influence)` key the
-    /// sequential engine sorts by), **partitions** the block by preferred
-    /// variable (stable counting sort), and descends each group with *its*
-    /// variable.
+    /// level from the *first row's* estimates. This configuration batches
+    /// the *estimation* too ([`Constraint::estimate`]: one estimate column
+    /// per unbound variable over the whole block), computes each row's
+    /// preferred next variable (argmax of the same [`variable_order_key`]
+    /// the sequential engine sorts by), **partitions** the block by
+    /// preferred variable (stable counting sort), and descends each group
+    /// with *its* variable. Per-branch ordering quality is restored while
+    /// batches stay level-wide within groups; fragmentation is bounded by
+    /// `|unbound|` groups per level.
     ///
-    /// Properties: per-branch ordering quality is restored while batches
-    /// stay level-wide within groups; fragmentation is bounded by
-    /// `|unbound|` groups per level (never per-branch collapse); the block
-    /// invariant deepens from same-bound-*set* to same-*ordering-history*
-    /// (each group's rows chose identically at every ancestor level, by
-    /// construction). Degenerate case: uniform preferences ⇒ one group ⇒
-    /// identical schedule to `solve_blocked` (and the block itself is
-    /// borrowed, not copied).
+    /// With merging off, filings are lineage-keyed (a fresh bucket per
+    /// filing) — this is **the same configuration as**
+    /// [`solve_dag_unmerged`](Self::solve_dag_unmerged); both names are
+    /// kept because they gate different probe histories.
     ///
     /// Semantics: same result **multiset** as the sequential iterator;
     /// row order may differ.
     pub fn solve_blocked_grouped(self) -> Vec<R> {
-        let Query {
-            constraint,
-            postprocessing,
-            influences,
-            base_estimates,
-            ..
-        } = self;
-        let variables = constraint.variables();
-        let mut unbound: Vec<VariableId> = variables.into_iter().collect();
-        let mut vars: Vec<VariableId> = Vec::new();
-        let mut results = Vec::new();
-        let mut binding = Binding::default();
-        descend_grouped(
-            &constraint,
-            &postprocessing,
-            &influences,
-            &base_estimates,
-            &mut vars,
-            &mut unbound,
-            &[],
-            &mut binding,
-            &mut results,
-        );
-        results
+        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
+        it.state.merge = false;
+        it.collect()
     }
 
     /// Create a new query.
@@ -1467,308 +1416,6 @@ fn choose_variable<'a, C: Constraint<'a>>(
     best.expect("non-empty unbound").0
 }
 
-/// PROBE: recursive frontier descent for [`Query::solve_blocked`].
-///
-/// One call = one search level for one block chunk: pick the next
-/// variable (first-row estimates, same magnitude/influence key as
-/// [`Query::push_next_variable`]), expand the frontier via
-/// [`Constraint::propose`] over the whole block (the seed level is just
-/// the one-virtual-row block), then recurse on the extended block in
-/// [`BLOCK_ROW_CAP`]-row chunks.
-#[allow(clippy::too_many_arguments)]
-fn descend_blocked<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
-    constraint: &C,
-    post: &P,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
-    vars: &mut Vec<VariableId>,
-    unbound: &mut Vec<VariableId>,
-    rows: &[RawInline],
-    binding: &mut Binding,
-    results: &mut Vec<R>,
-) {
-    let view = RowsView::new(vars, rows);
-    let n_rows = view.len();
-    if n_rows == 0 {
-        return;
-    }
-    let stride = view.stride();
-
-    if unbound.is_empty() {
-        for row in view.iter() {
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            if let Some(r) = post(binding) {
-                results.push(r);
-            }
-        }
-        return;
-    }
-
-    let ui = choose_variable(constraint, unbound, view.row_view(0), influences, base_estimates);
-    let variable = unbound.swap_remove(ui);
-    if order_trace::enabled() {
-        order_trace::record(stride, variable, 1);
-    }
-
-    // Expand the frontier: (parent row, candidate) pairs.
-    let mut pairs: Candidates = Vec::new();
-    constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut pairs));
-    if blocked_stats::enabled() {
-        blocked_stats::record_level(blocked_stats::LevelRecord {
-            depth: stride,
-            rows: n_rows,
-            group_sizes: vec![n_rows],
-            batch_sizes: vec![pairs.len()],
-        });
-    }
-
-    // Descend on the extended block, chunked to bound memory.
-    let row_cap = block_row_cap();
-    let new_stride = stride + 1;
-    vars.push(variable);
-    let mut next_rows: Vec<RawInline> = Vec::new();
-    let mut it = pairs.into_iter().peekable();
-    while it.peek().is_some() {
-        next_rows.clear();
-        let mut count = 0usize;
-        while count < row_cap {
-            let Some((row_idx, value)) = it.next() else {
-                break;
-            };
-            let base = row_idx as usize * stride;
-            next_rows.extend_from_slice(&rows[base..base + stride]);
-            next_rows.push(value);
-            count += 1;
-        }
-        debug_assert_eq!(next_rows.len(), count * new_stride);
-        if blocked_stats::enabled() {
-            blocked_stats::record_materialized(count);
-            blocked_stats::cells_add(count * new_stride);
-        }
-        descend_blocked(
-            constraint,
-            post,
-            influences,
-            base_estimates,
-            vars,
-            unbound,
-            &next_rows,
-            binding,
-            results,
-        );
-        if blocked_stats::enabled() {
-            blocked_stats::cells_sub(count * new_stride);
-        }
-    }
-    vars.pop();
-    unbound.push(variable);
-}
-
-/// PROBE (group-by-ordering): recursive grouped frontier descent for
-/// [`Query::solve_blocked_grouped`].
-///
-/// One call = one search level for one block chunk:
-/// 1. **Estimate** — one estimate column per unbound variable over
-///    the whole block ([`Constraint::estimate`]).
-/// 2. **Prefer per row** — argmax of the sequential engine's
-///    [`variable_order_key`] over the row's column entries (identical
-///    key, applied per row instead of per level).
-/// 3. **Partition** — stable counting sort of rows by preferred variable:
-///    up to `|unbound|` groups. A single group borrows the parent block
-///    (no copy) — the non-skewed fast path.
-/// 4. **Descend each group with its own variable** — one batched propose
-///    over the group's rows, then recurse in [`block_row_cap`]-row chunks.
-///
-/// STRETCH (designed, not built — the tree-becomes-DAG upgrade): rows in
-/// *different* groups that bind the same variable-SET in different orders
-/// reach the same lattice node and could coalesce into one block. That
-/// needs (a) a frontier keyed by bound-variable-set — a map
-/// `VariableSet -> pending row store` instead of this call stack, (b)
-/// deepest-first scheduling (pop the largest bound-set first) to keep
-/// memory DFS-like, and (c) row provenance no longer implied by the
-/// parent chunk, so result emission must not assume contiguous ancestry.
-/// Deliberately out of v0: cross-parent merging only pays when sibling
-/// groups' orders *reconverge* (bushy joins), and the frontier map's
-/// bookkeeping would obscure the grouping measurement this probe is for.
-#[allow(clippy::too_many_arguments)]
-fn descend_grouped<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R>(
-    constraint: &C,
-    post: &P,
-    influences: &[VariableSet; 128],
-    base_estimates: &[usize; 128],
-    vars: &mut Vec<VariableId>,
-    unbound: &mut Vec<VariableId>,
-    rows: &[RawInline],
-    binding: &mut Binding,
-    results: &mut Vec<R>,
-) {
-    let view = RowsView::new(vars, rows);
-    let n_rows = view.len();
-    if n_rows == 0 {
-        return;
-    }
-    let stride = view.stride();
-
-    if unbound.is_empty() {
-        for row in view.iter() {
-            for (k, &v) in vars.iter().enumerate() {
-                binding.set(v, &row[k]);
-            }
-            if let Some(r) = post(binding) {
-                results.push(r);
-            }
-        }
-        return;
-    }
-
-    let row_cap = block_row_cap();
-
-    // 1. Estimate: one column per unbound variable over the whole block.
-    let n_unbound = unbound.len();
-    let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
-    for &v in unbound.iter() {
-        let mut col = Vec::with_capacity(n_rows);
-        let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
-        assert!(relevant, "unconstrained variable in query");
-        debug_assert_eq!(col.len(), n_rows);
-        est_cols.push(col);
-    }
-
-    // 2. Per-row preferred variable: argmax of the engine's ordering key.
-    let mut preferred: Vec<u32> = Vec::with_capacity(n_rows);
-    let mut group_counts: Vec<usize> = vec![0; n_unbound];
-    for i in 0..n_rows {
-        let j = (0..n_unbound)
-            .max_by_key(|&j| {
-                variable_order_key(
-                    est_cols[j][i],
-                    base_estimates[unbound[j]],
-                    influences[unbound[j]].count(),
-                )
-            })
-            .expect("non-empty unbound");
-        preferred.push(j as u32);
-        group_counts[j] += 1;
-    }
-    drop(est_cols);
-
-    // 3. Partition (stable counting sort by preferred variable). One
-    //    group ⇒ borrow the parent block, no copy.
-    let n_groups = group_counts.iter().filter(|&&c| c > 0).count();
-    let mut starts: Vec<usize> = Vec::with_capacity(n_unbound);
-    let mut acc = 0usize;
-    for &c in &group_counts {
-        starts.push(acc);
-        acc += c;
-    }
-    let mut part: Vec<RawInline> = Vec::new();
-    if n_groups > 1 {
-        if blocked_stats::enabled() {
-            blocked_stats::cells_add(n_rows * stride);
-        }
-        part = vec![[0u8; 32]; n_rows * stride];
-        let mut cursors = starts.clone();
-        for i in 0..n_rows {
-            let j = preferred[i] as usize;
-            let dst = cursors[j];
-            cursors[j] += 1;
-            part[dst * stride..(dst + 1) * stride]
-                .copy_from_slice(&rows[i * stride..(i + 1) * stride]);
-        }
-    }
-    drop(preferred);
-
-    // 4. Descend each non-empty group with its preferred variable.
-    // `unbound` mutates (remove/push) per group, so snapshot the
-    // group-index → variable mapping first.
-    let group_vars: Vec<VariableId> = unbound.clone();
-    let stats = blocked_stats::enabled();
-    let mut group_sizes_rec: Vec<usize> = Vec::new();
-    let mut batch_sizes_rec: Vec<usize> = Vec::new();
-    for (j, &variable) in group_vars.iter().enumerate() {
-        let g_count = group_counts[j];
-        if g_count == 0 {
-            continue;
-        }
-        let g_rows: &[RawInline] = if n_groups == 1 {
-            rows
-        } else {
-            &part[starts[j] * stride..(starts[j] + g_count) * stride]
-        };
-
-        if order_trace::enabled() {
-            order_trace::record(stride, variable, g_count as u64);
-        }
-        let mut pairs: Candidates = Vec::new();
-        constraint.propose(
-            variable,
-            &RowsView::new(vars, g_rows),
-            &mut CandidateSink::Tagged(&mut pairs),
-        );
-        if stats {
-            group_sizes_rec.push(g_count);
-            batch_sizes_rec.push(pairs.len());
-        }
-
-        let pos = unbound
-            .iter()
-            .position(|&x| x == variable)
-            .expect("group variable still unbound");
-        unbound.swap_remove(pos);
-        vars.push(variable);
-        let new_stride = stride + 1;
-        let mut next_rows: Vec<RawInline> = Vec::new();
-        let mut it = pairs.into_iter().peekable();
-        while it.peek().is_some() {
-            next_rows.clear();
-            let mut count = 0usize;
-            while count < row_cap {
-                let Some((row_idx, value)) = it.next() else {
-                    break;
-                };
-                let base = row_idx as usize * stride;
-                next_rows.extend_from_slice(&g_rows[base..base + stride]);
-                next_rows.push(value);
-                count += 1;
-            }
-            debug_assert_eq!(next_rows.len(), count * new_stride);
-            if stats {
-                blocked_stats::record_materialized(count);
-                blocked_stats::cells_add(count * new_stride);
-            }
-            descend_grouped(
-                constraint,
-                post,
-                influences,
-                base_estimates,
-                vars,
-                unbound,
-                &next_rows,
-                binding,
-                results,
-            );
-            if stats {
-                blocked_stats::cells_sub(count * new_stride);
-            }
-        }
-        vars.pop();
-        unbound.push(variable);
-    }
-    if stats {
-        if n_groups > 1 {
-            blocked_stats::cells_sub(n_rows * stride);
-        }
-        blocked_stats::record_level(blocked_stats::LevelRecord {
-            depth: stride,
-            rows: n_rows,
-            group_sizes: group_sizes_rec,
-            batch_sizes: batch_sizes_rec,
-        });
-    }
-}
-
 /// PROBE (dag-frontier): counters specific to the bucket-worklist solver
 /// ([`Query::solve_dag`]). Off by default; benches enable/reset around a
 /// run and print [`report`](dag_stats::report). Complements
@@ -1903,305 +1550,120 @@ struct DagBucket {
     rows: Vec<RawInline>,
     /// Pop id of the last filing (merge-event detection only).
     writer: u64,
+    /// Pending-contributor count — the number of live buckets whose set
+    /// is a **strict subset** of this bucket's set. Rows only ever gain
+    /// variables, so every future filing into this bucket must come from
+    /// such a contributor; `pending == 0` therefore *is* the readiness
+    /// gate, replacing the O(buckets²) subset scan with O(buckets)
+    /// incremental maintenance on create/retire. Maintained only in merge
+    /// mode (the gate exists to hold buckets *for* merging); invariant
+    /// checked against the scan in debug builds ([`dag_gate_check`]).
+    pending: u32,
+}
+
+/// Counting-gate maintenance — a contributor with set `retired` is gone
+/// for good (bucket fully consumed; a pop's filings complete before the
+/// next pop decision, so consumption and retirement fuse): every live
+/// strict superset loses one pending contributor.
+fn dag_gate_retire(buckets: &mut [DagBucket], retired: &VariableSet) {
+    for o in buckets.iter_mut() {
+        if o.set != *retired && retired.is_subset_of(&o.set) {
+            debug_assert!(o.pending > 0, "pending-contributor underflow");
+            o.pending -= 1;
+        }
+    }
+}
+
+/// Counting-gate maintenance for a newly created bucket — returns its
+/// initial pending count (live strict subsets) and registers it as a new
+/// pending contributor with every live strict superset.
+fn dag_gate_admit(buckets: &mut [DagBucket], new_set: &VariableSet) -> u32 {
+    let mut pending = 0u32;
+    for o in buckets.iter_mut() {
+        if o.set == *new_set {
+            continue;
+        }
+        if o.set.is_subset_of(new_set) {
+            pending += 1;
+        }
+        if new_set.is_subset_of(&o.set) {
+            o.pending += 1;
+        }
+    }
+    pending
+}
+
+/// Equivalence assertion — every live bucket's incrementally maintained
+/// `pending` must equal the O(n²) strict-subset scan the gate replaced.
+/// Debug builds run this at every pop decision in merge mode, so the
+/// whole `solve_blocked` parity corpus doubles as the counting-gate ==
+/// scan-gate proof.
+fn dag_gate_check(buckets: &[DagBucket]) {
+    for b in buckets {
+        let scan = buckets
+            .iter()
+            .filter(|o| o.set != b.set && o.set.is_subset_of(&b.set))
+            .count();
+        assert_eq!(
+            b.pending as usize, scan,
+            "counting gate diverged from the subset scan on bucket {:?}",
+            b.set
+        );
+    }
 }
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// PROBE (dag-frontier): bucket-worklist solver — the tree-becomes-DAG
-    /// upgrade of [`solve_blocked_grouped`](Self::solve_blocked_grouped).
+    /// upgrade of [`solve_blocked_grouped`](Self::solve_blocked_grouped),
+    /// i.e. the worklist core in its default configuration (grouped,
+    /// **merged**), drained eagerly at saturated width.
     ///
     /// Evaluation state is a worklist of **buckets keyed by
     /// bound-variable-set** instead of a recursion stack. Pop a bucket,
-    /// partition its rows by preferred next variable (the same
-    /// estimate-blocked + per-row-argmax logic as the grouped solver), run
-    /// one batched propose+confirm per (group, variable), then **file** the
-    /// extended rows into the bucket keyed by `bound ∪ {v}` — creating it
-    /// or **appending** to it. The append is the whole point: rows whose
+    /// partition its rows by preferred next variable, run one batched
+    /// propose+confirm per (group, variable), then **file** the extended
+    /// rows into the bucket keyed by `bound ∪ {v}` — creating it or
+    /// **appending** to it. The append is the whole point: rows whose
     /// routes through the variable lattice bound the same set in different
-    /// orders *reconverge* into one row store and every downstream batch is
-    /// correspondingly fatter. Rows are affine — moved on pop, never
-    /// copied between buckets (prefix duplication on fan-out is
-    /// materialization, not sharing). Full-bound buckets emit.
+    /// orders *reconverge* into one row store and every downstream batch
+    /// is correspondingly fatter. Rows are affine — moved on pop, never
+    /// copied between buckets. Full-bound buckets emit.
     ///
     /// Scheduling: **deepest-first among ready buckets**, where a bucket
-    /// is *ready* iff no live bucket's set is a strict subset of its set.
-    /// The gate is exact — rows only ever gain variables, so any future
-    /// contributor to bucket `S` is currently a strict subset of `S`;
-    /// once none exists, `S` is complete and safe to pop. Without the
-    /// gate, strict deepest-first pops a reconvergent bucket after its
-    /// *first* parent files (children out-deepen every pending sibling
-    /// route), so cross-parent rows never co-locate and the merge is dead
-    /// machinery. The price is that reconvergent buckets are *held* until
-    /// all their feeders drain — on a densely reconverging lattice the
-    /// schedule degrades toward breadth-first and frontier memory grows
-    /// accordingly (measured, not hidden). Where routes never reconverge
-    /// the gate never blocks and the schedule is DFS-like.
+    /// is *ready* iff no live bucket's set is a strict subset of its set
+    /// (tracked incrementally by the counting gate — see
+    /// [`DagBucket::pending`]). The gate is exact — rows only ever gain
+    /// variables, so any future contributor to bucket `S` is currently a
+    /// strict subset of `S`; once none exists, `S` is complete and safe
+    /// to pop. Without the gate, strict deepest-first pops a reconvergent
+    /// bucket after its *first* parent files, so cross-parent rows never
+    /// co-locate and the merge is dead machinery. The price is that
+    /// reconvergent buckets are *held* until all their feeders drain — on
+    /// a densely reconverging lattice the schedule degrades toward
+    /// breadth-first and frontier memory grows accordingly (measured, not
+    /// hidden). Where routes never reconverge the gate never blocks and
+    /// the schedule is DFS-like.
     ///
     /// Semantics: same result **multiset** as the sequential iterator
     /// (each row still value-partitions its region of the search space;
     /// merging is co-location only). Row order differs.
     pub fn solve_dag(self) -> Vec<R> {
-        self.solve_dag_impl(true)
+        self.solve_dag_lazy().start_width(usize::MAX).collect()
     }
 
     /// PROBE (dag-frontier): [`solve_dag`](Self::solve_dag) with merging
     /// **disabled** — every filing creates a fresh bucket (lineage-keyed),
-    /// so reconvergent routes stay in separate row stores. Identical
-    /// scheduling rule and machinery; this is the control that isolates
-    /// what the merge itself buys (batch re-fattening) from what the
-    /// worklist restructuring costs.
+    /// so reconvergent routes stay in separate row stores. This is the
+    /// control that isolates what the merge itself buys (batch
+    /// re-fattening) from what the worklist restructuring costs. With no
+    /// merging there is nothing to hold buckets *for*, so the readiness
+    /// gate is off and scheduling is strict deepest-first (DFS-like) —
+    /// which also makes this configuration identical to
+    /// [`solve_blocked_grouped`](Self::solve_blocked_grouped).
     pub fn solve_dag_unmerged(self) -> Vec<R> {
-        self.solve_dag_impl(false)
-    }
-
-    fn solve_dag_impl(self, merge: bool) -> Vec<R> {
-        let Query {
-            constraint,
-            postprocessing,
-            influences,
-            base_estimates,
-            ..
-        } = self;
-        let full = constraint.variables();
-        let row_cap = block_row_cap();
-        let stats = blocked_stats::enabled();
-        let dstats = dag_stats::enabled();
-        let mut results: Vec<R> = Vec::new();
-        let mut binding = Binding::default();
-
-        // Seed: the empty bound-set with one virtual zero-width row.
-        let mut buckets: Vec<DagBucket> = vec![DagBucket {
-            set: VariableSet::new_empty(),
-            vars: Vec::new(),
-            rows: Vec::new(),
-            writer: 0,
-        }];
-        let mut pop_id: u64 = 0;
-
-        while !buckets.is_empty() {
-            // Pop the deepest READY bucket. Ready: no live bucket is a
-            // strict subset (nothing can ever file into it again). The
-            // minimal elements of the live poset are always ready, so a
-            // pop always exists. O(buckets²) scan — bucket count is
-            // bounded by the number of distinct bound-sets in flight
-            // (lattice antichains in practice: a handful).
-            let strict = dag_strict_deepest();
-            let mut best: Option<(usize, usize)> = None;
-            for (i, b) in buckets.iter().enumerate() {
-                let ready = strict
-                    || buckets.iter().enumerate().all(|(j, o)| {
-                        j == i || !(o.set != b.set && o.set.is_subset_of(&b.set))
-                    });
-                if !ready {
-                    continue;
-                }
-                let depth = b.set.count();
-                if best.is_none_or(|(_, bd)| depth > bd) {
-                    best = Some((i, depth));
-                }
-            }
-            let (idx, _) = best.expect("a minimal live bucket is always ready");
-            let bucket = buckets.swap_remove(idx);
-            pop_id += 1;
-            if dstats {
-                dag_stats::record_pop();
-            }
-            let stride = bucket.vars.len();
-            let n_rows = RowsView::new(&bucket.vars, &bucket.rows).len();
-
-            // Full-bound bucket: emit.
-            if bucket.set == full {
-                for row in RowsView::new(&bucket.vars, &bucket.rows).iter() {
-                    for (k, &v) in bucket.vars.iter().enumerate() {
-                        binding.set(v, &row[k]);
-                    }
-                    if let Some(r) = postprocessing(&binding) {
-                        results.push(r);
-                    }
-                }
-                if stats {
-                    blocked_stats::cells_sub(bucket.rows.len());
-                }
-                continue;
-            }
-
-            let unbound: Vec<VariableId> = full.subtract(bucket.set).into_iter().collect();
-            let n_unbound = unbound.len();
-
-            // Files one group's `(row, value)` pairs into the child bucket
-            // for `bucket.set ∪ {variable}`, creating or appending.
-            let file =
-                |buckets: &mut Vec<DagBucket>,
-                 variable: VariableId,
-                 g_rows: &[RawInline],
-                 pairs: Vec<(u32, RawInline)>| {
-                    if pairs.is_empty() {
-                        return;
-                    }
-                    let mut child_set = bucket.set;
-                    child_set.set(variable);
-                    // Canonical layout: insert the new value at the
-                    // variable's ascending position.
-                    let vpos = bucket
-                        .vars
-                        .iter()
-                        .position(|&x| x > variable)
-                        .unwrap_or(stride);
-                    let child_stride = stride + 1;
-                    let target = if merge {
-                        buckets.iter().position(|b| b.set == child_set)
-                    } else {
-                        None
-                    };
-                    let target = match target {
-                        Some(t) => {
-                            if dstats && !buckets[t].rows.is_empty() && buckets[t].writer != pop_id
-                            {
-                                dag_stats::record_merge(pairs.len());
-                            }
-                            buckets[t].writer = pop_id;
-                            t
-                        }
-                        None => {
-                            let mut child_vars = bucket.vars.clone();
-                            child_vars.insert(vpos, variable);
-                            buckets.push(DagBucket {
-                                set: child_set,
-                                vars: child_vars,
-                                rows: Vec::new(),
-                                writer: pop_id,
-                            });
-                            if dstats {
-                                dag_stats::record_bucket_created(buckets.len());
-                            }
-                            buckets.len() - 1
-                        }
-                    };
-                    let store = &mut buckets[target].rows;
-                    store.reserve(pairs.len() * child_stride);
-                    let mut filed = 0usize;
-                    for (row_idx, value) in pairs {
-                        let base = row_idx as usize * stride;
-                        store.extend_from_slice(&g_rows[base..base + vpos]);
-                        store.push(value);
-                        store.extend_from_slice(&g_rows[base + vpos..base + stride]);
-                        filed += 1;
-                    }
-                    if stats {
-                        blocked_stats::record_materialized(filed);
-                        blocked_stats::cells_add(filed * child_stride);
-                    }
-                };
-
-            // Process the bucket's rows in cap-sized chunks: estimate,
-            // prefer, partition, one batched propose per group, file.
-            // The seed bucket (no columns) is one chunk of one virtual
-            // zero-width row — no special case.
-            let mut group_sizes_rec: Vec<usize> = Vec::new();
-            let mut batch_sizes_rec: Vec<usize> = Vec::new();
-            let mut start_row = 0usize;
-            while start_row < n_rows {
-                let end_row = (start_row + row_cap).min(n_rows);
-                let chunk = &bucket.rows[start_row * stride..end_row * stride];
-                let view = RowsView::new(&bucket.vars, chunk);
-                let c_rows = end_row - start_row;
-                start_row = end_row;
-
-                // 1. Estimate columns.
-                let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
-                for &v in unbound.iter() {
-                    let mut col = Vec::with_capacity(c_rows);
-                    let relevant =
-                        constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
-                    assert!(relevant, "unconstrained variable in query");
-                    debug_assert_eq!(col.len(), c_rows);
-                    est_cols.push(col);
-                }
-
-                // 2. Per-row preferred variable.
-                let mut preferred: Vec<u32> = Vec::with_capacity(c_rows);
-                let mut group_counts: Vec<usize> = vec![0; n_unbound];
-                for i in 0..c_rows {
-                    let j = (0..n_unbound)
-                        .max_by_key(|&j| {
-                            variable_order_key(
-                                est_cols[j][i],
-                                base_estimates[unbound[j]],
-                                influences[unbound[j]].count(),
-                            )
-                        })
-                        .expect("non-empty unbound");
-                    preferred.push(j as u32);
-                    group_counts[j] += 1;
-                }
-                drop(est_cols);
-
-                // 3. Partition (stable counting sort); single group
-                //    borrows the chunk.
-                let n_groups = group_counts.iter().filter(|&&c| c > 0).count();
-                let mut starts: Vec<usize> = Vec::with_capacity(n_unbound);
-                let mut acc = 0usize;
-                for &c in &group_counts {
-                    starts.push(acc);
-                    acc += c;
-                }
-                let mut part: Vec<RawInline> = Vec::new();
-                if n_groups > 1 {
-                    if stats {
-                        blocked_stats::cells_add(chunk.len());
-                    }
-                    part = vec![[0u8; 32]; chunk.len()];
-                    let mut cursors = starts.clone();
-                    for i in 0..c_rows {
-                        let j = preferred[i] as usize;
-                        let dst = cursors[j];
-                        cursors[j] += 1;
-                        part[dst * stride..(dst + 1) * stride]
-                            .copy_from_slice(&chunk[i * stride..(i + 1) * stride]);
-                    }
-                }
-                drop(preferred);
-
-                // 4. One batched propose per group; file into buckets.
-                for (j, &variable) in unbound.iter().enumerate() {
-                    let g_count = group_counts[j];
-                    if g_count == 0 {
-                        continue;
-                    }
-                    let g_rows: &[RawInline] = if n_groups == 1 {
-                        chunk
-                    } else {
-                        &part[starts[j] * stride..(starts[j] + g_count) * stride]
-                    };
-                    if order_trace::enabled() {
-                        order_trace::record(stride, variable, g_count as u64);
-                    }
-                    let mut pairs: Candidates = Vec::new();
-                    constraint.propose(
-                        variable,
-                        &RowsView::new(&bucket.vars, g_rows),
-                        &mut CandidateSink::Tagged(&mut pairs),
-                    );
-                    if stats {
-                        group_sizes_rec.push(g_count);
-                        batch_sizes_rec.push(pairs.len());
-                    }
-                    file(&mut buckets, variable, g_rows, pairs);
-                }
-                if stats && n_groups > 1 {
-                    blocked_stats::cells_sub(chunk.len());
-                }
-            }
-            if stats {
-                blocked_stats::record_level(blocked_stats::LevelRecord {
-                    depth: stride,
-                    rows: n_rows,
-                    group_sizes: group_sizes_rec,
-                    batch_sizes: batch_sizes_rec,
-                });
-                blocked_stats::cells_sub(bucket.rows.len());
-            }
-        }
-        results
+        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
+        it.state.merge = false;
+        it.collect()
     }
 
     /// PROBE (lazy-dag): resumable-iterator form of
@@ -2359,6 +1821,45 @@ pub(crate) struct DagState<R> {
     width: usize,
     growth: usize,
     cap: usize,
+    /// File by bound-set — reconvergent routes co-locate and downstream
+    /// batches re-fatten. Off: lineage-keyed filing (a fresh bucket per
+    /// filing), the tree-shaped control.
+    merge: bool,
+    /// Per-row variable choice + partition (group-by-ordering). Off: one
+    /// variable per pop from the first row's estimates (blocked-v1's
+    /// trivial partition).
+    grouped: bool,
+    /// Pooled per-pop scratch — the worklist loop is allocation-free in
+    /// steady state (bucket row stores and their `vars` are the only
+    /// per-pop allocations left, and those are the product, not scratch).
+    scratch: DagScratch,
+}
+
+/// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
+/// (taken with `mem::take`, returned when the pop completes).
+#[derive(Default)]
+struct DagScratch {
+    /// Unbound variables of the popped bucket.
+    unbound: Vec<VariableId>,
+    /// Column layout of the popped rows (survives bucket removal).
+    parent_vars: Vec<VariableId>,
+    /// Flat estimate matrix, variable-major: `est[j * rows + i]` — the
+    /// columns land contiguously because [`EstimateSink::Column`] appends.
+    est: Vec<usize>,
+    /// Per-row preferred-variable index (into `unbound`).
+    preferred: Vec<u32>,
+    /// Rows per group.
+    group_counts: Vec<usize>,
+    /// Group start offsets (rows).
+    starts: Vec<usize>,
+    /// Partition write cursors (counting sort).
+    cursors: Vec<usize>,
+    /// Partitioned row store (populated only when >1 group).
+    part: Vec<RawInline>,
+    /// Copied tail rows for partial pops.
+    work: Vec<RawInline>,
+    /// Candidate frontier, reused across groups and pops.
+    pairs: Candidates,
 }
 
 impl<R> DagState<R> {
@@ -2371,6 +1872,7 @@ impl<R> DagState<R> {
                 vars: Vec::new(),
                 rows: Vec::new(),
                 writer: 0,
+                pending: 0,
             }],
             pop_id: 0,
             binding: Binding::default(),
@@ -2378,84 +1880,104 @@ impl<R> DagState<R> {
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
+            merge: true,
+            grouped: true,
+            scratch: DagScratch::default(),
         }
     }
 }
 
-impl<R> DagState<R> {
-    /// Files one group's `(row, value)` pairs into the bucket keyed by
-    /// `parent_set ∪ {variable}`, creating or (in merge mode — always, for
-    /// the lazy probe) appending. Identical to the eager solver's `file`
-    /// closure; a method because the lazy engine needs it across pops.
-    ///
-    /// Note on merge stats: with partial pops, the same parent's remainder
-    /// files into the same child across *different* pop ids, so
-    /// [`dag_stats`] merge events count self-refills as merges here.
-    fn file(
-        &mut self,
-        parent_set: VariableSet,
-        parent_vars: &[VariableId],
-        variable: VariableId,
-        g_rows: &[RawInline],
-        pairs: Vec<(u32, RawInline)>,
-    ) {
-        if pairs.is_empty() {
-            return;
-        }
-        let stats = blocked_stats::enabled();
-        let dstats = dag_stats::enabled();
-        let stride = parent_vars.len();
-        let mut child_set = parent_set;
-        child_set.set(variable);
-        let vpos = parent_vars
-            .iter()
-            .position(|&x| x > variable)
-            .unwrap_or(stride);
-        let child_stride = stride + 1;
-        let target = match self.buckets.iter().position(|b| b.set == child_set) {
-            Some(t) => {
-                if dstats && !self.buckets[t].rows.is_empty() && self.buckets[t].writer != self.pop_id
-                {
-                    dag_stats::record_merge(pairs.len());
-                }
-                self.buckets[t].writer = self.pop_id;
-                t
-            }
-            None => {
-                let mut child_vars = parent_vars.to_vec();
-                child_vars.insert(vpos, variable);
-                self.buckets.push(DagBucket {
-                    set: child_set,
-                    vars: child_vars,
-                    rows: Vec::new(),
-                    writer: self.pop_id,
-                });
-                if dstats {
-                    dag_stats::record_bucket_created(self.buckets.len());
-                }
-                self.buckets.len() - 1
-            }
-        };
-        let store = &mut self.buckets[target].rows;
-        store.reserve(pairs.len() * child_stride);
-        let mut filed = 0usize;
-        for (row_idx, value) in pairs {
-            let base = row_idx as usize * stride;
-            store.extend_from_slice(&g_rows[base..base + vpos]);
-            store.push(value);
-            store.extend_from_slice(&g_rows[base + vpos..base + stride]);
-            filed += 1;
-        }
-        if stats {
-            blocked_stats::record_materialized(filed);
-            blocked_stats::cells_add(filed * child_stride);
-        }
+/// Files one group's `(row, value)` pairs into the bucket keyed by
+/// `parent_set ∪ {variable}` — finding it (merge mode: reconvergent routes
+/// co-locate) or creating it (always in lineage mode). New buckets are
+/// admitted to the counting gate in merge mode.
+///
+/// Note on merge stats: with partial pops, the same parent's remainder
+/// files into the same child across *different* pop ids, so [`dag_stats`]
+/// merge events count self-refills as merges under narrow widths.
+#[allow(clippy::too_many_arguments)]
+fn dag_file(
+    buckets: &mut Vec<DagBucket>,
+    merge: bool,
+    pop_id: u64,
+    parent_set: VariableSet,
+    parent_vars: &[VariableId],
+    variable: VariableId,
+    g_rows: &[RawInline],
+    pairs: &[(u32, RawInline)],
+) {
+    if pairs.is_empty() {
+        return;
     }
+    let stats = blocked_stats::enabled();
+    let dstats = dag_stats::enabled();
+    let stride = parent_vars.len();
+    let mut child_set = parent_set;
+    child_set.set(variable);
+    // Canonical layout: insert the new value at the variable's ascending
+    // position.
+    let vpos = parent_vars
+        .iter()
+        .position(|&x| x > variable)
+        .unwrap_or(stride);
+    let child_stride = stride + 1;
+    let target = if merge {
+        buckets.iter().position(|b| b.set == child_set)
+    } else {
+        None
+    };
+    let target = match target {
+        Some(t) => {
+            if dstats && !buckets[t].rows.is_empty() && buckets[t].writer != pop_id {
+                dag_stats::record_merge(pairs.len());
+            }
+            buckets[t].writer = pop_id;
+            t
+        }
+        None => {
+            let mut child_vars = Vec::with_capacity(child_stride);
+            child_vars.extend_from_slice(&parent_vars[..vpos]);
+            child_vars.push(variable);
+            child_vars.extend_from_slice(&parent_vars[vpos..]);
+            let pending = if merge {
+                dag_gate_admit(buckets, &child_set)
+            } else {
+                0
+            };
+            buckets.push(DagBucket {
+                set: child_set,
+                vars: child_vars,
+                rows: Vec::new(),
+                writer: pop_id,
+                pending,
+            });
+            if dstats {
+                dag_stats::record_bucket_created(buckets.len());
+            }
+            buckets.len() - 1
+        }
+    };
+    let store = &mut buckets[target].rows;
+    store.reserve(pairs.len() * child_stride);
+    for &(row_idx, value) in pairs {
+        let base = row_idx as usize * stride;
+        store.extend_from_slice(&g_rows[base..base + vpos]);
+        store.push(value);
+        store.extend_from_slice(&g_rows[base + vpos..base + stride]);
+    }
+    if stats {
+        blocked_stats::record_materialized(pairs.len());
+        blocked_stats::cells_add(pairs.len() * child_stride);
+    }
+}
 
+impl<R> DagState<R> {
     /// One pop: choose a bucket (sprint: strict deepest; harvest:
-    /// deepest-ready), take at most `width` rows off its tail (full-bound
-    /// and seed buckets are consumed whole), and either emit (full-bound)
-    /// or estimate → prefer → partition → propose → file.
+    /// deepest-ready per the counting gate), take at most `width` rows off
+    /// its tail (full-bound and seed buckets are consumed whole), and
+    /// either emit (full-bound) or expand — grouped (estimate → prefer →
+    /// partition → propose per group) or ungrouped (first-row choice, one
+    /// propose over the whole block) — then file into child buckets.
     fn pop_once<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
         &mut self,
         constraint: &C,
@@ -2466,19 +1988,19 @@ impl<R> DagState<R> {
     ) {
         let stats = blocked_stats::enabled();
         let dstats = dag_stats::enabled();
-        // Harvest gating: only once the width has saturated does holding
-        // buckets for merging make sense (see `solve_dag_lazy` docs). The
+        // Readiness gating exists to hold buckets *for merging*, and only
+        // pays once the width has saturated (harvest — see
+        // `solve_dag_lazy` docs); in sprint, and always in lineage mode,
+        // the scheduler pops strict-deepest (DFS-isomorphic). The
         // strict-deepest env ablation forces sprint scheduling throughout.
-        let gated = width >= self.cap && !dag_strict_deepest();
+        let gated = self.merge && width >= self.cap && !dag_strict_deepest();
+        if cfg!(debug_assertions) && self.merge {
+            dag_gate_check(&self.buckets);
+        }
         let mut best: Option<(usize, usize)> = None;
         for (i, b) in self.buckets.iter().enumerate() {
-            if gated {
-                let ready = self.buckets.iter().enumerate().all(|(j, o)| {
-                    j == i || !(o.set != b.set && o.set.is_subset_of(&b.set))
-                });
-                if !ready {
-                    continue;
-                }
+            if gated && b.pending != 0 {
+                continue;
             }
             let depth = b.set.count();
             if best.is_none_or(|(_, bd)| depth > bd) {
@@ -2496,6 +2018,9 @@ impl<R> DagState<R> {
         // the iterator discards the rest for free).
         if self.buckets[idx].set == self.full {
             let bucket = self.buckets.swap_remove(idx);
+            if self.merge {
+                dag_gate_retire(&mut self.buckets, &bucket.set);
+            }
             for row in RowsView::new(&bucket.vars, &bucket.rows).iter() {
                 for (k, &v) in bucket.vars.iter().enumerate() {
                     self.binding.set(v, &row[k]);
@@ -2512,109 +2037,186 @@ impl<R> DagState<R> {
 
         let stride = self.buckets[idx].vars.len();
 
-        // Partial pop: take up to `width` rows off the tail; a remainder
-        // stays live under the same key (it is its own future feeder —
-        // in harvest mode the gate holds its children until it drains,
-        // in sprint mode its children out-deepen it and dive first).
-        // The seed bucket is a single virtual zero-width row, so it is
-        // always consumed whole and flows through the generic path.
+        // Take up to `width` rows off the tail; a remainder stays live
+        // under the same key (it is its own future feeder — in harvest
+        // mode the gate holds its children until it drains, in sprint
+        // mode its children out-deepen it and dive first). The seed
+        // bucket is a single virtual zero-width row, so it is always
+        // consumed whole and flows through the generic path.
+        let mut scratch = std::mem::take(&mut self.scratch);
         let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
         let take = n_rows.min(width.max(1));
-        let (parent_set, parent_vars, work) = if take == n_rows {
+        scratch.parent_vars.clear();
+        let owned: Vec<RawInline>;
+        let (parent_set, work): (VariableSet, &[RawInline]) = if take == n_rows {
             let b = self.buckets.swap_remove(idx);
-            (b.set, b.vars, b.rows)
+            if self.merge {
+                dag_gate_retire(&mut self.buckets, &b.set);
+            }
+            scratch.parent_vars.extend_from_slice(&b.vars);
+            owned = b.rows;
+            (b.set, &owned)
         } else {
             let b = &mut self.buckets[idx];
-            let work = b.rows.split_off((n_rows - take) * stride);
-            (b.set, b.vars.clone(), work)
+            let split = (n_rows - take) * stride;
+            scratch.work.clear();
+            scratch.work.extend_from_slice(&b.rows[split..]);
+            b.rows.truncate(split);
+            scratch.parent_vars.extend_from_slice(&b.vars);
+            (b.set, &scratch.work)
         };
-        let view = RowsView::new(&parent_vars, &work);
+        let view = RowsView::new(&scratch.parent_vars, work);
         let c_rows = take;
-        let unbound: Vec<VariableId> = self.full.subtract(parent_set).into_iter().collect();
-        let n_unbound = unbound.len();
+        scratch.unbound.clear();
+        scratch.unbound.extend(self.full.subtract(parent_set));
+        let n_unbound = scratch.unbound.len();
 
-        // 1. Estimate columns.
-        let mut est_cols: Vec<Vec<usize>> = Vec::with_capacity(n_unbound);
-        for &v in unbound.iter() {
-            let mut col = Vec::with_capacity(c_rows);
-            let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut col));
-            assert!(relevant, "unconstrained variable in query");
-            debug_assert_eq!(col.len(), c_rows);
-            est_cols.push(col);
+        if !self.grouped {
+            // Trivial partition: one group, next variable chosen once per
+            // block from the first row's estimates (blocked-v1).
+            let ui = choose_variable(
+                constraint,
+                &scratch.unbound,
+                view.row_view(0),
+                influences,
+                base_estimates,
+            );
+            let variable = scratch.unbound[ui];
+            if order_trace::enabled() {
+                order_trace::record(stride, variable, 1);
+            }
+            scratch.pairs.clear();
+            constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut scratch.pairs));
+            if stats {
+                blocked_stats::record_level(blocked_stats::LevelRecord {
+                    depth: stride,
+                    rows: c_rows,
+                    group_sizes: vec![c_rows],
+                    batch_sizes: vec![scratch.pairs.len()],
+                });
+            }
+            dag_file(
+                &mut self.buckets,
+                self.merge,
+                self.pop_id,
+                parent_set,
+                &scratch.parent_vars,
+                variable,
+                work,
+                &scratch.pairs,
+            );
+            if stats {
+                blocked_stats::cells_sub(work.len());
+            }
+            self.scratch = scratch;
+            return;
         }
 
-        // 2. Per-row preferred variable.
-        let mut preferred: Vec<u32> = Vec::with_capacity(c_rows);
-        let mut group_counts: Vec<usize> = vec![0; n_unbound];
+        // 1. Estimate: flat variable-major matrix, one column per unbound
+        //    variable — columns land contiguously because the sink appends.
+        scratch.est.clear();
+        for &v in scratch.unbound.iter() {
+            let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut scratch.est));
+            assert!(relevant, "unconstrained variable in query");
+        }
+        debug_assert_eq!(scratch.est.len(), n_unbound * c_rows);
+
+        // 2. Per-row preferred variable: argmax of the engine's ordering
+        //    key over the row's matrix entries.
+        scratch.preferred.clear();
+        scratch.group_counts.clear();
+        scratch.group_counts.resize(n_unbound, 0);
         for i in 0..c_rows {
             let j = (0..n_unbound)
                 .max_by_key(|&j| {
                     variable_order_key(
-                        est_cols[j][i],
-                        base_estimates[unbound[j]],
-                        influences[unbound[j]].count(),
+                        scratch.est[j * c_rows + i],
+                        base_estimates[scratch.unbound[j]],
+                        influences[scratch.unbound[j]].count(),
                     )
                 })
                 .expect("non-empty unbound");
-            preferred.push(j as u32);
-            group_counts[j] += 1;
+            scratch.preferred.push(j as u32);
+            scratch.group_counts[j] += 1;
         }
-        drop(est_cols);
 
-        // 3. Partition (stable counting sort); single group borrows the
-        //    popped rows.
-        let n_groups = group_counts.iter().filter(|&&c| c > 0).count();
-        let mut starts: Vec<usize> = Vec::with_capacity(n_unbound);
+        // 3. Partition (stable counting sort); a single group borrows the
+        //    popped rows directly.
+        let n_groups = scratch.group_counts.iter().filter(|&&c| c > 0).count();
+        scratch.starts.clear();
         let mut acc = 0usize;
-        for &c in &group_counts {
-            starts.push(acc);
+        for &c in &scratch.group_counts {
+            scratch.starts.push(acc);
             acc += c;
         }
-        let mut part: Vec<RawInline> = Vec::new();
         if n_groups > 1 {
             if stats {
                 blocked_stats::cells_add(work.len());
             }
-            part = vec![[0u8; 32]; work.len()];
-            let mut cursors = starts.clone();
+            scratch.part.clear();
+            scratch.part.resize(work.len(), [0u8; 32]);
+            scratch.cursors.clear();
+            scratch.cursors.extend_from_slice(&scratch.starts);
             for i in 0..c_rows {
-                let j = preferred[i] as usize;
-                let dst = cursors[j];
-                cursors[j] += 1;
-                part[dst * stride..(dst + 1) * stride]
+                let j = scratch.preferred[i] as usize;
+                let dst = scratch.cursors[j];
+                scratch.cursors[j] += 1;
+                scratch.part[dst * stride..(dst + 1) * stride]
                     .copy_from_slice(&work[i * stride..(i + 1) * stride]);
             }
         }
-        drop(preferred);
 
-        // 4. One batched propose per group; file into buckets.
-        for (j, &variable) in unbound.iter().enumerate() {
-            let g_count = group_counts[j];
+        // 4. One batched propose per group; file into child buckets.
+        let mut group_sizes_rec: Vec<usize> = Vec::new();
+        let mut batch_sizes_rec: Vec<usize> = Vec::new();
+        for j in 0..n_unbound {
+            let g_count = scratch.group_counts[j];
             if g_count == 0 {
                 continue;
             }
+            let variable = scratch.unbound[j];
             let g_rows: &[RawInline] = if n_groups == 1 {
-                &work
+                work
             } else {
-                &part[starts[j] * stride..(starts[j] + g_count) * stride]
+                &scratch.part[scratch.starts[j] * stride..(scratch.starts[j] + g_count) * stride]
             };
             if order_trace::enabled() {
                 order_trace::record(stride, variable, g_count as u64);
             }
-            let mut pairs: Candidates = Vec::new();
+            scratch.pairs.clear();
             constraint.propose(
                 variable,
-                &RowsView::new(&parent_vars, g_rows),
-                &mut CandidateSink::Tagged(&mut pairs),
+                &RowsView::new(&scratch.parent_vars, g_rows),
+                &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
-            self.file(parent_set, &parent_vars, variable, g_rows, pairs);
+            if stats {
+                group_sizes_rec.push(g_count);
+                batch_sizes_rec.push(scratch.pairs.len());
+            }
+            dag_file(
+                &mut self.buckets,
+                self.merge,
+                self.pop_id,
+                parent_set,
+                &scratch.parent_vars,
+                variable,
+                g_rows,
+                &scratch.pairs,
+            );
         }
         if stats {
             if n_groups > 1 {
                 blocked_stats::cells_sub(work.len());
             }
+            blocked_stats::record_level(blocked_stats::LevelRecord {
+                depth: stride,
+                rows: c_rows,
+                group_sizes: group_sizes_rec,
+                batch_sizes: batch_sizes_rec,
+            });
             blocked_stats::cells_sub(work.len());
         }
+        self.scratch = scratch;
     }
 }
 
