@@ -1837,7 +1837,6 @@ pub(crate) struct DagState<R> {
 
 /// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
 /// (taken with `mem::take`, returned when the pop completes).
-#[derive(Default)]
 struct DagScratch {
     /// Unbound variables of the popped bucket.
     unbound: Vec<VariableId>,
@@ -1860,6 +1859,29 @@ struct DagScratch {
     work: Vec<RawInline>,
     /// Candidate frontier, reused across groups and pops.
     pairs: Candidates,
+    /// Variable→column index for the popped layout
+    /// ([`RowsView::new_indexed`]), refilled once per pop — every verb
+    /// call of every constraint at this level then locates its columns in
+    /// O(1) instead of scanning `vars`.
+    cols: [u8; 128],
+}
+
+impl Default for DagScratch {
+    fn default() -> Self {
+        DagScratch {
+            unbound: Vec::new(),
+            parent_vars: Vec::new(),
+            est: Vec::new(),
+            preferred: Vec::new(),
+            group_counts: Vec::new(),
+            starts: Vec::new(),
+            cursors: Vec::new(),
+            part: Vec::new(),
+            work: Vec::new(),
+            pairs: Vec::new(),
+            cols: [COL_UNBOUND; 128],
+        }
+    }
 }
 
 impl<R> DagState<R> {
@@ -2065,7 +2087,11 @@ impl<R> DagState<R> {
             scratch.parent_vars.extend_from_slice(&b.vars);
             (b.set, &scratch.work)
         };
-        let view = RowsView::new(&scratch.parent_vars, work);
+        scratch.cols = [COL_UNBOUND; 128];
+        for (i, &v) in scratch.parent_vars.iter().enumerate() {
+            scratch.cols[v] = i as u8;
+        }
+        let view = RowsView::new_indexed(&scratch.parent_vars, work, &scratch.cols);
         let c_rows = take;
         scratch.unbound.clear();
         scratch.unbound.extend(self.full.subtract(parent_set));
@@ -2186,7 +2212,7 @@ impl<R> DagState<R> {
             scratch.pairs.clear();
             constraint.propose(
                 variable,
-                &RowsView::new(&scratch.parent_vars, g_rows),
+                &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
                 &mut CandidateSink::Tagged(&mut scratch.pairs),
             );
             if stats {
