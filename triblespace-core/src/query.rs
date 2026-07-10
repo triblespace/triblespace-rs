@@ -321,10 +321,29 @@ pub trait Constraint<'a> {
     /// Enumerates candidate values for `variable` into `proposals`.
     ///
     /// Called on the constraint with the lowest estimate for the variable
-    /// being bound. Values are appended to `proposals`; the engine may
-    /// already have values in the vector from a previous round.
+    /// being bound.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
+    ///
+    /// # Protocol law: the sink is always empty
+    ///
+    /// `propose` is always handed an **empty** sink. The engine clears the
+    /// proposal vector before every call, and composite constraints must
+    /// preserve the invariant when delegating: every candidate in the sink
+    /// belongs to the callee, which may therefore append, filter, sort, and
+    /// deduplicate the vector freely (an
+    /// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
+    /// lets its tightest child propose and then filters the sink through the
+    /// remaining children's [`confirm`](Constraint::confirm)).
+    ///
+    /// The dual obligation falls on composites that invoke more than one
+    /// child `propose` for the same sink:
+    /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+    /// hands each variant its own empty buffer and merges the independent
+    /// outputs afterwards. Sharing one vector across variants would let a
+    /// filtering variant delete candidates another variant produced — the
+    /// result would depend on variant order and adding data could remove
+    /// results, violating the substrate's monotonicity guarantee.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>);
 
     /// Filters `proposals` to remove values for `variable` that violate
@@ -340,11 +359,23 @@ pub trait Constraint<'a> {
     /// Returns whether this constraint is consistent with the current
     /// `binding`.
     ///
-    /// The default implementation returns `true`. Override this when the
-    /// constraint can cheaply detect that no solution exists — for example,
-    /// a `TribleSetConstraint`
-    /// whose entity, attribute, and value are all bound but the triple is
-    /// absent from the dataset.
+    /// # Protocol law: exact when fully bound
+    ///
+    /// While at least one of this constraint's variables is unbound,
+    /// `satisfied` may answer an optimistic `true` (the default
+    /// implementation). Once **all** of the constraint's variables are
+    /// bound the answer MUST be exact: `true` if and only if the bound
+    /// values jointly satisfy the constraint — for example, a
+    /// `TribleSetConstraint` whose entity, attribute, and value are all
+    /// bound must perform the membership check rather than defaulting to
+    /// `true`.
+    ///
+    /// Exactness is a soundness requirement, not an optimisation:
+    /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+    /// relies on `satisfied` to detect dead variants when it propose/confirms
+    /// *other* variables of the union. A leaf that leaves the optimistic
+    /// default lets a dead variant keep proposing, producing rows that no
+    /// single variant would accept.
     ///
     /// Composite constraints propagate this check to their children:
     /// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)

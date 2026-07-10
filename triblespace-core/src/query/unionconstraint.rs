@@ -72,11 +72,32 @@ where
     /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false`) are skipped so their stale bindings cannot inject
     /// values that no live variant would produce.
+    ///
+    /// Each variant proposes into its **own empty buffer** and the union
+    /// merges the independent per-variant outputs. This upholds the
+    /// empty-sink law of [`propose`](Constraint::propose): a composite
+    /// variant (e.g. an intersection) filters the sink it is handed via its
+    /// children's `confirm`, so sharing one vector across variants would let
+    /// a later variant delete candidates an earlier variant produced —
+    /// making the result depend on variant order and, worse, letting a
+    /// monotonic growth of the underlying data *remove* results (a CALM
+    /// violation observed in [`pattern_changes!`](crate::macros::pattern_changes)
+    /// joins).
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        debug_assert!(
+            proposals.is_empty(),
+            "propose expects an empty sink (see the Constraint::propose protocol law)"
+        );
+        let mut variant_proposals = Vec::new();
         self.constraints
             .iter()
             .filter(|c| c.satisfied(binding))
-            .for_each(|c| c.propose(variable, binding, proposals));
+            .for_each(|c| {
+                c.propose(variable, binding, &mut variant_proposals);
+                // `append` drains the buffer, leaving it empty for the
+                // next variant.
+                proposals.append(&mut variant_proposals);
+            });
         proposals.sort_unstable();
         proposals.dedup();
     }
