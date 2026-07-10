@@ -741,3 +741,115 @@ fn lazy_slow_start_trajectory() {
         "width never grew — the engine was never resumed twice: {widths:?}"
     );
 }
+
+/// PROBE (lazy-dag) demand-bounded postprocessing: a full-bound bucket
+/// must be drained at the current chunk width, not wholesale — the first
+/// `next()` (the `exists!`/`take(1)` path) triggers exactly one final-row
+/// conversion at start width 1, every later pull adds at most the current
+/// width worth of postprocess calls, and a full drain postprocesses each
+/// result row exactly once.
+#[test]
+fn lazy_full_bound_postprocess_is_width_bounded() {
+    let (kb, human, _anchor) = build_world();
+    let expected: usize = multiset(find!(
+        (e: Inline<_>, g: Inline<_>, c: Inline<_>),
+        pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
+    ))
+    .values()
+    .sum();
+    assert!(expected > 3, "fixture too small to observe eager drain");
+
+    let calls = std::cell::Cell::new(0usize);
+    let mut ctx = triblespace::core::query::VariableContext::new();
+    macro_rules! __local_find_context {
+        () => {
+            &mut ctx
+        };
+    }
+    let e = ctx.next_variable::<GenId>();
+    let g = ctx.next_variable::<GenId>();
+    let c = ctx.next_variable::<GenId>();
+    let constraint =
+        pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }]);
+    let _ = (e, g, c);
+    let q = triblespace::core::query::Query::new(constraint, |_binding| {
+        calls.set(calls.get() + 1);
+        Some(())
+    });
+    let mut it = q.solve_dag_lazy().start_width(1).growth(2);
+
+    assert!(it.next().is_some(), "fixture must produce rows");
+    assert_eq!(
+        calls.get(),
+        1,
+        "first next() postprocessed {} rows — full-bound bucket drained eagerly",
+        calls.get()
+    );
+
+    let mut total = 1usize;
+    loop {
+        let before = calls.get();
+        let width = it.current_width();
+        if it.next().is_none() {
+            break;
+        }
+        total += 1;
+        assert!(
+            calls.get() - before <= width,
+            "one pull postprocessed {} rows at width {width}",
+            calls.get() - before
+        );
+    }
+    assert_eq!(total, expected, "lazy drain lost or duplicated rows");
+    assert_eq!(
+        calls.get(),
+        expected,
+        "each result row must be postprocessed exactly once"
+    );
+}
+
+/// PROBE (lazy-dag) panic ordering: with width-bounded postprocessing, a
+/// later row's postprocessing panic fires only once the consumer pulls
+/// that far — earlier valid rows have already been yielded. (The eager
+/// wholesale drain converted every row of the final bucket up front, so
+/// the panic destroyed rows the consumer never got to see.)
+#[test]
+fn lazy_yields_earlier_rows_before_later_panic() {
+    let (kb, human, _anchor) = build_world();
+    let calls = std::cell::Cell::new(0usize);
+    let mut ctx = triblespace::core::query::VariableContext::new();
+    macro_rules! __local_find_context {
+        () => {
+            &mut ctx
+        };
+    }
+    let e = ctx.next_variable::<GenId>();
+    let g = ctx.next_variable::<GenId>();
+    let c = ctx.next_variable::<GenId>();
+    let constraint =
+        pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }]);
+    let _ = (e, g, c);
+    let q = triblespace::core::query::Query::new(constraint, |_binding| {
+        let n = calls.get() + 1;
+        calls.set(n);
+        if n == 3 {
+            panic!("postprocessing side effect for row 3");
+        }
+        Some(())
+    });
+    let mut it = q.solve_dag_lazy().start_width(1).growth(2);
+    let yielded = std::cell::Cell::new(0usize);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        while it.next().is_some() {
+            yielded.set(yielded.get() + 1);
+        }
+    }));
+    assert!(
+        result.is_err(),
+        "fixture never reached the panicking row — gate is vacuous"
+    );
+    assert!(
+        yielded.get() >= 1,
+        "earlier valid rows were lost to a later row's panic — postprocessing ran eagerly"
+    );
+}

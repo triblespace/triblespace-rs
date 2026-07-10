@@ -870,6 +870,22 @@ where
     P: Fn(&Binding) -> Option<R> + Clone,
 {
     fn clone(&self) -> Self {
+        // The sequential clone snapshots the remaining search state — the
+        // clone yields exactly the rows the original hasn't consumed yet.
+        // The DAG engine cannot honor that contract without `R: Clone`
+        // (its emit buffer holds already-postprocessed `R`s), and
+        // silently restarting from scratch would duplicate rows the
+        // original already yielded. Refuse loudly instead. Rayon's
+        // par-iter never hits this: `split` only clones queries that have
+        // not been driven through `next()` (folding starts after
+        // splitting), for which `dag` is still `None`.
+        assert!(
+            self.dag.is_none(),
+            "cannot clone a Query mid-iteration under TRIBLES_ENGINE=dag: \
+             the DAG engine's in-flight state is not snapshottable without \
+             `R: Clone`, and a silent restart would duplicate rows already \
+             consumed — clone before the first `next()`, or collect instead"
+        );
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
@@ -885,11 +901,8 @@ where
             unbound: self.unbound.clone(),
             values: self.values.clone(),
             binding: self.binding.clone(),
-            // DAG state is not cloneable (the emit buffer holds `R`s, which
-            // aren't `Clone` here). Rayon's producer `split` only clones
-            // queries that have never been driven through `next()` (folding
-            // starts after splitting), so this is always `None` there; a
-            // manual mid-iteration clone in dag mode restarts from scratch.
+            // Guarded `None` above — a started dag-mode query refuses to
+            // clone rather than silently restart.
             dag: None,
         }
     }
@@ -1992,10 +2005,11 @@ fn dag_file(
 impl<R> DagState<R> {
     /// One pop: choose a bucket (sprint: strict deepest; harvest:
     /// deepest-ready per the counting gate), take at most `width` rows off
-    /// its tail (full-bound and seed buckets are consumed whole), and
-    /// either emit (full-bound) or expand — grouped (estimate → prefer →
-    /// partition → propose per group) or ungrouped (first-row choice, one
-    /// propose over the whole block) — then file into child buckets.
+    /// its tail (the seed bucket is one virtual row, always consumed
+    /// whole), and either emit (full-bound: postprocess just the taken
+    /// rows) or expand — grouped (estimate → prefer → partition → propose
+    /// per group) or ungrouped (first-row choice, one propose over the
+    /// whole block) — then file into child buckets.
     fn pop_once<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
         &mut self,
         constraint: &C,
@@ -2031,16 +2045,39 @@ impl<R> DagState<R> {
             dag_stats::record_pop();
         }
 
-        // Full-bound bucket: consume whole, postprocess into the emit
-        // buffer (finished rows — buffering them is cheap and dropping
-        // the iterator discards the rest for free).
+        // Full-bound bucket: take at most `width` rows off its tail and
+        // postprocess only those into the emit buffer — the remainder
+        // stays live under the same key, exactly like a partial
+        // expansion pop. Final-row conversion is thereby demand-bounded:
+        // `exists!`/`take(1)` consumers trigger at most `width`
+        // postprocessing calls per resumption, and a later row's
+        // postprocessing side effects (or panic) happen only once the
+        // consumer actually pulls that far.
         if self.buckets[idx].set == self.full {
-            let bucket = self.buckets.swap_remove(idx);
-            if self.merge {
-                dag_gate_retire(&mut self.buckets, &bucket.set);
-            }
-            for row in RowsView::new(&bucket.vars, &bucket.rows).iter() {
-                for (k, &v) in bucket.vars.iter().enumerate() {
+            let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
+            let take = n_rows.min(width.max(1));
+            let mut scratch = std::mem::take(&mut self.scratch);
+            scratch.parent_vars.clear();
+            let owned: Vec<RawInline>;
+            let rows: &[RawInline] = if take == n_rows {
+                let bucket = self.buckets.swap_remove(idx);
+                if self.merge {
+                    dag_gate_retire(&mut self.buckets, &bucket.set);
+                }
+                scratch.parent_vars.extend_from_slice(&bucket.vars);
+                owned = bucket.rows;
+                &owned
+            } else {
+                let b = &mut self.buckets[idx];
+                let split = (n_rows - take) * b.vars.len();
+                scratch.work.clear();
+                scratch.work.extend_from_slice(&b.rows[split..]);
+                b.rows.truncate(split);
+                scratch.parent_vars.extend_from_slice(&b.vars);
+                &scratch.work
+            };
+            for row in RowsView::new(&scratch.parent_vars, rows).iter() {
+                for (k, &v) in scratch.parent_vars.iter().enumerate() {
                     self.binding.set(v, &row[k]);
                 }
                 if let Some(r) = postprocessing(&self.binding) {
@@ -2048,8 +2085,9 @@ impl<R> DagState<R> {
                 }
             }
             if stats {
-                blocked_stats::cells_sub(bucket.rows.len());
+                blocked_stats::cells_sub(rows.len());
             }
+            self.scratch = scratch;
             return;
         }
 

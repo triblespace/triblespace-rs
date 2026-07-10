@@ -132,3 +132,42 @@ fn seam_par_iter_duplicate_free() {
         "par-iter under TRIBLES_ENGINE=dag diverged (split-leaf guard broken?)"
     );
 }
+
+/// Cloning a query under the env flag: a fresh clone (before the first
+/// `next()`) runs the full query; a mid-iteration clone must refuse
+/// loudly — the DAG engine cannot snapshot its remaining rows (no
+/// `R: Clone`), and a silent restart would duplicate rows the original
+/// already yielded.
+#[cfg(feature = "parallel")]
+#[test]
+fn seam_clone_fresh_ok_mid_iteration_refuses() {
+    set_dag_engine();
+    let (kb, human) = build_world();
+
+    // Fresh clone: both copies drain the full multiset.
+    let q = star_query!(kb, human);
+    let q2 = q.clone();
+    let full = multiset(q);
+    assert!(!full.is_empty(), "fixture must produce rows");
+    assert_eq!(
+        full,
+        multiset(q2),
+        "a clone taken before iteration must run the full query"
+    );
+
+    // Started query: clone panics instead of silently restarting.
+    let mut q = star_query!(kb, human);
+    assert!(q.next().is_some(), "fixture must produce rows");
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| q.clone())).expect_err(
+        "mid-iteration clone under TRIBLES_ENGINE=dag must panic, not silently restart",
+    );
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("cannot clone a Query mid-iteration"),
+        "unexpected panic message: {msg}"
+    );
+}
