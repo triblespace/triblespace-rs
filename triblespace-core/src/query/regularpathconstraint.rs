@@ -1137,4 +1137,16 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }
     }
+
+    /// Exact when both endpoints are bound: checks reachability from the
+    /// bound start to the bound end (with the zero-length-path scope rule
+    /// applied). Returns `true` optimistically while either endpoint is
+    /// unbound. The same-variable case (`?x expr ?x`) is covered
+    /// naturally — both lookups read the same binding slot.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match (binding.get(self.start), binding.get(self.end)) {
+            (Some(from), Some(to)) => has_path_gated(&self.set, &self.expr, from, to),
+            _ => true,
+        }
+    }
 }

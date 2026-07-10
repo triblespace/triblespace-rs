@@ -109,6 +109,19 @@ where
             });
         }
     }
+
+    /// Exact when the variable is bound: binary-searches the slice for the
+    /// bound value. Returns `true` optimistically while the variable is
+    /// unbound.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable.index) {
+            Some(v) => match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                Ok(t) => self.slice.0.binary_search(&t).is_ok(),
+                Err(_) => false,
+            },
+            None => true,
+        }
+    }
 }
 
 impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for SortedSlice<'a, T>

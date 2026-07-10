@@ -437,4 +437,29 @@ where
             _ => unreachable!("invalid trible constraint state"),
         }
     }
+
+    /// Exact when entity, attribute, and value are all bound: checks
+    /// whether the archive contains that exact triple (E→A→V range
+    /// restriction, mirroring `TribleSetConstraint`'s fully-bound EAV
+    /// membership probe). Returns `true` optimistically while any
+    /// position is unbound.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let e_bound = binding.get(self.variable_e);
+        let a_bound = binding.get(self.variable_a);
+        let v_bound = binding.get(self.variable_v);
+        match (e_bound, a_bound, v_bound) {
+            (Some(e), Some(a), Some(v)) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.a_a,
+                    &self.archive.eva_c,
+                    a,
+                    &r,
+                );
+                restrict_len(&self.archive.domain, &self.archive.aev_c, v, &r) != 0
+            }
+            _ => true,
+        }
+    }
 }

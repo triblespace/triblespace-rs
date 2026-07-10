@@ -67,6 +67,19 @@ where
             });
         }
     }
+
+    /// Exact when the variable is bound: checks whether the bound value is
+    /// a member of the set. Returns `true` optimistically while the
+    /// variable is unbound.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable.index) {
+            Some(v) => match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                Ok(t) => self.set.contains(&t),
+                Err(_) => false,
+            },
+            None => true,
+        }
+    }
 }
 
 impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for &'a HashSet<T>

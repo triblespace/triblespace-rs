@@ -54,6 +54,16 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
             proposals.retain(|v| self.patch.has_prefix(v));
         }
     }
+
+    /// Exact when the variable is bound: checks whether the bound value is
+    /// present in the patch. Returns `true` optimistically while the
+    /// variable is unbound.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable.index) {
+            Some(v) => self.patch.has_prefix(v),
+            None => true,
+        }
+    }
 }
 
 impl<'a, S: InlineEncoding> ContainsConstraint<'a, S>
@@ -113,14 +123,29 @@ where
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        proposals.retain(|v| {
-            if let Some(id) = id_from_value(v) {
-                self.patch.has_prefix(&id)
-            } else {
-                false
-            }
-        });
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+        if self.variable.index == variable {
+            proposals.retain(|v| {
+                if let Some(id) = id_from_value(v) {
+                    self.patch.has_prefix(&id)
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    /// Exact when the variable is bound: checks whether the bound value is
+    /// an ID present in the patch. Returns `true` optimistically while the
+    /// variable is unbound.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable.index) {
+            Some(v) => match id_from_value(v) {
+                Some(id) => self.patch.has_prefix(&id),
+                None => false,
+            },
+            None => true,
+        }
     }
 }
 
