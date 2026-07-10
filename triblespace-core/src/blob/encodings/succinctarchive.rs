@@ -645,9 +645,9 @@ where
 
     fn pattern<'a, V: InlineEncoding>(
         &'a self,
-        e: crate::query::Variable<GenId>,
-        a: crate::query::Variable<GenId>,
-        v: crate::query::Variable<V>,
+        e: impl Into<crate::query::Term<GenId>>,
+        a: impl Into<crate::query::Term<GenId>>,
+        v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'a> {
         SuccinctArchiveConstraint::new(e, a, v, self)
     }

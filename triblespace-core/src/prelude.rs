@@ -68,6 +68,7 @@ pub use crate::query::sortedsliceconstraint::SortedSlice;
 pub use crate::query::temp;
 pub use crate::query::unionconstraint::UnionConstraint;
 pub use crate::query::ContainsConstraint;
+pub use crate::query::Term;
 pub use crate::query::TriblePattern;
 pub use crate::query::Variable;
 pub use crate::repo::ancestors;

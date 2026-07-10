@@ -447,9 +447,9 @@ impl TriblePattern for TribleSet {
 
     fn pattern<V: InlineEncoding>(
         &self,
-        e: Variable<GenId>,
-        a: Variable<GenId>,
-        v: Variable<V>,
+        e: impl Into<crate::query::Term<GenId>>,
+        a: impl Into<crate::query::Term<GenId>>,
+        v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'static> {
         TribleSetConstraint::new(e, a, v, self.clone())
     }

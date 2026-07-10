@@ -9,7 +9,8 @@ use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
 use crate::query::Binding;
 use crate::query::Constraint;
-use crate::query::Variable;
+use crate::query::RawTerm;
+use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
@@ -17,47 +18,49 @@ use crate::trible::TribleSet;
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
 /// Created by [`TribleSet::pattern`](crate::query::TriblePattern::pattern)
-/// (typically via the [`pattern!`](crate::pattern) macro). Each constraint
-/// binds three variables — entity, attribute, value — and uses the six
-/// covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to provide tight
-/// estimates and fast proposals regardless of which positions are already
-/// bound.
+/// (typically via the [`pattern!`](crate::pattern) macro). Each position —
+/// entity, attribute, value — is a [`Term`]: a variable to solve for or a
+/// constant pinned at construction. The constraint uses the six covering
+/// indexes (EAV, EVA, AEV, AVE, VEA, VAE) to provide tight estimates and
+/// fast proposals regardless of which positions are bound; a constant
+/// position simply enters that dispatch as bound from the start.
 ///
-/// When all three variables are bound, [`satisfied`](Constraint::satisfied)
+/// When all three positions have values, [`satisfied`](Constraint::satisfied)
 /// checks whether the triple exists in the set, enabling composite
 /// constraints to prune dead branches early.
 pub struct TribleSetConstraint {
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
     set: TribleSet,
 }
 
 impl TribleSetConstraint {
     /// Creates a triple-pattern constraint over `set` for the given
-    /// entity, attribute, and value variables.
+    /// entity, attribute, and value terms.
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         set: TribleSet,
     ) -> Self {
         TribleSetConstraint {
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.into().erase(),
+            term_a: a.into().erase(),
+            term_v: v.into().erase(),
             set,
         }
     }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
-    /// Returns the set `{entity, attribute, value}` (three variables).
+    /// Returns the set of variable positions (constant positions are
+    /// invisible to the engine).
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
         variables
     }
 
@@ -66,16 +69,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// depends on which of the other two positions are already bound,
     /// giving tight estimates regardless of access pattern.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return None;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = if let Some(e) = binding.get(self.variable_e) {
+        let e_bound = if let Some(e) = self.term_e.bound(binding) {
             let Some(e) = id_from_value(e) else {
                 return Some(0);
             };
@@ -83,7 +85,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let a_bound = if let Some(a) = binding.get(self.variable_a) {
+        let a_bound = if let Some(a) = self.term_a.bound(binding) {
             let Some(a) = id_from_value(a) else {
                 return Some(0);
             };
@@ -91,7 +93,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let v_bound = binding.get(self.variable_v);
+        let v_bound = self.term_v.bound(binding);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Legal distinct-position combinations (queried var
@@ -198,11 +200,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// via `infixes`. The index is chosen to match the bound positions,
     /// so proposals are generated directly from a prefix scan.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
 
-        let e_bound = if let Some(e) = binding.get(self.variable_e) {
+        if !e_var && !a_var && !v_var {
+            return;
+        }
+
+        let e_bound = if let Some(e) = self.term_e.bound(binding) {
             let Some(e) = id_from_value(e) else {
                 return;
             };
@@ -210,7 +216,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let a_bound = if let Some(a) = binding.get(self.variable_a) {
+        let a_bound = if let Some(a) = self.term_a.bound(binding) {
             let Some(a) = id_from_value(a) else {
                 return;
             };
@@ -218,7 +224,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let v_bound = binding.get(self.variable_v);
+        let v_bound = self.term_v.bound(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Distinct-position combinations: the queried variable
@@ -392,11 +398,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// Retains only proposals whose combined key (bound positions +
     /// proposed value) has a matching prefix in the appropriate index.
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
 
-        let e_bound = if let Some(e) = binding.get(self.variable_e) {
+        if !e_var && !a_var && !v_var {
+            return;
+        }
+
+        let e_bound = if let Some(e) = self.term_e.bound(binding) {
             let Some(e) = id_from_value(e) else {
                 proposals.clear();
                 return;
@@ -405,7 +415,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let a_bound = if let Some(a) = binding.get(self.variable_a) {
+        let a_bound = if let Some(a) = self.term_a.bound(binding) {
             let Some(a) = id_from_value(a) else {
                 proposals.clear();
                 return;
@@ -414,7 +424,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } else {
             None
         };
-        let v_bound = binding.get(self.variable_v);
+        let v_bound = self.term_v.bound(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => proposals.retain(|value| {
@@ -590,13 +600,13 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         }
     }
 
-    /// When all three positions are bound, checks whether the triple
-    /// exists in the EAV index. Returns `true` optimistically when any
-    /// position is still unbound.
+    /// When all three positions have values (bound or constant), checks
+    /// whether the triple exists in the EAV index. Returns `true`
+    /// optimistically when any position is still unbound.
     fn satisfied(&self, binding: &Binding) -> bool {
-        let e = binding.get(self.variable_e);
-        let a = binding.get(self.variable_a);
-        let v = binding.get(self.variable_v);
+        let e = self.term_e.bound(binding);
+        let a = self.term_a.bound(binding);
+        let v = self.term_v.bound(binding);
         match (e, a, v) {
             (Some(e_raw), Some(a_raw), Some(v_raw)) => {
                 let Some(e) = id_from_value(e_raw) else {

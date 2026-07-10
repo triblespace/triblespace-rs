@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`or!(pattern!(..), pattern!(..))` no longer panics — pattern constants
+  are folded into the constraint instead of becoming hidden variables.**
+  `UnionConstraint` requires every arm to declare the same variable set
+  (a flat-result-schema requirement: every row binds the same variables
+  exactly once). The macro layer used to allocate a fresh hidden variable
+  plus a `ConstantConstraint` for every attribute constant, literal value,
+  and constant entity id — so two separate `pattern!` invocations never
+  declared equal sets and the book's own `or!` example deterministically
+  tripped the assertion. Triple-pattern positions are now `Term`s (a
+  variable to solve for, or a constant pinned at construction): constants
+  enter the backends' existing bound-position dispatch as "born bound" and
+  never appear in the variable set, so union arms compare only the query
+  variables the caller wrote. `TriblePattern::pattern` accepts
+  `impl Into<Term<_>>` per position (plain `Variable` arguments keep
+  working unchanged); `TribleSetConstraint`, `SuccinctArchiveConstraint`,
+  and `UnionArchive` store terms; `pattern!`/`pattern_changes!` emit
+  constant terms with zero helper allocations (queries also get tighter
+  initial estimates and shed the per-constant binding steps). A pattern
+  whose positions are all constants now has an empty variable set and acts
+  as a pure existence check: `Query::new` settles it with one exact
+  `satisfied()` probe up front (the fully-bound exactness law with zero
+  variables). The union's variable-set mismatch panic now names the
+  offending sets instead of failing in a bare `assert!`.
+
 ### Changed
 
 - **`Pile::restore()` is now `Pile::amputate()` — the destructive

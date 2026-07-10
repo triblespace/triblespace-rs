@@ -10,8 +10,16 @@ use itertools::Itertools;
 /// or directly via [`new`](Self::new).
 ///
 /// All variants must declare the same [`VariableSet`]; this is asserted at
-/// construction time. Estimates are summed across variants, proposals are
-/// merged and deduplicated, and confirmations are unioned via
+/// construction time. Branch-local variables are unsupported because the
+/// engine's result schema is flat — every row binds the same variable set
+/// exactly once, so a variable that exists only in some alternatives has
+/// no representation. (This is a result-model restriction, not a semantic
+/// one: the union itself is monotonic.) Since `pattern!` folds attribute
+/// constants and literal values into constant [`Term`](crate::query::Term)s
+/// (they never become variables), the requirement is about the *query
+/// variables the caller wrote*: every arm must mention the same ones.
+/// Estimates are summed across variants, proposals are merged and
+/// deduplicated, and confirmations are unioned via
 /// [`kmerge`](itertools::Itertools::kmerge).
 ///
 /// Before proposing or confirming, the union checks each variant's
@@ -40,11 +48,23 @@ where
             "UnionConstraint requires at least one variant; \
              use a different constraint type for the empty case"
         );
-        assert!(constraints
+        if let Some((i, (a, b))) = constraints
             .iter()
             .map(|c| c.variables())
             .tuple_windows()
-            .all(|(a, b)| a == b));
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+        {
+            panic!(
+                "all union (or!) variants must mention the same query \
+                 variables: variant {} declares {:?} but variant {} \
+                 declares {:?}",
+                i,
+                a,
+                i + 1,
+                b
+            );
+        }
         UnionConstraint { constraints }
     }
 }

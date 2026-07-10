@@ -75,17 +75,21 @@ pub trait TriblePattern {
         Self: 'a;
 
     /// Create a constraint for a given trible pattern.
-    /// The method takes three variables, one for each part of the trible.
+    /// Each position takes a [`Term`]: either a [`Variable`] to solve for
+    /// or a constant [`Inline`] value baked into the constraint (a constant
+    /// position behaves exactly like a variable the engine has already
+    /// bound, but never appears in the constraint's [`VariableSet`]).
     /// The schemas of the entities and attributes are always [GenId], while the value
     /// schema can be any type implementing [InlineEncoding] and is specified as a type parameter.
     ///
     /// This method is usually not called directly, but rather through typed query language
-    /// macros like [pattern!][crate::macros::pattern].
+    /// macros like [pattern!][crate::macros::pattern], which pass attribute
+    /// constants and literal values as constant terms.
     fn pattern<'a, V: InlineEncoding>(
         &'a self,
-        e: Variable<GenId>,
-        a: Variable<GenId>,
-        v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a>;
 }
 
@@ -174,6 +178,96 @@ impl<T: InlineEncoding> Variable<T> {
             )
         });
         Inline::as_transmute_raw(raw)
+    }
+}
+
+/// One position of a triple pattern: either a [`Variable`] the engine
+/// solves for, or a constant [`Inline`] value pinned at construction.
+///
+/// Constants are how the macro layer expresses attribute constants and
+/// literal values without allocating hidden helper variables. A constant
+/// position behaves exactly like a variable that is already bound — the
+/// backends' bound/unbound dispatch handles it with no extra cases — but
+/// it never appears in the constraint's [`VariableSet`]. This keeps the
+/// visible variable set of a `pattern!` equal to the query variables the
+/// user actually wrote, which is what makes
+/// [`or!`](crate::or) over patterns with different attributes or literals
+/// well-formed (all arms declare the same set).
+#[derive(Debug)]
+pub enum Term<T: InlineEncoding> {
+    /// A variable to solve for.
+    Var(Variable<T>),
+    /// A constant value pinned at construction.
+    Const(Inline<T>),
+}
+
+impl<T: InlineEncoding> Copy for Term<T> {}
+
+impl<T: InlineEncoding> Clone for Term<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: InlineEncoding> From<Variable<T>> for Term<T> {
+    fn from(v: Variable<T>) -> Self {
+        Term::Var(v)
+    }
+}
+
+impl<T: InlineEncoding> From<Inline<T>> for Term<T> {
+    fn from(c: Inline<T>) -> Self {
+        Term::Const(c)
+    }
+}
+
+impl<T: InlineEncoding> Term<T> {
+    /// Erases the schema type, yielding the runtime representation
+    /// constraint implementations store.
+    pub fn erase(self) -> RawTerm {
+        match self {
+            Term::Var(v) => RawTerm::Var(v.index),
+            Term::Const(c) => RawTerm::Const(c.raw),
+        }
+    }
+}
+
+/// Untyped runtime form of a [`Term`]: a variable slot index or a pinned
+/// 32-byte value. Constraint implementations store this and use
+/// [`is_var`](RawTerm::is_var) / [`bound`](RawTerm::bound) in place of the
+/// raw `VariableId` comparison and `Binding::get` lookup — a constant term
+/// then flows through the existing bound-position dispatch for free.
+#[derive(Clone, Copy, Debug)]
+pub enum RawTerm {
+    /// A variable slot index.
+    Var(VariableId),
+    /// A pinned raw value.
+    Const(RawInline),
+}
+
+impl RawTerm {
+    /// Returns `true` when this term is the given variable.
+    #[inline]
+    pub fn is_var(&self, variable: VariableId) -> bool {
+        matches!(self, RawTerm::Var(v) if *v == variable)
+    }
+
+    /// Returns the term's value under `binding`: the pinned value for a
+    /// constant, the binding's value (if any) for a variable.
+    #[inline]
+    pub fn bound<'b>(&'b self, binding: &'b Binding) -> Option<&'b RawInline> {
+        match self {
+            RawTerm::Var(v) => binding.get(*v),
+            RawTerm::Const(c) => Some(c),
+        }
+    }
+
+    /// Adds the term's variable (if it is one) to `set`.
+    #[inline]
+    pub fn add_to(&self, set: &mut VariableSet) {
+        if let RawTerm::Var(v) = self {
+            set.set(*v);
+        }
     }
 }
 
@@ -607,10 +701,24 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             )
         });
 
+        // Constraints whose variables are all constant [`Term`]s (e.g. a
+        // fully-constant `pattern!` used as an existence check) have an
+        // empty variable set, so the propose/confirm search never consults
+        // them. Their truth is binding-independent and `satisfied` is exact
+        // for them from the start (the fully-bound exactness law: zero
+        // unbound variables). One check up front settles every such
+        // subtree; constraints with unbound variables answer an optimistic
+        // `true` here and are validated by the search as usual.
+        let mode = if constraint.satisfied(&binding) {
+            Search::NextVariable
+        } else {
+            Search::Done
+        };
+
         Query {
             constraint,
             postprocessing,
-            mode: Search::NextVariable,
+            mode,
             binding,
             influences,
             estimates,

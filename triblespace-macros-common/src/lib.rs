@@ -291,9 +291,7 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
                     // Optional postfix modifier (`?`/`*`/`+`) is part
                     // of the same PathElt and must come before the
                     // Inverse marker.
-                    if i < toks.len()
-                        && matches!(toks[i], Tok::Star | Tok::Plus | Tok::Question)
-                    {
+                    if i < toks.len() && matches!(toks[i], Tok::Star | Tok::Plus | Tok::Question) {
                         out.push(toks[i].clone());
                         i += 1;
                     }
@@ -661,9 +659,11 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                     quote! { let #e_ident = #local_ident; }
                 }
                 Inline::Expr(ref id_expr) => {
+                    // Constant entity id: fold it into the pattern as a
+                    // constant term — no hidden variable, no
+                    // ConstantConstraint.
                     quote! {
-                        let #e_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::inline::IntoInline::to_inline(#id_expr))));
+                        let #e_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#id_expr);
                     }
                 }
             }
@@ -687,15 +687,17 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 ));
             }
 
-            // Set up (or reuse) the attribute variable for this slot.
-            // For Inline::Expr (concrete attribute) we keep the
-            // existing behaviour: emit a `let __af = &expr` reference
-            // to the Attribute constant so downstream value codegen
-            // can call `.inline_from(...)` / `.as_variable(...)` on
-            // it. For Inline::Var / Inline::LocalVar (free attribute)
-            // there is no schema available — `__af` is `None` and
-            // the value position must use the opaque `UnknownInline`
-            // schema.
+            // Set up (or reuse) the attribute term for this slot.
+            // For Inline::Expr (concrete attribute) we emit a
+            // `let __af = &expr` reference to the Attribute constant
+            // (so downstream value codegen can call `.inline_from(...)`
+            // / `.as_variable(...)` on it) plus a constant
+            // `Inline<GenId>` term carrying the attribute id — no
+            // hidden variable is allocated, so the constant never
+            // appears in the constraint's variable set. For
+            // Inline::Var / Inline::LocalVar (free attribute) there is
+            // no schema available — `__af` is `None` and the value
+            // position must use the opaque `UnknownInline` schema.
             let key = match &name {
                 Inline::Var(ident) => format!("?{}", ident),
                 Inline::LocalVar(ident) => format!("_?{}", ident),
@@ -716,8 +718,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                             );
                             attr_tokens.extend(quote! {
                                 let #af_ident = &#expr;
-                                let #a_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
-                                constraints.push(Box::new(#a_ident.is(#base_path::inline::IntoInline::to_inline(#af_ident.id()))));
+                                let #a_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#af_ident.id());
                             });
                             (a_ident, Some(af_ident))
                         }
@@ -753,8 +754,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 Inline::LocalVar(ref ident) => Some((true, ident.to_string())),
                 _ => None,
             };
-            let self_ref = entity_var_key.is_some()
-                && entity_var_key == value_var_key;
+            let self_ref = entity_var_key.is_some() && entity_var_key == value_var_key;
 
             // Emit the per-trible constraint. The shape splits along
             // two axes: Inline variant (Var / LocalVar / Expr) and
@@ -807,13 +807,15 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                     }
                 }
                 (Inline::Expr(ref expr), Some(af_ident)) => {
+                    // Literal value: fold it into the pattern as a
+                    // constant term (typed by the attribute's schema
+                    // via `inline_from`) — no hidden variable, no
+                    // ConstantConstraint.
                     quote! {
                         {
                             #[allow(unused_imports)] use #base_path::query::TriblePattern;
                             let #v_tmp_ident = #af_ident.inline_from(#expr);
-                            let v_var = #af_ident.as_variable(#ctx_ident.next_variable());
-                            constraints.push(Box::new(v_var.is(#v_tmp_ident)));
-                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, #v_tmp_ident)));
                         }
                     }
                 }
@@ -1177,11 +1179,9 @@ pub fn pattern_changes_impl(
     let delta_ident = format_ident!("__delta", span = Span::mixed_site());
 
     let mut attr_decl_tokens = TokenStream2::new();
-    let mut attr_const_tokens = TokenStream2::new();
     let mut entity_decl_tokens = TokenStream2::new();
     let mut entity_const_tokens = TokenStream2::new();
     let mut value_decl_tokens = TokenStream2::new();
-    let mut value_const_tokens = TokenStream2::new();
 
     let mut triples = Vec::<TripleInfo>::new();
 
@@ -1224,9 +1224,9 @@ pub fn pattern_changes_impl(
                     entity_decl_tokens.extend(quote! { let #e_ident = #local_ident; });
                 }
                 Inline::Expr(ref id_expr) => {
-                    entity_const_tokens.extend(quote! {
-                        let #e_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
-                        constraints.push(Box::new(#e_ident.is(#base_path::inline::IntoInline::to_inline(#id_expr))));
+                    // Constant entity id: folded as a constant term.
+                    entity_decl_tokens.extend(quote! {
+                        let #e_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#id_expr);
                     });
                 }
             },
@@ -1276,12 +1276,11 @@ pub fn pattern_changes_impl(
                     let a_ident = format_ident!("__a{}", attr_idx, span = Span::mixed_site());
                     let af_ident = format_ident!("__af{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
+                    // Attribute constant: folded as a constant term —
+                    // no hidden variable, no ConstantConstraint.
                     attr_decl_tokens.extend(quote! {
                         let #af_ident = &#attr_expr;
-                        let #a_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
-                    });
-                    attr_const_tokens.extend(quote! {
-                        constraints.push(Box::new(#a_ident.is(#base_path::inline::IntoInline::to_inline(#af_ident.id()))));
+                        let #a_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#af_ident.id());
                     });
                     (a_ident, af_ident)
                 })
@@ -1295,24 +1294,19 @@ pub fn pattern_changes_impl(
                 Inline::LocalVar(ref ident) => Some((true, ident.to_string())),
                 _ => None,
             };
-            let self_ref = entity_var_key.is_some()
-                && entity_var_key == value_var_key;
+            let self_ref = entity_var_key.is_some() && entity_var_key == value_var_key;
 
             match value {
                 Inline::Expr(expr) => {
-                    let val_ident = format_ident!("__c{}", value_idx, span = Span::mixed_site());
-                    value_idx += 1;
+                    // Literal value: folded as a constant term.
                     value_decl_tokens.extend(quote! {
-                        let #val_ident = #af_ident.inline_from(#expr);
-                        let #v_ident = #af_ident.as_variable(#ctx_ident.next_variable());
-                    });
-                    value_const_tokens.extend(quote! {
-                        constraints.push(Box::new(#v_ident.is(#val_ident)));
+                        let #v_ident = #af_ident.inline_from(#expr);
                     });
                 }
                 Inline::Var(_) | Inline::LocalVar(_) if self_ref => {
                     // Self-referencing: create fresh alias + equality
-                    let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
+                    let alias_ident =
+                        format_ident!("__alias{}", value_idx, span = Span::mixed_site());
                     value_idx += 1;
                     value_decl_tokens.extend(quote! {
                         let #alias_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
@@ -1397,9 +1391,7 @@ pub fn pattern_changes_impl(
             #value_decl_tokens
             let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint + Send + Sync>> = ::std::vec::Vec::new();
             #[allow(unused_imports)] use #base_path::query::TriblePattern;
-            #attr_const_tokens
             #entity_const_tokens
-            #value_const_tokens
             constraints.push(Box::new(#union_expr));
             ::std::sync::Arc::new(
                 #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)

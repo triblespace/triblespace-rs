@@ -134,7 +134,7 @@ use crate::inline::encodings::iu256::U256BE;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::query::unionconstraint::UnionConstraint;
-use crate::query::{TriblePattern, Variable};
+use crate::query::{Term, TriblePattern};
 use crate::repo::{BlobStore, BlobStoreGet, PinStore, PushResult};
 use crate::trible::TribleSet;
 
@@ -661,10 +661,13 @@ where
 
     fn pattern<'p, V: InlineEncoding>(
         &'p self,
-        e: Variable<GenId>,
-        a: Variable<GenId>,
-        v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'p> {
+        let e: Term<GenId> = e.into();
+        let a: Term<GenId> = a.into();
+        let v: Term<V> = v.into();
         let constraints = self
             .segments
             .iter()

@@ -10,9 +10,9 @@ pub struct SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
     archive: &'a SuccinctArchive<U>,
 }
 
@@ -21,15 +21,15 @@ where
     U: Universe,
 {
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         archive: &'a SuccinctArchive<U>,
     ) -> Self {
         SuccinctArchiveConstraint {
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.into().erase(),
+            term_a: a.into().erase(),
+            term_v: v.into().erase(),
             archive,
         }
     }
@@ -100,25 +100,24 @@ where
 {
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
         variables
     }
 
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return None;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.bound(binding);
+        let a_bound = self.term_a.bound(binding);
+        let v_bound = self.term_v.bound(binding);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => self.archive.entity_count,
@@ -165,18 +164,17 @@ where
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.bound(binding);
+        let a_bound = self.term_a.bound(binding);
+        let v_bound = self.term_v.bound(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -324,18 +322,17 @@ where
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.bound(binding);
+        let a_bound = self.term_a.bound(binding);
+        let v_bound = self.term_v.bound(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -444,9 +441,9 @@ where
     /// membership probe). Returns `true` optimistically while any
     /// position is unbound.
     fn satisfied(&self, binding: &Binding) -> bool {
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.bound(binding);
+        let a_bound = self.term_a.bound(binding);
+        let v_bound = self.term_v.bound(binding);
         match (e_bound, a_bound, v_bound) {
             (Some(e), Some(a), Some(v)) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
