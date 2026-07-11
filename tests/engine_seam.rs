@@ -112,6 +112,58 @@ fn seam_take_is_lazy_and_sound() {
     }
 }
 
+/// MERGE SEAM (constant folding × env-flag route): a fully-constant
+/// pattern has ZERO variables, so `Query::new` settles it with one exact
+/// `satisfied()` probe before any engine runs. The dag-routed
+/// `Iterator::next` relies on a different mechanism than the probe
+/// solvers to honor that settlement — the `Search::NextVariable` guard
+/// keeps a failed settlement (`Search::Done`) off the `DagState` path
+/// entirely, while a successful one seeds a full-bound zero-width bucket
+/// that emits exactly one virtual row. Pin both branches on the env-flag
+/// route, and their multiset parity with the eager DAG solver.
+#[test]
+fn seam_fully_constant_settlement() {
+    set_dag_engine();
+    let mut kb = TribleSet::new();
+    let human = ufoid();
+    let anchor = ufoid();
+    kb += entity! { &anchor @ world::kind: &human };
+    let human = *human;
+    let anchor = *anchor;
+
+    // Present: the settlement succeeds and the DAG route must emit
+    // exactly one (empty) row.
+    let present: Vec<()> =
+        find!((), pattern!(&kb, [{ &anchor @ world::kind: human }])).collect();
+    assert_eq!(
+        present.len(),
+        1,
+        "present fully-constant existence check must yield exactly one row via the dag route"
+    );
+    assert_eq!(
+        present.len(),
+        find!((), pattern!(&kb, [{ &anchor @ world::kind: human }]))
+            .solve_dag()
+            .len(),
+        "dag-routed Iterator::next diverged from eager solve_dag on the present case"
+    );
+
+    // Absent: the settlement fails (`Search::Done`); the dag route must
+    // yield nothing — never construct a DagState that resurrects a row.
+    let absent: Vec<()> =
+        find!((), pattern!(&kb, [{ &anchor @ world::kind: anchor }])).collect();
+    assert!(
+        absent.is_empty(),
+        "absent fully-constant existence check must yield no rows via the dag route"
+    );
+    assert!(
+        find!((), pattern!(&kb, [{ &anchor @ world::kind: anchor }]))
+            .solve_dag()
+            .is_empty(),
+        "eager solve_dag must honor the failed settlement too"
+    );
+}
+
 /// Rayon par-iter under the env flag: post-split leaves carry partial
 /// bindings and must fall back to the sequential DFS — total multiset
 /// must match, no duplicates, no losses.

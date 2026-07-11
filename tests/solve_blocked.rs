@@ -247,6 +247,31 @@ fn fully_constant_settlement_on_succinctarchive() {
     gate_fully_constant(&archive, human, anchor);
 }
 
+/// The probe solvers restart evaluation from the seed block, so calling
+/// one on a query whose sequential cursor already yielded rows would
+/// emit those rows AGAIN. Like the mid-iteration `Clone` guard, they
+/// must refuse loudly instead of silently duplicating. (A fresh query
+/// whose zero-variable settlement failed — `Done` with an untouched
+/// cursor — stays allowed and yields the empty multiset; that path is
+/// pinned by `gate_fully_constant` above.)
+#[test]
+fn probe_solvers_refuse_started_query() {
+    let (kb, human, _anchor) = build_world();
+    let mut q = find!((e: Inline<_>), pattern!(&kb, [{ ?e @ world::kind: human }]));
+    assert!(q.next().is_some(), "fixture must produce rows");
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || q.solve_dag()))
+        .expect_err("solve_dag on a started query must panic, not re-emit yielded rows");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("cannot probe-solve a Query mid-iteration"),
+        "unexpected panic message: {msg}"
+    );
+}
+
 /// PROBE (group-by-ordering) skew world: two sub-populations whose rows
 /// genuinely prefer **different** next variables after `?e` is bound, so
 /// blocked-v1's single per-level choice (first row's estimates) is wrong

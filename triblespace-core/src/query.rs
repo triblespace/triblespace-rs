@@ -1859,7 +1859,29 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     ///
     /// Semantics: fully drained, the same result **multiset** as the
     /// sequential iterator and the eager DAG solver; row order differs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query's iteration has already started (any
+    /// `Iterator::next` call that engaged the search). The probe solvers
+    /// restart evaluation from the seed block, so rows the cursor already
+    /// yielded would be emitted **again** — the same duplicate-emission
+    /// hazard the mid-iteration [`Clone`] guard refuses. A fresh query is
+    /// fine, including one whose zero-variable settlement already failed
+    /// in [`Query::new`] (`Search::Done` with an untouched cursor): that
+    /// one correctly yields the empty multiset.
     pub fn solve_dag_lazy(self) -> DagIter<C, P, R> {
+        assert!(
+            self.dag.is_none()
+                && self.stack.is_empty()
+                && self.bound.is_empty()
+                && self.touched_variables.is_empty()
+                && matches!(self.mode, Search::NextVariable | Search::Done),
+            "cannot probe-solve a Query mid-iteration: rows already yielded by the \
+             sequential cursor would be emitted again; the probe solvers \
+             (solve_blocked/solve_blocked_grouped/solve_dag/solve_dag_unmerged/\
+             solve_dag_lazy) require a fresh query"
+        );
         let Query {
             constraint,
             postprocessing,
