@@ -771,7 +771,7 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
             .solve_dag_lazy()
             .start_width(1)
             .growth(2)
-            .soft_partition(1, 4),
+            .soft_partition(4),
     );
     assert_eq!(
         softened, sequential,

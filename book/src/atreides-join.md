@@ -154,11 +154,12 @@ depth-first traversal from thrashing through unrelated values.
   result-projection boundary. A `touched_variables` set marks which estimates
   need refreshing before the next decision point.
 - The ordinary DAG-backed iterator lifts the same negotiation to blocks of
-  sibling rows. Under wide demand it may softly coalesce rows onto a small set
-  of variables that remain within a pointwise estimate bound, then partitions
-  by those scheduled choices and files extensions into worklist buckets keyed
-  by bound-variable set. Different binding orders can therefore reconverge into
-  a larger downstream batch without changing the result multiset.
+  sibling rows. Whenever their exact choices split, it may contract complete
+  compatible preference groups onto one variable hub under a pointwise
+  estimate bound, then partitions by those scheduled choices and files
+  extensions into worklist buckets keyed by bound-variable set. Different
+  binding orders can therefore reconverge into a larger downstream batch
+  without changing the result multiset.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.

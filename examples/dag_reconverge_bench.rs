@@ -164,7 +164,7 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
             q.solve_dag_lazy()
                 .start_width(1)
                 .growth(2)
-                .soft_partition(256, 8),
+                .soft_partition(8),
         ),
         Mode::DagU => tally(q.solve_dag_unmerged()),
     }

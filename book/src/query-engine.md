@@ -105,9 +105,10 @@ An expansion still performs the familiar Atreides negotiation:
 2. Choose the preferred next variable. In a multi-row block this decision is
    made per row, because different bound values can imply different
    cardinalities.
-3. Under sustained wide demand, approximately cover the rows with a small set
-   of compatible variables; otherwise retain their exact preferences. Then
-   partition the rows by the scheduled variable with a stable counting sort.
+3. If rows prefer more than one variable, consider every unbound variable as a
+   possible hub and score complete compatible source-group contractions against
+   exact grouping. Then partition by the scheduled variable with a stable
+   counting sort.
 4. For each group, ask the root constraint to propose that variable. An
    intersection chooses its tightest child per row to propose and runs the
    remaining children as whole-frontier confirmation passes. A union evaluates
@@ -179,15 +180,17 @@ turns on and the remaining computation enters the batch-harvesting regime. An
 `exists!` or `take(1)` consumer can therefore discard the worklist after the
 first match instead of paying for full enumeration.
 
-Wide demand also changes partition economics. Starting at chunk width 256, a
-soft-bucketing pass treats unbound variables as possible batch centers. For
-each pointwise estimate envelope through 8× it greedily covers compatible
-rows, then reassigns every row to its cheapest selected center. Plans are
-scored by estimated candidates plus a scale-free cost per retained group; the
-exchange rate is calibrated so exact grouping ties a one-group plan at the
-former 8× boundary. This admits intermediate group counts instead of choosing
-between exact per-row groups and one first-row variable. A hard per-row bound
-prevents a wide block from hiding a catastrophically bad outlier inside an
+Partition economics are decided by the split itself, not by chunk width. When
+rows genuinely prefer more than one next variable, one soft-bucketing pass
+considers every unbound variable—including a variable that currently wins no
+row—as a possible hub. Each exact preferred group is indivisible: it may move
+to the hub only if every row stays within the 8× pointwise estimate bound. For
+each hub, independently profitable compatible source groups form its best
+complete star; unopened hubs pay a group-opening cost. Complete stars and exact
+grouping are scored by estimated candidates plus a scale-free cost per retained
+group, calibrated so exact grouping ties a one-group plan at the former 8×
+boundary. A one-row chunk is naturally uniform, while a hard per-row bound
+prevents a large block from hiding a catastrophically bad outlier inside an
 acceptable aggregate sum. The choice affects order and batching only:
 `propose` and `confirm` still determine the exact solutions.
 
@@ -234,7 +237,7 @@ algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
 providing skew-resistant and predictable performance. The sequential scheduler
 explores those choices depth-first; the DAG scheduler begins from the same
-per-row choices, may softly coalesce compatible rows under wide demand, and
+per-row choices, may softly coalesce compatible complete preference groups, and
 files the results through its worklist. Because both refresh estimates during
 evaluation, binding order adapts whenever a constraint updates its influence
 set—there is no separate planning artifact to maintain.
