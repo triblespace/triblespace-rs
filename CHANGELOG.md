@@ -35,6 +35,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The public `Constraint` protocol is now block-native.** Every verb receives
+  a borrowed `RowsView` of sibling partial bindings; `EstimateSink` and
+  `CandidateSink` provide scalar/plain-value representations for the explicit
+  sequential scheduler and per-row/tagged representations for frontier
+  execution. The sequential engine is therefore the block-of-one case rather
+  than a separate constraint API. Custom constraints must obey three soundness
+  laws: `propose` receives and owns an empty sink, `confirm` only filters, and
+  `satisfied` is exact whenever all relevant variables are bound. The latter
+  includes constant, zero-variable constraints and lets unions reject dead arms
+  while negotiating variables owned by another arm.
+- **The ordinary `Query` iterator now uses the lazy DAG scheduler.** It
+  evaluates a worklist of row buckets keyed by bound-variable set, partitions
+  each block by its per-row preferred next variable, and merges routes that
+  reconverge on the same set. Demand-adaptive chunk width starts with
+  depth-first, first-result-oriented execution and grows into readiness-gated
+  batch harvesting. Once a chunk reaches 256 rows, the scheduler may replace a
+  split per-row partition with the first row's whole-block choice only when
+  the estimate matrix bounds candidate inflation at 8×; this keeps
+  heterogeneous PATCH joins grouped while collapsing fragmented CPU/GPU work
+  into fatter batches when the estimates say the trade is bounded.
+  `Query::sequential()` explicitly selects the scalar
+  block-of-one DFS specialization, while fresh rayon iteration retains its
+  established DFS splitter. Fully-bound rows stay raw until the consumer pulls
+  them: the worklist never stores projected `R`s, preserving `Query` auto
+  traits and allowing exact mid-iteration clones without `R: Clone`.
+  `Query::solve_dag_lazy` remains the configurable entry point and `solve_dag`
+  exposes the eager saturated form. Fully drained schedulers preserve the same
+  result multiset, but result order may differ. Probe solvers require a
+  never-pulled `Query`; freshness is tracked explicitly so exhausted
+  zero-variable queries cannot be mistaken for untouched ones.
+- **`ignore!` keeps its wildcard scoping semantics under union gating.**
+  Ignored variables disappear from planning and projection: hidden-only clauses
+  are inert, and repeated ignored names do not create a shared witness. Once an
+  arm's outward variables are bound, `satisfied` replays each visible variable
+  as a singleton confirmation with that variable omitted. This also respects
+  confirm-only constraints, and rejects a dead visible union arm without ever
+  binding hidden variables or turning `ignore!` into an existential join; use
+  `temp!` for a non-projected helper that must participate in a join.
 - **`Pile::restore()` is now `Pile::amputate()` — the destructive
   truncation stops wearing a comforting name.** The operation TRUNCATES
   the pile file at the first invalid record, destroying everything after

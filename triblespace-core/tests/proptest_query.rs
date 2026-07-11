@@ -6,7 +6,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-use triblespace_core::query::{EstimateSink, CandidateSink, 
+use triblespace_core::query::{EstimateSink, CandidateSink,
     Binding, Candidates, Constraint, ContainsConstraint, RowsView, TriblePattern, Variable,
     VariableContext,
 };

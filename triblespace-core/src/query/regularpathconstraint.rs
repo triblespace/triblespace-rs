@@ -1161,7 +1161,6 @@ impl RegularPathConstraint {
             }
         }
     }
-
 }
 
 impl<'a> Constraint<'a> for RegularPathConstraint {
@@ -1172,19 +1171,30 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         vars
     }
 
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if variable != self.start && variable != self.end {
             return false;
         }
         let ps = view.col(self.start);
         let pe = view.col(self.end);
-        out.extend(view.iter().map(|row| {
-            self.estimate_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]))
-        }));
+        out.extend(
+            view.iter()
+                .map(|row| self.estimate_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]))),
+        );
         true
     }
 
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable != self.start && variable != self.end {
             return;
         }
@@ -1203,7 +1213,12 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable != self.start && variable != self.end {
             return;
         }

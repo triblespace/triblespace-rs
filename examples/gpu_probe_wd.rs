@@ -59,6 +59,7 @@ enum Mode {
     Seq,
     Blk,
     Grp,
+    Lazy,
     Dag,
     DagU,
 }
@@ -67,9 +68,10 @@ enum Mode {
 macro_rules! run {
     ($q:expr, $mode:expr) => {
         match $mode {
-            Mode::Seq => tally($q),
+            Mode::Seq => tally($q.sequential()),
             Mode::Blk => tally($q.solve_blocked()),
             Mode::Grp => tally($q.solve_blocked_grouped()),
+            Mode::Lazy => tally($q.solve_dag_lazy()),
             Mode::Dag => tally($q.solve_dag()),
             Mode::DagU => tally($q.solve_dag_unmerged()),
         }
@@ -80,7 +82,9 @@ macro_rules! run {
 fn main() {
     use triblespace::core::blob::encodings::succinctarchive::gpu::stats;
 
-    let nt_path = std::env::args().nth(1).expect("usage: gpu_probe_wd <nt> [reps]");
+    let nt_path = std::env::args()
+        .nth(1)
+        .expect("usage: gpu_probe_wd <nt> [reps]");
     let reps: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -311,11 +315,10 @@ fn main() {
         for (name, q) in &queries {
             let mut times = Vec::new();
             let mut sig = (0, 0);
-            stats::reset();
-            for rep in 0..reps {
-                if rep == 1 {
-                    stats::reset(); // keep stats of a single steady-state rep
-                }
+            for _rep in 0..reps {
+                // Keep the counters from exactly one timed repetition (the
+                // final one), rather than accidentally accumulating reps 2..N.
+                stats::reset();
                 let t = Instant::now();
                 sig = q(archive, mode);
                 times.push(t.elapsed().as_secs_f64() * 1e3);
@@ -336,9 +339,12 @@ fn main() {
                 blocked_stats::reset();
                 dag_stats::reset();
                 q(archive, mode);
-                if mode == Mode::Dag || mode == Mode::DagU {
-                    pass.block_stats
-                        .push(format!("{} | {}", blocked_stats::report(), dag_stats::report()));
+                if matches!(mode, Mode::Lazy | Mode::Dag | Mode::DagU) {
+                    pass.block_stats.push(format!(
+                        "{} | {}",
+                        blocked_stats::report(),
+                        dag_stats::report()
+                    ));
                 } else {
                     pass.block_stats.push(blocked_stats::report());
                 }
@@ -368,12 +374,13 @@ fn main() {
     let cpu_seq = run_pass("cpu-seq", &archive, Mode::Seq);
     let cpu_blk = run_pass("cpu-blk", &archive, Mode::Blk);
     let cpu_grp = run_pass("cpu-grp", &archive, Mode::Grp);
+    let cpu_lazy = run_pass("cpu-lazy", &archive, Mode::Lazy);
     let cpu_dag = run_pass("cpu-dag", &archive, Mode::Dag);
     let cpu_dagu = run_pass("cpu-dagu", &archive, Mode::DagU);
 
-    let (gpu_seq, gpu_blk, gpu_grp) = if cpu_only {
+    let (gpu_seq, gpu_blk, gpu_grp, gpu_lazy, gpu_dag, gpu_dagu) = if cpu_only {
         eprintln!("TRIBLES_PROBE_CPU_ONLY set: skipping gpu passes");
-        (None, None, None)
+        (None, None, None, None, None, None)
     } else {
         let t0 = Instant::now();
         archive.enable_gpu().expect("gpu upload");
@@ -382,6 +389,9 @@ fn main() {
             Some(run_pass("gpu-seq", &archive, Mode::Seq)),
             Some(run_pass("gpu-blk", &archive, Mode::Blk)),
             Some(run_pass("gpu-grp", &archive, Mode::Grp)),
+            Some(run_pass("gpu-lazy", &archive, Mode::Lazy)),
+            Some(run_pass("gpu-dag", &archive, Mode::Dag)),
+            Some(run_pass("gpu-dagu", &archive, Mode::DagU)),
         )
     };
 
@@ -400,19 +410,45 @@ fn main() {
         let cs = median(&cpu_seq.times[i]);
         let cb = median(&cpu_blk.times[i]);
         let cg = median(&cpu_grp.times[i]);
+        let cl = median(&cpu_lazy.times[i]);
         let cd = median(&cpu_dag.times[i]);
         let cdu = median(&cpu_dagu.times[i]);
-        let gs = gpu_seq.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
-        let gb = gpu_blk.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
-        let gg = gpu_grp.as_ref().map(|p| median(&p.times[i])).unwrap_or(f64::NAN);
+        let gs = gpu_seq
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
+        let gb = gpu_blk
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
+        let gg = gpu_grp
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
+        let gl = gpu_lazy
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
+        let gd = gpu_dag
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
+        let gdu = gpu_dagu
+            .as_ref()
+            .map(|p| median(&p.times[i]))
+            .unwrap_or(f64::NAN);
         let parity = [
             Some(&cpu_blk),
             Some(&cpu_grp),
+            Some(&cpu_lazy),
             Some(&cpu_dag),
             Some(&cpu_dagu),
             gpu_seq.as_ref(),
             gpu_blk.as_ref(),
             gpu_grp.as_ref(),
+            gpu_lazy.as_ref(),
+            gpu_dag.as_ref(),
+            gpu_dagu.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -438,6 +474,13 @@ fn main() {
             cs / gg,
             if parity { "ok" } else { "MISMATCH" }
         );
+        println!(
+            "  schedulers: cpu-lazy {cl:.2} ms ({:.2}x) | gpu-lazy {gl:.2} ms ({:.2}x) | gpu-dag {gd:.2} ms ({:.2}x) | gpu-dagu {gdu:.2} ms ({:.2}x)",
+            cs / cl,
+            cs / gl,
+            cs / gd,
+            cs / gdu,
+        );
         println!("  cpu-seq probes: {}", cpu_seq.stats[i]);
         println!("  cpu-blk probes: {}", cpu_blk.stats[i]);
         println!("  cpu-grp probes: {}", cpu_grp.stats[i]);
@@ -450,10 +493,29 @@ fn main() {
         if let Some(p) = &gpu_grp {
             println!("  gpu-grp probes: {}", p.stats[i]);
         }
+        if let Some(p) = &gpu_lazy {
+            println!("  gpu-lazy probes: {}", p.stats[i]);
+        }
+        if let Some(p) = &gpu_dag {
+            println!("  gpu-dag probes: {}", p.stats[i]);
+        }
+        if let Some(p) = &gpu_dagu {
+            println!("  gpu-dagu probes: {}", p.stats[i]);
+        }
         println!("  cpu-blk blocks: {}", cpu_blk.block_stats[i]);
         println!("  cpu-grp blocks: {}", cpu_grp.block_stats[i]);
+        println!("  cpu-lazy blocks: {}", cpu_lazy.block_stats[i]);
         println!("  cpu-dag blocks: {}", cpu_dag.block_stats[i]);
         println!("  cpu-dagu blocks: {}", cpu_dagu.block_stats[i]);
+        if let Some(p) = &gpu_lazy {
+            println!("  gpu-lazy blocks: {}", p.block_stats[i]);
+        }
+        if let Some(p) = &gpu_dag {
+            println!("  gpu-dag blocks: {}", p.block_stats[i]);
+        }
+        if let Some(p) = &gpu_dagu {
+            println!("  gpu-dagu blocks: {}", p.block_stats[i]);
+        }
         println!("  cpu-seq order:  {}", cpu_seq.orders[i]);
         println!("  cpu-blk order:  {}", cpu_blk.orders[i]);
         println!("  cpu-grp order:  {}", cpu_grp.orders[i]);

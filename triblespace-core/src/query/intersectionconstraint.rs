@@ -51,7 +51,12 @@ where
     /// The scalar (single-row cursor) arm folds child estimates through
     /// stack slots — no column scratch is ever allocated on the
     /// sequential engine's path.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         match out {
             EstimateSink::Scalar(slot) => {
                 let mut any = false;
@@ -105,7 +110,12 @@ where
     /// and every relevant child then confirms the full frontier.
     /// Re-confirming a child's own pairs is a wasted-work cost, never a
     /// correctness one.
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         // The sequential cursor (a Values sink is always a block of 1):
         // scalar child estimates in stack slots, argmin, propose, ordered
         // confirms — no estimate columns, no heap scratch.
@@ -200,7 +210,12 @@ where
 
     /// Confirms a whole frontier through every relevant child in
     /// ascending (first-row) estimate order.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         let first = view.row_view(0);
         let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
         for (ci, c) in self.constraints.iter().enumerate() {

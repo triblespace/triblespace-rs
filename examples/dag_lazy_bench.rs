@@ -23,10 +23,17 @@
 //!     cargo run --release --example dag_lazy_bench -- \
 //!         [archive_cache=/tmp/wd_10m.nt.succinctarchive] [reps=5] \
 //!         [n_per_pop=20000] [fan=64]
+//!
+//! Set `TRIBLES_LAZY_GPU=1` and build with `--features gpu` to upload the
+//! archive before the WD measurements. Small lazy chunks still use the CPU;
+//! once a proposal/confirmation stream crosses `TRIBLES_GPU_MIN_BATCH`, the
+//! same iterator dispatches that batch to the GPU.
 
 use std::hint::black_box;
 use std::time::Instant;
 
+#[cfg(feature = "gpu")]
+use triblespace::core::blob::encodings::succinctarchive::gpu::stats as gpu_stats;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
 };
@@ -34,7 +41,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::import::ntriples::uri_to_id_pure;
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::query::dag_stats;
+use triblespace::core::query::{blocked_stats, dag_stats};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -129,7 +136,7 @@ macro_rules! measure {
     ($label:expr, $reps:expr, $q:expr) => {{
         // Parity first: fully drained, all three engines agree on the
         // result multiset.
-        let seq_sig = tally($q);
+        let seq_sig = tally($q.sequential());
         let lazy_sig = tally($q.solve_dag_lazy());
         let eager_sig = tally($q.solve_dag());
         assert_eq!(seq_sig, lazy_sig, "lazy parity broke on {}", $label);
@@ -140,12 +147,18 @@ macro_rules! measure {
         let mut lazy_first = Vec::new();
         let mut seq_first10 = Vec::new();
         let mut lazy_first10 = Vec::new();
+        let mut seq_first100 = Vec::new();
+        let mut lazy_first100 = Vec::new();
+        let mut seq_first1k = Vec::new();
+        let mut lazy_first1k = Vec::new();
+        let mut seq_first10k = Vec::new();
+        let mut lazy_first10k = Vec::new();
         let mut seq_drain = Vec::new();
         let mut lazy_drain = Vec::new();
         let mut eager_total = Vec::new();
         for _ in 0..reps {
             let t = Instant::now();
-            let mut it = $q;
+            let mut it = $q.sequential();
             black_box(it.next());
             seq_first.push(ms(t));
             drop(it);
@@ -157,7 +170,7 @@ macro_rules! measure {
             drop(it);
 
             let t = Instant::now();
-            black_box($q.take(10).count());
+            black_box($q.sequential().take(10).count());
             seq_first10.push(ms(t));
 
             let t = Instant::now();
@@ -165,7 +178,31 @@ macro_rules! measure {
             lazy_first10.push(ms(t));
 
             let t = Instant::now();
-            black_box($q.count());
+            black_box($q.sequential().take(100).count());
+            seq_first100.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.solve_dag_lazy().take(100).count());
+            lazy_first100.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.sequential().take(1_000).count());
+            seq_first1k.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.solve_dag_lazy().take(1_000).count());
+            lazy_first1k.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.sequential().take(10_000).count());
+            seq_first10k.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.solve_dag_lazy().take(10_000).count());
+            lazy_first10k.push(ms(t));
+
+            let t = Instant::now();
+            black_box($q.sequential().count());
             seq_drain.push(ms(t));
 
             let t = Instant::now();
@@ -189,6 +226,21 @@ macro_rules! measure {
             median(lazy_first10),
         );
         println!(
+            "  first-100 ms: seq {:>8.3} | lazy {:>9.3}",
+            median(seq_first100),
+            median(lazy_first100),
+        );
+        println!(
+            "  first-1k  ms: seq {:>8.3} | lazy {:>9.3}",
+            median(seq_first1k),
+            median(lazy_first1k),
+        );
+        println!(
+            "  first-10k ms: seq {:>8.3} | lazy {:>9.3}",
+            median(seq_first10k),
+            median(lazy_first10k),
+        );
+        println!(
             "  drain    ms: seq {:>9.3} | lazy {:>9.3} | eager      {:>9.3}",
             median(seq_drain),
             median(lazy_drain),
@@ -198,16 +250,280 @@ macro_rules! measure {
         // Stats pass: slow-start trajectory for a first-match probe and
         // for a full drain (dag_stats is process-global — this example is
         // single-threaded).
+        blocked_stats::set_enabled(true);
+        blocked_stats::reset();
         dag_stats::set_enabled(true);
         dag_stats::reset();
+        #[cfg(feature = "gpu")]
+        gpu_stats::reset();
         let mut it = $q.solve_dag_lazy();
         black_box(it.next());
         drop(it);
         println!("  first-match stats: {}", dag_stats::report());
+        println!("  first-match work:  {}", blocked_stats::report());
+        let partition_costs = blocked_stats::partition_cost_report();
+        if !partition_costs.is_empty() {
+            println!("  first-match partition costs: {partition_costs}");
+        }
+        #[cfg(feature = "gpu")]
+        println!("  first-match GPU:   {}", gpu_stats::report());
+        blocked_stats::reset();
         dag_stats::reset();
+        #[cfg(feature = "gpu")]
+        gpu_stats::reset();
         black_box($q.solve_dag_lazy().count());
         println!("  drain stats:       {}", dag_stats::report());
+        println!("  drain work:        {}", blocked_stats::report());
+        let partition_costs = blocked_stats::partition_cost_report();
+        if !partition_costs.is_empty() {
+            println!("  drain partition costs: {partition_costs}");
+        }
+        #[cfg(feature = "gpu")]
+        println!("  drain GPU:         {}", gpu_stats::report());
+        blocked_stats::set_enabled(false);
         dag_stats::set_enabled(false);
+    }};
+}
+
+/// Runs four width-triggered partition policies on one continuously consumed
+/// iterator per repetition. Every checkpoint is therefore a true prefix of
+/// the same execution, unlike independent `take(k)` probes.
+macro_rules! checkpoint_matrix {
+    ($label:expr, $reps:expr, $q:expr) => {{
+        const CHECKPOINTS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
+        const POLICIES: [(&str, Option<usize>, Option<usize>); 4] = [
+            ("grouped", None, None),
+            ("trivial@256", Some(256), None),
+            ("adaptive4@256", Some(256), Some(4)),
+            ("adaptive8@256", Some(256), Some(8)),
+        ];
+
+        let sequential = tally($q.sequential());
+        assert!(
+            sequential.0 >= *CHECKPOINTS.last().unwrap(),
+            "{} has too few rows for the checkpoint matrix",
+            $label
+        );
+        for &(policy, width, inflation) in &POLICIES {
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            let actual = tally(it);
+            assert_eq!(
+                sequential, actual,
+                "checkpoint policy parity failed for {} under {}",
+                $label, policy
+            );
+        }
+
+        // Warm every policy before timing. Rotate the starting policy each
+        // repetition so no configuration owns a fixed thermal/cache slot.
+        for &(_, width, inflation) in &POLICIES {
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            black_box(it.count());
+        }
+
+        let reps: usize = $reps;
+        let mut samples: Vec<Vec<Vec<f64>>> = POLICIES
+            .iter()
+            .map(|_| (0..=CHECKPOINTS.len()).map(|_| Vec::new()).collect())
+            .collect();
+        for rep in 0..reps {
+            for offset in 0..POLICIES.len() {
+                let ci = (rep + offset) % POLICIES.len();
+                let (_, width, inflation) = POLICIES[ci];
+                let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+                if let Some(width) = width {
+                    it = match inflation {
+                        Some(inflation) => it.adaptive_partition(width, inflation),
+                        None => it.trivial_partition_at_width(width),
+                    };
+                } else {
+                    it = it.grouped_partition();
+                }
+                let started = Instant::now();
+                let mut rows = 0usize;
+                let mut checkpoint = 0usize;
+                while let Some(item) = it.next() {
+                    black_box(item);
+                    rows += 1;
+                    if checkpoint < CHECKPOINTS.len() && rows == CHECKPOINTS[checkpoint] {
+                        samples[ci][checkpoint].push(ms(started));
+                        checkpoint += 1;
+                    }
+                }
+                samples[ci][CHECKPOINTS.len()].push(ms(started));
+                assert_eq!(rows, sequential.0, "{} row count changed", $label);
+                assert_eq!(
+                    checkpoint,
+                    CHECKPOINTS.len(),
+                    "{} missed a timing checkpoint",
+                    $label
+                );
+            }
+        }
+
+        println!(
+            "=== {} continuous checkpoint matrix (rows {}) ===",
+            $label, sequential.0
+        );
+        for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
+            println!(
+                "  {policy:>13}: K1 {:>8.3} | K10 {:>8.3} | K100 {:>8.3} | K1k {:>8.3} | K10k {:>8.3} | drain {:>8.3} ms",
+                median(samples[ci][0].clone()),
+                median(samples[ci][1].clone()),
+                median(samples[ci][2].clone()),
+                median(samples[ci][3].clone()),
+                median(samples[ci][4].clone()),
+                median(samples[ci][5].clone()),
+            );
+
+            blocked_stats::set_enabled(true);
+            blocked_stats::reset();
+            dag_stats::set_enabled(true);
+            dag_stats::reset();
+            #[cfg(feature = "gpu")]
+            gpu_stats::reset();
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            let rows = black_box(it.count());
+            assert_eq!(rows, sequential.0);
+            println!("    DAG: {}", dag_stats::report());
+            println!("    work: {}", blocked_stats::report());
+            let partition_costs = blocked_stats::partition_cost_report();
+            if !partition_costs.is_empty() {
+                println!("    partition costs: {partition_costs}");
+            }
+            #[cfg(feature = "gpu")]
+            println!("    GPU: {}", gpu_stats::report());
+            blocked_stats::set_enabled(false);
+            dag_stats::set_enabled(false);
+        }
+    }};
+}
+
+/// Compares the grouped scheduler with width-triggered trivial partitions on
+/// workloads that may have fewer than 10k results. Configuration order rotates
+/// across repetitions so cache and thermal position do not belong to one
+/// policy. The instrumented pass makes changes in work visible even when wall
+/// time is noisy.
+macro_rules! drain_partition_matrix {
+    ($label:expr, $reps:expr, $q:expr) => {{
+        const POLICIES: [(&str, Option<usize>, Option<usize>); 4] = [
+            ("grouped", None, None),
+            ("trivial@256", Some(256), None),
+            ("adaptive4@256", Some(256), Some(4)),
+            ("adaptive8@256", Some(256), Some(8)),
+        ];
+
+        let sequential = tally($q.sequential());
+        for &(policy, width, inflation) in &POLICIES {
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            assert_eq!(
+                sequential,
+                tally(it),
+                "drain partition policy parity failed for {} under {}",
+                $label,
+                policy
+            );
+        }
+
+        for &(_, width, inflation) in &POLICIES {
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            black_box(it.count());
+        }
+
+        let reps: usize = $reps;
+        let mut samples: Vec<Vec<f64>> = POLICIES.iter().map(|_| Vec::new()).collect();
+        for rep in 0..reps {
+            for offset in 0..POLICIES.len() {
+                let ci = (rep + offset) % POLICIES.len();
+                let (_, width, inflation) = POLICIES[ci];
+                let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+                if let Some(width) = width {
+                    it = match inflation {
+                        Some(inflation) => it.adaptive_partition(width, inflation),
+                        None => it.trivial_partition_at_width(width),
+                    };
+                } else {
+                    it = it.grouped_partition();
+                }
+                let started = Instant::now();
+                black_box(it.count());
+                samples[ci].push(ms(started));
+            }
+        }
+
+        println!(
+            "=== {} drain partition matrix (rows {}) ===",
+            $label, sequential.0
+        );
+        for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
+            println!(
+                "  {policy:>13}: drain {:>9.3} ms",
+                median(samples[ci].clone()),
+            );
+
+            blocked_stats::set_enabled(true);
+            blocked_stats::reset();
+            dag_stats::set_enabled(true);
+            dag_stats::reset();
+            let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
+            if let Some(width) = width {
+                it = match inflation {
+                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    None => it.trivial_partition_at_width(width),
+                };
+            } else {
+                it = it.grouped_partition();
+            }
+            assert_eq!(black_box(it.count()), sequential.0);
+            println!("    DAG: {}", dag_stats::report());
+            println!("    work: {}", blocked_stats::report());
+            let partition_costs = blocked_stats::partition_cost_report();
+            if !partition_costs.is_empty() {
+                println!("    partition costs: {partition_costs}");
+            }
+            blocked_stats::set_enabled(false);
+            dag_stats::set_enabled(false);
+        }
     }};
 }
 
@@ -270,7 +586,23 @@ fn run_skew(n_per_pop: usize, fan: usize, reps: usize) {
             pattern!(&kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
         )
     );
+    drain_partition_matrix!(
+        "skew ?e p ?x . q ?y . ?x r ?y (tribleset)",
+        reps,
+        find!(
+            (e: Inline<_>, x: Inline<_>, y: Inline<_>),
+            pattern!(&kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
+        )
+    );
     measure!(
+        "skew ?e p ?x . q ?y . ?x r ?y (archive)",
+        reps,
+        find!(
+            (e: Inline<_>, x: Inline<_>, y: Inline<_>),
+            pattern!(&archive, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
+        )
+    );
+    drain_partition_matrix!(
         "skew ?e p ?x . q ?y . ?x r ?y (archive)",
         reps,
         find!(
@@ -289,13 +621,30 @@ fn run_wd(cache: &str, reps: usize) {
             .expect("map cache")
     };
     let blob: Blob<SuccinctArchiveBlob> = Blob::new(bytes);
-    let wd: SuccinctArchive<OrderedUniverse> = blob.try_from_blob().expect("decode cached archive");
+    let mut wd: SuccinctArchive<OrderedUniverse> =
+        blob.try_from_blob().expect("decode cached archive");
     eprintln!(
         "wd archive loaded from cache in {:?}: E {} / A {} / V {}",
         t0.elapsed(),
         wd.entity_count,
         wd.attribute_count,
         wd.value_count,
+    );
+
+    let want_gpu = std::env::var("TRIBLES_LAZY_GPU").is_ok();
+    #[cfg(feature = "gpu")]
+    if want_gpu {
+        let t0 = Instant::now();
+        wd.enable_gpu().expect("gpu upload");
+        eprintln!("GPU archive enabled in {:?}", t0.elapsed());
+    }
+    #[cfg(not(feature = "gpu"))]
+    if want_gpu {
+        panic!("TRIBLES_LAZY_GPU requires --features gpu");
+    }
+    eprintln!(
+        "wd lazy benchmark backend: {}",
+        if want_gpu { "adaptive CPU/GPU" } else { "CPU" }
     );
 
     let p31 = wd_predicate("P31");
@@ -327,6 +676,23 @@ fn run_wd(cache: &str, reps: usize) {
         )
     );
     measure!(
+        "wd star3 ?e P31 Q5 . P21 ?g . P27 ?c",
+        reps,
+        find!(
+            (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
+            pattern!(&wd, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
+        )
+    );
+
+    checkpoint_matrix!(
+        "wd filter ?e P31 Q5 . ?e P106 ?o",
+        reps,
+        find!(
+            (e: Inline<GenId>, o: Inline<GenId>),
+            pattern!(&wd, [{ ?e @ &p31: q5, &p106: ?o }])
+        )
+    );
+    checkpoint_matrix!(
         "wd star3 ?e P31 Q5 . P21 ?g . P27 ?c",
         reps,
         find!(

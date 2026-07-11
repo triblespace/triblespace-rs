@@ -130,10 +130,13 @@ fn blocked_gpu_paths_match_sequential_cpu() {
         .expect("a kind exists");
 
     // Star with value-bound clause.
-    let star_cpu = multiset(find!(
-        (e: Inline<GenId>, h: Inline<GenId>),
-        pattern!(&cpu, [{ ?e @ zoo::kind: kid, zoo::home: ?h }])
-    ));
+    let star_cpu = multiset(
+        find!(
+            (e: Inline<GenId>, h: Inline<GenId>),
+            pattern!(&cpu, [{ ?e @ zoo::kind: kid, zoo::home: ?h }])
+        )
+        .sequential(),
+    );
     let star_gpu = multiset(
         find!(
             (e: Inline<GenId>, h: Inline<GenId>),
@@ -144,10 +147,13 @@ fn blocked_gpu_paths_match_sequential_cpu() {
     assert_eq!(star_cpu, star_gpu, "blocked-gpu kind-star mismatch");
 
     // Attribute intersection, nothing value-bound.
-    let isect_cpu = multiset(find!(
-        (e: Inline<GenId>, k: Inline<GenId>, h: Inline<GenId>),
-        pattern!(&cpu, [{ ?e @ zoo::kind: ?k, zoo::home: ?h }])
-    ));
+    let isect_cpu = multiset(
+        find!(
+            (e: Inline<GenId>, k: Inline<GenId>, h: Inline<GenId>),
+            pattern!(&cpu, [{ ?e @ zoo::kind: ?k, zoo::home: ?h }])
+        )
+        .sequential(),
+    );
     let isect_gpu = multiset(
         find!(
             (e: Inline<GenId>, k: Inline<GenId>, h: Inline<GenId>),
@@ -158,10 +164,13 @@ fn blocked_gpu_paths_match_sequential_cpu() {
     assert_eq!(isect_cpu, isect_gpu, "blocked-gpu intersection mismatch");
 
     // Chain join across entities.
-    let chain_cpu = multiset(find!(
-        (e: Inline<GenId>, b: Inline<GenId>, k: Inline<GenId>),
-        pattern!(&cpu, [{ ?e @ zoo::boss: ?b }, { ?b @ zoo::kind: ?k }])
-    ));
+    let chain_cpu = multiset(
+        find!(
+            (e: Inline<GenId>, b: Inline<GenId>, k: Inline<GenId>),
+            pattern!(&cpu, [{ ?e @ zoo::boss: ?b }, { ?b @ zoo::kind: ?k }])
+        )
+        .sequential(),
+    );
     let chain_gpu = multiset(
         find!(
             (e: Inline<GenId>, b: Inline<GenId>, k: Inline<GenId>),

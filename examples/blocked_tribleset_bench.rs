@@ -57,7 +57,7 @@ enum Mode {
 macro_rules! run {
     ($q:expr, $mode:expr) => {
         match $mode {
-            Mode::Seq => tally($q),
+            Mode::Seq => tally($q.sequential()),
             Mode::Blk => tally($q.solve_blocked()),
             Mode::Grp => tally($q.solve_blocked_grouped()),
             Mode::Dag => tally($q.solve_dag()),
@@ -190,7 +190,16 @@ fn main() {
 
     println!(
         "{:<48} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8} {:>8}  parity",
-        "query", "rows", "seq ms", "blk ms", "grp ms", "dag ms", "dagu ms", "blk/seq", "grp/seq", "dag/seq"
+        "query",
+        "rows",
+        "seq ms",
+        "blk ms",
+        "grp ms",
+        "dag ms",
+        "dagu ms",
+        "blk/seq",
+        "grp/seq",
+        "dag/seq"
     );
     for (name, q) in &queries {
         let mut seq_times = Vec::new();

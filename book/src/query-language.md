@@ -285,6 +285,15 @@ not force the sub-clauses to agree, because each occurrence is treated as its
 own wildcard; introduce a `temp!` binding when you need the same hidden value to
 appear in multiple places.
 
+There is one composition detail under `or!`: a union asks each arm whether it
+is still satisfied before that arm participates in another variable's proposal.
+Once all of an `ignore!` arm's surviving variables are bound, the wrapper
+replays each visible variable as a singleton confirmation with that variable
+temporarily omitted and requires the bound value to survive. This includes
+confirm-only filters such as ranges, prevents a dead *visible* arm from leaking
+candidates, and still leaves ignored-only clauses inert without binding a
+shared hidden witness.
+
 ### Temporary variables (temp!)
 
 Real queries often need helper bindings that participate in the joins but do
@@ -499,11 +508,33 @@ let matches: Vec<_> =
 The example wraps an external `HashSet` so it can be queried directly.  A
 `TriblePattern` implementation follows the same shape: create a constraint
 type that reads from your backing store and return it from `pattern`.  The query
-engine drives both traits through `Constraint`, so any data source that can
-estimate, propose, confirm, and report `satisfied()` can participate in `find!`.
-The full protocol is: `variables`, `estimate`, `propose`, `confirm`, and
-`satisfied` (a fast consistency check that returns `false` when the current
-binding is known to have no solution).
+engine drives both traits through `Constraint`, so any data source that speaks
+the block-native protocol can participate in `find!`. The six core methods are:
+
+| Method | Role |
+|---|---|
+| `variables` | Declare the variables touched by the constraint. |
+| `estimate` | Append one candidate-count estimate per input row. |
+| `propose` | Fill an initially empty sink with candidate extensions. |
+| `confirm` | Filter candidates proposed by another constraint without adding any. |
+| `satisfied` | Report exact truth once every relevant variable is bound. |
+| `influence` | Name estimates that may change after a variable is bound or unbound. |
+
+The explicit `Query::sequential()` scheduler calls these methods with a one-row
+[`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
+the ordinary DAG-backed iterator calls the same methods with row blocks and
+tagged candidate frontiers. Implementations without a specialized batch
+operation can loop over the rows, use `CandidateSink::extend_row`, and use the
+`confirm_per_row` adapter.
+
+`propose` owns the empty sink it receives, whereas `confirm` may only remove
+entries from an existing sink. `satisfied` may conservatively return `true`
+while a relevant variable remains unbound, but its result must be exact once
+all of the constraint's variables are present in the view. That exactness is
+required for sound composition with `or!` and for constant, zero-variable
+checks; it is not merely an optional early-pruning optimization. Zero-variable
+roots are settled once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
+chapter explains the protocol and both schedulers in detail.
 
 ## Regular path queries
 

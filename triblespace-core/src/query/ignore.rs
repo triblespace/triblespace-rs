@@ -1,24 +1,19 @@
 use super::*;
 
-/// Hides variables from the outer query while preserving internal joins.
+/// Hides variables from the outer query as don't-care wildcard positions.
 ///
 /// Created by the [`ignore!`](crate::ignore) macro. The wrapped constraint
-/// still constrains the hidden variables internally — they participate in
-/// estimate, propose, and confirm — but the engine does not see them in
-/// [`variables`](Constraint::variables), so they are neither bound from
-/// outside nor projected into results.
+/// loses the ignored variables from its outward
+/// [`variables`](Constraint::variables) set, so the engine neither binds nor
+/// projects them. The inner constraint is consulted only while solving the
+/// variables that remain visible; ignored positions stay unbound and behave
+/// as independent wildcards.
 ///
-/// This is useful when a multi-column constraint (like a triple pattern)
-/// should enforce a join condition without exposing one of its positions
-/// to the caller.
-///
-/// Semantically the wrapper is an **existential quantifier**: a binding of
-/// the visible variables satisfies it iff *some* assignment of the hidden
-/// variables satisfies the inner constraint. [`satisfied`](Constraint::satisfied)
-/// computes exactly that once every visible variable is bound, which is
-/// what keeps `ignore!` sound as an exists-filter inside [`and!`](crate::and)
-/// and as a variant component inside [`or!`](crate::or) — and, with constant
-/// folding, as a fully-hidden (zero visible variables) existence check.
+/// This is a projection/scoping operator, not existential quantification.
+/// A child that mentions only ignored variables is inert, and repeating an
+/// ignored variable across children does not join those children through a
+/// shared witness. Use [`temp!`](crate::temp) when a hidden helper must
+/// actually be bound and joined.
 pub struct IgnoreConstraint<'a> {
     ignored: VariableSet,
     constraint: Box<dyn Constraint<'a> + Send + Sync + 'a>,
@@ -44,111 +39,113 @@ impl<'a> Constraint<'a> for IgnoreConstraint<'a> {
         self.constraint.variables().subtract(self.ignored)
     }
 
-    /// Delegates to the inner constraint. Ignored variables are still
-    /// estimated normally — they participate internally, just not in the
-    /// outer variable set.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    /// Delegates estimates for outward variables to the inner constraint.
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         self.constraint.estimate(variable, view, out)
     }
 
     /// Delegates to the inner constraint.
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         self.constraint.propose(variable, view, candidates);
     }
 
     /// Delegates to the inner constraint.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         self.constraint.confirm(variable, view, candidates)
     }
 
-    /// Exact existential over the hidden variables once every *visible*
-    /// variable is bound.
+    /// Replays the historical wildcard filter once every outward variable is
+    /// bound.
     ///
-    /// The constraint's outward [`variables`](Constraint::variables) set is
-    /// the inner set minus the hidden ones, so "all variables bound" can be
-    /// reached while the hidden variables are still free — with constant
-    /// folding even at construction time (an empty visible set, e.g.
-    /// `ignore!((h), pattern!(kb, [{ ?h @ attr: lit }]))`, which
-    /// [`Query::new`](super::Query::new) settles with one probe against the
-    /// seed block). The exact answer demanded by the fully-bound
-    /// [`satisfied`](Constraint::satisfied) law is then: does **some**
-    /// assignment of the hidden variables satisfy the inner constraint?
+    /// [`UnionConstraint`](super::unionconstraint::UnionConstraint) calls
+    /// `satisfied` to gate an arm while proposing a variable owned by another
+    /// arm. Returning the usual optimistic `true` after all outward variables
+    /// are bound would let a dead visible arm leak candidates. To ask whether
+    /// a completed row belongs to the same relation that the old wrapper
+    /// exposed, this method removes each outward variable in turn, seeds its
+    /// actual value as a candidate, and delegates
+    /// [`confirm`](Constraint::confirm). The value must survive.
     ///
-    /// Neither the optimistic default (`true`) nor delegation to the inner
-    /// constraint (which sees the hidden variables as unbound and also
-    /// answers an optimistic `true`) computes that existential, so this
-    /// searches for a witness per row: each hidden variable is enumerated
-    /// through the inner constraint's own [`propose`](Constraint::propose)
-    /// (complete by the propose contract, and — like the engine itself —
-    /// generating nothing for confirm-only constraints), and once every
-    /// hidden variable is bound the inner
-    /// [`satisfied`](Constraint::satisfied) — exact by the fully-bound law —
-    /// decides. The search short-circuits on the first witness.
+    /// This replays exactly how historical `IgnoreConstraint` filtered a value
+    /// proposed elsewhere, including confirm-only constraints such as
+    /// [`InlineRange`](super::rangeconstraint::InlineRange). Checking every
+    /// visible variable makes the answer independent of binding order and
+    /// validates every visible-bearing child. Ignored variables are never
+    /// added to the replay view: it is rebuilt strictly from the other outward
+    /// variables, rather than inheriting arbitrary columns from the caller.
+    /// Hidden-only children therefore remain inert and even a manually reused
+    /// variable ID cannot turn an ignored name into a shared witness. With no
+    /// outward variables the check is vacuously true.
     ///
-    /// While any visible variable is unbound the answer stays the
-    /// optimistic `true` the law permits.
+    /// While any outward variable is unbound the answer remains the
+    /// optimistic `true` permitted by the protocol.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        if self
-            .variables()
-            .into_iter()
-            .any(|v| view.col(v).is_none())
-        {
+        let visible: Vec<VariableId> = self.variables().into_iter().collect();
+        if visible.iter().any(|&v| view.col(v).is_none()) {
             return true;
         }
-        let hidden: Vec<VariableId> = self
-            .constraint
-            .variables()
-            .intersect(self.ignored)
-            .into_iter()
-            .collect();
-        view.iter().all(|row| {
-            let mut vars: Vec<VariableId> = view.vars.to_vec();
-            let mut values: Vec<RawInline> = row.to_vec();
-            witness_exists(&self.constraint, &mut vars, &mut values, &hidden)
-        })
-    }
-}
 
-/// Depth-first witness search over the `remaining` hidden variables of an
-/// [`IgnoreConstraint`]: extends the single-row binding in `vars`/`values`
-/// with candidates from the inner constraint's own
-/// [`propose`](Constraint::propose) and, once every hidden variable is
-/// bound, asks the inner [`satisfied`](Constraint::satisfied) (exact by the
-/// fully-bound law). Short-circuits on the first witness found.
-fn witness_exists<'a, C: Constraint<'a> + ?Sized>(
-    constraint: &C,
-    vars: &mut Vec<VariableId>,
-    values: &mut Vec<RawInline>,
-    remaining: &[VariableId],
-) -> bool {
-    let Some((&variable, rest)) = remaining.split_first() else {
-        return constraint.satisfied(&RowsView::new(vars, values));
-    };
-    let mut candidates: Vec<RawInline> = Vec::new();
-    constraint.propose(
-        variable,
-        &RowsView::new(vars, values),
-        &mut CandidateSink::Values(&mut candidates),
-    );
-    for value in candidates {
-        vars.push(variable);
-        values.push(value);
-        let found = witness_exists(constraint, vars, values, rest);
-        vars.pop();
-        values.pop();
-        if found {
-            return true;
+        let mut replay_vars = Vec::with_capacity(visible.len().saturating_sub(1));
+        let mut replay_values = Vec::with_capacity(visible.len().saturating_sub(1));
+        let mut candidates = Vec::new();
+
+        for row in view.iter() {
+            for &variable in &visible {
+                let actual = row[view
+                    .col(variable)
+                    .expect("all outward Ignore variables were checked as bound")];
+
+                replay_vars.clear();
+                replay_values.clear();
+                for &bound in &visible {
+                    if bound != variable {
+                        replay_vars.push(bound);
+                        replay_values.push(
+                            row[view
+                                .col(bound)
+                                .expect("all outward Ignore variables were checked as bound")],
+                        );
+                    }
+                }
+
+                candidates.clear();
+                candidates.push(actual);
+                self.constraint.confirm(
+                    variable,
+                    &RowsView::new(&replay_vars, &replay_values),
+                    &mut CandidateSink::Values(&mut candidates),
+                );
+                if !candidates.contains(&actual) {
+                    return false;
+                }
+            }
         }
+
+        true
     }
-    false
 }
 
 /// Wraps a constraint while hiding one or more variables from the outer
 /// query.
 ///
-/// Hidden variables still participate in internal joins but are not
-/// projected into results. Useful when a multi-column constraint should
-/// enforce a join without exposing a helper variable.
+/// Hidden positions behave as independent wildcards and are not projected.
+/// Clauses that contain only hidden variables are inert. Use [`temp!`] when a
+/// hidden helper must participate in a join.
 ///
 /// ```rust,ignore
 /// ignore!((helper), set.pattern(e, a, helper))

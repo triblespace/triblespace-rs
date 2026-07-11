@@ -124,7 +124,7 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
         pattern!(kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
     );
     match mode {
-        Mode::Seq => tally(q),
+        Mode::Seq => tally(q.sequential()),
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
@@ -236,6 +236,11 @@ fn main() {
     eprintln!("\narchives built in {:?}", t0.elapsed());
 
     println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
-    bench_backend("skew  ?e p ?x . q ?y . r", &skew_archive, skew_expected, reps);
+    bench_backend(
+        "skew  ?e p ?x . q ?y . r",
+        &skew_archive,
+        skew_expected,
+        reps,
+    );
     bench_backend("uniform control", &uni_archive, uni_expected, reps);
 }

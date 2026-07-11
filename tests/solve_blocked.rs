@@ -96,7 +96,7 @@ fn build_world() -> (TribleSet, Id, Id) {
 
 macro_rules! gate {
     ($name:expr, $q:expr) => {{
-        let sequential = multiset($q);
+        let sequential = multiset(($q).sequential());
         let blocked = multiset($q.solve_blocked());
         assert_eq!(
             sequential, blocked,
@@ -247,20 +247,58 @@ fn fully_constant_settlement_on_succinctarchive() {
     gate_fully_constant(&archive, human, anchor);
 }
 
-/// The probe solvers restart evaluation from the seed block, so calling
-/// one on a query whose sequential cursor already yielded rows would
-/// emit those rows AGAIN. Like the mid-iteration `Clone` guard, they
-/// must refuse loudly instead of silently duplicating. (A fresh query
-/// whose zero-variable settlement failed — `Done` with an untouched
-/// cursor — stays allowed and yields the empty multiset; that path is
-/// pinned by `gate_fully_constant` above.)
+/// Probe solvers restart evaluation from the seed block, so they accept only
+/// queries whose public iterator has never been pulled. This is explicit
+/// state rather than a cursor-shape inference: a drained successful
+/// zero-variable query and an untouched failed settlement are both `Done`
+/// with empty cursors. The former must refuse; the latter remains fresh and
+/// yields the empty multiset.
 #[test]
 fn probe_solvers_refuse_started_query() {
-    let (kb, human, _anchor) = build_world();
+    let (kb, human, anchor) = build_world();
     let mut q = find!((e: Inline<_>), pattern!(&kb, [{ ?e @ world::kind: human }]));
     assert!(q.next().is_some(), "fixture must produce rows");
     let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || q.solve_dag()))
         .expect_err("solve_dag on a started query must panic, not re-emit yielded rows");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("cannot probe-solve a Query mid-iteration"),
+        "unexpected panic message: {msg}"
+    );
+
+    // A successful zero-variable query returns to `Done` with the same
+    // structurally empty cursor as an untouched failed settlement. Draining
+    // it must not erase the fact that iteration started.
+    let mut present = find!((), pattern!(&kb, [{ &anchor @ world::kind: human }]));
+    assert_eq!(present.next(), Some(()));
+    assert_eq!(present.next(), None);
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || present.solve_dag()))
+        .expect_err("a drained successful zero-variable query is not fresh");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("cannot probe-solve a Query mid-iteration"),
+        "unexpected panic message: {msg}"
+    );
+
+    // An untouched failed settlement is still fresh and can be handed to a
+    // probe solver, but even a failed `next()` consumes that freshness.
+    assert!(
+        find!((), pattern!(&kb, [{ &anchor @ world::kind: anchor }]))
+            .solve_dag()
+            .is_empty()
+    );
+    let mut absent = find!((), pattern!(&kb, [{ &anchor @ world::kind: anchor }]));
+    assert_eq!(absent.next(), None);
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || absent.solve_dag()))
+        .expect_err("calling next on a failed zero-variable query consumes freshness");
     let msg = err
         .downcast_ref::<String>()
         .map(String::as_str)
@@ -340,7 +378,11 @@ fn gate_skew<S: TriblePattern>(kb: &S, expected: usize) {
         pattern!(kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
     )
     .collect();
-    assert_eq!(seq.len(), expected, "skew world must yield one row per person");
+    assert_eq!(
+        seq.len(),
+        expected,
+        "skew world must yield one row per person"
+    );
     gate!(
         "skew ?e p ?x . ?e q ?y . ?x r ?y",
         find!(
@@ -370,7 +412,10 @@ fn build_reconverge_world(
     n_per_pop: usize,
     z_fan: usize,
 ) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
-    assert!(z_fan > 8, "z must be chosen after every x (fans go up to 8)");
+    assert!(
+        z_fan > 8,
+        "z must be chosen after every x (fans go up to 8)"
+    );
     let mut kb = TribleSet::new();
     let markers: Vec<_> = (0..4).map(|_| ufoid()).collect();
     let z_marker = ufoid();
@@ -437,11 +482,7 @@ fn build_reconverge_world(
     )
 }
 
-fn gate_reconverge<S: TriblePattern>(
-    kb: &S,
-    markers: (Id, Id, Id, Id, Id),
-    expected: usize,
-) {
+fn gate_reconverge<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), expected: usize) {
     let (k1, k2, k3, k4, kz) = markers;
     let seq: Vec<_> = find!(
         (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
@@ -710,8 +751,32 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
             )
         };
     }
-    let sequential = multiset(star3!());
+    let sequential = multiset(star3!().sequential());
     assert!(!sequential.is_empty(), "partial gate is vacuous");
+
+    let hybrid = multiset(
+        star3!()
+            .solve_dag_lazy()
+            .start_width(1)
+            .growth(2)
+            .trivial_partition_at_width(256),
+    );
+    assert_eq!(
+        hybrid, sequential,
+        "switching partitions at a width threshold changed the full multiset"
+    );
+
+    let adaptive = multiset(
+        star3!()
+            .solve_dag_lazy()
+            .start_width(1)
+            .growth(2)
+            .adaptive_partition(1, 4),
+    );
+    assert_eq!(
+        adaptive, sequential,
+        "estimate-guarded whole-block batching changed the full multiset"
+    );
 
     // take(1) — first-result path, narrow sprint width only.
     let one = multiset(star3!().solve_dag_lazy().take(1));
@@ -811,10 +876,13 @@ fn lazy_slow_start_trajectory() {
 #[test]
 fn lazy_full_bound_postprocess_is_width_bounded() {
     let (kb, human, _anchor) = build_world();
-    let expected: usize = multiset(find!(
-        (e: Inline<_>, g: Inline<_>, c: Inline<_>),
-        pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
-    ))
+    let expected: usize = multiset(
+        find!(
+            (e: Inline<_>, g: Inline<_>, c: Inline<_>),
+            pattern!(&kb, [{ ?e @ world::kind: human, world::gender: ?g, world::country: ?c }])
+        )
+        .sequential(),
+    )
     .values()
     .sum();
     assert!(expected > 3, "fixture too small to observe eager drain");

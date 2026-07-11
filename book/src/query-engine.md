@@ -1,62 +1,207 @@
 # Query Engine
 
-Queries describe the patterns you want to retrieve. The engine favors extreme
-simplicity and aims for predictable latency and skew resistance without any
-tuning. Every constraint implements the
-[`Constraint`](triblespace::core::query::Constraint) trait so operators, sub-languages, and
-even alternative data sources can compose cleanly. Query evaluation is
-expressed as a negotiation between constraints, but the contract stays tiny:
-constraints report which variables they touch, estimate how many candidates
-remain for each variable, enumerate concrete values on demand, and signal
-when a fully-bound assignment is unsatisfied. Those six methods feed directly
-into the depth-first search; there is no standalone plan to build or cache.
+Queries describe the patterns you want to retrieve. The engine favors
+predictable latency and skew resistance without a separately compiled query
+plan. Every operator and data source implements the same
+[`Constraint`](triblespace::core::query::Constraint) protocol, and the engine
+consults those constraints while it searches. Binding order can therefore
+adapt to the values already found instead of being fixed before evaluation.
 
-The constraint API mirrors the mental model you would use when reasoning about
-a query by hand. Constraints expose their
-[`VariableSet`](triblespace::core::query::VariableSet) via `variables()`, provide `estimate`
-methods so the engine can choose the next variable to bind, and implement
-`propose` to extend partial assignments. Composite constraints, such as unions,
-may also override `confirm` to tighten previously gathered proposals. A fifth
-method, `satisfied()`, returns `false` when all variables are bound but the
-constraint is unsatisfied — `UnionConstraint` uses this to prune dead variants.
-Finally, `influence` reports which other variables need their estimates refreshed
-when a given variable is bound. This cooperative protocol of six methods keeps
-the engine agnostic to where the data comes from—be it in-memory indices,
-remote stores, or bespoke application predicates.
+The current protocol is **block-native**. Its unit of work is not necessarily
+one partial binding, but a block of partial bindings that have the same set of
+bound variables. The ordinary iterator uses a demand-adaptive DAG worklist;
+the explicit [`Query::sequential`](triblespace::core::query::Query::sequential)
+path speaks the same protocol with blocks of one row. This shared interface is
+the important part of the design: a constraint has one implementation whether
+its probes are issued one at a time, fused into a CPU loop, or dispatched to a
+batch-oriented accelerator.
 
-## Search Loop
+## Bindings as row blocks
 
-The engine executes a query as a depth-first search over partial bindings. The
-loop integrates the cardinality heuristics directly instead of running a
-separate planning phase. Picking a different heuristic simply yields another
-member of the Atreides join family:
+A [`RowsView`](triblespace::core::query::RowsView) is a borrowed, row-major view
+of partial bindings. Its `vars` slice names the columns and every row contains
+one value for each of those variables. For example:
 
-1. **Initialisation** – When a [`Query`](triblespace::core::query::Query) is constructed it
-   asks the root constraint for its variable set. The engine records each
-   variable's [`influence`](triblespace::core::query::Constraint::influence) so it knows
-   which estimates to refresh when bindings change, computes an initial
-   `estimate` for every variable, and sorts the yet-unbound list using those
-   numbers.
-2. **Propose (and confirm)** – The engine pops the most selective variable from
-   the sorted list and calls `propose` to collect candidate values that respect
-   the current binding. Intersection constraints such as those built by
-   [`and!`](triblespace::core::prelude::and) reorder their children by increasing estimate
-   and call `confirm` on the remaining branches so inconsistent candidates are
-   filtered out before the engine commits to them. Constraints that observe the
-   partial assignment simply avoid proposing or confirming values they already
-   know will fail.
-3. **Bind or Backtrack** – If `propose` yielded values, the engine binds one,
-   marks that variable as touched, and recurses. If no candidates remain it
-   backtracks: the binding is undone, the variable returns to the unbound set,
-   and the touched marker ensures dependent estimates refresh before the next
-   attempt.
-4. **Yield** – Once every variable is bound the post-processing closure runs
-   and the tuple is produced as a result row.
+```text
+vars = [person, city]
 
-Between iterations the engine refreshes estimates for any variables influenced
-by the newly bound values. Because constraints only observe the bindings they
-explicitly depend on, unrelated sub-queries interleave naturally and new
-constraint types can participate without custom planner hooks.
+row 0 = [P1, Bremen]
+row 1 = [P2, Arrakeen]
+row 2 = [P3, Bremen]
+```
+
+All rows have bound the same variables, although their values differ. Column
+order is not part of the protocol: constraints locate a variable with
+`RowsView::col` rather than assuming a position. A view with no columns is the
+seed block, represented as one virtual zero-width row. Consequently the empty
+binding is an ordinary input to the protocol rather than a special engine case.
+
+When the engine asks for candidates for another variable, the blocked form of
+[`CandidateSink`](triblespace::core::query::CandidateSink) stores a ragged
+matrix as `(row, value)` pairs:
+
+```text
+(0, E1), (0, E2), (2, E7)
+```
+
+Here row 0 has two extensions, row 1 dies, and row 2 has one. Pairs remain
+grouped by row. A one-row caller instead uses the plain-values sink, where the
+row index is statically zero and no tag is stored. Estimates follow the same
+pattern through [`EstimateSink`](triblespace::core::query::EstimateSink): a
+blocked caller receives one estimate per row, while the sequential caller
+writes one scalar estimate directly into its cursor state.
+
+## The constraint protocol
+
+Six methods perform the query negotiation:
+
+| Method | Responsibility |
+|---|---|
+| `variables` | Declare the variables the constraint touches. |
+| `estimate` | Produce a candidate-count estimate for a variable and every input row. |
+| `propose` | Enumerate candidate values for a variable and associate each value with its parent row. |
+| `confirm` | Remove candidates that violate this constraint. |
+| `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
+| `influence` | Report which variables may need fresh estimates after another variable changes binding state. |
+
+Three laws are load-bearing for correctness:
+
+1. `propose` is always given an **empty** sink. A composite must preserve that
+   ownership when delegating. In particular, each arm of a union proposes into
+   its own empty buffer before the buffers are merged.
+2. `confirm` may only filter its input. It must not append candidates, and it
+   must preserve their row grouping.
+3. `satisfied` may optimistically return `true` while one of the constraint's
+   variables is unbound, but it **must be exact once all of them are bound**.
+   This includes zero-variable constraints, which are fully bound at the seed.
+
+The third law is easy to mistake for an optimization hook, but it is a
+soundness rule. An [`or!`](triblespace::core::prelude::or) constraint uses it to
+discard alternatives contradicted by the current row before those alternatives
+propose or confirm another variable. An optimistic answer for a fully bound,
+false alternative could otherwise admit a row that no single alternative
+satisfies. A fully constant pattern similarly has no variable through which the
+search could discover failure, so [`Query::new`](triblespace::core::query::Query::new)
+settles it with an exact `satisfied` call against the seed block.
+
+`ignore!` removes its wildcard positions from the outward variable set. When a
+union needs to gate such an arm after all surviving variables are bound, the
+wrapper replays each visible variable as a singleton `confirm` call with that
+variable temporarily omitted. This is the same filtering operation the
+historical wrapper performed during search, including for confirm-only range
+constraints. Hidden-only clauses remain inert and ignored names never become a
+shared existential witness.
+
+Constraints are otherwise stateless. Each method receives the current
+`RowsView`; the engine does not notify constraints when it backtracks, chunks a
+frontier, or processes work in a different order. This is what allows the same
+constraint tree to run under both schedulers.
+
+## One expansion step
+
+An expansion still performs the familiar Atreides negotiation:
+
+1. Estimate each unbound variable under the current partial bindings.
+2. Choose the preferred next variable. In a multi-row block this decision is
+   made per row, because different bound values can imply different
+   cardinalities.
+3. Partition rows by their preferred variable with a stable counting sort.
+4. For each group, ask the root constraint to propose that variable. An
+   intersection chooses its tightest child per row to propose and runs the
+   remaining children as whole-frontier confirmation passes. A union evaluates
+   its still-satisfied alternatives independently and merges their candidates.
+5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
+   candidates disappear.
+
+There is still no standalone join plan. The difference from the original
+engine is that several sibling searches can negotiate and probe together.
+
+## Sequential scheduler: a block of one
+
+[`Query::sequential`](triblespace::core::query::Query::sequential) selects the
+original depth-first behavior. It keeps a stack of bound variables and a
+parallel row of values, plus a variable-to-column index for constant-time
+lookup. At each depth it refreshes influenced estimates, chooses one variable,
+calls `propose` with a one-row `RowsView` and a plain-values sink, then tries the
+returned values one by one. Exhausting a proposal vector pops the cursor and
+backtracks. Completing the cursor invokes the result conversion closure.
+
+Thus the sequential path does not emulate batching by allocating tagged rows:
+it is the zero-overhead scalar representation of the same protocol. It remains
+valuable for low first-result latency, tiny candidate sets, and workloads where
+there is no useful frontier to fuse.
+
+## DAG worklist engine
+
+The DAG engine replaces the recursive search stack with buckets keyed by the
+**set of variables already bound**. Consider two rows that reach the same
+state through different binding orders:
+
+```text
+             {p, a} ─────▶ {p, a, b}
+            /                 ▲
+          {p}                 │
+            \                 │
+             {p, b} ──────────┘
+```
+
+A multi-row `{p}` bucket can contain rows whose bound values make `a` the best
+next variable and rows that prefer `b`. A tree-shaped evaluator would retain
+two `{p, a, b}` frontiers, one for each history. The DAG evaluator stores
+columns in canonical variable order and files both into the same `{p, a, b}`
+bucket. The rows are merely co-located—each complete assignment still follows
+exactly one route—but downstream constraints now receive a fatter batch.
+
+One worklist pop performs the expansion described above: take a chunk of rows
+from a bucket, estimate and partition them, propose and confirm once per group,
+then file the extended rows under `bound ∪ {next}`. A full-bound bucket emits
+rows instead. Parent work is
+logically consumed into child buckets rather than retained as parallel search
+trees; filing materializes each extended child row in canonical column order.
+
+Reconvergence requires a scheduling rule. At full batch width, a bucket is
+ready only when no live bucket has a strict subset of its bound-variable set.
+Any future contributor must be such a subset because evaluation only adds
+bindings. Waiting until those contributors drain lets routes actually meet;
+strict deepest-first scheduling would normally consume a bucket immediately
+after its first parent filed into it. The tradeoff is explicit: highly
+reconvergent queries can retain a broader frontier and use more memory in
+exchange for larger batches.
+
+The ordinary [`Query`](triblespace::core::query::Query) iterator combines this
+worklist with demand-adaptive chunking. Its width starts at one row and grows
+geometrically whenever the consumer asks the engine to resume. Before the width
+cap is reached, scheduling is strict deepest-first, preserving
+sequential-class first-result behavior; after saturation, the readiness gate
+turns on and the remaining computation enters the batch-harvesting regime. An
+`exists!` or `take(1)` consumer can therefore discard the worklist after the
+first match instead of paying for full enumeration.
+
+Wide demand also changes partition economics. Starting at width 256, a block
+whose rows prefer different next variables may use the first row's variable as
+one whole-block batch, but only when the full estimate column predicts at most
+eight times the candidates of the per-row grouped choices. This estimate guard
+is evaluated independently for each pop. It rejects the heterogeneous case
+where one ordering would explode the intermediate frontier, while allowing a
+bounded amount of extra candidate work to buy fewer, larger CPU or GPU
+dispatches. The choice affects order and batching only: `propose` and
+`confirm` still determine the exact solutions.
+
+Fully-bound rows remain in raw inline form until the consumer pulls them. The
+worklist never stores projected result values, so a query's `Send`/`Sync`
+properties do not depend on its output type and cloning a partially consumed
+query snapshots its exact remaining raw state without requiring the result type
+to implement `Clone`.
+
+[`Query::solve_dag_lazy`](triblespace::core::query::Query::solve_dag_lazy)
+exposes the same scheduler as a configurable iterator with explicit starting
+width, growth, cap, and partition-policy controls. The eager/grouped probe
+solvers pin grouping explicitly so they remain stable controls for the
+adaptive ordinary iterator.
+
+[`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
+saturated-width form. Fully drained schedulers produce the same result
+**multiset**, but worklist scheduling may produce a different row order.
 
 ## Queries as Schemas
 
@@ -82,13 +227,13 @@ definition, as a query only returns data satisfying its constraints.[^2]
 
 The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
-through `Constraint::estimate` to guide the depth-first search over variable
-bindings, providing skew-resistant and predictable performance. Because the
-engine refreshes those estimates inside the search loop, the binding order
-adapts whenever a constraint updates its influence set—there is no separate
-planning artifact to maintain. For a detailed discussion, see the [Atreides
-Join](atreides-join.md)
-chapter.
+through `Constraint::estimate` to guide variable choice over partial bindings,
+providing skew-resistant and predictable performance. The sequential scheduler
+explores those choices depth-first; the DAG scheduler partitions a block by the
+same per-row choices and files the results through its worklist. Because both
+refresh estimates during evaluation, binding order adapts whenever a constraint
+updates its influence set—there is no separate planning artifact to maintain.
+For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages
 

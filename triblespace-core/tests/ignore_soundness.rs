@@ -1,22 +1,16 @@
-//! REGRESSION (constant folding × `IgnoreConstraint`): `ignore!` hides
-//! variables from the outer query, so a wrapped constraint can reach
-//! "all visible variables bound" — with constant folding even at
-//! construction time (an EMPTY visible set, e.g.
-//! `ignore!((h), pattern!(kb, [{ ?h @ attr: lit }]))`) — while the hidden
-//! variables are still free. The exact-when-fully-bound `satisfied()` law
-//! then demands the *existential* over the hidden variables. Before the
-//! override, `IgnoreConstraint` inherited the optimistic-`true` default:
-//! a fully-hidden existence check settled as vacuously true (one row on
-//! an empty kb), an exists-filter inside `and!` was silently dropped, and
-//! a dead `or!` arm containing an `ignore!` kept proposing — emitting
-//! rows satisfied by NO arm (the exact leak shape the fully-bound-exact
-//! fix closed for the other constraint leaves).
+//! Contract tests for `ignore!`'s historical anonymous-wildcard semantics.
 //!
-//! Attribute ids reuse the canonical test-world attributes minted for
-//! `tests/solve_blocked.rs`.
+//! Ignored variables are removed from the outer plan rather than solved as
+//! existential witnesses. A clause with no surviving variables is therefore
+//! inert, and repeating an ignored name across clauses does not create a
+//! hidden join. Clauses which also mention a visible variable still constrain
+//! that variable through the ordinary propose/confirm protocol.
 
 use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::prelude::*;
+
+use std::collections::HashSet;
 
 mod world {
     use triblespace_core::prelude::*;
@@ -29,228 +23,300 @@ mod world {
     }
 }
 
-/// A fully-hidden pattern (`?h` ignored, attribute and value constant)
-/// has an EMPTY visible variable set, so `Query::new` settles it with one
-/// `satisfied()` probe. That probe must be the existential over `h`: one
-/// row when a witness exists, none when it doesn't — on both engines.
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
+fn insert_edge(set: &mut TribleSet, from: &Id, attribute: &Attribute<GenId>, to: &Id) {
+    set.insert(&Trible::new::<GenId>(
+        ExclusiveId::force_ref(from),
+        &attribute.id(),
+        &to.to_inline(),
+    ));
+}
+
+/// A fully hidden constraint has no scheduling edge into the outer query.
+/// Whether its inner pattern has a match or not, it is omitted and the
+/// zero-variable query produces its single unit row.
 #[test]
-fn fully_hidden_existence_check_present_vs_absent() {
+fn fully_hidden_present_and_absent_are_both_omitted() {
     let human = ufoid();
     let robot = ufoid();
-    let e = ufoid();
+    let person = ufoid();
     let mut kb = TribleSet::new();
-    kb += entity! { &e @ world::kind: &human };
+    kb += entity! { &person @ world::kind: &human };
     let human = *human;
     let robot = *robot;
 
-    let present: Vec<()> =
-        find!((), ignore!((h), pattern!(&kb, [{ ?h @ world::kind: human }]))).collect();
-    assert_eq!(
-        present.len(),
-        1,
-        "a witness (an entity of kind=human) exists — exactly one row"
-    );
-    assert_eq!(
-        find!((), ignore!((h), pattern!(&kb, [{ ?h @ world::kind: human }])))
-            .solve_dag()
-            .len(),
-        1,
-        "DAG engine diverged on the present fully-hidden existence check"
-    );
+    macro_rules! present {
+        () => {
+            find!(
+                (),
+                ignore!((h), pattern!(&kb, [{ ?h @ world::kind: human }]))
+            )
+        };
+    }
+    macro_rules! absent {
+        () => {
+            find!(
+                (),
+                ignore!((h), pattern!(&kb, [{ ?h @ world::kind: robot }]))
+            )
+        };
+    }
 
-    let absent: Vec<()> =
-        find!((), ignore!((h), pattern!(&kb, [{ ?h @ world::kind: robot }]))).collect();
-    assert!(
-        absent.is_empty(),
-        "no entity has kind=robot — the hidden existential is false, zero rows"
-    );
-    assert!(
-        find!((), ignore!((h), pattern!(&kb, [{ ?h @ world::kind: robot }])))
-            .solve_dag()
-            .is_empty(),
-        "DAG engine diverged on the absent fully-hidden existence check"
-    );
+    assert_eq!(present!().collect::<Vec<_>>(), vec![()]);
+    assert_eq!(present!().solve_dag(), vec![()]);
+    assert_eq!(absent!().collect::<Vec<_>>(), vec![()]);
+    assert_eq!(absent!().solve_dag(), vec![()]);
 }
 
-/// An `ignore!`-wrapped constant-position pattern used as an exists-filter
-/// inside `and!`: it has no visible variables, so the search never
-/// consults it via propose/confirm — the settlement probe is the ONLY
-/// gate. A false existential must empty the whole conjunction; a true one
-/// must not filter anything.
+/// A hidden-only false clause cannot act as an exists-filter. Adding a
+/// witness later consequently cannot remove or duplicate any outer rows.
 #[test]
-fn fully_hidden_exists_filter_gates_the_conjunction() {
+fn hidden_only_clause_cannot_filter_a_conjunction() {
     let human = ufoid();
     let robot = ufoid();
     let people: Vec<_> = (0..5).map(|_| ufoid()).collect();
-    let mut kb = TribleSet::new();
+    let mut before = TribleSet::new();
     for person in &people {
-        kb += entity! { person @ world::kind: &human };
+        before += entity! { person @ world::kind: &human };
     }
+    let mut after = before.clone();
+    let robot_entity = ufoid();
+    after += entity! { &robot_entity @ world::kind: &robot };
     let human = *human;
     let robot = *robot;
 
-    let with_witness: Vec<Inline<GenId>> = find!(
-        (x: Inline<_>),
-        and!(
-            pattern!(&kb, [{ ?x @ world::kind: human }]),
-            ignore!((h), pattern!(&kb, [{ ?h @ world::kind: human }]))
-        )
-    )
-    .map(|(x,)| x)
-    .collect();
-    assert_eq!(
-        with_witness.len(),
-        5,
-        "a satisfied exists-filter must not drop rows"
-    );
+    macro_rules! query {
+        ($store:expr) => {
+            find!(
+                x: Inline<GenId>,
+                and!(
+                    pattern!($store, [{ ?x @ world::kind: human }]),
+                    ignore!((h), pattern!($store, [{ ?h @ world::kind: robot }]))
+                )
+            )
+        };
+    }
 
-    let without_witness: Vec<Inline<GenId>> = find!(
-        (x: Inline<_>),
-        and!(
-            pattern!(&kb, [{ ?x @ world::kind: human }]),
-            ignore!((h), pattern!(&kb, [{ ?h @ world::kind: robot }]))
-        )
-    )
-    .map(|(x,)| x)
-    .collect();
-    assert!(
-        without_witness.is_empty(),
-        "an exists-filter with no witness must empty the conjunction, not be silently dropped"
-    );
+    let expected = sorted(people.iter().map(|id| id.to_inline()).collect());
+    let before_seq = sorted(query!(&before).collect());
+    let before_dag = sorted(query!(&before).solve_dag());
+    let after_seq = sorted(query!(&after).collect());
+    let after_dag = sorted(query!(&after).solve_dag());
+    assert_eq!(before_seq, expected);
+    assert_eq!(before_dag, expected);
+    assert_eq!(after_seq, expected);
+    assert_eq!(after_dag, expected);
 }
 
-/// Fixture for the `or!`-arm leak: arm A is
-/// `and!(ignore!((h), ?x p ?h), ?x q ?z)`, arm B is `?x r ?z`.
-///
-/// - `x1` has `p → h1` and `q → z1`: arm A yields `(x1, z1)`.
-/// - `x2` has `q → z2` and `r → z3` but NO `p`-edge: arm A is
-///   semantically dead for `x2` (the hidden existential over `h` is
-///   false), arm B yields `(x2, z3)`.
-///
-/// The leak: with `x = x2` bound, the union gates arm A through
-/// `satisfied()`; an optimistic answer keeps the dead arm proposing `z`
-/// candidates from its q-pattern, emitting `(x2, z2)` — a row satisfied
-/// by NO arm.
-fn build_union_world() -> (TribleSet, Id, Id, Id, Id, Id) {
+/// Reusing the spelling `h` does not turn an ignored wildcard into a hidden
+/// join key. The `q(h, target)` clause is hidden-only and inert; the visible
+/// `p(x, h)` clause still requires each returned `x` to have some `p` edge.
+#[test]
+fn repeated_ignored_name_does_not_join_across_clauses() {
+    let human = ufoid();
+    let target = ufoid();
+    let wrong_target = ufoid();
+    let matching = ufoid();
+    let mismatching = ufoid();
+    let no_p = ufoid();
+    let matching_h = ufoid();
+    let mismatching_h = ufoid();
+    let mut kb = TribleSet::new();
+    kb += entity! { &matching @ world::kind: &human, world::p: &matching_h };
+    kb += entity! { &matching_h @ world::q: &target };
+    kb += entity! { &mismatching @ world::kind: &human, world::p: &mismatching_h };
+    kb += entity! { &mismatching_h @ world::q: &wrong_target };
+    kb += entity! { &no_p @ world::kind: &human };
+
+    macro_rules! query {
+        () => {
+            find!(
+                x: Inline<GenId>,
+                and!(
+                    pattern!(&kb, [{ ?x @ world::kind: (&human) }]),
+                    ignore!(
+                        (h),
+                        and!(
+                            pattern!(&kb, [{ ?x @ world::p: ?h }]),
+                            pattern!(&kb, [{ ?h @ world::q: (&target) }])
+                        )
+                    )
+                )
+            )
+        };
+    }
+
+    let expected = sorted(vec![matching.to_inline(), mismatching.to_inline()]);
+    assert_eq!(sorted(query!().collect()), expected);
+    assert_eq!(sorted(query!().solve_dag()), expected);
+}
+
+/// An atomic pattern with a surviving `x` is not inert merely because its
+/// object is ignored. Adding a new `p` edge grows the result monotonically.
+#[test]
+fn atomic_wildcard_still_constrains_visible_variable() {
+    let human = ufoid();
+    let a = ufoid();
+    let b = ufoid();
+    let h1 = ufoid();
+    let h2 = ufoid();
+    let mut before = TribleSet::new();
+    before += entity! { &a @ world::kind: &human, world::p: &h1 };
+    before += entity! { &b @ world::kind: &human };
+    let mut after = before.clone();
+    after += entity! { &b @ world::p: &h2 };
+    let human = *human;
+    let a = *a;
+    let b = *b;
+
+    macro_rules! query {
+        ($store:expr) => {
+            find!(
+                x: Inline<GenId>,
+                and!(
+                    pattern!($store, [{ ?x @ world::kind: human }]),
+                    ignore!((h), pattern!($store, [{ ?x @ world::p: ?h }]))
+                )
+            )
+        };
+    }
+
+    let before_expected = vec![a.to_inline()];
+    let after_expected = sorted(vec![a.to_inline(), b.to_inline()]);
+    assert_eq!(query!(&before).collect::<Vec<_>>(), before_expected);
+    assert_eq!(query!(&before).solve_dag(), before_expected);
+    assert_eq!(sorted(query!(&after).collect()), after_expected);
+    assert_eq!(sorted(query!(&after).solve_dag()), after_expected);
+}
+
+fn build_union_world() -> (TribleSet, Id, Id, Id, Id, Id, Id) {
     let x1 = ufoid();
     let x2 = ufoid();
     let h1 = ufoid();
+    let h2 = ufoid();
     let z1 = ufoid();
     let z2 = ufoid();
     let z3 = ufoid();
     let mut kb = TribleSet::new();
     kb += entity! { &x1 @ world::p: &h1, world::q: &z1 };
     kb += entity! { &x2 @ world::q: &z2, world::r: &z3 };
-    (kb, *x1, *x2, *z1, *z2, *z3)
+    (kb, *x1, *x2, *h2, *z1, *z2, *z3)
 }
 
-// The whole `find!` lives inside the macro so the `?x`/`?z`/`?h` tokens
-// share one hygiene context with the variable declarations (the
-// `star_query!` pattern from `tests/engine_seam.rs`).
 macro_rules! union_query {
-    ($kb:expr) => {
+    ($store:expr) => {
         find!(
-            (x: Inline<_>, z: Inline<_>),
+            (x: Inline<GenId>, z: Inline<GenId>),
             or!(
                 and!(
-                    ignore!((h), pattern!(&$kb, [{ ?x @ world::p: ?h }])),
-                    pattern!(&$kb, [{ ?x @ world::q: ?z }])
+                    ignore!((h), pattern!($store, [{ ?x @ world::p: ?h }])),
+                    pattern!($store, [{ ?x @ world::q: ?z }])
                 ),
-                pattern!(&$kb, [{ ?x @ world::r: ?z }])
+                pattern!($store, [{ ?x @ world::r: ?z }])
             )
         )
     };
-    ($kb:expr, $pin:expr) => {
+    ($store:expr, $pin:expr) => {
         find!(
-            (x: Inline<_>, z: Inline<_>),
+            (x: Inline<GenId>, z: Inline<GenId>),
             and!(
                 x.is($pin),
                 or!(
                     and!(
-                        ignore!((h), pattern!(&$kb, [{ ?x @ world::p: ?h }])),
-                        pattern!(&$kb, [{ ?x @ world::q: ?z }])
+                        ignore!((h), pattern!($store, [{ ?x @ world::p: ?h }])),
+                        pattern!($store, [{ ?x @ world::q: ?z }])
                     ),
-                    pattern!(&$kb, [{ ?x @ world::r: ?z }])
+                    pattern!($store, [{ ?x @ world::r: ?z }])
                 )
             )
         )
     };
 }
 
-/// Deterministic order (x pinned, so it binds first): with `x = x2` the
-/// arm-A existential over `h` is false, so only arm B's `(x2, z3)` may
-/// appear — the dead arm must not leak `(x2, z2)`.
+/// A union must not replay a visible arm whose wildcard pattern has already
+/// rejected the bound `x`. Once a matching `p(x, _)` fact is added, that arm
+/// becomes live and contributes its row without removing the other arm.
 #[test]
-fn dead_union_arm_with_ignore_does_not_leak() {
-    let (kb, _x1, x2, _z1, _z2, z3) = build_union_world();
-
-    let rows: Vec<(Inline<GenId>, Inline<GenId>)> =
-        union_query!(kb, x2.to_inline()).collect();
-    assert_eq!(
-        rows,
-        vec![(x2.to_inline(), z3.to_inline())],
-        "x2 has no p-edge: arm A is dead; its q-target z2 must not leak through"
-    );
-
-    let dag_rows: Vec<(Inline<GenId>, Inline<GenId>)> =
-        union_query!(kb, x2.to_inline()).solve_dag();
-    assert_eq!(
-        dag_rows,
-        vec![(x2.to_inline(), z3.to_inline())],
-        "DAG engine diverged on the dead-arm leak fixture"
-    );
-}
-
-/// The full (unpinned) multiset over both arms: exactly arm-A's
-/// `(x1, z1)` and arm-B's `(x2, z3)`, whatever variable order the engine
-/// picks — and identical across engines.
-#[test]
-fn union_with_ignore_full_multiset() {
-    let (kb, x1, x2, z1, _z2, z3) = build_union_world();
-
-    let mut expected = vec![
+fn dead_visible_union_arm_only_replays_after_monotonic_growth() {
+    let (before, x1, x2, h2, z1, z2, z3) = build_union_world();
+    let before_expected = sorted(vec![
         (x1.to_inline(), z1.to_inline()),
         (x2.to_inline(), z3.to_inline()),
-    ];
-    expected.sort();
+    ]);
 
-    let mut rows: Vec<(Inline<GenId>, Inline<GenId>)> = union_query!(kb).collect();
-    rows.sort();
-    assert_eq!(rows, expected, "union-with-ignore multiset is wrong");
-
-    let mut dag_rows: Vec<(Inline<GenId>, Inline<GenId>)> = union_query!(kb).solve_dag();
-    dag_rows.sort();
     assert_eq!(
-        dag_rows, expected,
-        "DAG engine diverged on the union-with-ignore multiset"
+        union_query!(&before, x2.to_inline()).collect::<Vec<_>>(),
+        vec![(x2.to_inline(), z3.to_inline())]
     );
+    assert_eq!(
+        union_query!(&before, x2.to_inline()).solve_dag(),
+        vec![(x2.to_inline(), z3.to_inline())]
+    );
+    assert_eq!(sorted(union_query!(&before).collect()), before_expected);
+    assert_eq!(sorted(union_query!(&before).solve_dag()), before_expected);
+
+    let mut after = before.clone();
+    insert_edge(&mut after, &x2, &world::p, &h2);
+    let after_expected = sorted(vec![
+        (x1.to_inline(), z1.to_inline()),
+        (x2.to_inline(), z2.to_inline()),
+        (x2.to_inline(), z3.to_inline()),
+    ]);
+    assert_eq!(sorted(union_query!(&after).collect()), after_expected);
+    assert_eq!(sorted(union_query!(&after).solve_dag()), after_expected);
 }
 
-/// Non-regression: the ordinary use of `ignore!` — hiding a variable that
-/// still participates in joins through propose/confirm — keeps working,
-/// including when the hidden variable's existential is checked per-row
-/// inside a union.
+/// Wildcard replay uses the historical confirmation path, not proposal
+/// enumeration. This matters for filters such as `value_range`, which
+/// intentionally never propose: the primary arm must stay live for an
+/// in-range bound value and die for an out-of-range one.
 #[test]
-fn ignore_still_hides_while_joining() {
-    let human = ufoid();
-    let target = ufoid();
-    let a = ufoid();
-    let b = ufoid();
-    let mut kb = TribleSet::new();
-    kb += entity! { &a @ world::kind: &human, world::p: &target };
-    kb += entity! { &b @ world::kind: &human };
-    let human = *human;
-    let a = *a;
+fn union_replay_respects_confirm_only_range() {
+    let below = U256BE::inline_from(5u64);
+    let inside = U256BE::inline_from(15u64);
+    let above = U256BE::inline_from(25u64);
+    let hidden = U256BE::inline_from(99u64);
+    let min = U256BE::inline_from(10u64);
+    let max = U256BE::inline_from(20u64);
+    let primary_z = U256BE::inline_from(1u64);
+    let fallback_z = U256BE::inline_from(2u64);
 
-    // Only `a` has a p-edge, so the hidden join keeps `b` out.
-    let rows: Vec<Inline<GenId>> = find!(
-        (x: Inline<_>),
-        and!(
-            pattern!(&kb, [{ ?x @ world::kind: human }]),
-            ignore!((h), pattern!(&kb, [{ ?x @ world::p: ?h }]))
-        )
-    )
-    .map(|(x,)| x)
-    .collect();
-    assert_eq!(rows, vec![a.to_inline()]);
+    let domain = HashSet::from([below, inside, above]);
+    let primary = HashSet::from([primary_z]);
+    let fallback = HashSet::from([fallback_z]);
+
+    macro_rules! query {
+        ($pin:expr) => {
+            find!(
+                (x: Inline<U256BE>, z: Inline<U256BE>),
+                and!(
+                    x.is($pin),
+                    or!(
+                        and!(
+                            ignore!(
+                                (h),
+                                and!(value_range(x, min, max), h.is(hidden))
+                            ),
+                            primary.has(z)
+                        ),
+                        and!(domain.has(x), fallback.has(z))
+                    )
+                )
+            )
+        };
+    }
+
+    let inside_expected = sorted(vec![(inside, primary_z), (inside, fallback_z)]);
+    assert_eq!(sorted(query!(inside).collect()), inside_expected);
+    assert_eq!(sorted(query!(inside).solve_dag()), inside_expected);
+
+    for outside in [below, above] {
+        let expected = vec![(outside, fallback_z)];
+        assert_eq!(query!(outside).collect::<Vec<_>>(), expected);
+        assert_eq!(query!(outside).solve_dag(), expected);
+    }
 }

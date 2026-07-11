@@ -148,9 +148,16 @@ depth-first traversal from thrashing through unrelated values.
 
 ## Implementation notes
 
-- During iteration the engine keeps a stack of bound variables, a `Binding`
-  structure holding the active assignments, and a `touched_variables` set that
-  marks which estimates need refreshing before the next decision point.
+- The explicit `Query::sequential()` scheduler keeps a stack of bound variables
+  and a parallel row of values. It presents that cursor to constraints as a
+  one-row `RowsView`; `Binding` is now only reconstructed at the
+  result-projection boundary. A `touched_variables` set marks which estimates
+  need refreshing before the next decision point.
+- The ordinary DAG-backed iterator lifts the same negotiation to blocks of
+  sibling rows. It partitions each block by the variable that row would have
+  selected, then files extensions into worklist buckets keyed by bound-variable
+  set. Different binding orders can therefore reconverge into a larger
+  downstream batch without changing the result multiset.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.
@@ -160,13 +167,22 @@ depth-first traversal from thrashing through unrelated values.
 
 ## Why worst-case optimal?
 
-Worst-case optimal join algorithms guarantee that their running time never
-exceeds the size of the output by more than a constant factor, even for
-pathological inputs. The Atreides family retains this property because the
-search always explores bindings in an order that honours the cardinality bounds
-supplied by the constraints. As a result the engine remains robust under heavy
-skew, sparse joins, and high-dimensional queries without requiring a bespoke
-join plan for each case.
+"Worst-case optimal" does **not** mean output size plus a constant factor: a
+query with an empty result may still need to inspect substantial input. It means
+matching, up to implementation and logarithmic factors, the worst-case output
+bound implied by the input relation cardinalities (the AGM/fractional-edge-cover
+bound), rather than materialising pairwise intermediates that can be
+asymptotically larger.
+
+The Atreides family follows the generic-join shape behind that result: choose a
+variable, let the tightest participating constraint enumerate its possible
+values, and intersect those values through the other constraints before
+descending. Dynamic cardinality estimates choose among valid variable orders;
+they improve the realised work on skewed data, while the propose/confirm
+intersection is the part that avoids oversized binary-join intermediates. The
+precise guarantee still depends on participating constraints providing complete
+proposals and sound confirmations—the scheduler cannot manufacture those laws
+for an arbitrary custom data source.
 
 This combination of simple heuristics, incremental estimates, and a disciplined
 search strategy keeps the implementation straightforward while delivering the

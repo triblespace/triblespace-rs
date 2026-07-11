@@ -63,7 +63,10 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
 }
 
 fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
-    assert!(z_fan > 8, "z must be chosen after every x (fans go up to 8)");
+    assert!(
+        z_fan > 8,
+        "z must be chosen after every x (fans go up to 8)"
+    );
     let mut kb = TribleSet::new();
     let markers: Vec<_> = (0..4).map(|_| ufoid()).collect();
     let z_marker = ufoid();
@@ -135,6 +138,7 @@ enum Mode {
     Blk,
     Grp,
     Dag,
+    Adapt,
     DagU,
 }
 
@@ -152,10 +156,16 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         ])
     );
     match mode {
-        Mode::Seq => tally(q),
+        Mode::Seq => tally(q.sequential()),
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
+        Mode::Adapt => tally(
+            q.solve_dag_lazy()
+                .start_width(1)
+                .growth(2)
+                .adaptive_partition(256, 8),
+        ),
         Mode::DagU => tally(q.solve_dag_unmerged()),
     }
 }
@@ -178,6 +188,7 @@ fn bench_backend<S: TriblePattern>(
         ("blk", Mode::Blk),
         ("grp", Mode::Grp),
         ("dag", Mode::Dag),
+        ("adapt", Mode::Adapt),
         ("dagu", Mode::DagU),
     ];
     let mut sigs = Vec::new();
@@ -195,16 +206,17 @@ fn bench_backend<S: TriblePattern>(
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
-        "{label:<24} rows {:>7}  seq {:>8.3} ms  blk {:>8.3}  grp {:>8.3}  dag {:>8.3}  dagu {:>8.3}  \
-         dag/grp {:>6.3}x  dag/dagu {:>6.3}x  {}",
+        "{label:<24} rows {:>7}  seq {:>8.3} ms  blk {:>8.3}  grp {:>8.3}  dag {:>8.3}  adapt {:>8.3}  dagu {:>8.3}  \
+         adapt/dag {:>6.3}x  dag/dagu {:>6.3}x  {}",
         sigs[0].0,
         meds[0],
         meds[1],
         meds[2],
         meds[3],
         meds[4],
-        meds[3] / meds[2],
-        meds[3] / meds[4],
+        meds[5],
+        meds[4] / meds[3],
+        meds[3] / meds[5],
         if parity { "ok" } else { "MISMATCH" }
     );
     // Instrumented single passes: group/batch structure, intermediates,
@@ -216,7 +228,7 @@ fn bench_backend<S: TriblePattern>(
         dag_stats::reset();
         run_query(kb, markers, mode);
         println!("  {name}: {}", blocked_stats::report());
-        if mode == Mode::Dag || mode == Mode::DagU {
+        if matches!(mode, Mode::Dag | Mode::Adapt | Mode::DagU) {
             println!("  {name} buckets: {}", dag_stats::report());
         }
     }

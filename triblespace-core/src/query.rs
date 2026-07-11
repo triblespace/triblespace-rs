@@ -409,16 +409,9 @@ impl<'v> RowsView<'v> {
     /// Creates a view with a caller-maintained variable→column index
     /// (`cols[v]` = column of `v`, [`COL_UNBOUND`] otherwise), making
     /// [`col`](Self::col) O(1). The single-row cursor engine uses this.
-    pub fn new_indexed(
-        vars: &'v [VariableId],
-        rows: &'v [RawInline],
-        cols: &'v [u8; 128],
-    ) -> Self {
+    pub fn new_indexed(vars: &'v [VariableId], rows: &'v [RawInline], cols: &'v [u8; 128]) -> Self {
         debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
-        debug_assert!(vars
-            .iter()
-            .enumerate()
-            .all(|(i, &v)| cols[v] as usize == i));
+        debug_assert!(vars.iter().enumerate().all(|(i, &v)| cols[v] as usize == i));
         let n_rows = match vars.len() {
             0 => 1,
             stride => rows.len() / stride,
@@ -593,7 +586,6 @@ impl CandidateSink<'_> {
             Self::Values(values) => values.retain(|value| f(0, value)),
         }
     }
-
 }
 
 /// The output sink of [`Constraint::estimate`]: one estimate per row of
@@ -779,8 +771,12 @@ pub trait Constraint<'a> {
     /// ordering, not correctness. Tighter estimates lead to better search
     /// pruning; see the [Atreides join](crate) family for how estimate
     /// fidelity affects performance.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>)
-        -> bool;
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool;
 
     /// Enumerates candidate values for `variable` for every row of the
     /// block, pushing `(row, value)` candidates into the sink grouped by
@@ -809,7 +805,12 @@ pub trait Constraint<'a> {
     /// filtering variant delete candidates another variant produced — the
     /// result would depend on variant order and adding data could remove
     /// results, violating the substrate's monotonicity guarantee.
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>);
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    );
 
     /// Filters `candidates`, removing `(row, value)` candidates whose
     /// value violates this constraint under that row's bindings, while
@@ -818,7 +819,12 @@ pub trait Constraint<'a> {
     /// Called on every constraint *except* the one that proposed, in
     /// order of increasing estimate. Does nothing when `variable` is not
     /// constrained by this constraint.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>);
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    );
 
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
@@ -875,17 +881,32 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
@@ -907,17 +928,32 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.variables()
     }
 
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         let inner: &T = self;
         inner.estimate(variable, view, out)
     }
 
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         let inner: &T = self;
         inner.propose(variable, view, candidates)
     }
 
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
     }
@@ -933,11 +969,20 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueryScheduler {
+    LazyDag,
+    Sequential,
+}
+
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
-/// The query engine uses a depth-first search to find solutions to the query,
-/// proposing values for the variables and backtracking when it reaches a dead end.
+/// The ordinary iterator uses a lazy DAG worklist that starts with narrow,
+/// depth-first chunks and widens as the consumer keeps pulling. Wide split
+/// blocks may collapse to one estimate-guarded batch when candidate inflation
+/// remains bounded. Use
+/// [`Query::sequential`] for the scalar depth-first specialization.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
 /// The query engine is designed to be used in combination with the [Constraint] trait,
@@ -951,7 +996,17 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
+    scheduler: QueryScheduler,
     mode: Search,
+    /// Whether [`Iterator::next`] has ever been called on this query.
+    ///
+    /// Probe solvers restart from the seed block and therefore require this
+    /// to remain `false`. Cursor shape cannot encode the same fact: an
+    /// untouched failed zero-variable settlement and a successfully drained
+    /// zero-variable query are both `Done` with empty cursor state. This bit
+    /// also records a failed `next()` call, giving freshness the simple exact
+    /// meaning "the iterator has never been pulled."
+    iteration_started: bool,
     influences: [VariableSet; 128],
     estimates: [usize; 128],
     /// PROBE (order-key experiment): each variable's estimate against the
@@ -981,11 +1036,10 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
-    /// PROBE (dag-as-main): lazily initialized DAG engine state when
-    /// `TRIBLES_ENGINE=dag` — the [`Iterator`] impl delegates every
-    /// `next()` here once it exists. `None` on the sequential path.
-    /// Boxed so the (per-split memcpy'd) query state doesn't grow.
-    dag: Option<Box<DagState<R>>>,
+    /// Lazily initialized default-scheduler state. Keeping the worklist in a
+    /// box avoids growing the already-large sequential cursor copied by
+    /// rayon's DFS splitter.
+    dag: Option<Box<DagState>>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -997,26 +1051,15 @@ where
     P: Fn(&Binding) -> Option<R> + Clone,
 {
     fn clone(&self) -> Self {
-        // The sequential clone snapshots the remaining search state — the
-        // clone yields exactly the rows the original hasn't consumed yet.
-        // The DAG engine cannot honor that contract without `R: Clone`
-        // (its emit buffer holds already-postprocessed `R`s), and
-        // silently restarting from scratch would duplicate rows the
-        // original already yielded. Refuse loudly instead. Rayon's
-        // par-iter never hits this: `split` only clones queries that have
-        // not been driven through `next()` (folding starts after
-        // splitting), for which `dag` is still `None`.
-        assert!(
-            self.dag.is_none(),
-            "cannot clone a Query mid-iteration under TRIBLES_ENGINE=dag: \
-             the DAG engine's in-flight state is not snapshottable without \
-             `R: Clone`, and a silent restart would duplicate rows already \
-             consumed — clone before the first `next()`, or collect instead"
-        );
+        // Both cursor forms contain only raw bindings, never projected `R`s,
+        // so a clone snapshots the exact remaining search without requiring
+        // the output type itself to implement `Clone`.
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
+            scheduler: self.scheduler,
             mode: self.mode,
+            iteration_started: self.iteration_started,
             influences: self.influences,
             estimates: self.estimates,
             base_estimates: self.base_estimates,
@@ -1028,9 +1071,7 @@ where
             unbound: self.unbound.clone(),
             values: self.values.clone(),
             binding: self.binding.clone(),
-            // Guarded `None` above — a started dag-mode query refuses to
-            // clone rather than silently restart.
-            dag: None,
+            dag: self.dag.clone(),
         }
     }
 }
@@ -1106,8 +1147,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// partition** configuration of the worklist core (ungrouped,
     /// unmerged, saturated width).
     ///
-    /// The standard iterator descends one binding at a time, so on star or
-    /// filter shapes every sibling branch runs its own tiny
+    /// The scalar [`sequential`](Self::sequential) scheduler descends one
+    /// binding at a time, so on star or filter shapes every sibling branch
+    /// runs its own tiny
     /// propose/confirm round — the per-branch candidate sets (≤ a few
     /// values) are far below any batching break-even. `solve_blocked`
     /// instead carries a **block** of sibling partial bindings per level
@@ -1126,6 +1168,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let mut it = self.solve_dag_lazy().start_width(usize::MAX);
         it.state.merge = false;
         it.state.grouped = false;
+        it.state.adaptive_partition = None;
         it.collect()
     }
 
@@ -1152,9 +1195,32 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Semantics: same result **multiset** as the sequential iterator;
     /// row order may differ.
     pub fn solve_blocked_grouped(self) -> Vec<R> {
-        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
+        let mut it = self
+            .solve_dag_lazy()
+            .grouped_partition()
+            .start_width(usize::MAX);
         it.state.merge = false;
         it.collect()
+    }
+
+    /// Use the scalar depth-first scheduler for this query.
+    ///
+    /// The ordinary iterator defaults to the lazy DAG worklist. The scalar
+    /// scheduler remains useful for tiny queries, strict frontier-memory
+    /// bounds, and as the block-of-one specialization of the same
+    /// block-native constraint protocol.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started. Scheduler selection must be
+    /// made before the first call to [`Iterator::next`].
+    pub fn sequential(mut self) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none(),
+            "cannot select the sequential query scheduler after iteration has started"
+        );
+        self.scheduler = QueryScheduler::Sequential;
+        self
     }
 
     /// Create a new query.
@@ -1177,8 +1243,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             if variables.is_set(v) {
                 let mut estimate = 0usize;
                 assert!(
-                    constraint
-                        .estimate(v, &RowsView::EMPTY, &mut EstimateSink::Scalar(&mut estimate)),
+                    constraint.estimate(
+                        v,
+                        &RowsView::EMPTY,
+                        &mut EstimateSink::Scalar(&mut estimate)
+                    ),
                     "unconstrained variable in query"
                 );
                 estimate
@@ -1214,7 +1283,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         Query {
             constraint,
             postprocessing,
+            scheduler: QueryScheduler::LazyDag,
             mode,
+            iteration_started: false,
             influences,
             estimates,
             base_estimates,
@@ -1264,14 +1335,12 @@ pub enum OrderKeyMode {
 /// `influenced_only`}; anything else (or unset) is [`OrderKeyMode::Default`].
 pub fn order_key_mode() -> OrderKeyMode {
     static MODE: std::sync::OnceLock<OrderKeyMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(
-        || match std::env::var("TRIBLES_ORDER_KEY").as_deref() {
-            Ok("influence_first") => OrderKeyMode::InfluenceFirst,
-            Ok("ratio_first") => OrderKeyMode::RatioFirst,
-            Ok("influenced_only") => OrderKeyMode::InfluencedOnly,
-            _ => OrderKeyMode::Default,
-        },
-    )
+    *MODE.get_or_init(|| match std::env::var("TRIBLES_ORDER_KEY").as_deref() {
+        Ok("influence_first") => OrderKeyMode::InfluenceFirst,
+        Ok("ratio_first") => OrderKeyMode::RatioFirst,
+        Ok("influenced_only") => OrderKeyMode::InfluencedOnly,
+        _ => OrderKeyMode::Default,
+    })
 }
 
 /// The engine's variable-order key. **Larger key = picked next**: every
@@ -1430,10 +1499,21 @@ pub mod blocked_stats {
         pub depth: usize,
         /// Rows in the block this call handled.
         pub rows: usize,
+        /// Slow-start chunk width in force for this pop.
+        pub chunk_width: usize,
         /// Per-group row counts (the v1 solver always reports one group).
         pub group_sizes: Vec<usize>,
         /// Frontier size (candidate pairs) produced per group's propose.
         pub batch_sizes: Vec<usize>,
+        /// Sum of candidate-count estimates under each row's preferred
+        /// variable. Present when the grouped scheduler computed the full
+        /// estimate matrix.
+        pub preferred_estimate_sum: Option<u128>,
+        /// Estimate sum obtained by choosing the first row's preferred
+        /// variable for the entire block (the trivial-partition control's
+        /// choice). Its ratio to `preferred_estimate_sum` predicts the extra
+        /// candidate work traded for one larger batch.
+        pub first_preferred_estimate_sum: Option<u128>,
     }
 
     static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -1498,6 +1578,41 @@ pub mod blocked_stats {
         RECORDS.lock().unwrap().clone()
     }
 
+    /// Per-pop estimate penalty for replacing a grouped partition with the
+    /// first row's preferred variable. Only genuinely split grouped pops are
+    /// shown.
+    pub fn partition_cost_report() -> String {
+        use std::fmt::Write;
+        let records = RECORDS.lock().unwrap();
+        let mut out = String::new();
+        for record in records.iter().filter(|record| record.group_sizes.len() > 1) {
+            let (Some(preferred), Some(single)) = (
+                record.preferred_estimate_sum,
+                record.first_preferred_estimate_sum,
+            ) else {
+                continue;
+            };
+            if !out.is_empty() {
+                let _ = write!(out, "; ");
+            }
+            let ratio = if preferred == 0 {
+                f64::INFINITY
+            } else {
+                single as f64 / preferred as f64
+            };
+            let _ = write!(
+                out,
+                "d{} w{} rows{} groups{} {:.3}x",
+                record.depth,
+                record.chunk_width,
+                record.rows,
+                record.group_sizes.len(),
+                ratio,
+            );
+        }
+        out
+    }
+
     /// Terse per-depth aggregate: calls, rows, group count/sizes, batch
     /// size distribution, plus the global materialized-row total.
     pub fn report() -> String {
@@ -1513,8 +1628,10 @@ pub mod blocked_stats {
             let rows: usize = recs.iter().map(|r| r.rows).sum();
             let groups: usize = recs.iter().map(|r| r.group_sizes.len()).sum();
             let max_groups = recs.iter().map(|r| r.group_sizes.len()).max().unwrap_or(0);
-            let mut batches: Vec<usize> =
-                recs.iter().flat_map(|r| r.batch_sizes.iter().copied()).collect();
+            let mut batches: Vec<usize> = recs
+                .iter()
+                .flat_map(|r| r.batch_sizes.iter().copied())
+                .collect();
             batches.sort_unstable();
             let (bmin, bmed, bmax, btot) = if batches.is_empty() {
                 (0, 0, 0, 0)
@@ -1526,11 +1643,25 @@ pub mod blocked_stats {
                     batches.iter().sum(),
                 )
             };
+            let preferred_estimate_sum: u128 =
+                recs.iter().filter_map(|r| r.preferred_estimate_sum).sum();
+            let first_preferred_estimate_sum: u128 = recs
+                .iter()
+                .filter_map(|r| r.first_preferred_estimate_sum)
+                .sum();
+            let partition_cost = if preferred_estimate_sum == 0 {
+                String::new()
+            } else {
+                format!(
+                    " predicted single/grouped {:.3}x;",
+                    first_preferred_estimate_sum as f64 / preferred_estimate_sum as f64
+                )
+            };
             let _ = write!(
                 out,
                 "d{d}: {calls} calls / {rows} rows / {groups} groups (max {max_groups}/call), \
-                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}]; ",
-                batches.len()
+                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}];{partition_cost} ",
+                batches.len(),
             );
         }
         let _ = write!(
@@ -1640,8 +1771,7 @@ pub mod dag_stats {
         MERGE_EVENTS.load(Ordering::Relaxed)
     }
 
-    /// Number of bucket pops — nonzero iff the DAG engine ran (the
-    /// `TRIBLES_ENGINE=dag` seam test's observable).
+    /// Number of bucket pops performed by DAG-backed query iteration.
     pub fn pops() -> u64 {
         POPS.load(Ordering::Relaxed)
     }
@@ -1694,6 +1824,7 @@ pub fn dag_strict_deepest() -> bool {
 /// protocol method locates variables by scanning `vars`, so no constraint
 /// cares about the order — but rows sharing one store must share one
 /// layout.)
+#[derive(Clone)]
 struct DagBucket {
     /// Bound-variable set (`vars` as a bitset) — the bucket key.
     set: VariableSet,
@@ -1801,7 +1932,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// (each row still value-partitions its region of the search space;
     /// merging is co-location only). Row order differs.
     pub fn solve_dag(self) -> Vec<R> {
-        self.solve_dag_lazy().start_width(usize::MAX).collect()
+        self.solve_dag_lazy()
+            .grouped_partition()
+            .start_width(usize::MAX)
+            .collect()
     }
 
     /// PROBE (dag-frontier): [`solve_dag`](Self::solve_dag) with merging
@@ -1814,7 +1948,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// which also makes this configuration identical to
     /// [`solve_blocked_grouped`](Self::solve_blocked_grouped).
     pub fn solve_dag_unmerged(self) -> Vec<R> {
-        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
+        let mut it = self
+            .solve_dag_lazy()
+            .grouped_partition()
+            .start_width(usize::MAX);
         it.state.merge = false;
         it.collect()
     }
@@ -1824,10 +1961,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// (TCP slow start).
     ///
     /// The worklist is explicit state, so there is no recursion to
-    /// suspend: [`DagIter`] holds `{buckets, emit buffer, postprocessing}`
-    /// and `next()` drains the buffer, else runs pop → group → batch →
-    /// file until a full-bound bucket emits rows, buffers them, and yields
-    /// one. Dropping the iterator drops the worklist — this is the
+    /// suspend: [`DagIter`] holds the worklist and postprocessing closure;
+    /// `next()` postprocesses staged full rows one at a time, else runs pop →
+    /// group → batch → file until a full-bound bucket stages another chunk.
+    /// Dropping the iterator drops the worklist — this is the
     /// streaming yield catch-5 called for: `exists!`-class consumers stop
     /// the engine at the first match instead of paying for full
     /// enumeration.
@@ -1835,7 +1972,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// **Slow start.** A per-iterator chunk width starts tiny
     /// (`TRIBLES_LAZY_START_WIDTH`, default 1) and multiplies by
     /// `TRIBLES_LAZY_GROWTH` (default 2) on each engine *resumption* (a
-    /// `next()` call that finds the emit buffer empty), saturating at
+    /// `next()` call that finds the staged-row buffer empty), saturating at
     /// [`block_row_cap`]. Each pop takes at most `width` rows off the
     /// chosen bucket's tail; the remainder stays live under the same key.
     /// Narrow pops keep first-result latency sequential-class; sustained
@@ -1857,30 +1994,38 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// computation is the eager [`solve_dag`](Self::solve_dag) algorithm
     /// on the remaining state.
     ///
+    /// **Adaptive partitioning.** Once width reaches 256, a split grouped
+    /// pop may use the first row's preferred variable for the whole block,
+    /// but only when summing that variable's per-row estimates predicts no
+    /// more than 8× the candidates of the grouped choices. This preserves the
+    /// narrow grouped sprint and rejects heterogeneous-ordering explosions,
+    /// while allowing a sustained consumer to trade bounded extra candidates
+    /// for a much fatter CPU/GPU batch. Estimates affect scheduling only;
+    /// exact proposal/confirmation semantics are unchanged.
+    ///
     /// Semantics: fully drained, the same result **multiset** as the
     /// sequential iterator and the eager DAG solver; row order differs.
     ///
     /// # Panics
     ///
-    /// Panics when the query's iteration has already started (any
-    /// `Iterator::next` call that engaged the search). The probe solvers
-    /// restart evaluation from the seed block, so rows the cursor already
-    /// yielded would be emitted **again** — the same duplicate-emission
-    /// hazard the mid-iteration [`Clone`] guard refuses. A fresh query is
-    /// fine, including one whose zero-variable settlement already failed
-    /// in [`Query::new`] (`Search::Done` with an untouched cursor): that
-    /// one correctly yields the empty multiset.
+    /// Panics once [`Iterator::next`] has been called, whether that call
+    /// yielded a row or returned `None`. The probe solvers restart evaluation
+    /// from the seed block, so an explicit never-pulled rule prevents both
+    /// duplicate emission and ambiguity after exhaustion. An untouched query
+    /// is fresh, including one whose zero-variable settlement already failed
+    /// in [`Query::new`] (`Search::Done` without a `next()` call): that one
+    /// correctly yields the empty multiset.
     pub fn solve_dag_lazy(self) -> DagIter<C, P, R> {
         assert!(
-            self.dag.is_none()
+            !self.iteration_started
                 && self.stack.is_empty()
                 && self.bound.is_empty()
                 && self.touched_variables.is_empty()
                 && matches!(self.mode, Search::NextVariable | Search::Done),
-            "cannot probe-solve a Query mid-iteration: rows already yielded by the \
-             sequential cursor would be emitted again; the probe solvers \
-             (solve_blocked/solve_blocked_grouped/solve_dag/solve_dag_unmerged/\
-             solve_dag_lazy) require a fresh query"
+            "cannot probe-solve a Query mid-iteration: Iterator::next has already \
+             been called; probe solvers (solve_blocked/solve_blocked_grouped/\
+             solve_dag/solve_dag_unmerged/solve_dag_lazy) restart from the seed \
+             block and require a fresh query"
         );
         let Query {
             constraint,
@@ -1912,18 +2057,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     }
 }
 
-/// PROBE (dag-as-main): selects the production evaluation strategy for
-/// [`Query`]'s [`Iterator`] impl — `TRIBLES_ENGINE=dag` routes fresh
-/// queries through an internal [`DagState`] (the lazy DAG engine);
-/// anything else (or unset) keeps the sequential DFS engine. Read once
-/// per process.
-pub fn engine_dag() -> bool {
-    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| {
-        std::env::var("TRIBLES_ENGINE").is_ok_and(|v| v.eq_ignore_ascii_case("dag"))
-    })
-}
-
 /// PROBE (lazy-dag): initial chunk width for [`Query::solve_dag_lazy`] —
 /// `TRIBLES_LAZY_START_WIDTH`, default 1. Read per iterator (not cached),
 /// so experiments can vary it within one process.
@@ -1946,9 +2079,18 @@ fn lazy_growth() -> usize {
         .unwrap_or(2)
 }
 
+/// Once sustained demand reaches this chunk width, the lazy scheduler may
+/// replace a split per-row partition with one whole-block variable.
+const LAZY_ADAPTIVE_MIN_WIDTH: usize = 256;
+
+/// Maximum estimated candidate inflation accepted in exchange for the fatter
+/// whole-block batch. The estimate is only a scheduling hint; proposal and
+/// confirmation still determine the exact result set.
+const LAZY_ADAPTIVE_MAX_INFLATION: usize = 8;
+
 /// PROBE (lazy-dag): the resumable bucket-worklist engine behind
 /// [`Query::solve_dag_lazy`]. See there for the design; per-instance state
-/// is exactly `{worklist buckets, emit buffer, postprocessing, width}`.
+/// is exactly `{worklist buckets, raw staged rows, postprocessing, width}`.
 ///
 /// Builder-style [`start_width`](Self::start_width) /
 /// [`growth`](Self::growth) override the env defaults (tests need
@@ -1958,7 +2100,7 @@ pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
     postprocessing: P,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
-    state: DagState<R>,
+    state: DagState,
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
@@ -1971,6 +2113,53 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
     /// Overrides the per-resumption width growth factor (min 1 = fixed).
     pub fn growth(mut self, growth: usize) -> Self {
         self.state.growth = growth.max(1);
+        self
+    }
+
+    /// PROBE: switches from per-row preferred-variable partitioning to the
+    /// trivial one-variable-per-block partition once a resumption reaches
+    /// `width` rows.
+    ///
+    /// This replaces the ordinary estimate-guarded adaptive policy with an
+    /// unconditional transition. A threshold above the start width keeps the
+    /// width-one first-result sprint unchanged. This changes only search order
+    /// and batching; fully drained result multisets are unchanged.
+    pub fn trivial_partition_at_width(mut self, width: usize) -> Self {
+        self.state.grouped = true;
+        self.state.adaptive_partition = None;
+        self.state.trivial_partition_width = Some(width.max(1));
+        self
+    }
+
+    /// PROBE: overrides the default adaptive partition policy. After
+    /// `min_width`, replace a genuinely split grouped partition with one
+    /// whole-block variable only when the estimate matrix predicts at most
+    /// `max_estimate_inflation` times as many candidates.
+    /// The chosen whole-block variable is the first row's preference, exactly
+    /// matching the trivial-partition control; the full estimate column is
+    /// used only to veto that choice when it would inflate candidate work.
+    ///
+    /// This is a scheduling and batching choice only; it cannot add or remove
+    /// solutions. A `min_width` above the initial sprint preserves narrow
+    /// prefix latency, while the estimate guard rejects heterogeneous blocks
+    /// where one global ordering would inflate the intermediate frontier.
+    pub fn adaptive_partition(mut self, min_width: usize, max_estimate_inflation: usize) -> Self {
+        self.state.grouped = true;
+        self.state.trivial_partition_width = None;
+        self.state.adaptive_partition = Some(AdaptivePartition {
+            min_width: min_width.max(1),
+            max_estimate_inflation: max_estimate_inflation.max(1) as u128,
+        });
+        self
+    }
+
+    /// PROBE: pins per-row preferred-variable grouping for every pop. This is
+    /// the control behind the eager/grouped solvers and disables both adaptive
+    /// and unconditional whole-block partition transitions.
+    pub fn grouped_partition(mut self) -> Self {
+        self.state.grouped = true;
+        self.state.trivial_partition_width = None;
+        self.state.adaptive_partition = None;
         self
     }
 
@@ -1992,19 +2181,27 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
     }
 }
 
-/// PROBE (dag-as-main): the constraint-agnostic core of the lazy DAG
-/// engine — exactly the resumable state (`{worklist buckets, emit
-/// buffer, binding scratch, slow-start width}`), with the constraint,
+/// PROBE (lazy-dag): the constraint-agnostic core of the lazy DAG engine —
+/// exactly the resumable state (`{worklist buckets, raw staged rows, binding
+/// scratch, slow-start width}`), with the constraint,
 /// postprocessing, and the frozen `influences`/`base_estimates` tables
-/// passed in per call. Split out of [`DagIter`] so [`Query`]'s
-/// [`Iterator`] impl can host the same engine behind the
-/// `TRIBLES_ENGINE=dag` seam without double-owning the constraint.
-pub(crate) struct DagState<R> {
+/// passed in per call.
+#[derive(Clone)]
+pub(crate) struct DagState {
     full: VariableSet,
     buckets: Vec<DagBucket>,
     pop_id: u64,
     binding: Binding,
-    emit: std::collections::VecDeque<R>,
+    /// Fully-bound rows staged for demand-driven postprocessing. Results are
+    /// deliberately kept in raw form: storing projected `R`s here would make
+    /// `Query`'s auto traits depend on its output type and make an exact
+    /// mid-iteration clone require `R: Clone`.
+    emit_vars: Vec<VariableId>,
+    emit_rows: Vec<RawInline>,
+    emit_next: usize,
+    /// Row count is explicit because a zero-column block contains one virtual
+    /// row even though `emit_rows` is empty.
+    emit_count: usize,
     width: usize,
     growth: usize,
     cap: usize,
@@ -2016,6 +2213,13 @@ pub(crate) struct DagState<R> {
     /// variable per pop from the first row's estimates (blocked-v1's
     /// trivial partition).
     grouped: bool,
+    /// Experimental width at which later resumptions use the trivial
+    /// partition. `None` preserves grouped scheduling throughout.
+    trivial_partition_width: Option<usize>,
+    /// Per-pop guarded whole-block batching policy. Unlike
+    /// `trivial_partition_width`, this never disables grouped ordering
+    /// permanently: every eligible pop earns the larger batch independently.
+    adaptive_partition: Option<AdaptivePartition>,
     /// Pooled per-pop scratch — the worklist loop is allocation-free in
     /// steady state (bucket row stores and their `vars` are the only
     /// per-pop allocations left, and those are the product, not scratch).
@@ -2024,6 +2228,7 @@ pub(crate) struct DagState<R> {
 
 /// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
 /// (taken with `mem::take`, returned when the pop completes).
+#[derive(Clone)]
 struct DagScratch {
     /// Unbound variables of the popped bucket.
     unbound: Vec<VariableId>,
@@ -2071,7 +2276,7 @@ impl Default for DagScratch {
     }
 }
 
-impl<R> DagState<R> {
+impl DagState {
     fn new(full: VariableSet) -> Self {
         let cap = block_row_cap();
         DagState {
@@ -2085,15 +2290,29 @@ impl<R> DagState<R> {
             }],
             pop_id: 0,
             binding: Binding::default(),
-            emit: std::collections::VecDeque::new(),
+            emit_vars: Vec::new(),
+            emit_rows: Vec::new(),
+            emit_next: 0,
+            emit_count: 0,
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
             merge: true,
             grouped: true,
+            trivial_partition_width: None,
+            adaptive_partition: Some(AdaptivePartition {
+                min_width: LAZY_ADAPTIVE_MIN_WIDTH,
+                max_estimate_inflation: LAZY_ADAPTIVE_MAX_INFLATION as u128,
+            }),
             scratch: DagScratch::default(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct AdaptivePartition {
+    min_width: usize,
+    max_estimate_inflation: u128,
 }
 
 /// Files one group's `(row, value)` pairs into the bucket keyed by
@@ -2180,18 +2399,17 @@ fn dag_file(
     }
 }
 
-impl<R> DagState<R> {
+impl DagState {
     /// One pop: choose a bucket (sprint: strict deepest; harvest:
     /// deepest-ready per the counting gate), take at most `width` rows off
     /// its tail (the seed bucket is one virtual row, always consumed
-    /// whole), and either emit (full-bound: postprocess just the taken
-    /// rows) or expand — grouped (estimate → prefer → partition → propose
+    /// whole), and either stage full-bound rows for emission or expand —
+    /// grouped (estimate → prefer → partition → propose
     /// per group) or ungrouped (first-row choice, one propose over the
     /// whole block) — then file into child buckets.
-    fn pop_once<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
+    fn pop_once<'a, C: Constraint<'a>>(
         &mut self,
         constraint: &C,
-        postprocessing: &P,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
         width: usize,
@@ -2223,49 +2441,37 @@ impl<R> DagState<R> {
             dag_stats::record_pop();
         }
 
-        // Full-bound bucket: take at most `width` rows off its tail and
-        // postprocess only those into the emit buffer — the remainder
-        // stays live under the same key, exactly like a partial
-        // expansion pop. Final-row conversion is thereby demand-bounded:
-        // `exists!`/`take(1)` consumers trigger at most `width`
-        // postprocessing calls per resumption, and a later row's
-        // postprocessing side effects (or panic) happen only once the
-        // consumer actually pulls that far.
+        // Full-bound bucket: take at most `width` rows off its tail and stage
+        // them in raw form — the remainder stays live under the same key,
+        // exactly like a partial expansion pop. `pull` postprocesses staged
+        // rows one at a time, so output values never become engine state and
+        // a later row's side effects (or panic) happen only when the consumer
+        // actually pulls that far.
         if self.buckets[idx].set == self.full {
             let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
             let take = n_rows.min(width.max(1));
-            let mut scratch = std::mem::take(&mut self.scratch);
-            scratch.parent_vars.clear();
-            let owned: Vec<RawInline>;
-            let rows: &[RawInline] = if take == n_rows {
-                let bucket = self.buckets.swap_remove(idx);
+            debug_assert!(self.emit_next >= self.emit_count);
+            self.emit_vars.clear();
+            self.emit_rows.clear();
+            self.emit_next = 0;
+            self.emit_count = take;
+            if take == n_rows {
+                let mut bucket = self.buckets.swap_remove(idx);
                 if self.merge {
                     dag_gate_retire(&mut self.buckets, &bucket.set);
                 }
-                scratch.parent_vars.extend_from_slice(&bucket.vars);
-                owned = bucket.rows;
-                &owned
+                self.emit_vars.append(&mut bucket.vars);
+                self.emit_rows.append(&mut bucket.rows);
             } else {
                 let b = &mut self.buckets[idx];
                 let split = (n_rows - take) * b.vars.len();
-                scratch.work.clear();
-                scratch.work.extend_from_slice(&b.rows[split..]);
+                self.emit_vars.extend_from_slice(&b.vars);
+                self.emit_rows.extend_from_slice(&b.rows[split..]);
                 b.rows.truncate(split);
-                scratch.parent_vars.extend_from_slice(&b.vars);
-                &scratch.work
-            };
-            for row in RowsView::new(&scratch.parent_vars, rows).iter() {
-                for (k, &v) in scratch.parent_vars.iter().enumerate() {
-                    self.binding.set(v, &row[k]);
-                }
-                if let Some(r) = postprocessing(&self.binding) {
-                    self.emit.push_back(r);
-                }
             }
             if stats {
-                blocked_stats::cells_sub(rows.len());
+                blocked_stats::cells_sub(self.emit_rows.len());
             }
-            self.scratch = scratch;
             return;
         }
 
@@ -2331,16 +2537,27 @@ impl<R> DagState<R> {
             };
             let variable = scratch.unbound[ui];
             if order_trace::enabled() {
-                order_trace::record(stride, variable, if self.grouped { c_rows as u64 } else { 1 });
+                order_trace::record(
+                    stride,
+                    variable,
+                    if self.grouped { c_rows as u64 } else { 1 },
+                );
             }
             scratch.pairs.clear();
-            constraint.propose(variable, &view, &mut CandidateSink::Tagged(&mut scratch.pairs));
+            constraint.propose(
+                variable,
+                &view,
+                &mut CandidateSink::Tagged(&mut scratch.pairs),
+            );
             if stats {
                 blocked_stats::record_level(blocked_stats::LevelRecord {
                     depth: stride,
                     rows: c_rows,
+                    chunk_width: width,
                     group_sizes: vec![c_rows],
                     batch_sizes: vec![scratch.pairs.len()],
+                    preferred_estimate_sum: None,
+                    first_preferred_estimate_sum: None,
                 });
             }
             dag_file(
@@ -2364,33 +2581,116 @@ impl<R> DagState<R> {
         //    variable — columns land contiguously because the sink appends.
         scratch.est.clear();
         for &v in scratch.unbound.iter() {
-            let relevant = constraint.estimate(v, &view, &mut EstimateSink::Column(&mut scratch.est));
+            let relevant =
+                constraint.estimate(v, &view, &mut EstimateSink::Column(&mut scratch.est));
             assert!(relevant, "unconstrained variable in query");
         }
         debug_assert_eq!(scratch.est.len(), n_unbound * c_rows);
 
         // 2. Per-row preferred variable: argmax of the engine's ordering
-        //    key over the row's matrix entries.
+        //    key over the row's matrix entries. When instrumentation or the
+        //    adaptive partition probe needs it, accumulate the preferred
+        //    estimates and the first row's chosen column in the same pass
+        //    instead of rescanning the matrix.
+        let adaptive = self
+            .adaptive_partition
+            .filter(|policy| width >= policy.min_width);
+        let need_partition_cost = stats || adaptive.is_some();
         scratch.preferred.clear();
         scratch.group_counts.clear();
         scratch.group_counts.resize(n_unbound, 0);
+        let mut preferred_sum = 0u128;
+        let mut first_preferred_ui = None;
+        let mut first_preferred_sum = 0u128;
         for i in 0..c_rows {
-            let j = (0..n_unbound)
-                .max_by_key(|&j| {
-                    variable_order_key(
-                        scratch.est[j * c_rows + i],
-                        base_estimates[scratch.unbound[j]],
-                        influences[scratch.unbound[j]].count(),
-                    )
-                })
-                .expect("non-empty unbound");
-            scratch.preferred.push(j as u32);
-            scratch.group_counts[j] += 1;
+            let mut preferred: Option<(usize, (u64, u64, u64))> = None;
+            for j in 0..n_unbound {
+                let estimate = scratch.est[j * c_rows + i];
+                let key = variable_order_key(
+                    estimate,
+                    base_estimates[scratch.unbound[j]],
+                    influences[scratch.unbound[j]].count(),
+                );
+                if preferred.is_none_or(|(_, best_key)| key > best_key) {
+                    preferred = Some((j, key));
+                }
+            }
+            let preferred = preferred.expect("non-empty unbound").0;
+            if first_preferred_ui.is_none() {
+                first_preferred_ui = Some(preferred);
+            }
+            scratch.preferred.push(preferred as u32);
+            scratch.group_counts[preferred] += 1;
+            if need_partition_cost {
+                preferred_sum += scratch.est[preferred * c_rows + i] as u128;
+                first_preferred_sum += scratch.est
+                    [first_preferred_ui.expect("first row visited") * c_rows + i]
+                    as u128;
+            }
+        }
+        let first_preferred = need_partition_cost.then(|| {
+            (
+                first_preferred_ui.expect("non-empty row block"),
+                first_preferred_sum,
+            )
+        });
+        let (preferred_estimate_sum, first_preferred_estimate_sum) = if stats {
+            (Some(preferred_sum), first_preferred.map(|(_, sum)| sum))
+        } else {
+            (None, None)
+        };
+
+        // 3. If the trivial control's whole-block variable stays within the
+        //    configured estimate budget, buy one larger batch without making
+        //    the choice permanent. Heterogeneous blocks with a large ordering
+        //    penalty continue through the grouped partition below.
+        let n_groups = scratch.group_counts.iter().filter(|&&c| c > 0).count();
+        let adaptive_single = adaptive.and_then(|policy| {
+            let (ui, single_sum) = first_preferred.expect("adaptive policy computed column sums");
+            let limit = preferred_sum.saturating_mul(policy.max_estimate_inflation);
+            (n_groups > 1 && single_sum <= limit).then_some(ui)
+        });
+        if let Some(ui) = adaptive_single {
+            let variable = scratch.unbound[ui];
+            if order_trace::enabled() {
+                order_trace::record(stride, variable, c_rows as u64);
+            }
+            scratch.pairs.clear();
+            constraint.propose(
+                variable,
+                &view,
+                &mut CandidateSink::Tagged(&mut scratch.pairs),
+            );
+            if stats {
+                blocked_stats::record_level(blocked_stats::LevelRecord {
+                    depth: stride,
+                    rows: c_rows,
+                    chunk_width: width,
+                    group_sizes: vec![c_rows],
+                    batch_sizes: vec![scratch.pairs.len()],
+                    preferred_estimate_sum,
+                    first_preferred_estimate_sum,
+                });
+            }
+            dag_file(
+                &mut self.buckets,
+                self.merge,
+                self.pop_id,
+                parent_set,
+                &scratch.parent_vars,
+                variable,
+                work,
+                &scratch.pairs,
+            );
+            if stats {
+                blocked_stats::cells_sub(work.len());
+            }
+            self.scratch = scratch;
+            return;
         }
 
-        // 3. Partition (stable counting sort); a single group borrows the
+        // 4. Partition (stable counting sort); a single group borrows the
         //    popped rows directly.
-        let n_groups = scratch.group_counts.iter().filter(|&&c| c > 0).count();
         scratch.starts.clear();
         let mut acc = 0usize;
         for &c in &scratch.group_counts {
@@ -2414,7 +2714,7 @@ impl<R> DagState<R> {
             }
         }
 
-        // 4. One batched propose per group; file into child buckets.
+        // 5. One batched propose per group; file into child buckets.
         let mut group_sizes_rec: Vec<usize> = Vec::new();
         let mut batch_sizes_rec: Vec<usize> = Vec::new();
         for j in 0..n_unbound {
@@ -2459,8 +2759,11 @@ impl<R> DagState<R> {
             blocked_stats::record_level(blocked_stats::LevelRecord {
                 depth: stride,
                 rows: c_rows,
+                chunk_width: width,
                 group_sizes: group_sizes_rec,
                 batch_sizes: batch_sizes_rec,
+                preferred_estimate_sum,
+                first_preferred_estimate_sum,
             });
             blocked_stats::cells_sub(work.len());
         }
@@ -2468,31 +2771,54 @@ impl<R> DagState<R> {
     }
 }
 
-impl<R> DagState<R> {
-    /// One consumer pull: drain the emit buffer, else resume the engine —
-    /// run pops at the current width until something reaches the emit
-    /// buffer (or the worklist drains), then grow the width (TCP slow
-    /// start on consumer demand).
-    fn pull<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>>(
+impl DagState {
+    /// One consumer pull: postprocess staged full rows one at a time, else
+    /// resume the engine — run pops at the current width until something is
+    /// staged (or the worklist drains), then grow the width (TCP slow start
+    /// on consumer demand).
+    fn pull<'a, C, P, R>(
         &mut self,
         constraint: &C,
         postprocessing: &P,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
-    ) -> Option<R> {
+    ) -> Option<R>
+    where
+        C: Constraint<'a>,
+        P: Fn(&Binding) -> Option<R>,
+    {
         loop {
-            if let Some(r) = self.emit.pop_front() {
-                return Some(r);
+            while self.emit_next < self.emit_count {
+                let row_index = self.emit_next;
+                // Consume the raw row before invoking user postprocessing. If
+                // it panics and the unwind is caught, retrying the iterator
+                // must not repeat the same row or its side effects.
+                self.emit_next += 1;
+                let stride = self.emit_vars.len();
+                let start = row_index * stride;
+                let row = &self.emit_rows[start..start + stride];
+                for (k, &v) in self.emit_vars.iter().enumerate() {
+                    self.binding.set(v, &row[k]);
+                }
+                if let Some(r) = postprocessing(&self.binding) {
+                    return Some(r);
+                }
             }
             if self.buckets.is_empty() {
                 return None;
             }
             let width = self.width;
+            if self
+                .trivial_partition_width
+                .is_some_and(|threshold| width >= threshold)
+            {
+                self.grouped = false;
+            }
             if dag_stats::enabled() {
                 dag_stats::record_width(width);
             }
-            while self.emit.is_empty() && !self.buckets.is_empty() {
-                self.pop_once(constraint, postprocessing, influences, base_estimates, width);
+            while self.emit_next >= self.emit_count && !self.buckets.is_empty() {
+                self.pop_once(constraint, influences, base_estimates, width);
             }
             self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
         }
@@ -2533,12 +2859,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // PROBE (dag-as-main): `TRIBLES_ENGINE=dag` routes *fresh* queries
-        // through the lazy DAG engine. The freshness guard (never-touched
-        // DFS state) keeps rayon's post-`split` leaves — which carry a
-        // partial cursor the DAG engine would ignore — on the
-        // sequential path; an unsplit par-iter leaf is a whole query, for
-        // which the DAG multiset is identical.
+        let fresh = !self.iteration_started;
+        // Freshness is an explicit public-iterator property, not something
+        // inferred from the cursor. In particular, successful and failed
+        // zero-variable queries both have structurally empty `Done` state
+        // after a pull. Record the call before any iterator return path.
+        self.iteration_started = true;
+
         if let Some(state) = &mut self.dag {
             return state.pull(
                 &self.constraint,
@@ -2547,10 +2874,17 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 &self.base_estimates,
             );
         }
-        if engine_dag()
+
+        // The ordinary iterator defaults to the lazy DAG. Rayon partitions a
+        // fresh query by advancing the scalar cursor before its leaves call
+        // `next`; those partial cursors deliberately stay on the sequential
+        // path instead of restarting from the seed worklist.
+        if self.scheduler == QueryScheduler::LazyDag
+            && fresh
             && matches!(self.mode, Search::NextVariable)
             && self.stack.is_empty()
             && self.bound.is_empty()
+            && self.touched_variables.is_empty()
         {
             let state = self
                 .dag
@@ -2562,6 +2896,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 &self.base_estimates,
             );
         }
+
         loop {
             match &self.mode {
                 Search::NextVariable => {
@@ -2629,7 +2964,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
+            .field("scheduler", &self.scheduler)
             .field("mode", &self.mode)
+            .field("iteration_started", &self.iteration_started)
+            .field("dag_started", &self.dag.is_some())
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
             .finish()
@@ -2733,6 +3071,15 @@ mod parallel {
         /// see the module doc comment for why this preserves correctness
         /// without re-enumeration.
         fn split(mut self) -> (Self, Option<Self>) {
+            // A query converted to a parallel iterator after an ordinary
+            // `next()` already owns a resumable DAG worklist. The DFS cursor
+            // is still untouched, so splitting it would restart the query and
+            // duplicate rows. Keep this producer as one leaf and let
+            // `fold_with` drain the exact remaining DAG state.
+            if self.inner.dag.is_some() {
+                self.split_budget = 0;
+                return (self, None);
+            }
             if self.split_budget == 0 {
                 return (self, None);
             }
@@ -3209,5 +3556,51 @@ mod tests {
         let r: Vec<_> = q.collect();
         assert_eq!(1, r.len());
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
+    }
+
+    #[test]
+    fn lazy_trivial_partition_switches_at_configured_width() {
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+        let constraint = or!(
+            variable.is(values[0]),
+            variable.is(values[1]),
+            variable.is(values[2]),
+            variable.is(values[3])
+        );
+        let mut switched = Query::new(constraint, |_| Some(()))
+            .solve_dag_lazy()
+            .start_width(1)
+            .growth(2)
+            .trivial_partition_at_width(2);
+        assert!(switched.state.grouped);
+        assert_eq!(switched.next(), Some(()));
+        assert!(
+            switched.state.grouped,
+            "the width-one first-result sprint must remain grouped"
+        );
+        assert_eq!(switched.current_width(), 2);
+        assert_eq!(switched.next(), Some(()));
+        assert!(
+            !switched.state.grouped,
+            "the threshold-width resumption must use the trivial partition"
+        );
+
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let constraint = or!(
+            variable.is(values[0]),
+            variable.is(values[1]),
+            variable.is(values[2]),
+            variable.is(values[3])
+        );
+        let mut default = Query::new(constraint, |_| Some(())).solve_dag_lazy();
+        assert_eq!(default.next(), Some(()));
+        assert_eq!(default.next(), Some(()));
+        assert!(
+            default.state.grouped,
+            "the experimental builder must not change default scheduling"
+        );
     }
 }
