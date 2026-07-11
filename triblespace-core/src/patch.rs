@@ -40,9 +40,7 @@ use std::sync::Once;
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("PATCH tagged pointers require 64-bit targets");
 
-// `pub` (was private) so the `vwpatch` clone can share the same SIP key and
-// thus produce identical leaf/node hashes for identical key sets.
-pub static mut SIP_KEY: [u8; 16] = [0; 16];
+static mut SIP_KEY: [u8; 16] = [0; 16];
 static INIT: Once = Once::new();
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the

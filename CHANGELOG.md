@@ -7,8 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`or!(pattern!(..), pattern!(..))` no longer panics — pattern constants
+  are folded into the constraint instead of becoming hidden variables.**
+  `UnionConstraint` requires every arm to declare the same variable set
+  (a flat-result-schema requirement: every row binds the same variables
+  exactly once). The macro layer used to allocate a fresh hidden variable
+  plus a `ConstantConstraint` for every attribute constant, literal value,
+  and constant entity id — so two separate `pattern!` invocations never
+  declared equal sets and the book's own `or!` example deterministically
+  tripped the assertion. Triple-pattern positions are now `Term`s (a
+  variable to solve for, or a constant pinned at construction): constants
+  enter the backends' existing bound-position dispatch as "born bound" and
+  never appear in the variable set, so union arms compare only the query
+  variables the caller wrote. `TriblePattern::pattern` accepts
+  `impl Into<Term<_>>` per position (plain `Variable` arguments keep
+  working unchanged); `TribleSetConstraint`, `SuccinctArchiveConstraint`,
+  and `UnionArchive` store terms; `pattern!`/`pattern_changes!` emit
+  constant terms with zero helper allocations (queries also get tighter
+  initial estimates and shed the per-constant binding steps). A pattern
+  whose positions are all constants now has an empty variable set and acts
+  as a pure existence check: `Query::new` settles it with one exact
+  `satisfied()` probe up front (the fully-bound exactness law with zero
+  variables). The union's variable-set mismatch panic now names the
+  offending sets instead of failing in a bare `assert!`.
+
 ### Changed
 
+- **`Pile::restore()` is now `Pile::amputate()` — the destructive
+  truncation stops wearing a comforting name.** The operation TRUNCATES
+  the pile file at the first invalid record, destroying everything after
+  it; "restore" read like a safe recovery and invited routine use on
+  open, which under version skew is exactly how stale binaries eat valid
+  data. `Yard::restore` (which amputates every generation pile) is
+  renamed to `Yard::amputate` for the same reason, and the CLI command
+  moves from `trible pile restore` to `trible pile amputate` with help
+  text that states the destruction plainly. No deprecation shims — the
+  old names are gone. Additionally, the crate's telemetry sink was the
+  last remaining restore-on-open holdout: it now opens its pile with the
+  non-mutating `refresh()` and disables telemetry (with a warning) on a
+  corrupt tail instead of truncating it.
 - **V3 on-disk pile format: uniform 256-byte records.** Every new record —
   blob, branch (pin) head, branch tombstone, weak-pin marker, weak-unpin
   marker — is written with a FIXED 256-byte header and padded to a 256-byte
@@ -20,11 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GPU-aliasable (CUDA/Metal `min_storage_buffer_offset_alignment`); and the
   blob header carries 192 reserved zero bytes that are NOT part of the
   content hash. The reader still accepts the original V1 records, so
-  existing piles read byte-identical with no migration. **Version skew is
-  fail-loud in one direction:** binaries from before V3 treat the new
-  markers as unknown records and report `CorruptPile` (they do not
-  truncate; repair stays explicit) — upgrade the binary, don't "repair"
-  the pile.
+  existing piles read byte-identical with no migration. **Version-skew
+  warning:** a binary from before V3 treats the new markers as unknown
+  records and reports `CorruptPile` at the first V3 record. With a
+  *current* pre-V3 build that is merely fail-loud — but **deployed
+  binaries from before the fail-loud change auto-ran the truncating
+  repair on open, so a stale binary touching a V3 pile WILL truncate it
+  at the first V3 record, destroying everything after it.** Writing V3
+  records into a shared pile arms every stale binary that can reach the
+  file; upgrade every reader/writer of a pile before letting V3 records
+  into it, and never "repair" a `CorruptPile` report without first ruling
+  out version skew.
 - **One record decoder; the CLI no longer hand-rolls pile parsing.**
   `triblespace-core` now exports `repo::pile::PileRecords` — a record-level
   iterator over a pile file yielding `PileRecord { offset, len, content }`
@@ -53,8 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the non-mutating `Pile::refresh()` and fails loud with
   `YardOpenError::Pile { path, err }` naming the corrupt generation file;
   nothing is truncated. Repair is an explicit opt-in via the new
-  `Yard::restore(paths, config)` constructor (mirroring
-  `Pile::refresh`/`Pile::restore`). Rewrite (`reclaim`/`compact`) recovery
+  `Yard::amputate(paths, config)` constructor (mirroring
+  `Pile::refresh`/`Pile::amputate`). Rewrite (`reclaim`/`compact`) recovery
   reopens the generation without repair and propagates a double failure as
   the new `YardReclaimError::Reopen { path, primary, err }` instead of
   silently leaving the segment closed.
@@ -64,10 +109,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   torn or corrupt tail as a side effect — on the *source* pile for the
   rewrite commands (`reid`, `squash`) and on the in-place-migrated pile for
   `migrate`. They now open with the non-mutating `Pile::refresh()` and fail
-  loud with the standard repair pointer (`trible pile restore <path>`),
+  loud with the standard repair pointer (`trible pile amputate <path>`),
   leaving the file byte-identical; `reid` and `squash` also never create the
-  destination when the source refuses to open. `trible pile restore` is now
-  genuinely the only entry point that calls `Pile::restore()`.
+  destination when the source refuses to open. `trible pile amputate` is now
+  genuinely the only entry point that calls `Pile::amputate()`.
 - **Want-record failures are errors, and wants are flushed durable.**
   `Peer::get_or_fetch_async` now returns
   `Result<Option<Bytes>, WantRecordError>` — a pin/flush failure while
@@ -103,8 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Pile::open` + `Pile::refresh()` (a non-mutating full load) and **fail loud** with
   a non-zero exit on any corruption, printing the byte offset and a repair
   instruction instead of quietly repairing. Repair is now explicit and lives in one
-  place: `trible pile restore <path>`, the only entry point that still calls
-  `Pile::restore()`.
+  place: `trible pile amputate <path>`, the only entry point that still calls
+  `Pile::amputate()`.
 
 ### Added
 
@@ -176,7 +221,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   definitely-absent. A failed want-record is an error
   (`WantGetError::WantRecord` / `WantWaitError::WantRecord`), never a
   silent proceed, and store refresh errors propagate immediately
-  (`WantWaitError::Store` — fail loud, never auto-restore). Waking is an
+  (`WantWaitError::Store` — fail loud, never auto-amputate). Waking is an
   implementation detail: in-process `put`s signal waiters directly; a
   lazily-spawned, self-retiring cadence thread re-checks (with a store
   refresh) for landings by other handles/processes — pure `std`, no tokio
@@ -228,7 +273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PinStore` impl (in-memory CAS over its strong pins), required by the
   `WeakPinStore: PinStore` bound. Note the loud-failure posture: binaries
   from before this change treat the new markers as unknown records — they
-  fail loud on such piles (and never truncate, per the explicit-restore
+  fail loud on such piles (and never truncate, per the explicit-amputate
   posture above).
 - **Lazy content sync — the want-reconcile loop.** `trible pile net sync` now
   services durable weak-pin **wants** (fetch-on-want): each pass re-reads the
@@ -247,11 +292,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hold quiescence off). The mechanism lives in the library as
   `triblespace_net::reconcile::Reconciler` — an async, deterministic-sim-tested
   `tick(&mut Peer<S>) -> ReconcileStats` — and the CLI is just the wiring.
-- **`trible pile restore <path>`.** Explicit, opt-in repair for a pile with a
-  partial or corrupt (torn) tail: loads every valid record and, if the tail is
-  torn, truncates back to the last known-good offset, reporting bytes before/after
-  (or "already valid"). This replaces the implicit auto-repair that faculties used
-  to perform on open.
+- **`trible pile amputate <path>`.** Explicit, opt-in, DESTRUCTIVE repair for a
+  pile with a partial or corrupt (torn) tail: loads every valid record and, if the
+  tail is torn, truncates the file back to the last known-good offset — destroying
+  everything after it — reporting bytes before/after (or "already valid"). This
+  replaces the implicit auto-repair that faculties used to perform on open.
 - **`repo::yard` generational blob storage.** Adds a standalone Yard storage
   component that layers young-to-old Pile generations, union reads, per-blob
   strong/weak retention, weak-veto reachability pruning, and size-triggered

@@ -3,18 +3,18 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::ContainsConstraint;
 use crate::query::EstimateSink;
 use crate::query::RowsView;
-use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -78,6 +78,21 @@ where
                     Err(_) => return false,
                 })
             });
+        }
+    }
+
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is a key of the map. Returns `true` optimistically while the
+    /// variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(&row[c])) {
+                    Ok(k) => self.map.contains_key(&k),
+                    Err(_) => false,
+                }
+            }),
+            None => true,
         }
     }
 }

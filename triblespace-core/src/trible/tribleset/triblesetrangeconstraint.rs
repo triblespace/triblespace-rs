@@ -1,3 +1,7 @@
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
@@ -6,10 +10,6 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::RawInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
 ///

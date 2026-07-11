@@ -8,13 +8,13 @@ pub use ed25519_dalek::VerifyingKey;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::TryFromInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 /// A inline encoding for the R component of an Ed25519 signature.
@@ -159,24 +159,21 @@ impl ED25519SComponent {
     }
 }
 
-impl Encodes<Signature> for ED25519RComponent
-{
+impl Encodes<Signature> for ED25519RComponent {
     type Output = Inline<ED25519RComponent>;
     fn encode(source: Signature) -> Inline<ED25519RComponent> {
         ED25519RComponent::from_signature(source)
     }
 }
 
-impl Encodes<Signature> for ED25519SComponent
-{
+impl Encodes<Signature> for ED25519SComponent {
     type Output = Inline<ED25519SComponent>;
     fn encode(source: Signature) -> Inline<ED25519SComponent> {
         ED25519SComponent::from_signature(source)
     }
 }
 
-impl Encodes<ComponentBytes> for ED25519RComponent
-{
+impl Encodes<ComponentBytes> for ED25519RComponent {
     type Output = Inline<ED25519RComponent>;
     fn encode(source: ComponentBytes) -> Inline<ED25519RComponent> {
         Inline::new(source)
@@ -190,8 +187,7 @@ impl TryFromInline<'_, ED25519RComponent> for ComponentBytes {
     }
 }
 
-impl Encodes<ComponentBytes> for ED25519SComponent
-{
+impl Encodes<ComponentBytes> for ED25519SComponent {
     type Output = Inline<ED25519SComponent>;
     fn encode(source: ComponentBytes) -> Inline<ED25519SComponent> {
         Inline::new(source)
@@ -205,8 +201,7 @@ impl TryFromInline<'_, ED25519SComponent> for ComponentBytes {
     }
 }
 
-impl Encodes<VerifyingKey> for ED25519PublicKey
-{
+impl Encodes<VerifyingKey> for ED25519PublicKey {
     type Output = Inline<ED25519PublicKey>;
     fn encode(source: VerifyingKey) -> Inline<ED25519PublicKey> {
         Inline::new(source.to_bytes())

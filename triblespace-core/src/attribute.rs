@@ -34,8 +34,8 @@
 
 use crate::id::Id;
 use crate::id::RawId;
-use crate::trible::Fragment;
 use crate::inline::InlineEncoding;
+use crate::trible::Fragment;
 use core::marker::PhantomData;
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
@@ -107,9 +107,8 @@ impl<S: InlineEncoding> Attribute<S> {
     pub fn encoded_from<V>(&self, v: V) -> crate::inline::Encoded<S>
     where
         V: crate::inline::IntoEncoded<<S as crate::inline::InlineEncoding>::Encoding>,
-        <V as crate::inline::IntoEncoded<
-            <S as crate::inline::InlineEncoding>::Encoding,
-        >>::Output: crate::inline::ToEncoded<S>,
+        <V as crate::inline::IntoEncoded<<S as crate::inline::InlineEncoding>::Encoding>>::Output:
+            crate::inline::ToEncoded<S>,
     {
         use crate::inline::ToEncoded;
         v.into_encoded().to_encoded()
@@ -178,11 +177,11 @@ mod tests {
     use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
     use crate::id::Id;
-    use crate::macros::{entity, find, pattern};
-    use crate::metadata::{self, Describe, MetaDescribe};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::encodings::shortstring::ShortString;
     use crate::inline::Inline;
+    use crate::macros::{entity, find, pattern};
+    use crate::metadata::{self, Describe, MetaDescribe};
 
     #[test]
     fn dynamic_field_is_deterministic() {

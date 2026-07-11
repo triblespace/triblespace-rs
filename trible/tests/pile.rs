@@ -524,9 +524,9 @@ fn pile_branch_create_outputs_id() {
 }
 
 /// A corrupt (torn-tail) source pile must make `reid`, `squash`, and
-/// `migrate` fail loud — pointing at `trible pile restore` — without
+/// `migrate` fail loud — pointing at `trible pile amputate` — without
 /// truncating the source file. Silent auto-repair on open is reserved
-/// for the explicit `trible pile restore` command.
+/// for the explicit `trible pile amputate` command.
 #[test]
 fn corrupt_source_fails_loud_without_truncation() {
     use std::io::Write;
@@ -554,7 +554,7 @@ fn corrupt_source_fails_loud_without_truncation() {
     }
     let len_before = std::fs::metadata(&src_path).unwrap().len();
 
-    let fail_loud = predicate::str::contains("trible pile restore");
+    let fail_loud = predicate::str::contains("trible pile amputate");
 
     // reid: fails loud, source untouched, destination never created.
     let dest = dir.path().join("reid_dst.pile");
@@ -569,7 +569,10 @@ fn corrupt_source_fails_loud_without_truncation() {
         .assert()
         .failure()
         .stderr(fail_loud.clone());
-    assert!(!dest.exists(), "reid must not create dest on corrupt source");
+    assert!(
+        !dest.exists(),
+        "reid must not create dest on corrupt source"
+    );
 
     // squash: same contract.
     let dest = dir.path().join("squash_dst.pile");
@@ -584,7 +587,10 @@ fn corrupt_source_fails_loud_without_truncation() {
         .assert()
         .failure()
         .stderr(fail_loud.clone());
-    assert!(!dest.exists(), "squash must not create dest on corrupt source");
+    assert!(
+        !dest.exists(),
+        "squash must not create dest on corrupt source"
+    );
 
     // migrate (in-place rewrite): still refuses to open a corrupt pile.
     Command::cargo_bin("trible")

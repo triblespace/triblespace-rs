@@ -69,6 +69,21 @@ where
             });
         }
     }
+
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is a member of the set. Returns `true` optimistically while
+    /// the variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(&row[c])) {
+                    Ok(t) => self.set.contains(&t),
+                    Err(_) => false,
+                }
+            }),
+            None => true,
+        }
+    }
 }
 
 impl<'a, S: InlineEncoding, T> ContainsConstraint<'a, S> for &'a HashSet<T>

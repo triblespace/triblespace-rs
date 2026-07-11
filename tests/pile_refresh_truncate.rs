@@ -6,7 +6,7 @@ use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::prelude::*;
 
 #[test]
-fn refresh_during_restore_truncation_is_safe() {
+fn refresh_during_amputate_truncation_is_safe() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pile.pile");
 
@@ -29,7 +29,7 @@ fn refresh_during_restore_truncation_is_safe() {
 
     // Open two handles on the same pile
     let mut pile_refresh: Pile = Pile::open(&path).unwrap();
-    let mut pile_restore: Pile = Pile::open(&path).unwrap();
+    let mut pile_amputate: Pile = Pile::open(&path).unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
     let b1 = barrier.clone();
@@ -40,16 +40,16 @@ fn refresh_during_restore_truncation_is_safe() {
     });
 
     let b2 = barrier.clone();
-    let restore_thread = std::thread::spawn(move || {
+    let amputate_thread = std::thread::spawn(move || {
         b2.wait();
-        pile_restore.restore().unwrap();
-        pile_restore.close().unwrap();
+        pile_amputate.amputate().unwrap();
+        pile_amputate.close().unwrap();
     });
 
     refresh_thread.join().unwrap();
-    restore_thread.join().unwrap();
+    amputate_thread.join().unwrap();
 
-    // The pile should be valid after restore
+    // The pile should be valid after amputate
     let mut pile: Pile = Pile::open(&path).unwrap();
     pile.refresh().unwrap();
     let blob = pile

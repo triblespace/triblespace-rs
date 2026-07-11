@@ -1,16 +1,16 @@
 use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::ID_LEN;
-use crate::patch::IdentitySchema;
-use crate::patch::PATCH;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
+use crate::patch::IdentitySchema;
+use crate::patch::PATCH;
 
 use super::CandidateSink;
 use super::Constraint;
+use super::ContainsConstraint;
 use super::EstimateSink;
 use super::RowsView;
-use super::ContainsConstraint;
 use super::Variable;
 use super::VariableId;
 use super::VariableSet;
@@ -35,7 +35,12 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if self.variable.index != variable {
             return false;
         }
@@ -43,7 +48,12 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         true
     }
 
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch
@@ -52,14 +62,31 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn confirm(&self, variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
             candidates.retain(|_, v| self.patch.has_prefix(v));
         }
     }
+
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is present in the patch. Returns `true` optimistically while
+    /// the variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| self.patch.has_prefix(&row[c])),
+            None => true,
+        }
+    }
 }
 
-impl<'a, S: InlineEncoding> ContainsConstraint<'a, S> for &'a PATCH<INLINE_LEN, IdentitySchema, ()> {
+impl<'a, S: InlineEncoding> ContainsConstraint<'a, S>
+    for &'a PATCH<INLINE_LEN, IdentitySchema, ()>
+{
     type Constraint = PatchValueConstraint<'a, S>;
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
@@ -98,7 +125,12 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if self.variable.index != variable {
             return false;
         }
@@ -106,7 +138,12 @@ where
         true
     }
 
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
             for i in 0..view.len() as u32 {
                 self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
@@ -116,14 +153,34 @@ where
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        candidates.retain(|_, v| {
-            if let Some(id) = id_from_value(v) {
-                self.patch.has_prefix(&id)
-            } else {
-                false
-            }
-        });
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if self.variable.index == variable {
+            candidates.retain(|_, v| {
+                if let Some(id) = id_from_value(v) {
+                    self.patch.has_prefix(&id)
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is an ID present in the patch. Returns `true` optimistically
+    /// while the variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| match id_from_value(&row[c]) {
+                Some(id) => self.patch.has_prefix(&id),
+                None => false,
+            }),
+            None => true,
+        }
     }
 }
 

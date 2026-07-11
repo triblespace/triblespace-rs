@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -243,8 +243,7 @@ impl std::fmt::Display for ReservedBitsNonZero {
     }
 }
 
-impl Encodes<i128> for NsDuration
-{
+impl Encodes<i128> for NsDuration {
     type Output = Inline<NsDuration>;
     fn encode(source: i128) -> Inline<NsDuration> {
         let mut raw = [0u8; 32];
@@ -264,8 +263,7 @@ impl TryFromInline<'_, NsDuration> for i128 {
     }
 }
 
-impl Encodes<Duration> for NsDuration
-{
+impl Encodes<Duration> for NsDuration {
     type Output = Inline<NsDuration>;
     fn encode(source: Duration) -> Inline<NsDuration> {
         source.total_nanoseconds().to_inline()

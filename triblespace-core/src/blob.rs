@@ -9,14 +9,14 @@
 // `FromBlob` were never required and have been removed for simplicity.
 
 mod cache;
-mod memoryblobstore;
 /// Built-in blob encoding types and their conversion implementations.
 pub mod encodings;
+mod memoryblobstore;
 
-use crate::metadata::MetaDescribe;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::metadata::MetaDescribe;
 
 use std::convert::Infallible;
 use std::error::Error;
@@ -267,9 +267,7 @@ pub trait BlobEncoding: MetaDescribe + Sized + 'static {
 /// for MyForeignType` legal for downstream crates: the local
 /// `MyBlobEncoding` sits at trait position 0, satisfying Rust's
 /// orphan rule.
-pub trait IntoBlob<S: BlobEncoding>:
-    crate::inline::IntoEncoded<S, Output = Blob<S>>
-{
+pub trait IntoBlob<S: BlobEncoding>: crate::inline::IntoEncoded<S, Output = Blob<S>> {
     /// Convert directly to `Blob<S>`.
     fn to_blob(self) -> Blob<S>
     where
@@ -387,10 +385,7 @@ mod tests {
         // bytes. This is the optimization read paths exploit (they
         // already know the handle, no point re-hashing).
         let bogus: Inline<Handle<UnknownBlob>> = Inline::new([0xAA; 32]);
-        let b: Blob<UnknownBlob> = Blob::with_handle(
-            Bytes::from(b"any bytes".to_vec()),
-            bogus,
-        );
+        let b: Blob<UnknownBlob> = Blob::with_handle(Bytes::from(b"any bytes".to_vec()), bogus);
         assert_eq!(b.get_handle(), bogus);
     }
 

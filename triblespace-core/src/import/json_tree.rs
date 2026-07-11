@@ -5,7 +5,6 @@
 //! Entity ids are content-addressed so identical subtrees deduplicate across
 //! imports.
 
-
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
@@ -13,16 +12,16 @@ use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
-use crate::macros::{entity, id_hex};
-use crate::metadata;
-use crate::repo::BlobStore;
-use crate::trible::Fragment;
-use crate::trible::TribleSet;
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::{Blake3, Handle};
 use crate::inline::encodings::iu256::U256BE;
 use crate::inline::Inline;
+use crate::macros::{entity, id_hex};
+use crate::metadata;
+use crate::repo::BlobStore;
+use crate::trible::Fragment;
+use crate::trible::TribleSet;
 use triblespace_core_macros::attributes;
 
 use crate::import::json::{
@@ -100,11 +99,7 @@ pub fn build_json_tree_metadata() -> Fragment {
     metadata += describe_kind(kind_number, "json.kind.number", "JSON number node.");
     metadata += describe_kind(kind_bool, "json.kind.bool", "JSON boolean node.");
     metadata += describe_kind(kind_null, "json.kind.null", "JSON null node.");
-    metadata += describe_kind(
-        kind_field,
-        "json.kind.field",
-        "JSON object field entry.",
-    );
+    metadata += describe_kind(kind_field, "json.kind.field", "JSON object field entry.");
     metadata += describe_kind(
         kind_array_entry,
         "json.kind.array_entry",
@@ -154,10 +149,7 @@ where
     /// Creates a new lossless importer backed by `store`. Pass an optional
     /// 32-byte salt to namespace the content-addressed entity ids.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
-        Self {
-            store,
-            id_salt,
-        }
+        Self { store, id_salt }
     }
 
     /// Imports a JSON string. Convenience wrapper around [`import_blob`](Self::import_blob).
@@ -491,11 +483,10 @@ fn id_from_digest(digest: &[u8]) -> Id {
 #[cfg(test)]
 mod tests {
     use super::{kind_array_entry, JsonTreeImporter};
-    use crate::blob::MemoryBlobStore;
     use crate::blob::IntoBlob;
+    use crate::blob::MemoryBlobStore;
     use crate::id::Id;
     use crate::macros::{find, pattern};
-    
 
     #[test]
     fn lossless_ids_are_content_based() {

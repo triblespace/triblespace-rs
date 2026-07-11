@@ -1,12 +1,12 @@
 use std::ops::{Add, AddAssign, Deref};
 
-use crate::blob::{BlobEncoding, MemoryBlobStore, IntoBlob};
+use crate::blob::{BlobEncoding, IntoBlob, MemoryBlobStore};
 use crate::id::Id;
 use crate::id::RawId;
-use crate::patch::Entry;
-use crate::patch::PATCH;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
+use crate::patch::Entry;
+use crate::patch::PATCH;
 
 use super::Trible;
 use super::TribleSet;
@@ -88,11 +88,7 @@ impl Fragment {
     /// uses this to wrap its accumulated state — facts come from per-
     /// attribute inserts, blobs come from any `field*: spread_source`
     /// extras the spread sources carried with them.
-    pub fn rooted_with_blobs(
-        root: Id,
-        facts: TribleSet,
-        blobs: MemoryBlobStore,
-    ) -> Self {
+    pub fn rooted_with_blobs(root: Id, facts: TribleSet, blobs: MemoryBlobStore) -> Self {
         let mut exports = PATCH::<16>::new();
         let raw: RawId = root.into();
         exports.insert(&Entry::new(&raw));
@@ -178,7 +174,6 @@ impl Fragment {
     pub fn into_parts(self) -> (PATCH<16>, TribleSet, MemoryBlobStore) {
         (self.exports, self.facts, self.blobs)
     }
-
 }
 
 impl Deref for Fragment {

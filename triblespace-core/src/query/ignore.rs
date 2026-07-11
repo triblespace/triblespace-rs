@@ -19,7 +19,10 @@ pub struct IgnoreConstraint<'a> {
 impl<'a> IgnoreConstraint<'a> {
     /// Wraps `constraint`, hiding every variable in `ignored` from the
     /// outer query.
-    pub fn new(ignored: VariableSet, constraint: Box<dyn Constraint<'a> + Send + Sync + 'a>) -> Self {
+    pub fn new(
+        ignored: VariableSet,
+        constraint: Box<dyn Constraint<'a> + Send + Sync + 'a>,
+    ) -> Self {
         IgnoreConstraint {
             ignored,
             constraint,

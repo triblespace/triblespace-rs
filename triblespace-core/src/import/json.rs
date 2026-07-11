@@ -14,22 +14,22 @@ use std::str::FromStr;
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
+use crate::attribute::Attribute;
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
-use crate::attribute::Attribute;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
-use crate::macros::entity;
-use crate::metadata;
-use crate::metadata::{MetaDescribe, Describe};
-use crate::repo::BlobStore;
-use crate::trible::{Fragment, Trible, TribleSet};
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::f64::F64;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::{Blake3, Handle};
 use crate::inline::encodings::UnknownInline;
-use crate::inline::{RawInline, IntoInline, Inline, InlineEncoding};
+use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
+use crate::macros::entity;
+use crate::metadata;
+use crate::metadata::{Describe, MetaDescribe};
+use crate::repo::BlobStore;
+use crate::trible::{Fragment, Trible, TribleSet};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
@@ -168,10 +168,7 @@ where
         }))
     }
 
-    fn bool_attr(
-        &mut self,
-        field: &ParsedString,
-    ) -> Result<Attribute<Boolean>, JsonImportError> {
+    fn bool_attr(&mut self, field: &ParsedString) -> Result<Attribute<Boolean>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.bool_attrs.get(&key) {
             return Ok(attr.clone());
@@ -204,10 +201,7 @@ where
         Ok(attr)
     }
 
-    fn genid_attr(
-        &mut self,
-        field: &ParsedString,
-    ) -> Result<Attribute<GenId>, JsonImportError> {
+    fn genid_attr(&mut self, field: &ParsedString) -> Result<Attribute<GenId>, JsonImportError> {
         let key = field.clone();
         if let Some(attr) = self.genid_attrs.get(&key) {
             return Ok(attr.clone());
@@ -226,7 +220,8 @@ where
             num_attrs: HashMap::new(),
             str_attrs: HashMap::new(),
             genid_attrs: HashMap::new(),
-            id_salt,            array_fields: HashSet::new(),
+            id_salt,
+            array_fields: HashSet::new(),
         }
     }
 
@@ -389,13 +384,13 @@ where
                 let text = self.parse_string(bytes)?;
                 let field_name = field.as_ref().to_owned();
                 let attr = self.str_attr(field)?;
-                let handle: Inline<Handle<LongString>> = self
-                    .store
-                    .put(text)
-                    .map_err(|err| JsonImportError::EncodeString {
-                        field: field_name,
-                        source: EncodeError::from_error(err),
-                    })?;
+                let handle: Inline<Handle<LongString>> =
+                    self.store
+                        .put(text)
+                        .map_err(|err| JsonImportError::EncodeString {
+                            field: field_name,
+                            source: EncodeError::from_error(err),
+                        })?;
                 pairs.push((attr.raw(), handle.raw));
                 Ok(())
             }
@@ -660,10 +655,10 @@ pub(crate) fn parse_number_common(bytes: &mut Bytes) -> Result<Bytes, JsonImport
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::MemoryBlobStore;
     use crate::blob::IntoBlob;
+    use crate::blob::MemoryBlobStore;
     use crate::prelude::Attribute;
-    
+
     use anybytes::View;
 
     #[test]
@@ -681,9 +676,7 @@ mod tests {
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawInline {
         use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
-        let h: Inline<Handle<LongString>> = String::from(expected_attr)
-            .to_blob()
-            .get_handle();
+        let h: Inline<Handle<LongString>> = String::from(expected_attr).to_blob().get_handle();
         let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
             metadata::name:         h,
             metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),

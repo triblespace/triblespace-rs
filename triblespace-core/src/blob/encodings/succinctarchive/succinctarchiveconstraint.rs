@@ -10,9 +10,9 @@ pub struct SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
     archive: &'a SuccinctArchive<U>,
 }
 
@@ -21,15 +21,15 @@ where
     U: Universe,
 {
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         archive: &'a SuccinctArchive<U>,
     ) -> Self {
         SuccinctArchiveConstraint {
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.into().erase(),
+            term_a: a.into().erase(),
+            term_v: v.into().erase(),
             archive,
         }
     }
@@ -98,18 +98,68 @@ where
     }
 }
 
+/// The per-call value source of one pattern position: a column of the
+/// current block (a variable bound in the view) or the constant pinned at
+/// construction (which behaves exactly like a bound variable, uniformly
+/// across all rows). Resolved once per protocol call; the per-row work is
+/// pure reads.
+#[derive(Clone, Copy)]
+enum Src {
+    /// The position's variable is bound at this column of the block.
+    Col(usize),
+    /// The position is a constant term.
+    Const(RawInline),
+}
+
+impl Src {
+    #[inline]
+    fn get<'r>(&'r self, row: &'r [RawInline]) -> &'r RawInline {
+        match self {
+            Src::Col(i) => &row[*i],
+            Src::Const(c) => c,
+        }
+    }
+}
+
+/// Resolves a term against the block layout: `None` for an unbound
+/// variable, the column for a bound one, the pinned value for a constant.
+fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
+    match term {
+        RawTerm::Var(v) => view.col(*v).map(Src::Col),
+        RawTerm::Const(c) => Some(Src::Const(*c)),
+    }
+}
+
 /// The hoisted per-call context of one [`SuccinctArchiveConstraint`]
-/// protocol call: which positions hold the queried variable (`*_var`) and
-/// which columns of the block bind the other positions (`p*`). The arm
-/// dispatch this drives is structural — uniform across a block — so it is
-/// computed once per call and the per-row work is pure column reads.
+/// protocol call: which positions hold the queried variable (`*_var` —
+/// never true for a constant term) and where the other positions' values
+/// come from (`p*`: block column or pinned constant). The arm dispatch
+/// this drives is structural — uniform across a block — so it is computed
+/// once per call and the per-row work is pure reads.
 struct Positions {
     e_var: bool,
     a_var: bool,
     v_var: bool,
-    pe: Option<usize>,
-    pa: Option<usize>,
-    pv: Option<usize>,
+    pe: Option<Src>,
+    pa: Option<Src>,
+    pv: Option<Src>,
+}
+
+impl Positions {
+    #[inline]
+    fn e<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pe.as_ref().map(|s| s.get(row))
+    }
+
+    #[inline]
+    fn a<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pa.as_ref().map(|s| s.get(row))
+    }
+
+    #[inline]
+    fn v<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pv.as_ref().map(|s| s.get(row))
+    }
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -118,12 +168,12 @@ where
 {
     fn positions(&self, variable: VariableId, view: &RowsView<'_>) -> Positions {
         Positions {
-            e_var: self.variable_e == variable,
-            a_var: self.variable_a == variable,
-            v_var: self.variable_v == variable,
-            pe: view.col(self.variable_e),
-            pa: view.col(self.variable_a),
-            pv: view.col(self.variable_v),
+            e_var: self.term_e.is_var(variable),
+            a_var: self.term_a.is_var(variable),
+            v_var: self.term_v.is_var(variable),
+            pe: term_src(&self.term_e, view),
+            pa: term_src(&self.term_a, view),
+            pv: term_src(&self.term_v, view),
         }
     }
 
@@ -137,9 +187,9 @@ where
             v_var,
             ..
         } = *p;
-        let e_bound = p.pe.map(|i| &row[i]);
-        let a_bound = p.pa.map(|i| &row[i]);
-        let v_bound = p.pv.map(|i| &row[i]);
+        let e_bound = p.e(row);
+        let a_bound = p.a(row);
+        let v_bound = p.v(row);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => self.archive.entity_count,
@@ -197,130 +247,133 @@ where
             v_var,
             ..
         } = *p;
-        let e_bound = p.pe.map(|i| &row[i]);
-        let a_bound = p.pa.map(|i| &row[i]);
-        let v_bound = p.pv.map(|i| &row[i]);
+        let e_bound = p.e(row);
+        let a_bound = p.a(row);
+        let v_bound = p.v(row);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => self.archive
+            (None, None, None, true, false, false) => self
+                .archive
                 .enumerate_domain(&self.archive.e_a)
                 .for_each(&mut *push),
-            (None, None, None, false, true, false) => self.archive
+            (None, None, None, false, true, false) => self
+                .archive
                 .enumerate_domain(&self.archive.a_a)
                 .for_each(&mut *push),
-            (None, None, None, false, false, true) => self.archive
+            (None, None, None, false, false, true) => self
+                .archive
                 .enumerate_domain(&self.archive.v_a)
                 .for_each(&mut *push),
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_e_a,
-                            &r,
-                            &self.archive.eav_c,
-                            &self.archive.v_a,
-                        )
-                        .map(|x| self.archive.vea_c.access(x).unwrap())
-                        .for_each(|a| push(self.archive.domain.access(a)))
+                    .enumerate_in(
+                        &self.archive.changed_e_a,
+                        &r,
+                        &self.archive.eav_c,
+                        &self.archive.v_a,
+                    )
+                    .map(|x| self.archive.vea_c.access(x).unwrap())
+                    .for_each(|a| push(self.archive.domain.access(a)))
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_e_v,
-                            &r,
-                            &self.archive.eva_c,
-                            &self.archive.a_a,
-                        )
-                        .map(|x| self.archive.aev_c.access(x).unwrap())
-                        .for_each(|v| push(self.archive.domain.access(v)))
+                    .enumerate_in(
+                        &self.archive.changed_e_v,
+                        &r,
+                        &self.archive.eva_c,
+                        &self.archive.a_a,
+                    )
+                    .map(|x| self.archive.aev_c.access(x).unwrap())
+                    .for_each(|v| push(self.archive.domain.access(v)))
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_a_e,
-                            &r,
-                            &self.archive.aev_c,
-                            &self.archive.v_a,
-                        )
-                        .map(|x| self.archive.vae_c.access(x).unwrap())
-                        .for_each(|e| push(self.archive.domain.access(e)))
+                    .enumerate_in(
+                        &self.archive.changed_a_e,
+                        &r,
+                        &self.archive.aev_c,
+                        &self.archive.v_a,
+                    )
+                    .map(|x| self.archive.vae_c.access(x).unwrap())
+                    .for_each(|e| push(self.archive.domain.access(e)))
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_a_v,
-                            &r,
-                            &self.archive.ave_c,
-                            &self.archive.e_a,
-                        )
-                        .map(|x| self.archive.eav_c.access(x).unwrap())
-                        .for_each(|v| push(self.archive.domain.access(v)))
+                    .enumerate_in(
+                        &self.archive.changed_a_v,
+                        &r,
+                        &self.archive.ave_c,
+                        &self.archive.e_a,
+                    )
+                    .map(|x| self.archive.eav_c.access(x).unwrap())
+                    .for_each(|v| push(self.archive.domain.access(v)))
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_v_e,
-                            &r,
-                            &self.archive.vea_c,
-                            &self.archive.a_a,
-                        )
-                        .map(|x| self.archive.ave_c.access(x).unwrap())
-                        .for_each(|e| push(self.archive.domain.access(e)))
+                    .enumerate_in(
+                        &self.archive.changed_v_e,
+                        &r,
+                        &self.archive.vea_c,
+                        &self.archive.a_a,
+                    )
+                    .map(|x| self.archive.ave_c.access(x).unwrap())
+                    .for_each(|e| push(self.archive.domain.access(e)))
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
                 self.archive
-                        .enumerate_in(
-                            &self.archive.changed_v_a,
-                            &r,
-                            &self.archive.vae_c,
-                            &self.archive.e_a,
-                        )
-                        .map(|x| self.archive.eva_c.access(x).unwrap())
-                        .for_each(|a| push(self.archive.domain.access(a)))
+                    .enumerate_in(
+                        &self.archive.changed_v_a,
+                        &r,
+                        &self.archive.vae_c,
+                        &self.archive.e_a,
+                    )
+                    .map(|x| self.archive.eva_c.access(x).unwrap())
+                    .for_each(|a| push(self.archive.domain.access(a)))
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
                 restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .map(|e| self.archive.vae_c.access(e).unwrap())
-                    .unique()
-                    .for_each(|e| push(self.archive.domain.access(e)))
+                    &self.archive.domain,
+                    &self.archive.v_a,
+                    &self.archive.aev_c,
+                    v,
+                    &r,
+                )
+                .map(|e| self.archive.vae_c.access(e).unwrap())
+                .unique()
+                .for_each(|e| push(self.archive.domain.access(e)))
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.eav_c,
-                        v,
-                        &r,
-                    )
-                    .map(|a| self.archive.vea_c.access(a).unwrap())
-                    .unique()
-                    .for_each(|a| push(self.archive.domain.access(a)))
+                    &self.archive.domain,
+                    &self.archive.v_a,
+                    &self.archive.eav_c,
+                    v,
+                    &r,
+                )
+                .map(|a| self.archive.vea_c.access(a).unwrap())
+                .unique()
+                .for_each(|a| push(self.archive.domain.access(a)))
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
                 restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.eva_c,
-                        a,
-                        &r,
-                    )
-                    .map(|v| self.archive.aev_c.access(v).unwrap())
-                    .unique()
-                    .for_each(|v| push(self.archive.domain.access(v)))
+                    &self.archive.domain,
+                    &self.archive.a_a,
+                    &self.archive.eva_c,
+                    a,
+                    &r,
+                )
+                .map(|v| self.archive.aev_c.access(v).unwrap())
+                .unique()
+                .for_each(|v| push(self.archive.domain.access(v)))
             }
             _ => unreachable!(),
         }
@@ -333,9 +386,9 @@ where
 {
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
         variables
     }
 
@@ -343,8 +396,15 @@ where
     /// loop. Batching the resulting rank stream (CPU-fused or on the GPU
     /// ring) is possible exactly like confirm's and remains deferred —
     /// it only changes constants, not calls.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return false;
         }
@@ -370,8 +430,15 @@ where
     /// falls through to the per-row path. (Confirm is different: its
     /// batch is cache-friendlier even on CPU, so `confirm` always
     /// batches.)
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return;
         }
@@ -406,25 +473,43 @@ where
         type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
         let (col, range_fn): (RingCol, RangeFn<'_>) =
             match (p.pe, p.pa, p.pv, p.e_var, p.a_var, p.v_var) {
-                (None, Some(pa), Some(pv), true, false, false) => (
+                (None, Some(sa), Some(sv), true, false, false) => (
                     RingCol::VaeC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
-                        restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                        let r = base_range(&archive.domain, &archive.a_a, sa.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.v_a,
+                            &archive.aev_c,
+                            sv.get(row),
+                            &r,
+                        )
                     }),
                 ),
-                (Some(pe), None, Some(pv), false, true, false) => (
+                (Some(se), None, Some(sv), false, true, false) => (
                     RingCol::VeaC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                        restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                        let r = base_range(&archive.domain, &archive.e_a, se.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.v_a,
+                            &archive.eav_c,
+                            sv.get(row),
+                            &r,
+                        )
                     }),
                 ),
-                (Some(pe), Some(pa), None, false, false, true) => (
+                (Some(se), Some(sa), None, false, false, true) => (
                     RingCol::AevC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                        restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                        let r = base_range(&archive.domain, &archive.e_a, se.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.a_a,
+                            &archive.eva_c,
+                            sa.get(row),
+                            &r,
+                        )
                     }),
                 ),
                 _ => {
@@ -533,8 +618,15 @@ where
     /// The probe stream is evaluated CPU-batched by default, or as one
     /// `rank_batch` GPU dispatch when the archive's GPU ring is enabled
     /// and the stream is above the sync break-even threshold.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return;
         }
@@ -565,61 +657,79 @@ where
                     });
                     return;
                 }
-                (Some(pe), None, None, false, true, false) => (
+                (Some(se), None, None, false, true, false) => (
                     RingCol::EvaC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.e_a, &row[pe])
+                        base_range(&archive.domain, &archive.e_a, se.get(row))
                     }),
                 ),
-                (Some(pe), None, None, false, false, true) => (
+                (Some(se), None, None, false, false, true) => (
                     RingCol::EavC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.e_a, &row[pe])
+                        base_range(&archive.domain, &archive.e_a, se.get(row))
                     }),
                 ),
-                (None, Some(pa), None, true, false, false) => (
+                (None, Some(sa), None, true, false, false) => (
                     RingCol::AveC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.a_a, &row[pa])
+                        base_range(&archive.domain, &archive.a_a, sa.get(row))
                     }),
                 ),
-                (None, Some(pa), None, false, false, true) => (
+                (None, Some(sa), None, false, false, true) => (
                     RingCol::AevC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.a_a, &row[pa])
+                        base_range(&archive.domain, &archive.a_a, sa.get(row))
                     }),
                 ),
-                (None, None, Some(pv), true, false, false) => (
+                (None, None, Some(sv), true, false, false) => (
                     RingCol::VaeC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.v_a, &row[pv])
+                        base_range(&archive.domain, &archive.v_a, sv.get(row))
                     }),
                 ),
-                (None, None, Some(pv), false, true, false) => (
+                (None, None, Some(sv), false, true, false) => (
                     RingCol::VeaC,
                     Box::new(move |row: &[RawInline]| {
-                        base_range(&archive.domain, &archive.v_a, &row[pv])
+                        base_range(&archive.domain, &archive.v_a, sv.get(row))
                     }),
                 ),
-                (None, Some(pa), Some(pv), true, false, false) => (
+                (None, Some(sa), Some(sv), true, false, false) => (
                     RingCol::VaeC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.a_a, &row[pa]);
-                        restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, &row[pv], &r)
+                        let r = base_range(&archive.domain, &archive.a_a, sa.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.v_a,
+                            &archive.aev_c,
+                            sv.get(row),
+                            &r,
+                        )
                     }),
                 ),
-                (Some(pe), None, Some(pv), false, true, false) => (
+                (Some(se), None, Some(sv), false, true, false) => (
                     RingCol::VeaC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                        restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, &row[pv], &r)
+                        let r = base_range(&archive.domain, &archive.e_a, se.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.v_a,
+                            &archive.eav_c,
+                            sv.get(row),
+                            &r,
+                        )
                     }),
                 ),
-                (Some(pe), Some(pa), None, false, false, true) => (
+                (Some(se), Some(sa), None, false, false, true) => (
                     RingCol::AevC,
                     Box::new(move |row: &[RawInline]| {
-                        let r = base_range(&archive.domain, &archive.e_a, &row[pe]);
-                        restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, &row[pa], &r)
+                        let r = base_range(&archive.domain, &archive.e_a, se.get(row));
+                        restrict_range(
+                            &archive.domain,
+                            &archive.a_a,
+                            &archive.eva_c,
+                            sa.get(row),
+                            &r,
+                        )
                     }),
                 ),
                 _ => unreachable!("invalid trible constraint state"),
@@ -698,5 +808,31 @@ where
             i += 1;
             keep
         });
+    }
+
+    /// Exact when entity, attribute, and value all have values (bound or
+    /// constant): checks whether the archive contains that exact triple
+    /// (E→A→V range restriction, mirroring `TribleSetConstraint`'s
+    /// fully-bound EAV membership probe) for every row. Returns `true`
+    /// optimistically while any position is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match (
+            term_src(&self.term_e, view),
+            term_src(&self.term_a, view),
+            term_src(&self.term_v, view),
+        ) {
+            (Some(se), Some(sa), Some(sv)) => view.iter().all(|row| {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, se.get(row));
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.a_a,
+                    &self.archive.eva_c,
+                    sa.get(row),
+                    &r,
+                );
+                restrict_len(&self.archive.domain, &self.archive.aev_c, sv.get(row), &r) != 0
+            }),
+            _ => true,
+        }
     }
 }

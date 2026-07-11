@@ -4,8 +4,10 @@ use super::*;
 ///
 /// Created by [`Variable::is`]. The estimate is always 1, propose yields
 /// exactly the constant, and confirm retains only matching proposals.
-/// This is the simplest possible constraint and is used by the macro
-/// layer to bind attribute IDs and literal values.
+/// This is the simplest possible constraint. Note that `pattern!` does
+/// not use it for attribute constants or literal values — those are
+/// folded into the pattern constraint as constant
+/// [`Term`](crate::query::Term)s and never become variables.
 pub struct ConstantConstraint {
     variable: VariableId,
     constant: RawInline,

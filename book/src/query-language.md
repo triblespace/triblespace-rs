@@ -148,9 +148,11 @@ The snippet above keeps only the rows where `title` equals `"Dune"`.  Because
 is also handy for helpers such as `temp!` when you want to filter hidden
 bindings without exposing them in the result tuple.
 
-`pattern!` and `pattern_changes!` construct constant constraints for literal
-values automatically, so you often get the same behaviour simply by writing the
-desired value in the pattern:
+`pattern!` and `pattern_changes!` fold literal values (and attribute
+constants) directly into the pattern constraint as constant
+[`Term`](triblespace::core::query::Term)s — no variable is allocated for
+them — so you often get the same behaviour simply by writing the desired
+value in the pattern:
 
 ```rust,ignore
 find!((friend: Inline<_>),
@@ -211,12 +213,27 @@ Each branch contributes every match it can produce given the current bindings.
 In the example above, people who have both a nickname and a display name yield
 two rows—one for each attribute—because the solver keeps the union of all
 solutions to preserve the query's monotonic semantics. Branches that cannot
-match simply contribute nothing. Because each branch is still a full constraint,
-combine `or!` with `temp!` when you need hidden helpers or wrap portions in
-`ignore!` to drop positions that do not matter for a particular alternative. If
-two branches reference different variables the macro panics at runtime, so keep
-the variable sets aligned even when some branches ignore portions of a
-constraint.
+match simply contribute nothing.
+
+All branches of an `or!` must bind exactly the same set of variables;
+branch-local variables are not supported. This is a consequence of the
+engine's flat result schema — every result row binds the same variable set
+exactly once, so there is no way to represent a variable that only exists
+in some alternatives. (It is *not* a semantic or monotonicity limitation:
+the union itself is monotonic.) Attribute constants and literal values do
+not count towards a branch's variable set: `pattern!` folds them into the
+constraint as constant [`Term`](triblespace::core::query::Term)s rather
+than allocating hidden variables, which is what lets the branches above use
+*different* attributes (`nickname` vs. `display_name`) while still
+declaring the identical set `{entity, alias}`. Only genuine query variables
+must align: if two branches reference different variables the constraint
+panics at construction time, naming the mismatched sets. Note that an
+anonymous entity (`{ attr: ?v }` without an `?entity @` id) introduces a
+fresh variable scoped to its own `pattern!`, so bind entities explicitly —
+as the example does with `temp!((entity), ...)` — when combining such
+patterns with `or!`. Because each branch is still a full constraint, you
+can also wrap portions in `ignore!` to drop positions that do not matter
+for a particular alternative.
 
 ### Ignoring bindings (ignore!)
 

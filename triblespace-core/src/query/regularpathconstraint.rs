@@ -4,24 +4,24 @@ use std::collections::VecDeque;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::Inline;
+use crate::inline::IntoInline;
+use crate::inline::RawInline;
 use crate::query::confirm_per_row;
-use crate::query::CandidateSink;
-use crate::query::EstimateSink;
-use crate::query::Binding;
 use crate::query::intersectionconstraint::IntersectionConstraint;
+use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
-use crate::query::RowsView;
+use crate::query::EstimateSink;
 use crate::query::Query;
+use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::Inline;
-use crate::inline::RawInline;
-use crate::inline::IntoInline;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -188,8 +188,12 @@ fn invert(expr: PathExpr) -> PathExpr {
         PathExpr::NotAttr(a) => PathExpr::InverseNotAttr(a),
         PathExpr::InverseNotAttr(a) => PathExpr::NotAttr(a),
         // Sequence reverses: ^(a / b) = ^b / ^a
-        PathExpr::Concat(lhs, rhs) => PathExpr::Concat(Box::new(invert(*rhs)), Box::new(invert(*lhs))),
-        PathExpr::Union(lhs, rhs) => PathExpr::Union(Box::new(invert(*lhs)), Box::new(invert(*rhs))),
+        PathExpr::Concat(lhs, rhs) => {
+            PathExpr::Concat(Box::new(invert(*rhs)), Box::new(invert(*lhs)))
+        }
+        PathExpr::Union(lhs, rhs) => {
+            PathExpr::Union(Box::new(invert(*lhs)), Box::new(invert(*rhs)))
+        }
         PathExpr::Star(body) => PathExpr::Star(Box::new(invert(*body))),
         PathExpr::Plus(body) => PathExpr::Plus(Box::new(invert(*body))),
         PathExpr::Optional(body) => PathExpr::Optional(Box::new(invert(*body))),
@@ -239,15 +243,13 @@ fn distribute_concat(l: PathExpr, r: PathExpr) -> PathExpr {
             Box::new(distribute_concat(a, *c)),
         ),
         // a? / c  ↦  c | (a / c)
-        (PathExpr::Optional(a), c) => PathExpr::Union(
-            Box::new(c.clone()),
-            Box::new(distribute_concat(*a, c)),
-        ),
+        (PathExpr::Optional(a), c) => {
+            PathExpr::Union(Box::new(c.clone()), Box::new(distribute_concat(*a, c)))
+        }
         // a / b?  ↦  a | (a / b)
-        (a, PathExpr::Optional(b)) => PathExpr::Union(
-            Box::new(a.clone()),
-            Box::new(distribute_concat(a, *b)),
-        ),
+        (a, PathExpr::Optional(b)) => {
+            PathExpr::Union(Box::new(a.clone()), Box::new(distribute_concat(a, *b)))
+        }
         // Pure pattern: build the Concat directly.
         (l, r) => PathExpr::Concat(Box::new(l), Box::new(r)),
     }
@@ -338,12 +340,13 @@ fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawInline) -> HashSe
     e_prefix.copy_from_slice(&start_id);
     // Step 1: enumerate distinct attributes from this entity.
     let mut attrs: Vec<RawId> = Vec::new();
-    set.eav.infixes::<{ ID_LEN }, ID_LEN, _>(&e_prefix, |a: &[u8; ID_LEN]| {
-        if a == excluded {
-            return;
-        }
-        attrs.push(*a);
-    });
+    set.eav
+        .infixes::<{ ID_LEN }, ID_LEN, _>(&e_prefix, |a: &[u8; ID_LEN]| {
+            if a == excluded {
+                return;
+            }
+            attrs.push(*a);
+        });
     // Step 2: enumerate values per surviving attribute.
     for attr in attrs {
         let mut ea_prefix = [0u8; ID_LEN * 2];
@@ -492,7 +495,9 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
         PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
         PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
         PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, from).contains(to),
-        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, from).contains(to),
+        PathExpr::InverseNotAttr(excluded) => {
+            eval_not_attr_inverse(set, excluded, from).contains(to)
+        }
         PathExpr::Concat(lhs, rhs) if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) => {
             // Per-mid fallback (matches eval_from arm).
             for mid in eval_from(set, lhs, from) {
@@ -606,12 +611,7 @@ fn bounded_eval_from(
             results
         }
         PathExpr::Star(body) => {
-            let mut results = bounded_eval_from(
-                set,
-                &PathExpr::Plus(body.clone()),
-                start,
-                depth,
-            );
+            let mut results = bounded_eval_from(set, &PathExpr::Plus(body.clone()), start, depth);
             results.insert(*start);
             results
         }
@@ -628,9 +628,7 @@ fn bounded_eval_from(
 fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
     // Unwrap closure to get the body for estimation.
     let body = match expr {
-        PathExpr::Star(inner) | PathExpr::Plus(inner) | PathExpr::Optional(inner) => {
-            inner.as_ref()
-        }
+        PathExpr::Star(inner) | PathExpr::Plus(inner) | PathExpr::Optional(inner) => inner.as_ref(),
         other => other,
     };
     match body {
@@ -763,9 +761,10 @@ fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
     for step in &steps {
         match step {
             FirstStep::Fwd(attr) => {
-                set.aev.infixes::<ID_LEN, ID_LEN, _>(attr, |e: &[u8; ID_LEN]| {
-                    seeds.insert(id_into_value(e));
-                });
+                set.aev
+                    .infixes::<ID_LEN, ID_LEN, _>(attr, |e: &[u8; ID_LEN]| {
+                        seeds.insert(id_into_value(e));
+                    });
             }
             FirstStep::Inv(attr) => {
                 set.ave.infixes::<ID_LEN, 32, _>(attr, |v: &[u8; 32]| {
@@ -773,9 +772,10 @@ fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
                 });
             }
             FirstStep::AnyFwd => {
-                set.eav.infixes::<0, ID_LEN, _>(&[0u8; 0], |e: &[u8; ID_LEN]| {
-                    seeds.insert(id_into_value(e));
-                });
+                set.eav
+                    .infixes::<0, ID_LEN, _>(&[0u8; 0], |e: &[u8; ID_LEN]| {
+                        seeds.insert(id_into_value(e));
+                    });
             }
             FirstStep::AnyInv => {
                 set.vea.infixes::<0, 32, _>(&[0u8; 0], |v: &[u8; 32]| {
@@ -1161,6 +1161,7 @@ impl RegularPathConstraint {
             }
         }
     }
+
 }
 
 impl<'a> Constraint<'a> for RegularPathConstraint {
@@ -1211,5 +1212,19 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         confirm_per_row(view, candidates, |row, values| {
             self.confirm_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]), values);
         });
+    }
+
+    /// Exact when both endpoints are bound: checks reachability from the
+    /// bound start to the bound end (with the zero-length-path scope rule
+    /// applied) for every row. Returns `true` optimistically while either
+    /// endpoint is unbound. The same-variable case (`?x expr ?x`) is
+    /// covered naturally — both lookups read the same column.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match (view.col(self.start), view.col(self.end)) {
+            (Some(cs), Some(ce)) => view
+                .iter()
+                .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
+            _ => true,
+        }
     }
 }

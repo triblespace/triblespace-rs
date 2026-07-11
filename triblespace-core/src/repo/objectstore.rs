@@ -150,9 +150,7 @@ impl AsyncBlobStore for ObjectStoreRemote {
     type Reader = ObjectStoreReader;
     type ReaderError = Infallible;
 
-    fn reader(
-        &mut self,
-    ) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
+    fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         let reader = ObjectStoreReader {
             store: self.store.clone(),
             prefix: self.prefix.clone(),

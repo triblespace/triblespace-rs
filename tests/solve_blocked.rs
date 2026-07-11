@@ -212,6 +212,41 @@ fn gate_backend<S: TriblePattern>(kb: &S, human: Id, anchor: Id) {
     );
 }
 
+/// MERGE REGRESSION (constant folding × DAG worklist): a fully-constant
+/// pattern has ZERO variables; `Query::new` settles it with one exact
+/// `satisfied()` probe against the seed block. Every solver must honor
+/// that settlement — a satisfied constant pattern yields exactly one
+/// (empty) row, a failed one yields nothing (`solve_dag_lazy` starts
+/// with an empty worklist instead of a seed bucket).
+///
+/// Kept in its own function (not `gate_backend`): each `gate!` expands
+/// ~9 inline `Query` values, and debug builds don't reuse their stack
+/// slots — folding these into `gate_backend`'s already-large frame
+/// overflowed the default test-thread stack.
+fn gate_fully_constant<S: TriblePattern>(kb: &S, human: Id, anchor: Id) {
+    gate!(
+        "fully-constant existence check (present)",
+        find!((), pattern!(kb, [{ &anchor @ world::kind: human }]))
+    );
+    gate!(
+        "fully-constant existence check (absent) — empty",
+        find!((), pattern!(kb, [{ &anchor @ world::kind: anchor }]))
+    );
+}
+
+#[test]
+fn fully_constant_settlement_on_tribleset() {
+    let (kb, human, anchor) = build_world();
+    gate_fully_constant(&kb, human, anchor);
+}
+
+#[test]
+fn fully_constant_settlement_on_succinctarchive() {
+    let (kb, human, anchor) = build_world();
+    let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+    gate_fully_constant(&archive, human, anchor);
+}
+
 /// PROBE (group-by-ordering) skew world: two sub-populations whose rows
 /// genuinely prefer **different** next variables after `?e` is bound, so
 /// blocked-v1's single per-level choice (first row's estimates) is wrong

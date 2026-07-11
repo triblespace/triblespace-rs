@@ -56,7 +56,8 @@ impl TryFromBlob<UnknownBlob> for Bytes {
 }
 
 impl Encodes<Bytes> for UnknownBlob
-where crate::inline::encodings::hash::Handle<UnknownBlob>: crate::inline::InlineEncoding,
+where
+    crate::inline::encodings::hash::Handle<UnknownBlob>: crate::inline::InlineEncoding,
 {
     type Output = Blob<UnknownBlob>;
     fn encode(source: Bytes) -> Blob<UnknownBlob> {

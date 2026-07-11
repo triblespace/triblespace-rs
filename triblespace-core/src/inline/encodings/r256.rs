@@ -1,14 +1,14 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::TryFromInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 
 use std::convert::TryInto;
@@ -169,8 +169,7 @@ impl TryFromInline<'_, R256BE> for Ratio<i128> {
     }
 }
 
-impl Encodes<Ratio<i128>> for R256BE
-{
+impl Encodes<Ratio<i128>> for R256BE {
     type Output = Inline<R256BE>;
     fn encode(source: Ratio<i128>) -> Inline<R256BE> {
         let ratio = source.reduced();
@@ -183,8 +182,7 @@ impl Encodes<Ratio<i128>> for R256BE
     }
 }
 
-impl Encodes<i128> for R256BE
-{
+impl Encodes<i128> for R256BE {
     type Output = Inline<R256BE>;
     fn encode(source: i128) -> Inline<R256BE> {
         let mut bytes = [0; 32];
@@ -218,8 +216,7 @@ impl TryFromInline<'_, R256LE> for Ratio<i128> {
     }
 }
 
-impl Encodes<Ratio<i128>> for R256LE
-{
+impl Encodes<Ratio<i128>> for R256LE {
     type Output = Inline<R256LE>;
     fn encode(source: Ratio<i128>) -> Inline<R256LE> {
         let mut bytes = [0; 32];
@@ -230,8 +227,7 @@ impl Encodes<Ratio<i128>> for R256LE
     }
 }
 
-impl Encodes<i128> for R256LE
-{
+impl Encodes<i128> for R256LE {
     type Output = Inline<R256LE>;
     fn encode(source: i128) -> Inline<R256LE> {
         let mut bytes = [0; 32];

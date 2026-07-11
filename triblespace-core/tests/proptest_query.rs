@@ -2,6 +2,8 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 use triblespace_core::query::{EstimateSink, CandidateSink, 
@@ -9,8 +11,6 @@ use triblespace_core::query::{EstimateSink, CandidateSink,
     VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
-use triblespace_core::inline::encodings::genid::GenId;
-use triblespace_core::inline::encodings::UnknownInline;
 
 mod test_ns {
     use triblespace_core::prelude::*;

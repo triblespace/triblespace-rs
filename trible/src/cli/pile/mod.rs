@@ -66,16 +66,20 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: diagnose::Command,
     },
-    /// Repair a pile with a partial or corrupt (torn) tail.
+    /// DESTRUCTIVE: truncate a pile at its first invalid record, deleting
+    /// everything after it.
     ///
     /// This is the ONLY explicit entry point that truncates a pile: it loads
-    /// every valid record and, if the tail is torn, drops it back to the last
-    /// known-good offset. Faculties and other tools deliberately refuse to do
-    /// this on open (a stale binary hitting a newer-format record could eat
-    /// valid data), so run this by hand after confirming the tail is genuinely
-    /// corrupt.
-    Restore {
-        /// Path to the pile file to repair
+    /// every valid record and cuts the file back to the last offset THIS
+    /// binary can parse — everything past that point is permanently destroyed.
+    /// A stale binary sees newer-format records as "invalid" and will happily
+    /// amputate perfectly good data, which is why faculties and other tools
+    /// refuse to do this on open. This is last-resort surgery for a torn tail
+    /// left by a crashed write: back the file up first, confirm the tail is
+    /// genuinely a torn write (e.g. `trible pile diagnose`), and only then
+    /// run this by hand.
+    Amputate {
+        /// Path to the pile file to amputate (TRUNCATED in place)
         path: PathBuf,
     },
     /// Migrate legacy pile metadata to the current schemas.
@@ -131,15 +135,16 @@ pub enum PileCommand {
 
 /// Open a pile and load its records via `refresh`, failing loud on a
 /// corrupt or torn tail instead of silently truncating it (which
-/// `Pile::restore` would do). Deliberate repair stays an explicit,
-/// separate step: `trible pile restore <path>`.
+/// `Pile::amputate` would do). Deliberate, destructive repair stays an
+/// explicit, separate step: `trible pile amputate <path>`.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
         return Err(anyhow!(
             "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
-             truncate newer data). Repair a torn tail explicitly with: trible pile restore {}",
+             truncate newer data). If, and only if, the tail is a genuinely torn write, \
+             truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
             path.display(),
             path.display()
         ));
@@ -177,20 +182,23 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         }
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
-        PileCommand::Restore { path } => {
+        PileCommand::Amputate { path } => {
             let before = fs::metadata(&path)?.len();
             let mut pile = Pile::open(&path)?;
-            // `restore` loads every valid record and, on a torn tail, truncates
-            // the file back to the last known-good offset. This is the single
-            // place in the tree that performs that mutation.
-            pile.restore().map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
+            // `amputate` loads every valid record and, on a torn tail,
+            // TRUNCATES the file back to the last known-good offset,
+            // destroying everything after it. This is the single place in
+            // the tree that performs that mutation.
+            pile.amputate()
+                .map_err(|e| anyhow::anyhow!("amputate pile {}: {e:?}", path.display()))?;
             let after = fs::metadata(&path)?.len();
-            pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+            pile.close()
+                .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
             if after == before {
                 println!("{}: already valid ({before} bytes)", path.display());
             } else {
                 println!(
-                    "{}: repaired torn tail, {before} -> {after} bytes ({} bytes dropped)",
+                    "{}: amputated torn tail, {before} -> {after} bytes ({} bytes DESTROYED)",
                     path.display(),
                     before - after
                 );

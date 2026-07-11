@@ -100,10 +100,7 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
     ///   tagged-pointer encoding has room for the `LocalLeaf` tag in
     ///   the low 4 bits). Any `[u8; 64]` at an offset that's a
     ///   multiple of 16 from a 16-byte aligned base satisfies this.
-    pub unsafe fn new(
-        ptr: NonNull<[u8; KEY_LEN]>,
-        owner: &'a Arc<dyn ArchiveOwner>,
-    ) -> Self {
+    pub unsafe fn new(ptr: NonNull<[u8; KEY_LEN]>, owner: &'a Arc<dyn ArchiveOwner>) -> Self {
         debug_assert_eq!(
             ptr.as_ptr() as usize & 0x0f,
             0,
@@ -113,7 +110,9 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
             use siphasher::sip128::SipHasher24;
             use std::ptr::addr_of;
             let key = *addr_of!(crate::patch::SIP_KEY);
-            SipHasher24::new_with_key(&key).hash(&ptr.as_ref()[..]).into()
+            SipHasher24::new_with_key(&key)
+                .hash(&ptr.as_ref()[..])
+                .into()
         };
         Self { ptr, owner, hash }
     }

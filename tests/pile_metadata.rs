@@ -44,7 +44,7 @@ fn metadata_detects_corrupted_blob() {
     }
 
     let mut reopened: Pile = Pile::open(&path).unwrap();
-    reopened.restore().unwrap();
+    reopened.amputate().unwrap();
     let reader = reopened.reader().unwrap();
     assert!(reader.metadata(handle).unwrap().is_none());
     drop(reader);

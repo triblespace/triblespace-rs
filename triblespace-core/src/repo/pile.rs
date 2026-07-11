@@ -46,16 +46,16 @@ use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::id::Id;
 use crate::id::RawId;
+use crate::inline::encodings::hash::Blake3;
+use crate::inline::encodings::hash::Hash;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
-use crate::inline::encodings::hash::Blake3;
-use crate::inline::encodings::hash::Hash;
-use crate::inline::RawInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -109,7 +109,7 @@ fn v3_post_pad(data_len: usize) -> usize {
 /// threshold we rely on kernel atomicity and let concurrent writers hold a
 /// shared lock. Above it we switch to an exclusive-lock fallback that
 /// issues plain `write_all` calls — still append-only, still recoverable
-/// via [`Pile::restore`], just serialized with other writers for the
+/// via [`Pile::amputate`], just serialized with other writers for the
 /// duration of the large append. The margin keeps us comfortably below
 /// any platform's single-call ceiling.
 const ATOMIC_WRITE_LIMIT: usize = 1 << 30;
@@ -365,7 +365,7 @@ pub enum PileRecordContent {
 
 /// Decodes the record starting at the beginning of `bytes`, which is the pile
 /// file's content from `offset` onward. This is the single source of truth for
-/// record parsing: [`Pile::refresh`]/[`Pile::restore`] replay records through
+/// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
 /// it, and [`PileRecords`] exposes it for raw inspection. An unknown magic
 /// marker or a truncated record yields [`ReadError::CorruptPile`] pointing at
 /// `offset` — never a silent stop.
@@ -448,8 +448,7 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             })
         }
         MAGIC_MARKER_BRANCH_V3 => {
-            let (header, _) =
-                BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            let (header, _) = BranchHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
@@ -612,7 +611,8 @@ fn padding_for_blob(blob_size: usize) -> usize {
 /// the same underlying pile data.
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
-    blobs: PATCH<32, IdentitySchema, IndexEntry>,}
+    blobs: PATCH<32, IdentitySchema, IndexEntry>,
+}
 
 impl PartialEq for PileReader {
     fn eq(&self, other: &Self) -> bool {
@@ -624,9 +624,7 @@ impl Eq for PileReader {}
 
 impl PileReader {
     fn new(mmap: Arc<MmapRaw>, blobs: PATCH<32, IdentitySchema, IndexEntry>) -> Self {
-        Self {
-            mmap,
-            blobs,        }
+        Self { mmap, blobs }
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -643,7 +641,8 @@ impl PileReader {
         PileBlobStoreIter {
             mmap: self.mmap.clone(),
             inner,
-            lookup,        }
+            lookup,
+        }
     }
 
     // metadata moved into BlobStoreMeta impl below
@@ -887,8 +886,9 @@ impl Pile {
     /// equivalent if you need a fresh pile.
     ///
     /// The returned pile has no in-memory index; callers should invoke
-    /// [`Self::refresh`] to load existing data or [`Self::restore`] to repair and load
-    /// after a crash.
+    /// [`Self::refresh`] to load existing data. After a crash left a torn
+    /// tail, [`Self::amputate`] loads and **truncates the file at the first
+    /// invalid record** — a destructive last resort, not an open path.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
         let length = file.metadata()?.len() as usize;
@@ -922,7 +922,7 @@ impl Pile {
     /// would invalidate existing `Bytes` handles and continuing would result in
     /// undefined behavior.
     ///
-    /// This acquires a shared file lock to avoid racing with [`Self::restore`],
+    /// This acquires a shared file lock to avoid racing with [`Self::amputate`],
     /// which takes an exclusive lock before truncating.
     pub fn refresh(&mut self) -> Result<(), ReadError> {
         self.file.lock_shared()?;
@@ -1046,14 +1046,24 @@ impl Pile {
         Ok(())
     }
 
-    /// Restores a pile after a partial or corrupt append.
+    /// Amputates the pile's tail: **TRUNCATES the file at the first invalid
+    /// record, destroying everything after it.**
+    ///
+    /// This is a last-resort surgical recovery for a torn tail left by a
+    /// crashed or interrupted append — never a routine open path. Everything
+    /// past the first record this binary cannot parse is *gone from disk*,
+    /// including data that a newer binary would have read fine (a stale
+    /// binary sees newer record formats as corruption and would amputate
+    /// them). If you are not certain the tail is a torn write, take a copy
+    /// of the file first and prefer the non-mutating [`Self::refresh`],
+    /// which fails loud without touching the file.
     ///
     /// The method first attempts a regular [`Self::refresh`]. If corruption is
     /// detected, it acquires an exclusive lock, re-attempts the refresh and,
     /// upon confirming the corruption, truncates the pile to the last known
     /// good offset. The exclusive lock blocks other readers so truncation
     /// cannot race with [`Self::refresh`].
-    pub fn restore(&mut self) -> Result<(), ReadError> {
+    pub fn amputate(&mut self) -> Result<(), ReadError> {
         match self.refresh() {
             Ok(()) => Ok(()),
             Err(ReadError::CorruptPile { .. }) => {
@@ -1144,11 +1154,11 @@ pub struct PileBlobStoreIter {
     mmap: Arc<MmapRaw>,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
     /// Owned clone of the PATCH used for lookups of IndexEntry by key.
-    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,}
+    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,
+}
 
 impl Iterator for PileBlobStoreIter {
-    type Item =
-        Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
+    type Item = Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.inner.next()?; // [u8;32]
@@ -1180,8 +1190,7 @@ impl Iterator for PileBlobStoreIter {
                     // We just validated against `hash`; pre-seed the
                     // cached handle so downstream `get_handle` /
                     // `insert` skip the Blake3 recompute.
-                    let blob: Blob<UnknownBlob> =
-                        Blob::with_handle(bytes.clone(), handle);
+                    let blob: Blob<UnknownBlob> = Blob::with_handle(bytes.clone(), handle);
                     Some(Ok((handle, blob)))
                 }
                 ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes.clone()))),
@@ -1197,7 +1206,8 @@ impl Iterator for PileBlobStoreIter {
 /// Adapter that yields only the blob handles. The iterator owns the handle
 /// list and does not borrow the backing [`PATCH`].
 pub struct PileBlobStoreListIter {
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,}
+    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
+}
 
 impl Iterator for PileBlobStoreListIter {
     type Item = Result<Inline<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
@@ -1220,8 +1230,7 @@ impl BlobStoreList for PileReader {
         // being cheap (PATCH clone is copy-on-write).
         let cloned = self.blobs.clone();
         let inner = cloned.into_iter();
-        PileBlobStoreListIter {
-            inner,        }
+        PileBlobStoreListIter { inner }
     }
 
     /// Cheap PATCH-level set difference between this reader's blob index
@@ -1231,7 +1240,8 @@ impl BlobStoreList for PileReader {
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         let diff = self.blobs.difference(&old.blobs);
         PileBlobStoreListIter {
-            inner: diff.into_iter(),        }
+            inner: diff.into_iter(),
+        }
     }
 }
 
@@ -1266,7 +1276,7 @@ impl BlobStorePut for Pile {
     /// hold a shared file lock and proceed concurrently. Larger records
     /// take an exclusive lock and append via plain `write_all`, trading
     /// concurrency for reach — the recovery path
-    /// ([`Pile::restore`]) truncates any partial tail left by a crash,
+    /// ([`Pile::amputate`]) truncates any partial tail left by a crash,
     /// so a multi-`write` record is still crash-safe. Multiple writers
     /// are safe only on filesystems guaranteeing atomic `write`/`vwrite`
     /// appends; other filesystems may corrupt the pile.
@@ -1359,7 +1369,7 @@ impl Pile {
             } else {
                 // Separate `write_all` calls — payload dominates, so the extra
                 // syscalls for header/padding are negligible. Any partial
-                // completion after a crash is caught by `restore`.
+                // completion after a crash is caught by `amputate`.
                 self.file.write_all(header.as_bytes())?;
                 self.file.write_all(blob.bytes.as_ref())?;
                 if padding > 0 {
@@ -1395,9 +1405,7 @@ impl Pile {
     }
 }
 
-impl PinStore for Pile
-{
-
+impl PinStore for Pile {
     type PinsError = ReadError;
     // Pulling a head may require refreshing the pile which can fail; expose
     // the underlying `ReadError` so callers can surface refresh failures.
@@ -1710,7 +1718,7 @@ mod tests {
         pile.close().unwrap();
 
         let mut reopened: Pile = Pile::open(&tmp_pile).unwrap();
-        reopened.restore().unwrap();
+        reopened.amputate().unwrap();
         reopened.close().unwrap();
     }
 
@@ -1739,9 +1747,13 @@ mod tests {
         }
         // Reopen fresh — the scan rebuilds the index from the on-disk V3 records.
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
-            let entry = pile.blobs.get(&hash.raw).expect("V3 blob missing after reopen").clone();
+            let entry = pile
+                .blobs
+                .get(&hash.raw)
+                .expect("V3 blob missing after reopen")
+                .clone();
             let IndexEntry { offset, len, .. } = entry;
             assert_eq!(
                 offset % GPU_DATA_ALIGNMENT,
@@ -1749,17 +1761,21 @@ mod tests {
                 "V3 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
                 expected.len()
             );
-            let got = unsafe {
-                std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize)
-            };
-            assert_eq!(got, &expected[..], "V3 roundtrip mismatch (size {})", expected.len());
+            let got =
+                unsafe { std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize) };
+            assert_eq!(
+                got,
+                &expected[..],
+                "V3 roundtrip mismatch (size {})",
+                expected.len()
+            );
         }
         pile.close().unwrap();
     }
 
     /// The whole point of uniform-V3: `cat a.pile >> b.pile` is a valid merge —
     /// every record from both piles is found and byte-correct, the data stays
-    /// 256-aligned, and `restore()` does not truncate the concatenation as
+    /// 256-aligned, and `amputate()` does not truncate the concatenation as
     /// corrupt. This is what an offset-derived pad could never survive.
     #[test]
     fn v3_cat_merge_preserves_all_blobs_and_alignment() {
@@ -1793,20 +1809,29 @@ mod tests {
 
         // Each pure-V3 pile is a whole number of 256-byte units — the precondition
         // that makes the appended pile land on a 256-aligned offset.
-        assert_eq!(std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64, 0);
-        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        assert_eq!(
+            std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
+        assert_eq!(
+            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
 
         // cat a.pile >> b.pile
         {
             let a_bytes = std::fs::read(&path_a).unwrap();
-            let mut bf = std::fs::OpenOptions::new().append(true).open(&path_b).unwrap();
+            let mut bf = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path_b)
+                .unwrap();
             bf.write_all(&a_bytes).unwrap();
             bf.sync_all().unwrap();
         }
         let merged_len = std::fs::metadata(&path_b).unwrap().len();
 
         let mut merged: Pile = Pile::open(&path_b).unwrap();
-        merged.restore().unwrap();
+        merged.amputate().unwrap();
         assert_eq!(
             std::fs::metadata(&path_b).unwrap().len(),
             merged_len,
@@ -1819,13 +1844,21 @@ mod tests {
                 .expect("blob lost after cat-merge")
                 .clone();
             let IndexEntry { offset, len, .. } = entry;
-            assert_eq!(offset % V3_ALIGNMENT, 0, "post-cat data offset not 256-aligned");
-            let got =
-                unsafe { std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize) };
+            assert_eq!(
+                offset % V3_ALIGNMENT,
+                0,
+                "post-cat data offset not 256-aligned"
+            );
+            let got = unsafe {
+                std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize)
+            };
             assert_eq!(got, &expected[..], "blob bytes wrong after cat-merge");
         }
         // Still 256-aligned, so it can be cat'd again.
-        assert_eq!(std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64, 0);
+        assert_eq!(
+            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            0
+        );
         merged.close().unwrap();
     }
 
@@ -1849,7 +1882,7 @@ mod tests {
             f.sync_all().unwrap();
         }
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let reader = pile.reader().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(
@@ -1859,7 +1892,6 @@ mod tests {
         );
         pile.close().unwrap();
     }
-
 
     #[test]
     fn recover_shrink() {
@@ -1879,7 +1911,7 @@ mod tests {
         file.set_len(len - 10).unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
@@ -1913,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_truncates_unknown_magic() {
+    fn amputate_truncates_unknown_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -1934,7 +1966,7 @@ mod tests {
             .unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
     }
@@ -2003,7 +2035,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_truncates_length_beyond_file() {
+    fn amputate_truncates_length_beyond_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -2028,7 +2060,7 @@ mod tests {
         drop(file);
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         pile.close().unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
@@ -2052,7 +2084,7 @@ mod tests {
         pile.close().unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let reader = pile.reader().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
@@ -2217,7 +2249,7 @@ mod tests {
         pile.close().unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let head = pile.head(branch_id).unwrap();
         assert_eq!(head, Some(handle1.transmute()));
         pile.close().unwrap();
@@ -2242,7 +2274,7 @@ mod tests {
         };
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         assert_eq!(pile.head(branch_id).unwrap(), Some(handle.transmute()));
         assert!(std::fs::metadata(&path).unwrap().len() > 0);
         pile.close().unwrap();
@@ -2348,7 +2380,7 @@ mod tests {
         pile.close().unwrap();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let reader = pile.reader().unwrap();
         let meta = reader.metadata(handle).unwrap().expect("metadata");
         assert_eq!(meta.length, 32);
@@ -2430,7 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_truncates_corrupt_tail() {
+    fn amputate_truncates_corrupt_tail() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -2450,7 +2482,7 @@ mod tests {
             file.sync_all().unwrap();
         }
 
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
 
         // Blobs are now written as V3 records (fixed 256-byte header, padded to a
         // 256-byte multiple).
@@ -2650,7 +2682,7 @@ mod tests {
         pile.close().unwrap();
 
         let mut reopened: Pile = Pile::open(&path).unwrap();
-        reopened.restore().unwrap();
+        reopened.amputate().unwrap();
         let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(
@@ -2688,7 +2720,7 @@ mod tests {
 
         // The same resolution must fall out of a fresh log replay.
         let mut reopened: Pile = Pile::open(&path).unwrap();
-        reopened.restore().unwrap();
+        reopened.amputate().unwrap();
         let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(pinned.contains(&a));
@@ -2736,7 +2768,10 @@ mod tests {
             let v1_hash: Inline<Hash<Blake3>> = v1_handle.into();
             let header = BlobHeader::new(42, v1_data.len() as u64, v1_hash);
             let pad = padding_for_blob(v1_data.len());
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(header.as_bytes()).unwrap();
             f.write_all(&v1_data).unwrap();
             f.write_all(&vec![0u8; pad]).unwrap();
@@ -2750,7 +2785,7 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![12u8; 13])).get_handle();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
 
         // Interleave: weak-pin, V3 blob, branch head, weak-pin + weak-unpin,
         // another V3 blob.
@@ -2768,7 +2803,7 @@ mod tests {
 
         // Fresh scan must walk the whole interleaved sequence.
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
 
         let reader = pile.reader().unwrap();
         let got_v1: Blob<UnknownBlob> = reader.get(v1_handle).unwrap();
@@ -2805,7 +2840,10 @@ mod tests {
             let v1_hash: Inline<Hash<Blake3>> = v1_handle.into();
             let header = BlobHeader::new(42, v1_data.len() as u64, v1_hash);
             let pad = padding_for_blob(v1_data.len());
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(header.as_bytes()).unwrap();
             f.write_all(&v1_data).unwrap();
             f.write_all(&vec![0u8; pad]).unwrap();
@@ -2817,7 +2855,7 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![11u8; 13])).get_handle();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
@@ -2899,7 +2937,10 @@ mod tests {
         // A garbage tail is an error at its offset, then the iterator ends.
         let garbage_offset = std::fs::metadata(&path).unwrap().len() as usize;
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(&[0xFFu8; 32]).unwrap();
             f.sync_all().unwrap();
         }
@@ -2954,10 +2995,10 @@ mod tests {
 
         pile.close().unwrap();
 
-        // Round-trip across open+restore to ensure the on-disk record
+        // Round-trip across open+amputate to ensure the on-disk record
         // is fully self-describing and recoverable.
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.restore().unwrap();
+        pile.amputate().unwrap();
         let reader = pile.reader().unwrap();
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());

@@ -44,7 +44,11 @@ fn one<O: KeySchema<TRIBLE_LEN>>(name: &str, keys: &[Key]) {
             .map(|f| hist[f] * (bucket.max(next_pow2(f)) as u64))
             .sum();
         let idx = (branches * 64 + slots * 8) as f64 / n;
-        let tag = if bucket == 2 { " (model vs measured ↑)" } else { "" };
+        let tag = if bucket == 2 {
+            " (model vs measured ↑)"
+        } else {
+            ""
+        };
         print!("  b{bucket}={slots} ({idx:.1} B/tr){tag}");
     }
     println!();

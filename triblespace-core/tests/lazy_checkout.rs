@@ -14,8 +14,8 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::prelude::*;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::lazy::WantGetError;
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::WorkspaceCheckoutError;
 
 mod test_ns {
@@ -30,8 +30,8 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     let key = SigningKey::from_bytes(&[7u8; 32]);
 
     // ── Source repo: one branch, one commit ──────────────────────────
-    let mut repo_a = Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new())
-        .expect("source repo");
+    let mut repo_a =
+        Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).expect("source repo");
     let branch_id = *repo_a.create_branch("main", None).expect("create branch");
     let mut ws = repo_a.pull(branch_id).expect("pull");
 
@@ -41,9 +41,8 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     repo_a.push(&mut ws).expect("push");
 
     // The commit's content blob — the one we withhold from the replica.
-    let content_blob: Blob<
-        triblespace_core::blob::encodings::simplearchive::SimpleArchive,
-    > = data.to_blob();
+    let content_blob: Blob<triblespace_core::blob::encodings::simplearchive::SimpleArchive> =
+        data.to_blob();
     let content_handle = content_blob.get_handle();
 
     // ── Replica: everything EXCEPT the content blob ──────────────────
@@ -70,9 +69,10 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
 
     // ── Lazy checkout over the wrapped replica ─────────────────────
     let lazy = Lazy::new(replica);
-    let mut repo_b =
-        Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
-    let mut ws_b = repo_b.pull(branch_id).expect("pull succeeds — branch meta + commit present");
+    let mut repo_b = Repository::new(lazy, key, TribleSet::new()).expect("replica repo");
+    let mut ws_b = repo_b
+        .pull(branch_id)
+        .expect("pull succeeds — branch meta + commit present");
 
     let err = ws_b
         .checkout(..)

@@ -49,9 +49,9 @@ use constantconstraint::*;
 pub use ignore::IgnoreConstraint;
 
 use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -74,17 +74,21 @@ pub trait TriblePattern {
         Self: 'a;
 
     /// Create a constraint for a given trible pattern.
-    /// The method takes three variables, one for each part of the trible.
+    /// Each position takes a [`Term`]: either a [`Variable`] to solve for
+    /// or a constant [`Inline`] value baked into the constraint (a constant
+    /// position behaves exactly like a variable the engine has already
+    /// bound, but never appears in the constraint's [`VariableSet`]).
     /// The schemas of the entities and attributes are always [GenId], while the value
     /// schema can be any type implementing [InlineEncoding] and is specified as a type parameter.
     ///
     /// This method is usually not called directly, but rather through typed query language
-    /// macros like [pattern!][crate::macros::pattern].
+    /// macros like [pattern!][crate::macros::pattern], which pass attribute
+    /// constants and literal values as constant terms.
     fn pattern<'a, V: InlineEncoding>(
         &'a self,
-        e: Variable<GenId>,
-        a: Variable<GenId>,
-        v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a>;
 }
 
@@ -173,6 +177,96 @@ impl<T: InlineEncoding> Variable<T> {
             )
         });
         Inline::as_transmute_raw(raw)
+    }
+}
+
+/// One position of a triple pattern: either a [`Variable`] the engine
+/// solves for, or a constant [`Inline`] value pinned at construction.
+///
+/// Constants are how the macro layer expresses attribute constants and
+/// literal values without allocating hidden helper variables. A constant
+/// position behaves exactly like a variable that is already bound — the
+/// backends' bound/unbound dispatch handles it with no extra cases — but
+/// it never appears in the constraint's [`VariableSet`]. This keeps the
+/// visible variable set of a `pattern!` equal to the query variables the
+/// user actually wrote, which is what makes
+/// [`or!`](crate::or) over patterns with different attributes or literals
+/// well-formed (all arms declare the same set).
+#[derive(Debug)]
+pub enum Term<T: InlineEncoding> {
+    /// A variable to solve for.
+    Var(Variable<T>),
+    /// A constant value pinned at construction.
+    Const(Inline<T>),
+}
+
+impl<T: InlineEncoding> Copy for Term<T> {}
+
+impl<T: InlineEncoding> Clone for Term<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: InlineEncoding> From<Variable<T>> for Term<T> {
+    fn from(v: Variable<T>) -> Self {
+        Term::Var(v)
+    }
+}
+
+impl<T: InlineEncoding> From<Inline<T>> for Term<T> {
+    fn from(c: Inline<T>) -> Self {
+        Term::Const(c)
+    }
+}
+
+impl<T: InlineEncoding> Term<T> {
+    /// Erases the schema type, yielding the runtime representation
+    /// constraint implementations store.
+    pub fn erase(self) -> RawTerm {
+        match self {
+            Term::Var(v) => RawTerm::Var(v.index),
+            Term::Const(c) => RawTerm::Const(c.raw),
+        }
+    }
+}
+
+/// Untyped runtime form of a [`Term`]: a variable slot index or a pinned
+/// 32-byte value. Constraint implementations store this and use
+/// [`is_var`](RawTerm::is_var) / [`bound`](RawTerm::bound) in place of the
+/// raw `VariableId` comparison and `Binding::get` lookup — a constant term
+/// then flows through the existing bound-position dispatch for free.
+#[derive(Clone, Copy, Debug)]
+pub enum RawTerm {
+    /// A variable slot index.
+    Var(VariableId),
+    /// A pinned raw value.
+    Const(RawInline),
+}
+
+impl RawTerm {
+    /// Returns `true` when this term is the given variable.
+    #[inline]
+    pub fn is_var(&self, variable: VariableId) -> bool {
+        matches!(self, RawTerm::Var(v) if *v == variable)
+    }
+
+    /// Returns the term's value under `binding`: the pinned value for a
+    /// constant, the binding's value (if any) for a variable.
+    #[inline]
+    pub fn bound<'b>(&'b self, binding: &'b Binding) -> Option<&'b RawInline> {
+        match self {
+            RawTerm::Var(v) => binding.get(*v),
+            RawTerm::Const(c) => Some(c),
+        }
+    }
+
+    /// Adds the term's variable (if it is one) to `set`.
+    #[inline]
+    pub fn add_to(&self, set: &mut VariableSet) {
+        if let RawTerm::Var(v) = self {
+            set.set(*v);
+        }
     }
 }
 
@@ -695,6 +789,26 @@ pub trait Constraint<'a> {
     /// Called on the constraint with the lowest estimate for the variable
     /// being bound. Does nothing when `variable` is not constrained by
     /// this constraint.
+    ///
+    /// # Protocol law: the sink is always empty
+    ///
+    /// `propose` is always handed an **empty** sink. The engine clears the
+    /// candidate sink before every call, and composite constraints must
+    /// preserve the invariant when delegating: every candidate in the sink
+    /// belongs to the callee, which may therefore append, filter, sort, and
+    /// deduplicate the sink freely (an
+    /// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
+    /// lets its tightest child propose and then filters the sink through the
+    /// remaining children's [`confirm`](Constraint::confirm)).
+    ///
+    /// The dual obligation falls on composites that invoke more than one
+    /// child `propose` for the same sink:
+    /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+    /// hands each variant its own empty buffer and merges the independent
+    /// outputs afterwards. Sharing one sink across variants would let a
+    /// filtering variant delete candidates another variant produced — the
+    /// result would depend on variant order and adding data could remove
+    /// results, violating the substrate's monotonicity guarantee.
     fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>);
 
     /// Filters `candidates`, removing `(row, value)` candidates whose
@@ -709,10 +823,23 @@ pub trait Constraint<'a> {
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
     ///
-    /// The default implementation returns `true`. Override this when the
-    /// constraint can cheaply detect that no solution exists — for
-    /// example, a `TribleSetConstraint` whose entity, attribute, and
-    /// value are all bound but the triple is absent from the dataset.
+    /// # Protocol law: exact when fully bound
+    ///
+    /// While at least one of this constraint's variables is unbound,
+    /// `satisfied` may answer an optimistic `true` (the default
+    /// implementation). Once **all** of the constraint's variables are
+    /// bound (in every row of the block) the answer MUST be exact: `true`
+    /// if and only if the bound values jointly satisfy the constraint in
+    /// every row — for example, a `TribleSetConstraint` whose entity,
+    /// attribute, and value are all bound must perform the membership
+    /// check rather than defaulting to `true`.
+    ///
+    /// Exactness is a soundness requirement, not an optimisation:
+    /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+    /// relies on `satisfied` to detect dead variants when it propose/confirms
+    /// *other* variables of the union. A leaf that leaves the optimistic
+    /// default lets a dead variant keep proposing, producing rows that no
+    /// single variant would accept.
     ///
     /// Composite constraints propagate this check to their children with
     /// single-row views: [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
@@ -1067,10 +1194,27 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             variable_order_key(estimates[*v], base_estimates[*v], influences[*v].count())
         });
 
+        // Constraints whose variables are all constant [`Term`]s (e.g. a
+        // fully-constant `pattern!` used as an existence check) have an
+        // empty variable set, so the propose/confirm search never consults
+        // them. Their truth is binding-independent and `satisfied` is exact
+        // for them from the start (the fully-bound exactness law: zero
+        // unbound variables). One check up front settles every such
+        // subtree; constraints with unbound variables answer an optimistic
+        // `true` here and are validated by the search as usual.
+        // `RowsView::EMPTY` is the seed block (a single zero-width row —
+        // the empty binding), so this is the block-native form of the
+        // empty-binding probe.
+        let mode = if constraint.satisfied(&RowsView::EMPTY) {
+            Search::NextVariable
+        } else {
+            Search::Done
+        };
+
         Query {
             constraint,
             postprocessing,
-            mode: Search::NextVariable,
+            mode,
             influences,
             estimates,
             base_estimates,
@@ -1721,15 +1865,27 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             postprocessing,
             influences,
             base_estimates,
+            mode,
             ..
         } = self;
         let full = constraint.variables();
+        let mut state = DagState::new(full);
+        // [`Query::new`] settles zero-variable (fully-constant) constraints
+        // with one exact `satisfied` probe against the seed block; when the
+        // probe failed the query is already `Done`. The DAG worklist never
+        // consults zero-variable constraints (they have no unbound
+        // variables to propose for), so honor the settlement here by
+        // starting with an empty worklist — the DAG engine then agrees
+        // with the sequential engine's empty result multiset.
+        if matches!(mode, Search::Done) {
+            state.buckets.clear();
+        }
         DagIter {
             constraint,
             postprocessing,
             influences,
             base_estimates,
-            state: DagState::new(full),
+            state,
         }
     }
 }
@@ -2487,9 +2643,7 @@ pub use parallel::QueryParIter;
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
-    };
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over the results of a [`Query`]. Obtained via
@@ -2668,7 +2822,6 @@ mod parallel {
             bridge_unindexed(self, consumer)
         }
     }
-
 }
 
 /// Iterate over query results, converting each variable via

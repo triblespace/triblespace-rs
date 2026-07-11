@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
 use triblespace::prelude::*;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::BlobStoreMeta;
 use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
-use triblespace_core::inline::encodings::hash::Handle;
 
 type NameHandle = Inline<Handle<blobencodings::LongString>>;
 type BranchMetaHandle = Inline<Handle<blobencodings::SimpleArchive>>;
@@ -141,7 +141,7 @@ fn migrate_branch_metadata_name(
     rename_duplicates: bool,
 ) -> Result<()> {
     // The migration rewrites this pile in place, but opening it must still be
-    // fail-loud: a corrupt tail is repaired explicitly (`trible pile restore`),
+    // fail-loud: a corrupt tail is amputated explicitly (`trible pile amputate`),
     // never as a silent side effect of running a migration.
     let mut pile = super::open_refreshed(pile_path)?;
 
@@ -285,10 +285,7 @@ fn legacy_branch_name(meta: &TribleSet) -> Result<Option<String>> {
     Ok(Some(name))
 }
 
-fn load_branch_name(
-    reader: &impl BlobStoreGet,
-    meta: &TribleSet,
-) -> Result<Option<String>> {
+fn load_branch_name(reader: &impl BlobStoreGet, meta: &TribleSet) -> Result<Option<String>> {
     let mut names = find!(
         (handle: NameHandle),
         pattern!(meta, [{ triblespace_core::metadata::name: ?handle }])

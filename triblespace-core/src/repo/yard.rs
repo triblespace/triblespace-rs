@@ -26,7 +26,7 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::pile::{GetBlobError, InsertError, Pile, PileReader, ReadError, PileWriteError};
+use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
 use super::{
     reachable, transfer, BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, StorageClose, TransferError, WeakPinStore,
@@ -202,8 +202,8 @@ impl Yard {
     ///
     /// Fails loud on corruption: a generation pile with an invalid tail
     /// surfaces as [`YardOpenError::Pile`] naming the file, and **nothing is
-    /// truncated**. Repair is an explicit opt-in via [`Yard::restore`]
-    /// (mirroring [`Pile::refresh`] vs [`Pile::restore`]).
+    /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
+    /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
     /// The weak-pin state is rebuilt from the durable weak-pin markers found
     /// in the generation piles (old to young, so the young generation's
@@ -219,13 +219,12 @@ impl Yard {
         Self::open_impl(paths, config, false)
     }
 
-    /// Open an existing yard, **repairing** each generation pile first:
-    /// any invalid tail (for example a torn write left by a crash) is
-    /// truncated back to the last valid record, exactly like
-    /// [`Pile::restore`]. This is the explicit opt-in counterpart to the
-    /// fail-loud [`Yard::open`] — reach for it only after `open` reported
+    /// Open an existing yard, **amputating** each generation pile first:
+    /// every generation file is **TRUNCATED at its first invalid record,
+    /// destroying everything after it**, exactly like [`Pile::amputate`].
+    /// This is the explicit opt-in counterpart to the fail-loud [`Yard::open`] — reach for it only after `open` reported
     /// corruption and losing the invalid tail is acceptable.
-    pub fn restore<P>(
+    pub fn amputate<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
     ) -> Result<Self, YardOpenError>
@@ -251,7 +250,7 @@ impl Yard {
                 err,
             })?;
             let load = if repair {
-                pile.restore()
+                pile.amputate()
             } else {
                 pile.refresh()
             };
@@ -310,11 +309,9 @@ impl Yard {
         Handle<S>: InlineEncoding,
     {
         let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        self.generations.get(level).is_some_and(|g| {
-            g.segments
-                .iter()
-                .any(|s| s.live.get(&handle.raw).is_some())
-        })
+        self.generations
+            .get(level)
+            .is_some_and(|g| g.segments.iter().any(|s| s.live.get(&handle.raw).is_some()))
     }
 
     /// Strongly pin a blob as the current head for `pin`.
@@ -405,8 +402,9 @@ impl Yard {
             let strong_keep = self.strong_keep_set(&reader);
 
             for level in 0..last {
-                let strong_here =
-                    self.generations[level].segments[0].live.intersect(&strong_keep);
+                let strong_here = self.generations[level].segments[0]
+                    .live
+                    .intersect(&strong_keep);
                 if strong_here.len() as usize <= self.strong_budget_for(level) {
                     continue;
                 }
@@ -1018,7 +1016,7 @@ pub enum YardOpenError {
     /// A generation pile failed to open or validate. A
     /// [`ReadError::CorruptPile`] here means the named generation file has
     /// an invalid tail; nothing was truncated — repair explicitly with
-    /// [`Yard::restore`] if losing the tail is acceptable.
+    /// [`Yard::amputate`] if losing the tail is acceptable.
     Pile {
         /// The generation pile file that failed.
         path: PathBuf,
@@ -1034,7 +1032,11 @@ impl fmt::Display for YardOpenError {
             Self::NoGenerations => write!(f, "yard requires at least one generation"),
             Self::Io(err) => write!(f, "failed to create yard pile file: {err}"),
             Self::Pile { path, err } => {
-                write!(f, "failed to open yard generation pile {}: {err}", path.display())
+                write!(
+                    f,
+                    "failed to open yard generation pile {}: {err}",
+                    path.display()
+                )
             }
             Self::List(err) => write!(f, "failed to list yard pile: {err}"),
         }
@@ -1258,8 +1260,7 @@ mod tests {
         // `child` enters the cache the demand-born way: weak-pinned while
         // absent (the want), then fetched. It is reachable from a strong
         // parent, yet the weak veto still makes it evictable.
-        let child =
-            Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
+        let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
         yard.pin_weak(child).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
             .unwrap();
@@ -1461,8 +1462,7 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
 
         // A pure want: pinned while absent, never fetched.
-        let want =
-            Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
+        let want = Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
         yard.pin_weak(want).unwrap();
         // A demand-fetched cache entry: pinned while absent, then put.
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached")).get_handle();
@@ -1538,7 +1538,7 @@ mod tests {
 
     /// The fail-loud posture: opening a yard whose generation pile has a
     /// corrupt tail must surface the corruption (naming the file) WITHOUT
-    /// truncating anything; `Yard::restore` is the explicit opt-in repair.
+    /// truncating anything; `Yard::amputate` is the explicit opt-in repair.
     #[test]
     fn open_fails_loud_on_corrupt_generation_without_truncating() {
         use std::io::Write;
@@ -1549,10 +1549,7 @@ mod tests {
 
         // Corrupt the tail: append garbage that is not a valid record.
         {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&paths[0])
-                .unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(&paths[0]).unwrap();
             file.write_all(&[0xFF; 64]).unwrap();
             file.sync_all().unwrap();
         }
@@ -1576,9 +1573,9 @@ mod tests {
             "fail-loud open must not truncate the generation pile"
         );
 
-        // Explicit repair: restore truncates the invalid tail and the
+        // Explicit repair: amputate truncates the invalid tail and the
         // valid prefix stays readable.
-        let mut repaired = Yard::restore(paths.clone(), YardConfig::default()).unwrap();
+        let mut repaired = Yard::amputate(paths.clone(), YardConfig::default()).unwrap();
         assert!(fs::metadata(&paths[0]).unwrap().len() < corrupt_len);
         let reader = repaired.reader().unwrap();
         assert_eq!(get_raw(&reader, live).unwrap(), raw_blob(b"survivor"));

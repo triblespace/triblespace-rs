@@ -561,16 +561,14 @@ pub trait TryFromInline<'a, S: InlineEncoding>: Sized {
     fn try_from_inline(v: &'a Inline<S>) -> Result<Self, Self::Error>;
 }
 
-impl<S: InlineEncoding> Encodes<Inline<S>> for S
-{
+impl<S: InlineEncoding> Encodes<Inline<S>> for S {
     type Output = Inline<S>;
     fn encode(source: Inline<S>) -> Inline<S> {
         source
     }
 }
 
-impl<S: InlineEncoding> Encodes<&Inline<S>> for S
-{
+impl<S: InlineEncoding> Encodes<&Inline<S>> for S {
     type Output = Inline<S>;
     fn encode(source: &Inline<S>) -> Inline<S> {
         *source

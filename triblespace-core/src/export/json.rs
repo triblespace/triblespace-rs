@@ -5,6 +5,14 @@ use std::fmt::Write as FmtWrite;
 use crate::and;
 use crate::blob::encodings::longstring::LongString;
 use crate::id::Id;
+use crate::inline::encodings::boolean::Boolean;
+use crate::inline::encodings::f64::F64;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::encodings::UnknownInline;
+use crate::inline::Inline;
+use crate::inline::IntoInline;
+use crate::inline::RawInline;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::prelude::{find, pattern};
@@ -12,14 +20,6 @@ use crate::query::TriblePattern;
 use crate::repo::BlobStoreGet;
 use crate::temp;
 use crate::trible::TribleSet;
-use crate::inline::encodings::boolean::Boolean;
-use crate::inline::encodings::f64::F64;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::hash::{Blake3, Handle, Hash};
-use crate::inline::encodings::UnknownInline;
-use crate::inline::RawInline;
-use crate::inline::IntoInline;
-use crate::inline::Inline;
 use anybytes::View;
 use ryu::Buffer;
 
@@ -181,8 +181,7 @@ fn render_schema_value(
     static BOOLEAN_ID: LazyLock<Id> = LazyLock::new(Boolean::id);
     static F64_ID: LazyLock<Id> = LazyLock::new(F64::id);
     static GENID_ID: LazyLock<Id> = LazyLock::new(GenId::id);
-    static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> =
-        LazyLock::new(Handle::<LongString>::id);
+    static HANDLE_BLAKE3_LONGSTRING_ID: LazyLock<Id> = LazyLock::new(Handle::<LongString>::id);
 
     if schema == *BOOLEAN_ID {
         let value = value.transmute::<Boolean>();

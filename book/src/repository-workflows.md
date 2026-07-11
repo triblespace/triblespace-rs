@@ -496,8 +496,8 @@ fn merge_import_example(
 ) -> anyhow::Result<()> {
     // 1) Open source (read) and destination (write) piles. `refresh`
     //    loads the existing records and fails loud on a corrupt tail
-    //    (repair is a separate, explicit step: `Pile::restore` /
-    //    `trible pile restore`).
+    //    (repair is a separate, explicit step: `Pile::amputate` /
+    //    `trible pile amputate`).
     let mut src = Pile::open(src_path)?;
     src.refresh()?;
     let mut dst = Pile::open(dst_path)?;

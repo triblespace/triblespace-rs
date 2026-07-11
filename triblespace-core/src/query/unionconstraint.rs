@@ -10,8 +10,16 @@ use itertools::Itertools;
 /// or directly via [`new`](Self::new).
 ///
 /// All variants must declare the same [`VariableSet`]; this is asserted at
-/// construction time. Estimates are summed across variants, proposals are
-/// merged and deduplicated, and confirmations are unioned via
+/// construction time. Branch-local variables are unsupported because the
+/// engine's result schema is flat — every row binds the same variable set
+/// exactly once, so a variable that exists only in some alternatives has
+/// no representation. (This is a result-model restriction, not a semantic
+/// one: the union itself is monotonic.) Since `pattern!` folds attribute
+/// constants and literal values into constant [`Term`](crate::query::Term)s
+/// (they never become variables), the requirement is about the *query
+/// variables the caller wrote*: every arm must mention the same ones.
+/// Estimates are summed across variants, proposals are merged and
+/// deduplicated, and confirmations are unioned via
 /// [`kmerge`](itertools::Itertools::kmerge).
 ///
 /// Before proposing or confirming, the union checks each variant's
@@ -40,11 +48,23 @@ where
             "UnionConstraint requires at least one variant; \
              use a different constraint type for the empty case"
         );
-        assert!(constraints
+        if let Some((i, (a, b))) = constraints
             .iter()
             .map(|c| c.variables())
             .tuple_windows()
-            .all(|(a, b)| a == b));
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+        {
+            panic!(
+                "all union (or!) variants must mention the same query \
+                 variables: variant {} declares {:?} but variant {} \
+                 declares {:?}",
+                i,
+                a,
+                i + 1,
+                b
+            );
+        }
         UnionConstraint { constraints }
     }
 }
@@ -62,7 +82,12 @@ where
     /// Appends the elementwise **sum** of estimates across all variants.
     /// A union can produce candidates from any branch, so the
     /// cardinalities add.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         match out {
             EstimateSink::Scalar(slot) => {
                 let mut any = false;
@@ -105,20 +130,48 @@ where
     /// group. Dead variants (where [`satisfied`](Constraint::satisfied)
     /// returns `false` for the row) are skipped so their stale bindings
     /// cannot inject values that no live variant would produce.
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        let mut scratch: Vec<RawInline> = Vec::new();
+    ///
+    /// Each variant proposes into its **own empty buffer** and the union
+    /// merges the independent per-variant outputs. This upholds the
+    /// empty-sink law of [`propose`](Constraint::propose): a composite
+    /// variant (e.g. an intersection) filters the sink it is handed via its
+    /// children's `confirm`, so sharing one buffer across variants would let
+    /// a later variant delete candidates an earlier variant produced —
+    /// making the result depend on variant order and, worse, letting a
+    /// monotonic growth of the underlying data *remove* results (a CALM
+    /// violation observed in [`pattern_changes!`](crate::macros::pattern_changes)
+    /// joins).
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        debug_assert!(
+            candidates.is_empty(),
+            "propose expects an empty sink (see the Constraint::propose protocol law)"
+        );
+        let mut row_values: Vec<RawInline> = Vec::new();
+        let mut variant_values: Vec<RawInline> = Vec::new();
         for (i, row) in view.iter().enumerate() {
             let row_view = RowsView::new(view.vars, row);
-            scratch.clear();
+            row_values.clear();
             self.constraints
                 .iter()
                 .filter(|c| c.satisfied(&row_view))
                 .for_each(|c| {
-                    c.propose(variable, &row_view, &mut CandidateSink::Values(&mut scratch))
+                    c.propose(
+                        variable,
+                        &row_view,
+                        &mut CandidateSink::Values(&mut variant_values),
+                    );
+                    // `append` drains the buffer, leaving it empty for the
+                    // next variant.
+                    row_values.append(&mut variant_values);
                 });
-            scratch.sort_unstable();
-            scratch.dedup();
-            candidates.extend_row(i as u32, scratch.iter().copied());
+            row_values.sort_unstable();
+            row_values.dedup();
+            candidates.extend_row(i as u32, row_values.iter().copied());
         }
     }
 
@@ -126,7 +179,12 @@ where
     /// variant independently, then merges the per-variant survivors via
     /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
     /// passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         confirm_per_row(view, candidates, |row, values| {
             let row_view = RowsView::new(view.vars, row);
             values.sort_unstable();

@@ -13,7 +13,7 @@ enum Op {
     Put(Vec<u8>),
     Flush,
     Refresh,
-    Restore,
+    Amputate,
     Get(usize),
     BranchUpdate { branch: usize, handle: usize },
     BranchHead(usize),
@@ -50,7 +50,7 @@ fn actor_op_strategy(actors: usize, branches: usize) -> impl Strategy<Value = Ac
         }),
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
-            op: Op::Restore
+            op: Op::Amputate
         }),
         (0..actors, idx.clone()).prop_map(|(actor, i)| ActorOp::Run {
             actor,
@@ -115,11 +115,11 @@ proptest! {
                     Op::Refresh => {
                         let _ = piles[actor].refresh();
                     }
-                    Op::Restore => {
-                        // Simulate crash recovery: close and reopen with restore
+                    Op::Amputate => {
+                        // Simulate crash recovery: close and reopen with amputate
                         let path = dir.path().join("sim.pile");
                         piles[actor] = Pile::open(&path).unwrap();
-                        piles[actor].restore().unwrap();
+                        piles[actor].amputate().unwrap();
                     }
                     Op::Get(i) => {
                         if !handles.is_empty() {
@@ -200,7 +200,7 @@ proptest! {
             pile.close().unwrap();
         }
         let mut pile_final: Pile = Pile::open(&path).unwrap();
-        pile_final.restore().unwrap();
+        pile_final.amputate().unwrap();
         let reader = pile_final.reader().unwrap();
         for (handle, data) in &expected {
             let blob = reader.get::<Blob<UnknownBlob>, _>(*handle).unwrap();

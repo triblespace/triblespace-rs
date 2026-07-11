@@ -4,86 +4,137 @@ use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::EstimateSink;
+use crate::query::RawTerm;
 use crate::query::RowsView;
-use crate::query::Variable;
+use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
-use crate::inline::InlineEncoding;
-use crate::inline::INLINE_LEN;
 
 /// A triple-pattern lookup against a [`TribleSet`].
 ///
 /// Created by [`TribleSet::pattern`](crate::query::TriblePattern::pattern)
-/// (typically via the [`pattern!`](crate::pattern) macro). Each constraint
-/// binds three variables — entity, attribute, value — and uses the six
-/// covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to provide tight
-/// estimates and fast proposals regardless of which positions are already
-/// bound.
+/// (typically via the [`pattern!`](crate::pattern) macro). Each position —
+/// entity, attribute, value — is a [`Term`]: a variable to solve for or a
+/// constant pinned at construction. The constraint uses the six covering
+/// indexes (EAV, EVA, AEV, AVE, VEA, VAE) to provide tight estimates and
+/// fast proposals regardless of which positions are bound; a constant
+/// position simply enters that dispatch as bound from the start.
 ///
-/// When all three variables are bound, [`satisfied`](Constraint::satisfied)
+/// When all three positions have values, [`satisfied`](Constraint::satisfied)
 /// checks whether the triple exists in the set, enabling composite
 /// constraints to prune dead branches early.
 pub struct TribleSetConstraint {
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
     set: TribleSet,
 }
 
 impl TribleSetConstraint {
     /// Creates a triple-pattern constraint over `set` for the given
-    /// entity, attribute, and value variables.
+    /// entity, attribute, and value terms.
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         set: TribleSet,
     ) -> Self {
         TribleSetConstraint {
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.into().erase(),
+            term_a: a.into().erase(),
+            term_v: v.into().erase(),
             set,
         }
     }
+}
 
+/// The per-call value source of one pattern position: a column of the
+/// current block (a variable bound in the view) or the constant pinned at
+/// construction (which behaves exactly like a bound variable, uniformly
+/// across all rows). Resolved once per protocol call; the per-row work is
+/// pure reads.
+#[derive(Clone, Copy)]
+enum Src {
+    /// The position's variable is bound at this column of the block.
+    Col(usize),
+    /// The position is a constant term.
+    Const(RawInline),
+}
+
+impl Src {
+    #[inline]
+    fn get<'r>(&'r self, row: &'r [RawInline]) -> &'r RawInline {
+        match self {
+            Src::Col(i) => &row[*i],
+            Src::Const(c) => c,
+        }
+    }
+}
+
+/// Resolves a term against the block layout: `None` for an unbound
+/// variable, the column for a bound one, the pinned value for a constant.
+fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
+    match term {
+        RawTerm::Var(v) => view.col(*v).map(Src::Col),
+        RawTerm::Const(c) => Some(Src::Const(*c)),
+    }
 }
 
 /// The hoisted per-row context of one [`TribleSetConstraint`] call: which
-/// positions hold the queried variable (`*_var`) and which columns of the
-/// block bind the other positions (`p*`). Computed once per protocol call;
-/// the per-row work is pure column reads.
+/// positions hold the queried variable (`*_var` — never true for a
+/// constant term) and where the other positions' values come from (`p*`:
+/// block column or pinned constant). Computed once per protocol call; the
+/// per-row work is pure reads.
 struct Positions {
     e_var: bool,
     a_var: bool,
     v_var: bool,
-    pe: Option<usize>,
-    pa: Option<usize>,
-    pv: Option<usize>,
+    pe: Option<Src>,
+    pa: Option<Src>,
+    pv: Option<Src>,
+}
+
+impl Positions {
+    #[inline]
+    fn e<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pe.as_ref().map(|s| s.get(row))
+    }
+
+    #[inline]
+    fn a<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pa.as_ref().map(|s| s.get(row))
+    }
+
+    #[inline]
+    fn v<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pv.as_ref().map(|s| s.get(row))
+    }
 }
 
 impl TribleSetConstraint {
     fn positions(&self, variable: VariableId, view: &RowsView<'_>) -> Positions {
         Positions {
-            e_var: self.variable_e == variable,
-            a_var: self.variable_a == variable,
-            v_var: self.variable_v == variable,
-            pe: view.col(self.variable_e),
-            pa: view.col(self.variable_a),
-            pv: view.col(self.variable_v),
+            e_var: self.term_e.is_var(variable),
+            a_var: self.term_a.is_var(variable),
+            v_var: self.term_v.is_var(variable),
+            pe: term_src(&self.term_e, view),
+            pa: term_src(&self.term_a, view),
+            pv: term_src(&self.term_v, view),
         }
     }
 
     /// Candidate count for one row. Uses the covering indexes (EAV, EVA,
     /// AEV, AVE, VEA, VAE) to count matching entries via `segmented_len`.
-    /// The index chosen depends on which of the other two positions are
-    /// already bound, giving tight estimates regardless of access pattern.
+    /// The index chosen depends on which of the other two positions have
+    /// values, giving tight estimates regardless of access pattern.
     fn estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
         let Positions {
             e_var,
@@ -91,21 +142,21 @@ impl TribleSetConstraint {
             v_var,
             ..
         } = *p;
-        let e_bound = match p.pe.map(|i| &row[i]) {
+        let e_bound = match p.e(row) {
             Some(e) => match id_from_value(e) {
                 Some(e) => Some(e),
                 None => return 0,
             },
             None => None,
         };
-        let a_bound = match p.pa.map(|i| &row[i]) {
+        let a_bound = match p.a(row) {
             Some(a) => match id_from_value(a) {
                 Some(a) => Some(a),
                 None => return 0,
             },
             None => None,
         };
-        let v_bound = p.pv.map(|i| &row[i]);
+        let v_bound = p.v(row);
 
         (match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Legal distinct-position combinations (queried var
@@ -221,40 +272,38 @@ impl TribleSetConstraint {
             v_var,
             ..
         } = *p;
-        let e_bound = match p.pe.map(|i| &row[i]) {
+        let e_bound = match p.e(row) {
             Some(e) => match id_from_value(e) {
                 Some(e) => Some(e),
                 None => return,
             },
             None => None,
         };
-        let a_bound = match p.pa.map(|i| &row[i]) {
+        let a_bound = match p.a(row) {
             Some(a) => match id_from_value(a) {
                 Some(a) => Some(a),
                 None => return,
             },
             None => None,
         };
-        let v_bound = p.pv.map(|i| &row[i]);
+        let v_bound = p.v(row);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Distinct-position combinations: the queried variable
             // appears in exactly one trible slot. Drive enumeration
             // from the most selective covering index.
             (None, None, None, true, false, false) => {
-                self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
-                    push(id_into_value(e))
-                });
+                self.set
+                    .eav
+                    .infixes(&[0; 0], &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, None, None, false, true, false) => {
-                self.set.aev.infixes(&[0; 0], &mut |a: &[u8; 16]| {
-                    push(id_into_value(a))
-                });
+                self.set
+                    .aev
+                    .infixes(&[0; 0], &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (None, None, None, false, false, true) => {
-                self.set
-                    .vea
-                    .infixes(&[0; 0], &mut |&v: &[u8; 32]| push(v));
+                self.set.vea.infixes(&[0; 0], &mut |&v: &[u8; 32]| push(v));
             }
 
             (Some(e), None, None, false, true, false) => {
@@ -263,9 +312,7 @@ impl TribleSetConstraint {
                     .infixes(&e, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (Some(e), None, None, false, false, true) => {
-                self.set
-                    .eva
-                    .infixes(&e, &mut |&v: &[u8; 32]| push(v));
+                self.set.eva.infixes(&e, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, Some(a), None, true, false, false) => {
@@ -274,9 +321,7 @@ impl TribleSetConstraint {
                     .infixes(&a, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, Some(a), None, false, false, true) => {
-                self.set
-                    .ave
-                    .infixes(&a, &mut |&v: &[u8; 32]| push(v));
+                self.set.ave.infixes(&a, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, None, Some(v), true, false, false) => {
@@ -293,25 +338,23 @@ impl TribleSetConstraint {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.ave.infixes(&prefix, &mut |e: &[u8; 16]| {
-                    push(id_into_value(e))
-                });
+                self.set
+                    .ave
+                    .infixes(&prefix, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.eva.infixes(&prefix, &mut |a: &[u8; 16]| {
-                    push(id_into_value(a))
-                });
+                self.set
+                    .eva
+                    .infixes(&prefix, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
-                self.set
-                    .eav
-                    .infixes(&prefix, &mut |&v: &[u8; 32]| push(v));
+                self.set.eav.infixes(&prefix, &mut |&v: &[u8; 32]| push(v));
             }
 
             // Same-Variable arms. The covering indexes already
@@ -598,19 +641,27 @@ impl TribleSetConstraint {
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
-    /// Returns the set `{entity, attribute, value}` (three variables).
+    /// Returns the set of variable positions (constant positions are
+    /// invisible to the engine).
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
         variables
     }
 
     /// One [`segmented_len`](crate::patch::PATCH::segmented_len) count per
     /// row; the index dispatch is hoisted out of the row loop.
-    fn estimate(&self, variable: VariableId, view: &RowsView<'_>, out: &mut EstimateSink<'_>) -> bool {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return false;
         }
@@ -623,8 +674,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// sink variant is matched once; each arm drives the enumeration with
     /// a monomorphized push (the sequential `Values` arm never touches a
     /// row tag).
-    fn propose(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return;
         }
@@ -646,8 +704,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// One `has_prefix` probe per candidate; each row's bound positions
     /// are decoded once (candidates are grouped by row). A row whose
     /// bound id fails to decode rejects all of its candidates.
-    fn confirm(&self, variable: VariableId, view: &RowsView<'_>, candidates: &mut CandidateSink<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return;
         }
@@ -665,46 +730,46 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 e_bound = None;
                 a_bound = None;
                 v_bound = None;
-                if let Some(i) = p.pe {
-                    match id_from_value(&row[i]) {
+                if let Some(e) = p.e(row) {
+                    match id_from_value(e) {
                         Some(e) => e_bound = Some(e),
                         None => row_ok = false,
                     }
                 }
-                if let Some(i) = p.pa {
-                    match id_from_value(&row[i]) {
+                if let Some(a) = p.a(row) {
+                    match id_from_value(a) {
                         Some(a) => a_bound = Some(a),
                         None => row_ok = false,
                     }
                 }
-                if let Some(i) = p.pv {
-                    v_bound = Some(row[i]);
+                if let Some(v) = p.v(row) {
+                    v_bound = Some(*v);
                 }
             }
             row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, value)
         });
     }
 
-    /// When all three positions are bound, checks whether each row's
-    /// triple exists in the EAV index. Returns `true` optimistically when
-    /// any position is still unbound.
+    /// When all three positions have values (bound or constant), checks
+    /// whether each row's triple exists in the EAV index. Returns `true`
+    /// optimistically when any position is still unbound.
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         match (
-            view.col(self.variable_e),
-            view.col(self.variable_a),
-            view.col(self.variable_v),
+            term_src(&self.term_e, view),
+            term_src(&self.term_a, view),
+            term_src(&self.term_v, view),
         ) {
-            (Some(ce), Some(ca), Some(cv)) => view.iter().all(|row| {
-                let Some(e) = id_from_value(&row[ce]) else {
+            (Some(se), Some(sa), Some(sv)) => view.iter().all(|row| {
+                let Some(e) = id_from_value(se.get(row)) else {
                     return false;
                 };
-                let Some(a) = id_from_value(&row[ca]) else {
+                let Some(a) = id_from_value(sa.get(row)) else {
                     return false;
                 };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN + ID_LEN..].copy_from_slice(&row[cv]);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(sv.get(row));
                 self.set.eav.has_prefix(&prefix)
             }),
             _ => true,
@@ -716,12 +781,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 mod tests {
     use crate::find;
     use crate::id::rngid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
     use crate::query::TriblePattern;
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::inline::encodings::UnknownInline;
-    use crate::inline::Inline;
 
     #[test]
     fn constant() {
@@ -747,8 +812,8 @@ mod tests {
         // value positions) enumerates self-edge entities without
         // panicking. Adds 3 self-edges and 2 non-self tribles for
         // the same attribute; the query should return exactly 3.
-        use crate::inline::encodings::genid::GenId;
         use crate::and;
+        use crate::inline::encodings::genid::GenId;
 
         // Helper: encode a 16-byte id as a GenId-style Inline value
         // (32 bytes: upper 16 zero, lower 16 = id).
@@ -791,7 +856,12 @@ mod tests {
             )
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(3, r.len(), "expected 3 self-edges with bound attr, got {}", r.len());
+        assert_eq!(
+            3,
+            r.len(),
+            "expected 3 self-edges with bound attr, got {}",
+            r.len()
+        );
     }
 
     #[test]
@@ -898,6 +968,11 @@ mod tests {
             set.pattern(x, x, x)
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(2, r.len(), "expected 2 self-self-self triples, got {}", r.len());
+        assert_eq!(
+            2,
+            r.len(),
+            "expected 2 self-self-self triples, got {}",
+            r.len()
+        );
     }
 }

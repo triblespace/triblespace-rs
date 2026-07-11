@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::RawInline;
+use crate::inline::TryFromInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::RawInline;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use proc_macro::Span;
 use std::convert::Infallible;
 
@@ -94,8 +94,7 @@ fn decode_location(raw: &RawInline) -> (u64, u64, u64, u64) {
     )
 }
 
-impl Encodes<(u64, u64, u64, u64)> for LineLocation
-{
+impl Encodes<(u64, u64, u64, u64)> for LineLocation {
     type Output = Inline<LineLocation>;
     fn encode(source: (u64, u64, u64, u64)) -> Inline<LineLocation> {
         Inline::new(encode_location(source))
@@ -109,8 +108,7 @@ impl TryFromInline<'_, LineLocation> for (u64, u64, u64, u64) {
     }
 }
 
-impl Encodes<Span> for LineLocation
-{
+impl Encodes<Span> for LineLocation {
     type Output = Inline<LineLocation>;
     fn encode(source: Span) -> Inline<LineLocation> {
         (

@@ -1,16 +1,16 @@
-use crate::inline::Encodes;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::Encodes;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::TryToInline;
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::trible::Fragment;
-use crate::inline::IntoInline;
-use crate::inline::TryFromInline;
-use crate::inline::TryToInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 use std::convert::Infallible;
 use std::fmt;
 
@@ -265,8 +265,7 @@ impl TryFromInline<'_, F256BE> for f256 {
     }
 }
 
-impl Encodes<f256> for F256BE
-{
+impl Encodes<f256> for F256BE {
     type Output = Inline<F256BE>;
     fn encode(source: f256) -> Inline<F256BE> {
         Inline::new(source.to_be_bytes())
@@ -280,8 +279,7 @@ impl TryFromInline<'_, F256LE> for f256 {
     }
 }
 
-impl Encodes<f256> for F256LE
-{
+impl Encodes<f256> for F256LE {
     type Output = Inline<F256LE>;
     fn encode(source: f256) -> Inline<F256LE> {
         Inline::new(source.to_le_bytes())

@@ -45,7 +45,10 @@ pub mod deterministic {
     pub fn try_fill(buf: &mut [u8]) -> bool {
         use rand::RngCore;
         SOURCE.with(|s| {
-            s.borrow_mut().as_mut().map(|rng| rng.fill_bytes(buf)).is_some()
+            s.borrow_mut()
+                .as_mut()
+                .map(|rng| rng.fill_bytes(buf))
+                .is_some()
         })
     }
 }
@@ -71,7 +74,8 @@ pub fn rngid() -> ExclusiveId {
         });
         if let Some(id) = seeded {
             return ExclusiveId::force(
-                Id::new(id).expect("the probability for a zero id from the seeded stream is negligible"),
+                Id::new(id)
+                    .expect("the probability for a zero id from the seeded stream is negligible"),
             );
         }
     }
