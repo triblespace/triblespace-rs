@@ -105,7 +105,9 @@ An expansion still performs the familiar Atreides negotiation:
 2. Choose the preferred next variable. In a multi-row block this decision is
    made per row, because different bound values can imply different
    cardinalities.
-3. Partition rows by their preferred variable with a stable counting sort.
+3. Under sustained wide demand, approximately cover the rows with a small set
+   of compatible variables; otherwise retain their exact preferences. Then
+   partition the rows by the scheduled variable with a stable counting sort.
 4. For each group, ask the root constraint to propose that variable. An
    intersection chooses its tightest child per row to propose and runs the
    remaining children as whole-frontier confirmation passes. A union evaluates
@@ -177,15 +179,17 @@ turns on and the remaining computation enters the batch-harvesting regime. An
 `exists!` or `take(1)` consumer can therefore discard the worklist after the
 first match instead of paying for full enumeration.
 
-Wide demand also changes partition economics. Starting at width 256, a block
-whose rows prefer different next variables may use the first row's variable as
-one whole-block batch, but only when the full estimate column predicts at most
-eight times the candidates of the per-row grouped choices. This estimate guard
-is evaluated independently for each pop. It rejects the heterogeneous case
-where one ordering would explode the intermediate frontier, while allowing a
-bounded amount of extra candidate work to buy fewer, larger CPU or GPU
-dispatches. The choice affects order and batching only: `propose` and
-`confirm` still determine the exact solutions.
+Wide demand also changes partition economics. Starting at chunk width 256, a
+soft-bucketing pass treats unbound variables as possible batch centers. For
+each pointwise estimate envelope through 8× it greedily covers compatible
+rows, then reassigns every row to its cheapest selected center. Plans are
+scored by estimated candidates plus a scale-free cost per retained group; the
+exchange rate is calibrated so exact grouping ties a one-group plan at the
+former 8× boundary. This admits intermediate group counts instead of choosing
+between exact per-row groups and one first-row variable. A hard per-row bound
+prevents a wide block from hiding a catastrophically bad outlier inside an
+acceptable aggregate sum. The choice affects order and batching only:
+`propose` and `confirm` still determine the exact solutions.
 
 Fully-bound rows remain in raw inline form until the consumer pulls them. The
 worklist never stores projected result values, so a query's `Send`/`Sync`
@@ -197,7 +201,7 @@ to implement `Clone`.
 exposes the same scheduler as a configurable iterator with explicit starting
 width, growth, cap, and partition-policy controls. The eager/grouped probe
 solvers pin grouping explicitly so they remain stable controls for the
-adaptive ordinary iterator.
+soft-bucketed ordinary iterator.
 
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result
@@ -229,10 +233,11 @@ The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
 providing skew-resistant and predictable performance. The sequential scheduler
-explores those choices depth-first; the DAG scheduler partitions a block by the
-same per-row choices and files the results through its worklist. Because both
-refresh estimates during evaluation, binding order adapts whenever a constraint
-updates its influence set—there is no separate planning artifact to maintain.
+explores those choices depth-first; the DAG scheduler begins from the same
+per-row choices, may softly coalesce compatible rows under wide demand, and
+files the results through its worklist. Because both refresh estimates during
+evaluation, binding order adapts whenever a constraint updates its influence
+set—there is no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

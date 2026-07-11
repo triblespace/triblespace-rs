@@ -13,7 +13,7 @@
 //! for both a first-match probe and a full drain.
 //!
 //! Fixtures:
-//!   - the group-by-ordering **skew** world (2×n_per_pop people, fan) on
+//!   - the group-by-ordering **skew** world (majority + minority people, fan) on
 //!     both backends — the synthetic full-drain surface;
 //!   - a **Wikidata truthy slice** via its SuccinctArchive blob cache
 //!     (`/tmp/wd_10m.nt.succinctarchive` by default): point / filter /
@@ -22,12 +22,16 @@
 //! Usage:
 //!     cargo run --release --example dag_lazy_bench -- \
 //!         [archive_cache=/tmp/wd_10m.nt.succinctarchive] [reps=5] \
-//!         [n_per_pop=20000] [fan=64]
+//!         [majority=20000] [fan=64] [minority=majority]
 //!
 //! Set `TRIBLES_LAZY_GPU=1` and build with `--features gpu` to upload the
 //! archive before the WD measurements. Small lazy chunks still use the CPU;
 //! once a proposal/confirmation stream crosses `TRIBLES_GPU_MIN_BATCH`, the
 //! same iterator dispatches that batch to the GPU.
+//!
+//! Set `TRIBLES_PAIRED_STAR3_REPS=21` to skip the broad matrix and run a
+//! warm, alternating whole-block-versus-soft8 star3 drain comparison with
+//! paired median delta and MAD, followed by one untimed work-graph report.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -82,11 +86,11 @@ fn ms(t: Instant) -> f64 {
 /// The skew world from the grouped-descent probe: two sub-populations
 /// preferring different variable orders after `?e` binds (see
 /// `blocked_group_skew_bench` for the full rationale).
-fn build_skew(n_per_pop: usize, fan: usize) -> (TribleSet, usize) {
+fn build_skew(majority: usize, minority: usize, fan: usize) -> (TribleSet, usize) {
     let mut kb = TribleSet::new();
     let junk_sink = ufoid();
-    for _ in 0..n_per_pop {
-        // Pop A: selective ?x, wide ?y.
+    // Population A: selective ?x, wide ?y.
+    for _ in 0..majority {
         let e = ufoid();
         let x = ufoid();
         kb += entity! { &e @ world::p: &x };
@@ -99,7 +103,9 @@ fn build_skew(n_per_pop: usize, fan: usize) -> (TribleSet, usize) {
             let dummy = ufoid();
             kb += entity! { &dummy @ world::r: y };
         }
-        // Pop B: wide ?x, selective ?y.
+    }
+    // Population B: wide ?x, selective ?y.
+    for _ in 0..minority {
         let e = ufoid();
         let y = ufoid();
         kb += entity! { &e @ world::q: &y };
@@ -112,7 +118,7 @@ fn build_skew(n_per_pop: usize, fan: usize) -> (TribleSet, usize) {
             kb += entity! { x @ world::r: &junk_sink };
         }
     }
-    (kb, 2 * n_per_pop)
+    (kb, majority + minority)
 }
 
 fn predicate(uri: &str) -> Attribute<GenId> {
@@ -261,9 +267,9 @@ macro_rules! measure {
         drop(it);
         println!("  first-match stats: {}", dag_stats::report());
         println!("  first-match work:  {}", blocked_stats::report());
-        let partition_costs = blocked_stats::partition_cost_report();
+        let partition_costs = blocked_stats::bucketing_report();
         if !partition_costs.is_empty() {
-            println!("  first-match partition costs: {partition_costs}");
+            println!("  first-match bucketing: {partition_costs}");
         }
         #[cfg(feature = "gpu")]
         println!("  first-match GPU:   {}", gpu_stats::report());
@@ -274,9 +280,9 @@ macro_rules! measure {
         black_box($q.solve_dag_lazy().count());
         println!("  drain stats:       {}", dag_stats::report());
         println!("  drain work:        {}", blocked_stats::report());
-        let partition_costs = blocked_stats::partition_cost_report();
+        let partition_costs = blocked_stats::bucketing_report();
         if !partition_costs.is_empty() {
-            println!("  drain partition costs: {partition_costs}");
+            println!("  drain bucketing: {partition_costs}");
         }
         #[cfg(feature = "gpu")]
         println!("  drain GPU:         {}", gpu_stats::report());
@@ -285,17 +291,18 @@ macro_rules! measure {
     }};
 }
 
-/// Runs four width-triggered partition policies on one continuously consumed
+/// Runs five wide-pop partition policies on one continuously consumed
 /// iterator per repetition. Every checkpoint is therefore a true prefix of
 /// the same execution, unlike independent `take(k)` probes.
 macro_rules! checkpoint_matrix {
     ($label:expr, $reps:expr, $q:expr) => {{
         const CHECKPOINTS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
-        const POLICIES: [(&str, Option<usize>, Option<usize>); 4] = [
+        const POLICIES: [(&str, Option<usize>, Option<usize>); 5] = [
             ("grouped", None, None),
             ("trivial@256", Some(256), None),
-            ("adaptive4@256", Some(256), Some(4)),
-            ("adaptive8@256", Some(256), Some(8)),
+            ("soft-rho2@256", Some(256), Some(2)),
+            ("soft-rho4@256", Some(256), Some(4)),
+            ("soft-rho8@256", Some(256), Some(8)),
         ];
 
         let sequential = tally($q.sequential());
@@ -308,7 +315,7 @@ macro_rules! checkpoint_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -328,7 +335,7 @@ macro_rules! checkpoint_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -349,7 +356,7 @@ macro_rules! checkpoint_matrix {
                 let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
                 if let Some(width) = width {
                     it = match inflation {
-                        Some(inflation) => it.adaptive_partition(width, inflation),
+                        Some(inflation) => it.soft_partition(width, inflation),
                         None => it.trivial_partition_at_width(width),
                     };
                 } else {
@@ -383,7 +390,7 @@ macro_rules! checkpoint_matrix {
         );
         for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
             println!(
-                "  {policy:>13}: K1 {:>8.3} | K10 {:>8.3} | K100 {:>8.3} | K1k {:>8.3} | K10k {:>8.3} | drain {:>8.3} ms",
+                "  {policy:>15}: K1 {:>8.3} | K10 {:>8.3} | K100 {:>8.3} | K1k {:>8.3} | K10k {:>8.3} | drain {:>8.3} ms",
                 median(samples[ci][0].clone()),
                 median(samples[ci][1].clone()),
                 median(samples[ci][2].clone()),
@@ -401,7 +408,7 @@ macro_rules! checkpoint_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -411,9 +418,9 @@ macro_rules! checkpoint_matrix {
             assert_eq!(rows, sequential.0);
             println!("    DAG: {}", dag_stats::report());
             println!("    work: {}", blocked_stats::report());
-            let partition_costs = blocked_stats::partition_cost_report();
+            let partition_costs = blocked_stats::bucketing_report();
             if !partition_costs.is_empty() {
-                println!("    partition costs: {partition_costs}");
+                println!("    bucketing: {partition_costs}");
             }
             #[cfg(feature = "gpu")]
             println!("    GPU: {}", gpu_stats::report());
@@ -423,18 +430,19 @@ macro_rules! checkpoint_matrix {
     }};
 }
 
-/// Compares the grouped scheduler with width-triggered trivial partitions on
+/// Compares grouped, whole-block, and guarded soft partitions on
 /// workloads that may have fewer than 10k results. Configuration order rotates
 /// across repetitions so cache and thermal position do not belong to one
 /// policy. The instrumented pass makes changes in work visible even when wall
 /// time is noisy.
 macro_rules! drain_partition_matrix {
     ($label:expr, $reps:expr, $q:expr) => {{
-        const POLICIES: [(&str, Option<usize>, Option<usize>); 4] = [
+        const POLICIES: [(&str, Option<usize>, Option<usize>); 5] = [
             ("grouped", None, None),
             ("trivial@256", Some(256), None),
-            ("adaptive4@256", Some(256), Some(4)),
-            ("adaptive8@256", Some(256), Some(8)),
+            ("soft-rho2@256", Some(256), Some(2)),
+            ("soft-rho4@256", Some(256), Some(4)),
+            ("soft-rho8@256", Some(256), Some(8)),
         ];
 
         let sequential = tally($q.sequential());
@@ -442,7 +450,7 @@ macro_rules! drain_partition_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -461,7 +469,7 @@ macro_rules! drain_partition_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -479,7 +487,7 @@ macro_rules! drain_partition_matrix {
                 let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
                 if let Some(width) = width {
                     it = match inflation {
-                        Some(inflation) => it.adaptive_partition(width, inflation),
+                        Some(inflation) => it.soft_partition(width, inflation),
                         None => it.trivial_partition_at_width(width),
                     };
                 } else {
@@ -497,7 +505,7 @@ macro_rules! drain_partition_matrix {
         );
         for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
             println!(
-                "  {policy:>13}: drain {:>9.3} ms",
+                "  {policy:>15}: drain {:>9.3} ms",
                 median(samples[ci].clone()),
             );
 
@@ -508,7 +516,7 @@ macro_rules! drain_partition_matrix {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
             if let Some(width) = width {
                 it = match inflation {
-                    Some(inflation) => it.adaptive_partition(width, inflation),
+                    Some(inflation) => it.soft_partition(width, inflation),
                     None => it.trivial_partition_at_width(width),
                 };
             } else {
@@ -517,9 +525,9 @@ macro_rules! drain_partition_matrix {
             assert_eq!(black_box(it.count()), sequential.0);
             println!("    DAG: {}", dag_stats::report());
             println!("    work: {}", blocked_stats::report());
-            let partition_costs = blocked_stats::partition_cost_report();
+            let partition_costs = blocked_stats::bucketing_report();
             if !partition_costs.is_empty() {
-                println!("    partition costs: {partition_costs}");
+                println!("    bucketing: {partition_costs}");
             }
             blocked_stats::set_enabled(false);
             dag_stats::set_enabled(false);
@@ -535,7 +543,7 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let n_per_pop: usize = std::env::args()
+    let majority: usize = std::env::args()
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20000);
@@ -543,6 +551,10 @@ fn main() {
         .nth(4)
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
+    let minority: usize = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(majority);
 
     println!(
         "lazy-dag probe: start_width {} growth {} cap {} (env TRIBLES_LAZY_START_WIDTH / TRIBLES_LAZY_GROWTH / TRIBLES_BLOCK_ROW_CAP)",
@@ -551,9 +563,9 @@ fn main() {
         triblespace::core::query::block_row_cap(),
     );
 
-    // ---- Synthetic: the skew fixture (n_per_pop = 0 skips it) ---------
-    if n_per_pop > 0 {
-        run_skew(n_per_pop, fan, reps);
+    // ---- Synthetic: the skew fixture (majority = 0 skips it) ----------
+    if majority > 0 {
+        run_skew(majority, minority, fan, reps);
     }
 
     // ---- Wikidata slice via archive blob cache ------------------------
@@ -564,13 +576,15 @@ fn main() {
     run_wd(&cache, reps);
 }
 
-fn run_skew(n_per_pop: usize, fan: usize, reps: usize) {
+fn run_skew(majority: usize, minority: usize, fan: usize, reps: usize) {
     let t0 = Instant::now();
-    let (kb, expected) = build_skew(n_per_pop, fan);
+    let (kb, expected) = build_skew(majority, minority, fan);
     eprintln!(
-        "skew world: {} tribles, {} people, fan {} in {:?}",
+        "skew world: {} tribles, {} people ({} + {}), fan {} in {:?}",
         kb.len(),
         expected,
+        majority,
+        minority,
         fan,
         t0.elapsed()
     );
@@ -644,7 +658,11 @@ fn run_wd(cache: &str, reps: usize) {
     }
     eprintln!(
         "wd lazy benchmark backend: {}",
-        if want_gpu { "adaptive CPU/GPU" } else { "CPU" }
+        if want_gpu {
+            "soft-bucket CPU/GPU"
+        } else {
+            "CPU"
+        }
     );
 
     let p31 = wd_predicate("P31");
@@ -652,6 +670,93 @@ fn run_wd(cache: &str, reps: usize) {
     let p21 = wd_predicate("P21");
     let p27 = wd_predicate("P27");
     let q5 = wd_entity("Q5");
+
+    if let Some(pairs) = std::env::var("TRIBLES_PAIRED_STAR3_REPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+    {
+        macro_rules! star3 {
+            () => {
+                find!(
+                    (e: Inline<GenId>, g: Inline<GenId>, c: Inline<GenId>),
+                    pattern!(&wd, [{ ?e @ &p31: q5, &p21: ?g, &p27: ?c }])
+                )
+            };
+        }
+        let run = |soft: bool| {
+            let mut iter = star3!().solve_dag_lazy().start_width(1).growth(2);
+            iter = if soft {
+                iter.soft_partition(256, 8)
+            } else {
+                iter.trivial_partition_at_width(256)
+            };
+            let started = Instant::now();
+            let signature = tally(iter);
+            (signature, ms(started))
+        };
+
+        // Warm both code paths and the GPU pipelines before paired timing.
+        let expected = run(false).0;
+        assert_eq!(run(true).0, expected);
+        let mut trivial_times = Vec::with_capacity(pairs);
+        let mut soft_times = Vec::with_capacity(pairs);
+        let mut deltas = Vec::with_capacity(pairs);
+        for pair in 0..pairs {
+            let ((trivial_sig, trivial_ms), (soft_sig, soft_ms)) = if pair % 2 == 0 {
+                (run(false), run(true))
+            } else {
+                let soft = run(true);
+                let trivial = run(false);
+                (trivial, soft)
+            };
+            assert_eq!(trivial_sig, expected);
+            assert_eq!(soft_sig, expected);
+            trivial_times.push(trivial_ms);
+            soft_times.push(soft_ms);
+            deltas.push(soft_ms - trivial_ms);
+        }
+        let median_delta = median(deltas.clone());
+        let mad = median(
+            deltas
+                .iter()
+                .map(|delta| (delta - median_delta).abs())
+                .collect(),
+        );
+        println!(
+            "=== paired star3 drain ({pairs} alternating pairs, rows {}) ===",
+            expected.0
+        );
+        println!(
+            "  trivial median {:>9.3} ms | soft-rho8 median {:>9.3} ms | paired delta {:>+9.3} ms (MAD {:>8.3})",
+            median(trivial_times),
+            median(soft_times),
+            median_delta,
+            mad,
+        );
+
+        for (label, soft) in [("trivial", false), ("soft-rho8", true)] {
+            blocked_stats::set_enabled(true);
+            blocked_stats::reset();
+            dag_stats::set_enabled(true);
+            dag_stats::reset();
+            #[cfg(feature = "gpu")]
+            gpu_stats::reset();
+            let (signature, _) = run(soft);
+            assert_eq!(signature, expected);
+            println!("  {label} DAG: {}", dag_stats::report());
+            println!("  {label} work: {}", blocked_stats::report());
+            let bucketing = blocked_stats::bucketing_report();
+            if !bucketing.is_empty() {
+                println!("  {label} bucketing: {bucketing}");
+            }
+            #[cfg(feature = "gpu")]
+            println!("  {label} GPU: {}", gpu_stats::report());
+            blocked_stats::set_enabled(false);
+            dag_stats::set_enabled(false);
+        }
+        return;
+    }
 
     // A subject that certainly exists: any P31 subject from the archive.
     let (subj, _c) = find!((e: Id, c: Id), pattern!(&wd, [{ ?e @ &p31: ?c }]))

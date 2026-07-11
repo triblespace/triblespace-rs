@@ -50,11 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each block by its per-row preferred next variable, and merges routes that
   reconverge on the same set. Demand-adaptive chunk width starts with
   depth-first, first-result-oriented execution and grows into readiness-gated
-  batch harvesting. Once a chunk reaches 256 rows, the scheduler may replace a
-  split per-row partition with the first row's whole-block choice only when
-  the estimate matrix bounds candidate inflation at 8×; this keeps
-  heterogeneous PATCH joins grouped while collapsing fragmented CPU/GPU work
-  into fatter batches when the estimates say the trade is bounded.
+  batch harvesting. Once demand reaches a 256-row chunk width, guarded soft bucketing uses
+  the estimate matrix to coalesce compatible per-row choices into fewer,
+  fatter groups. A pointwise regret envelope keeps heterogeneous PATCH
+  outliers separate, while a scale-free candidate-work/group-count score
+  preserves the former 8× batching tradeoff without a first-row whole-block
+  dichotomy.
   `Query::sequential()` explicitly selects the scalar
   block-of-one DFS specialization, while fresh rayon iteration retains its
   established DFS splitter. Fully-bound rows stay raw until the consumer pulls

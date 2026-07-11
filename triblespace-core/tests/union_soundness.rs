@@ -132,6 +132,8 @@ fn pattern_changes_monotone_growth_keeps_results() {
                 { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
             ])
         )
+        .solve_dag_lazy()
+        .soft_partition(1, 8)
         .map(|e: Inline<GenId>| e.raw)
         .collect()
     };
@@ -413,6 +415,8 @@ fn union_of_intersections(
         x: Inline<ShortString>,
         or!(and!(s1.has(x), s2.has(x)), and!(s3.has(x), s4.has(x)))
     )
+    .solve_dag_lazy()
+    .soft_partition(1, 8)
     .map(|x: Inline<ShortString>| x.raw)
     .collect()
 }

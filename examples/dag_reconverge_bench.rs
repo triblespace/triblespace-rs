@@ -19,7 +19,7 @@
 //!     cargo run --release --example dag_reconverge_bench -- \
 //!         [n_per_pop=48] [z_fan=16] [reps=5]
 //!
-//! Runs sequential / blocked-v1 / grouped / dag / dag-unmerged on both
+//! Runs sequential / blocked-v1 / grouped / dag / soft / dag-unmerged on both
 //! backends and prints per mode: median wall time, parity signature, and
 //! for the frontier engines the group/batch structure, materialized rows,
 //! peak live row-store cells, and the DAG's bucket/merge census.
@@ -138,7 +138,7 @@ enum Mode {
     Blk,
     Grp,
     Dag,
-    Adapt,
+    Soft,
     DagU,
 }
 
@@ -160,11 +160,11 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
-        Mode::Adapt => tally(
+        Mode::Soft => tally(
             q.solve_dag_lazy()
                 .start_width(1)
                 .growth(2)
-                .adaptive_partition(256, 8),
+                .soft_partition(256, 8),
         ),
         Mode::DagU => tally(q.solve_dag_unmerged()),
     }
@@ -188,7 +188,7 @@ fn bench_backend<S: TriblePattern>(
         ("blk", Mode::Blk),
         ("grp", Mode::Grp),
         ("dag", Mode::Dag),
-        ("adapt", Mode::Adapt),
+        ("soft", Mode::Soft),
         ("dagu", Mode::DagU),
     ];
     let mut sigs = Vec::new();
@@ -206,8 +206,8 @@ fn bench_backend<S: TriblePattern>(
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
-        "{label:<24} rows {:>7}  seq {:>8.3} ms  blk {:>8.3}  grp {:>8.3}  dag {:>8.3}  adapt {:>8.3}  dagu {:>8.3}  \
-         adapt/dag {:>6.3}x  dag/dagu {:>6.3}x  {}",
+        "{label:<24} rows {:>7}  seq {:>8.3} ms  blk {:>8.3}  grp {:>8.3}  dag {:>8.3}  soft {:>8.3}  dagu {:>8.3}  \
+         soft/dag {:>6.3}x  dag/dagu {:>6.3}x  {}",
         sigs[0].0,
         meds[0],
         meds[1],
@@ -228,7 +228,7 @@ fn bench_backend<S: TriblePattern>(
         dag_stats::reset();
         run_query(kb, markers, mode);
         println!("  {name}: {}", blocked_stats::report());
-        if matches!(mode, Mode::Dag | Mode::Adapt | Mode::DagU) {
+        if matches!(mode, Mode::Dag | Mode::Soft | Mode::DagU) {
             println!("  {name} buckets: {}", dag_stats::report());
         }
     }
