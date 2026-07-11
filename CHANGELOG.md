@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **BM25 tokenization preserves non-ASCII symbols and emoji.**
+  `hash_tokens` previously discarded every token without an alphanumeric
+  character, making standalone emoji queries produce an empty term list.
+  It now adds Unicode symbol graphemes alongside the existing word terms,
+  keeping ZWJ sequences, flags, and modifier emoji atomic while continuing
+  to discard punctuation. Existing word hashes are unchanged; persisted
+  indexes must be rebuilt once to gain the new symbol postings.
 - **`or!(pattern!(..), pattern!(..))` no longer panics — pattern constants
   are folded into the constraint instead of becoming hidden variables.**
   `UnionConstraint` requires every arm to declare the same variable set

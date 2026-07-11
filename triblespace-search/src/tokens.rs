@@ -15,7 +15,8 @@
 //! with `ngram_tokens("foo", 3)`):
 //!
 //! - [`hash_tokens`] + [`code_tokens`] → [`Inline<WordHash>`]
-//!   (same output space — both lowercase + Blake3).
+//!   (same output space — normalized words/code segments, plus
+//!   non-ASCII symbolic graphemes from `hash_tokens`, then Blake3).
 //! - [`bigram_tokens`] → [`Inline<BigramHash>`].
 //! - [`ngram_tokens`] → [`Inline<NgramHash>`].
 //!
@@ -27,13 +28,16 @@ use std::convert::Infallible;
 
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
+use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::macros::entity;
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::trible::Fragment;
-use triblespace_core::inline::{Inline, InlineEncoding};
+use unicode_properties::{GeneralCategoryGroup, UnicodeEmoji, UnicodeGeneralCategory};
+use unicode_segmentation::UnicodeSegmentation;
 
-/// Term schema for [`hash_tokens`] and [`code_tokens`] — both
-/// produce Blake3 hashes of a lowercased word / code segment.
+/// Term schema for [`hash_tokens`] and [`code_tokens`] — Blake3
+/// hashes of normalized word/code segments, plus non-ASCII symbolic
+/// graphemes emitted by [`hash_tokens`].
 ///
 /// Schema id minted via `trible genid`:
 /// `8868FA39C4CDA947DD4CAA1652C30D06`.
@@ -44,7 +48,7 @@ impl MetaDescribe for WordHash {
         let id = id_hex!("8868FA39C4CDA947DD4CAA1652C30D06");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name:        "WordHash",
-            metadata::description: "Term schema for hash_tokens / code_tokens — Blake3 hash of a lowercased word or code segment.",
+            metadata::description: "Term schema for hash_tokens / code_tokens — Blake3 hash of a normalized word or code segment, plus non-ASCII symbolic graphemes from hash_tokens.",
             metadata::tag:         metadata::KIND_INLINE_ENCODING,
         }
     }
@@ -103,15 +107,18 @@ impl InlineEncoding for NgramHash {
     type Encoding = Self;
 }
 
-/// Tokenize `text` with a simple whitespace-and-lowercase scheme
-/// and return each token as a 32-byte Blake3 hash suitable for
-/// use as a `bm25::BM25Index` term value.
+/// Tokenize `text` into normalized words plus searchable Unicode
+/// symbols, returning each token as a 32-byte Blake3 hash suitable
+/// for use as a `bm25::BM25Index` term value.
 ///
 /// Rules:
 /// - Split on ASCII whitespace (`char::is_ascii_whitespace`).
 /// - Trim leading/trailing ASCII punctuation from each token.
 /// - Lowercase ASCII letters; leave non-ASCII bytes as-is.
-/// - Drop empty tokens (after trimming).
+/// - Additionally emit each non-ASCII Unicode symbol (including an
+///   emoji ZWJ/flag/modifier sequence) as one extended grapheme token,
+///   even when it touches a word or punctuation.
+/// - Drop empty and pure-punctuation tokens.
 /// - Duplicates are preserved — the index uses term frequency.
 ///
 /// The hashing is fixed (Blake3) so the same token produces the
@@ -125,20 +132,21 @@ impl InlineEncoding for NgramHash {
 ///
 /// ```
 /// # use triblespace_search::tokens::hash_tokens;
-/// let vs = hash_tokens("Hello, WORLD — hello.");
-/// // "hello" appears twice with the same hash; "world" once.
-/// assert_eq!(vs.len(), 3);
+/// let vs = hash_tokens("Hello, WORLD — hello. 🛰️");
+/// // "hello" appears twice with the same hash; "world" and 🛰️ once.
+/// assert_eq!(vs.len(), 4);
 /// assert_eq!(vs[0], vs[2]);
 /// assert_ne!(vs[0], vs[1]);
 /// ```
 pub fn hash_tokens(text: &str) -> Vec<Inline<WordHash>> {
     normalize_words(text)
+        .chain(symbol_graphemes(text))
         .map(|w| Inline::<WordHash>::new(*blake3::hash(w.as_bytes()).as_bytes()))
         .collect()
 }
 
-/// Shared word-normalization pipeline used by [`hash_tokens`]
-/// and [`bigram_tokens`]: split on ASCII whitespace, trim
+/// Word-normalization pipeline used by [`hash_tokens`] and
+/// [`bigram_tokens`]: split on ASCII whitespace, trim
 /// leading/trailing ASCII punctuation, drop tokens with no
 /// alphanumeric content, lowercase ASCII letters. Returns
 /// owned `String`s since callers typically hash them (and
@@ -163,21 +171,37 @@ fn normalize_words(text: &str) -> impl Iterator<Item = String> + '_ {
     })
 }
 
+/// Extra symbol terms for [`hash_tokens`]. Extended grapheme clusters
+/// keep multi-code-point emoji (ZWJ sequences, flags, skin-tone
+/// modifiers) atomic, while the Unicode general category distinguishes
+/// symbols from punctuation such as em dashes and ellipses.
+///
+/// ASCII symbols stay on the old path and are not added here: code-heavy
+/// corpora contain enough `+`, `=`, and `$` to inflate every document's
+/// term list without helping the Unicode lookup this path is for.
+fn symbol_graphemes(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.graphemes(true)
+        .filter(|grapheme| {
+            let has_non_ascii = grapheme.chars().any(|c| !c.is_ascii());
+            let has_symbol = grapheme.chars().any(|c| {
+                c.general_category_group() == GeneralCategoryGroup::Symbol || c.is_emoji_char()
+            });
+            has_non_ascii && has_symbol
+        })
+        .map(str::to_owned)
+}
+
 /// Word-level bigram tokenizer for phrase-aware retrieval.
 ///
-/// Tokenizes `text` with the same rules as [`hash_tokens`]
-/// (whitespace split + lowercase + punctuation trim + drop
-/// empty), then emits one hashed value per *adjacent pair* of
-/// resulting tokens. Each bigram is namespaced with a `"2w:"`
-/// prefix before hashing so it lives in its own term-space
-/// separate from single-word hashes.
+/// Tokenizes `text` with the word-normalization half of
+/// [`hash_tokens`] (whitespace split + lowercase + punctuation trim
+/// + drop empty), then emits one hashed value per *adjacent pair* of
+/// resulting words. Symbol graphemes do not form word bigrams.
 ///
-/// Concatenating `hash_tokens(text)` with `bigram_tokens(text)`
-/// before `BM25Builder::insert` lets the same BM25 index answer
-/// both single-word queries (via the hash_tokens half) and
-/// phrase queries (`bigram_tokens("quick brown")` produces the
-/// `(quick, brown)` bigram hash, which only matches docs that
-/// contain those two words adjacently).
+/// Indexing `bigram_tokens(text)` in a [`BigramHash`] BM25 index beside
+/// the [`WordHash`] index enables phrase queries:
+/// `bigram_tokens("quick brown")` produces the `(quick, brown)` term,
+/// which only matches documents containing those words adjacently.
 ///
 /// Rules:
 /// - Fewer than 2 tokens → empty output.
@@ -217,7 +241,9 @@ pub fn bigram_tokens(text: &str) -> Vec<Inline<BigramHash>> {
         buf.push_str(&pair[0]);
         buf.push('\u{0}');
         buf.push_str(&pair[1]);
-        out.push(Inline::<BigramHash>::new(*blake3::hash(buf.as_bytes()).as_bytes()));
+        out.push(Inline::<BigramHash>::new(
+            *blake3::hash(buf.as_bytes()).as_bytes(),
+        ));
     }
     out
 }
@@ -335,7 +361,9 @@ pub fn code_tokens(text: &str) -> Vec<Inline<WordHash>> {
             if lower.is_empty() {
                 None
             } else {
-                Some(Inline::<WordHash>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
+                Some(Inline::<WordHash>::new(
+                    *blake3::hash(lower.as_bytes()).as_bytes(),
+                ))
             }
         })
         .collect()
@@ -412,7 +440,9 @@ pub fn ngram_tokens(text: &str, n: usize) -> Vec<Inline<NgramHash>> {
             for &c in window {
                 gram.push(c);
             }
-            out.push(Inline::<NgramHash>::new(*blake3::hash(gram.as_bytes()).as_bytes()));
+            out.push(Inline::<NgramHash>::new(
+                *blake3::hash(gram.as_bytes()).as_bytes(),
+            ));
         }
     }
     out
@@ -454,6 +484,65 @@ mod tests {
         // Pure-punctuation tokens disappear after trimming.
         let tokens = hash_tokens("foo  ---  bar");
         assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn unicode_symbols_are_searchable_inside_punctuation_and_words() {
+        let satellite = hash_tokens("🛰️");
+        assert_eq!(satellite.len(), 1);
+
+        let punctuated = hash_tokens("telemetry 🛰️, nominal");
+        assert!(punctuated.contains(&satellite[0]));
+
+        // Symbol extraction is independent of whitespace, so an
+        // indexed document does not need to format the glyph specially.
+        let touching_word = hash_tokens("sensor🛰️array");
+        assert!(touching_word.contains(&satellite[0]));
+
+        // Adding the symbol term must not replace or re-hash the legacy
+        // whitespace-delimited word term from the same input.
+        let legacy_word =
+            Inline::<WordHash>::new(*blake3::hash("sensor🛰️array".as_bytes()).as_bytes());
+        assert!(touching_word.contains(&legacy_word));
+    }
+
+    #[test]
+    fn standalone_unicode_symbol_terms_are_distinct() {
+        let symbols = ["🛰️", "🧭", "🔭"];
+        let terms: Vec<_> = symbols.iter().map(|symbol| hash_tokens(symbol)).collect();
+        assert!(terms.iter().all(|term| term.len() == 1));
+        assert_ne!(terms[0], terms[1]);
+        assert_ne!(terms[1], terms[2]);
+    }
+
+    #[test]
+    fn repeated_and_complex_emoji_are_grapheme_tokens() {
+        let satellite = hash_tokens("🛰️");
+        assert_eq!(
+            hash_tokens("🛰️🛰️🛰️"),
+            vec![satellite[0], satellite[0], satellite[0]]
+        );
+
+        // A ZWJ sequence is one user-perceived symbol, not three
+        // independently searchable code points.
+        let technologist = hash_tokens("👩‍💻");
+        assert_eq!(technologist.len(), 1);
+        assert_eq!(hash_tokens("👩‍💻👩‍💻"), vec![technologist[0], technologist[0]]);
+
+        // Regional-indicator flags and emoji modifiers are extended
+        // grapheme clusters as well.
+        let flag = hash_tokens("🇪🇺");
+        assert_eq!(flag.len(), 1);
+        assert_eq!(hash_tokens("🇪🇺🇪🇺"), vec![flag[0], flag[0]]);
+
+        let modified = hash_tokens("👍🏽");
+        assert_eq!(modified.len(), 1);
+        assert_eq!(hash_tokens("👍🏽👍🏽"), vec![modified[0], modified[0]]);
+    }
+
+    #[test]
+    fn unicode_punctuation_stays_out_of_the_term_list() {
+        assert!(hash_tokens("— … 。").is_empty());
     }
 
     #[test]

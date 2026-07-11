@@ -51,6 +51,11 @@ zerocopy = { version = "0.8", features = ["derive"], optional = true }
 # blake3 — for `hash_tokens` helper (callers hash their own tokens
 # into 32-byte triblespace Values).
 blake3 = "1"
+# unicode-properties + unicode-segmentation — keep non-ASCII symbols
+# (including emoji sequences) searchable as complete grapheme clusters.
+unicode-properties = "0.1.4"
+# 1.13 raised its MSRV to 1.85; this crate still promises Rust 1.80.
+unicode-segmentation = "=1.12.0"
 
 [features]
 default = ["succinct"]

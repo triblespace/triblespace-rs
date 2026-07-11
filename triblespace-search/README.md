@@ -76,8 +76,9 @@ remaining open items are perf/encoding refinements, not architecture.
   word-hash-keyed sugar over `matches` and `score` — tokenises the
   query string with `hash_tokens` internally, available on indexes
   whose term schema is `WordHash` (the default).
-* **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
-  Blake3 tokenizer producing 32-byte term values.
+* **`tokens::hash_tokens`**: opt-in whitespace + lowercase word
+  tokenizer that also preserves non-ASCII Unicode symbols as extended
+  grapheme terms, then Blake3-hashes each term into 32 bytes.
 * **`tokens::ngram_tokens`**: character n-gram tokenizer (n
   namespaced into the hash) for prefix / typo matching.
   Compose with `hash_tokens` to get both exact and fuzzy
@@ -87,12 +88,11 @@ remaining open items are perf/encoding refinements, not architecture.
   (`HTMLParser` → `html`, `parser`). Lowercased output hashes
   the same as `hash_tokens`, so code and prose can share one
   index.
-* **`tokens::bigram_tokens`**: word-level bigram tokenizer
-  namespaced into `"2w:"` so bigrams and single-word hashes
-  coexist in one index. Compose with `hash_tokens` to answer
-  both single-word and phrase queries — `bigram_tokens("quick
-  brown")` hashes only the ordered pair, so a doc matches iff
-  the two words appear adjacently.
+* **`tokens::bigram_tokens`**: word-level bigram tokenizer in its
+  own `BigramHash` term schema. Index it beside the `WordHash`
+  index to answer phrase queries — `bigram_tokens("quick brown")`
+  hashes only the ordered pair, so a doc matches iff the two words
+  appear adjacently.
 * **`schemas::F32LE`**: `InlineEncoding` for packing `f32` scores
   into 32-byte `Inline<F32LE>`s. Used by the scored BM25
   constraint.
