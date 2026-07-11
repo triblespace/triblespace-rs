@@ -42,18 +42,17 @@
 //! approximately comparable — a term that is rare globally but common
 //! within one small segment is scored lower there than a single index
 //! over the whole corpus would score it. The size-tiered [`merge`]
-//! counters this: it reconstructs each segment's documents
-//! ([`SuccinctBM25Index::reconstruct_docs`]) and rebuilds one index
-//! over the union, so IDF is recomputed over the merged corpus and the
-//! bulk of the documents end up in a segment with corpus-wide
-//! statistics. Exact cross-segment IDF would require a global
+//! counters this by streaming the persisted segments through a
+//! bounded-memory union builder. IDF is recomputed over the merged
+//! corpus, so the bulk of the documents end up in a segment with
+//! corpus-wide statistics. Exact cross-segment IDF would require a global
 //! document-frequency roll-up across segments at query time; that is a
 //! deliberate follow-up, not done here.
 //!
 //! [`query_across`]: crate::index_bm25::query_across
 //! [`merge`]: IndexKind::merge
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anybytes::View;
 
@@ -111,17 +110,18 @@ impl<R> Bm25Rollup<R>
 where
     R: BlobStoreGet,
 {
-    /// Resolve one content handle into its text, discarding any handle
-    /// that can't be read (a stale/foreign handle can never enter the
-    /// index).
+    /// Resolve one content handle into its text. An unreadable stale/foreign
+    /// handle is omitted because [`IndexKind::build`] is infallible; archive
+    /// ingestion validates handles before invoking the hook, and other callers
+    /// that require completeness must do the same.
     fn text_of(&self, h: Inline<Handle<LongString>>) -> Option<String> {
         let view: View<str> = self.reader.get::<View<str>, LongString>(h).ok()?;
         Some(view.as_ref().to_owned())
     }
 
     /// Build a succinct BM25 blob from an iterator of `(doc_key,
-    /// tokens)` rows. Shared by `build` (tokenising source text) and
-    /// `merge` (re-using reconstructed token bags).
+    /// tokens)` rows. Used by `build` and by materialized-oracle tests for
+    /// the streaming merge.
     fn build_blob<I>(&self, rows: I) -> Blob<UnknownBlob>
     where
         I: IntoIterator<Item = (Inline<GenId>, Vec<Inline<WordHash>>)>,
@@ -148,50 +148,68 @@ where
 
     fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
         // Extract `entity -> Handle<LongString>` tribles under our
-        // content attribute, dedup by entity (the segment is keyed by
-        // entity id; a content-addressed rebuild is deterministic), and
-        // tokenise each resolved string.
-        let mut seen = HashSet::new();
-        let rows: Vec<(Inline<GenId>, Vec<Inline<WordHash>>)> = source
-            .iter()
-            .filter(|t| t.a() == &self.content_attr)
-            .filter_map(|t| {
-                let key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(t.e());
-                if !seen.insert(key.raw) {
-                    return None;
-                }
-                let handle: Inline<Handle<LongString>> = *t.v::<Handle<LongString>>();
-                let text = self.text_of(handle)?;
-                Some((key, crate::tokens::hash_tokens(&text)))
+        // content attribute and tokenise each resolved string. An entity can
+        // carry several content values in one commit. Treat those values as a
+        // monotone union: for each term keep the largest frequency seen in
+        // any value. `max` makes the result independent of trible order,
+        // retains terms from every value, and keeps exact duplicates
+        // idempotent instead of lengthening the document.
+        let mut docs: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
+        for t in source.iter().filter(|t| t.a() == &self.content_attr) {
+            let key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(t.e());
+            let handle: Inline<Handle<LongString>> = *t.v::<Handle<LongString>>();
+            let Some(text) = self.text_of(handle) else {
+                continue;
+            };
+
+            let mut value_tfs: HashMap<RawInline, u32> = HashMap::new();
+            for term in crate::tokens::hash_tokens(&text) {
+                *value_tfs.entry(term.raw).or_default() += 1;
+            }
+            let doc_tfs = docs.entry(key.raw).or_default();
+            for (term, tf) in value_tfs {
+                doc_tfs
+                    .entry(term)
+                    .and_modify(|old| *old = (*old).max(tf))
+                    .or_insert(tf);
+            }
+        }
+
+        let mut rows: Vec<(Inline<GenId>, Vec<Inline<WordHash>>)> = docs
+            .into_iter()
+            .map(|(key, tfs)| {
+                let mut tfs: Vec<(RawInline, u32)> = tfs.into_iter().collect();
+                tfs.sort_unstable_by_key(|&(term, _)| term);
+                let tokens = tfs
+                    .into_iter()
+                    .flat_map(|(term, tf)| {
+                        std::iter::repeat(Inline::<WordHash>::new(term)).take(tf as usize)
+                    })
+                    .collect();
+                (Inline::<GenId>::new(key), tokens)
             })
             .collect();
+        rows.sort_unstable_by_key(|(key, _)| key.raw);
         self.build_blob(rows)
     }
 
-    fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment {
+    fn try_attach(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<Self::Segment, Box<dyn std::error::Error + Send + Sync>> {
         SuccinctBM25Index::try_from_blob(blob.transmute::<SuccinctBM25Blob>())
-            .expect("valid succinct-bm25 segment blob")
+            .map_err(|err| Box::new(err) as Box<dyn std::error::Error + Send + Sync>)
     }
 
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {
-        // CPU union-then-rebuild (mirrors `SuccinctRollup::merge`):
-        // reconstruct each segment's `(doc_key, token-bag)` rows, dedup
-        // by doc key (a re-indexed message can appear in two segments),
-        // and rebuild one index. IDF + avg-doc-len are recomputed over
-        // the union, so the merged segment carries corpus-wide BM25
-        // statistics.
-        let mut seen: HashSet<RawInline> = HashSet::new();
-        let mut rows: Vec<(Inline<GenId>, Vec<Inline<WordHash>>)> = Vec::new();
-        for seg in segments {
-            for (key, tokens) in seg.reconstruct_docs() {
-                if !seen.insert(key) {
-                    continue;
-                }
-                let terms = tokens.into_iter().map(Inline::<WordHash>::new).collect();
-                rows.push((Inline::<GenId>::new(key), terms));
-            }
-        }
-        self.build_blob(rows)
+        // The kind always builds with BM25Builder's default tuning. Pass the
+        // same values to the direct per-term-max segment union, which retains
+        // all duplicate-key content without a corpus-sized token-bag
+        // intermediate.
+        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        let merged = SuccinctBM25Index::merge_segments(segments, defaults.k1, defaults.b);
+        let blob: Blob<SuccinctBM25Blob> = (&merged).to_blob();
+        blob.transmute()
     }
 }
 
@@ -230,9 +248,11 @@ pub fn query_across(
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
+
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::fucid;
-    use triblespace_core::prelude::{attributes, entity};
+    use triblespace_core::prelude::{attributes, entity, pattern};
     use triblespace_core::repo::index_home::{IndexHome, Manifest, FANOUT};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
@@ -316,6 +336,15 @@ mod tests {
         let reloaded: Blob<UnknownBlob> = Blob::new(blob.bytes.clone());
         let seg = kind.attach(reloaded);
         assert_eq!(seg.doc_count(), table.len());
+        let indexed_keys: HashSet<RawInline> = seg.document_keys().map(|key| key.raw).collect();
+        let expected_keys: HashSet<RawInline> = table
+            .iter()
+            .map(|(id, _)| {
+                let key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(id);
+                key.raw
+            })
+            .collect();
+        assert_eq!(indexed_keys, expected_keys);
 
         for q in ["alpha", "memory search", "rollup segment merge", "theta zeta"] {
             let got: HashMap<RawInline, f32> = query_across(
@@ -334,6 +363,34 @@ mod tests {
                 let gs = got.get(doc).unwrap_or_else(|| panic!("query `{q}`: missing doc"));
                 assert!((gs - ws).abs() <= 1e-4, "query `{q}`: score {gs} vs {ws}");
             }
+        }
+    }
+
+    #[test]
+    fn build_unions_same_commit_content_values_by_max_tf() {
+        let shared = *fucid();
+        let pairs = vec![
+            (shared, "alpha alpha first_value".to_owned()),
+            (shared, "alpha beta second_value".to_owned()),
+        ];
+        let mut store = MemoryBlobStore::new();
+        let (source, _) = stage(&mut store, &pairs);
+        let kind = Bm25Rollup::new(store.reader().unwrap(), content.id());
+        let segment = kind.attach(kind.build(&source));
+        let shared_key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(&shared);
+
+        assert_eq!(segment.doc_count(), 1);
+        assert_eq!(segment.doc_len(0), Some(5), "max(alpha)=2 plus three terms");
+        for term in ["alpha", "beta", "first_value", "second_value"] {
+            let hits: HashSet<RawInline> = segment
+                .query_multi(&hash_tokens(term))
+                .into_iter()
+                .map(|(doc, _)| doc.raw)
+                .collect();
+            assert!(
+                hits.contains(&shared_key.raw),
+                "same-commit union retains `{term}`"
+            );
         }
     }
 
@@ -374,6 +431,125 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "query `{q}`: merged matched-doc set == oracle set");
         }
+    }
+
+    #[test]
+    fn bounded_merge_matches_max_union_oracle_and_is_idempotent() {
+        // Lock the direct merge against a materialized per-term-max oracle.
+        // The direct path should produce the same canonical bytes while
+        // keeping corpus-sized token bags out of memory.
+        let shared = *fucid();
+        let first_only = *fucid();
+        let second_only = *fucid();
+        let a = vec![
+            (shared, "alpha alpha first_owner".to_owned()),
+            (first_only, "gamma stable".to_owned()),
+        ];
+        let b = vec![
+            (shared, "shadow_only beta".to_owned()),
+            (second_only, "beta delta".to_owned()),
+        ];
+
+        let mut store = MemoryBlobStore::new();
+        let (src_a, _) = stage(&mut store, &a);
+        let (src_b, _) = stage(&mut store, &b);
+        let reader = store.reader().unwrap();
+        let kind = Bm25Rollup::new(reader, content.id());
+        let blob_a = kind.build(&src_a);
+        let blob_b = kind.build(&src_b);
+        let segments = vec![
+            kind.attach(Blob::new(blob_a.bytes.clone())),
+            kind.attach(Blob::new(blob_b.bytes.clone())),
+        ];
+
+        let mut union_tfs: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
+        for segment in &segments {
+            for (key, tokens) in segment.reconstruct_docs() {
+                let mut value_tfs: HashMap<RawInline, u32> = HashMap::new();
+                for term in tokens {
+                    *value_tfs.entry(term).or_default() += 1;
+                }
+                let doc_tfs = union_tfs.entry(key).or_default();
+                for (term, tf) in value_tfs {
+                    doc_tfs
+                        .entry(term)
+                        .and_modify(|old| *old = (*old).max(tf))
+                        .or_insert(tf);
+                }
+            }
+        }
+        let mut rows: Vec<(Inline<GenId>, Vec<Inline<WordHash>>)> = Vec::new();
+        for (key, tfs) in union_tfs {
+            let mut tfs: Vec<(RawInline, u32)> = tfs.into_iter().collect();
+            tfs.sort_unstable_by_key(|&(term, _)| term);
+            let tokens = tfs
+                .into_iter()
+                .flat_map(|(term, tf)| {
+                    std::iter::repeat(Inline::<WordHash>::new(term)).take(tf as usize)
+                })
+                .collect();
+            rows.push((Inline::<GenId>::new(key), tokens));
+        }
+        rows.sort_unstable_by_key(|(key, _)| key.raw);
+        let materialized = kind.build_blob(rows);
+        let direct = kind.merge(&segments);
+        assert_eq!(
+            direct.bytes.as_ref(),
+            materialized.bytes.as_ref(),
+            "bounded merge must match the materialized max-union oracle"
+        );
+        let reverse_segments = vec![
+            kind.attach(Blob::new(blob_b.bytes.clone())),
+            kind.attach(Blob::new(blob_a.bytes.clone())),
+        ];
+        let reverse = kind.merge(&reverse_segments);
+        assert_eq!(
+            direct.bytes.as_ref(),
+            reverse.bytes.as_ref(),
+            "max union is independent of segment order"
+        );
+
+        let merged = kind.attach(direct);
+        let shared_key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(&shared);
+        for term in ["alpha", "first_owner", "shadow_only", "beta"] {
+            let hits: HashSet<RawInline> = merged
+                .query_multi(&hash_tokens(term))
+                .into_iter()
+                .map(|(doc, _)| doc.raw)
+                .collect();
+            assert!(hits.contains(&shared_key.raw), "max union retains `{term}`");
+        }
+        let shared_code = merged
+            .document_keys()
+            .position(|key| key.raw == shared_key.raw)
+            .unwrap();
+        assert_eq!(
+            merged.doc_len(shared_code),
+            Some(5),
+            "2 alpha + 3 union terms"
+        );
+
+        // Merging the same persisted segment twice must be idempotent: max(tf)
+        // retains its original frequencies and therefore its document lengths.
+        let duplicate_segments = vec![
+            kind.attach(Blob::new(blob_a.bytes.clone())),
+            kind.attach(Blob::new(blob_a.bytes.clone())),
+        ];
+        let duplicate_merged = kind.attach(kind.merge(&duplicate_segments));
+        assert_eq!(duplicate_merged.doc_count(), 2);
+        let duplicate_shared_code = duplicate_merged
+            .document_keys()
+            .position(|key| key.raw == shared_key.raw)
+            .unwrap();
+        assert_eq!(duplicate_merged.doc_len(duplicate_shared_code), Some(3));
+        let first_only_key: Inline<GenId> =
+            triblespace_core::inline::IntoInline::to_inline(&first_only);
+        let first_only_code = duplicate_merged
+            .document_keys()
+            .position(|key| key.raw == first_only_key.raw)
+            .unwrap();
+        assert_eq!(duplicate_merged.doc_len(first_only_code), Some(2));
+        assert!((duplicate_merged.avg_doc_len() - 2.5).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -485,6 +661,62 @@ mod tests {
     }
 
     #[test]
+    fn fanout_compaction_unions_duplicate_documents_monotonically() {
+        let mut storage = MemoryRepo::default();
+        let branch = *fucid();
+        let shared = *fucid();
+        let shared_key: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(&shared);
+        let mut sources = Vec::new();
+        let mut unique_terms = Vec::new();
+
+        for i in 0..FANOUT {
+            let unique = format!("unique_term_{i}");
+            let text = format!("common common {unique}");
+            let h: Inline<Handle<LongString>> = storage.put::<LongString, _>(text).unwrap();
+            let mut source = TribleSet::new();
+            source += entity! {
+                triblespace_core::id::ExclusiveId::force_ref(&shared) @ content: h
+            };
+            sources.push(source);
+            unique_terms.push(unique);
+        }
+
+        let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
+        {
+            let mut home = IndexHome::new(&mut storage, branch, kind.clone());
+            for source in &sources {
+                home.update_index(source).unwrap();
+            }
+            let manifest = home.read_manifest().unwrap();
+            assert_eq!(manifest.segments.len(), 1, "FANOUT leaves compact together");
+        }
+
+        let segments = {
+            let mut home = IndexHome::new(&mut storage, branch, kind);
+            home.attach_all().unwrap()
+        };
+        assert_eq!(segments.len(), 1);
+        let compacted = &segments[0];
+        assert_eq!(compacted.doc_count(), 1);
+        assert_eq!(
+            compacted.doc_len(0),
+            Some((2 + unique_terms.len()) as u32),
+            "shared common TF is max(2), not the sum across leaves"
+        );
+        for term in unique_terms {
+            let hits: HashSet<RawInline> = compacted
+                .query_multi(&hash_tokens(&term))
+                .into_iter()
+                .map(|(doc, _)| doc.raw)
+                .collect();
+            assert!(
+                hits.contains(&shared_key.raw),
+                "compaction retains `{term}`"
+            );
+        }
+    }
+
+    #[test]
     fn on_commit_hook_maintains_bm25_incrementally() {
         // The on-commit trigger, end-to-end through a real `Repository`:
         // the hook builds one BM25 segment per push from that push's
@@ -493,7 +725,9 @@ mod tests {
         // snapshots, so a registration-time reader would never see the
         // blobs later pushes upload). A SuccinctRollup registered
         // alongside proves two real kinds coexist on one branch head.
-        use triblespace_core::repo::index_home::{append_segment, SuccinctRollup};
+        use triblespace_core::repo::index_home::{
+            append_segment, set_coverage, Manifest, SuccinctRollup,
+        };
         use triblespace_core::repo::Repository;
 
         let storage = MemoryRepo::default();
@@ -505,13 +739,42 @@ mod tests {
         .unwrap();
 
         let content_attr = content.id();
-        repo.on_commit(move |storage, _branch, delta, head| {
+        repo.on_commit(move |storage, _branch, batch, head| {
             let reader = storage
                 .reader()
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             let kind = Bm25Rollup::new(reader, content_attr);
-            append_segment(storage, &kind, delta, head)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            let manifest = Manifest::from_tribles(head, kind.kind_id());
+            if !manifest.covers_head(batch.base_head) {
+                return Err(Box::new(triblespace_core::repo::index_home::CoverageMismatch {
+                    kind: kind.kind_id(),
+                    expected: batch.base_head,
+                    actual: manifest.covered,
+                }) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            for commit in &batch.commits {
+                let reader = storage
+                    .reader()
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let meta: TribleSet = reader
+                    .get(*commit)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let Some((payload,)) = triblespace_core::find!(
+                    (payload: Inline<Handle<triblespace_core::blob::encodings::simplearchive::SimpleArchive>>),
+                    pattern!(&meta, [{ triblespace_core::repo::content: ?payload }])
+                )
+                .next()
+                else {
+                    continue;
+                };
+                let delta: TribleSet = reader
+                    .get(payload)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                append_segment(storage, &kind, &delta, head)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+            set_coverage(head, kind.kind_id(), vec![batch.new_head]);
+            Ok(())
         });
         repo.register_index(SuccinctRollup::new());
 

@@ -16,12 +16,14 @@
 //!
 //! Each index *kind* is an LSMT of segments:
 //!
-//! - **Segments** — immutable, content-addressed blobs (one per
-//!   maintenance step, plus merged segments). Local cache blobs, GC'd
-//!   when unreferenced.
+//! - **Segments** — immutable, content-addressed blobs (normally one
+//!   logical level-zero leaf per source commit, plus merged segments; one
+//!   unusually large commit may use several physical shards). Local cache
+//!   blobs, GC'd when unreferenced.
 //! - **Manifest** — a set of tribles (one entity per segment, tagged
 //!   with the owning kind, carrying the segment blob handle, its LSMT
-//!   level, and a sequence number) unioned
+//!   level, and a sequence number, plus the source-commit coverage frontier)
+//!   unioned
 //!   directly into the branch-head tribleset. Rewritten (this kind's old
 //!   segment tribles differenced out, the new ones unioned in) as the
 //!   index evolves; the old branch-head-tribleset version and its
@@ -65,9 +67,9 @@
 //!    tribleset become unreachable and are reclaimed by the *existing*
 //!    store GC — no bespoke collector and no separate manifest-pin path.
 //! 3. **Ephemeral / soft-state.** The manifest is redundant with (and
-//!    re-derivable from) the commit chain; a `push` that rebuilds the
-//!    branch metadata simply drops it, exactly as it drops the `rollup`
-//!    attribute today, and [`IndexHome::update_index`](crate::repo::index_home::IndexHome::update_index) rebuilds it. Each
+//!    re-derivable from) the commit chain. Branch-metadata rebuilds carry it
+//!    forward, while its source-commit frontier makes a missed maintenance
+//!    hook detectable and restartable. Each
 //!    segment entity is tagged with its kind id ([`seg_kind`](crate::repo::index_home::seg_kind)), so two
 //!    kinds over the same branch keep independent manifests in the one
 //!    tribleset. The existing single-blob `rollup` branch-metadata
@@ -111,8 +113,8 @@
 //!
 //! # Seams left for follow-up work
 //!
-//! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (union-then-rebuild
-//!   for the SuccinctArchive rollup). The GPU-accelerated succinct merge
+//! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (a bounded-memory
+//!   structural merge for the SuccinctArchive rollup). The GPU-accelerated succinct merge
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.
 
@@ -122,7 +124,7 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, Universe,
+    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, Universe,
 };
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -159,6 +161,11 @@ attributes! {
     /// manifest. Gives a stable total order within a level and keeps
     /// content-addressed segment entities distinct.
     "DFE499897718CFB97497AA8504A5D48F" as pub seg_seq: U256BE;
+    /// Maximal source commits covered by this kind's live manifest. The
+    /// repeated values form an antichain frontier: the indexed source set is
+    /// the union of the tips' ancestor closures. A fully caught-up index has
+    /// exactly the source branch HEAD as its sole tip.
+    "C1D931CEA5CB365254E1C9FB349E9BA1" as pub covered_tip: Handle<SimpleArchive>;
 }
 
 /// Number of segments a level may hold before a size-tiered merge
@@ -187,13 +194,26 @@ pub trait IndexKind {
     /// bounded commit-range delta, never the whole branch).
     fn build(&self, source: &TribleSet) -> Blob<UnknownBlob>;
 
-    /// Attach a stored segment blob into its queryable form.
+    /// Fallibly attach a stored segment blob into its queryable form.
     ///
     /// The blob must be one previously produced by [`build`](Self::build)
-    /// or [`merge`](Self::merge) of the same kind; segments are
-    /// content-addressed and produced by this surface, so a decode
-    /// failure is a corruption bug, not an expected condition.
-    fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment;
+    /// or [`merge`](Self::merge) of the same kind. A decode failure means a
+    /// stale/corrupt manifest and is surfaced so repair can discard and
+    /// rebuild it rather than panic or certify unreadable state.
+    fn try_attach(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>>;
+
+    /// Attach a segment known to be valid, panicking on corruption.
+    ///
+    /// Maintenance and external reads should normally use the fallible
+    /// index-home APIs, which call [`try_attach`](Self::try_attach). This
+    /// convenience method remains useful in tests and trusted in-memory paths.
+    fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment {
+        self.try_attach(blob)
+            .unwrap_or_else(|err| panic!("invalid index segment: {err}"))
+    }
 
     /// Merge several attached segments into one new segment blob (CPU).
     ///
@@ -226,6 +246,9 @@ pub struct SegmentEntry {
 pub struct Manifest {
     /// Live segments, kept sorted by `(level, seq)`.
     pub segments: Vec<SegmentEntry>,
+    /// Maximal source commits whose ancestor closures this manifest covers.
+    /// Kept sorted and deduplicated for canonical serialization.
+    pub covered: Vec<Inline<Handle<SimpleArchive>>>,
     next_seq: u64,
 }
 
@@ -237,6 +260,16 @@ impl Manifest {
         self.next_seq += 1;
         self.segments.push(SegmentEntry { blob, level, seq });
         self.segments.sort_by_key(|e| (e.level, e.seq));
+    }
+
+    /// Adopt an already-built immutable segment at `level`.
+    ///
+    /// This is primarily a migration seam: a verified legacy monolithic
+    /// rollup can become the initial upper-tier segment without decoding and
+    /// rebuilding it. New source deltas should normally enter through
+    /// [`append_segment`] at level zero.
+    pub fn adopt_segment(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
+        self.push(blob, level);
     }
 
     /// The lowest LSMT level holding at least `fanout` segments, if any.
@@ -284,9 +317,19 @@ impl Manifest {
         }
         segments.sort_by_key(|e| (e.level, e.seq));
 
+        let mut covered: Vec<Inline<Handle<SimpleArchive>>> = find!(
+            (tip: Inline<Handle<SimpleArchive>>),
+            pattern!(set, [{ _?coverage @ seg_kind: kind, covered_tip: ?tip }])
+        )
+        .map(|(tip,)| tip)
+        .collect();
+        covered.sort_unstable_by_key(|tip| tip.raw);
+        covered.dedup_by_key(|tip| tip.raw);
+
         Self {
             next_seq: max_seq.map_or(0, |m| m + 1),
             segments,
+            covered,
         }
     }
 
@@ -303,9 +346,87 @@ impl Manifest {
                 seg_seq: e.seq,
             };
         }
+        for tip in &self.covered {
+            set += entity! {
+                seg_kind: kind,
+                covered_tip: *tip,
+            };
+        }
         set
     }
+
+    /// True when this manifest certifies exactly the supplied source head.
+    /// Empty source history is represented by an empty frontier; every
+    /// non-empty, fully caught-up branch is represented by one HEAD tip.
+    pub fn covers_head(&self, head: Option<Inline<Handle<SimpleArchive>>>) -> bool {
+        match head {
+            None => self.covered.is_empty(),
+            Some(head) => self.covered.as_slice() == [head],
+        }
+    }
+
+    /// Replace the coverage frontier with one fully covered source HEAD.
+    pub fn cover_head(&mut self, head: Option<Inline<Handle<SimpleArchive>>>) {
+        self.covered.clear();
+        if let Some(head) = head {
+            self.covered.push(head);
+        }
+    }
+
+    /// Replace the coverage frontier with canonical sorted, unique tips.
+    pub fn set_covered(&mut self, mut tips: Vec<Inline<Handle<SimpleArchive>>>) {
+        tips.sort_unstable_by_key(|tip| tip.raw);
+        tips.dedup_by_key(|tip| tip.raw);
+        self.covered = tips;
+    }
 }
+
+/// Replace one kind's complete manifest subset inside a branch-head set.
+/// Every non-index trible and every other index kind is preserved verbatim.
+pub fn replace_manifest(head_set: &mut TribleSet, kind: Id, manifest: &Manifest) {
+    let old = Manifest::from_tribles(head_set, kind).to_tribles(kind);
+    let mut next = head_set.difference(&old);
+    next += manifest.to_tribles(kind);
+    *head_set = next;
+}
+
+/// Remove one kind's segments and coverage certificate from a branch head.
+pub fn clear_manifest(head_set: &mut TribleSet, kind: Id) {
+    replace_manifest(head_set, kind, &Manifest::default());
+}
+
+/// Rewrite only one kind's coverage frontier, retaining its live segments.
+pub fn set_coverage(head_set: &mut TribleSet, kind: Id, tips: Vec<Inline<Handle<SimpleArchive>>>) {
+    let mut manifest = Manifest::from_tribles(head_set, kind);
+    manifest.set_covered(tips);
+    replace_manifest(head_set, kind, &manifest);
+}
+
+/// A live maintenance hook found that its manifest does not cover the source
+/// HEAD on which the push is based. Advancing from that state would falsely
+/// certify an unindexed gap, so the hook must leave the manifest untouched and
+/// let an explicit bootstrap/repair fill the missing commits.
+#[derive(Debug, Clone)]
+pub struct CoverageMismatch {
+    /// Index recipe whose certificate is stale.
+    pub kind: Id,
+    /// Source HEAD the incoming push assumes is already covered.
+    pub expected: Option<Inline<Handle<SimpleArchive>>>,
+    /// Frontier actually recorded in the manifest.
+    pub actual: Vec<Inline<Handle<SimpleArchive>>>,
+}
+
+impl fmt::Display for CoverageMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "index {:x} coverage is stale: expected {:?}, found {:?}",
+            self.kind, self.expected, self.actual
+        )
+    }
+}
+
+impl Error for CoverageMismatch {}
 
 /// Extract the index-home manifest subset of a branch-head tribleset: every
 /// segment entity across *all* kinds.
@@ -362,6 +483,9 @@ pub(crate) fn manifest_tribles(set: &TribleSet) -> TribleSet {
 pub enum IndexError {
     /// An underlying storage operation failed.
     Storage(Box<dyn Error + Send + Sync>),
+    /// A manifest referenced a segment that could not be decoded as this
+    /// index kind. The manifest is repairable soft state.
+    Segment(Box<dyn Error + Send + Sync>),
     /// The branch pin advanced between read and CAS-write (a concurrent
     /// commit or another index update). The caller may retry — segment
     /// blobs are content-addressed, so a retry dedupes against
@@ -373,6 +497,7 @@ impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IndexError::Storage(e) => write!(f, "index-home storage error: {e}"),
+            IndexError::Segment(e) => write!(f, "index-home segment decode error: {e}"),
             IndexError::Conflict => write!(f, "index-home manifest pin advanced concurrently"),
         }
     }
@@ -411,11 +536,6 @@ where
 {
     let kind_id = kind.kind_id();
     let mut manifest = Manifest::from_tribles(head_set, kind_id);
-    // Snapshot this kind's current manifest tribles so we can subtract
-    // exactly them (round-trip fidelity: to_tribles reproduces the
-    // content-addressed entities that from_tribles just read).
-    let old_manifest_tribles = manifest.to_tribles(kind_id);
-
     // Build + append a fresh level-0 segment.
     let segment_blob = kind.build(source);
     let handle = storage.put::<UnknownBlob, _>(segment_blob).map_err(boxed)?;
@@ -429,7 +549,7 @@ where
         let mut attached = Vec::with_capacity(victims.len());
         for v in &victims {
             let blob: Blob<UnknownBlob> = reader.get(v.blob).map_err(boxed)?;
-            attached.push(kind.attach(blob));
+            attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
         }
         let merged_blob = kind.merge(&attached);
         let merged_handle = storage.put::<UnknownBlob, _>(merged_blob).map_err(boxed)?;
@@ -441,9 +561,7 @@ where
     // tribles (branch metadata, other kinds' segments) are preserved
     // because union only adds and the difference targets exactly this
     // kind's old segment entities.
-    let mut new_set = head_set.difference(&old_manifest_tribles);
-    new_set += manifest.to_tribles(kind_id);
-    *head_set = new_set;
+    replace_manifest(head_set, kind_id, &manifest);
     Ok(())
 }
 
@@ -506,11 +624,21 @@ where
     /// plus a bounded number of segment fetches.
     pub fn attach_all(&mut self) -> Result<Vec<K::Segment>, IndexError> {
         let manifest = self.read_manifest()?;
+        self.attach_manifest(&manifest)
+    }
+
+    /// Attach the segments from an already-read manifest snapshot.
+    ///
+    /// This lets a caller read one branch-head tribleset, validate its source
+    /// coverage, and then attach exactly the segment handles certified by that
+    /// same snapshot. Unlike [`attach_all`](Self::attach_all), this method does
+    /// not reread the mutable branch pin.
+    pub fn attach_manifest(&mut self, manifest: &Manifest) -> Result<Vec<K::Segment>, IndexError> {
         let reader = self.storage.reader().map_err(boxed)?;
         let mut out = Vec::with_capacity(manifest.segments.len());
         for e in &manifest.segments {
             let blob: Blob<UnknownBlob> = reader.get(e.blob).map_err(boxed)?;
-            out.push(self.kind.attach(blob));
+            out.push(self.kind.try_attach(blob).map_err(IndexError::Segment)?);
         }
         Ok(out)
     }
@@ -527,12 +655,18 @@ where
     /// Superseded segments and the old branch-head tribleset become
     /// unreachable and are reclaimed by the store's GC.
     ///
+    /// Because `source` is an arbitrary caller-supplied view rather than a
+    /// commit batch, this operation clears any source-commit coverage
+    /// certificate. Callers that know and have verified a frontier can publish
+    /// it separately in the same higher-level transaction.
+    ///
     /// Returns [`IndexError::Conflict`] if the branch pin advanced
     /// concurrently; the caller may retry.
     pub fn update_index(&mut self, source: &TribleSet) -> Result<(), IndexError> {
         let old_head = self.head()?;
         let mut new_set = self.head_set()?;
         append_segment(&mut *self.storage, &self.kind, source, &mut new_set)?;
+        set_coverage(&mut new_set, self.kind.kind_id(), Vec::new());
         let new_head: Inline<Handle<SimpleArchive>> = self.storage.put(new_set).map_err(boxed)?;
         match self
             .storage
@@ -557,10 +691,11 @@ where
 ///   wavelet freeze).
 /// - `attach` — decode the blob into a [`SuccinctArchive`], mmap-queried
 ///   in place (zero-copy over the shared `Bytes`).
-/// - `merge` — **CPU** union-then-rebuild: reconstruct each segment's
-///   tribles, union them, and rebuild one archive. This is the clean seam
-///   the GPU-accelerated succinct merge (sorted-run merge + wavelet
-///   reassembly) replaces without touching the surface.
+/// - `merge` — **CPU** structural merge: remap segment-local domains, k-way
+///   merge all six sorted rotations, and rebuild the wavelet structures
+///   without reconstructing the full six-PATCH [`TribleSet`]. This remains
+///   the clean seam where a GPU implementation can drop in without changing
+///   the surface.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SuccinctRollup;
 
@@ -601,21 +736,20 @@ impl IndexKind for SuccinctRollup {
         }
     }
 
-    fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment {
+    fn try_attach(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>> {
         blob.transmute::<SuccinctArchiveBlob>()
             .try_from_blob()
-            .expect("valid succinct-archive segment blob")
+            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)
     }
 
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {
-        // CPU union-then-rebuild. GPU-merge seam: replace this body with a
-        // structural sorted-run merge + wavelet reassembly.
-        let mut union = TribleSet::new();
-        for seg in segments {
-            let set: TribleSet = seg.into();
-            union += set;
-        }
-        let archive: SuccinctArchive<OrderedUniverse> = (&union).into();
+        // Merge the six already-sorted Ring rotations directly. Domains are
+        // remapped and wavelet matrices rebuilt, but no six-index TribleSet is
+        // reconstructed at the compaction tier's full size.
+        let archive = merge_ordered_archives(segments);
         {
             let blob: Blob<SuccinctArchiveBlob> = (&archive).to_blob();
             blob.transmute()
@@ -684,6 +818,7 @@ mod tests {
     use crate::id::fucid;
     use crate::inline::TryToInline;
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::BlobStorePut;
 
     fn person(name: &str) -> TribleSet {
         let id = fucid();
@@ -703,8 +838,11 @@ mod tests {
         let mut m = Manifest::default();
         let h0 = Inline::<Handle<UnknownBlob>>::new([1u8; 32]);
         let h1 = Inline::<Handle<UnknownBlob>>::new([2u8; 32]);
+        let tip = Inline::<Handle<SimpleArchive>>::new([3u8; 32]);
+        let other_tip = Inline::<Handle<SimpleArchive>>::new([4u8; 32]);
         m.push(h0, 0);
         m.push(h1, 1);
+        m.set_covered(vec![other_tip, tip, tip]);
 
         let kind = SuccinctRollup.kind_id();
         let parsed = Manifest::from_tribles(&m.to_tribles(kind), kind);
@@ -716,6 +854,13 @@ mod tests {
         assert_eq!(parsed.segments[1].level, 1);
         // next_seq continues past the max seq read back.
         assert_eq!(parsed.next_seq, 2);
+        assert_eq!(parsed.covered, vec![tip, other_tip]);
+        assert!(!parsed.covers_head(Some(tip)));
+        assert_eq!(
+            parsed.to_tribles(kind),
+            m.to_tribles(kind),
+            "canonical coverage entities round-trip exactly"
+        );
     }
 
     #[test]
@@ -744,6 +889,37 @@ mod tests {
         // The branch pin now names the newest branch-head tribleset, not
         // the first.
         assert_ne!(first_head, second_head);
+    }
+
+    #[test]
+    fn explicit_update_invalidates_commit_coverage() {
+        let mut storage = MemoryRepo::default();
+        let branch = source_branch();
+        let kind = SuccinctRollup::new();
+        let certified = Inline::<Handle<SimpleArchive>>::new([9u8; 32]);
+
+        {
+            let mut home = IndexHome::new(&mut storage, branch, kind);
+            home.update_index(&person("Ada")).unwrap();
+        }
+        let old_head = storage.head(branch).unwrap().unwrap();
+        let mut head_set: TribleSet = storage.reader().unwrap().get(old_head).unwrap();
+        set_coverage(&mut head_set, kind.kind_id(), vec![certified]);
+        let certified_head: Inline<Handle<SimpleArchive>> = storage.put(head_set).unwrap();
+        assert!(matches!(
+            storage
+                .update(branch, Some(old_head), Some(certified_head))
+                .unwrap(),
+            PushResult::Success()
+        ));
+
+        let mut home = IndexHome::new(&mut storage, branch, kind);
+        assert!(home.read_manifest().unwrap().covers_head(Some(certified)));
+        home.update_index(&person("Grace")).unwrap();
+        assert!(
+            home.read_manifest().unwrap().covered.is_empty(),
+            "an arbitrary explicit source cannot retain a commit certificate"
+        );
     }
 
     #[test]
@@ -1223,7 +1399,53 @@ mod tests {
         )
         .count();
         assert_eq!(count, n, "union read covers every commit's delta");
+        assert!(
+            m.covers_head(repo.pull(*branch).unwrap().head()),
+            "coverage certificate follows source HEAD"
+        );
         assert!(repo.take_hook_errors().is_empty());
+    }
+
+    #[test]
+    fn several_commits_in_one_push_become_distinct_leaves() {
+        use crate::repo::Repository;
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        repo.register_index(SuccinctRollup::new());
+        let branch = repo.create_branch("main", None).unwrap();
+
+        let mut ws = repo.pull(*branch).unwrap();
+        for name in ["Ada", "Grace", "Edsger"] {
+            ws.commit(person(name), "person");
+        }
+        let pushed_head = ws.head().unwrap();
+        repo.push(&mut ws).unwrap();
+        assert!(repo.take_hook_errors().is_empty());
+
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
+        let manifest = home.read_manifest().unwrap();
+        assert_eq!(
+            manifest.segments.len(),
+            3,
+            "one physical L0 leaf per content-bearing commit, not per push"
+        );
+        assert!(manifest.segments.iter().all(|entry| entry.level == 0));
+        assert_eq!(manifest.covered, vec![pushed_head]);
+
+        let segments = home.attach_all().unwrap();
+        let union = SuccinctRollup::union(&segments);
+        assert_eq!(
+            find!(
+                (name: Inline<_>),
+                pattern!(&union, [{ _?person @ literature::firstname: ?name }])
+            )
+            .count(),
+            3
+        );
     }
 
     #[test]
@@ -1246,8 +1468,11 @@ mod tests {
             fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
                 SuccinctRollup.build(source)
             }
-            fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment {
-                SuccinctRollup.attach(blob)
+            fn try_attach(
+                &self,
+                blob: Blob<UnknownBlob>,
+            ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>> {
+                SuccinctRollup.try_attach(blob)
             }
             fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {
                 SuccinctRollup.merge(segments)
@@ -1419,6 +1644,7 @@ mod tests {
         let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup::new());
         let manifest = home.read_manifest().unwrap();
         assert_eq!(manifest.segments.len(), 2, "one segment per landed delta");
+        assert_eq!(manifest.covered, vec![ws2.head().unwrap()]);
         let segments = home.attach_all().unwrap();
         let union = SuccinctRollup::union(&segments);
         let mut names: Vec<_> = find!(
@@ -1428,6 +1654,53 @@ mod tests {
         .collect();
         names.sort();
         assert_eq!(names.len(), 2, "both writers' deltas indexed");
+    }
+
+    #[test]
+    fn an_unhooked_gap_stays_detectably_stale() {
+        use crate::repo::Repository;
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let storage = MemoryRepo::default();
+        let mut repo = Repository::new(storage, key.clone(), TribleSet::new()).unwrap();
+        repo.register_index(SuccinctRollup::new());
+        let branch = repo.create_branch("main", None).unwrap();
+
+        let mut first = repo.pull(*branch).unwrap();
+        first.commit(person("indexed"), "indexed");
+        repo.push(&mut first).unwrap();
+        let indexed_head = first.head().unwrap();
+        assert!(repo.take_hook_errors().is_empty());
+
+        // Reopen without process-local hooks and land one source commit. The
+        // manifest remains pinned to the earlier source HEAD.
+        let storage = repo.into_storage();
+        let mut unhooked = Repository::new(storage, key.clone(), TribleSet::new()).unwrap();
+        let mut missed = unhooked.pull(*branch).unwrap();
+        missed.commit(person("missed"), "missed");
+        unhooked.push(&mut missed).unwrap();
+        let missed_head = missed.head().unwrap();
+
+        // Reinstall maintenance and push again. It must not skip over the
+        // missed commit and falsely certify the new HEAD.
+        let storage = unhooked.into_storage();
+        let mut repaired = Repository::new(storage, key, TribleSet::new()).unwrap();
+        repaired.register_index(SuccinctRollup::new());
+        let mut later = repaired.pull(*branch).unwrap();
+        assert_eq!(later.head(), Some(missed_head));
+        later.commit(person("later"), "later");
+        repaired.push(&mut later).unwrap();
+
+        let errors = repaired.take_hook_errors();
+        assert_eq!(errors.len(), 1, "stale coverage is reported");
+        assert!(errors[0].error.to_string().contains("coverage is stale"));
+
+        let mut home = IndexHome::new(repaired.storage_mut(), *branch, SuccinctRollup::new());
+        let manifest = home.read_manifest().unwrap();
+        assert_eq!(manifest.covered, vec![indexed_head]);
+        assert_eq!(manifest.segments.len(), 1, "no partial leaf was appended");
+        assert!(!manifest.covers_head(later.head()));
     }
 
     // Timing demo: query-without-checkout vs a full checkout, on a

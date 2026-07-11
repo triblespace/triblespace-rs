@@ -53,6 +53,7 @@
 //! exactly this.
 
 use std::collections::HashSet;
+use std::error::Error;
 
 use anybytes::View;
 
@@ -171,9 +172,12 @@ where
         self.build_blob(pairs)
     }
 
-    fn attach(&self, blob: Blob<UnknownBlob>) -> Self::Segment {
+    fn try_attach(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>> {
         SuccinctHNSWIndex::try_from_blob(blob.transmute::<SuccinctHNSWBlob>())
-            .expect("valid succinct-hnsw segment blob")
+            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)
     }
 
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {

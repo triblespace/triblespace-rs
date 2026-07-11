@@ -1629,6 +1629,16 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         self.keys.len()
     }
 
+    /// Iterate document keys in canonical universe order without traversing
+    /// postings or reconstructing token bags.
+    ///
+    /// This is the cheap coverage/migration seam for persisted BM25 segments:
+    /// callers can compare exact indexed-document membership in `O(n_docs)`
+    /// instead of paying [`Self::reconstruct_docs`]'s postings walk.
+    pub fn document_keys(&self) -> impl Iterator<Item = Inline<D>> + '_ {
+        (0..self.keys.len()).map(|code| Inline::new(self.keys.access(code)))
+    }
+
     /// Number of distinct terms.
     pub fn term_count(&self) -> usize {
         self.terms.len()
@@ -1718,9 +1728,9 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     }
 
     /// Approximately reconstruct the per-document token multisets this
-    /// index was built from — the union-then-rebuild primitive for an
-    /// index-home segment merge (see
-    /// [`triblespace_search::index_bm25::Bm25Rollup`]).
+    /// index was built from. This remains useful for diagnostics and
+    /// compatibility tests; production index-home merges use
+    /// [`Self::merge_segments`] so they never materialize all token bags.
     ///
     /// Returns one `(doc_key, tokens)` row per document, `doc_key`
     /// being the raw `Inline<D>` bytes and `tokens` the recovered
@@ -1735,7 +1745,6 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// recomputes IDF over the union — the LSMT merge is lossless in
     /// everything the score's monotone part depends on.
     ///
-    /// [`triblespace_search::index_bm25::Bm25Rollup`]: crate::index_bm25::Bm25Rollup
     pub fn reconstruct_docs(&self) -> Vec<(RawInline, Vec<RawInline>)> {
         let n = self.doc_count();
         let nf = n as f32;
@@ -1770,6 +1779,242 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     }
 }
 
+impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
+    /// Merge several persisted BM25 segments directly into one canonical
+    /// succinct index.
+    ///
+    /// This is the bounded-memory counterpart to reconstructing every
+    /// segment as `Vec<(doc_key, Vec<term>)>` and feeding those token bags
+    /// back through [`BM25Builder`](crate::bm25::BM25Builder). It preserves
+    /// monotone document-union semantics:
+    ///
+    /// - duplicate document keys retain every term, taking the maximum term
+    ///   frequency seen for that document and term;
+    /// - exact duplicate segments are therefore idempotent;
+    /// - term frequencies are recovered from the quantized source scores;
+    /// - document lengths, global document frequencies, IDF, and scores are
+    ///   recomputed over the union; and
+    /// - the resulting bytes use the unchanged [`SuccinctBM25Blob`] format.
+    ///
+    /// The persistent source segments stay zero-copy. Temporary memory is
+    /// `O(total_segment_docs + union_docs + union_terms + max_source_term_postings)`:
+    /// a compact local-to-union code map for each segment, the merged document
+    /// lengths and term table, and one term's recovered source postings. In
+    /// particular, there is no `O(total token multiplicity)` token-bag
+    /// materialization and no nested term-to-document hash map.
+    pub(crate) fn merge_segments(segments: &[Self], k1: f32, b: f32) -> Self {
+        let mut area = ByteArea::new().expect("alloc ByteArea");
+        let mut sections = area.sections();
+
+        // ── 1. Sorted union of document keys. Every segment universe is
+        // already sorted, so a tiny k-way cursor supplies the sorted-dedup
+        // contract directly; no flat 32-byte key table is needed here.
+        let mut key_positions = vec![0usize; segments.len()];
+        let key_union = std::iter::from_fn(|| {
+            let next = segments
+                .iter()
+                .enumerate()
+                .filter_map(|(segment, index)| {
+                    (key_positions[segment] < index.keys.len())
+                        .then(|| index.keys.access(key_positions[segment]))
+                })
+                .min()?;
+
+            for (segment, index) in segments.iter().enumerate() {
+                while key_positions[segment] < index.keys.len()
+                    && index.keys.access(key_positions[segment]) == next
+                {
+                    key_positions[segment] += 1;
+                }
+            }
+            Some(next)
+        });
+        let build_universe = CompressedUniverse::with_sorted_dedup(key_union, &mut sections);
+        let keys_meta = build_universe.metadata();
+        let n_docs = build_universe.len();
+        assert!(
+            u32::try_from(n_docs).is_ok(),
+            "succinct BM25 supports at most u32::MAX documents"
+        );
+
+        // Map every source segment's local doc code to its merged code.
+        // Duplicate keys deliberately map to the same code: recover_term
+        // combines their frequencies with max below.
+        let mut code_maps: Vec<Vec<u32>> = Vec::with_capacity(segments.len());
+        for segment in segments {
+            let mut map = vec![0; segment.doc_count()];
+            for (local, slot) in map.iter_mut().enumerate() {
+                let key = segment.keys.access(local);
+                let global = build_universe
+                    .search(&key)
+                    .expect("source key is present in merged universe");
+                *slot = global as u32;
+            }
+            code_maps.push(map);
+        }
+
+        // Reconstruct one term's `(merged_doc_code, tf)` postings. Source
+        // postings are lossless in document presence; recover_tf has the same
+        // saturated-tail approximation as reconstruct_docs(). When a document
+        // occurs in several segments, compact adjacent codes with max(tf):
+        // every distinct term survives, while exact duplicate segments do not
+        // inflate either frequency or document length.
+        let recover_term = |term: &RawInline, out: &mut Vec<(u32, u32)>| {
+            out.clear();
+            for (segment_index, segment) in segments.iter().enumerate() {
+                let Ok(term_index) = segment.terms.binary_search(term) else {
+                    continue;
+                };
+                let source_df = segment.postings.posting_count(term_index).unwrap_or(0) as f32;
+                let source_n = segment.doc_count() as f32;
+                let source_idf = ((source_n - source_df + 0.5) / (source_df + 0.5) + 1.0).ln();
+                if let Some(postings) = segment.postings.postings_for(term_index) {
+                    for (local_code, score) in postings {
+                        let merged_code = code_maps[segment_index][local_code as usize];
+                        let dl = segment.doc_lens.get(local_code as usize).unwrap_or(0) as f32;
+                        let norm = if segment.avg_doc_len > 0.0 {
+                            1.0 - segment.b + segment.b * (dl / segment.avg_doc_len)
+                        } else {
+                            1.0
+                        };
+                        let tf = recover_tf(score, source_idf, norm, segment.k1);
+                        out.push((merged_code, tf));
+                    }
+                }
+            }
+            out.sort_unstable_by_key(|&(code, _)| code);
+            let mut write = 0;
+            for read in 0..out.len() {
+                let (code, tf) = out[read];
+                if write > 0 && out[write - 1].0 == code {
+                    out[write - 1].1 = out[write - 1].1.max(tf);
+                } else {
+                    out[write] = (code, tf);
+                    write += 1;
+                }
+            }
+            out.truncate(write);
+        };
+
+        // ── 2. K-way term union + first postings pass. This pass rebuilds
+        // document lengths from the per-term max union.
+        let mut term_positions = vec![0usize; segments.len()];
+        let mut term_rows: Vec<RawInline> = Vec::new();
+        let mut posting_counts: Vec<usize> = Vec::new();
+        let mut doc_lens_vec = vec![0u32; n_docs];
+        let mut recovered: Vec<(u32, u32)> = Vec::new();
+        loop {
+            let Some(next) = segments
+                .iter()
+                .enumerate()
+                .filter_map(|(segment, index)| index.terms.get(term_positions[segment]).copied())
+                .min()
+            else {
+                break;
+            };
+            for (segment, index) in segments.iter().enumerate() {
+                while index.terms.get(term_positions[segment]).copied() == Some(next) {
+                    term_positions[segment] += 1;
+                }
+            }
+
+            recover_term(&next, &mut recovered);
+            if recovered.is_empty() {
+                continue;
+            }
+            for &(code, tf) in &recovered {
+                let slot = &mut doc_lens_vec[code as usize];
+                *slot = slot
+                    .checked_add(tf)
+                    .expect("recovered document length exceeds u32::MAX");
+            }
+            term_rows.push(next);
+            posting_counts.push(recovered.len());
+        }
+
+        let avg_doc_len = if n_docs == 0 {
+            0.0
+        } else {
+            doc_lens_vec.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_docs as f32
+        };
+        let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)
+            .expect("build merged doc_lens");
+        let terms_handle =
+            pack_byte_table::<32>(&mut sections, &term_rows).expect("build merged terms");
+
+        // ── 3. Score sizing pass. The output CompactVectors require the
+        // exact posting count and maximum score before their sections can be
+        // reserved. Re-walking zero-copy source postings is the memory-bounded
+        // trade: CPU is linear in postings; peak scratch is one term.
+        let total: usize = posting_counts.iter().sum();
+        let n = n_docs as f32;
+        let score = |df: f32, tf: u32, code: u32| -> f32 {
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            let tf = tf as f32;
+            let dl = doc_lens_vec[code as usize] as f32;
+            let norm = if avg_doc_len > 0.0 {
+                1.0 - b + b * (dl / avg_doc_len)
+            } else {
+                1.0
+            };
+            idf * (tf * (k1 + 1.0)) / (tf + k1 * norm)
+        };
+        let mut max_score = 0.0f32;
+        for (term_index, term) in term_rows.iter().enumerate() {
+            recover_term(term, &mut recovered);
+            let df = posting_counts[term_index] as f32;
+            for &(code, tf) in &recovered {
+                max_score = max_score.max(score(df, tf, code));
+            }
+        }
+
+        // ── 4. Final postings pass, streamed into the canonical area.
+        let mut write_recovered: Vec<(u32, u32)> = Vec::new();
+        let postings_meta = SuccinctPostings::build_with_into(
+            &mut sections,
+            n_docs as u32,
+            term_rows.len(),
+            total,
+            max_score,
+            |term_index, buf| {
+                recover_term(&term_rows[term_index], &mut write_recovered);
+                let df = posting_counts[term_index] as f32;
+                buf.extend(
+                    write_recovered
+                        .iter()
+                        .map(|&(code, tf)| (code, score(df, tf, code))),
+                );
+            },
+        )
+        .expect("build merged postings");
+
+        // ── 5. Unchanged suffix metadata / canonical blob format.
+        let meta = SuccinctBM25Meta {
+            n_docs: n_docs as u64,
+            n_terms: term_rows.len() as u64,
+            avg_doc_len,
+            k1,
+            b,
+            _pad: 0,
+            keys: keys_meta,
+            doc_lens: doc_lens_meta,
+            postings: postings_meta,
+            terms: terms_handle,
+        };
+        {
+            let mut meta_sec = sections
+                .reserve::<SuccinctBM25Meta>(1)
+                .expect("reserve merged meta section");
+            meta_sec.as_mut_slice()[0] = meta;
+            meta_sec.freeze().expect("freeze merged meta section");
+        }
+
+        drop(build_universe);
+        drop(sections);
+        let bytes = area.freeze().expect("freeze merged ByteArea");
+        Self::from_bytes(meta, bytes).expect("round-trip merged BM25 bytes")
+    }
+}
 
 /// Errors loading a `SuccinctBM25Index` or `SuccinctHNSWIndex`
 /// blob.

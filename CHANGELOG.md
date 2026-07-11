@@ -165,7 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index *kind* (`IndexKind`: `build` / `attach` / `merge`) maintains a
   log-structured merge tree of immutable, content-addressed segment blobs;
   the *manifest* (one entity per segment: kind tag, blob handle, LSMT
-  level, sequence number) lives as tribles unioned directly into the
+  level, sequence number, plus a source-commit coverage frontier) lives as
+  tribles unioned directly into the
   **branch-head tribleset** — no separate pin, and GC of superseded
   segments is the store's existing reachability sweep because the branch
   head is already a reachability root. Reads go branch-head → manifest
@@ -176,13 +177,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the usual path — **on-commit hooks**: `Repository::register_index` /
   `register_index_filtered` / `on_commit` fold the new segment's manifest
   into the same branch-head tribleset the push is about to CAS in, so a
-  commit and its index maintenance land in one atomic repoint (hooks re-run
+  commit and its index maintenance land in one atomic repoint. Hooks receive
+  a parents-first `CommitBatch` and build one logical leaf per newly reachable
+  source commit instead of materialising one push-sized union; contentless
+  merge commits advance coverage without creating empty segments. A stale
+  frontier (for example after an unhooked writer) is detected rather than
+  silently skipped. Segment attachment is fallible (`IndexKind::try_attach`),
+  so missing/corrupt soft state can be rebuilt instead of panicking; explicit
+  `IndexHome::update_index` clears commit coverage because its arbitrary source
+  view cannot certify a frontier. Hooks re-run
   per push attempt; content-addressed segments make that idempotent, and a
   hook failure is recorded and drained via `take_hook_errors`, never
   blocking the commit). Branch-metadata rebuilds (`push`,
   `compute_rollup`) carry the manifest forward (`rebuild_branch_meta`), so
   segments **accumulate across commits** instead of being wiped by each
-  rebuild. First kinds: `SuccinctRollup` in core (segments are
+  rebuild. Succinct compaction structurally merges the six sorted rotations
+  with bounded working memory, BM25 compaction streams persisted postings
+  instead of reconstructing every document's token bag, and the direct
+  documented `SimpleArchive` → `SuccinctArchive` conversion is now wired. First
+  kinds: `SuccinctRollup` in core (segments are
   `SuccinctArchive`s; `SuccinctRollup::union` gives cross-segment joins via
   `UnionConstraint`), and in `triblespace-search` the `Bm25Rollup` (term
   search) and `HnswRollup` (vector search) kinds ride the same surface.

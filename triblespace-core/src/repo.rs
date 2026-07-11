@@ -942,6 +942,19 @@ where
     Create(BranchError<Storage>),
 }
 
+/// A topologically ordered batch of source commits introduced by one push
+/// attempt. The batch carries handles only; hooks that need payloads load one
+/// commit at a time from the storage passed alongside it.
+#[derive(Debug, Clone)]
+pub struct CommitBatch {
+    /// Source branch HEAD covered by the branch metadata this push replaces.
+    pub base_head: Option<CommitHandle>,
+    /// Source branch HEAD the push is about to publish.
+    pub new_head: CommitHandle,
+    /// Newly reachable commits, parents before children and deduplicated.
+    pub commits: Vec<CommitHandle>,
+}
+
 /// An on-commit hook, run by [`Repository::try_push`] once per push
 /// attempt, after the new branch-head tribleset has been assembled and
 /// before it is CAS'd in.
@@ -953,10 +966,9 @@ where
 ///    unreferenced and content-addressed: a retry dedupes against them
 ///    and GC reclaims them otherwise.
 /// 2. [`Id`] — the branch being pushed.
-/// 3. `&TribleSet` — the push's **content delta**: the union of the
-///    content of every commit reachable from the new head but not from
-///    the base head. Incremental by construction — never the whole
-///    branch.
+/// 3. [`CommitBatch`] — every commit newly reachable from this attempt,
+///    ordered parents-first. Payloads are deliberately not unioned: hooks can
+///    build one logical leaf per source commit with bounded peak memory.
 /// 4. `&mut TribleSet` — the branch-head tribleset about to be CAS'd
 ///    in. A hook folds its derived state (e.g. an index-home manifest)
 ///    into this set, so commit and maintenance land in **one** atomic
@@ -977,7 +989,7 @@ pub type CommitHook<Storage> = Box<
     dyn FnMut(
             &mut Storage,
             Id,
-            &TribleSet,
+            &CommitBatch,
             &mut TribleSet,
         ) -> Result<(), Box<dyn Error + Send + Sync>>
         + Send
@@ -1104,7 +1116,7 @@ where
         F: FnMut(
                 &mut Storage,
                 Id,
-                &TribleSet,
+                &CommitBatch,
                 &mut TribleSet,
             ) -> Result<(), Box<dyn Error + Send + Sync>>
             + Send
@@ -1115,9 +1127,9 @@ where
     }
 
     /// Register an [`IndexKind`](index_home::IndexKind) for automatic,
-    /// incremental on-commit maintenance: every push builds one level-0
-    /// segment from the push's content delta and folds the updated
-    /// manifest into the same branch-head tribleset the push CAS's in
+    /// incremental on-commit maintenance: every newly reachable commit
+    /// builds one level-0 segment from that commit's content and folds the
+    /// updated manifest into the same branch-head tribleset the push CAS's in
     /// (via [`index_home::append_segment`]); the size-tiered merge keeps
     /// read fan-out bounded. Kinds that select their own source subset
     /// during `build` (like `Bm25Rollup`) need nothing more; to restrict
@@ -1130,8 +1142,8 @@ where
         self.register_index_filtered(kind, |delta: &TribleSet| delta.clone());
     }
 
-    /// Like [`register_index`](Self::register_index), but each commit's
-    /// content delta is first passed through `filter` to select the
+    /// Like [`register_index`](Self::register_index), but each source commit's
+    /// content is first passed through `filter` to select the
     /// kind's source subset (e.g. only tribles under the attributes the
     /// index covers). When the filtered source is empty the commit
     /// appends no segment at all.
@@ -1140,13 +1152,53 @@ where
         K: index_home::IndexKind + Send + Sync + 'static,
         F: FnMut(&TribleSet) -> TribleSet + Send + Sync + 'static,
     {
-        self.on_commit(move |storage, _branch, delta, head_meta| {
-            let source = filter(delta);
-            if source.is_empty() {
-                return Ok(());
+        self.on_commit(move |storage, _branch, batch, head_meta| {
+            let kind_id = kind.kind_id();
+            let manifest = index_home::Manifest::from_tribles(head_meta, kind_id);
+            if !manifest.covers_head(batch.base_head) {
+                return Err(Box::new(index_home::CoverageMismatch {
+                    kind: kind_id,
+                    expected: batch.base_head,
+                    actual: manifest.covered,
+                }));
             }
-            index_home::append_segment(storage, &kind, &source, head_meta)
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+
+            // All workspace blobs were uploaded before hooks run. Take one
+            // fresh snapshot and materialise exactly one commit payload at a
+            // time: strict commit-as-leaf semantics without a push-sized
+            // union in memory.
+            let reader = storage
+                .reader()
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            for commit in &batch.commits {
+                let meta: TribleSet = reader
+                    .get(*commit)
+                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                let content_handle = find!(
+                    (content_handle: Inline<Handle<SimpleArchive>>),
+                    pattern!(&meta, [{ content: ?content_handle }])
+                )
+                .at_most_one()
+                .map_err(|_| {
+                    Box::new(std::io::Error::other("ambiguous commit content"))
+                        as Box<dyn Error + Send + Sync>
+                })?
+                .map(|(handle,)| handle);
+                let Some(content_handle) = content_handle else {
+                    // Contentless merge commits still advance coverage.
+                    continue;
+                };
+                let delta: TribleSet = reader
+                    .get(content_handle)
+                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                let source = filter(&delta);
+                if !source.is_empty() {
+                    index_home::append_segment(storage, &kind, &source, head_meta)
+                        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+                }
+            }
+            index_home::set_coverage(head_meta, kind_id, vec![batch.new_head]);
+            Ok(())
         });
     }
 
@@ -1497,13 +1549,13 @@ where
                 WorkspaceCheckoutError::BadCommitMetadata() => PushError::BadCommitMetadata(),
             };
 
-            // The push's content delta: the union of the content of every
-            // commit reachable from the new head but not from the base
-            // head. Bounded by what this push adds — never the whole
-            // branch. (Stopping on the base head's full ancestor closure
-            // matters for merge commits: a conflict-retry merge reaches
-            // old history through the caller's side, and those commits
-            // are already covered by the winner's head.)
+            // Select every commit reachable from the new head but not from
+            // the base head, then order that bounded set parents-first.
+            // Hooks receive handles rather than one materialised union, so
+            // they can process one source commit at a time. Stopping on the
+            // base head's full ancestor closure matters for merge commits: a
+            // conflict-retry merge reaches old history through the caller's
+            // side, and those commits are already covered by the winner.
             let new_commits = match workspace.base_head {
                 None => collect_reachable(workspace, head_handle).map_err(convert)?,
                 Some(base) => {
@@ -1513,9 +1565,12 @@ where
                     collect_reachable_from_patch_until(workspace, seeds, &stop).map_err(convert)?
                 }
             };
-            let delta = workspace
-                .checkout_commits(new_commits.iter().map(|raw| Inline::new(*raw)))
-                .map_err(convert)?;
+            let commits = topological_commits(workspace, &new_commits).map_err(convert)?;
+            let batch = CommitBatch {
+                base_head: workspace.base_head,
+                new_head: head_handle,
+                commits,
+            };
 
             let branch_id = workspace.base_branch_id;
             for hook in self.hooks.iter_mut() {
@@ -1526,7 +1581,7 @@ where
                 // re-buildable soft state — so on error we skip the hook,
                 // record it for `take_hook_errors`, and push anyway.
                 let mut scratch = branch_meta.clone();
-                match hook(&mut self.storage, branch_id, &delta, &mut scratch) {
+                match hook(&mut self.storage, branch_id, &batch, &mut scratch) {
                     Ok(()) => branch_meta = scratch,
                     Err(error) => self.hook_errors.push(HookError {
                         branch: branch_id,
@@ -2263,6 +2318,78 @@ where
 // start selector. This keeps the mechanics explicit—`start..end` literally
 // walks from `end` until it hits `start`—while continuing to support selectors
 // such as `Ancestors(...)` at either boundary.
+
+/// Select commits and return them in deterministic ancestor-before-child
+/// order without loading their content blobs.
+///
+/// This is the commit-leaf traversal used by derived-index bootstrap and
+/// on-push maintenance. A commit reachable through several merge parents is
+/// returned once. Ordering between unrelated commits is deterministic but has
+/// no semantic significance.
+pub fn commits_topological<S, Blobs>(
+    ws: &mut Workspace<Blobs>,
+    selector: S,
+) -> Result<
+    Vec<CommitHandle>,
+    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
+>
+where
+    S: CommitSelector<Blobs>,
+    Blobs: BlobStore,
+{
+    let commits = selector.select(ws)?;
+    topological_commits(ws, &commits)
+}
+
+fn topological_commits<Blobs: BlobStore>(
+    ws: &mut Workspace<Blobs>,
+    commits: &CommitSet,
+) -> Result<
+    Vec<CommitHandle>,
+    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
+> {
+    let mut ordered = Vec::with_capacity(commits.len() as usize);
+    let mut emitted: HashSet<CommitHandle> = HashSet::new();
+
+    // Iterative post-order DFS avoids recursion depth depending on history
+    // length. Starting points and parent lists are sorted so the result is
+    // reproducible even though PATCH's ordinary iterator is intentionally
+    // unordered.
+    for raw in commits.iter_ordered() {
+        let root = Inline::new(*raw);
+        if emitted.contains(&root) {
+            continue;
+        }
+        let mut stack = vec![(root, false)];
+        while let Some((commit, expanded)) = stack.pop() {
+            if emitted.contains(&commit) {
+                continue;
+            }
+            if expanded {
+                emitted.insert(commit);
+                ordered.push(commit);
+                continue;
+            }
+
+            stack.push((commit, true));
+            let meta: TribleSet = ws.get(commit).map_err(WorkspaceCheckoutError::Storage)?;
+            let mut parents: Vec<CommitHandle> = find!(
+                (parent_: Inline<Handle<SimpleArchive>>),
+                pattern!(&meta, [{ parent: ?parent_ }])
+            )
+            .map(|(parent_,)| parent_)
+            .filter(|parent_| commits.get(&parent_.raw).is_some())
+            .filter(|parent_| !emitted.contains(parent_))
+            .collect();
+            parents.sort_unstable_by_key(|parent_| parent_.raw);
+            parents.dedup_by_key(|parent_| parent_.raw);
+            for parent_ in parents.into_iter().rev() {
+                stack.push((parent_, false));
+            }
+        }
+    }
+    Ok(ordered)
+}
 
 fn collect_reachable_from_patch<Blobs: BlobStore>(
     ws: &mut Workspace<Blobs>,
