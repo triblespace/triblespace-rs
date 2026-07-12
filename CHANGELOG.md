@@ -230,7 +230,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source commit instead of materialising one push-sized union; contentless
   merge commits advance coverage without creating empty segments. A stale
   frontier (for example after an unhooked writer) is detected rather than
-  silently skipped. Segment attachment is fallible (`IndexKind::try_attach`),
+  silently skipped. Carry chains now keep intermediate merged segments in
+  memory and store only the final stable blob while preserving the historical
+  sequence stream and canonical manifest bytes; maintenance also repairs the
+  lowest overfull tier globally when public or migration seams supply a
+  non-canonical manifest. Segment attachment is fallible
+  (`IndexKind::try_attach`), and kinds may surface merge failures through
+  `IndexKind::try_merge` / `IndexError::Merge`; either failure leaves the prior
+  manifest and all victim blobs live (an already-stored content-addressed leaf
+  may merely become collectible garbage),
   so missing/corrupt soft state can be rebuilt instead of panicking; explicit
   `IndexHome::update_index` clears commit coverage because its arbitrary source
   view cannot certify a frontier. Hooks re-run

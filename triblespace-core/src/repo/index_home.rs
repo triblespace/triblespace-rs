@@ -1000,8 +1000,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
     use super::*;
     use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use crate::examples::literature;
@@ -1559,7 +1557,7 @@ mod tests {
             sequence: &[u32],
             planes: &mut [&mut [u64]],
         ) -> Result<(), Self::Error> {
-            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             if self.fail {
                 return Err(());
             }
@@ -1590,7 +1588,7 @@ mod tests {
             let actual = accelerated.merge(&segments);
             assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
             assert_eq!(
-                accelerated.backend().calls.load(AtomicOrdering::Relaxed),
+                accelerated.backend().calls.load(Ordering::Relaxed),
                 expected_calls,
                 "threshold {threshold} for {input_rows} input rows"
             );
@@ -1615,7 +1613,7 @@ mod tests {
         assert_eq!(accelerated.kind_id(), cpu.kind_id());
         assert!(!accelerated.accelerator_enabled());
         assert_eq!(
-            accelerated.backend().calls.load(AtomicOrdering::Relaxed),
+            accelerated.backend().calls.load(Ordering::Relaxed),
             1,
             "the second merge must skip the failed backend"
         );
@@ -1624,7 +1622,7 @@ mod tests {
         assert!(accelerated.accelerator_enabled());
         let actual = accelerated.merge(&segments);
         assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
-        assert_eq!(accelerated.backend().calls.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(accelerated.backend().calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]
