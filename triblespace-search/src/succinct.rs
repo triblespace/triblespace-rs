@@ -52,6 +52,7 @@ use triblespace_core::inline::{RawInline, Inline, InlineEncoding};
 use crate::schemas::{EmbHandle, Embedding};
 
 use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use crate::hnsw::HNSWIndex;
 
 /// Errors produced by the succinct building blocks.
@@ -348,7 +349,10 @@ impl SuccinctPostings {
             n_terms,
             total,
             max_score,
-            materialize_term,
+            |term, buf| {
+                materialize_term(term, buf);
+                Ok(())
+            },
         )?;
         let bytes = area.freeze()?;
         Ok((bytes, meta))
@@ -384,7 +388,7 @@ impl SuccinctPostings {
         mut materialize_term: F,
     ) -> Result<SuccinctPostingsMeta, SuccinctDocLensError>
     where
-        F: FnMut(usize, &mut Vec<(u32, f32)>),
+        F: FnMut(usize, &mut Vec<(u32, f32)>) -> Result<(), SuccinctDocLensError>,
     {
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
@@ -400,7 +404,7 @@ impl SuccinctPostings {
         let mut pos = 0usize;
         for t in 0..n_terms {
             buf.clear();
-            materialize_term(t, &mut buf);
+            materialize_term(t, &mut buf)?;
             for &(idx, s) in &buf {
                 doc_idx_b.set_int(pos, idx as usize)?;
                 scores_b.set_int(pos, quantize_score(s, max_score) as usize)?;
@@ -526,6 +530,22 @@ fn recover_tf(score: f32, idf: f32, norm: f32, k1: f32) -> u32 {
     }
     let tf = (s * k1 * norm) / denom;
     (tf.round() as i64).max(1) as u32
+}
+
+/// Write one recovered posting to the merge spool. The scratch format is
+/// deliberately tiny and private: two little-endian `u32`s, sorted by
+/// `(term, merged document code)` through the order in which callers append.
+fn write_recovered_posting(writer: &mut impl Write, code: u32, tf: u32) -> std::io::Result<()> {
+    let packed = u64::from(code) | (u64::from(tf) << 32);
+    writer.write_all(&packed.to_le_bytes())
+}
+
+/// Read one recovered posting written by [`write_recovered_posting`].
+fn read_recovered_posting(reader: &mut impl Read) -> std::io::Result<(u32, u32)> {
+    let mut raw = [0u8; 8];
+    reader.read_exact(&mut raw)?;
+    let packed = u64::from_le_bytes(raw);
+    Ok((packed as u32, (packed >> 32) as u32))
 }
 
 /// Jerky-backed HNSW layer-graph component.
@@ -1549,6 +1569,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
                         .map(|(&code, &tf)| (code, bm25_score(df, idf, tf, code))),
                 );
                 buf.sort_unstable_by_key(|&(code, _)| code);
+                Ok(())
             },
         )
         .expect("build postings");
@@ -1799,11 +1820,37 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// The persistent source segments stay zero-copy. Temporary memory is
     /// `O(total_segment_docs + union_docs + union_terms + max_source_term_postings)`:
     /// a compact local-to-union code map for each segment, the merged document
-    /// lengths and term table, and one term's recovered source postings. In
-    /// particular, there is no `O(total token multiplicity)` token-bag
-    /// materialization and no nested term-to-document hash map.
+    /// lengths and term table, and one term's recovered source postings. The
+    /// recovered union is streamed once to an anonymous scratch file (eight
+    /// bytes per output posting), then read sequentially for exact score sizing
+    /// and final serialization. In particular, there is no `O(total token
+    /// multiplicity)` token-bag materialization or corpus-sized in-memory
+    /// posting cache.
     pub(crate) fn merge_segments(segments: &[Self], k1: f32, b: f32) -> Self {
-        let mut area = ByteArea::new().expect("alloc ByteArea");
+        Self::try_merge_segments(segments, k1, b).expect("merge canonical BM25 segments")
+    }
+
+    /// Fallible counterpart to [`Self::merge_segments`]. This is the entry
+    /// point used by rollup code that must preserve its old metadata when an
+    /// anonymous spool or succinct-area operation fails.
+    pub(crate) fn try_merge_segments(
+        segments: &[Self],
+        k1: f32,
+        b: f32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::try_merge_segments_observed(segments, k1, b, |_| {})
+    }
+
+    /// Merge implementation with phase callbacks used by the ignored
+    /// microbenchmark. The production wrapper passes an inline no-op closure,
+    /// so phase accounting adds no runtime state to normal compactions.
+    pub(crate) fn try_merge_segments_observed(
+        segments: &[Self],
+        k1: f32,
+        b: f32,
+        mut phase_finished: impl FnMut(&'static str),
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut area = ByteArea::new()?;
         let mut sections = area.sections();
 
         // ── 1. Sorted union of document keys. Every segment universe is
@@ -1852,6 +1899,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             }
             code_maps.push(map);
         }
+        phase_finished("keys + code maps");
 
         // Reconstruct one term's `(merged_doc_code, tf)` postings. Source
         // postings are lossless in document presence; recover_tf has the same
@@ -1896,13 +1944,20 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             out.truncate(write);
         };
 
-        // ── 2. K-way term union + first postings pass. This pass rebuilds
-        // document lengths from the per-term max union.
+        // ── 2. K-way term union + the only source-postings recovery pass.
+        // Rebuild document lengths from the per-term max union and spool the
+        // sorted recovered `(merged_code, tf)` rows. Exact score quantization
+        // needs final document lengths before it can determine the global
+        // maximum, so a strictly single-pass encoder would have to retain all
+        // recovered postings in RAM. The anonymous sequential spool keeps RAM
+        // bounded while avoiding two further source decodes and term sorts.
         let mut term_positions = vec![0usize; segments.len()];
         let mut term_rows: Vec<RawInline> = Vec::new();
         let mut posting_counts: Vec<usize> = Vec::new();
         let mut doc_lens_vec = vec![0u32; n_docs];
         let mut recovered: Vec<(u32, u32)> = Vec::new();
+        let mut recovered_spool = tempfile::tempfile()?;
+        let mut spool_writer = BufWriter::new(&mut recovered_spool);
         loop {
             let Some(next) = segments
                 .iter()
@@ -1927,25 +1982,27 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
                 *slot = slot
                     .checked_add(tf)
                     .expect("recovered document length exceeds u32::MAX");
+                write_recovered_posting(&mut spool_writer, code, tf)?;
             }
             term_rows.push(next);
             posting_counts.push(recovered.len());
         }
+        spool_writer.flush()?;
+        drop(spool_writer);
+        phase_finished("recover + spool");
 
         let avg_doc_len = if n_docs == 0 {
             0.0
         } else {
             doc_lens_vec.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_docs as f32
         };
-        let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)
-            .expect("build merged doc_lens");
-        let terms_handle =
-            pack_byte_table::<32>(&mut sections, &term_rows).expect("build merged terms");
+        let doc_lens_meta = SuccinctDocLens::build_into(&mut sections, &doc_lens_vec)?;
+        let terms_handle = pack_byte_table::<32>(&mut sections, &term_rows)?;
+        phase_finished("doc/term sections");
 
-        // ── 3. Score sizing pass. The output CompactVectors require the
-        // exact posting count and maximum score before their sections can be
-        // reserved. Re-walking zero-copy source postings is the memory-bounded
-        // trade: CPU is linear in postings; peak scratch is one term.
+        // ── 3. Score sizing pass over the sequential recovered-postings
+        // spool. The output CompactVectors require the exact posting count and
+        // maximum score before their sections can be reserved.
         let total: usize = posting_counts.iter().sum();
         let n = n_docs as f32;
         let score = |df: f32, tf: u32, code: u32| -> f32 {
@@ -1960,16 +2017,24 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             idf * (tf * (k1 + 1.0)) / (tf + k1 * norm)
         };
         let mut max_score = 0.0f32;
-        for (term_index, term) in term_rows.iter().enumerate() {
-            recover_term(term, &mut recovered);
+        recovered_spool.seek(SeekFrom::Start(0))?;
+        let mut spool_reader = BufReader::new(&mut recovered_spool);
+        for (term_index, &posting_count) in posting_counts.iter().enumerate() {
             let df = posting_counts[term_index] as f32;
-            for &(code, tf) in &recovered {
+            for _ in 0..posting_count {
+                let (code, tf) = read_recovered_posting(&mut spool_reader)?;
                 max_score = max_score.max(score(df, tf, code));
             }
         }
+        drop(spool_reader);
+        phase_finished("score sizing spool");
 
-        // ── 4. Final postings pass, streamed into the canonical area.
-        let mut write_recovered: Vec<(u32, u32)> = Vec::new();
+        // ── 4. Final sequential spool pass, streamed into the canonical
+        // area. `build_with_into` still receives one term-sized buffer, but it
+        // is filled from fixed-width scratch rows rather than recovering and
+        // sorting the persisted source postings for a third time.
+        recovered_spool.seek(SeekFrom::Start(0))?;
+        let mut spool_reader = BufReader::new(&mut recovered_spool);
         let postings_meta = SuccinctPostings::build_with_into(
             &mut sections,
             n_docs as u32,
@@ -1977,16 +2042,15 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             total,
             max_score,
             |term_index, buf| {
-                recover_term(&term_rows[term_index], &mut write_recovered);
                 let df = posting_counts[term_index] as f32;
-                buf.extend(
-                    write_recovered
-                        .iter()
-                        .map(|&(code, tf)| (code, score(df, tf, code))),
-                );
+                for _ in 0..posting_counts[term_index] {
+                    let (code, tf) = read_recovered_posting(&mut spool_reader)?;
+                    buf.push((code, score(df, tf, code)));
+                }
+                Ok(())
             },
-        )
-        .expect("build merged postings");
+        )?;
+        phase_finished("write postings spool");
 
         // ── 5. Unchanged suffix metadata / canonical blob format.
         let meta = SuccinctBM25Meta {
@@ -2002,17 +2066,17 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
             terms: terms_handle,
         };
         {
-            let mut meta_sec = sections
-                .reserve::<SuccinctBM25Meta>(1)
-                .expect("reserve merged meta section");
+            let mut meta_sec = sections.reserve::<SuccinctBM25Meta>(1)?;
             meta_sec.as_mut_slice()[0] = meta;
-            meta_sec.freeze().expect("freeze merged meta section");
+            meta_sec.freeze()?;
         }
 
         drop(build_universe);
         drop(sections);
-        let bytes = area.freeze().expect("freeze merged ByteArea");
-        Self::from_bytes(meta, bytes).expect("round-trip merged BM25 bytes")
+        let bytes = area.freeze()?;
+        let merged = Self::from_bytes(meta, bytes)?;
+        phase_finished("metadata + freeze");
+        Ok(merged)
     }
 }
 

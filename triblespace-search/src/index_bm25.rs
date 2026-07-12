@@ -292,6 +292,67 @@ mod tests {
             .collect()
     }
 
+    #[derive(Clone, Copy)]
+    struct MergeRng(u64);
+
+    impl MergeRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    fn merge_doc(ordinal: u64) -> Inline<GenId> {
+        let mut raw = [0u8; 32];
+        raw[0] = 1;
+        raw[24..].copy_from_slice(&ordinal.to_be_bytes());
+        Inline::new(raw)
+    }
+
+    fn merge_term(ordinal: u64) -> Inline<WordHash> {
+        let mut raw = [0u8; 32];
+        raw[..8].copy_from_slice(&ordinal.to_be_bytes());
+        raw[8..16].copy_from_slice(&ordinal.rotate_left(13).to_be_bytes());
+        raw[16..24].copy_from_slice(&ordinal.rotate_left(29).to_be_bytes());
+        raw[24..].copy_from_slice(&ordinal.rotate_left(47).to_be_bytes());
+        Inline::new(raw)
+    }
+
+    fn materialized_max_union(segments: &[Seg], k1: f32, b: f32) -> Seg {
+        let mut union: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
+        for segment in segments {
+            for (key, tokens) in segment.reconstruct_docs() {
+                let mut source_tfs: HashMap<RawInline, u32> = HashMap::new();
+                for term in tokens {
+                    *source_tfs.entry(term).or_default() += 1;
+                }
+                let merged_tfs = union.entry(key).or_default();
+                for (term, tf) in source_tfs {
+                    merged_tfs
+                        .entry(term)
+                        .and_modify(|old| *old = (*old).max(tf))
+                        .or_insert(tf);
+                }
+            }
+        }
+
+        let mut rows: Vec<_> = union.into_iter().collect();
+        rows.sort_unstable_by_key(|(key, _)| *key);
+        let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(k1).b(b);
+        for (key, tfs) in rows {
+            let mut tfs: Vec<_> = tfs.into_iter().collect();
+            tfs.sort_unstable_by_key(|(term, _)| *term);
+            let terms = tfs.into_iter().flat_map(|(term, tf)| {
+                std::iter::repeat(Inline::<WordHash>::new(term)).take(tf as usize)
+            });
+            builder.insert(Inline::<GenId>::new(key), terms);
+        }
+        builder.build()
+    }
+
     /// Stage `pairs` as `LongString` blobs under `content`, returning
     /// the source tribleset and a parallel `(id, text)` table.
     fn stage(store: &mut MemoryBlobStore, pairs: &[(Id, String)]) -> (TribleSet, StagedTable) {
@@ -550,6 +611,131 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate_merged.doc_len(first_only_code), Some(2));
         assert!((duplicate_merged.avg_doc_len() - 2.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn randomized_overlap_and_high_tf_match_max_union_oracle() {
+        const SEGMENTS: usize = 5;
+        const DOCS_PER_SEGMENT: usize = 36;
+        const SHARED_DOCS: usize = 15;
+        const VOCAB: u64 = 41;
+
+        let mut segments: Vec<Seg> = Vec::new();
+        for segment in 0..SEGMENTS {
+            let mut rng = MergeRng(0xB25_0A11 ^ segment as u64);
+            let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
+            for local in 0..DOCS_PER_SEGMENT {
+                let ordinal = if local < SHARED_DOCS {
+                    local
+                } else {
+                    SHARED_DOCS + segment * (DOCS_PER_SEGMENT - SHARED_DOCS) + local - SHARED_DOCS
+                };
+                let mut terms = Vec::new();
+                for slot in 0..12 {
+                    let term = merge_term(rng.next() % VOCAB);
+                    let mut tf = 1 + (rng.next() % 9) as usize;
+                    if (segment + local + slot) % 43 == 0 {
+                        tf = 257 + (rng.next() % 1_300) as usize;
+                    }
+                    terms.extend(std::iter::repeat(term).take(tf));
+                }
+                // Guarantee an overlapping high-TF posting whose winner
+                // differs by segment, including the quantized saturated tail.
+                if local == 0 {
+                    terms.extend(std::iter::repeat(merge_term(0)).take(300 + segment * 700));
+                }
+                builder.insert(merge_doc((ordinal + 1) as u64), terms);
+            }
+            segments.push(builder.build());
+        }
+
+        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        let expected = materialized_max_union(&segments, defaults.k1, defaults.b);
+        let merged = SuccinctBM25Index::merge_segments(&segments, defaults.k1, defaults.b);
+        assert_eq!(
+            merged.bytes.as_ref(),
+            expected.bytes.as_ref(),
+            "spooled merge must match the recovered max-union oracle"
+        );
+
+        segments.reverse();
+        let reversed = SuccinctBM25Index::merge_segments(&segments, defaults.k1, defaults.b);
+        assert_eq!(merged.bytes.as_ref(), reversed.bytes.as_ref());
+
+        // Adding an exact duplicate source segment cannot change max(tf).
+        segments.push(
+            SuccinctBM25Index::try_from_blob(Blob::new(segments[0].bytes.clone()))
+                .expect("clone canonical segment through its blob"),
+        );
+        let duplicated = SuccinctBM25Index::merge_segments(&segments, defaults.k1, defaults.b);
+        assert_eq!(merged.bytes.as_ref(), duplicated.bytes.as_ref());
+    }
+
+    /// Manual phase microbenchmark. Run with:
+    /// `cargo test --release -p triblespace-search bm25_merge_phase_benchmark \
+    ///     -- --ignored --nocapture`
+    ///
+    /// Optional environment variables: `BM25_MERGE_SEGMENTS`,
+    /// `BM25_MERGE_DOCS`, `BM25_MERGE_TERMS`, `BM25_MERGE_VOCAB`, and
+    /// `BM25_MERGE_OVERLAP_PERCENT`.
+    #[test]
+    #[ignore = "manual release-mode merge microbenchmark"]
+    fn bm25_merge_phase_benchmark() {
+        fn setting(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .map(|value| value.parse().expect("benchmark setting is usize"))
+                .unwrap_or(default)
+        }
+
+        let segment_count = setting("BM25_MERGE_SEGMENTS", 8);
+        let docs_per_segment = setting("BM25_MERGE_DOCS", 10_000);
+        let terms_per_doc = setting("BM25_MERGE_TERMS", 96);
+        let vocabulary = setting("BM25_MERGE_VOCAB", 20_000);
+        let overlap_percent = setting("BM25_MERGE_OVERLAP_PERCENT", 0);
+        assert!(overlap_percent <= 100);
+        let shared_docs = docs_per_segment * overlap_percent / 100;
+
+        let mut segments: Vec<Seg> = Vec::new();
+        for segment in 0..segment_count {
+            let mut rng = MergeRng(0xB25_5EED ^ segment as u64);
+            let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
+            for local in 0..docs_per_segment {
+                let ordinal = if local < shared_docs {
+                    local
+                } else {
+                    shared_docs + segment * (docs_per_segment - shared_docs) + local - shared_docs
+                };
+                let terms = (0..terms_per_doc)
+                    .map(|_| merge_term(rng.next() % vocabulary as u64));
+                builder.insert(merge_doc((ordinal + 1) as u64), terms);
+            }
+            segments.push(builder.build());
+        }
+
+        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        let total_started = std::time::Instant::now();
+        let mut phase_started = total_started;
+        let merged = SuccinctBM25Index::try_merge_segments_observed(
+            &segments,
+            defaults.k1,
+            defaults.b,
+            |phase| {
+                let now = std::time::Instant::now();
+                eprintln!("{phase:<24} {:?}", now.duration_since(phase_started));
+                phase_started = now;
+            },
+        )
+        .expect("benchmark merge");
+        eprintln!(
+            "total {:>30?}; output {} bytes; {} segments x {} docs x {} terms; {}% overlap",
+            total_started.elapsed(),
+            merged.bytes.len(),
+            segment_count,
+            docs_per_segment,
+            terms_per_doc,
+            overlap_percent,
+        );
+        assert!(merged.doc_count() >= docs_per_segment);
     }
 
     #[test]
