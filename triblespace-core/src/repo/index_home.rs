@@ -111,20 +111,25 @@
 //! query-without-checkout via [`IndexHome::attach_all`](crate::repo::index_home::IndexHome::attach_all)
 //! and a union query over the attached segments.
 //!
-//! # Seams left for follow-up work
+//! # Acceleration seam
 //!
-//! - **GPU merge.** [`IndexKind::merge`](crate::repo::index_home::IndexKind::merge) is CPU today (a bounded-memory
-//!   structural merge for the SuccinctArchive rollup). The GPU-accelerated succinct merge
-//!   (compass:09ce3667) drops in behind this one method — the surface,
-//!   manifest, and tiering are unaffected.
+//! [`SuccinctRollup`](crate::repo::index_home::SuccinctRollup) uses the
+//! bounded-memory CPU structural merge.
+//! [`AcceleratedSuccinctRollup`](crate::repo::index_home::AcceleratedSuccinctRollup)
+//! delegates only sufficiently large wavelet freezes to an external backend,
+//! retaining the same manifest, kind id, and canonical segment bytes. A
+//! returned backend error opens a circuit breaker and falls back to the CPU
+//! implementation.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, Universe,
+    merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
+    SuccinctArchiveBlob, Universe, WaveletMatrixFreezeBackend,
 };
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -176,7 +181,7 @@ pub const FANOUT: usize = 4;
 
 /// What a derived index *is*: how to build a segment from source tribles,
 /// how to attach a stored segment into a queryable form, and how to merge
-/// segments (CPU).
+/// segments.
 ///
 /// The [`IndexHome`] surface owns *when and where* (manifest, latest-wins
 /// overwrite, size-tiered merge, GC); a kind owns *what* (the segment
@@ -215,10 +220,10 @@ pub trait IndexKind {
             .unwrap_or_else(|err| panic!("invalid index segment: {err}"))
     }
 
-    /// Merge several attached segments into one new segment blob (CPU).
+    /// Merge several attached segments into one new segment blob.
     ///
-    /// This is the LSMT maintenance primitive. The GPU-accelerated
-    /// succinct merge drops in behind exactly this method.
+    /// This is the LSMT maintenance primitive; each kind chooses its own
+    /// execution backend while preserving its canonical segment format.
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob>;
 }
 
@@ -757,6 +762,100 @@ impl IndexKind for SuccinctRollup {
     }
 }
 
+/// Succinct rollup that delegates sufficiently large wavelet-freeze passes to
+/// an external accelerator backend while preserving the same kind id, segment
+/// format, and canonical bytes as [`SuccinctRollup`].
+///
+/// Small compactions stay on the CPU because device dispatch dominates below
+/// the backend's measured break-even. If the accelerator returns an error, the
+/// merge retries on the canonical CPU implementation and disables further
+/// accelerator attempts until [`reset_accelerator`](Self::reset_accelerator)
+/// is called. This fallback handles returned errors only: it does not catch a
+/// backend panic, allocation failure, abort, or device loss that terminates the
+/// process.
+pub struct AcceleratedSuccinctRollup<B> {
+    backend: B,
+    min_input_rows: usize,
+    accelerator_enabled: AtomicBool,
+}
+
+impl<B> AcceleratedSuccinctRollup<B> {
+    /// Construct an accelerated rollup.
+    ///
+    /// `min_input_rows` is compared with the saturating sum of the input
+    /// segments' row counts, before cross-segment duplicates are removed. A
+    /// deployment should therefore calibrate the threshold with that same
+    /// quantity rather than with the deduplicated output size.
+    pub fn new(backend: B, min_input_rows: usize) -> Self {
+        Self {
+            backend,
+            min_input_rows,
+            accelerator_enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Borrow the configured accelerator backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Return the configured input-row CPU/accelerator crossover threshold.
+    pub fn min_input_rows(&self) -> usize {
+        self.min_input_rows
+    }
+
+    /// Whether the accelerator circuit is currently closed (enabled).
+    pub fn accelerator_enabled(&self) -> bool {
+        self.accelerator_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Re-enable accelerator attempts after an operator has repaired or
+    /// replaced the backend.
+    pub fn reset_accelerator(&self) {
+        self.accelerator_enabled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl<B> IndexKind for AcceleratedSuccinctRollup<B>
+where
+    B: WaveletMatrixFreezeBackend,
+{
+    type Segment = SuccinctArchive<OrderedUniverse>;
+
+    fn kind_id(&self) -> Id {
+        SuccinctRollup.kind_id()
+    }
+
+    fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
+        SuccinctRollup.build(source)
+    }
+
+    fn try_attach(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>> {
+        SuccinctRollup.try_attach(blob)
+    }
+
+    fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {
+        let input_rows = segments.iter().fold(0usize, |sum, segment| {
+            sum.saturating_add(segment.eav_c.len())
+        });
+        if input_rows >= self.min_input_rows && self.accelerator_enabled() {
+            match merge_ordered_archives_with_backend(segments, &self.backend) {
+                Ok(archive) => {
+                    let blob: Blob<SuccinctArchiveBlob> = (&archive).to_blob();
+                    return blob.transmute();
+                }
+                Err(_) => {
+                    self.accelerator_enabled.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+        SuccinctRollup.merge(segments)
+    }
+}
+
 /// A [`TriblePattern`] view that unions several [`SuccinctArchive`]
 /// segments into one logical dataset.
 ///
@@ -813,6 +912,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
     use super::*;
     use crate::examples::literature;
     use crate::id::fucid;
@@ -1077,6 +1178,135 @@ mod tests {
         let mut union = da;
         union += db;
         assert_eq!(merged_set, union);
+    }
+
+    fn reference_freeze(sequence: &[u32], planes: &mut [&mut [u64]]) {
+        let mut current = sequence.to_vec();
+        let mut next = vec![0u32; sequence.len()];
+        let width = planes.len();
+        for (depth, plane) in planes.iter_mut().enumerate() {
+            plane.fill(0);
+            let shift = width - 1 - depth;
+            let mut zeros = 0usize;
+            for (position, &code) in current.iter().enumerate() {
+                let bit = (code >> shift) & 1;
+                if bit == 0 {
+                    zeros += 1;
+                } else {
+                    plane[position / 64] |= 1u64 << (position % 64);
+                }
+            }
+            let (mut zero, mut one) = (0usize, zeros);
+            for &code in &current {
+                if (code >> shift) & 1 == 0 {
+                    next[zero] = code;
+                    zero += 1;
+                } else {
+                    next[one] = code;
+                    one += 1;
+                }
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+    }
+
+    struct CountingFreeze {
+        calls: AtomicUsize,
+        fail: bool,
+    }
+
+    impl CountingFreeze {
+        fn succeeding() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                fail: true,
+            }
+        }
+    }
+
+    impl WaveletMatrixFreezeBackend for CountingFreeze {
+        type Error = ();
+
+        fn freeze_rotation(
+            &self,
+            _rotation: crate::blob::encodings::succinctarchive::SuccinctRotation,
+            _alphabet_size: usize,
+            sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if self.fail {
+                return Err(());
+            }
+            reference_freeze(sequence, planes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn accelerated_rollup_threshold_is_inclusive_input_row_sum() {
+        let cpu = SuccinctRollup::new();
+        let da = person("Ada");
+        let db = person("Grace");
+        let segments = [cpu.attach(cpu.build(&da)), cpu.attach(cpu.build(&db))];
+        let input_rows = segments
+            .iter()
+            .map(|segment| segment.eav_c.len())
+            .sum::<usize>();
+        let expected = cpu.merge(&segments);
+
+        for (threshold, expected_calls) in [
+            (input_rows + 1, 0),
+            (input_rows, 6),
+            (input_rows.saturating_sub(1), 6),
+        ] {
+            let accelerated =
+                AcceleratedSuccinctRollup::new(CountingFreeze::succeeding(), threshold);
+            let actual = accelerated.merge(&segments);
+            assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
+            assert_eq!(
+                accelerated.backend().calls.load(AtomicOrdering::Relaxed),
+                expected_calls,
+                "threshold {threshold} for {input_rows} input rows"
+            );
+            assert!(accelerated.accelerator_enabled());
+            assert_eq!(accelerated.min_input_rows(), threshold);
+        }
+    }
+
+    #[test]
+    fn accelerated_rollup_circuit_breaks_after_returned_failure() {
+        let cpu = SuccinctRollup::new();
+        let accelerated = AcceleratedSuccinctRollup::new(CountingFreeze::failing(), 0);
+        let da = person("Ada");
+        let db = person("Grace");
+        let segments = [cpu.attach(cpu.build(&da)), cpu.attach(cpu.build(&db))];
+
+        let expected = cpu.merge(&segments);
+        for _ in 0..2 {
+            let actual = accelerated.merge(&segments);
+            assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
+        }
+        assert_eq!(accelerated.kind_id(), cpu.kind_id());
+        assert!(!accelerated.accelerator_enabled());
+        assert_eq!(
+            accelerated.backend().calls.load(AtomicOrdering::Relaxed),
+            1,
+            "the second merge must skip the failed backend"
+        );
+
+        accelerated.reset_accelerator();
+        assert!(accelerated.accelerator_enabled());
+        let actual = accelerated.merge(&segments);
+        assert_eq!(actual.bytes.as_ref(), expected.bytes.as_ref());
+        assert_eq!(accelerated.backend().calls.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]

@@ -1,0 +1,33 @@
+[package]
+name = "triblespace-gpu"
+version = "0.47.0"
+authors = ["⚫️ <jp@bultmann.eu>"]
+edition = "2021"
+rust-version = "1.89"
+description = "Opt-in GPU acceleration backends for TribleSpace"
+homepage = "https://trible.space"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/triblespace-gpu"
+repository = "https://github.com/triblespace/triblespace-rs"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["wgpu", "cuda"]
+
+[features]
+default = []
+wgpu = ["dep:cubecl", "cubecl/wgpu"]
+cuda = ["dep:cubecl", "cubecl/cuda"]
+
+[dependencies]
+cubecl = { version = "=0.9.0", default-features = false, features = ["std"], optional = true }
+triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
+
+[[example]]
+name = "archive_merge"
+required-features = ["wgpu"]
+
+[[test]]
+name = "wgpu_parity"
+required-features = ["wgpu"]

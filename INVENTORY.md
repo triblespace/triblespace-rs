@@ -171,6 +171,11 @@ prioritized for efficient zero-copy access.
 - Property-test BM25 max-union compaction across randomized segment
   permutations, repeated multi-level FANOUT merges, and high term frequencies
   near score-quantization saturation.
+- The optional CubeCL succinct-merge backend's per-level block-prefix scan is
+  still one serial device thread. Packed CPU reduced the measured WGPU gain to
+  5–8% on large Apple Metal tiers; investigate a hierarchical device scan and
+  rotation batching before considering GPU acceleration for default archive
+  maintenance. Keep the summed-input crossover hardware-calibrated.
 - Yard collection currently evicts blobs from per-generation live PATCH sets
   while leaving the append-only Pile records in place. Add a future physical
   compaction/rewrite path when Yard needs to reclaim disk space, preserving

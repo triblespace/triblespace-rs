@@ -36,7 +36,7 @@ use std::iter;
 
 use itertools::Itertools;
 
-use anybytes::area::{ByteArea, SectionWriter};
+use anybytes::area::{ByteArea, Section, SectionHandle, SectionWriter};
 use anybytes::Bytes;
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::Access;
@@ -404,14 +404,46 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum SuccinctRotation {
+/// One of the six sorted Ring rotations stored by a [`SuccinctArchive`].
+///
+/// The order is also the canonical wavelet-matrix serialization order used by
+/// [`merge_ordered_archives_with_backend`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SuccinctRotation {
+    /// Entity → attribute → value.
     Eav,
+    /// Value → entity → attribute.
     Vea,
+    /// Attribute → value → entity.
     Ave,
+    /// Value → attribute → entity.
     Vae,
+    /// Entity → value → attribute.
     Eva,
+    /// Attribute → entity → value.
     Aev,
+}
+
+impl SuccinctRotation {
+    const ALL: [Self; 6] = [
+        Self::Eav,
+        Self::Vea,
+        Self::Ave,
+        Self::Vae,
+        Self::Eva,
+        Self::Aev,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Eav => 0,
+            Self::Vea => 1,
+            Self::Ave => 2,
+            Self::Vae => 3,
+            Self::Eva => 4,
+            Self::Aev => 5,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -627,6 +659,515 @@ fn remap_row(row: [usize; 3], remap: &[usize]) -> [usize; 3] {
     [remap[row[0]], remap[row[1]], remap[row[2]]]
 }
 
+/// Device-agnostic seam for accelerating the expensive wavelet-freeze phase
+/// of a structural [`SuccinctArchive`] merge.
+///
+/// Core performs the domain remap and sorted k-way merge of each Ring
+/// rotation. For every rotation it passes the resulting last-column code
+/// sequence to this backend together with preallocated canonical output bit
+/// planes. A backend may use a GPU, SIMD, or another accelerator; no such
+/// dependency is imposed on `triblespace-core` itself.
+///
+/// `planes[0]` is the most-significant wavelet level. Bit `position` is stored
+/// in `planes[level][position / 64]` at `position % 64` (least-significant-bit
+/// first). Each deeper plane must be in the order produced by stable
+/// zero/one-partitioning the preceding level. Every word must be written and
+/// unused high bits in the final word must remain zero. Meeting this contract
+/// makes the resulting archive byte-identical to the canonical CPU builder.
+///
+/// Core validates the output shape (by allocating the planes itself), every
+/// all-zero plane before the sequence's highest set bit, that first informative
+/// plane pointwise, and zero padding in every final word. If every code is zero,
+/// it validates that every plane is zero. It deliberately does not rebuild the
+/// deeper stable partitions on the CPU, because doing so would duplicate the
+/// work this seam exists to accelerate. A backend returning `Ok(())` is
+/// therefore trusted for the ordering of interior bits after the first
+/// informative plane and must synchronize and surface device-side validation
+/// errors before it returns.
+pub trait WaveletMatrixFreezeBackend {
+    /// Backend-specific failure.
+    type Error;
+
+    /// Freeze one remapped Ring rotation into its packed wavelet bit planes.
+    fn freeze_rotation(
+        &self,
+        rotation: SuccinctRotation,
+        alphabet_size: usize,
+        sequence: &[u32],
+        planes: &mut [&mut [u64]],
+    ) -> Result<(), Self::Error>;
+}
+
+/// Failure from [`merge_ordered_archives_with_backend`].
+#[derive(Debug)]
+pub enum SuccinctArchiveMergeError<E> {
+    /// The accelerator rejected or failed a freeze operation.
+    Backend(E),
+    /// A remapped domain code does not fit the backend contract's `u32` lane.
+    DomainTooWide(usize),
+    /// A remapped code unexpectedly lies outside the merged domain.
+    CodeOutsideDomain {
+        /// The invalid remapped code.
+        code: usize,
+        /// Number of values in the merged domain.
+        domain_size: usize,
+    },
+    /// An all-zero prefix plane or the first informative plane is invalid.
+    PlanePrefixMismatch {
+        /// Rotation whose output failed validation.
+        rotation: SuccinctRotation,
+        /// Zero-based wavelet depth that differs from the input sequence.
+        depth: usize,
+    },
+    /// The backend wrote non-canonical padding bits.
+    NonZeroTail(SuccinctRotation),
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for SuccinctArchiveMergeError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(error) => write!(f, "wavelet-freeze backend failed: {error}"),
+            Self::DomainTooWide(size) => {
+                write!(
+                    f,
+                    "succinct domain of {size} values exceeds u32 backend codes"
+                )
+            }
+            Self::CodeOutsideDomain { code, domain_size } => {
+                write!(
+                    f,
+                    "remapped code {code} lies outside domain of size {domain_size}"
+                )
+            }
+            Self::PlanePrefixMismatch { rotation, depth } => {
+                write!(
+                    f,
+                    "wavelet-freeze backend wrote an invalid prefix plane {depth} for {rotation:?}"
+                )
+            }
+            Self::NonZeroTail(rotation) => {
+                write!(
+                    f,
+                    "wavelet-freeze backend wrote padding bits for {rotation:?}"
+                )
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for SuccinctArchiveMergeError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Backend(error) => Some(error),
+            Self::DomainTooWide(_)
+            | Self::CodeOutsideDomain { .. }
+            | Self::PlanePrefixMismatch { .. }
+            | Self::NonZeroTail(_) => None,
+        }
+    }
+}
+
+trait MergedWaveletOutputs {
+    type Error;
+
+    fn set_int(
+        &mut self,
+        rotation: SuccinctRotation,
+        position: usize,
+        value: usize,
+    ) -> Result<(), Self::Error>;
+
+    fn finish_rotation(&mut self, rotation: SuccinctRotation) -> Result<(), Self::Error>;
+
+    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error>;
+}
+
+trait MergedWaveletFactory {
+    type Error;
+    type Outputs<'area>: MergedWaveletOutputs<Error = Self::Error>
+    where
+        Self: 'area;
+
+    fn create<'area>(
+        &self,
+        alphabet_size: usize,
+        len: usize,
+        writer: &mut SectionWriter<'area>,
+    ) -> Result<Self::Outputs<'area>, Self::Error>
+    where
+        Self: 'area;
+}
+
+struct JerkyWaveletFactory;
+
+struct JerkyWaveletOutputs<'area> {
+    builders: Vec<WaveletMatrixBuilder<'area>>,
+}
+
+impl MergedWaveletFactory for JerkyWaveletFactory {
+    type Error = jerky::error::Error;
+    type Outputs<'area> = JerkyWaveletOutputs<'area>;
+
+    fn create<'area>(
+        &self,
+        alphabet_size: usize,
+        len: usize,
+        writer: &mut SectionWriter<'area>,
+    ) -> Result<Self::Outputs<'area>, Self::Error>
+    where
+        Self: 'area,
+    {
+        let mut builders = Vec::with_capacity(SuccinctRotation::ALL.len());
+        for _ in SuccinctRotation::ALL {
+            builders.push(WaveletMatrixBuilder::with_capacity(
+                alphabet_size,
+                len,
+                writer,
+            )?);
+        }
+        Ok(JerkyWaveletOutputs { builders })
+    }
+}
+
+impl MergedWaveletOutputs for JerkyWaveletOutputs<'_> {
+    type Error = jerky::error::Error;
+
+    fn set_int(
+        &mut self,
+        rotation: SuccinctRotation,
+        position: usize,
+        value: usize,
+    ) -> Result<(), Self::Error> {
+        self.builders[rotation.index()].set_int(position, value)
+    }
+
+    fn finish_rotation(&mut self, _rotation: SuccinctRotation) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
+        let builders = self.builders.into_iter();
+
+        let metadata = builders
+            .map(|builder| {
+                builder
+                    .freeze::<Rank9SelIndex>()
+                    .map(|matrix| matrix.metadata())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+    }
+}
+
+/// Preallocated packed wavelet output with the same section order as Jerky's
+/// `WaveletMatrixBuilder`, but without constructing a temporary CPU index.
+struct PackedWaveletBuilder<'area> {
+    alphabet_size: usize,
+    len: usize,
+    handles: Section<'area, SectionHandle<u64>>,
+    planes: Vec<Section<'area, u64>>,
+}
+
+impl<'area> PackedWaveletBuilder<'area> {
+    fn new(alphabet_size: usize, len: usize, writer: &mut SectionWriter<'area>) -> Self {
+        let width = jerky::utils::needed_bits(alphabet_size);
+        let mut handles = writer.reserve::<SectionHandle<u64>>(width).unwrap();
+        let mut planes = Vec::with_capacity(width);
+        for depth in 0..width {
+            let mut plane = writer.reserve::<u64>(len.div_ceil(64)).unwrap();
+            plane.as_mut_slice().fill(0);
+            handles[depth] = plane.handle();
+            planes.push(plane);
+        }
+        Self {
+            alphabet_size,
+            len,
+            handles,
+            planes,
+        }
+    }
+
+    fn plane_slices(&mut self) -> Vec<&mut [u64]> {
+        self.planes.iter_mut().map(Section::as_mut_slice).collect()
+    }
+
+    fn tail_is_zero(&self) -> bool {
+        let tail = self.len % 64;
+        if tail == 0 {
+            return true;
+        }
+        let mask = !((1u64 << tail) - 1);
+        self.planes
+            .iter()
+            .all(|plane| plane.last().is_none_or(|word| word & mask == 0))
+    }
+
+    fn validate_plane_prefix(&self, sequence: &[u32]) -> Result<(), usize> {
+        let code_or = sequence.iter().copied().fold(0, |bits, code| bits | code);
+        if code_or == 0 {
+            return self
+                .planes
+                .iter()
+                .position(|plane| plane.iter().any(|word| *word != 0))
+                .map_or(Ok(()), Err);
+        }
+
+        let highest_bit = (u32::BITS - 1 - code_or.leading_zeros()) as usize;
+        let informative_depth = self.planes.len() - 1 - highest_bit;
+        if let Some(depth) = self.planes[..informative_depth]
+            .iter()
+            .position(|plane| plane.iter().any(|word| *word != 0))
+        {
+            return Err(depth);
+        }
+
+        let plane = &self.planes[informative_depth];
+        if sequence.iter().enumerate().all(|(position, code)| {
+            let expected = (code >> highest_bit) & 1;
+            let actual = (plane[position / 64] >> (position % 64)) & 1;
+            actual == u64::from(expected)
+        }) {
+            Ok(())
+        } else {
+            Err(informative_depth)
+        }
+    }
+
+    fn freeze(self) -> WaveletMatrixMeta {
+        let layers = self.handles.handle();
+        let alph_width = self.planes.len();
+        self.handles.freeze().unwrap();
+        for plane in self.planes {
+            plane.freeze().unwrap();
+        }
+        WaveletMatrixMeta {
+            alph_size: self.alphabet_size,
+            alph_width,
+            len: self.len,
+            layers,
+        }
+    }
+}
+
+struct PackedCpuWaveletFactory;
+
+struct PackedCpuWaveletOutputs<'area> {
+    alphabet_size: usize,
+    builders: Vec<PackedWaveletBuilder<'area>>,
+    sequence: Vec<u32>,
+    scratch: Vec<u32>,
+}
+
+impl MergedWaveletFactory for PackedCpuWaveletFactory {
+    type Error = SuccinctArchiveMergeError<std::convert::Infallible>;
+    type Outputs<'area> = PackedCpuWaveletOutputs<'area>;
+
+    fn create<'area>(
+        &self,
+        alphabet_size: usize,
+        len: usize,
+        writer: &mut SectionWriter<'area>,
+    ) -> Result<Self::Outputs<'area>, Self::Error>
+    where
+        Self: 'area,
+    {
+        if alphabet_size > u32::MAX as usize {
+            return Err(SuccinctArchiveMergeError::DomainTooWide(alphabet_size));
+        }
+        let builders = SuccinctRotation::ALL
+            .into_iter()
+            .map(|_| PackedWaveletBuilder::new(alphabet_size, len, writer))
+            .collect();
+        Ok(PackedCpuWaveletOutputs {
+            alphabet_size,
+            builders,
+            sequence: Vec::with_capacity(len),
+            scratch: Vec::with_capacity(len),
+        })
+    }
+}
+
+impl MergedWaveletOutputs for PackedCpuWaveletOutputs<'_> {
+    type Error = SuccinctArchiveMergeError<std::convert::Infallible>;
+
+    fn set_int(
+        &mut self,
+        _rotation: SuccinctRotation,
+        position: usize,
+        value: usize,
+    ) -> Result<(), Self::Error> {
+        debug_assert_eq!(position, self.sequence.len());
+        if value >= self.alphabet_size {
+            return Err(SuccinctArchiveMergeError::CodeOutsideDomain {
+                code: value,
+                domain_size: self.alphabet_size,
+            });
+        }
+        self.sequence.push(
+            u32::try_from(value)
+                .map_err(|_| SuccinctArchiveMergeError::DomainTooWide(self.alphabet_size))?,
+        );
+        Ok(())
+    }
+
+    fn finish_rotation(&mut self, rotation: SuccinctRotation) -> Result<(), Self::Error> {
+        let builder = &mut self.builders[rotation.index()];
+        let mut planes = builder.plane_slices();
+        self.scratch.resize(self.sequence.len(), 0);
+        let mut sequence_is_current = true;
+        let width = planes.len();
+
+        for (depth, plane) in planes.iter_mut().enumerate() {
+            plane.fill(0);
+            let shift = width - 1 - depth;
+            let current = if sequence_is_current {
+                self.sequence.as_slice()
+            } else {
+                self.scratch.as_slice()
+            };
+            let mut zeros = 0usize;
+            for (position, &code) in current.iter().enumerate() {
+                let bit = (code >> shift) & 1;
+                if bit == 0 {
+                    zeros += 1;
+                } else {
+                    plane[position / 64] |= 1u64 << (position % 64);
+                }
+            }
+
+            if depth + 1 < width {
+                let (current, next) = if sequence_is_current {
+                    (self.sequence.as_slice(), self.scratch.as_mut_slice())
+                } else {
+                    (self.scratch.as_slice(), self.sequence.as_mut_slice())
+                };
+                let (mut zero, mut one) = (0usize, zeros);
+                for &code in current {
+                    if (code >> shift) & 1 == 0 {
+                        next[zero] = code;
+                        zero += 1;
+                    } else {
+                        next[one] = code;
+                        one += 1;
+                    }
+                }
+                sequence_is_current = !sequence_is_current;
+            }
+        }
+        self.sequence.clear();
+        Ok(())
+    }
+
+    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
+        let metadata: Vec<_> = self
+            .builders
+            .into_iter()
+            .map(PackedWaveletBuilder::freeze)
+            .collect();
+        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+    }
+}
+
+struct BackendWaveletFactory<'backend, B> {
+    backend: &'backend B,
+}
+
+struct BackendWaveletOutputs<'area, 'backend, B> {
+    backend: &'backend B,
+    alphabet_size: usize,
+    builders: Vec<PackedWaveletBuilder<'area>>,
+    sequence: Vec<u32>,
+}
+
+impl<'backend, B> MergedWaveletFactory for BackendWaveletFactory<'backend, B>
+where
+    B: WaveletMatrixFreezeBackend,
+{
+    type Error = SuccinctArchiveMergeError<B::Error>;
+    type Outputs<'area>
+        = BackendWaveletOutputs<'area, 'backend, B>
+    where
+        Self: 'area;
+
+    fn create<'area>(
+        &self,
+        alphabet_size: usize,
+        len: usize,
+        writer: &mut SectionWriter<'area>,
+    ) -> Result<Self::Outputs<'area>, Self::Error>
+    where
+        Self: 'area,
+    {
+        if alphabet_size > u32::MAX as usize {
+            return Err(SuccinctArchiveMergeError::DomainTooWide(alphabet_size));
+        }
+        let builders = SuccinctRotation::ALL
+            .into_iter()
+            .map(|_| PackedWaveletBuilder::new(alphabet_size, len, writer))
+            .collect();
+        Ok(BackendWaveletOutputs {
+            backend: self.backend,
+            alphabet_size,
+            builders,
+            sequence: Vec::with_capacity(len),
+        })
+    }
+}
+
+impl<B> MergedWaveletOutputs for BackendWaveletOutputs<'_, '_, B>
+where
+    B: WaveletMatrixFreezeBackend,
+{
+    type Error = SuccinctArchiveMergeError<B::Error>;
+
+    fn set_int(
+        &mut self,
+        _rotation: SuccinctRotation,
+        position: usize,
+        value: usize,
+    ) -> Result<(), Self::Error> {
+        debug_assert_eq!(position, self.sequence.len());
+        if value >= self.alphabet_size {
+            return Err(SuccinctArchiveMergeError::CodeOutsideDomain {
+                code: value,
+                domain_size: self.alphabet_size,
+            });
+        }
+        let value = u32::try_from(value)
+            .map_err(|_| SuccinctArchiveMergeError::DomainTooWide(self.alphabet_size))?;
+        self.sequence.push(value);
+        Ok(())
+    }
+
+    fn finish_rotation(&mut self, rotation: SuccinctRotation) -> Result<(), Self::Error> {
+        let builder = &mut self.builders[rotation.index()];
+        let mut planes = builder.plane_slices();
+        self.backend
+            .freeze_rotation(rotation, self.alphabet_size, &self.sequence, &mut planes)
+            .map_err(SuccinctArchiveMergeError::Backend)?;
+        if let Err(depth) = builder.validate_plane_prefix(&self.sequence) {
+            return Err(SuccinctArchiveMergeError::PlanePrefixMismatch { rotation, depth });
+        }
+        if !builder.tail_is_zero() {
+            return Err(SuccinctArchiveMergeError::NonZeroTail(rotation));
+        }
+        self.sequence.clear();
+        Ok(())
+    }
+
+    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
+        let metadata: Vec<_> = self
+            .builders
+            .into_iter()
+            .map(PackedWaveletBuilder::freeze)
+            .collect();
+        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+    }
+}
+
 #[derive(Default)]
 struct PrefixAccumulator {
     last: Option<usize>,
@@ -663,22 +1204,25 @@ impl PrefixAccumulator {
     }
 }
 
-fn fill_merged_rotation(
+fn fill_merged_rotation<O>(
     segments: &[SuccinctArchive<OrderedUniverse>],
     remaps: &[Vec<usize>],
     rotation: SuccinctRotation,
-    wavelet: &mut WaveletMatrixBuilder<'_>,
+    wavelets: &mut O,
     changed_pair: &mut BitVectorBuilder<'_>,
     mut prefix: Option<&mut BitVectorBuilder<'_>>,
     triple_count: usize,
     domain_len: usize,
-) -> usize {
+) -> Result<usize, O::Error>
+where
+    O: MergedWaveletOutputs,
+{
     let mut last_pair = None;
     let mut prefix_accumulator = PrefixAccumulator::default();
     let mut written = 0usize;
 
     for (position, row) in MergedRows::new(segments, remaps, rotation).enumerate() {
-        wavelet.set_int(position, row[2]).unwrap();
+        wavelets.set_int(rotation, position, row[2])?;
         let pair = [row[0], row[1]];
         let changed = last_pair != Some(pair);
         changed_pair.set_bit(position, changed).unwrap();
@@ -689,20 +1233,25 @@ fn fill_merged_rotation(
         written = position + 1;
     }
     assert_eq!(written, triple_count, "all rotations have equal length");
+    wavelets.finish_rotation(rotation)?;
 
-    match prefix {
+    Ok(match prefix {
         Some(builder) => prefix_accumulator.finish(builder, triple_count, domain_len),
         None => 0,
-    }
+    })
 }
 
 /// Structurally merges sorted succinct-archive segments without reconstructing
 /// their six-PATCH [`TribleSet`] representation. Segment-local value domains
 /// are merged first; all six rotations are then k-way merged and fed directly
 /// into the existing succinct builders. The on-disk blob format is unchanged.
-pub(crate) fn merge_ordered_archives(
+fn merge_ordered_archives_with_factory<F>(
     segments: &[SuccinctArchive<OrderedUniverse>],
-) -> SuccinctArchive<OrderedUniverse> {
+    factory: &F,
+) -> Result<SuccinctArchive<OrderedUniverse>, F::Error>
+where
+    F: MergedWaveletFactory,
+{
     let mut area = ByteArea::new().unwrap();
     let mut sections = area.sections();
 
@@ -740,18 +1289,7 @@ pub(crate) fn merge_ordered_archives(
     let mut v_a_builder =
         BitVectorBuilder::from_bit(false, triple_count + domain_len + 1, &mut sections).unwrap();
 
-    let mut eav_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
-    let mut vea_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
-    let mut ave_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
-    let mut vae_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
-    let mut eva_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
-    let mut aev_builder =
-        WaveletMatrixBuilder::with_capacity(domain_len, triple_count, &mut sections).unwrap();
+    let mut wavelets = factory.create(domain_len, triple_count, &mut sections)?;
 
     let mut changed_e_a_builder =
         BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
@@ -770,62 +1308,62 @@ pub(crate) fn merge_ordered_archives(
         segments,
         &remaps,
         SuccinctRotation::Eav,
-        &mut eav_builder,
+        &mut wavelets,
         &mut changed_e_a_builder,
         Some(&mut e_a_builder),
         triple_count,
         domain_len,
-    );
+    )?;
     let value_count = fill_merged_rotation(
         segments,
         &remaps,
         SuccinctRotation::Vea,
-        &mut vea_builder,
+        &mut wavelets,
         &mut changed_v_e_builder,
         Some(&mut v_a_builder),
         triple_count,
         domain_len,
-    );
+    )?;
     let attribute_count = fill_merged_rotation(
         segments,
         &remaps,
         SuccinctRotation::Ave,
-        &mut ave_builder,
+        &mut wavelets,
         &mut changed_a_v_builder,
         Some(&mut a_a_builder),
         triple_count,
         domain_len,
-    );
+    )?;
     fill_merged_rotation(
         segments,
         &remaps,
         SuccinctRotation::Vae,
-        &mut vae_builder,
+        &mut wavelets,
         &mut changed_v_a_builder,
         None,
         triple_count,
         domain_len,
-    );
+    )?;
     fill_merged_rotation(
         segments,
         &remaps,
         SuccinctRotation::Eva,
-        &mut eva_builder,
+        &mut wavelets,
         &mut changed_e_v_builder,
         None,
         triple_count,
         domain_len,
-    );
+    )?;
     fill_merged_rotation(
         segments,
         &remaps,
         SuccinctRotation::Aev,
-        &mut aev_builder,
+        &mut wavelets,
         &mut changed_a_e_builder,
         None,
         triple_count,
         domain_len,
-    );
+    )?;
     drop(remaps);
 
     // Freeze to metadata and immediately drop the temporary indexes. The final
@@ -833,12 +1371,7 @@ pub(crate) fn merge_ordered_archives(
     let e_a = e_a_builder.freeze::<Rank9SelIndex>().metadata();
     let a_a = a_a_builder.freeze::<Rank9SelIndex>().metadata();
     let v_a = v_a_builder.freeze::<Rank9SelIndex>().metadata();
-    let eav_c = eav_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
-    let vea_c = vea_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
-    let ave_c = ave_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
-    let vae_c = vae_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
-    let eva_c = eva_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
-    let aev_c = aev_builder.freeze::<Rank9SelIndex>().unwrap().metadata();
+    let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c] = wavelets.freeze()?;
     let changed_e_a = changed_e_a_builder.freeze::<Rank9SelIndex>().metadata();
     let changed_e_v = changed_e_v_builder.freeze::<Rank9SelIndex>().metadata();
     let changed_a_e = changed_a_e_builder.freeze::<Rank9SelIndex>().metadata();
@@ -874,7 +1407,43 @@ pub(crate) fn merge_ordered_archives(
     meta_sec.as_mut_slice()[0] = meta;
     meta_sec.freeze().unwrap();
     let bytes = area.freeze().unwrap();
-    SuccinctArchive::from_bytes(meta, bytes).unwrap()
+    Ok(SuccinctArchive::from_bytes(meta, bytes).unwrap())
+}
+
+/// Structurally merge sorted succinct-archive segments on the default CPU
+/// backend, preserving the canonical SuccinctArchive byte representation.
+pub fn merge_ordered_archives(
+    segments: &[SuccinctArchive<OrderedUniverse>],
+) -> SuccinctArchive<OrderedUniverse> {
+    match merge_ordered_archives_with_factory(segments, &PackedCpuWaveletFactory) {
+        Ok(archive) => archive,
+        Err(SuccinctArchiveMergeError::DomainTooWide(_)) => {
+            merge_ordered_archives_with_factory(segments, &JerkyWaveletFactory).unwrap()
+        }
+        Err(SuccinctArchiveMergeError::Backend(never)) => match never {},
+        Err(error) => panic!("internal packed wavelet freeze violated its contract: {error}"),
+    }
+}
+
+/// Structurally merge sorted succinct-archive segments while delegating only
+/// the six wavelet-freeze passes to `backend`.
+///
+/// Domain remapping, k-way row merge, prefix/change vectors, canonical section
+/// order, and final blob attachment remain in `triblespace-core`; consequently
+/// an accelerator implementation can live in an optional companion crate and
+/// does not add GPU dependencies to the default core build.
+///
+/// The returned error covers backend-reported failures and the inexpensive
+/// output checks described by [`WaveletMatrixFreezeBackend`]. Allocation
+/// failure, a backend panic, or process abort are not caught here.
+pub fn merge_ordered_archives_with_backend<B>(
+    segments: &[SuccinctArchive<OrderedUniverse>],
+    backend: &B,
+) -> Result<SuccinctArchive<OrderedUniverse>, SuccinctArchiveMergeError<B::Error>>
+where
+    B: WaveletMatrixFreezeBackend,
+{
+    merge_ordered_archives_with_factory(segments, &BackendWaveletFactory { backend })
 }
 
 impl<U> From<&TribleSet> for SuccinctArchive<U>
@@ -1281,6 +1850,49 @@ mod tests {
     use itertools::Itertools;
     use proptest::prelude::*;
 
+    struct ReferencePackedFreeze;
+
+    impl WaveletMatrixFreezeBackend for ReferencePackedFreeze {
+        type Error = std::convert::Infallible;
+
+        fn freeze_rotation(
+            &self,
+            _rotation: SuccinctRotation,
+            _alphabet_size: usize,
+            sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            let mut current = sequence.to_vec();
+            let mut next = vec![0u32; sequence.len()];
+            let width = planes.len();
+            for (depth, plane) in planes.iter_mut().enumerate() {
+                plane.fill(0);
+                let shift = width - 1 - depth;
+                let mut zeros = 0usize;
+                for (position, &code) in current.iter().enumerate() {
+                    let bit = (code >> shift) & 1;
+                    if bit == 0 {
+                        zeros += 1;
+                    } else {
+                        plane[position / 64] |= 1u64 << (position % 64);
+                    }
+                }
+                let (mut zero, mut one) = (0usize, zeros);
+                for &code in &current {
+                    if (code >> shift) & 1 == 0 {
+                        next[zero] = code;
+                        zero += 1;
+                    } else {
+                        next[one] = code;
+                        one += 1;
+                    }
+                }
+                std::mem::swap(&mut current, &mut next);
+            }
+            Ok(())
+        }
+    }
+
     pub mod knights {
         use crate::prelude::*;
 
@@ -1328,7 +1940,7 @@ mod tests {
                     any::<[u8; 32]>(),
                     1u8..16,
                 ),
-                0..32,
+                0..96,
             )
         ) {
             let mut sets: [TribleSet; 4] = std::array::from_fn(|_| TribleSet::new());
@@ -1349,11 +1961,15 @@ mod tests {
             let archives: Vec<SuccinctArchive<OrderedUniverse>> =
                 sets.iter().map(Into::into).collect();
             let merged = merge_ordered_archives(&archives);
+            let backend_merged =
+                merge_ordered_archives_with_backend(&archives, &ReferencePackedFreeze).unwrap();
             let union = sets.into_iter().fold(TribleSet::new(), |left, right| left + right);
             let rebuilt: SuccinctArchive<OrderedUniverse> = (&union).into();
 
             prop_assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
-            prop_assert_eq!(TribleSet::from(&merged), union);
+            prop_assert_eq!(backend_merged.bytes.as_ref(), rebuilt.bytes.as_ref());
+            prop_assert_eq!(&TribleSet::from(&merged), &union);
+            prop_assert_eq!(&TribleSet::from(&backend_merged), &union);
         }
 
         #[test]
@@ -1572,6 +2188,8 @@ mod tests {
             .map(Into::into)
             .collect();
         let merged = merge_ordered_archives(&archives);
+        let backend_merged =
+            merge_ordered_archives_with_backend(&archives, &ReferencePackedFreeze).unwrap();
 
         let mut union = left;
         union += middle;
@@ -1581,9 +2199,268 @@ mod tests {
 
         assert_eq!(merged_set, union);
         assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
+        assert_eq!(backend_merged.bytes.as_ref(), rebuilt.bytes.as_ref());
         assert_eq!(merged.entity_count, rebuilt.entity_count);
         assert_eq!(merged.attribute_count, rebuilt.attribute_count);
         assert_eq!(merged.value_count, rebuilt.value_count);
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LaterFailure;
+
+    struct FailOnRotation(SuccinctRotation);
+
+    impl WaveletMatrixFreezeBackend for FailOnRotation {
+        type Error = LaterFailure;
+
+        fn freeze_rotation(
+            &self,
+            rotation: SuccinctRotation,
+            alphabet_size: usize,
+            sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            if rotation == self.0 {
+                return Err(LaterFailure);
+            }
+            ReferencePackedFreeze
+                .freeze_rotation(rotation, alphabet_size, sequence, planes)
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    enum Corruption {
+        FirstPlane,
+        Tail,
+    }
+
+    struct CorruptOnRotation {
+        rotation: SuccinctRotation,
+        corruption: Corruption,
+    }
+
+    impl WaveletMatrixFreezeBackend for CorruptOnRotation {
+        type Error = std::convert::Infallible;
+
+        fn freeze_rotation(
+            &self,
+            rotation: SuccinctRotation,
+            alphabet_size: usize,
+            sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            ReferencePackedFreeze.freeze_rotation(rotation, alphabet_size, sequence, planes)?;
+            if rotation == self.rotation {
+                match self.corruption {
+                    Corruption::FirstPlane => planes[0][0] ^= 1,
+                    Corruption::Tail => {
+                        let tail = sequence.len() % 64;
+                        assert_ne!(tail, 0);
+                        *planes.last_mut().unwrap().last_mut().unwrap() |= 1u64 << tail;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn backend_errors_keep_the_later_rotation() {
+        let set = varied_knights();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let result =
+            merge_ordered_archives_with_backend(&[archive], &FailOnRotation(SuccinctRotation::Eva));
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::Backend(LaterFailure))
+        ));
+    }
+
+    #[test]
+    fn backend_first_plane_corruption_is_rejected() {
+        let set = varied_knights();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let result = merge_ordered_archives_with_backend(
+            &[archive],
+            &CorruptOnRotation {
+                rotation: SuccinctRotation::Ave,
+                corruption: Corruption::FirstPlane,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::PlanePrefixMismatch {
+                rotation: SuccinctRotation::Ave,
+                depth: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn backend_nonzero_tail_on_later_rotation_is_rejected() {
+        let set = varied_knights();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let result = merge_ordered_archives_with_backend(
+            &[archive],
+            &CorruptOnRotation {
+                rotation: SuccinctRotation::Vae,
+                corruption: Corruption::Tail,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::NonZeroTail(
+                SuccinctRotation::Vae
+            ))
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn backend_factory_rejects_alphabet_beyond_u32() {
+        let backend = ReferencePackedFreeze;
+        let factory = BackendWaveletFactory { backend: &backend };
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let result = factory.create(u32::MAX as usize + 1, 0, &mut sections);
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::DomainTooWide(size))
+                if size == u32::MAX as usize + 1
+        ));
+    }
+
+    #[test]
+    fn backend_output_rejects_code_outside_domain() {
+        let backend = ReferencePackedFreeze;
+        let factory = BackendWaveletFactory { backend: &backend };
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let mut outputs = factory.create(2, 1, &mut sections).unwrap();
+        let result = outputs.set_int(SuccinctRotation::Eav, 0, 2);
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::CodeOutsideDomain {
+                code: 2,
+                domain_size: 2
+            })
+        ));
+    }
+
+    struct ZeroFreeze;
+
+    impl WaveletMatrixFreezeBackend for ZeroFreeze {
+        type Error = std::convert::Infallible;
+
+        fn freeze_rotation(
+            &self,
+            _rotation: SuccinctRotation,
+            _alphabet_size: usize,
+            _sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            for plane in planes {
+                plane.fill(0);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn zero_backend_is_rejected_after_leading_zero_planes() {
+        let backend = ZeroFreeze;
+        let factory = BackendWaveletFactory { backend: &backend };
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let mut outputs = factory.create(256, 3, &mut sections).unwrap();
+        for (position, code) in [1usize, 2, 127].into_iter().enumerate() {
+            outputs
+                .set_int(SuccinctRotation::Eav, position, code)
+                .unwrap();
+        }
+        let result = outputs.finish_rotation(SuccinctRotation::Eav);
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::PlanePrefixMismatch {
+                rotation: SuccinctRotation::Eav,
+                depth: 2,
+            })
+        ));
+    }
+
+    struct OneBitFreeze {
+        depth: usize,
+    }
+
+    impl WaveletMatrixFreezeBackend for OneBitFreeze {
+        type Error = std::convert::Infallible;
+
+        fn freeze_rotation(
+            &self,
+            _rotation: SuccinctRotation,
+            _alphabet_size: usize,
+            _sequence: &[u32],
+            planes: &mut [&mut [u64]],
+        ) -> Result<(), Self::Error> {
+            for plane in planes.iter_mut() {
+                plane.fill(0);
+            }
+            planes[self.depth][0] = 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn all_zero_sequence_requires_every_plane_to_be_zero() {
+        let backend = OneBitFreeze { depth: 7 };
+        let factory = BackendWaveletFactory { backend: &backend };
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let mut outputs = factory.create(256, 3, &mut sections).unwrap();
+        for position in 0..3 {
+            outputs.set_int(SuccinctRotation::Eav, position, 0).unwrap();
+        }
+        let result = outputs.finish_rotation(SuccinctRotation::Eav);
+        assert!(matches!(
+            result,
+            Err(SuccinctArchiveMergeError::PlanePrefixMismatch {
+                rotation: SuccinctRotation::Eav,
+                depth: 7,
+            })
+        ));
+    }
+
+    fn synthetic_trible(ordinal: usize) -> Trible {
+        let mut state = (ordinal as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut data = [0u8; 64];
+        for chunk in data.chunks_exact_mut(8) {
+            state ^= state >> 30;
+            state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            state ^= state >> 27;
+            chunk.copy_from_slice(&state.to_le_bytes());
+        }
+        data[0] |= 0x80;
+        data[16] |= 0x80;
+        Trible { data }
+    }
+
+    #[test]
+    fn packed_cpu_merge_is_canonical_across_word_and_block_boundaries() {
+        for rows in [31usize, 32, 33, 63, 64, 65, 255, 256, 257] {
+            let mut sets: [TribleSet; 3] = std::array::from_fn(|_| TribleSet::new());
+            for ordinal in 0..rows {
+                sets[ordinal % sets.len()].insert(&synthetic_trible(ordinal));
+            }
+            let archives: Vec<SuccinctArchive<OrderedUniverse>> =
+                sets.iter().map(Into::into).collect();
+            let merged = merge_ordered_archives(&archives);
+            let union = sets
+                .into_iter()
+                .fold(TribleSet::new(), |union, set| union + set);
+            let rebuilt: SuccinctArchive<OrderedUniverse> = (&union).into();
+            assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref(), "{rows} rows");
+        }
     }
 
     #[test]

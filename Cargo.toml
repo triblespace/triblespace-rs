@@ -25,6 +25,7 @@ members = [
     "triblespace-macros-common",
     "triblespace-net",
     "triblespace-search",
+    "triblespace-gpu",
     "trible",
 ]
 resolver = "2"
@@ -125,4 +126,3 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
 [package.metadata.kani.flags]
 default-unwind = "1"
-

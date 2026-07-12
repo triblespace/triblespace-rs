@@ -192,8 +192,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compute_rollup`) carry the manifest forward (`rebuild_branch_meta`), so
   segments **accumulate across commits** instead of being wiped by each
   rebuild. Succinct compaction structurally merges the six sorted rotations
-  with bounded working memory, BM25 compaction streams persisted postings
-  instead of reconstructing every document's token bag, and the direct
+  with bounded working memory. The canonical CPU merge now writes packed
+  wavelet planes with a two-buffer O(n) scratch reused across rotations,
+  avoiding Jerky's transient Rank9 indexes and O(n log² σ) cycle-rotation
+  freeze. Its wavelet-freeze phase also has a GPU-free
+  `WaveletMatrixFreezeBackend` seam plus
+  `merge_ordered_archives_with_backend`; core still owns domain remapping,
+  sorted rotation merge, canonical section layout, and blob assembly, while an
+  optional `triblespace-gpu` workspace companion fills preallocated packed bit
+  planes through CubeCL/WGPU or CUDA without adding GPU dependencies to core.
+  `AcceleratedSuccinctRollup` selects that backend at or above a caller-chosen
+  input-row threshold; a returned failure opens a circuit breaker before the
+  canonical CPU retry, without changing the kind id or bytes. BM25 compaction
+  streams persisted postings instead of reconstructing every document's token
+  bag, and the direct
   documented `SimpleArchive` → `SuccinctArchive` conversion is now wired. First
   kinds: `SuccinctRollup` in core (segments are
   `SuccinctArchive`s; `SuccinctRollup::union` gives cross-segment joins via
