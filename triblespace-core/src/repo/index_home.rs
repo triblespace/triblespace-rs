@@ -596,9 +596,35 @@ where
     S: BlobStore,
     K: IndexKind,
 {
+    append_prebuilt_segment(storage, kind, kind.build(source), head_set)
+}
+
+/// Fold an already-built level-zero segment into `head_set`, running the
+/// ordered size-tiered carry and global overfull-level repair.
+///
+/// This is the leaf-preparation seam for callers that can build independent
+/// segments in parallel. Queue the completed blobs through this function in
+/// their desired logical order: manifest sequence numbers follow call order,
+/// and compaction remains serialized so the resulting manifest is canonical.
+/// Each `segment` must have been produced by [`IndexKind::build`] for `kind`.
+///
+/// Segment blobs are uploaded to `storage` as the carry advances. As with
+/// [`append_segment`], an error may leave unreferenced content-addressed blobs
+/// for GC, but `head_set` is replaced only after every carry and repair
+/// succeeds (`Err` leaves it untouched).
+pub fn append_prebuilt_segment<S, K>(
+    storage: &mut S,
+    kind: &K,
+    segment: Blob<UnknownBlob>,
+    head_set: &mut TribleSet,
+) -> Result<(), IndexError>
+where
+    S: BlobStore,
+    K: IndexKind,
+{
     let kind_id = kind.kind_id();
     let mut manifest = Manifest::from_tribles(head_set, kind_id);
-    let mut pending = Some((kind.build(source), 0));
+    let mut pending = Some((segment, 0));
 
     // Carry pending blobs upward entirely in memory, then repair any globally
     // overfull tier admitted through the manifest's public/migration seams.
@@ -1657,6 +1683,74 @@ mod tests {
         )
         .count();
         assert_eq!(count, names.len(), "all facts survive compaction");
+    }
+
+    #[test]
+    fn prebuilt_append_matches_build_then_append_canonically() {
+        let (base, initial_head, _victims) = seeded_cascade(2);
+        let source = person("parallel-leaf");
+        let kind = SuccinctRollup;
+
+        let mut built_store = CountingStore::clone_from(&base);
+        let mut prebuilt_store = CountingStore::clone_from(&base);
+        let mut built_head = initial_head.clone();
+        let mut prebuilt_head = initial_head;
+
+        append_segment(&mut built_store, &kind, &source, &mut built_head).unwrap();
+        let segment = kind.build(&source);
+        append_prebuilt_segment(&mut prebuilt_store, &kind, segment, &mut prebuilt_head).unwrap();
+
+        assert_eq!(prebuilt_head, built_head);
+        assert_eq!(
+            prebuilt_store.counts.puts.load(Ordering::Relaxed),
+            built_store.counts.puts.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            prebuilt_store.counts.gets.load(Ordering::Relaxed),
+            built_store.counts.gets.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn prebuilt_append_repairs_a_distant_overfull_tier() {
+        let (base, initial_head, _victims) = seeded_levels(&[(5, FANOUT), (6, FANOUT - 1)]);
+        let kind = SuccinctRollup;
+        let segment = kind.build(&person("parallel-repair"));
+        let mut storage = CountingStore::clone_from(&base);
+        let mut head = initial_head;
+
+        append_prebuilt_segment(&mut storage, &kind, segment, &mut head).unwrap();
+
+        let manifest = Manifest::from_tribles(&head, kind.kind_id());
+        assert!(manifest.overflowing_level(FANOUT).is_none());
+        assert_eq!(
+            manifest
+                .segments
+                .iter()
+                .map(|entry| entry.level)
+                .collect::<Vec<_>>(),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn prebuilt_append_merge_error_leaves_head_untouched() {
+        let (base, initial_head, victim_handles) = seeded_cascade(1);
+        let kind = FailableSuccinct {
+            failure: KindFailure::Merge,
+        };
+        let segment = kind.build(&person("parallel-failure"));
+        let mut storage = CountingStore::clone_from(&base);
+        let mut head = initial_head.clone();
+
+        let error = append_prebuilt_segment(&mut storage, &kind, segment, &mut head).unwrap_err();
+
+        assert!(matches!(error, IndexError::Merge(_)));
+        assert_eq!(head, initial_head);
+        let reader = storage.reader().unwrap();
+        for handle in victim_handles {
+            assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle).is_ok());
+        }
     }
 
     #[test]
