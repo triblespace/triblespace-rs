@@ -83,9 +83,11 @@ WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL
 kernels and is compile-checked, but remains experimental until the parity gate
 has also run on CUDA hardware.
 
-Apple Metal measurements from 2026-07-12 used CubeCL 0.9 (the Rust 1.89
-compatible line), three overlapping segments, and warm shaders and allocator
-state. The threshold column is the exact quantity compared by
+Initial Apple Metal measurements from 2026-07-12 used CubeCL 0.9 (the Rust
+1.89-compatible line), three overlapping segments, and warm shaders and
+allocator state. They predate the materialize-once rotation pipeline,
+parallel source decode, and parallel packed CPU freeze, and are retained as the
+optimization baseline. The threshold column is the exact quantity compared by
 `min_input_rows`.
 
 | base rows/input | threshold input rows | output rows | old Jerky CPU | packed CPU | WGPU | WGPU speedup |
@@ -96,9 +98,22 @@ state. The threshold column is the exact quantity compared by
 | 100,000 | 315,792 | 305,264 | 2.956 s | 1.785 s | 1.708 s | 1.05x |
 | 300,000 | 947,370 | 915,790 | 10.732 s | 6.484 s | 6.104 s | 1.06x |
 
-All measured outputs were byte-identical. The packed O(n log σ) CPU algorithm
-supersedes the old Jerky O(n log² σ) baseline, leaving WGPU only a modest
-upper-tier optimization on this machine. `300_000` summed input rows is a
-conservative starting crossover for this hardware; calibrate it on deployment
-hardware and do not transplant a threshold based only on deduplicated output
-rows.
+All initial outputs were byte-identical. At that stage, the packed O(n log σ)
+CPU algorithm superseded the old Jerky O(n log² σ) baseline and left WGPU as
+only a modest upper-tier optimization. `300_000` summed input rows was kept as
+a conservative starting crossover; calibrate it on deployment hardware and do
+not transplant a threshold based only on deduplicated output rows.
+
+Remeasuring current `main` after the materialize-once and parallel CPU work
+shows why that conservative threshold remains useful while the upper-tier GPU
+case became substantially stronger:
+
+| base rows/input | threshold input rows | output rows | parallel CPU | WGPU | WGPU speedup |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 31,581 | 30,527 | 47 ms | 46 ms | 1.02x |
+| 30,000 | 94,737 | 91,579 | 141 ms | 138 ms | 1.02x |
+| 100,000 | 315,792 | 305,264 | 1.306 s | 0.740 s | 1.76x |
+
+All remeasured outputs were again byte-identical. Below roughly 100k summed
+input rows WGPU only ties the CPU path, while the first point above the 300k
+activation threshold has a material win.
