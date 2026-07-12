@@ -130,6 +130,8 @@ pub mod memoryrepo;
 pub mod objectstore;
 /// Local file-based pile storage backend.
 pub mod pile;
+/// Experimental opt-in persistent locator snapshots for local piles.
+pub mod pile_index;
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 

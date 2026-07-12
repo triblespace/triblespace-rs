@@ -182,6 +182,29 @@ mode. (Records above the threshold use the exclusive-lock fallback and don't
 rely on filesystem atomicity.) Using an atomicity-lacking filesystem for
 small records risks pile corruption.
 
+## Experimental static locator snapshots
+
+`MappedPileIndex` is an opt-in proof that the replayed blob, pin, and weak-pin
+state can live in a compact mapped `.pidx` cache instead of a corpus-sized heap
+index. The pile remains authoritative: deleting or rejecting the cache simply
+returns the caller to normal PATCH replay. Snapshot construction uses the
+canonical `PileRecords` decoder, bounded external-sort runs, checksummed sorted
+tables, and an atomic rename after the completed file is synced.
+
+The initial format is deliberately static. A snapshot is bound to the exact OS
+file identity and byte length observed through the same file descriptor as its
+mapping. Any append, truncation, or path replacement rejects it as stale; there
+is no unindexed tail overlay. Opening also verifies the header and table
+checksums, canonical section bounds, strict key ordering, and first/last record
+anchors before exposing point lookups or streaming key iteration. Malformed or
+stale cache files are disposable, while errors reading the pile itself remain
+authoritative failures.
+
+This proof does not alter `Pile` or `PileReader` defaults and is not maintained
+incrementally yet. Its 16-byte format marker
+`080FB58E9F63E801C625DB2F2EFA292B` was minted with `trible genid` on
+2026-07-12 rather than derived from a name.
+
 Tools that need the raw log rather than the collapsed state—reflogs,
 consolidation, forensics—should use
 [`PileRecords`](../../src/repo/pile.rs), an iterator over every record in a

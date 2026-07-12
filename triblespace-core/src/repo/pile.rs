@@ -57,6 +57,8 @@ use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 
+use super::pile_index::{PileBlobLocator, PileIndex, PileIndexError};
+
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
@@ -369,7 +371,7 @@ pub enum PileRecordContent {
 /// it, and [`PileRecords`] exposes it for raw inspection. An unknown magic
 /// marker or a truncated record yields [`ReadError::CorruptPile`] pointing at
 /// `offset` — never a silent stop.
-fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
+pub(super) fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
         valid_length: offset,
     };
@@ -511,6 +513,9 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
 /// record list.
 #[derive(Debug)]
 pub struct PileRecords {
+    /// Keep the exact file descriptor used to create `bytes` so derived
+    /// snapshots can bind their identity without a path-reopen TOCTOU.
+    file: File,
     bytes: Bytes,
     offset: usize,
     failed: bool,
@@ -533,6 +538,7 @@ impl PileRecords {
             unsafe { Bytes::map_file(&file)? }
         };
         Ok(Self {
+            file,
             bytes,
             offset: 0,
             failed: false,
@@ -543,6 +549,11 @@ impl PileRecords {
     /// `data_offset`/`data_len` reported by [`PileRecordContent::Blob`].
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
+    }
+
+    /// Metadata from the same file descriptor that backs [`Self::bytes`].
+    pub(crate) fn file_metadata(&self) -> Result<std::fs::Metadata, ReadError> {
+        Ok(self.file.metadata()?)
     }
 }
 
@@ -604,6 +615,24 @@ fn padding_for_blob(blob_size: usize) -> usize {
     (BLOB_ALIGNMENT - ((BLOB_HEADER_LEN + blob_size) % BLOB_ALIGNMENT)) % BLOB_ALIGNMENT
 }
 
+/// Canonical legacy V1 blob bytes for mixed-format regression tests.
+#[cfg(test)]
+pub(crate) fn legacy_v1_blob_record_for_test(
+    payload: &[u8],
+    timestamp: u64,
+) -> (Inline<Handle<UnknownBlob>>, Vec<u8>) {
+    let blob = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec()));
+    let handle = blob.get_handle();
+    let hash: Inline<Hash<Blake3>> = handle.into();
+    let header = BlobHeader::new(timestamp, payload.len() as u64, hash);
+    let record_len = BLOB_HEADER_LEN + payload.len() + padding_for_blob(payload.len());
+    let mut record = Vec::with_capacity(record_len);
+    record.extend_from_slice(header.as_bytes());
+    record.extend_from_slice(payload);
+    record.resize(record_len, 0);
+    (handle, record)
+}
+
 #[derive(Debug, Clone)]
 /// Read-only handle referencing a [`Pile`].
 ///
@@ -612,6 +641,60 @@ fn padding_for_blob(blob_size: usize) -> usize {
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
+}
+
+/// Snapshot of the current heap PATCH indices, exposed only as the oracle for
+/// the opt-in mapped-index proof. Normal [`Pile`] and [`PileReader`] behavior
+/// remains unchanged.
+#[derive(Debug, Clone)]
+pub struct PatchPileIndex {
+    blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+    weak_pins: PATCH<32, IdentitySchema>,
+    covered_len: usize,
+}
+
+/// Streaming ordered keys from the PATCH blob-index oracle.
+pub struct PatchBlobHandles {
+    inner: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, IndexEntry>,
+}
+
+impl Iterator for PatchBlobHandles {
+    type Item = Result<Inline<Handle<UnknownBlob>>, PileIndexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|raw| Ok(Inline::new(raw)))
+    }
+}
+
+/// Streaming ordered pin ids from the PATCH oracle.
+pub struct PatchPinIds {
+    inner:
+        crate::patch::PATCHIntoOrderedIterator<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+}
+
+impl Iterator for PatchPinIds {
+    type Item = Result<Id, PileIndexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|raw| {
+            Id::new(raw)
+                .ok_or_else(|| PileIndexError::InvalidIndex("PATCH contains a nil pin id".into()))
+        })
+    }
+}
+
+/// Streaming ordered weak-pin handles from the PATCH oracle.
+pub struct PatchWeakPinHandles {
+    inner: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, ()>,
+}
+
+impl Iterator for PatchWeakPinHandles {
+    type Item = Result<Inline<Handle<UnknownBlob>>, PileIndexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|raw| Ok(Inline::new(raw)))
+    }
 }
 
 impl PartialEq for PileReader {
@@ -705,6 +788,70 @@ impl BlobStore for Pile {
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.refresh()?;
         Ok(PileReader::new(self.mmap.clone(), self.blobs.clone()))
+    }
+}
+
+impl Pile {
+    /// Captures the current PATCH-backed locator state for differential testing
+    /// against [`crate::repo::pile_index::MappedPileIndex`].
+    ///
+    /// This does not opt the Pile into persistent indexing; it performs the
+    /// same full refresh as the existing default path.
+    pub fn patch_index(&mut self) -> Result<PatchPileIndex, ReadError> {
+        self.refresh()?;
+        Ok(PatchPileIndex {
+            blobs: self.blobs.clone(),
+            branches: self.branches.clone(),
+            weak_pins: self.weak_pins.clone(),
+            covered_len: self.applied_length,
+        })
+    }
+}
+
+impl PileIndex for PatchPileIndex {
+    type BlobHandles<'a> = PatchBlobHandles;
+    type PinIds<'a> = PatchPinIds;
+    type WeakPinHandles<'a> = PatchWeakPinHandles;
+
+    fn covered_len(&self) -> u64 {
+        self.covered_len as u64
+    }
+
+    fn blob_locator(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Result<Option<PileBlobLocator>, PileIndexError> {
+        let hash: Inline<Hash<Blake3>> = handle.transmute();
+        let Some(entry) = self.blobs.get(&hash.raw) else {
+            return Ok(None);
+        };
+        Ok(Some(PileBlobLocator {
+            payload_offset: entry.offset as u64,
+            payload_len: entry.len,
+            timestamp: entry.timestamp,
+        }))
+    }
+
+    fn blob_handles(&self) -> Self::BlobHandles<'_> {
+        PatchBlobHandles {
+            inner: self.blobs.clone().into_iter_ordered(),
+        }
+    }
+
+    fn pin_head(&self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, PileIndexError> {
+        Ok(self.branches.get(&id.into()).copied())
+    }
+
+    fn pin_ids(&self) -> Self::PinIds<'_> {
+        PatchPinIds {
+            inner: self.branches.clone().into_iter_ordered(),
+        }
+    }
+
+    fn weak_pin_handles(&self) -> Self::WeakPinHandles<'_> {
+        PatchWeakPinHandles {
+            inner: self.weak_pins.clone().into_iter_ordered(),
+        }
     }
 }
 
@@ -2510,20 +2657,12 @@ mod tests {
         pile1.flush().unwrap();
         pile1.refresh().unwrap();
 
-        // Corrupt the first blob's bytes on disk.
-        #[repr(C)]
-        struct Header {
-            magic_marker: [u8; 16],
-            timestamp: u64,
-            length: u64,
-            hash: [u8; 32],
-        }
-        let header_len = std::mem::size_of::<Header>();
+        // Corrupt the first V3 blob's payload (the fixed header is 256 bytes).
         use std::io::Seek;
         use std::io::SeekFrom;
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(header_len as u64)).unwrap();
+        file.seek(SeekFrom::Start(V3_HEADER_LEN as u64)).unwrap();
         file.write_all(&[9u8; 4]).unwrap();
         file.sync_all().unwrap();
 

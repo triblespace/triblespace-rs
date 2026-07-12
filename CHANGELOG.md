@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Piles have an experimental, opt-in mapped locator snapshot.**
+  `MappedPileIndex` builds a checksummed `.pidx` cache with sorted blob, pin,
+  and weak-pin tables, using bounded external-sort runs instead of another
+  corpus-sized heap index. It represents one exact pile identity and byte
+  length: replacement, truncation, or append makes the cache stale and callers
+  can fall back to the unchanged PATCH replay path. The proof is not yet wired
+  into `PileReader` or maintained incrementally.
 - **Succinct archives expose decoded fixed-attribute AVE iteration.**
   `SuccinctArchive::iter_attribute_value_entities` yields one raw
   `(value, entity)` tuple per matching fact in byte-lexicographic AVE order.
