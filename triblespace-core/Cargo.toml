@@ -75,7 +75,7 @@ kani = []
 # path is compiled identically without this feature.
 deterministic = []
 wasm = ["dep:wasmi"]
-parallel = ["dep:rayon"]
+parallel = ["dep:rayon", "blake3/rayon"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

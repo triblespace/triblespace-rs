@@ -71,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Large pile payload validation now uses BLAKE3's Rayon join strategy.**
+  With the existing `parallel` feature enabled, lock-free `PileReader` blob and
+  metadata reads validate a contiguous payload of at least 1 MiB with
+  `update_rayon` when the current Rayon pool has more than one worker. The
+  parallel digest is computed outside the `OnceLock` initializer before racing
+  to publish the immutable result, avoiding cache/pool liveness cycles;
+  concurrent first misses may duplicate hash work and then converge. Replay,
+  duplicate repair, deduplicating puts, and pile-side mapped-base lookups remain
+  serial because they can run under file locks. Smaller inputs, single-worker
+  pools, and no-default-feature builds also retain the serial digest path. All
+  paths share one strategy-aware validation helper and preserve the existing
+  cached-result and corruption behavior.
 - **Read-only pile closes no longer issue a whole-file durability barrier.**
   `Pile` now tracks mutations made through each handle, and `close` calls
   `sync_all` only for a handle with unflushed appends or truncation. Replaying

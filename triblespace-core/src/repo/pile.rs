@@ -120,6 +120,12 @@ fn v3_post_pad(data_len: usize) -> usize {
 /// any platform's single-call ceiling.
 const ATOMIC_WRITE_LIMIT: usize = 1 << 30;
 
+/// Payloads at least this large may use BLAKE3's Rayon join strategy when the
+/// current pool has more than one worker. Smaller payloads stay on the serial
+/// one-shot path to avoid paying scheduling overhead for short validations.
+#[cfg(any(feature = "parallel", test))]
+const PARALLEL_BLAKE3_THRESHOLD: usize = 1 << 20;
+
 /// Lazily-computed validation status of a blob record in the pile.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationState {
@@ -127,6 +133,67 @@ pub enum ValidationState {
     Validated,
     /// The blob's hash does not match — the record is corrupt.
     Invalid,
+}
+
+#[cfg(feature = "parallel")]
+fn should_parallelize_validation(len: usize) -> bool {
+    len >= PARALLEL_BLAKE3_THRESHOLD && rayon::current_num_threads() > 1
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ValidationStrategy {
+    /// Hash inside the `OnceLock` initializer on the calling thread.
+    Serial,
+    /// For a sufficiently large first miss, hash outside the initializer with
+    /// BLAKE3's Rayon join strategy, then race only to publish the result.
+    ParallelIfLarge,
+}
+
+fn classify_validation(
+    computed: Inline<Hash<Blake3>>,
+    expected: &Inline<Hash<Blake3>>,
+) -> ValidationState {
+    if computed == *expected {
+        ValidationState::Validated
+    } else {
+        ValidationState::Invalid
+    }
+}
+
+/// Return the cached result of validating one immutable pile payload.
+///
+/// Every lazy pile-validation site goes through this helper so mapped and heap
+/// indices share identical digest comparison and cache semantics. Parallel
+/// validation is restricted to lock-free reader paths. It must happen outside
+/// the `OnceLock` initializer: otherwise an external initializer can inject
+/// Rayon work while all pool workers block on the same cell. Concurrent reader
+/// first misses may duplicate hash work, but converge on the same immutable
+/// result when they publish it.
+fn validation_state(
+    state: &OnceLock<ValidationState>,
+    bytes: &Bytes,
+    expected: &Inline<Hash<Blake3>>,
+    strategy: ValidationStrategy,
+) -> ValidationState {
+    if let Some(cached) = state.get() {
+        return *cached;
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    let _ = strategy;
+
+    #[cfg(feature = "parallel")]
+    if matches!(strategy, ValidationStrategy::ParallelIfLarge)
+        && should_parallelize_validation(bytes.len())
+    {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_rayon(bytes);
+        let computed = Inline::new(*hasher.finalize().as_bytes());
+        let computed_state = classify_validation(computed, expected);
+        return *state.get_or_init(|| computed_state);
+    }
+
+    *state.get_or_init(|| classify_validation(Hash::<Blake3>::digest(bytes), expected))
 }
 
 #[derive(Debug, Clone)]
@@ -695,6 +762,7 @@ fn read_base_blob(
     base: &IndexedPileBase,
     mmap: &Arc<MmapRaw>,
     handle: Inline<Handle<UnknownBlob>>,
+    strategy: ValidationStrategy,
 ) -> Result<Option<(Bytes, PileBlobLocator, ValidationState)>, PileIndexError> {
     let Some(locator) = base.index.blob_locator(handle)? else {
         return Ok(None);
@@ -723,14 +791,8 @@ fn read_base_blob(
         Bytes::from_raw_parts(slice, mmap.clone())
     };
     let cell = base.validation_cell(handle.raw);
-    let state = *cell.get_or_init(|| {
-        let expected: Inline<Hash<Blake3>> = handle.into();
-        if Hash::<Blake3>::digest(&bytes) == expected {
-            ValidationState::Validated
-        } else {
-            ValidationState::Invalid
-        }
-    });
+    let expected: Inline<Hash<Blake3>> = handle.into();
+    let state = validation_state(&cell, &bytes, &expected, strategy);
     Ok(Some((bytes, locator, state)))
 }
 
@@ -842,7 +904,12 @@ impl PileReader {
         let Some(base) = &self.base else {
             return Ok(None);
         };
-        read_base_blob(base, &self.mmap, handle)
+        read_base_blob(
+            base,
+            &self.mmap,
+            handle,
+            ValidationStrategy::ParallelIfLarge,
+        )
     }
 
     fn logical_blob_keys(&self) -> Result<Vec<[u8; 32]>, PileIndexError> {
@@ -881,14 +948,7 @@ impl BlobStoreGet for PileReader {
                     .unwrap();
                 Bytes::from_raw_parts(slice, self.mmap.clone())
             };
-            let state = *state.get_or_init(|| {
-                let computed_hash = Hash::<Blake3>::digest(&bytes);
-                if computed_hash == *hash {
-                    ValidationState::Validated
-                } else {
-                    ValidationState::Invalid
-                }
-            });
+            let state = validation_state(&state, &bytes, hash, ValidationStrategy::ParallelIfLarge);
             (bytes, state)
         } else {
             let base_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
@@ -1514,7 +1574,7 @@ impl Pile {
         let Some(base) = &self.base else {
             return Ok(None);
         };
-        read_base_blob(base, &self.mmap, handle)
+        read_base_blob(base, &self.mmap, handle, ValidationStrategy::Serial)
     }
 
     /// Refreshes in-memory state from newly appended records.
@@ -1615,7 +1675,9 @@ impl Pile {
                         let IndexEntry {
                             state, offset, len, ..
                         } = entry_ref.clone();
-                        let state = state.get_or_init(|| {
+                        let state = if let Some(cached) = state.get() {
+                            *cached
+                        } else {
                             let bytes = unsafe {
                                 let slice = slice_from_raw_parts(
                                     self.mmap.as_ptr().add(offset),
@@ -1625,13 +1687,8 @@ impl Pile {
                                 .unwrap();
                                 Bytes::from_raw_parts(slice, self.mmap.clone())
                             };
-                            let computed = Hash::<Blake3>::digest(&bytes);
-                            if computed == hash {
-                                ValidationState::Validated
-                            } else {
-                                ValidationState::Invalid
-                            }
-                        });
+                            validation_state(&state, &bytes, &hash, ValidationStrategy::Serial)
+                        };
                         if let ValidationState::Invalid = state {
                             self.blobs.replace(&entry);
                         }
@@ -2081,7 +2138,9 @@ impl Pile {
                 state, offset, len, ..
             }) = self.blobs.get(&hash.raw)
             {
-                let st = state.get_or_init(|| {
+                let state = if let Some(cached) = state.get() {
+                    *cached
+                } else {
                     let bytes = unsafe {
                         let slice =
                             slice_from_raw_parts(self.mmap.as_ptr().add(*offset), *len as usize)
@@ -2089,14 +2148,9 @@ impl Pile {
                                 .unwrap();
                         Bytes::from_raw_parts(slice, self.mmap.clone())
                     };
-                    let computed = Hash::<Blake3>::digest(&bytes);
-                    if computed == hash {
-                        ValidationState::Validated
-                    } else {
-                        ValidationState::Invalid
-                    }
-                });
-                if matches!(st, ValidationState::Validated) {
+                    validation_state(state, &bytes, &hash, ValidationStrategy::Serial)
+                };
+                if matches!(state, ValidationState::Validated) {
                     return Ok(handle.transmute());
                 }
             }
@@ -2429,14 +2483,7 @@ impl crate::repo::BlobStoreMeta for PileReader {
                     .unwrap();
                 Bytes::from_raw_parts(slice, self.mmap.clone())
             };
-            let state = *state.get_or_init(|| {
-                let computed_hash = Hash::<Blake3>::digest(&bytes);
-                if computed_hash == *hash {
-                    ValidationState::Validated
-                } else {
-                    ValidationState::Invalid
-                }
-            });
+            let state = validation_state(&state, &bytes, hash, ValidationStrategy::ParallelIfLarge);
             (bytes, timestamp, state)
         } else {
             let base_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
@@ -2517,6 +2564,165 @@ mod tests {
 
     fn overlay_count<const N: usize, V: Clone>(patch: &PATCH<N, IdentitySchema, V>) -> usize {
         patch.clone().into_iter_ordered().count()
+    }
+
+    #[test]
+    fn payload_validation_matches_and_rejects_around_parallel_threshold() {
+        for strategy in [
+            ValidationStrategy::Serial,
+            ValidationStrategy::ParallelIfLarge,
+        ] {
+            for len in [
+                PARALLEL_BLAKE3_THRESHOLD - 1,
+                PARALLEL_BLAKE3_THRESHOLD,
+                PARALLEL_BLAKE3_THRESHOLD + 1,
+            ] {
+                let bytes = Bytes::from_source(
+                    (0..len)
+                        .map(|position| (position.wrapping_mul(131) % 251) as u8)
+                        .collect::<Vec<_>>(),
+                );
+                let expected = Hash::<Blake3>::digest(&bytes);
+
+                let valid = OnceLock::new();
+                assert!(matches!(
+                    validation_state(&valid, &bytes, &expected, strategy),
+                    ValidationState::Validated
+                ));
+
+                let mut wrong = expected;
+                wrong.raw[0] ^= 1;
+                let invalid = OnceLock::new();
+                assert!(matches!(
+                    validation_state(&invalid, &bytes, &wrong, strategy),
+                    ValidationState::Invalid
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn payload_validation_keeps_the_first_cached_result() {
+        let bytes = Bytes::from_source(vec![0x5A; PARALLEL_BLAKE3_THRESHOLD]);
+        let expected = Hash::<Blake3>::digest(&bytes);
+        let state = OnceLock::new();
+        assert!(matches!(
+            validation_state(&state, &bytes, &expected, ValidationStrategy::Serial),
+            ValidationState::Validated
+        ));
+
+        let mut wrong = expected;
+        wrong.raw[0] ^= 1;
+        assert!(matches!(
+            validation_state(&state, &bytes, &wrong, ValidationStrategy::ParallelIfLarge),
+            ValidationState::Validated
+        ));
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_validation_dispatch_respects_threshold_and_current_pool() {
+        let bytes = Bytes::from_source(vec![0xA5; PARALLEL_BLAKE3_THRESHOLD]);
+        let expected = Hash::<Blake3>::digest(&bytes);
+
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        one_worker.install(|| {
+            assert!(!should_parallelize_validation(PARALLEL_BLAKE3_THRESHOLD));
+            assert!(matches!(
+                validation_state(
+                    &OnceLock::new(),
+                    &bytes,
+                    &expected,
+                    ValidationStrategy::ParallelIfLarge
+                ),
+                ValidationState::Validated
+            ));
+        });
+
+        let two_workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        two_workers.install(|| {
+            assert!(!should_parallelize_validation(
+                PARALLEL_BLAKE3_THRESHOLD - 1
+            ));
+            assert!(should_parallelize_validation(PARALLEL_BLAKE3_THRESHOLD));
+            assert!(matches!(
+                validation_state(
+                    &OnceLock::new(),
+                    &bytes,
+                    &expected,
+                    ValidationStrategy::ParallelIfLarge
+                ),
+                ValidationState::Validated
+            ));
+            assert!(matches!(
+                validation_state(
+                    &OnceLock::new(),
+                    &bytes,
+                    &expected,
+                    ValidationStrategy::Serial
+                ),
+                ValidationState::Validated
+            ));
+        });
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn large_reader_get_validates_heap_and_mapped_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "large-reader.pile");
+        let index_path = dir.path().join("large-reader.pidx");
+        let payload = vec![0xC3; PARALLEL_BLAKE3_THRESHOLD + 17];
+
+        let mut writer = Pile::open(&path).unwrap();
+        let handle: Inline<Handle<UnknownBlob>> =
+            writer.put(Bytes::from_source(payload.clone())).unwrap();
+        writer.close().unwrap();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+
+        let mut replayed = Pile::open(&path).unwrap();
+        let reader = replayed.reader().unwrap();
+        pool.install(|| {
+            let blob = reader
+                .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+                .unwrap();
+            assert_eq!(blob.bytes.as_ref(), payload.as_slice());
+        });
+        drop(reader);
+        replayed.close().unwrap();
+
+        MappedPileIndex::build(&path, &index_path).unwrap();
+        let mut indexed = Pile::open_indexed(&path, &index_path).unwrap();
+        let reader = indexed.reader().unwrap();
+        pool.install(|| {
+            let blob = reader
+                .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+                .unwrap();
+            assert_eq!(blob.bytes.as_ref(), payload.as_slice());
+        });
+        assert_eq!(
+            indexed
+                .base
+                .as_ref()
+                .unwrap()
+                .validations
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reader);
+        indexed.close().unwrap();
     }
 
     #[test]
