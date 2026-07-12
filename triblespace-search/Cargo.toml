@@ -2,10 +2,10 @@
 name = "triblespace-search"
 version = "0.47.0"
 edition = "2021"
-# `std::thread::scope` (1.63) is the oldest non-trivial feature
-# used; const assertions + zerocopy derive pull the actual
-# requirement higher. 1.80 is the lowest stable we've verified.
-rust-version = "1.80"
+# The search crate depends directly on triblespace-core, whose verified MSRV
+# is 1.89. Advertising an older compiler here only defers the same failure to
+# dependency resolution.
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "Content-addressed BM25 + HNSW indexes on top of triblespace piles."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
