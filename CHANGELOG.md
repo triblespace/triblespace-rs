@@ -12,10 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Piles have an experimental, opt-in mapped locator snapshot.**
   `MappedPileIndex` builds a checksummed `.pidx` cache with sorted blob, pin,
   and weak-pin tables, using bounded external-sort runs instead of another
-  corpus-sized heap index. It represents one exact pile identity and byte
-  length: replacement, truncation, or append makes the cache stale and callers
-  can fall back to the unchanged PATCH replay path. The proof is not yet wired
-  into `PileReader` or maintained incrementally.
+  corpus-sized heap index. `Pile::open_indexed` now binds that immutable prefix
+  to the pile's retained file descriptor and mapping, then canonically replays
+  only later records into sparse blob, pin, weak-pin, and negative overlays.
+  `PileReader` point reads consult the tail before the mapped base; explicit
+  enumeration and PATCH snapshots merge both views on demand. Strict opens
+  preserve cache-error provenance, while `open_indexed_or_replay` may discard a
+  missing, malformed, stale, or wrong-identity cache only before accepting its
+  watermark. Tail corruption always fails loud. Writes do not rebuild or
+  publish `.pidx`; the format remains an opt-in static cache. The new error
+  provenance is source-visible: `GetBlobError` and `ReadError` gain index-error
+  variants, and `PileReader` metadata changes its error from `Infallible` to
+  `PileIndexError`.
 - **Succinct archives expose decoded fixed-attribute AVE iteration.**
   `SuccinctArchive::iter_attribute_value_entities` yields one raw
   `(value, entity)` tuple per matching fact in byte-lexicographic AVE order.

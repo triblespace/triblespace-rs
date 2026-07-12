@@ -22,6 +22,7 @@ use anybytes::Bytes;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs::File;
@@ -31,6 +32,7 @@ use std::io::Write;
 use std::path::Path;
 use std::ptr::slice_from_raw_parts;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -57,7 +59,9 @@ use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
 
-use super::pile_index::{PileBlobLocator, PileIndex, PileIndexError};
+use super::pile_index::{
+    MappedPileIndex, OwnedMappedBlobHandles, PileBlobLocator, PileIndex, PileIndexError,
+};
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -598,12 +602,23 @@ enum Applied {
 pub struct Pile {
     file: File,
     mmap: Arc<MmapRaw>,
+    /// Accepted immutable prefix. `None` is the unchanged full-PATCH path;
+    /// when present, the PATCH fields below contain only the canonical tail.
+    base: Option<IndexedPileBase>,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    /// Tail blob keys absent from `base`. Corrupt-base replacements live in
+    /// `blobs` but not here because they do not change the logical key set.
+    blob_additions: Option<PATCH<32, IdentitySchema>>,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+    /// Negative tail cells are retained separately so an absent positive
+    /// overlay never resurrects a mapped base pin.
+    branch_tombstones: Option<PATCH<16, IdentitySchema>>,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
     /// record for a handle win by construction.
     weak_pins: PATCH<32, IdentitySchema>,
+    /// Negative weak-pin tail cells, analogous to `branch_tombstones`.
+    weak_unpins: Option<PATCH<32, IdentitySchema>>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -640,7 +655,83 @@ pub(crate) fn legacy_v1_blob_record_for_test(
 /// the same underlying pile data.
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
+    base: Option<IndexedPileBase>,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    blob_additions: Option<PATCH<32, IdentitySchema>>,
+}
+
+/// Shared mapped prefix plus a sparse validation cache for base blobs that
+/// are actually read or challenged by a duplicate in the tail. The map only
+/// stores touched keys; each cell lets concurrent readers hash outside the
+/// short map lock and converge on one result.
+#[derive(Debug, Clone)]
+struct IndexedPileBase {
+    index: Arc<MappedPileIndex>,
+    validations: Arc<Mutex<HashMap<[u8; 32], Arc<OnceLock<ValidationState>>>>>,
+}
+
+impl IndexedPileBase {
+    fn new(index: MappedPileIndex) -> Self {
+        Self {
+            index: Arc::new(index),
+            validations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn validation_cell(&self, key: [u8; 32]) -> Arc<OnceLock<ValidationState>> {
+        let mut cache = self.validations.lock().unwrap_or_else(|e| e.into_inner());
+        cache
+            .entry(key)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    }
+}
+
+fn read_base_blob(
+    base: &IndexedPileBase,
+    mmap: &Arc<MmapRaw>,
+    handle: Inline<Handle<UnknownBlob>>,
+) -> Result<Option<(Bytes, PileBlobLocator, ValidationState)>, PileIndexError> {
+    let Some(locator) = base.index.blob_locator(handle)? else {
+        return Ok(None);
+    };
+    let offset =
+        usize::try_from(locator.payload_offset).map_err(|_| PileIndexError::StaleLocator {
+            offset: locator.payload_offset,
+        })?;
+    let len = usize::try_from(locator.payload_len).map_err(|_| PileIndexError::StaleLocator {
+        offset: locator.payload_offset,
+    })?;
+    let end = offset
+        .checked_add(len)
+        .ok_or(PileIndexError::StaleLocator {
+            offset: locator.payload_offset,
+        })?;
+    if end > mmap.len() {
+        return Err(PileIndexError::StaleLocator {
+            offset: locator.payload_offset,
+        });
+    }
+    let bytes = unsafe {
+        let slice = slice_from_raw_parts(mmap.as_ptr().add(offset), len)
+            .as_ref()
+            .unwrap();
+        Bytes::from_raw_parts(slice, mmap.clone())
+    };
+    let cell = base.validation_cell(handle.raw);
+    let state = *cell.get_or_init(|| {
+        let expected: Inline<Hash<Blake3>> = handle.into();
+        if Hash::<Blake3>::digest(&bytes) == expected {
+            ValidationState::Validated
+        } else {
+            ValidationState::Invalid
+        }
+    });
+    Ok(Some((bytes, locator, state)))
+}
+
+fn index_error_as_read(err: PileIndexError) -> ReadError {
+    ReadError::IndexError(Box::new(err))
 }
 
 /// Snapshot of the current heap PATCH indices, exposed only as the oracle for
@@ -699,15 +790,34 @@ impl Iterator for PatchWeakPinHandles {
 
 impl PartialEq for PileReader {
     fn eq(&self, other: &Self) -> bool {
-        self.blobs == other.blobs
+        match (&self.base, &other.base) {
+            (None, None) => self.blobs == other.blobs,
+            (Some(left), Some(right)) if Arc::ptr_eq(&left.index, &right.index) => {
+                self.blob_additions == other.blob_additions
+            }
+            _ => match (self.logical_blob_keys(), other.logical_blob_keys()) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            },
+        }
     }
 }
 
 impl Eq for PileReader {}
 
 impl PileReader {
-    fn new(mmap: Arc<MmapRaw>, blobs: PATCH<32, IdentitySchema, IndexEntry>) -> Self {
-        Self { mmap, blobs }
+    fn new(
+        mmap: Arc<MmapRaw>,
+        base: Option<IndexedPileBase>,
+        blobs: PATCH<32, IdentitySchema, IndexEntry>,
+        blob_additions: Option<PATCH<32, IdentitySchema>>,
+    ) -> Self {
+        Self {
+            mmap,
+            base,
+            blobs,
+            blob_additions,
+        }
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -715,17 +825,30 @@ impl PileReader {
     /// This creates an owned snapshot of the current keys/indices so the
     /// returned iterator does not borrow from the underlying PATCH.
     pub fn iter(&self) -> PileBlobStoreIter {
-        // Clone the PATCH (cheap copy-on-write) and create two clones: one
-        // consumed by the iterator and one retained for lookups of index
-        // entries while iterating.
-        let for_iter = self.blobs.clone();
-        let lookup = for_iter.clone();
-        let inner = for_iter.into_iter();
         PileBlobStoreIter {
-            mmap: self.mmap.clone(),
-            inner,
-            lookup,
+            reader: self.clone(),
+            handles: self.blobs(),
         }
+    }
+
+    fn base_blob(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Result<Option<(Bytes, PileBlobLocator, ValidationState)>, PileIndexError> {
+        let Some(base) = &self.base else {
+            return Ok(None);
+        };
+        read_base_blob(base, &self.mmap, handle)
+    }
+
+    fn logical_blob_keys(&self) -> Result<Vec<[u8; 32]>, PileIndexError> {
+        <Self as super::BlobStoreList>::blobs(self)
+            .map(|item| match item {
+                Ok(handle) => Ok(handle.raw),
+                Err(GetBlobError::IndexError(err)) => Err(err),
+                Err(_) => unreachable!("blob-key iteration only reports index errors"),
+            })
+            .collect()
     }
 
     // metadata moved into BlobStoreMeta impl below
@@ -744,26 +867,35 @@ impl BlobStoreGet for PileReader {
         Handle<S>: InlineEncoding,
     {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
-        let Some(entry) = self.blobs.get(&hash.raw) else {
-            return Err(GetBlobError::BlobNotFound);
+        let (bytes, state) = if let Some(entry) = self.blobs.get(&hash.raw) {
+            let IndexEntry {
+                state, offset, len, ..
+            } = entry.clone();
+            let bytes = unsafe {
+                let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
+                    .as_ref()
+                    .unwrap();
+                Bytes::from_raw_parts(slice, self.mmap.clone())
+            };
+            let state = *state.get_or_init(|| {
+                let computed_hash = Hash::<Blake3>::digest(&bytes);
+                if computed_hash == *hash {
+                    ValidationState::Validated
+                } else {
+                    ValidationState::Invalid
+                }
+            });
+            (bytes, state)
+        } else {
+            let base_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+            let Some((bytes, _, state)) = self
+                .base_blob(base_handle)
+                .map_err(GetBlobError::IndexError)?
+            else {
+                return Err(GetBlobError::BlobNotFound);
+            };
+            (bytes, state)
         };
-        let IndexEntry {
-            state, offset, len, ..
-        } = entry.clone();
-        let bytes = unsafe {
-            let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                .as_ref()
-                .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
-        };
-        let state = state.get_or_init(|| {
-            let computed_hash = Hash::<Blake3>::digest(&bytes);
-            if computed_hash == *hash {
-                ValidationState::Validated
-            } else {
-                ValidationState::Invalid
-            }
-        });
         match state {
             ValidationState::Validated => {
                 // The handle is what we just validated against — reuse
@@ -774,7 +906,7 @@ impl BlobStoreGet for PileReader {
                     Err(e) => Err(GetBlobError::ConversionError(e)),
                 }
             }
-            ValidationState::Invalid => Err(GetBlobError::ValidationError(bytes.clone())),
+            ValidationState::Invalid => Err(GetBlobError::ValidationError(bytes)),
         }
     }
 }
@@ -787,11 +919,57 @@ impl BlobStore for Pile {
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.refresh()?;
-        Ok(PileReader::new(self.mmap.clone(), self.blobs.clone()))
+        Ok(PileReader::new(
+            self.mmap.clone(),
+            self.base.clone(),
+            self.blobs.clone(),
+            self.blob_additions.clone(),
+        ))
     }
 }
 
 impl Pile {
+    fn logical_head(
+        &self,
+        id: Id,
+    ) -> Result<Option<Inline<Handle<SimpleArchive>>>, PileIndexError> {
+        let raw: RawId = id.into();
+        if let Some(head) = self.branches.get(&raw) {
+            return Ok(Some(*head));
+        }
+        if self
+            .branch_tombstones
+            .as_ref()
+            .is_some_and(|tombstones| tombstones.get(&raw).is_some())
+        {
+            return Ok(None);
+        }
+        match &self.base {
+            Some(base) => base.index.pin_head(id),
+            None => Ok(None),
+        }
+    }
+
+    fn logical_weak_pin(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Result<bool, PileIndexError> {
+        if self.weak_pins.get(&handle.raw).is_some() {
+            return Ok(true);
+        }
+        if self
+            .weak_unpins
+            .as_ref()
+            .is_some_and(|unpins| unpins.get(&handle.raw).is_some())
+        {
+            return Ok(false);
+        }
+        let Some(base) = &self.base else {
+            return Ok(false);
+        };
+        base.index.has_weak_pin(handle)
+    }
+
     /// Captures the current PATCH-backed locator state for differential testing
     /// against [`crate::repo::pile_index::MappedPileIndex`].
     ///
@@ -800,11 +978,91 @@ impl Pile {
     pub fn patch_index(&mut self) -> Result<PatchPileIndex, ReadError> {
         self.refresh()?;
         Ok(PatchPileIndex {
-            blobs: self.blobs.clone(),
-            branches: self.branches.clone(),
-            weak_pins: self.weak_pins.clone(),
+            blobs: self.materialize_blobs()?,
+            branches: self.materialize_branches()?,
+            weak_pins: self.materialize_weak_pins()?,
             covered_len: self.applied_length,
         })
+    }
+
+    fn materialize_blobs(&self) -> Result<PATCH<32, IdentitySchema, IndexEntry>, ReadError> {
+        let Some(base) = &self.base else {
+            return Ok(self.blobs.clone());
+        };
+        let mut blobs = PATCH::new();
+        for handle in base.index.blob_handles() {
+            let handle = handle.map_err(index_error_as_read)?;
+            let locator = base
+                .index
+                .blob_locator(handle)
+                .map_err(index_error_as_read)?
+                .ok_or_else(|| {
+                    index_error_as_read(PileIndexError::InvalidIndex(
+                        "listed base blob has no locator".into(),
+                    ))
+                })?;
+            let offset = usize::try_from(locator.payload_offset).map_err(|_| {
+                index_error_as_read(PileIndexError::StaleLocator {
+                    offset: locator.payload_offset,
+                })
+            })?;
+            blobs.insert(&Entry::with_value(
+                &handle.raw,
+                IndexEntry::new(offset, locator.payload_len, locator.timestamp),
+            ));
+        }
+        for key in self.blobs.clone().into_iter_ordered() {
+            if let Some(entry) = self.blobs.get(&key) {
+                blobs.replace(&Entry::with_value(&key, entry.clone()));
+            }
+        }
+        Ok(blobs)
+    }
+
+    fn materialize_branches(
+        &self,
+    ) -> Result<PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>, ReadError> {
+        let Some(base) = &self.base else {
+            return Ok(self.branches.clone());
+        };
+        let mut branches = PATCH::new();
+        for id in base.index.pin_ids() {
+            let id = id.map_err(index_error_as_read)?;
+            if let Some(head) = base.index.pin_head(id).map_err(index_error_as_read)? {
+                branches.insert(&Entry::with_value(&id.into(), head));
+            }
+        }
+        if let Some(tombstones) = &self.branch_tombstones {
+            for key in tombstones.clone().into_iter_ordered() {
+                branches.remove(&key);
+            }
+        }
+        for key in self.branches.clone().into_iter_ordered() {
+            if let Some(head) = self.branches.get(&key) {
+                branches.replace(&Entry::with_value(&key, *head));
+            }
+        }
+        Ok(branches)
+    }
+
+    fn materialize_weak_pins(&self) -> Result<PATCH<32, IdentitySchema>, ReadError> {
+        let Some(base) = &self.base else {
+            return Ok(self.weak_pins.clone());
+        };
+        let mut weak = PATCH::new();
+        for handle in base.index.weak_pin_handles() {
+            let handle = handle.map_err(index_error_as_read)?;
+            weak.insert(&Entry::new(&handle.raw));
+        }
+        if let Some(unpins) = &self.weak_unpins {
+            for key in unpins.clone().into_iter_ordered() {
+                weak.remove(&key);
+            }
+        }
+        for key in self.weak_pins.clone().into_iter_ordered() {
+            weak.insert(&Entry::new(&key));
+        }
+        Ok(weak)
     }
 }
 
@@ -848,6 +1106,10 @@ impl PileIndex for PatchPileIndex {
         }
     }
 
+    fn has_weak_pin(&self, handle: Inline<Handle<UnknownBlob>>) -> Result<bool, PileIndexError> {
+        Ok(self.weak_pins.get(&handle.raw).is_some())
+    }
+
     fn weak_pin_handles(&self) -> Self::WeakPinHandles<'_> {
         PatchWeakPinHandles {
             inner: self.weak_pins.clone().into_iter_ordered(),
@@ -870,6 +1132,36 @@ pub enum ReadError {
         /// Actual file length.
         length: usize,
     },
+    /// A previously accepted mapped-prefix locator failed validation. This is
+    /// distinct from authoritative tail corruption and is never amputatable.
+    IndexError(Box<PileIndexError>),
+}
+
+/// Failure of the strict opt-in mapped-prefix open path.
+#[derive(Debug)]
+pub enum IndexedOpenError {
+    /// Opening or reading the authoritative pile failed.
+    Pile(ReadError),
+    /// The derived `.pidx` cache was unavailable, stale, or malformed.
+    Index(PileIndexError),
+}
+
+impl std::fmt::Display for IndexedOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pile(err) => write!(f, "failed to open pile: {err}"),
+            Self::Index(err) => write!(f, "failed to attach pile index: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for IndexedOpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pile(err) => Some(err),
+            Self::Index(err) => Some(err),
+        }
+    }
 }
 
 impl std::fmt::Display for ReadError {
@@ -882,10 +1174,19 @@ impl std::fmt::Display for ReadError {
             ReadError::FileTooLarge { length } => {
                 write!(f, "Pile of length {length} exceeds supported size")
             }
+            ReadError::IndexError(err) => write!(f, "Pile index error: {err}"),
         }
     }
 }
-impl std::error::Error for ReadError {}
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(err) => Some(err),
+            Self::IndexError(err) => Some(err.as_ref()),
+            Self::CorruptPile { .. } | Self::FileTooLarge { .. } => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for ReadError {
     fn from(err: std::io::Error) -> Self {
@@ -903,6 +1204,7 @@ impl From<ReadError> for std::io::Error {
             ReadError::FileTooLarge { length } => {
                 std::io::Error::other(format!("pile length {length} exceeds supported size"))
             }
+            ReadError::IndexError(err) => std::io::Error::new(std::io::ErrorKind::InvalidData, err),
         }
     }
 }
@@ -924,7 +1226,14 @@ impl std::fmt::Display for InsertError {
         }
     }
 }
-impl std::error::Error for InsertError {}
+impl std::error::Error for InsertError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(err) => Some(err),
+            Self::TimeError(err) => Some(err),
+        }
+    }
+}
 
 impl From<std::io::Error> for InsertError {
     fn from(err: std::io::Error) -> Self {
@@ -951,7 +1260,13 @@ pub enum PileWriteError {
     IoError(std::io::Error),
 }
 
-impl std::error::Error for PileWriteError {}
+impl std::error::Error for PileWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IoError(err) => Some(err),
+        }
+    }
+}
 
 impl std::fmt::Debug for PileWriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -990,6 +1305,9 @@ pub enum GetBlobError<E: Error> {
     ValidationError(Bytes),
     /// The blob was found and valid but deserialization failed.
     ConversionError(E),
+    /// The accepted mapped prefix no longer yields a trustworthy locator.
+    /// This is never translated into absence or a tail-corruption error.
+    IndexError(PileIndexError),
 }
 
 impl<E: Error> std::fmt::Display for GetBlobError<E> {
@@ -998,11 +1316,19 @@ impl<E: Error> std::fmt::Display for GetBlobError<E> {
             GetBlobError::BlobNotFound => write!(f, "Blob not found"),
             GetBlobError::ConversionError(err) => write!(f, "Conversion error: {err}"),
             GetBlobError::ValidationError(_) => write!(f, "Validation error"),
+            GetBlobError::IndexError(err) => write!(f, "Pile index error: {err}"),
         }
     }
 }
 
-impl<E: Error> std::error::Error for GetBlobError<E> {}
+impl<E: Error> std::error::Error for GetBlobError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IndexError(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 /// Error returned by [`Pile::flush`] and [`Pile::close`].
 #[derive(Debug)]
@@ -1038,7 +1364,9 @@ impl Pile {
     /// invalid record** — a destructive last resort, not an open path.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
-        let length = file.metadata()?.len() as usize;
+        let length_u64 = file.metadata()?.len();
+        let length = usize::try_from(length_u64)
+            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
         let page_size = page_size::get();
         let base_size = page_size * 1024;
         let mapped_size = base_size.max(
@@ -1055,11 +1383,132 @@ impl Pile {
         Ok(Self {
             file,
             mmap,
+            base: None,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
+            blob_additions: None,
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
+            branch_tombstones: None,
             weak_pins: PATCH::<32, IdentitySchema>::new(),
+            weak_unpins: None,
             applied_length: 0,
         })
+    }
+
+    /// Strictly opens `path` with an immutable `.pidx` prefix. Like
+    /// [`Self::open`], this seeds state but leaves the authoritative tail lazy;
+    /// [`Self::refresh`] and normal operations replay it canonically. Cache
+    /// failures are reported distinctly and never trigger a hidden fallback.
+    pub fn open_indexed(path: &Path, index_path: &Path) -> Result<Self, IndexedOpenError> {
+        let mut pile = Self::open(path).map_err(IndexedOpenError::Pile)?;
+        match pile.attach_index(index_path) {
+            Ok(()) => Ok(pile),
+            Err(err) => {
+                let _ = pile.close();
+                Err(err)
+            }
+        }
+    }
+
+    /// Best-effort indexed open. A missing, malformed, stale, or
+    /// identity-mismatched derived cache falls back to the unchanged full
+    /// PATCH replay path. Like [`Self::open`], both outcomes leave replay lazy;
+    /// the first normal operation performs it. Authoritative tail corruption
+    /// after a base has been accepted still fails loud and never falls back.
+    pub fn open_indexed_or_replay(path: &Path, index_path: &Path) -> Result<Self, ReadError> {
+        let mut pile = Self::open(path)?;
+        match pile.attach_index(index_path) {
+            Ok(()) => Ok(pile),
+            Err(IndexedOpenError::Index(_)) => Ok(pile),
+            Err(IndexedOpenError::Pile(err)) => {
+                let _ = pile.close();
+                Err(err)
+            }
+        }
+    }
+
+    fn attach_index(&mut self, index_path: &Path) -> Result<(), IndexedOpenError> {
+        self.file
+            .lock_shared()
+            .map_err(ReadError::from)
+            .map_err(IndexedOpenError::Pile)?;
+        let result = (|| {
+            let file_len_u64 = self
+                .file
+                .metadata()
+                .map_err(ReadError::from)
+                .map_err(IndexedOpenError::Pile)?
+                .len();
+            let file_len = usize::try_from(file_len_u64).map_err(|_| {
+                IndexedOpenError::Pile(ReadError::FileTooLarge { length: usize::MAX })
+            })?;
+            self.ensure_mapped(file_len)
+                .map_err(IndexedOpenError::Pile)?;
+            let pile_bytes = self.mapped_bytes(file_len);
+            let mapped = MappedPileIndex::open_prefix_on_file(&self.file, pile_bytes, index_path)
+                .map_err(|err| match err {
+                PileIndexError::PileIo(err) => IndexedOpenError::Pile(ReadError::IoError(err)),
+                other => IndexedOpenError::Index(other),
+            })?;
+            let covered_len = usize::try_from(mapped.covered_len()).map_err(|_| {
+                IndexedOpenError::Index(PileIndexError::InvalidIndex(
+                    "covered length is not addressable".into(),
+                ))
+            })?;
+
+            // This is the commit point: every cache error above leaves the
+            // ordinary full-replay state untouched. The tail intentionally
+            // stays lazy, matching `Pile::open`, so callers can inspect or
+            // explicitly amputate a torn tail from this accepted boundary.
+            self.base = Some(IndexedPileBase::new(mapped));
+            self.blob_additions = Some(PATCH::new());
+            self.branch_tombstones = Some(PATCH::new());
+            self.weak_unpins = Some(PATCH::new());
+            self.applied_length = covered_len;
+            Ok(())
+        })();
+        let unlock = self.file.unlock().map_err(ReadError::from);
+        match (result, unlock) {
+            (_, Err(err)) => Err(IndexedOpenError::Pile(err)),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn ensure_mapped(&mut self, file_len: usize) -> Result<(), ReadError> {
+        if file_len <= self.mmap.len() {
+            return Ok(());
+        }
+        let mapped_size = file_len
+            .checked_next_power_of_two()
+            .ok_or(ReadError::FileTooLarge { length: file_len })?;
+        self.mmap = Arc::new(
+            MmapOptions::new()
+                .len(mapped_size)
+                .map_raw_read_only(&self.file)?,
+        );
+        Ok(())
+    }
+
+    fn mapped_bytes(&self, len: usize) -> Bytes {
+        if len == 0 {
+            return Bytes::empty();
+        }
+        unsafe {
+            let slice = slice_from_raw_parts(self.mmap.as_ptr(), len)
+                .as_ref()
+                .unwrap();
+            Bytes::from_raw_parts(slice, self.mmap.clone())
+        }
+    }
+
+    fn base_blob(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Result<Option<(Bytes, PileBlobLocator, ValidationState)>, PileIndexError> {
+        let Some(base) = &self.base else {
+            return Ok(None);
+        };
+        read_base_blob(base, &self.mmap, handle)
     }
 
     /// Refreshes in-memory state from newly appended records.
@@ -1086,7 +1535,9 @@ impl Pile {
     /// applied, which would otherwise leave existing `Bytes` handles dangling
     /// and lead to undefined behavior.
     fn apply_next(&mut self) -> Result<Option<Applied>, ReadError> {
-        let file_len = self.file.metadata()?.len() as usize;
+        let file_len_u64 = self.file.metadata()?.len();
+        let file_len = usize::try_from(file_len_u64)
+            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
         if file_len < self.applied_length {
             // Truncation below `applied_length` invalidates previously issued
             // `Bytes` handles, so there is no safe recovery path.
@@ -1095,16 +1546,7 @@ impl Pile {
         if file_len == self.applied_length {
             return Ok(None);
         }
-        let mut mapped_size = self.mmap.len();
-        if file_len > mapped_size {
-            while mapped_size < file_len {
-                mapped_size *= 2;
-            }
-            let mmap = MmapOptions::new()
-                .len(mapped_size)
-                .map_raw_read_only(&self.file)?;
-            self.mmap = Arc::new(mmap);
-        }
+        self.ensure_mapped(file_len)?;
         let start_offset = self.applied_length;
         let slice = unsafe {
             slice_from_raw_parts(
@@ -1117,8 +1559,8 @@ impl Pile {
         // Single decoder shared with [`PileRecords`] — understands every
         // record format ever written (V1 and V3 alike).
         let record = decode_record(slice, start_offset)?;
-        self.applied_length = start_offset + record.len;
-        match record.content {
+        let next_applied_length = start_offset + record.len;
+        let applied = match record.content {
             PileRecordContent::Blob {
                 timestamp,
                 hash,
@@ -1129,9 +1571,23 @@ impl Pile {
                     &hash.raw,
                     IndexEntry::new(data_offset, data_len as u64, timestamp),
                 );
+                let mut insert_tail = false;
+                let mut is_addition = false;
                 match self.blobs.get(&hash.raw) {
                     None => {
-                        self.blobs.insert(&entry);
+                        let handle: Inline<Handle<UnknownBlob>> = hash.into();
+                        match self
+                            .base_blob(handle)
+                            .map_err(index_error_as_read)?
+                            .map(|(_, _, state)| state)
+                        {
+                            Some(ValidationState::Validated) => {}
+                            Some(ValidationState::Invalid) => insert_tail = true,
+                            None => {
+                                insert_tail = true;
+                                is_addition = self.base.is_some();
+                            }
+                        }
                     }
                     Some(entry_ref) => {
                         // Duplicate hash: keep the existing record unless it
@@ -1162,30 +1618,53 @@ impl Pile {
                         }
                     }
                 }
-                Ok(Some(Applied::Blob { hash }))
+                if insert_tail {
+                    self.blobs.insert(&entry);
+                    if is_addition {
+                        self.blob_additions
+                            .as_mut()
+                            .expect("indexed pile has an additions overlay")
+                            .insert(&Entry::new(&hash.raw));
+                    }
+                }
+                Applied::Blob { hash }
             }
             PileRecordContent::Branch { branch_id, head } => {
                 let entry = Entry::with_value(&branch_id.into(), head);
                 // Replace existing mapping (if any) with the new head.
                 self.branches.replace(&entry);
-                Ok(Some(Applied::Branch {
+                if let Some(tombstones) = &mut self.branch_tombstones {
+                    tombstones.remove(&branch_id.into());
+                }
+                Applied::Branch {
                     id: branch_id,
                     hash: head.into(),
-                }))
+                }
             }
             PileRecordContent::BranchTombstone { branch_id } => {
                 self.branches.remove(&branch_id.into());
-                Ok(Some(Applied::BranchTombstone { id: branch_id }))
+                if let Some(tombstones) = &mut self.branch_tombstones {
+                    tombstones.insert(&Entry::new(&branch_id.into()));
+                }
+                Applied::BranchTombstone { id: branch_id }
             }
             PileRecordContent::WeakPin { handle } => {
                 self.weak_pins.insert(&Entry::new(&handle.raw));
-                Ok(Some(Applied::WeakPin { handle }))
+                if let Some(unpins) = &mut self.weak_unpins {
+                    unpins.remove(&handle.raw);
+                }
+                Applied::WeakPin { handle }
             }
             PileRecordContent::WeakUnpin { handle } => {
                 self.weak_pins.remove(&handle.raw);
-                Ok(Some(Applied::WeakUnpin { handle }))
+                if let Some(unpins) = &mut self.weak_unpins {
+                    unpins.insert(&Entry::new(&handle.raw));
+                }
+                Applied::WeakUnpin { handle }
             }
-        }
+        };
+        self.applied_length = next_applied_length;
+        Ok(Some(applied))
     }
 
     fn refresh_locked(&mut self) -> Result<(), ReadError> {
@@ -1247,9 +1726,13 @@ impl Pile {
         unsafe {
             std::ptr::drop_in_place(&mut this.mmap);
             std::ptr::drop_in_place(&mut this.file);
+            std::ptr::drop_in_place(&mut this.base);
             std::ptr::drop_in_place(&mut this.blobs);
+            std::ptr::drop_in_place(&mut this.blob_additions);
             std::ptr::drop_in_place(&mut this.branches);
+            std::ptr::drop_in_place(&mut this.branch_tombstones);
             std::ptr::drop_in_place(&mut this.weak_pins);
+            std::ptr::drop_in_place(&mut this.weak_unpins);
         }
 
         res
@@ -1298,72 +1781,92 @@ use super::WeakPinStore;
 /// a snapshot of keys/indices at iterator creation so the iterator does not
 /// borrow the underlying [`PATCH`] and can live independently of the [`Pile`].
 pub struct PileBlobStoreIter {
-    mmap: Arc<MmapRaw>,
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
-    /// Owned clone of the PATCH used for lookups of IndexEntry by key.
-    lookup: crate::patch::PATCH<32, IdentitySchema, IndexEntry>,
+    reader: PileReader,
+    handles: PileBlobStoreListIter,
 }
 
 impl Iterator for PileBlobStoreIter {
     type Item = Result<(Inline<Handle<UnknownBlob>>, Blob<UnknownBlob>), GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let key = self.inner.next()?; // [u8;32]
-        let hash = Inline::<Hash<Blake3>>::new(key);
-        // Look up the index entry inside the owned PATCH clone held by the
-        // `lookup` field. The clone is cheap and allows us to resolve index
-        // entries without borrowing the live PATCH.
-        if let Some(entry) = self.lookup.get(&key) {
-            let IndexEntry {
-                state, offset, len, ..
-            } = entry.clone();
-            let bytes = unsafe {
-                let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                    .as_ref()
-                    .unwrap();
-                Bytes::from_raw_parts(slice, self.mmap.clone())
-            };
-            let state = state.get_or_init(|| {
-                let computed_hash = Hash::<Blake3>::digest(&bytes);
-                if computed_hash == hash {
-                    ValidationState::Validated
-                } else {
-                    ValidationState::Invalid
-                }
-            });
-            match state {
-                ValidationState::Validated => {
-                    let handle: Inline<Handle<UnknownBlob>> = hash.into();
-                    // We just validated against `hash`; pre-seed the
-                    // cached handle so downstream `get_handle` /
-                    // `insert` skip the Blake3 recompute.
-                    let blob: Blob<UnknownBlob> = Blob::with_handle(bytes.clone(), handle);
-                    Some(Ok((handle, blob)))
-                }
-                ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes.clone()))),
-            }
-        } else {
-            // Missing index entry for key — this can happen if the underlying
-            // pile mutated concurrently; skip it.
-            Some(Err(GetBlobError::BlobNotFound))
+        let handle = match self.handles.next()? {
+            Ok(handle) => handle,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(
+            self.reader
+                .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+                .map(|blob| (handle, blob)),
+        )
+    }
+}
+
+enum TailBlobKeys {
+    Full(crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, IndexEntry>),
+    Additions(crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, ()>),
+    Materialized(std::vec::IntoIter<[u8; 32]>),
+}
+
+impl TailBlobKeys {
+    fn next(&mut self) -> Option<[u8; 32]> {
+        match self {
+            Self::Full(inner) => inner.next(),
+            Self::Additions(inner) => inner.next(),
+            Self::Materialized(inner) => inner.next(),
         }
     }
 }
 
-/// Adapter that yields only the blob handles. The iterator owns the handle
-/// list and does not borrow the backing [`PATCH`].
+/// Sorted merge of a mapped base key stream with owned tail additions.
 pub struct PileBlobStoreListIter {
-    inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
+    base: Option<OwnedMappedBlobHandles>,
+    tail: TailBlobKeys,
+    next_base: Option<Result<Inline<Handle<UnknownBlob>>, PileIndexError>>,
+    next_tail: Option<[u8; 32]>,
+    pending_error: Option<PileIndexError>,
 }
 
 impl Iterator for PileBlobStoreListIter {
     type Item = Result<Inline<Handle<UnknownBlob>>, GetBlobError<Infallible>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let key = self.inner.next()?;
-        let hash = Inline::<Hash<Blake3>>::new(key);
-        let handle: Inline<Handle<UnknownBlob>> = hash.into();
-        Some(Ok(handle))
+        if let Some(err) = self.pending_error.take() {
+            return Some(Err(GetBlobError::IndexError(err)));
+        }
+        if self.next_base.is_none() {
+            self.next_base = self.base.as_mut().and_then(Iterator::next);
+        }
+        if matches!(self.next_base.as_ref(), Some(Err(_))) {
+            let Err(err) = self.next_base.take().unwrap() else {
+                unreachable!()
+            };
+            return Some(Err(GetBlobError::IndexError(err)));
+        }
+        if self.next_tail.is_none() {
+            self.next_tail = self.tail.next();
+        }
+
+        match (self.next_base.as_ref(), self.next_tail) {
+            (None, None) => None,
+            (Some(Ok(_)), None) => Some(Ok(self.next_base.take().unwrap().unwrap())),
+            (None, Some(key)) => {
+                self.next_tail = None;
+                Some(Ok(Inline::new(key)))
+            }
+            (Some(Ok(base)), Some(tail)) => match base.raw.cmp(&tail) {
+                std::cmp::Ordering::Less => Some(Ok(self.next_base.take().unwrap().unwrap())),
+                std::cmp::Ordering::Greater => {
+                    self.next_tail = None;
+                    Some(Ok(Inline::new(tail)))
+                }
+                std::cmp::Ordering::Equal => {
+                    self.next_tail = None;
+                    self.next_base.take();
+                    Some(Ok(Inline::new(tail)))
+                }
+            },
+            (Some(Err(_)), _) => unreachable!(),
+        }
     }
 }
 
@@ -1372,12 +1875,22 @@ impl BlobStoreList for PileReader {
     type Iter<'a> = PileBlobStoreListIter;
 
     fn blobs(&self) -> Self::Iter<'_> {
-        // Clone the PATCH and create an owned iterator over its keys so we do
-        // not borrow the live PATCH. This avoids borrow conflicts while still
-        // being cheap (PATCH clone is copy-on-write).
-        let cloned = self.blobs.clone();
-        let inner = cloned.into_iter();
-        PileBlobStoreListIter { inner }
+        match (&self.base, &self.blob_additions) {
+            (Some(base), Some(additions)) => PileBlobStoreListIter {
+                base: Some(base.index.owned_blob_handles()),
+                tail: TailBlobKeys::Additions(additions.clone().into_iter_ordered()),
+                next_base: None,
+                next_tail: None,
+                pending_error: None,
+            },
+            _ => PileBlobStoreListIter {
+                base: None,
+                tail: TailBlobKeys::Full(self.blobs.clone().into_iter_ordered()),
+                next_base: None,
+                next_tail: None,
+                pending_error: None,
+            },
+        }
     }
 
     /// Cheap PATCH-level set difference between this reader's blob index
@@ -1385,9 +1898,62 @@ impl BlobStoreList for PileReader {
     /// PATCH, so this gives the exact set of blob hashes added between
     /// the two snapshots without having to enumerate either side.
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
-        let diff = self.blobs.difference(&old.blobs);
-        PileBlobStoreListIter {
-            inner: diff.into_iter(),
+        match (
+            &self.base,
+            &old.base,
+            &self.blob_additions,
+            &old.blob_additions,
+        ) {
+            (Some(base), Some(old_base), Some(additions), Some(old_additions))
+                if Arc::ptr_eq(&base.index, &old_base.index) =>
+            {
+                let diff = additions.difference(old_additions);
+                PileBlobStoreListIter {
+                    base: None,
+                    tail: TailBlobKeys::Additions(diff.into_iter_ordered()),
+                    next_base: None,
+                    next_tail: None,
+                    pending_error: None,
+                }
+            }
+            (None, None, _, _) => {
+                let diff = self.blobs.difference(&old.blobs);
+                PileBlobStoreListIter {
+                    base: None,
+                    tail: TailBlobKeys::Full(diff.into_iter_ordered()),
+                    next_base: None,
+                    next_tail: None,
+                    pending_error: None,
+                }
+            }
+            _ => match (self.logical_blob_keys(), old.logical_blob_keys()) {
+                (Ok(current), Ok(previous)) => {
+                    let mut difference = Vec::new();
+                    let mut old_position = 0usize;
+                    for key in current {
+                        while old_position < previous.len() && previous[old_position] < key {
+                            old_position += 1;
+                        }
+                        if old_position == previous.len() || previous[old_position] != key {
+                            difference.push(key);
+                        }
+                    }
+                    PileBlobStoreListIter {
+                        base: None,
+                        tail: TailBlobKeys::Materialized(difference.into_iter()),
+                        next_base: None,
+                        next_tail: None,
+                        pending_error: None,
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => PileBlobStoreListIter {
+                    base: None,
+                    tail: TailBlobKeys::Materialized(Vec::new().into_iter()),
+                    next_base: None,
+                    next_tail: None,
+                    pending_error: Some(err),
+                },
+            },
         }
     }
 }
@@ -1471,6 +2037,7 @@ impl Pile {
             let handle: Inline<Handle<S>> = blob.get_handle();
             let hash: Inline<Hash<Blake3>> = handle.into();
 
+            let tail_candidate = self.blobs.get(&hash.raw).is_some();
             if let Some(IndexEntry {
                 state, offset, len, ..
             }) = self.blobs.get(&hash.raw)
@@ -1491,6 +2058,17 @@ impl Pile {
                     }
                 });
                 if matches!(st, ValidationState::Validated) {
+                    return Ok(handle.transmute());
+                }
+            }
+            if !tail_candidate {
+                let base_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+                if matches!(
+                    self.base_blob(base_handle)
+                        .map_err(|err| InsertError::from(index_error_as_read(err)))?
+                        .map(|(_, _, state)| state),
+                    Some(ValidationState::Validated)
+                ) {
                     return Ok(handle.transmute());
                 }
             }
@@ -1568,7 +2146,7 @@ impl PinStore for Pile {
         // Create an owned ordered iterator from the PATCH clone so the
         // returned iterator does not borrow from `self.branches`. This avoids
         // allocating a temporary Vec of ids while preserving tree-order.
-        let cloned = self.branches.clone();
+        let cloned = self.materialize_branches()?;
         let inner = cloned.into_iter_ordered();
         Ok(PileBranchStoreIter { inner })
     }
@@ -1578,14 +2156,13 @@ impl PinStore for Pile {
         // This keeps callers up-to-date with any external writers that appended
         // to the pile file.
         self.refresh()?;
-        let raw: RawId = id.into();
-        Ok(self.branches.get(&raw).copied())
+        self.logical_head(id).map_err(index_error_as_read)
     }
 
     fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
         // Pin index is already a PATCH; clone is an O(1) refcount bump.
         self.refresh()?;
-        Ok(self.branches.clone())
+        self.materialize_branches()
     }
 
     /// Updates the head of `id` to `new` if it matches `old`.
@@ -1609,7 +2186,9 @@ impl PinStore for Pile {
         self.file.lock()?;
         let res = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
-            let current_hash = self.branches.get(&id.into()).copied();
+            let current_hash = self
+                .logical_head(id)
+                .map_err(|err| PileWriteError::from(index_error_as_read(err)))?;
             if current_hash != old {
                 return Ok(PushResult::Conflict(current_hash));
             }
@@ -1704,7 +2283,10 @@ impl Pile {
             // No-op short-circuit: the weak set is logically a per-handle
             // LWW cell; re-asserting the current state carries no
             // information and would just churn the append-only file.
-            if self.weak_pins.get(&handle.raw).is_some() == pin {
+            let current = self
+                .logical_weak_pin(handle)
+                .map_err(|err| PileWriteError::from(index_error_as_read(err)))?;
+            if current == pin {
                 return Ok(());
             }
 
@@ -1769,7 +2351,7 @@ impl WeakPinStore for Pile {
         // Ensure newly appended records are applied before enumerating so
         // external writers are visible to callers (mirrors `pins`).
         self.refresh()?;
-        let cloned = self.weak_pins.clone();
+        let cloned = self.materialize_weak_pins().map_err(PileWriteError::from)?;
         Ok(PileWeakPinIter {
             inner: cloned.into_iter_ordered(),
         })
@@ -1777,7 +2359,7 @@ impl WeakPinStore for Pile {
 }
 
 impl crate::repo::BlobStoreMeta for PileReader {
-    type MetaError = std::convert::Infallible;
+    type MetaError = PileIndexError;
 
     fn metadata<S>(
         &self,
@@ -1787,32 +2369,36 @@ impl crate::repo::BlobStoreMeta for PileReader {
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        // re-use existing implementation logic
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
-        let entry = match self.blobs.get(&hash.raw) {
-            Some(e) => e,
-            None => return Ok(None),
+        let (bytes, timestamp, state) = if let Some(entry) = self.blobs.get(&hash.raw) {
+            let IndexEntry {
+                state,
+                timestamp,
+                offset,
+                len,
+            } = entry.clone();
+            let bytes = unsafe {
+                let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
+                    .as_ref()
+                    .unwrap();
+                Bytes::from_raw_parts(slice, self.mmap.clone())
+            };
+            let state = *state.get_or_init(|| {
+                let computed_hash = Hash::<Blake3>::digest(&bytes);
+                if computed_hash == *hash {
+                    ValidationState::Validated
+                } else {
+                    ValidationState::Invalid
+                }
+            });
+            (bytes, timestamp, state)
+        } else {
+            let base_handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+            let Some((bytes, locator, state)) = self.base_blob(base_handle)? else {
+                return Ok(None);
+            };
+            (bytes, locator.timestamp, state)
         };
-        let IndexEntry {
-            state,
-            timestamp,
-            offset,
-            len,
-        } = entry.clone();
-        let bytes = unsafe {
-            let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                .as_ref()
-                .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
-        };
-        let state = state.get_or_init(|| {
-            let computed_hash = Hash::<Blake3>::digest(&bytes);
-            if computed_hash == *hash {
-                ValidationState::Validated
-            } else {
-                ValidationState::Invalid
-            }
-        });
         match state {
             ValidationState::Validated => Ok(Some(crate::repo::BlobMetadata {
                 timestamp,
@@ -1829,7 +2415,7 @@ mod tests {
 
     use rand::RngCore;
     use std::collections::{HashMap, HashSet};
-    use std::io::Write;
+    use std::io::{Seek, Write};
     use std::path::PathBuf;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
@@ -1842,6 +2428,566 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::File::create(&path).unwrap();
         path
+    }
+
+    fn v3_blob_record(
+        handle: Inline<Handle<UnknownBlob>>,
+        payload: &[u8],
+        timestamp: u64,
+    ) -> Vec<u8> {
+        let hash: Inline<Hash<Blake3>> = handle.into();
+        let header = BlobHeaderV3::new(timestamp, payload.len() as u64, hash);
+        let record_len = V3_HEADER_LEN + payload.len() + v3_post_pad(payload.len());
+        let mut record = Vec::with_capacity(record_len);
+        record.extend_from_slice(header.as_bytes());
+        record.extend_from_slice(payload);
+        record.resize(record_len, 0);
+        record
+    }
+
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    fn v3_branch_record(branch: Id, head: Option<Inline<Handle<SimpleArchive>>>) -> Vec<u8> {
+        match head {
+            Some(head) => BranchHeaderV3::new(branch, head).as_bytes().to_vec(),
+            None => BranchTombstoneHeaderV3::new(branch).as_bytes().to_vec(),
+        }
+    }
+
+    fn v3_weak_record(handle: Inline<Handle<UnknownBlob>>, pin: bool) -> Vec<u8> {
+        if pin {
+            WeakPinHeaderV3::new(handle).as_bytes().to_vec()
+        } else {
+            WeakUnpinHeaderV3::new(handle).as_bytes().to_vec()
+        }
+    }
+
+    fn overlay_count<const N: usize, V: Clone>(patch: &PATCH<N, IdentitySchema, V>) -> usize {
+        patch.clone().into_iter_ordered().count()
+    }
+
+    #[test]
+    fn indexed_valid_base_beats_tail_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "valid-base.pile");
+        let index_path = dir.path().join("valid-base.pidx");
+        let payload = b"chosen";
+        let mut pile = Pile::open(&path).unwrap();
+        let handle: Inline<Handle<UnknownBlob>> = pile
+            .put(Blob::<UnknownBlob>::new(Bytes::from_source(
+                payload.to_vec(),
+            )))
+            .unwrap();
+        pile.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+        let base_locator = MappedPileIndex::open(&path, &index_path)
+            .unwrap()
+            .blob_locator(handle)
+            .unwrap()
+            .unwrap();
+
+        append_raw(&path, &v3_blob_record(handle, b"broken", 2));
+        append_raw(&path, &v3_blob_record(handle, payload, 3));
+
+        let mut pile = Pile::open_indexed(&path, &index_path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(overlay_count(&pile.blobs), 0);
+        assert_eq!(overlay_count(pile.blob_additions.as_ref().unwrap()), 0);
+        assert_eq!(
+            pile.base
+                .as_ref()
+                .unwrap()
+                .validations
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            pile.patch_index()
+                .unwrap()
+                .blob_locator(handle)
+                .unwrap()
+                .unwrap(),
+            base_locator
+        );
+        let reader = pile.reader().unwrap();
+        assert_eq!(
+            reader.blobs().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![handle]
+        );
+        assert_eq!(
+            reader
+                .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+                .unwrap()
+                .bytes
+                .as_ref(),
+            payload
+        );
+        drop(reader);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_corrupt_base_yields_to_first_valid_tail_and_last_invalid_tail() {
+        fn run(all_invalid: bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fresh_empty_pile_path(&dir, "corrupt-base.pile");
+            let index_path = dir.path().join("corrupt-base.pidx");
+            let payload = b"target";
+            let handle =
+                Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
+            append_raw(&path, &v3_blob_record(handle, b"base!!", 1));
+            MappedPileIndex::build(&path, &index_path).unwrap();
+
+            append_raw(&path, &v3_blob_record(handle, b"tail-a", 2));
+            if all_invalid {
+                append_raw(&path, &v3_blob_record(handle, b"tail-b", 3));
+            } else {
+                append_raw(&path, &v3_blob_record(handle, payload, 3));
+                append_raw(&path, &v3_blob_record(handle, payload, 4));
+            }
+
+            let mut pile = Pile::open_indexed(&path, &index_path).unwrap();
+            pile.refresh().unwrap();
+            assert_eq!(overlay_count(&pile.blobs), 1);
+            assert_eq!(overlay_count(pile.blob_additions.as_ref().unwrap()), 0);
+            let locator = pile
+                .patch_index()
+                .unwrap()
+                .blob_locator(handle)
+                .unwrap()
+                .unwrap();
+            assert_eq!(locator.timestamp, 3);
+            let reader = pile.reader().unwrap();
+            assert_eq!(
+                reader.blobs().collect::<Result<Vec<_>, _>>().unwrap(),
+                vec![handle]
+            );
+            if all_invalid {
+                assert!(matches!(
+                    reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+                    Err(GetBlobError::ValidationError(_))
+                ));
+            } else {
+                assert_eq!(
+                    reader
+                        .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+                        .unwrap()
+                        .bytes
+                        .as_ref(),
+                    payload
+                );
+            }
+            drop(reader);
+            pile.close().unwrap();
+        }
+
+        run(false);
+        run(true);
+    }
+
+    #[test]
+    fn indexed_tail_pin_and_weak_tombstones_never_resurrect_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pin-tail.pile");
+        let index_path = dir.path().join("pin-tail.pidx");
+        let mut base = Pile::open(&path).unwrap();
+        let blob: Inline<Handle<UnknownBlob>> = base
+            .put(Blob::<UnknownBlob>::new(Bytes::from_source(
+                b"pin".to_vec(),
+            )))
+            .unwrap();
+        let branch = Id::new([44; 16]).unwrap();
+        let head_a: Inline<Handle<SimpleArchive>> = blob.transmute();
+        assert!(matches!(
+            base.update(branch, None, Some(head_a)).unwrap(),
+            PushResult::Success()
+        ));
+        base.pin_weak(blob).unwrap();
+        base.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut pile = Pile::open_indexed(&path, &index_path).unwrap();
+        assert!(matches!(
+            pile.update(branch, Some(head_a), None).unwrap(),
+            PushResult::Success()
+        ));
+        pile.unpin_weak(blob).unwrap();
+        assert_eq!(pile.head(branch).unwrap(), None);
+        assert!(pile.pins().unwrap().next().is_none());
+        assert!(pile.weak_pins().unwrap().next().is_none());
+
+        // The two LWW cell families are independent across the boundary.
+        pile.pin_weak(blob).unwrap();
+        assert_eq!(pile.head(branch).unwrap(), None);
+        assert_eq!(pile.weak_pins().unwrap().next().unwrap().unwrap(), blob);
+
+        let head_b = Inline::<Handle<SimpleArchive>>::new([9; 32]);
+        assert!(matches!(
+            pile.update(branch, None, Some(head_b)).unwrap(),
+            PushResult::Success()
+        ));
+        pile.unpin_weak(blob).unwrap();
+        assert_eq!(pile.head(branch).unwrap(), Some(head_b));
+        assert!(pile.weak_pins().unwrap().next().is_none());
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open_indexed(&path, &index_path).unwrap();
+        assert_eq!(reopened.head(branch).unwrap(), Some(head_b));
+        assert_eq!(
+            reopened
+                .pins()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![branch]
+        );
+        assert!(reopened.weak_pins().unwrap().next().is_none());
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_open_falls_back_only_before_tail_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "fallback.pile");
+        let index_path = dir.path().join("fallback.pidx");
+        let mut pile = Pile::open(&path).unwrap();
+        let handle: Inline<Handle<UnknownBlob>> = pile
+            .put(Blob::<UnknownBlob>::new(Bytes::from_source(
+                b"base".to_vec(),
+            )))
+            .unwrap();
+        pile.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut index = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .unwrap();
+        index.seek(std::io::SeekFrom::Start(256)).unwrap();
+        index.write_all(&[0xAA]).unwrap();
+        index.sync_all().unwrap();
+        assert!(matches!(
+            Pile::open_indexed(&path, &index_path),
+            Err(IndexedOpenError::Index(PileIndexError::InvalidIndex(_)))
+        ));
+        let mut fallback = Pile::open_indexed_or_replay(&path, &index_path).unwrap();
+        assert!(fallback.base.is_none());
+        assert!(fallback
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, UnknownBlob>(handle)
+            .is_ok());
+        fallback.close().unwrap();
+
+        let missing = dir.path().join("missing.pidx");
+        let missing_fallback = Pile::open_indexed_or_replay(&path, &missing).unwrap();
+        assert!(missing_fallback.base.is_none());
+        missing_fallback.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_truncated_tail_reports_absolute_boundary_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "truncated-tail.pile");
+        let index_path = dir.path().join("truncated-tail.pidx");
+        let mut pile = Pile::open(&path).unwrap();
+        pile.put::<UnknownBlob, _>(Bytes::from_source(b"base".to_vec()))
+            .unwrap();
+        pile.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+        let covered = std::fs::metadata(&path).unwrap().len() as usize;
+
+        let tail_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"tail".to_vec()));
+        let tail_handle = tail_blob.get_handle();
+        let tail = v3_blob_record(tail_handle, b"tail", 7);
+        append_raw(&path, &tail[..80]);
+        let mut reopened = Pile::open_indexed(&path, &index_path).unwrap();
+        assert!(matches!(
+            reopened.refresh(),
+            Err(ReadError::CorruptPile { valid_length })
+                if valid_length == covered
+        ));
+        assert_eq!(reopened.applied_length, covered);
+
+        append_raw(&path, &tail[80..]);
+        reopened.refresh().unwrap();
+        assert!(reopened
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, UnknownBlob>(tail_handle)
+            .is_ok());
+
+        let second_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"second".to_vec()));
+        let second_handle = second_blob.get_handle();
+        let second_record = v3_blob_record(second_handle, b"second", 8);
+        let repaired_len = reopened.applied_length + second_record.len();
+        append_raw(&path, &second_record);
+        append_raw(&path, &[0xAA; 31]);
+        assert!(matches!(
+            reopened.refresh(),
+            Err(ReadError::CorruptPile { valid_length }) if valid_length == repaired_len
+        ));
+        assert_eq!(reopened.applied_length, repaired_len);
+        reopened.amputate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() as usize,
+            repaired_len
+        );
+        assert!(reopened.base.is_some());
+        assert!(reopened
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, UnknownBlob>(second_handle)
+            .is_ok());
+        reopened.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn indexed_pile_retains_original_descriptor_across_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "retained.pile");
+        let moved = dir.path().join("moved.pile");
+        let index_path = dir.path().join("retained.pidx");
+        let mut base = Pile::open(&path).unwrap();
+        base.put::<UnknownBlob, _>(Bytes::from_source(b"base".to_vec()))
+            .unwrap();
+        base.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut retained = Pile::open_indexed(&path, &index_path).unwrap();
+        std::fs::rename(&path, &moved).unwrap();
+        File::create(&path).unwrap();
+        let tail: Inline<Handle<UnknownBlob>> = retained
+            .put(Bytes::from_source(b"old-inode-tail".to_vec()))
+            .unwrap();
+        retained.close().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(std::fs::metadata(&moved).unwrap().len() > 0);
+        assert!(matches!(
+            Pile::open_indexed(&path, &index_path),
+            Err(IndexedOpenError::Index(PileIndexError::StaleIndex(_)))
+        ));
+        let mut moved_pile = Pile::open_indexed(&moved, &index_path).unwrap();
+        assert!(moved_pile
+            .reader()
+            .unwrap()
+            .get::<Blob<UnknownBlob>, UnknownBlob>(tail)
+            .is_ok());
+        moved_pile.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_cold_private_state_is_tail_sized() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "shape.pile");
+        let index_path = dir.path().join("shape.pidx");
+        let mut base = Pile::open(&path).unwrap();
+        let mut handles = Vec::new();
+        for byte in 0..128u8 {
+            let handle = base
+                .put::<UnknownBlob, _>(Bytes::from_source(vec![byte; 16]))
+                .unwrap();
+            handles.push(handle);
+            base.pin_weak(handle).unwrap();
+            let branch = Id::new([byte.wrapping_add(1); 16]).unwrap();
+            let head: Inline<Handle<SimpleArchive>> = handle.transmute();
+            assert!(matches!(
+                base.update(branch, None, Some(head)).unwrap(),
+                PushResult::Success()
+            ));
+        }
+        base.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut pile = Pile::open_indexed(&path, &index_path).unwrap();
+        assert_eq!(overlay_count(&pile.blobs), 0);
+        assert_eq!(overlay_count(pile.blob_additions.as_ref().unwrap()), 0);
+        assert_eq!(overlay_count(&pile.branches), 0);
+        assert_eq!(overlay_count(pile.branch_tombstones.as_ref().unwrap()), 0);
+        assert_eq!(overlay_count(&pile.weak_pins), 0);
+        assert_eq!(overlay_count(pile.weak_unpins.as_ref().unwrap()), 0);
+        assert_eq!(
+            pile.base
+                .as_ref()
+                .unwrap()
+                .validations
+                .lock()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(pile.logical_weak_pin(handles[0]).unwrap());
+        assert!(pile
+            .logical_head(Id::new([1; 16]).unwrap())
+            .unwrap()
+            .is_some());
+        assert_eq!(pile.reader().unwrap().blobs().count(), 128);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_reader_equality_and_diff_are_representation_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "reader-equality.pile");
+        let index_path = dir.path().join("reader-equality.pidx");
+        let mut writer = Pile::open(&path).unwrap();
+        for byte in 1..=8u8 {
+            writer
+                .put::<UnknownBlob, _>(Bytes::from_source(vec![byte; 8]))
+                .unwrap();
+        }
+        writer.close().unwrap();
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut first_pile = Pile::open_indexed(&path, &index_path).unwrap();
+        let first = first_pile.reader().unwrap();
+        let mut second_pile = Pile::open_indexed(&path, &index_path).unwrap();
+        let second = second_pile.reader().unwrap();
+        let mut full_pile = Pile::open(&path).unwrap();
+        let full = full_pile.reader().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, full);
+        assert!(second.blobs_diff(&first).next().is_none());
+        assert!(first.blobs_diff(&full).next().is_none());
+        assert!(full.blobs_diff(&first).next().is_none());
+
+        drop((first, second, full));
+        first_pile.close().unwrap();
+        second_pile.close().unwrap();
+        full_pile.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_reader_diff_reports_additions_but_not_candidate_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "reader-diff.pile");
+        let index_path = dir.path().join("reader-diff.pidx");
+        let payload = b"target";
+        let target = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
+        append_raw(&path, &v3_blob_record(target, b"broken", 1));
+        MappedPileIndex::build(&path, &index_path).unwrap();
+
+        let mut pile = Pile::open_indexed(&path, &index_path).unwrap();
+        let baseline = pile.reader().unwrap();
+        append_raw(&path, &v3_blob_record(target, payload, 2));
+        pile.refresh().unwrap();
+        let override_only = pile.reader().unwrap();
+        assert_eq!(baseline, override_only);
+        assert!(override_only.blobs_diff(&baseline).next().is_none());
+        assert!(matches!(
+            baseline.get::<Blob<UnknownBlob>, UnknownBlob>(target),
+            Err(GetBlobError::ValidationError(_))
+        ));
+        assert!(override_only
+            .get::<Blob<UnknownBlob>, UnknownBlob>(target)
+            .is_ok());
+
+        let added_blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"added".to_vec()));
+        let added = added_blob.get_handle();
+        append_raw(&path, &v3_blob_record(added, b"added", 3));
+        pile.refresh().unwrap();
+        let current = pile.reader().unwrap();
+        assert_eq!(
+            current
+                .blobs_diff(&override_only)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![added]
+        );
+
+        drop((baseline, override_only, current));
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn indexed_prefix_tail_composition_matches_full_replay_at_every_boundary() {
+        let alpha_bytes = b"alpha";
+        let bravo_bytes = b"bravo";
+        let alpha = Blob::<UnknownBlob>::new(Bytes::from_source(alpha_bytes.to_vec())).get_handle();
+        let bravo = Blob::<UnknownBlob>::new(Bytes::from_source(bravo_bytes.to_vec())).get_handle();
+        let branch = Id::new([73; 16]).unwrap();
+        let alpha_head: Inline<Handle<SimpleArchive>> = alpha.transmute();
+        let bravo_head: Inline<Handle<SimpleArchive>> = bravo.transmute();
+        let records = vec![
+            v3_blob_record(alpha, b"ALPHA", 1),
+            v3_blob_record(bravo, bravo_bytes, 2),
+            v3_branch_record(branch, Some(alpha_head)),
+            v3_weak_record(alpha, true),
+            v3_blob_record(alpha, alpha_bytes, 5),
+            v3_blob_record(alpha, alpha_bytes, 6),
+            v3_blob_record(bravo, b"BRAVO", 7),
+            v3_branch_record(branch, None),
+            v3_weak_record(alpha, false),
+            v3_branch_record(branch, Some(bravo_head)),
+            v3_weak_record(alpha, true),
+        ];
+
+        for split in 0..=records.len() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = fresh_empty_pile_path(&dir, "differential.pile");
+            let index_path = dir.path().join("differential.pidx");
+            for record in &records[..split] {
+                append_raw(&path, record);
+            }
+            MappedPileIndex::build(&path, &index_path).unwrap();
+            for record in &records[split..] {
+                append_raw(&path, record);
+            }
+
+            let mut indexed_pile = Pile::open_indexed(&path, &index_path).unwrap();
+            let indexed = indexed_pile.patch_index().unwrap();
+            indexed_pile.close().unwrap();
+            let mut full_pile = Pile::open(&path).unwrap();
+            let full = full_pile.patch_index().unwrap();
+            full_pile.close().unwrap();
+
+            assert_eq!(indexed.covered_len(), full.covered_len(), "split {split}");
+            let indexed_handles = indexed
+                .blob_handles()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let full_handles = full.blob_handles().collect::<Result<Vec<_>, _>>().unwrap();
+            assert_eq!(indexed_handles, full_handles, "split {split}");
+            for handle in indexed_handles {
+                assert_eq!(
+                    indexed.blob_locator(handle).unwrap(),
+                    full.blob_locator(handle).unwrap(),
+                    "split {split}, handle {handle:?}"
+                );
+            }
+            assert_eq!(
+                indexed.pin_ids().collect::<Result<Vec<_>, _>>().unwrap(),
+                full.pin_ids().collect::<Result<Vec<_>, _>>().unwrap(),
+                "split {split}"
+            );
+            assert_eq!(
+                indexed.pin_head(branch).unwrap(),
+                full.pin_head(branch).unwrap(),
+                "split {split}"
+            );
+            assert_eq!(
+                indexed
+                    .weak_pin_handles()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                full.weak_pin_handles()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                "split {split}"
+            );
+        }
     }
 
     #[test]

@@ -3,8 +3,9 @@
 //! A snapshot is a derived cache over an exact, immutable prefix of a pile.
 //! It is deliberately separate from the authoritative append-only pile file:
 //! deleting it merely restores the normal PATCH replay path.  The first
-//! implementation is static and opt-in.  Incremental publication and using the
-//! mapped index inside `PileReader` are intentionally left for later work.
+//! implementation is static and opt-in. `Pile::open_indexed` may compose the
+//! immutable mapped prefix with a canonical in-memory tail; incremental index
+//! publication is intentionally left for later work.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -86,7 +87,11 @@ pub trait PileIndex {
         handle: Inline<Handle<UnknownBlob>>,
     ) -> Result<Option<PileBlobLocator>, PileIndexError>;
 
-    /// Lists all unique blob handles in byte order.
+    /// Lists all unique blob handles in byte order. This diagnostic trait
+    /// surface may validate every locator against the authoritative pile;
+    /// `PileReader` uses a separate owned key stream after the complete
+    /// sidecar checksum and ordering checks, avoiding a sparse pile-header
+    /// fault for every listed key.
     fn blob_handles(&self) -> Self::BlobHandles<'_>;
 
     /// Returns the current head of a pin.
@@ -94,6 +99,16 @@ pub trait PileIndex {
 
     /// Lists active pin ids in byte order.
     fn pin_ids(&self) -> Self::PinIds<'_>;
+
+    /// Tests whether a weak-pin cell is active.
+    fn has_weak_pin(&self, handle: Inline<Handle<UnknownBlob>>) -> Result<bool, PileIndexError> {
+        for candidate in self.weak_pin_handles() {
+            if candidate? == handle {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
     /// Lists active weak-pin handles in byte order.
     fn weak_pin_handles(&self) -> Self::WeakPinHandles<'_>;
@@ -211,6 +226,31 @@ pub struct MappedBlobHandles<'a> {
     position: usize,
 }
 
+/// Owned counterpart used by reader snapshots whose iterator must not borrow
+/// a live `Pile`. Cloning `MappedPileIndex` only bumps the two `Bytes` owners.
+pub(crate) struct OwnedMappedBlobHandles {
+    index: MappedPileIndex,
+    position: usize,
+}
+
+impl Iterator for OwnedMappedBlobHandles {
+    type Item = Result<Inline<Handle<UnknownBlob>>, PileIndexError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position == self.index.blobs_count {
+            return None;
+        }
+        let record = self.index.blob_record(self.position);
+        self.position += 1;
+        // `open_on_file` already checksums the complete index body and proves
+        // this table strictly sorted and unique. Live logical-key scans can
+        // therefore stay in the compact sidecar instead of randomly touching
+        // one authoritative pile header per key. Point reads still validate
+        // the selected locator against the pile before exposing bytes.
+        Some(Ok(Inline::new(record.key)))
+    }
+}
+
 impl Iterator for MappedBlobHandles<'_> {
     type Item = Result<Inline<Handle<UnknownBlob>>, PileIndexError>;
 
@@ -294,6 +334,12 @@ impl Iterator for MappedWeakPinHandles<'_> {
 impl ExactSizeIterator for MappedWeakPinHandles<'_> {}
 
 impl MappedPileIndex {
+    pub(crate) fn owned_blob_handles(&self) -> OwnedMappedBlobHandles {
+        OwnedMappedBlobHandles {
+            index: self.clone(),
+            position: 0,
+        }
+    }
     /// Builds and atomically installs a static snapshot for `pile_path`.
     ///
     /// The builder uses the canonical [`PileRecords`] decoder and spills
@@ -312,6 +358,43 @@ impl MappedPileIndex {
     /// grown or shrunk since the build, this returns [`PileIndexError::StaleIndex`]
     /// so the caller can use the PATCH oracle or rebuild.
     pub fn open(pile_path: &Path, index_path: &Path) -> Result<Self, PileIndexError> {
+        let pile_file = File::open(pile_path).map_err(PileIndexError::PileIo)?;
+        let pile_len = pile_file.metadata().map_err(PileIndexError::PileIo)?.len();
+        let pile = if pile_len == 0 {
+            Bytes::empty()
+        } else {
+            let pile_len = usize_from_u64(pile_len, "pile length")?;
+            // SAFETY: piles are immutable below their append point. Keep the
+            // exact descriptor that supplied the identity alive until after
+            // the mapping has been established.
+            unsafe {
+                Bytes::map_file_region(&pile_file, 0, pile_len).map_err(PileIndexError::PileIo)?
+            }
+        };
+        Self::open_on_file(&pile_file, pile, index_path, true)
+    }
+
+    /// Opens a snapshot as an immutable prefix of an already-open pile.
+    ///
+    /// `pile` must be a bounded view backed by the same descriptor as
+    /// `pile_file`. Unlike [`Self::open`], appends after `covered_len` are
+    /// accepted; callers replay that canonical tail themselves. This is kept
+    /// crate-private so the safe public entry point can bind the descriptor,
+    /// mapping, watermark, and replay state as one operation.
+    pub(crate) fn open_prefix_on_file(
+        pile_file: &File,
+        pile: Bytes,
+        index_path: &Path,
+    ) -> Result<Self, PileIndexError> {
+        Self::open_on_file(pile_file, pile, index_path, false)
+    }
+
+    fn open_on_file(
+        pile_file: &File,
+        pile: Bytes,
+        index_path: &Path,
+        require_exact_len: bool,
+    ) -> Result<Self, PileIndexError> {
         let index_file = File::open(index_path).map_err(PileIndexError::IndexIo)?;
         let index_len = index_file
             .metadata()
@@ -323,25 +406,30 @@ impl MappedPileIndex {
         let index = unsafe { Bytes::map_file(&index_file).map_err(PileIndexError::IndexIo)? };
         let header = ParsedHeader::parse(&index)?;
 
-        // Reject stale snapshots before hashing their potentially large body.
-        let pile_file = File::open(pile_path).map_err(PileIndexError::PileIo)?;
         let pile_meta = pile_file.metadata().map_err(PileIndexError::PileIo)?;
         let actual_identity = file_identity(&pile_meta)?;
         if actual_identity != header.identity {
             return Err(stale("pile file identity changed"));
         }
-        if pile_meta.len() != header.covered_len {
+        let covered_len = usize_from_u64(header.covered_len, "covered length")?;
+        if pile_meta.len() < header.covered_len || pile.len() < covered_len {
+            return Err(stale("pile is shorter than the indexed prefix"));
+        }
+        if require_exact_len && pile_meta.len() != header.covered_len {
             return Err(stale("pile length differs from the static snapshot"));
         }
         header.validate_content(&index)?;
         validate_sorted_tables(&index, &header)?;
-        let pile = if header.covered_len == 0 {
-            Bytes::empty()
-        } else {
-            unsafe { Bytes::map_file(&pile_file).map_err(PileIndexError::PileIo)? }
-        };
 
         validate_anchors(&pile, &header)?;
+        let final_meta = pile_file.metadata().map_err(PileIndexError::PileIo)?;
+        if file_identity(&final_meta)? != header.identity
+            || final_meta.len() < header.covered_len
+            || (require_exact_len && final_meta.len() != header.covered_len)
+        {
+            return Err(stale("pile changed while the index was attached"));
+        }
+        let pile = pile.slice(..covered_len);
 
         Ok(Self {
             pile,
@@ -408,6 +496,21 @@ impl MappedPileIndex {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let record = self.pin_record(mid);
+            match record.key.cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(record),
+            }
+        }
+        None
+    }
+
+    fn find_weak(&self, key: &[u8; 32]) -> Option<WeakSnapshotRecord> {
+        let mut lo = 0usize;
+        let mut hi = self.weak_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let record = self.weak_record(mid);
             match record.key.cmp(key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -510,6 +613,14 @@ impl PileIndex for MappedPileIndex {
             index: self,
             position: 0,
         }
+    }
+
+    fn has_weak_pin(&self, handle: Inline<Handle<UnknownBlob>>) -> Result<bool, PileIndexError> {
+        let Some(record) = self.find_weak(&handle.raw) else {
+            return Ok(false);
+        };
+        self.validate_weak(record)?;
+        Ok(true)
     }
 
     fn weak_pin_handles(&self) -> Self::WeakPinHandles<'_> {

@@ -191,17 +191,43 @@ returns the caller to normal PATCH replay. Snapshot construction uses the
 canonical `PileRecords` decoder, bounded external-sort runs, checksummed sorted
 tables, and an atomic rename after the completed file is synced.
 
-The initial format is deliberately static. A snapshot is bound to the exact OS
-file identity and byte length observed through the same file descriptor as its
-mapping. Any append, truncation, or path replacement rejects it as stale; there
-is no unindexed tail overlay. Opening also verifies the header and table
-checksums, canonical section bounds, strict key ordering, and first/last record
-anchors before exposing point lookups or streaming key iteration. Malformed or
-stale cache files are disposable, while errors reading the pile itself remain
-authoritative failures.
+The format itself remains deliberately static: it describes one immutable pile
+prefix, bound to the OS file identity and covered byte length observed through
+the same descriptor as its mapping. `MappedPileIndex::open` retains the original
+exact-length diagnostic surface. The opt-in `Pile::open_indexed` path instead
+accepts later appends, seeds `applied_length` from the covered prefix, and runs
+the canonical decoder over only the tail. Blob candidates stay in sparse tail
+overlays, including the first-valid-duplicate rule across the boundary. Pin and
+weak-pin heads use positive and negative tail cells so a tombstone never
+accidentally reveals an older base value. Point reads stay mapped; APIs whose
+return types require a PATCH snapshot materialize the merged view only when
+called. Attach itself leaves the tail lazy, just like `Pile::open`, so a caller
+can observe a torn-tail error and explicitly `amputate` from the accepted prefix
+without first rebuilding the corpus PATCH.
 
-This proof does not alter `Pile` or `PileReader` defaults and is not maintained
-incrementally yet. Its 16-byte format marker
+Readers sharing one mapped base compute blob differences from their tail
+addition PATCHes. Equality or difference across independently attached bases
+(or between indexed and full-PATCH readers) currently materializes sorted key
+vectors to preserve exact semantics; this is an explicit slow path, not cold-open
+state.
+
+Opening verifies the header and table checksums, canonical section bounds,
+strict key ordering, and first/last prefix anchors. That v1 validation still
+touches the `.pidx` body, so attach time is proportional to the sidecar size,
+even though private heap state is proportional to the tail. Missing, malformed,
+stale, and wrong-identity caches can be discarded by
+`Pile::open_indexed_or_replay` before the base watermark is accepted. Once
+accepted, index failures remain index failures and authoritative tail corruption
+fails at its absolute pile offset; neither is silently converted into absence or
+full replay. Cache fallback is lazy, matching `Pile::open`: the returned ordinary
+`Pile` builds its PATCH on the first `refresh`, reader, pin, or write operation.
+
+Tail replay currently inherits `apply_next`'s per-record file-length metadata
+check. Removing or batching that `fstat` is a separate benchmarked optimisation
+and remains a gate before making indexed open the default.
+
+The default `Pile::open` / `PileReader` path is unchanged, and ordinary writes
+do not build, compact, or publish `.pidx` files. Its 16-byte format marker
 `080FB58E9F63E801C625DB2F2EFA292B` was minted with `trible genid` on
 2026-07-12 rather than derived from a name.
 
