@@ -42,6 +42,7 @@ use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::Access;
 use jerky::bit_vector::BitVector;
 use jerky::bit_vector::BitVectorBuilder;
+use jerky::bit_vector::BitVectorData;
 use jerky::bit_vector::BitVectorDataMeta;
 use jerky::bit_vector::NumBits;
 use jerky::bit_vector::Rank;
@@ -83,10 +84,11 @@ impl MetaDescribe for SuccinctArchiveBlob {
 
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
-/// Serialisation metadata header for a [`SuccinctArchive`].
+/// Serialisation metadata trailer for a [`SuccinctArchive`].
 ///
-/// Stored at the start of the blob; the `D` parameter captures the
-/// domain (universe) metadata layout.
+/// Stored at the very end of the blob; the `D` parameter captures the
+/// domain (universe) metadata layout. Additive data may precede this trailer,
+/// but its bytes and EOF position remain the compatibility anchor.
 pub struct SuccinctArchiveMeta<D: Metadata> {
     /// Number of distinct entities in the archive.
     pub entity_count: usize,
@@ -126,6 +128,145 @@ pub struct SuccinctArchiveMeta<D: Metadata> {
     pub eva_c: WaveletMatrixMeta,
     /// Reverse ring: AEV last-column wavelet matrix metadata.
     pub aev_c: WaveletMatrixMeta,
+}
+
+/// Stable marker for the optional Rank9/select sidecar footer.
+///
+/// Minted with `trible genid` on 2026-07-12. The raw bytes are compared before
+/// the surrounding footer is interpreted, so an archive written by an older
+/// binary continues down the legacy rebuild path.
+const RANK9_SIDECAR_MARKER: [u8; 16] = [
+    0x6B, 0xE4, 0xFF, 0xC8, 0xE6, 0xF5, 0xA5, 0x1A, 0x12, 0x94, 0xBE, 0x9B, 0x0F, 0x49, 0x8F, 0xEA,
+];
+const RANK9_SIDECAR_VERSION: u32 = 1;
+const RANK9_SIDECAR_FLAGS: u32 = 0;
+const TOP_LEVEL_RANK9_INDEX_COUNT: usize = 9;
+
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
+struct Rank9SidecarFooter {
+    marker: [u8; 16],
+    version: u32,
+    flags: u32,
+    indexes: SectionHandle<SectionHandle<usize>>,
+}
+
+fn invalid_rank9_metadata(message: impl Into<String>) -> jerky::error::Error {
+    jerky::error::Error::invalid_metadata(message.into())
+}
+
+fn checked_align_up(value: usize, align: usize) -> Result<usize, jerky::error::Error> {
+    debug_assert!(align.is_power_of_two());
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+        .ok_or_else(|| invalid_rank9_metadata("succinct archive alignment overflow"))
+}
+
+fn checked_section_range<T>(
+    handle: SectionHandle<T>,
+    limit: usize,
+    description: &str,
+) -> Result<std::ops::Range<usize>, jerky::error::Error> {
+    let element_size = std::mem::size_of::<T>();
+    let alignment = std::mem::align_of::<T>();
+    if handle.offset % alignment != 0 {
+        return Err(invalid_rank9_metadata(format!(
+            "{description} offset {} is not aligned to {alignment}",
+            handle.offset
+        )));
+    }
+    if element_size != 0 && handle.len % element_size != 0 {
+        return Err(invalid_rank9_metadata(format!(
+            "{description} length {} is not a multiple of {element_size}",
+            handle.len
+        )));
+    }
+    let end = handle
+        .offset
+        .checked_add(handle.len)
+        .ok_or_else(|| invalid_rank9_metadata(format!("{description} range overflow")))?;
+    if end > limit {
+        return Err(invalid_rank9_metadata(format!(
+            "{description} range {}..{end} exceeds limit {limit}",
+            handle.offset
+        )));
+    }
+    Ok(handle.offset..end)
+}
+
+fn ensure_zero_bytes(
+    bytes: &Bytes,
+    range: std::ops::Range<usize>,
+    description: &str,
+) -> Result<(), jerky::error::Error> {
+    if bytes.as_ref()[range.clone()].iter().any(|byte| *byte != 0) {
+        return Err(invalid_rank9_metadata(format!(
+            "{description} contains non-zero padding in {}..{}",
+            range.start, range.end
+        )));
+    }
+    Ok(())
+}
+
+fn persist_top_level_rank9_indexes(
+    writer: &mut SectionWriter<'_>,
+    vectors: [&BitVector<Rank9SelIndex>; TOP_LEVEL_RANK9_INDEX_COUNT],
+) -> Vec<SectionHandle<usize>> {
+    vectors
+        .into_iter()
+        .map(|vector| vector.index.persist(writer).unwrap())
+        .collect()
+}
+
+/// Writes the one canonical sidecar table/footer and the unchanged EOF
+/// metadata trailer. Every archive construction backend funnels through this
+/// function after all legacy raw sections have been reserved.
+fn finalize_succinct_archive<D>(
+    writer: &mut SectionWriter<'_>,
+    meta: &SuccinctArchiveMeta<D>,
+    index_handles: &[SectionHandle<usize>],
+) where
+    D: Metadata + Clone,
+{
+    let mut table = writer
+        .reserve::<SectionHandle<usize>>(index_handles.len())
+        .unwrap();
+    table.as_mut_slice().copy_from_slice(index_handles);
+    let table_handle = table.handle();
+    let table_end = table_handle.offset.checked_add(table_handle.len).unwrap();
+    table.freeze().unwrap();
+
+    // Keep the footer immediately adjacent to the possibly more-aligned
+    // generic metadata trailer. Padding belongs before the footer and is
+    // explicitly zeroed so there is only one canonical representation.
+    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
+    let meta_align = std::mem::align_of::<SuccinctArchiveMeta<D>>();
+    let meta_start = checked_align_up(table_end.checked_add(footer_size).unwrap(), meta_align)
+        .expect("archive trailer size must fit usize");
+    let footer_start = meta_start - footer_size;
+    let padding_len = footer_start - table_end;
+    if padding_len != 0 {
+        let mut padding = writer.reserve::<u8>(padding_len).unwrap();
+        padding.as_mut_slice().fill(0);
+        assert_eq!(padding.handle().offset, table_end);
+        padding.freeze().unwrap();
+    }
+
+    let mut footer = writer.reserve::<Rank9SidecarFooter>(1).unwrap();
+    assert_eq!(footer.handle().offset, footer_start);
+    footer.as_mut_slice()[0] = Rank9SidecarFooter {
+        marker: RANK9_SIDECAR_MARKER,
+        version: RANK9_SIDECAR_VERSION,
+        flags: RANK9_SIDECAR_FLAGS,
+        indexes: table_handle,
+    };
+    footer.freeze().unwrap();
+
+    let mut meta_section = writer.reserve::<SuccinctArchiveMeta<D>>(1).unwrap();
+    assert_eq!(meta_section.handle().offset, meta_start);
+    meta_section.as_mut_slice()[0] = meta.clone();
+    meta_section.freeze().unwrap();
 }
 
 fn build_prefix_bv<I>(
@@ -222,6 +363,258 @@ pub struct SuccinctArchive<U> {
     pub eva_c: WaveletMatrix<Rank9SelIndex>,
     /// Reverse ring: last column of AEV-sorted rotation (values).
     pub aev_c: WaveletMatrix<Rank9SelIndex>,
+}
+
+fn top_level_bitvector_meta<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+) -> [BitVectorDataMeta; TOP_LEVEL_RANK9_INDEX_COUNT] {
+    [
+        meta.e_a,
+        meta.a_a,
+        meta.v_a,
+        meta.changed_e_a,
+        meta.changed_e_v,
+        meta.changed_a_e,
+        meta.changed_a_v,
+        meta.changed_v_e,
+        meta.changed_v_a,
+    ]
+}
+
+fn wavelet_meta<D: Metadata>(meta: &SuccinctArchiveMeta<D>) -> [WaveletMatrixMeta; 6] {
+    [
+        meta.eav_c, meta.vea_c, meta.ave_c, meta.vae_c, meta.eva_c, meta.aev_c,
+    ]
+}
+
+fn bitvector_word_bytes(len: usize) -> Result<usize, jerky::error::Error> {
+    len.checked_add(63)
+        .map(|bits| bits / 64)
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+        .ok_or_else(|| invalid_rank9_metadata("bit-vector raw section length overflow"))
+}
+
+fn expected_rank9_index_count<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+) -> Result<usize, jerky::error::Error> {
+    let mut count = TOP_LEVEL_RANK9_INDEX_COUNT;
+    for matrix in wavelet_meta(meta) {
+        if matrix.alph_width != jerky::utils::needed_bits(matrix.alph_size) {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet alphabet width {} does not match alphabet size {}",
+                matrix.alph_width, matrix.alph_size
+            )));
+        }
+        count = count
+            .checked_add(matrix.alph_width)
+            .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar count overflow"))?;
+    }
+    Ok(count)
+}
+
+/// Preflights every raw handle before any AnyBytes/Jerky view constructor can
+/// slice with it. The last legacy raw section is `changed_v_a`; its end is the
+/// canonical raw-prefix boundary for all writers.
+fn validate_raw_rank9_sources<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+    bytes: &Bytes,
+    raw_limit: usize,
+) -> Result<usize, jerky::error::Error> {
+    if raw_limit > bytes.len() {
+        return Err(invalid_rank9_metadata(format!(
+            "raw Rank9 source limit {raw_limit} exceeds {} bytes",
+            bytes.len()
+        )));
+    }
+    let changed_v_a_range = checked_section_range(
+        meta.changed_v_a.handle,
+        raw_limit,
+        "changed_v_a raw bit vector",
+    )?;
+    if meta.changed_v_a.handle.len != bitvector_word_bytes(meta.changed_v_a.len)? {
+        return Err(invalid_rank9_metadata(
+            "changed_v_a raw bit-vector length is not canonical",
+        ));
+    }
+    let raw_end = changed_v_a_range.end;
+
+    for (position, vector) in top_level_bitvector_meta(meta).into_iter().enumerate() {
+        let range = checked_section_range(
+            vector.handle,
+            raw_end,
+            &format!("top-level raw bit vector {position}"),
+        )?;
+        let expected = bitvector_word_bytes(vector.len)?;
+        if range.len() != expected {
+            return Err(invalid_rank9_metadata(format!(
+                "top-level raw bit vector {position} has {} bytes, expected {expected}",
+                range.len()
+            )));
+        }
+    }
+
+    for (matrix_index, matrix) in wavelet_meta(meta).into_iter().enumerate() {
+        if matrix.alph_width != jerky::utils::needed_bits(matrix.alph_size) {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet matrix {matrix_index} has a non-canonical alphabet width"
+            )));
+        }
+        let table_range = checked_section_range(
+            matrix.layers,
+            raw_end,
+            &format!("wavelet matrix {matrix_index} raw layer table"),
+        )?;
+        let expected_table_len = matrix
+            .alph_width
+            .checked_mul(std::mem::size_of::<SectionHandle<u64>>())
+            .ok_or_else(|| invalid_rank9_metadata("wavelet layer table length overflow"))?;
+        if table_range.len() != expected_table_len {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet matrix {matrix_index} raw layer table has {} bytes, expected {expected_table_len}",
+                table_range.len()
+            )));
+        }
+        let layers = matrix.layers.view(bytes)?;
+        let expected_layer_len = bitvector_word_bytes(matrix.len)?;
+        for (depth, layer) in layers.iter().copied().enumerate() {
+            let range = checked_section_range(
+                layer,
+                raw_end,
+                &format!("wavelet matrix {matrix_index} raw layer {depth}"),
+            )?;
+            if range.len() != expected_layer_len {
+                return Err(invalid_rank9_metadata(format!(
+                    "wavelet matrix {matrix_index} raw layer {depth} has {} bytes, expected {expected_layer_len}",
+                    range.len()
+                )));
+            }
+        }
+    }
+
+    Ok(raw_end)
+}
+
+fn validate_rank9_index_handles<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+    bytes: &Bytes,
+    handles: &[SectionHandle<usize>],
+    sidecar_limit: usize,
+) -> Result<usize, jerky::error::Error> {
+    let expected_count = expected_rank9_index_count(meta)?;
+    if handles.len() != expected_count {
+        return Err(invalid_rank9_metadata(format!(
+            "Rank9 sidecar table has {} handles, expected {expected_count}",
+            handles.len()
+        )));
+    }
+
+    let first = handles
+        .first()
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table is empty"))?;
+    checked_section_range(*first, sidecar_limit, "first Rank9 sidecar")?;
+    let raw_end = validate_raw_rank9_sources(meta, bytes, first.offset)?;
+    let expected_start = checked_align_up(raw_end, std::mem::align_of::<usize>())?;
+    if first.offset != expected_start {
+        return Err(invalid_rank9_metadata(format!(
+            "first Rank9 sidecar starts at {}, expected {expected_start}",
+            first.offset
+        )));
+    }
+    ensure_zero_bytes(bytes, raw_end..expected_start, "raw-to-sidecar gap")?;
+
+    let mut cursor = expected_start;
+    for (position, handle) in handles.iter().copied().enumerate() {
+        if handle.offset != cursor {
+            return Err(invalid_rank9_metadata(format!(
+                "Rank9 sidecar {position} starts at {}, expected {cursor}",
+                handle.offset
+            )));
+        }
+        if handle.len == 0 {
+            return Err(invalid_rank9_metadata(format!(
+                "Rank9 sidecar {position} is empty"
+            )));
+        }
+        cursor =
+            checked_section_range(handle, sidecar_limit, &format!("Rank9 sidecar {position}"))?.end;
+    }
+    Ok(cursor)
+}
+
+fn probe_rank9_sidecar_footer<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+    bytes: &Bytes,
+    meta_start: usize,
+) -> Result<Option<Vec<SectionHandle<usize>>>, jerky::error::Error> {
+    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
+    let Some(footer_start) = meta_start.checked_sub(footer_size) else {
+        return Ok(None);
+    };
+    let marker_end = footer_start + RANK9_SIDECAR_MARKER.len();
+    if bytes.as_ref()[footer_start..marker_end] != RANK9_SIDECAR_MARKER {
+        return Ok(None);
+    }
+
+    let footer = *bytes
+        .slice(footer_start..meta_start)
+        .view::<Rank9SidecarFooter>()?;
+    if footer.version != RANK9_SIDECAR_VERSION {
+        return Ok(None);
+    }
+    if footer.flags != RANK9_SIDECAR_FLAGS {
+        return Err(invalid_rank9_metadata(format!(
+            "unsupported Rank9 sidecar flags {:#x}",
+            footer.flags
+        )));
+    }
+
+    let expected_count = expected_rank9_index_count(meta)?;
+    let expected_table_len = expected_count
+        .checked_mul(std::mem::size_of::<SectionHandle<usize>>())
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table length overflow"))?;
+    let table_range =
+        checked_section_range(footer.indexes, footer_start, "Rank9 sidecar handle table")?;
+    if table_range.len() != expected_table_len {
+        return Err(invalid_rank9_metadata(format!(
+            "Rank9 sidecar handle table has {} bytes, expected {expected_table_len}",
+            table_range.len()
+        )));
+    }
+    let handles_view = footer.indexes.view(bytes)?;
+    let handles: Vec<_> = handles_view.iter().copied().collect();
+    let sidecar_end = validate_rank9_index_handles(meta, bytes, &handles, footer.indexes.offset)?;
+    if sidecar_end != footer.indexes.offset {
+        return Err(invalid_rank9_metadata(format!(
+            "Rank9 sidecars end at {sidecar_end}, table starts at {}",
+            footer.indexes.offset
+        )));
+    }
+
+    let canonical_meta_start = checked_align_up(
+        table_range
+            .end
+            .checked_add(footer_size)
+            .ok_or_else(|| invalid_rank9_metadata("Rank9 footer position overflow"))?,
+        std::mem::align_of::<SuccinctArchiveMeta<D>>(),
+    )?;
+    if canonical_meta_start != meta_start {
+        return Err(invalid_rank9_metadata(format!(
+            "Rank9 footer/meta trailer starts at {meta_start}, expected {canonical_meta_start}"
+        )));
+    }
+    let canonical_footer_start = canonical_meta_start - footer_size;
+    if canonical_footer_start != footer_start {
+        return Err(invalid_rank9_metadata(
+            "Rank9 footer is not immediately adjacent to EOF metadata",
+        ));
+    }
+    ensure_zero_bytes(
+        bytes,
+        table_range.end..footer_start,
+        "sidecar-table-to-footer gap",
+    )?;
+
+    Ok(Some(handles))
 }
 
 /// Names one of the six ring wavelet-matrix columns of a
@@ -912,7 +1305,10 @@ trait MergedWaveletOutputs {
 
     fn finish_rotation(&mut self, rotation: SuccinctRotation) -> Result<(), Self::Error>;
 
-    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error>;
+    fn freeze_with_rank9_sidecars(
+        self,
+        writer: &mut SectionWriter<'_>,
+    ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error>;
 }
 
 trait MergedWaveletFactory {
@@ -978,17 +1374,22 @@ impl MergedWaveletOutputs for JerkyWaveletOutputs<'_> {
         Ok(())
     }
 
-    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
+    fn freeze_with_rank9_sidecars(
+        self,
+        writer: &mut SectionWriter<'_>,
+    ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
         let builders = self.builders.into_iter();
-
-        let metadata = builders
-            .map(|builder| {
-                builder
-                    .freeze::<Rank9SelIndex>()
-                    .map(|matrix| matrix.metadata())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+        let mut metadata = Vec::with_capacity(SuccinctRotation::ALL.len());
+        let mut handles = Vec::new();
+        for builder in builders {
+            let matrix = builder.freeze::<Rank9SelIndex>()?;
+            metadata.push(matrix.metadata());
+            handles.extend(matrix.persist_layer_indexes(writer)?);
+        }
+        Ok((
+            metadata.try_into().expect("six Ring wavelet matrices"),
+            handles,
+        ))
     }
 }
 
@@ -1066,19 +1467,35 @@ impl<'area> PackedWaveletBuilder<'area> {
         }
     }
 
-    fn freeze(self) -> WaveletMatrixMeta {
+    fn freeze_with_rank9_sidecars(
+        self,
+        writer: &mut SectionWriter<'_>,
+    ) -> (WaveletMatrixMeta, Vec<SectionHandle<usize>>) {
         let layers = self.handles.handle();
         let alph_width = self.planes.len();
         self.handles.freeze().unwrap();
+        let mut index_handles = Vec::with_capacity(alph_width);
         for plane in self.planes {
-            plane.freeze().unwrap();
+            let handle = plane.handle();
+            let words = plane.freeze().unwrap().view::<[u64]>().unwrap();
+            let data = BitVectorData {
+                words,
+                len: self.len,
+                handle: Some(handle),
+            };
+            let (_, index_handle) =
+                Rank9SelIndex::<true, true>::build_and_persist(&data, writer).unwrap();
+            index_handles.push(index_handle);
         }
-        WaveletMatrixMeta {
-            alph_size: self.alphabet_size,
-            alph_width,
-            len: self.len,
-            layers,
-        }
+        (
+            WaveletMatrixMeta {
+                alph_size: self.alphabet_size,
+                alph_width,
+                len: self.len,
+                layers,
+            },
+            index_handles,
+        )
     }
 }
 
@@ -1351,13 +1768,21 @@ impl MergedWaveletOutputs for PackedCpuWaveletOutputs<'_> {
         Ok(())
     }
 
-    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
-        let metadata: Vec<_> = self
-            .builders
-            .into_iter()
-            .map(PackedWaveletBuilder::freeze)
-            .collect();
-        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+    fn freeze_with_rank9_sidecars(
+        self,
+        writer: &mut SectionWriter<'_>,
+    ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
+        let mut metadata = Vec::with_capacity(SuccinctRotation::ALL.len());
+        let mut handles = Vec::new();
+        for builder in self.builders {
+            let (meta, layer_handles) = builder.freeze_with_rank9_sidecars(writer);
+            metadata.push(meta);
+            handles.extend(layer_handles);
+        }
+        Ok((
+            metadata.try_into().expect("six Ring wavelet matrices"),
+            handles,
+        ))
     }
 }
 
@@ -1448,13 +1873,21 @@ where
         Ok(())
     }
 
-    fn freeze(self) -> Result<[WaveletMatrixMeta; 6], Self::Error> {
-        let metadata: Vec<_> = self
-            .builders
-            .into_iter()
-            .map(PackedWaveletBuilder::freeze)
-            .collect();
-        Ok(metadata.try_into().expect("six Ring wavelet matrices"))
+    fn freeze_with_rank9_sidecars(
+        self,
+        writer: &mut SectionWriter<'_>,
+    ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
+        let mut metadata = Vec::with_capacity(SuccinctRotation::ALL.len());
+        let mut handles = Vec::new();
+        for builder in self.builders {
+            let (meta, layer_handles) = builder.freeze_with_rank9_sidecars(writer);
+            metadata.push(meta);
+            handles.extend(layer_handles);
+        }
+        Ok((
+            metadata.try_into().expect("six Ring wavelet matrices"),
+            handles,
+        ))
     }
 }
 
@@ -1702,24 +2135,58 @@ where
     )?;
     drop((rows, row_scratch, radix_counts));
 
-    // Freeze to metadata and immediately drop the temporary indexes. The final
-    // from-bytes attachment builds exactly one retained Rank9Sel index set.
-    let e_a = e_a_builder.freeze::<Rank9SelIndex>().metadata();
-    let a_a = a_a_builder.freeze::<Rank9SelIndex>().metadata();
-    let v_a = v_a_builder.freeze::<Rank9SelIndex>().metadata();
-    let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c] = wavelets.freeze()?;
-    let changed_e_a = changed_e_a_builder.freeze::<Rank9SelIndex>().metadata();
-    let changed_e_v = changed_e_v_builder.freeze::<Rank9SelIndex>().metadata();
-    let changed_a_e = changed_a_e_builder.freeze::<Rank9SelIndex>().metadata();
-    let changed_a_v = changed_a_v_builder.freeze::<Rank9SelIndex>().metadata();
-    let changed_v_e = changed_v_e_builder.freeze::<Rank9SelIndex>().metadata();
-    let changed_v_a = changed_v_a_builder.freeze::<Rank9SelIndex>().metadata();
+    let e_a = e_a_builder.freeze::<Rank9SelIndex>();
+    let a_a = a_a_builder.freeze::<Rank9SelIndex>();
+    let v_a = v_a_builder.freeze::<Rank9SelIndex>();
+    let changed_e_a = changed_e_a_builder.freeze::<Rank9SelIndex>();
+    let changed_e_v = changed_e_v_builder.freeze::<Rank9SelIndex>();
+    let changed_a_e = changed_a_e_builder.freeze::<Rank9SelIndex>();
+    let changed_a_v = changed_a_v_builder.freeze::<Rank9SelIndex>();
+    let changed_v_e = changed_v_e_builder.freeze::<Rank9SelIndex>();
+    let changed_v_a = changed_v_a_builder.freeze::<Rank9SelIndex>();
+
+    let mut index_handles = persist_top_level_rank9_indexes(
+        &mut sections,
+        [
+            &e_a,
+            &a_a,
+            &v_a,
+            &changed_e_a,
+            &changed_e_v,
+            &changed_a_e,
+            &changed_a_v,
+            &changed_v_e,
+            &changed_v_a,
+        ],
+    );
+    let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
+        wavelets.freeze_with_rank9_sidecars(&mut sections)?;
+    index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
         entity_count,
         attribute_count,
         value_count,
         domain: domain.metadata(),
+        e_a: e_a.metadata(),
+        a_a: a_a.metadata(),
+        v_a: v_a.metadata(),
+        changed_e_a: changed_e_a.metadata(),
+        changed_e_v: changed_e_v.metadata(),
+        changed_a_e: changed_a_e.metadata(),
+        changed_a_v: changed_a_v.metadata(),
+        changed_v_e: changed_v_e.metadata(),
+        changed_v_a: changed_v_a.metadata(),
+        eav_c,
+        vea_c,
+        ave_c,
+        vae_c,
+        eva_c,
+        aev_c,
+    };
+
+    finalize_succinct_archive(&mut sections, &meta, &index_handles);
+    drop((
         e_a,
         a_a,
         v_a,
@@ -1729,21 +2196,9 @@ where
         changed_a_v,
         changed_v_e,
         changed_v_a,
-        eav_c,
-        vea_c,
-        ave_c,
-        vae_c,
-        eva_c,
-        aev_c,
-    };
-
-    let mut meta_sec = sections
-        .reserve::<SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>>(1)
-        .unwrap();
-    meta_sec.as_mut_slice()[0] = meta;
-    meta_sec.freeze().unwrap();
+    ));
     let bytes = area.freeze().unwrap();
-    Ok(SuccinctArchive::from_bytes(meta, bytes).unwrap())
+    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles).unwrap())
 }
 
 /// Structurally merge sorted succinct-archive segments on the default CPU
@@ -1911,8 +2366,6 @@ where
             .map(|(t, _)| t[32..64].try_into().unwrap())
             .map(|v| domain.search(&v).expect("v in domain")),
     )?;
-    let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c] = wavelets.freeze()?;
-
     let changed_e_a = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
@@ -1973,6 +2426,24 @@ where
         b.freeze::<Rank9SelIndex>()
     };
 
+    let mut index_handles = persist_top_level_rank9_indexes(
+        &mut sections,
+        [
+            &e_a,
+            &a_a,
+            &v_a,
+            &changed_e_a,
+            &changed_e_v,
+            &changed_a_e,
+            &changed_a_v,
+            &changed_v_e,
+            &changed_v_a,
+        ],
+    );
+    let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
+        wavelets.freeze_with_rank9_sidecars(&mut sections)?;
+    index_handles.extend(wavelet_index_handles);
+
     let meta = SuccinctArchiveMeta {
         entity_count,
         attribute_count,
@@ -1995,13 +2466,22 @@ where
         aev_c,
     };
 
-    let mut meta_sec = sections.reserve::<SuccinctArchiveMeta<U::Meta>>(1).unwrap();
-    meta_sec.as_mut_slice()[0] = meta.clone();
-    meta_sec.freeze().unwrap();
+    finalize_succinct_archive(&mut sections, &meta, &index_handles);
+    drop((
+        e_a,
+        a_a,
+        v_a,
+        changed_e_a,
+        changed_e_v,
+        changed_a_e,
+        changed_a_v,
+        changed_v_e,
+        changed_v_a,
+    ));
 
     let bytes = area.freeze().unwrap();
 
-    Ok(SuccinctArchive::from_bytes(meta, bytes).unwrap())
+    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles).unwrap())
 }
 
 impl<U> From<&TribleSet> for SuccinctArchive<U>
@@ -2068,6 +2548,83 @@ where
         v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'a> {
         SuccinctArchiveConstraint::new(e, a, v, self)
+    }
+}
+
+impl<U> SuccinctArchive<U>
+where
+    U: Universe + Serializable<Error = jerky::error::Error>,
+{
+    /// Attaches exact-validated persisted Rank9/select indexes in canonical
+    /// order. Unlike [`Serializable::from_bytes`], this explicit constructor
+    /// never guesses where an enclosing arena ends.
+    fn from_bytes_with_rank9_indexes(
+        meta: SuccinctArchiveMeta<U::Meta>,
+        bytes: Bytes,
+        index_handles: &[SectionHandle<usize>],
+    ) -> Result<Self, jerky::error::Error> {
+        validate_rank9_index_handles(&meta, &bytes, index_handles, bytes.len())?;
+
+        let top_level_meta = top_level_bitvector_meta(&meta);
+        let wavelet_metadata = wavelet_meta(&meta);
+        let domain = U::from_bytes(meta.domain, bytes.clone())?;
+        let mut top_level = Vec::with_capacity(TOP_LEVEL_RANK9_INDEX_COUNT);
+        for (raw_meta, index_handle) in top_level_meta
+            .into_iter()
+            .zip(index_handles.iter().copied())
+        {
+            // `validate_rank9_index_handles` preflights this raw handle before
+            // BitVectorData/AnyBytes can slice with it.
+            let data = BitVectorData::from_bytes(raw_meta, bytes.clone())?;
+            let index = Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&bytes))?;
+            top_level.push(BitVector::new(data, index));
+        }
+        let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]: [
+            BitVector<Rank9SelIndex>;
+            TOP_LEVEL_RANK9_INDEX_COUNT
+        ] = top_level.try_into().expect("nine top-level Rank9 indexes");
+
+        let mut wavelets = Vec::with_capacity(SuccinctRotation::ALL.len());
+        let mut handle_cursor = TOP_LEVEL_RANK9_INDEX_COUNT;
+        for matrix_meta in wavelet_metadata {
+            let handle_end = handle_cursor
+                .checked_add(matrix_meta.alph_width)
+                .ok_or_else(|| invalid_rank9_metadata("wavelet Rank9 handle range overflow"))?;
+            let matrix_handles = &index_handles[handle_cursor..handle_end];
+            let matrix = WaveletMatrix::from_bytes_with_persisted_indexes(
+                matrix_meta,
+                bytes.clone(),
+                matrix_handles.iter().map(|handle| handle.bytes(&bytes)),
+            )?;
+            wavelets.push(matrix);
+            handle_cursor = handle_end;
+        }
+        debug_assert_eq!(handle_cursor, index_handles.len());
+        let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [WaveletMatrix<Rank9SelIndex>; 6] =
+            wavelets.try_into().expect("six Ring wavelet matrices");
+
+        Ok(SuccinctArchive {
+            bytes,
+            domain,
+            entity_count: meta.entity_count,
+            attribute_count: meta.attribute_count,
+            value_count: meta.value_count,
+            e_a,
+            a_a,
+            v_a,
+            changed_e_a,
+            changed_e_v,
+            changed_a_e,
+            changed_a_v,
+            changed_v_e,
+            changed_v_a,
+            eav_c,
+            vea_c,
+            ave_c,
+            vae_c,
+            eva_c,
+            aev_c,
+        })
     }
 }
 
@@ -2179,7 +2736,16 @@ where
         let meta = *tail
             .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
             .map_err(|_| SuccinctArchiveError)?;
-        SuccinctArchive::from_bytes(meta, bytes).map_err(|_| SuccinctArchiveError)
+        let meta_start = tail.len();
+        match probe_rank9_sidecar_footer(&meta, &bytes, meta_start)
+            .map_err(|_| SuccinctArchiveError)?
+        {
+            Some(index_handles) => {
+                SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles)
+                    .map_err(|_| SuccinctArchiveError)
+            }
+            None => SuccinctArchive::from_bytes(meta, bytes).map_err(|_| SuccinctArchiveError),
+        }
     }
 }
 
@@ -2543,6 +3109,313 @@ mod tests {
         let rebuilt: SuccinctArchive<OrderedUniverse> = blob.try_from_blob().unwrap();
         let kb2: TribleSet = (&rebuilt).into();
         assert_eq!(kb, kb2);
+    }
+
+    fn ordered_archive_bytes(set: &TribleSet) -> (Vec<u8>, usize, Rank9SidecarFooter) {
+        let archive: SuccinctArchive<OrderedUniverse> = set.into();
+        let meta_start = archive.bytes.len()
+            - std::mem::size_of::<SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>>();
+        let footer_start = meta_start - std::mem::size_of::<Rank9SidecarFooter>();
+        let footer = *archive
+            .bytes
+            .clone()
+            .slice(footer_start..meta_start)
+            .view::<Rank9SidecarFooter>()
+            .unwrap();
+        (archive.bytes.as_ref().to_vec(), footer_start, footer)
+    }
+
+    fn write_usize(bytes: &mut [u8], offset: usize, value: usize) {
+        bytes[offset..offset + std::mem::size_of::<usize>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn decode_ordered_archive(
+        bytes: Vec<u8>,
+    ) -> Result<SuccinctArchive<OrderedUniverse>, SuccinctArchiveError> {
+        Blob::<SuccinctArchiveBlob>::new(Bytes::from_source(bytes)).try_from_blob()
+    }
+
+    fn assert_supported_sidecar_corruption_rejected(
+        mutate: impl FnOnce(&mut Vec<u8>, usize, Rank9SidecarFooter),
+    ) {
+        let set = varied_knights();
+        let (mut bytes, footer_start, footer) = ordered_archive_bytes(&set);
+        mutate(&mut bytes, footer_start, footer);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_ordered_archive(bytes)
+        }));
+        assert!(matches!(result, Ok(Err(_))));
+    }
+
+    #[test]
+    fn unknown_rank9_footer_version_falls_back_to_legacy_rebuild() {
+        let set = varied_knights();
+        let expected: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let (mut bytes, footer_start, _) = ordered_archive_bytes(&set);
+        write_u32(
+            &mut bytes,
+            footer_start + std::mem::offset_of!(Rank9SidecarFooter, version),
+            RANK9_SIDECAR_VERSION + 1,
+        );
+        let decoded = decode_ordered_archive(bytes).unwrap();
+        assert_eq!(decoded.iter().collect::<TribleSet>(), set);
+        assert_eq!(decoded.iter().collect_vec(), expected.iter().collect_vec());
+    }
+
+    #[test]
+    fn damaged_rank9_footer_marker_falls_back_to_legacy_rebuild() {
+        let set = varied_knights();
+        let (mut bytes, footer_start, _) = ordered_archive_bytes(&set);
+        bytes[footer_start] ^= 1;
+        let decoded = decode_ordered_archive(bytes).unwrap();
+        assert_eq!(decoded.iter().collect::<TribleSet>(), set);
+    }
+
+    #[test]
+    fn supported_rank9_footer_rejects_flags_table_and_handle_corruption_without_panicking() {
+        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, _| {
+            write_u32(
+                bytes,
+                footer_start + std::mem::offset_of!(Rank9SidecarFooter, flags),
+                1,
+            );
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, footer| {
+            write_usize(
+                bytes,
+                footer_start
+                    + std::mem::offset_of!(Rank9SidecarFooter, indexes)
+                    + std::mem::offset_of!(SectionHandle<SectionHandle<usize>>, len),
+                footer.indexes.len - std::mem::size_of::<SectionHandle<usize>>(),
+            );
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            write_usize(bytes, footer.indexes.offset, usize::MAX);
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            write_usize(bytes, footer.indexes.offset, usize::MAX - 3);
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            let first_offset = usize::from_ne_bytes(
+                bytes[footer.indexes.offset..footer.indexes.offset + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            write_usize(bytes, footer.indexes.offset, first_offset + 1);
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            let first_offset = usize::from_ne_bytes(
+                bytes[footer.indexes.offset..footer.indexes.offset + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            write_usize(
+                bytes,
+                footer.indexes.offset + std::mem::size_of::<SectionHandle<usize>>(),
+                first_offset,
+            );
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, _| {
+            write_usize(
+                bytes,
+                footer_start + std::mem::offset_of!(Rank9SidecarFooter, indexes),
+                usize::MAX,
+            );
+        });
+        assert_supported_sidecar_corruption_rejected(|bytes, _, _| {
+            type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
+            let meta_start = bytes.len() - std::mem::size_of::<Meta>();
+            let raw_handle_offset = meta_start
+                + std::mem::offset_of!(Meta, e_a)
+                + std::mem::offset_of!(BitVectorDataMeta, handle)
+                + std::mem::offset_of!(SectionHandle<u64>, offset);
+            write_usize(bytes, raw_handle_offset, usize::MAX);
+        });
+    }
+
+    #[test]
+    fn supported_rank9_footer_rejects_rank_and_trailing_payload_corruption() {
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            let first_handle = footer
+                .indexes
+                .view(&Bytes::from_source(bytes.clone()))
+                .unwrap()[0];
+            let rank_word = first_handle.offset + 2 * std::mem::size_of::<usize>();
+            let old = usize::from_ne_bytes(
+                bytes[rank_word..rank_word + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            );
+            write_usize(bytes, rank_word, old ^ 1);
+        });
+
+        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
+            let area = Bytes::from_source(bytes.clone());
+            let handles = footer.indexes.view(&area).unwrap();
+            let first = handles[0];
+            let second = handles[1];
+            write_usize(
+                bytes,
+                footer.indexes.offset + std::mem::size_of::<usize>(),
+                first.len + std::mem::size_of::<usize>(),
+            );
+            write_usize(
+                bytes,
+                footer.indexes.offset + std::mem::size_of::<SectionHandle<usize>>(),
+                second.offset + std::mem::size_of::<usize>(),
+            );
+            write_usize(
+                bytes,
+                footer.indexes.offset
+                    + std::mem::size_of::<SectionHandle<usize>>()
+                    + std::mem::size_of::<usize>(),
+                second.len - std::mem::size_of::<usize>(),
+            );
+        });
+    }
+
+    #[test]
+    fn supported_rank9_footer_rejects_hint_corruption() {
+        let rows = (0..1026).map(|ordinal| {
+            let mut data = [0u8; 64];
+            data[..16].fill(0x31);
+            data[16..32].fill(0x41);
+            data[32..56].fill(0x90);
+            data[56..].copy_from_slice(&(ordinal as u64).to_be_bytes());
+            Trible { data }
+        });
+        let set: TribleSet = rows.collect();
+        let (mut bytes, _, footer) = ordered_archive_bytes(&set);
+        let area = Bytes::from_source(bytes.clone());
+        let handles = footer.indexes.view(&area).unwrap();
+        let changed_e_v = handles[4];
+        let read_word = |position: usize| {
+            usize::from_ne_bytes(
+                bytes[position..position + std::mem::size_of::<usize>()]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let brp_len = read_word(changed_e_v.offset + std::mem::size_of::<usize>());
+        let select1_flag = changed_e_v.offset + (2 + brp_len) * std::mem::size_of::<usize>();
+        assert_eq!(read_word(select1_flag), 1);
+        let first_hint = select1_flag + 2 * std::mem::size_of::<usize>();
+        let old_hint = read_word(first_hint);
+        write_usize(&mut bytes, first_hint, old_hint ^ 1);
+        assert!(decode_ordered_archive(bytes).is_err());
+    }
+
+    #[derive(
+        Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
+    )]
+    #[repr(C, align(64))]
+    struct Align64Meta([u8; 64]);
+
+    #[test]
+    fn high_alignment_metadata_uses_zero_pre_footer_padding() {
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let mut leading = sections.reserve::<u64>(1).unwrap();
+        leading[0] = 0;
+        leading.freeze().unwrap();
+
+        let prefix_builders: Vec<_> = (0..3)
+            .map(|_| BitVectorBuilder::from_bit(false, 1, &mut sections).unwrap())
+            .collect();
+        let mut wavelet_builders: Vec<_> = (0..6)
+            .map(|_| WaveletMatrixBuilder::with_capacity(1, 1, &mut sections).unwrap())
+            .collect();
+        for builder in &mut wavelet_builders {
+            builder.set_int(0, 0).unwrap();
+        }
+        let changed_builders: Vec<_> = (0..6)
+            .map(|_| BitVectorBuilder::from_bit(false, 1, &mut sections).unwrap())
+            .collect();
+
+        let mut prefix: Vec<_> = prefix_builders
+            .into_iter()
+            .map(|builder| builder.freeze::<Rank9SelIndex>())
+            .collect();
+        let mut changed: Vec<_> = changed_builders
+            .into_iter()
+            .map(|builder| builder.freeze::<Rank9SelIndex>())
+            .collect();
+        let mut index_handles = persist_top_level_rank9_indexes(
+            &mut sections,
+            [
+                &prefix[0],
+                &prefix[1],
+                &prefix[2],
+                &changed[0],
+                &changed[1],
+                &changed[2],
+                &changed[3],
+                &changed[4],
+                &changed[5],
+            ],
+        );
+        let mut matrix_meta = Vec::new();
+        for builder in wavelet_builders {
+            let matrix = builder.freeze::<Rank9SelIndex>().unwrap();
+            matrix_meta.push(matrix.metadata());
+            index_handles.extend(matrix.persist_layer_indexes(&mut sections).unwrap());
+        }
+        let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [WaveletMatrixMeta; 6] =
+            matrix_meta.try_into().unwrap();
+        let meta = SuccinctArchiveMeta {
+            entity_count: 0,
+            attribute_count: 0,
+            value_count: 0,
+            domain: Align64Meta([0; 64]),
+            e_a: prefix[0].metadata(),
+            a_a: prefix[1].metadata(),
+            v_a: prefix[2].metadata(),
+            changed_e_a: changed[0].metadata(),
+            changed_e_v: changed[1].metadata(),
+            changed_a_e: changed[2].metadata(),
+            changed_a_v: changed[3].metadata(),
+            changed_v_e: changed[4].metadata(),
+            changed_v_a: changed[5].metadata(),
+            eav_c,
+            vea_c,
+            ave_c,
+            vae_c,
+            eva_c,
+            aev_c,
+        };
+        finalize_succinct_archive(&mut sections, &meta, &index_handles);
+        prefix.clear();
+        changed.clear();
+        let bytes = area.freeze().unwrap();
+
+        let meta_start = bytes.len() - std::mem::size_of::<SuccinctArchiveMeta<Align64Meta>>();
+        let footer_start = meta_start - std::mem::size_of::<Rank9SidecarFooter>();
+        let footer = *bytes
+            .clone()
+            .slice(footer_start..meta_start)
+            .view::<Rank9SidecarFooter>()
+            .unwrap();
+        let table_end = footer.indexes.offset + footer.indexes.len;
+        assert!(footer_start > table_end);
+        assert!(bytes.as_ref()[table_end..footer_start]
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(
+            footer_start + std::mem::size_of::<Rank9SidecarFooter>(),
+            meta_start
+        );
+        assert!(probe_rank9_sidecar_footer(&meta, &bytes, meta_start)
+            .unwrap()
+            .is_some());
+
+        let mut corrupted = bytes.as_ref().to_vec();
+        corrupted[table_end] = 1;
+        let corrupted = Bytes::from_source(corrupted);
+        assert!(probe_rank9_sidecar_footer(&meta, &corrupted, meta_start).is_err());
     }
 
     fn rotation_codes(
@@ -2940,7 +3813,9 @@ mod tests {
                 }
                 parallel.finish_rotation(rotation).unwrap();
             }
-            parallel.freeze().unwrap();
+            parallel
+                .freeze_with_rank9_sidecars(&mut parallel_sections)
+                .unwrap();
             drop(parallel_sections);
             parallel_area.freeze().unwrap().as_ref().to_vec()
         });
@@ -2962,7 +3837,9 @@ mod tests {
             }
             reference.finish_rotation(rotation).unwrap();
         }
-        reference.freeze().unwrap();
+        reference
+            .freeze_with_rank9_sidecars(&mut reference_sections)
+            .unwrap();
         drop(reference_sections);
         let reference_bytes = reference_area.freeze().unwrap();
 

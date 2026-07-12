@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Succinct archives persist their Rank9/select indexes as additive sidecars.**
+  Writers append exact native-`usize` Rank9 payloads, a canonical handle table,
+  and a versioned footer immediately before the unchanged EOF
+  `SuccinctArchiveMeta`; all legacy raw sections and offsets remain
+  byte-identical, so pre-sidecar readers still query new archives and new
+  readers rebuild indexes for legacy or unknown-version archives. Supported
+  sidecar attachment avoids index-sized allocation, exactly validates every raw
+  bit plane, and treats malformed v1 footers as corruption. Structural,
+  direct, packed CPU, Jerky fallback, and accelerator-backed builders share the
+  same finalizer and canonical handle order. The 16-byte footer marker
+  `6BE4FFC8E6F5A51A1294BE9B0F498FEA` was minted with `trible genid` on
+  2026-07-12.
 - **Piles have an experimental, opt-in mapped locator snapshot.**
   `MappedPileIndex` builds a checksummed `.pidx` cache with sorted blob, pin,
   and weak-pin tables, using bounded external-sort runs instead of another
