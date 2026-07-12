@@ -99,9 +99,9 @@ macro_rules! assert_all_engines_match {
             $label
         );
         prop_assert_eq!(
-            multiset(($query).solve_dag_lazy().soft_partition(8)),
+            multiset(($query).solve_dag_lazy().agglomerative_partition()),
             expected.clone(),
-            "{}: guarded soft partition",
+            "{}: agglomerative partition",
             $label
         );
         prop_assert_eq!(

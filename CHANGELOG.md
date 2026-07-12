@@ -50,14 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each block by its per-row preferred next variable, and merges routes that
   reconverge on the same set. Demand-adaptive chunk width starts with
   depth-first, first-result-oriented execution and grows into readiness-gated
-  batch harvesting. Whenever a block's exact per-row choices split, guarded
-  soft bucketing considers one deterministic best-star contraction onto every
-  possible variable hub, including zero-winner hubs. Only complete preferred
-  groups whose rows all fit the pointwise regret bound may move; exact grouping
-  remains the fallback. This removes the unrelated 256-row eligibility cutoff
-  and repeated envelope/greedy-cover passes while retaining the scale-free 8×
-  candidate-work/group-count tradeoff. The configurable probe is now the
-  one-argument `soft_partition(max_row_inflation)`.
+  batch harvesting. Whenever a block's exact per-row choices split, those
+  complete groups become the leaves of an agglomerative merge hierarchy. A
+  source group may move to active target `v` only when every row's binary
+  estimate-magnitude regret fits the bit length of
+  `{v} ∪ (influence(v) ∩ unbound)`; zero-estimate rows require zero work. At
+  each hierarchy level the compatible absorption with the least resulting
+  candidate estimate wins. Merging continues to the coarsest admissible level,
+  and compatibility is conjoined after each merge so one outlier preserves its
+  complete exact group.
+  This removes both the old 256-row eligibility cutoff and the fixed 8× guard:
+  batching tolerance now comes from the scheduler's existing logarithmic
+  cardinality resolution and the query's influence topology. The configurable
+  probe is `agglomerative_partition()`.
   `Query::sequential()` explicitly selects the scalar
   block-of-one DFS specialization, while fresh rayon iteration retains its
   established DFS splitter. Fully-bound rows stay raw until the consumer pulls

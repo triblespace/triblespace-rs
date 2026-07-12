@@ -980,8 +980,8 @@ enum QueryScheduler {
 /// and returns the results of the query as a stream of values.
 /// The ordinary iterator uses a lazy DAG worklist that starts with narrow,
 /// depth-first chunks and widens as the consumer keeps pulling. Split blocks
-/// may softly coalesce into fewer estimate-guarded batches when
-/// pointwise candidate inflation remains bounded. Use
+/// may agglomerate compatible exact-choice groups into fewer batches using
+/// estimate magnitudes and the query's influence topology. Use
 /// [`Query::sequential`] for the scalar depth-first specialization.
 /// The query engine is designed to be simple and efficient, providing low, consistent,
 /// and predictable latency, skew resistance, and no required (or possible) tuning.
@@ -1168,7 +1168,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let mut it = self.solve_dag_lazy().start_width(usize::MAX);
         it.state.merge = false;
         it.state.grouped = false;
-        it.state.soft_partition = None;
+        it.state.agglomerative_partition = false;
         it.collect()
     }
 
@@ -1380,14 +1380,14 @@ fn variable_order_key(
     base_estimate: usize,
     influence_count: usize,
 ) -> (u64, u64, u64) {
-    let magnitude = estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64;
+    let magnitude = estimate_magnitude(estimate);
     let inv_magnitude = u64::MAX - magnitude;
     let influence = influence_count as u64;
     match order_key_mode() {
         OrderKeyMode::Default => (inv_magnitude, influence, 0),
         OrderKeyMode::InfluenceFirst => (influence, inv_magnitude, 0),
         OrderKeyMode::RatioFirst => {
-            let base_magnitude = base_estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64;
+            let base_magnitude = estimate_magnitude(base_estimate);
             let drop = base_magnitude.saturating_sub(magnitude);
             (drop, inv_magnitude, influence)
         }
@@ -1396,6 +1396,11 @@ fn variable_order_key(
             (dropped, inv_magnitude, influence)
         }
     }
+}
+
+#[inline]
+fn estimate_magnitude(estimate: usize) -> u64 {
+    estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64
 }
 
 /// PROBE (order-key experiment): cheap realized-variable-order trace. Off
@@ -1509,11 +1514,11 @@ pub mod blocked_stats {
         /// variable. Present when the grouped scheduler computed the full
         /// estimate matrix.
         pub preferred_estimate_sum: Option<u128>,
-        /// Number of exact per-row preferred-variable groups before any soft
+        /// Number of exact per-row preferred-variable groups before any
         /// coalescing. The scheduled count is `group_sizes.len()`.
         pub preferred_group_count: Option<usize>,
         /// Estimate sum under the scheduled assignment. Equals the preferred
-        /// sum when no soft plan ran or the exact plan won.
+        /// sum when no agglomerative plan ran or no merge was admissible.
         pub scheduled_estimate_sum: Option<u128>,
         /// Actual maximum pointwise estimate inflation in the scheduled plan,
         /// rounded up. `None` means the planner was disabled/ineligible; `1`
@@ -2003,7 +2008,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Narrow pops keep first-result latency sequential-class; sustained
     /// pulling widens to full harvest batches.
     ///
-    /// **Scheduling — sprint vs harvest.** Width, pop order, and soft
+    /// **Scheduling — sprint vs harvest.** Width, pop order, and group
     /// assignments are correctness-free (any valid next-variable choice and
     /// pop order yields the same result multiset), but they interact: a
     /// partially drained bucket's remainder is a strict subset of its own
@@ -2019,14 +2024,22 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// computation is the eager [`solve_dag`](Self::solve_dag) algorithm
     /// on the remaining state.
     ///
-    /// **Soft bucketing.** Whenever a popped block genuinely splits across
-    /// per-row preferred variables, a guarded best-star pass considers every
-    /// unbound variable as a possible hub. It moves only complete preferred
-    /// groups whose every row stays within the 8× pointwise estimate bound,
-    /// and scores each complete star against exact grouping. A one-row chunk
-    /// is naturally ineligible because it cannot split; no independent width
-    /// cutoff is needed. Estimates affect scheduling only; exact
-    /// proposal/confirmation semantics are unchanged.
+    /// **Agglomerative grouping.** Whenever a popped block genuinely splits
+    /// across per-row preferred variables, exact-choice groups are the leaves
+    /// of a merge hierarchy. A complete source group may move to target `v`
+    /// only when every row's binary estimate-magnitude regret fits the bit
+    /// length of `{v} ∪ (influence(v) ∩ unbound)`. At each level, the
+    /// compatible absorption with the least resulting candidate estimate is
+    /// chosen; merging continues to the coarsest admissible level of that
+    /// hierarchy. A one-row chunk is naturally ineligible because it cannot
+    /// split, and no width or fixed-inflation cutoff is involved. Estimates
+    /// affect scheduling only; exact proposal/confirmation semantics are
+    /// unchanged.
+    ///
+    /// For `R` rows and `V ≤ 128` unbound variables, planning takes
+    /// `O(RV + V³)` time and `O(R + V²)` reusable scratch space: the planner
+    /// builds row/group compatibility once, then rescans the active directed
+    /// edges for at most `V - 1` absorptions.
     ///
     /// Semantics: fully drained, the same result **multiset** as the
     /// sequential iterator and the eager DAG solver; row order differs.
@@ -2104,16 +2117,6 @@ fn lazy_growth() -> usize {
         .unwrap_or(2)
 }
 
-/// Maximum pointwise estimate inflation considered by the default soft
-/// partition. Exact grouping remains a candidate and wins whenever no complete
-/// source-group contraction earns its batching cost.
-const LAZY_SOFT_MAX_ROW_INFLATION: usize = 8;
-
-/// Candidate-work/group-count exchange rate. A grouped plan and a one-group
-/// plan costing exactly this multiple of the grouped estimate receive the
-/// same score; intermediate group counts interpolate between those endpoints.
-const LAZY_SOFT_GROUP_TRADEOFF: usize = 8;
-
 /// PROBE (lazy-dag): the resumable bucket-worklist engine behind
 /// [`Query::solve_dag_lazy`]. See there for the design; per-instance state
 /// is exactly `{worklist buckets, raw staged rows, postprocessing, width}`.
@@ -2146,44 +2149,39 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
     /// trivial one-variable-per-block partition once a resumption reaches
     /// `width` rows.
     ///
-    /// This replaces the ordinary guarded soft-bucketing policy with an
+    /// This replaces the ordinary agglomerative grouping policy with an
     /// unconditional transition. A threshold above the start width keeps the
     /// width-one first-result sprint unchanged. This changes only search order
     /// and batching; fully drained result multisets are unchanged.
     pub fn trivial_partition_at_width(mut self, width: usize) -> Self {
         self.state.grouped = true;
-        self.state.soft_partition = None;
+        self.state.agglomerative_partition = false;
         self.state.trivial_partition_width = Some(width.max(1));
         self
     }
 
-    /// PROBE: overrides the default soft partition policy. Whenever a block's
-    /// rows genuinely prefer more than one next variable, complete preferred
-    /// groups may contract onto a common hub. Every moved row is bounded by
-    /// `max_row_inflation` times its preferred estimate, and exact grouping is
-    /// retained whenever no contraction improves the candidate-work/group-count
-    /// score.
+    /// PROBE: selects the topology-scaled agglomerative partition policy.
+    /// Starting from exact per-row preferred-variable groups, the planner
+    /// repeatedly absorbs the least-work compatible complete group and returns
+    /// the coarsest admissible level of the resulting hierarchy.
     ///
     /// This is a scheduling and batching choice only; it cannot add or remove
     /// solutions. A one-row chunk has only one preferred group naturally, so
     /// eligibility follows from the split itself rather than scheduler width.
-    pub fn soft_partition(mut self, max_row_inflation: usize) -> Self {
+    pub fn agglomerative_partition(mut self) -> Self {
         self.state.grouped = true;
         self.state.trivial_partition_width = None;
-        self.state.soft_partition = Some(SoftPartition {
-            max_row_inflation: max_row_inflation.max(1),
-            group_tradeoff: LAZY_SOFT_GROUP_TRADEOFF,
-        });
+        self.state.agglomerative_partition = true;
         self
     }
 
     /// PROBE: pins per-row preferred-variable grouping for every pop. This is
-    /// the control behind the eager/grouped solvers and disables both soft
-    /// and unconditional whole-block partition transitions.
+    /// the control behind the eager/grouped solvers and disables both
+    /// agglomeration and unconditional whole-block partition transitions.
     pub fn grouped_partition(mut self) -> Self {
         self.state.grouped = true;
         self.state.trivial_partition_width = None;
-        self.state.soft_partition = None;
+        self.state.agglomerative_partition = false;
         self
     }
 
@@ -2240,16 +2238,16 @@ pub(crate) struct DagState {
     /// Experimental width at which later resumptions use the trivial
     /// partition. `None` preserves grouped scheduling throughout.
     trivial_partition_width: Option<usize>,
-    /// Per-pop guarded best-star batching policy. Unlike
+    /// Per-pop topology-scaled agglomerative batching policy. Unlike
     /// `trivial_partition_width`, this never disables grouped ordering
-    /// permanently: every eligible pop computes its own soft partition.
-    soft_partition: Option<SoftPartition>,
+    /// permanently: every eligible pop computes its own merge hierarchy.
+    agglomerative_partition: bool,
     /// Pooled per-pop scratch — the worklist loop is allocation-free in
     /// steady state (bucket row stores and their `vars` are the only
     /// per-pop allocations left, and those are the product, not scratch).
     scratch: DagScratch,
     #[cfg(test)]
-    softened_pops: usize,
+    coalesced_pops: usize,
 }
 
 /// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
@@ -2265,14 +2263,14 @@ struct DagScratch {
     est: Vec<usize>,
     /// Per-row preferred-variable index (into `unbound`).
     preferred: Vec<u32>,
-    /// Candidate and incumbent assignments for soft star planning.
-    soft_assignment: Vec<u32>,
-    soft_best: Vec<u32>,
-    /// Per-variable source/hub estimate sums.
-    soft_source_cost: Vec<u128>,
-    soft_cost: Vec<u128>,
-    /// Per-source compatibility / move decision for the current hub.
-    soft_selected: Vec<bool>,
+    /// Current group owners and retained row assignment.
+    group_owners: Vec<u32>,
+    group_assignment: Vec<u32>,
+    /// Current-group × target-variable estimate sums and compatibility.
+    group_estimate_sums: Vec<u128>,
+    group_compatible: Vec<bool>,
+    /// Active groups in the agglomerative hierarchy.
+    group_active: Vec<bool>,
     /// Rows per group.
     group_counts: Vec<usize>,
     /// Group start offsets (rows).
@@ -2299,11 +2297,11 @@ impl Default for DagScratch {
             parent_vars: Vec::new(),
             est: Vec::new(),
             preferred: Vec::new(),
-            soft_assignment: Vec::new(),
-            soft_best: Vec::new(),
-            soft_source_cost: Vec::new(),
-            soft_cost: Vec::new(),
-            soft_selected: Vec::new(),
+            group_owners: Vec::new(),
+            group_assignment: Vec::new(),
+            group_estimate_sums: Vec::new(),
+            group_compatible: Vec::new(),
+            group_active: Vec::new(),
             group_counts: Vec::new(),
             starts: Vec::new(),
             cursors: Vec::new(),
@@ -2339,25 +2337,16 @@ impl DagState {
             merge: true,
             grouped: true,
             trivial_partition_width: None,
-            soft_partition: Some(SoftPartition {
-                max_row_inflation: LAZY_SOFT_MAX_ROW_INFLATION,
-                group_tradeoff: LAZY_SOFT_GROUP_TRADEOFF,
-            }),
+            agglomerative_partition: true,
             scratch: DagScratch::default(),
             #[cfg(test)]
-            softened_pops: 0,
+            coalesced_pops: 0,
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct SoftPartition {
-    max_row_inflation: usize,
-    group_tradeoff: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SoftPlan {
+struct AgglomerativePlan {
     preferred_groups: usize,
     scheduled_groups: usize,
     preferred_estimate_sum: u128,
@@ -2366,18 +2355,9 @@ struct SoftPlan {
 }
 
 #[inline]
-fn estimate_within_factor(estimate: usize, baseline: usize, factor: usize) -> bool {
-    (estimate as u128) <= (baseline as u128).saturating_mul(factor as u128)
-}
-
-#[inline]
 fn estimate_inflation(estimate: usize, baseline: usize) -> usize {
     if baseline == 0 {
-        debug_assert_eq!(
-            estimate, 0,
-            "a finite pointwise envelope cannot move a zero row"
-        );
-        return 1;
+        return if estimate == 0 { 1 } else { usize::MAX };
     }
     let estimate = estimate as u128;
     let baseline = baseline as u128;
@@ -2385,53 +2365,35 @@ fn estimate_inflation(estimate: usize, baseline: usize) -> usize {
     usize::try_from(rounded_up).unwrap_or(usize::MAX).max(1)
 }
 
-#[inline]
-fn soft_plan_score(
-    estimate_sum: u128,
-    groups: usize,
-    preferred_sum: u128,
-    preferred_groups: usize,
-    group_tradeoff: usize,
-) -> u128 {
-    debug_assert!(preferred_groups > 1);
-    if preferred_sum == 0 {
-        return groups as u128;
-    }
-    estimate_sum
-        .saturating_mul((preferred_groups - 1) as u128)
-        .saturating_add(
-            preferred_sum
-                .saturating_mul(group_tradeoff.saturating_sub(1) as u128)
-                .saturating_mul(groups.saturating_sub(1) as u128),
-        )
-}
-
-/// Approximate the guarded facility-location partition induced by `est` with
-/// one deterministic best-star contraction.
+/// Builds a deterministic minimum-regret merge hierarchy over the exact
+/// per-row preferred-variable groups and returns its coarsest compatible level.
 ///
-/// The exact per-row assignment in `preferred` is always the incumbent. Every
-/// unbound variable, including a zero-winner variable that is not currently an
-/// open group, is considered as a hub. A preferred source group is indivisible:
-/// it may move to the hub only when every one of its rows fits the pointwise
-/// estimate envelope. For a fixed hub, score changes are additive after the hub
-/// is open, so the best complete star absorbs exactly the compatible source
-/// groups whose marginal score is non-increasing. An unopened hub pays one
-/// group-opening charge in the exact candidate score. The best complete star
-/// across all hubs then competes with exact grouping under [`soft_plan_score`].
+/// A whole source group may be absorbed by target `v` only when every row's
+/// estimate-magnitude regret fits `v`'s influence neighborhood. The allowance
+/// is the bit length of `{v} ∪ (influence(v) ∩ unbound)`: the same logarithmic
+/// cardinality resolution used by variable ordering, scaled by how many still
+/// relevant downstream estimates binding `v` can change. Zero-estimate rows
+/// remain compatible only with zero work. This replaces a workload-specific
+/// fixed ratio with query topology.
+///
+/// Among admissible absorptions each hierarchy edge minimizes total estimated
+/// candidate work; every successful edge removes one proposal group. Exact
+/// grouping is the first level and remains the result when no groups are
+/// compatible.
 #[allow(clippy::too_many_arguments)]
-fn plan_soft_partition(
+fn plan_agglomerative_partition(
     est: &[usize],
     rows: usize,
     unbound: &[VariableId],
+    influences: &[VariableSet; 128],
     preferred: &[u32],
     preferred_counts: &[usize],
-    policy: SoftPartition,
-    assignment: &mut Vec<u32>,
+    owners: &mut Vec<u32>,
     best_assignment: &mut Vec<u32>,
-    source_cost: &mut Vec<u128>,
-    hub_cost: &mut Vec<u128>,
-    moved_sources: &mut Vec<bool>,
-) -> SoftPlan {
+    group_sums: &mut Vec<u128>,
+    compatible: &mut Vec<bool>,
+    active: &mut Vec<bool>,
+) -> AgglomerativePlan {
     let variables = unbound.len();
     debug_assert_eq!(est.len(), variables * rows);
     debug_assert_eq!(preferred.len(), rows);
@@ -2440,148 +2402,132 @@ fn plan_soft_partition(
     let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
     debug_assert!(preferred_groups > 1);
 
-    source_cost.clear();
-    source_cost.resize(variables, 0);
-    let mut preferred_estimate_sum = 0u128;
+    // The matrices hold sufficient statistics for evaluating every row
+    // currently owned by `source` on `target`.
+    group_sums.clear();
+    group_sums.resize(variables * variables, 0);
+    compatible.clear();
+    compatible.resize(variables * variables, true);
+    let mut unbound_set = VariableSet::new_empty();
+    for &variable in unbound {
+        unbound_set.set(variable);
+    }
+    let mut magnitude_allowances = [0u64; 128];
+    for target in 0..variables {
+        let variable = unbound[target];
+        let neighborhood = influences[variable]
+            .intersect(unbound_set)
+            .union(VariableSet::new_singleton(variable));
+        magnitude_allowances[target] = estimate_magnitude(neighborhood.count());
+    }
     for (row, &source) in preferred.iter().enumerate() {
-        let estimate = est[source as usize * rows + row] as u128;
-        source_cost[source as usize] = source_cost[source as usize].saturating_add(estimate);
-        preferred_estimate_sum = preferred_estimate_sum.saturating_add(estimate);
+        let source = source as usize;
+        let baseline = est[source * rows + row];
+        let baseline_magnitude = estimate_magnitude(baseline);
+        for target in 0..variables {
+            let estimate = est[target * rows + row];
+            let slot = source * variables + target;
+            group_sums[slot] += estimate as u128;
+            compatible[slot] &= if baseline == 0 {
+                estimate == 0
+            } else {
+                estimate_magnitude(estimate).saturating_sub(baseline_magnitude)
+                    <= magnitude_allowances[target]
+            };
+        }
     }
 
+    active.clear();
+    active.extend(preferred_counts.iter().map(|&count| count > 0));
+    owners.clear();
+    owners.extend((0..variables).map(|variable| variable as u32));
+
+    let preferred_estimate_sum: u128 = (0..variables)
+        .filter(|&source| active[source])
+        .map(|source| group_sums[source * variables + source])
+        .sum();
+    let mut work = preferred_estimate_sum;
+    let mut groups = preferred_groups;
     best_assignment.clear();
-    best_assignment.extend_from_slice(preferred);
-    let mut best = SoftPlan {
+    best_assignment.extend_from_slice(owners);
+    let mut best = AgglomerativePlan {
         preferred_groups,
         scheduled_groups: preferred_groups,
         preferred_estimate_sum,
         scheduled_estimate_sum: preferred_estimate_sum,
         row_inflation: 1,
     };
-    let mut best_score = soft_plan_score(
-        best.scheduled_estimate_sum,
-        best.scheduled_groups,
-        preferred_estimate_sum,
-        preferred_groups,
-        policy.group_tradeoff,
-    );
-
-    let candidate_scale = (preferred_groups - 1) as u128;
-    let group_credit =
-        preferred_estimate_sum.saturating_mul(policy.group_tradeoff.saturating_sub(1) as u128);
-    let mut best_hub: Option<VariableId> = None;
-
-    for hub in 0..variables {
-        hub_cost.clear();
-        hub_cost.resize(variables, 0);
-        moved_sources.clear();
-        moved_sources.resize(variables, false);
+    while groups > 1 {
+        // Every candidate level has the same `groups - 1`; the least-work
+        // directed absorption is therefore the least-regret edge in this
+        // hierarchy. Work ties use stable variable ids.
+        let mut merge: Option<(u128, VariableId, VariableId, usize, usize)> = None;
         for source in 0..variables {
-            moved_sources[source] = preferred_counts[source] > 0 && source != hub;
-        }
-
-        // Compatibility is deliberately group-atomic: one bad row keeps its
-        // entire exact preferred group off this hub.
-        for (row, &source) in preferred.iter().enumerate() {
-            let source = source as usize;
-            if source == hub {
+            if !active[source] {
                 continue;
             }
-            let estimate = est[hub * rows + row];
-            hub_cost[source] = hub_cost[source].saturating_add(estimate as u128);
-            let baseline = est[source * rows + row];
-            if !estimate_within_factor(estimate, baseline, policy.max_row_inflation) {
-                moved_sources[source] = false;
-            }
-        }
-
-        let mut moved = 0usize;
-        for source in 0..variables {
-            if !moved_sources[source] {
-                continue;
-            }
-            // Once the hub is open, absorbing this source removes one group.
-            // Include equality: the complete score ties and the deterministic
-            // secondary objective prefers fewer groups.
-            let moved_work = hub_cost[source].saturating_mul(candidate_scale);
-            let retained_work = source_cost[source]
-                .saturating_mul(candidate_scale)
-                .saturating_add(group_credit);
-            moved_sources[source] = moved_work <= retained_work;
-            moved += moved_sources[source] as usize;
-        }
-        if moved == 0 {
-            continue;
-        }
-
-        let groups = preferred_groups - moved + usize::from(preferred_counts[hub] == 0);
-        let mut estimate_sum = preferred_estimate_sum;
-        for source in 0..variables {
-            if moved_sources[source] {
-                estimate_sum = estimate_sum
-                    .saturating_sub(source_cost[source])
-                    .saturating_add(hub_cost[source]);
-            }
-        }
-        let score = soft_plan_score(
-            estimate_sum,
-            groups,
-            preferred_estimate_sum,
-            preferred_groups,
-            policy.group_tradeoff,
-        );
-        if score > best_score || (score == best_score && groups > best.scheduled_groups) {
-            continue;
-        }
-
-        // Division is needed only for a star that can still beat the incumbent;
-        // most rejected hubs never pay this second row scan.
-        let mut actual_inflation = 1usize;
-        for (row, &source) in preferred.iter().enumerate() {
-            let source = source as usize;
-            if moved_sources[source] {
-                actual_inflation = actual_inflation.max(estimate_inflation(
-                    est[hub * rows + row],
-                    est[source * rows + row],
-                ));
-            }
-        }
-        let deterministic_hub_tie = best_hub.is_some_and(|current| unbound[hub] < current);
-        let better = groups <= preferred_groups
-            && (score < best_score
-                || (score == best_score
-                    && (groups < best.scheduled_groups
-                        || (groups == best.scheduled_groups
-                            && (actual_inflation < best.row_inflation
-                                || (actual_inflation == best.row_inflation
-                                    && (estimate_sum < best.scheduled_estimate_sum
-                                        || (estimate_sum == best.scheduled_estimate_sum
-                                            && deterministic_hub_tie))))))));
-        if better {
-            best_score = score;
-            best_hub = Some(unbound[hub]);
-            best = SoftPlan {
-                preferred_groups,
-                scheduled_groups: groups,
-                preferred_estimate_sum,
-                scheduled_estimate_sum: estimate_sum,
-                row_inflation: actual_inflation,
-            };
-            assignment.clear();
-            assignment.reserve(rows);
-            assignment.extend(preferred.iter().map(|&source| {
-                let source = source as usize;
-                if moved_sources[source] {
-                    hub as u32
-                } else {
-                    source as u32
+            let source_self_slot = source * variables + source;
+            for target in 0..variables {
+                if source == target || !active[target] {
+                    continue;
                 }
-            }));
-            best_assignment.clear();
-            best_assignment.extend_from_slice(assignment);
+                let source_target_slot = source * variables + target;
+                if !compatible[source_target_slot] {
+                    continue;
+                }
+                let new_work = work - group_sums[source_self_slot] + group_sums[source_target_slot];
+                let candidate = (new_work, unbound[target], unbound[source], source, target);
+                if merge.as_ref().is_none_or(|current| candidate < *current) {
+                    merge = Some(candidate);
+                }
+            }
         }
+        let Some((new_work, _, _, source, target)) = merge else {
+            break;
+        };
+
+        for variable in 0..variables {
+            let target_slot = target * variables + variable;
+            let source_slot = source * variables + variable;
+            group_sums[target_slot] += group_sums[source_slot];
+            compatible[target_slot] &= compatible[source_slot];
+        }
+        active[source] = false;
+        for owner in owners.iter_mut() {
+            if *owner as usize == source {
+                *owner = target as u32;
+            }
+        }
+        work = new_work;
+        groups -= 1;
+        best.scheduled_groups = groups;
+        best.scheduled_estimate_sum = work;
+        best_assignment.clear();
+        best_assignment.extend_from_slice(owners);
     }
 
+    // Expand the retained group-owner map to one scheduled variable per row.
+    owners.clear();
+    owners.reserve(rows);
+    owners.extend(
+        preferred
+            .iter()
+            .map(|&source| best_assignment[source as usize]),
+    );
+    std::mem::swap(owners, best_assignment);
+
+    best.row_inflation = preferred
+        .iter()
+        .zip(best_assignment.iter())
+        .enumerate()
+        .map(|(row, (&source, &target))| {
+            estimate_inflation(
+                est[target as usize * rows + row],
+                est[source as usize * rows + row],
+            )
+        })
+        .max()
+        .unwrap_or(1);
     best
 }
 
@@ -2861,8 +2807,8 @@ impl DagState {
 
         // 2. Per-row preferred variable: argmax of the engine's ordering
         //    key over the row's matrix entries. Any genuinely split block is
-        //    eligible for soft planning; blocks of one are naturally uniform.
-        let soft = self.soft_partition;
+        //    eligible for agglomeration; blocks of one are naturally uniform.
+        let agglomerative = self.agglomerative_partition;
         scratch.preferred.clear();
         scratch.group_counts.clear();
         scratch.group_counts.resize(n_unbound, 0);
@@ -2893,22 +2839,22 @@ impl DagState {
         let mut scheduled_sum = preferred_sum;
         let mut row_inflation = None;
 
-        // 3. Replace the endpoint dichotomy with one guarded best-star
-        //    contraction of complete exact-preference groups. Eligibility is
-        //    the existence of a split, not scheduler width.
-        if let Some(policy) = soft.filter(|_| preferred_groups > 1) {
-            let plan = plan_soft_partition(
+        // 3. Agglomerate complete exact-choice groups along compatible,
+        //    minimum-work directed absorptions. Eligibility is the existence
+        //    of a split, not scheduler width or a fixed ratio guard.
+        if agglomerative && preferred_groups > 1 {
+            let plan = plan_agglomerative_partition(
                 &scratch.est,
                 c_rows,
                 &scratch.unbound,
+                influences,
                 &scratch.preferred,
                 &scratch.group_counts,
-                policy,
-                &mut scratch.soft_assignment,
-                &mut scratch.soft_best,
-                &mut scratch.soft_source_cost,
-                &mut scratch.soft_cost,
-                &mut scratch.soft_selected,
+                &mut scratch.group_owners,
+                &mut scratch.group_assignment,
+                &mut scratch.group_estimate_sums,
+                &mut scratch.group_compatible,
+                &mut scratch.group_active,
             );
             debug_assert_eq!(plan.preferred_groups, preferred_groups);
             if stats {
@@ -2918,10 +2864,12 @@ impl DagState {
             }
             #[cfg(test)]
             if plan.scheduled_groups < plan.preferred_groups {
-                self.softened_pops += 1;
+                self.coalesced_pops += 1;
             }
             scratch.preferred.clear();
-            scratch.preferred.extend_from_slice(&scratch.soft_best);
+            scratch
+                .preferred
+                .extend_from_slice(&scratch.group_assignment);
             scratch.group_counts.fill(0);
             for &variable in &scratch.preferred {
                 scratch.group_counts[variable as usize] += 1;
@@ -3823,60 +3771,96 @@ mod tests {
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
     }
 
-    fn soft_matrix_plan(
+    fn agglomerative_matrix_plan(
         est: &[usize],
         rows: usize,
         variables: usize,
         preferred: &[u32],
-        max_row_inflation: usize,
-    ) -> (SoftPlan, Vec<u32>) {
+    ) -> (AgglomerativePlan, Vec<u32>) {
+        let mut influences = [VariableSet::new_empty(); 128];
+        for variable in 0..variables {
+            for influenced in 0..variables {
+                if variable != influenced {
+                    influences[variable].set(influenced);
+                }
+            }
+        }
+        agglomerative_matrix_plan_with_influences(est, rows, variables, preferred, &influences)
+    }
+
+    fn agglomerative_matrix_plan_with_influences(
+        est: &[usize],
+        rows: usize,
+        variables: usize,
+        preferred: &[u32],
+        influences: &[VariableSet; 128],
+    ) -> (AgglomerativePlan, Vec<u32>) {
         let unbound: Vec<VariableId> = (0..variables).collect();
         let mut preferred_counts = vec![0usize; variables];
         for &variable in preferred {
             preferred_counts[variable as usize] += 1;
         }
-        let mut assignment = Vec::new();
+        let mut owners = Vec::new();
         let mut best_assignment = Vec::new();
-        let mut source_cost = Vec::new();
-        let mut hub_cost = Vec::new();
-        let mut moved_sources = Vec::new();
-        let plan = plan_soft_partition(
+        let mut group_sums = Vec::new();
+        let mut compatible = Vec::new();
+        let mut active = Vec::new();
+        let plan = plan_agglomerative_partition(
             est,
             rows,
             &unbound,
+            influences,
             preferred,
             &preferred_counts,
-            SoftPartition {
-                max_row_inflation,
-                group_tradeoff: 8,
-            },
-            &mut assignment,
+            &mut owners,
             &mut best_assignment,
-            &mut source_cost,
-            &mut hub_cost,
-            &mut moved_sources,
+            &mut group_sums,
+            &mut compatible,
+            &mut active,
         );
         (plan, best_assignment)
     }
 
     #[test]
-    fn soft_partition_finds_zero_winner_compromise_center() {
-        // Variable-major matrix: nobody individually prefers C, but C is the
-        // unique one-group plan inside the pointwise 2× envelope.
-        let (plan, assignment) = soft_matrix_plan(&[1, 100, 100, 1, 2, 2], 2, 3, &[0, 1], 2);
-        assert_eq!(assignment, [2, 2]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 4);
-        assert_eq!(plan.row_inflation, 2);
+    fn agglomeration_tolerance_comes_from_target_influence_topology() {
+        let est = [1, 800, 5, 100];
+        let preferred = [0, 1];
+
+        let disconnected = [VariableSet::new_empty(); 128];
+        let (exact, exact_assignment) =
+            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &disconnected);
+        assert_eq!(exact.scheduled_groups, 2);
+        assert_eq!(exact_assignment, preferred);
+
+        let mut connected = disconnected;
+        connected[1].set(0);
+        let (merged, merged_assignment) =
+            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &connected);
+        assert_eq!(merged.scheduled_groups, 1);
+        assert_eq!(merged_assignment, [1, 1]);
     }
 
     #[test]
-    fn soft_partition_is_not_first_row_or_majority_voting() {
-        // Both A and B cover every row at rho=8. Stable coverage ties must be
-        // decided by total candidate work, selecting B despite A owning row 0,
-        // the stable variable-id tie-break, and three of four exact winners.
+    fn agglomeration_coalesces_near_skew_but_preserves_far_skew() {
+        let (near, near_assignment) =
+            agglomerative_matrix_plan(&[8, 8, 12, 12, 12, 12, 8, 8], 4, 2, &[0, 0, 1, 1]);
+        assert_eq!(near.scheduled_groups, 1);
+        assert!(near_assignment.iter().all(|&variable| variable == 0));
+        assert_eq!(near.scheduled_estimate_sum, 40);
+        assert_eq!(near.row_inflation, 2);
+
+        let (far, far_assignment) = agglomerative_matrix_plan(&[1, 64, 64, 1], 2, 2, &[0, 1]);
+        assert_eq!(far.scheduled_groups, 2);
+        assert_eq!(far_assignment, [0, 1]);
+    }
+
+    #[test]
+    fn agglomeration_accepts_uniform_topology_scaled_regret() {
+        // Three rows prefer A, but B wins the expensive fourth row. Moving
+        // all rows to B raises the first three estimates 5× while increasing
+        // aggregate work only from 103 to 115; one batch beats two.
         let (plan, assignment) =
-            soft_matrix_plan(&[1, 1, 1, 800, 5, 5, 5, 100], 4, 2, &[0, 0, 0, 1], 8);
+            agglomerative_matrix_plan(&[1, 1, 1, 800, 5, 5, 5, 100], 4, 2, &[0, 0, 0, 1]);
         assert_eq!(assignment, [1, 1, 1, 1]);
         assert_eq!(plan.scheduled_groups, 1);
         assert_eq!(plan.scheduled_estimate_sum, 115);
@@ -3884,103 +3868,52 @@ mod tests {
     }
 
     #[test]
-    fn soft_partition_coalesces_near_skew_but_preserves_far_skew() {
-        let (near, near_assignment) =
-            soft_matrix_plan(&[8, 8, 12, 12, 12, 12, 8, 8], 4, 2, &[0, 0, 1, 1], 2);
-        assert_eq!(near.scheduled_groups, 1);
-        assert!(near_assignment.iter().all(|&variable| variable == 0));
-        assert_eq!(near.row_inflation, 2);
-
-        let (far, far_assignment) = soft_matrix_plan(&[1, 64, 64, 1], 2, 2, &[0, 1], 8);
-        assert_eq!(far.scheduled_groups, 2);
-        assert_eq!(far_assignment, [0, 1]);
+    fn agglomeration_breaks_equal_work_toward_lower_target_id() {
+        let (plan, assignment) = agglomerative_matrix_plan(&[1, 2, 2, 1], 2, 2, &[0, 1]);
+        assert_eq!(assignment, [0, 0]);
+        assert_eq!(plan.scheduled_groups, 1);
+        assert_eq!(plan.scheduled_estimate_sum, 3);
+        assert_eq!(plan.row_inflation, 2);
     }
 
     #[test]
-    fn soft_partition_does_not_hide_rare_catastrophic_rows() {
+    fn agglomeration_continues_through_the_compatible_merge_hierarchy() {
+        // Every off-diagonal estimate stays within the topology-derived
+        // magnitude allowance, so the three exact groups contract to one.
         let (plan, assignment) =
-            soft_matrix_plan(&[1, 1, 1, 400, 64, 64, 64, 1], 4, 2, &[0, 0, 0, 1], 8);
+            agglomerative_matrix_plan(&[34, 93, 94, 94, 33, 93, 94, 93, 33], 3, 3, &[0, 1, 2]);
+        assert_eq!(assignment, [2, 2, 2]);
+        assert_eq!(plan.scheduled_groups, 1);
+        assert_eq!(plan.scheduled_estimate_sum, 220);
+    }
+
+    #[test]
+    fn agglomeration_does_not_hide_rare_catastrophic_rows() {
+        let (plan, assignment) =
+            agglomerative_matrix_plan(&[1, 1, 1, 400, 64, 64, 64, 1], 4, 2, &[0, 0, 0, 1]);
         assert_eq!(plan.scheduled_groups, 2);
         assert_eq!(assignment, [0, 0, 0, 1]);
     }
 
     #[test]
-    fn soft_partition_vetoes_one_bad_row_but_moves_another_complete_group() {
-        // B's two-row source is not divisible: row 1 fits hub A but row 2
-        // does not. C's complete source does fit A, so only C contracts.
-        let (plan, assignment) = soft_matrix_plan(
-            &[1, 2, 9, 2, 100, 1, 1, 100, 100, 100, 100, 1],
-            4,
-            3,
-            &[0, 1, 1, 2],
-            8,
-        );
-        assert_eq!(assignment, [0, 1, 1, 0]);
-        assert_eq!(plan.preferred_groups, 3);
-        assert_eq!(plan.scheduled_groups, 2);
-        assert_eq!(plan.row_inflation, 2);
-    }
-
-    #[test]
-    fn soft_partition_handles_zero_and_max_estimates_without_overflow() {
-        let (zero, zero_assignment) = soft_matrix_plan(&[0, 1, 1, 0], 2, 2, &[0, 1], 8);
+    fn agglomeration_handles_zero_and_max_estimates_without_overflow() {
+        let (zero, zero_assignment) = agglomerative_matrix_plan(&[0, 1, 1, 0], 2, 2, &[0, 1]);
         assert_eq!(zero.scheduled_groups, 2);
         assert_eq!(zero_assignment, [0, 1]);
 
         let (max, max_assignment) =
-            soft_matrix_plan(&[usize::MAX, 1, 1, usize::MAX], 2, 2, &[1, 0], 8);
+            agglomerative_matrix_plan(&[usize::MAX, 1, 1, usize::MAX], 2, 2, &[1, 0]);
         assert_eq!(max.scheduled_groups, 2);
         assert_eq!(max_assignment, [1, 0]);
+
+        let (all_zero, all_zero_assignment) =
+            agglomerative_matrix_plan(&[0, 0, 0, 0], 2, 2, &[0, 1]);
+        assert_eq!(all_zero.scheduled_groups, 1);
+        assert_eq!(all_zero_assignment, [0, 0]);
     }
 
     #[test]
-    fn soft_partition_coalesces_zero_cost_groups_through_an_unopened_hub() {
-        // C0 = 0 uses the score's group-only branch. C wins no row exactly,
-        // yet both source groups can move to it at zero cost.
-        let (plan, assignment) = soft_matrix_plan(&[0, 1, 1, 0, 0, 0], 2, 3, &[0, 1], 1);
-        assert_eq!(assignment, [2, 2]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 0);
-        assert_eq!(plan.row_inflation, 1);
-    }
-
-    #[test]
-    fn soft_partition_includes_score_equal_complete_group_merge() {
-        // With G0=2, C0=2, tau=8, moving either one-row source from cost 1
-        // to cost 15 exactly ties the full score: 16. Fewer groups wins, and
-        // the lower-id hub makes the tie deterministic.
-        let (plan, assignment) = soft_matrix_plan(&[1, 15, 15, 1], 2, 2, &[0, 1], 15);
-        assert_eq!(assignment, [0, 0]);
-        assert_eq!(plan.scheduled_groups, 1);
-        assert_eq!(plan.scheduled_estimate_sum, 16);
-        assert_eq!(plan.row_inflation, 15);
-    }
-
-    #[test]
-    fn soft_partition_opens_zero_winner_hub_without_growing_group_count() {
-        // C can improve A's source group but cannot accept B. Closing A and
-        // opening C leaves G unchanged; it must never transiently become G+1.
-        let (plan, assignment) = soft_matrix_plan(&[2, 100, 100, 2, 1, 100], 2, 3, &[0, 1], 1);
-        assert_eq!(assignment, [2, 1]);
-        assert_eq!(plan.preferred_groups, 2);
-        assert_eq!(plan.scheduled_groups, 2);
-        assert_eq!(plan.scheduled_estimate_sum, 3);
-    }
-
-    #[test]
-    fn soft_partition_charges_for_opening_a_zero_winner_hub() {
-        // C can absorb A within rho and the per-closed-group marginal credit,
-        // but cannot absorb B. Closing A merely pays for opening C, so the
-        // complete same-group-count star is worse and exact grouping wins.
-        let (plan, assignment) = soft_matrix_plan(&[1, 100, 100, 1, 2, 100], 2, 3, &[0, 1], 2);
-        assert_eq!(assignment, [0, 1]);
-        assert_eq!(plan.preferred_groups, 2);
-        assert_eq!(plan.scheduled_groups, 2);
-        assert_eq!(plan.scheduled_estimate_sum, 2);
-    }
-
-    #[test]
-    fn lazy_dag_applies_nontrivial_soft_partition_end_to_end() {
+    fn lazy_dag_applies_nontrivial_agglomeration_end_to_end() {
         let mut kb = TribleSet::new();
         let junk_sink = ufoid();
         let n_per_population = 8usize;
@@ -4023,10 +3956,10 @@ mod tests {
             .solve_dag_lazy()
             .start_width(1)
             .growth(1)
-            .soft_partition(2);
+            .agglomerative_partition();
         assert_eq!(narrow.by_ref().count(), 2 * n_per_population);
         assert_eq!(
-            narrow.state.softened_pops, 0,
+            narrow.state.coalesced_pops, 0,
             "one-row chunks cannot contain multiple preferred groups"
         );
 
@@ -4034,10 +3967,10 @@ mod tests {
             .solve_dag_lazy()
             .start_width(usize::MAX)
             .growth(1)
-            .soft_partition(2);
+            .agglomerative_partition();
         assert_eq!(iter.by_ref().count(), 2 * n_per_population);
         assert!(
-            iter.state.softened_pops > 0,
+            iter.state.coalesced_pops > 0,
             "the near-skew block must exercise a real groups→fewer-groups decision"
         );
     }

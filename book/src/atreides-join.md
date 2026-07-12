@@ -154,9 +154,11 @@ depth-first traversal from thrashing through unrelated values.
   result-projection boundary. A `touched_variables` set marks which estimates
   need refreshing before the next decision point.
 - The ordinary DAG-backed iterator lifts the same negotiation to blocks of
-  sibling rows. Whenever their exact choices split, it may contract complete
-  compatible preference groups onto one variable hub under a pointwise
-  estimate bound, then partitions by those scheduled choices and files
+  sibling rows. Whenever their exact choices split, it builds a merge hierarchy
+  over complete preference groups. A source group may move to target `v` only
+  when every row's binary estimate-magnitude regret fits the bit length of
+  `{v} ∪ (influence(v) ∩ unbound)`; compatible edges are chosen by minimum total candidate
+  work. The engine then partitions by those scheduled choices and files
   extensions into worklist buckets keyed by bound-variable set. Different
   binding orders can therefore reconverge into a larger downstream batch
   without changing the result multiset.

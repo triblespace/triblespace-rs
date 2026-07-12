@@ -766,16 +766,16 @@ fn gate_partial<S: TriblePattern>(kb: &S, human: Id) {
         "switching partitions at a width threshold changed the full multiset"
     );
 
-    let softened = multiset(
+    let agglomerated = multiset(
         star3!()
             .solve_dag_lazy()
             .start_width(1)
             .growth(2)
-            .soft_partition(4),
+            .agglomerative_partition(),
     );
     assert_eq!(
-        softened, sequential,
-        "guarded soft bucketing changed the full multiset"
+        agglomerated, sequential,
+        "agglomerative bucketing changed the full multiset"
     );
 
     // take(1) — first-result path, narrow sprint width only.

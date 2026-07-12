@@ -181,18 +181,29 @@ turns on and the remaining computation enters the batch-harvesting regime. An
 first match instead of paying for full enumeration.
 
 Partition economics are decided by the split itself, not by chunk width. When
-rows genuinely prefer more than one next variable, one soft-bucketing pass
-considers every unbound variable—including a variable that currently wins no
-row—as a possible hub. Each exact preferred group is indivisible: it may move
-to the hub only if every row stays within the 8× pointwise estimate bound. For
-each hub, independently profitable compatible source groups form its best
-complete star; unopened hubs pay a group-opening cost. Complete stars and exact
-grouping are scored by estimated candidates plus a scale-free cost per retained
-group, calibrated so exact grouping ties a one-group plan at the former 8×
-boundary. A one-row chunk is naturally uniform, while a hard per-row bound
-prevents a large block from hiding a catastrophically bad outlier inside an
-acceptable aggregate sum. The choice affects order and batching only:
-`propose` and `confirm` still determine the exact solutions.
+rows genuinely prefer more than one next variable, those exact-choice groups
+become the leaves of an agglomerative merge hierarchy. A complete source group
+may be absorbed by an active target variable `v` only when every source row's
+binary estimate-magnitude regret fits the bit length of
+`{v} ∪ (influence(v) ∩ unbound)`. Binding a variable that can refresh a larger
+still-relevant downstream neighborhood can therefore justify a wider local cardinality bucket; an
+isolated variable cannot. Rows whose preferred estimate is zero remain
+compatible only with zero estimated work.
+
+Among compatible directed absorptions the engine chooses the one with the
+smallest resulting total candidate estimate, merges the groups, and repeats.
+Compatibility is conjoined as groups merge, so one incompatible row keeps its
+entire exact group separate. The planner returns the coarsest admissible level
+of that greedy hierarchy; it does not globally score intermediate levels.
+Exact grouping is the literal starting partition and remains the result when no
+complete group fits. A one-row chunk is naturally uniform. There is no
+independent width cutoff or fixed inflation factor. The choice affects order
+and batching only: `propose` and `confirm` still determine the exact solutions.
+
+For `R` rows and `V ≤ 128` unbound variables, planning is
+`O(RV + V³)` time and `O(R + V²)` reusable scratch space. It builds the
+row/group compatibility table once, then rescans the active directed edges for
+at most `V - 1` absorptions.
 
 Fully-bound rows remain in raw inline form until the consumer pulls them. The
 worklist never stores projected result values, so a query's `Send`/`Sync`
@@ -204,7 +215,7 @@ to implement `Clone`.
 exposes the same scheduler as a configurable iterator with explicit starting
 width, growth, cap, and partition-policy controls. The eager/grouped probe
 solvers pin grouping explicitly so they remain stable controls for the
-soft-bucketed ordinary iterator.
+agglomerative ordinary iterator.
 
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result

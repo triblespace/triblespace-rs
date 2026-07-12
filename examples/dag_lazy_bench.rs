@@ -30,7 +30,7 @@
 //! same iterator dispatches that batch to the GPU.
 //!
 //! Set `TRIBLES_PAIRED_STAR3_REPS=21` to skip the broad matrix and run a
-//! warm, alternating whole-block-versus-soft8 star3 drain comparison with
+//! warm, alternating whole-block-versus-agglomerative star3 drain comparison with
 //! paired median delta and MAD, followed by one untimed work-graph report.
 
 use std::hint::black_box;
@@ -291,19 +291,17 @@ macro_rules! measure {
     }};
 }
 
-/// Runs six partition policies on one continuously consumed
+/// Runs four partition policies on one continuously consumed
 /// iterator per repetition. Every checkpoint is therefore a true prefix of
 /// the same execution, unlike independent `take(k)` probes.
 macro_rules! checkpoint_matrix {
     ($label:expr, $reps:expr, $q:expr) => {{
         const CHECKPOINTS: [usize; 5] = [1, 10, 100, 1_000, 10_000];
-        const POLICIES: [(&str, Option<usize>, Option<usize>); 6] = [
-            ("grouped", None, None),
-            ("trivial@1", Some(1), None),
-            ("trivial@256", Some(256), None),
-            ("soft-rho2", None, Some(2)),
-            ("soft-rho4", None, Some(4)),
-            ("soft-rho8", None, Some(8)),
+        const POLICIES: [(&str, Option<usize>, bool); 4] = [
+            ("grouped", None, false),
+            ("trivial@1", Some(1), false),
+            ("trivial@256", Some(256), false),
+            ("agglomerative", None, true),
         ];
 
         let sequential = tally($q.sequential());
@@ -312,10 +310,10 @@ macro_rules! checkpoint_matrix {
             "{} has too few rows for the checkpoint matrix",
             $label
         );
-        for &(policy, width, inflation) in &POLICIES {
+        for &(policy, width, agglomerative) in &POLICIES {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -331,10 +329,10 @@ macro_rules! checkpoint_matrix {
 
         // Warm every policy before timing. Rotate the starting policy each
         // repetition so no configuration owns a fixed thermal/cache slot.
-        for &(_, width, inflation) in &POLICIES {
+        for &(_, width, agglomerative) in &POLICIES {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -351,10 +349,10 @@ macro_rules! checkpoint_matrix {
         for rep in 0..reps {
             for offset in 0..POLICIES.len() {
                 let ci = (rep + offset) % POLICIES.len();
-                let (_, width, inflation) = POLICIES[ci];
+                let (_, width, agglomerative) = POLICIES[ci];
                 let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-                if let Some(inflation) = inflation {
-                    it = it.soft_partition(inflation);
+                if agglomerative {
+                    it = it.agglomerative_partition();
                 } else if let Some(width) = width {
                     it = it.trivial_partition_at_width(width);
                 } else {
@@ -386,7 +384,7 @@ macro_rules! checkpoint_matrix {
             "=== {} continuous checkpoint matrix (rows {}) ===",
             $label, sequential.0
         );
-        for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
+        for (ci, &(policy, width, agglomerative)) in POLICIES.iter().enumerate() {
             println!(
                 "  {policy:>15}: K1 {:>8.3} | K10 {:>8.3} | K100 {:>8.3} | K1k {:>8.3} | K10k {:>8.3} | drain {:>8.3} ms",
                 median(samples[ci][0].clone()),
@@ -404,8 +402,8 @@ macro_rules! checkpoint_matrix {
             #[cfg(feature = "gpu")]
             gpu_stats::reset();
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -427,27 +425,25 @@ macro_rules! checkpoint_matrix {
     }};
 }
 
-/// Compares grouped, whole-block, and guarded soft partitions on
+/// Compares grouped, whole-block, and agglomerative partitions on
 /// workloads that may have fewer than 10k results. Configuration order rotates
 /// across repetitions so cache and thermal position do not belong to one
 /// policy. The instrumented pass makes changes in work visible even when wall
 /// time is noisy.
 macro_rules! drain_partition_matrix {
     ($label:expr, $reps:expr, $q:expr) => {{
-        const POLICIES: [(&str, Option<usize>, Option<usize>); 6] = [
-            ("grouped", None, None),
-            ("trivial@1", Some(1), None),
-            ("trivial@256", Some(256), None),
-            ("soft-rho2", None, Some(2)),
-            ("soft-rho4", None, Some(4)),
-            ("soft-rho8", None, Some(8)),
+        const POLICIES: [(&str, Option<usize>, bool); 4] = [
+            ("grouped", None, false),
+            ("trivial@1", Some(1), false),
+            ("trivial@256", Some(256), false),
+            ("agglomerative", None, true),
         ];
 
         let sequential = tally($q.sequential());
-        for &(policy, width, inflation) in &POLICIES {
+        for &(policy, width, agglomerative) in &POLICIES {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -462,10 +458,10 @@ macro_rules! drain_partition_matrix {
             );
         }
 
-        for &(_, width, inflation) in &POLICIES {
+        for &(_, width, agglomerative) in &POLICIES {
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -479,10 +475,10 @@ macro_rules! drain_partition_matrix {
         for rep in 0..reps {
             for offset in 0..POLICIES.len() {
                 let ci = (rep + offset) % POLICIES.len();
-                let (_, width, inflation) = POLICIES[ci];
+                let (_, width, agglomerative) = POLICIES[ci];
                 let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-                if let Some(inflation) = inflation {
-                    it = it.soft_partition(inflation);
+                if agglomerative {
+                    it = it.agglomerative_partition();
                 } else if let Some(width) = width {
                     it = it.trivial_partition_at_width(width);
                 } else {
@@ -498,7 +494,7 @@ macro_rules! drain_partition_matrix {
             "=== {} drain partition matrix (rows {}) ===",
             $label, sequential.0
         );
-        for (ci, &(policy, width, inflation)) in POLICIES.iter().enumerate() {
+        for (ci, &(policy, width, agglomerative)) in POLICIES.iter().enumerate() {
             println!(
                 "  {policy:>15}: drain {:>9.3} ms",
                 median(samples[ci].clone()),
@@ -509,8 +505,8 @@ macro_rules! drain_partition_matrix {
             dag_stats::set_enabled(true);
             dag_stats::reset();
             let mut it = $q.solve_dag_lazy().start_width(1).growth(2);
-            if let Some(inflation) = inflation {
-                it = it.soft_partition(inflation);
+            if agglomerative {
+                it = it.agglomerative_partition();
             } else if let Some(width) = width {
                 it = it.trivial_partition_at_width(width);
             } else {
@@ -653,7 +649,7 @@ fn run_wd(cache: &str, reps: usize) {
     eprintln!(
         "wd lazy benchmark backend: {}",
         if want_gpu {
-            "soft-bucket CPU/GPU"
+            "agglomerative CPU/GPU"
         } else {
             "CPU"
         }
@@ -682,19 +678,19 @@ fn run_wd(cache: &str, reps: usize) {
         enum StarPolicy {
             Trivial1,
             Trivial256,
-            Soft,
+            Agglomerative,
         }
         const POLICIES: [(&str, StarPolicy); 3] = [
             ("trivial@1", StarPolicy::Trivial1),
             ("trivial@256", StarPolicy::Trivial256),
-            ("soft-rho8", StarPolicy::Soft),
+            ("agglomerative", StarPolicy::Agglomerative),
         ];
         let run = |policy: StarPolicy| {
             let mut iter = star3!().solve_dag_lazy().start_width(1).growth(2);
             iter = match policy {
                 StarPolicy::Trivial1 => iter.trivial_partition_at_width(1),
                 StarPolicy::Trivial256 => iter.trivial_partition_at_width(256),
-                StarPolicy::Soft => iter.soft_partition(8),
+                StarPolicy::Agglomerative => iter.agglomerative_partition(),
             };
             let started = Instant::now();
             let signature = tally(iter);
@@ -707,8 +703,8 @@ fn run_wd(cache: &str, reps: usize) {
             assert_eq!(run(policy).0, expected);
         }
         let mut policy_times: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(pairs));
-        let mut soft_minus_trivial1 = Vec::with_capacity(pairs);
-        let mut soft_minus_trivial256 = Vec::with_capacity(pairs);
+        let mut agglomerative_minus_trivial1 = Vec::with_capacity(pairs);
+        let mut agglomerative_minus_trivial256 = Vec::with_capacity(pairs);
         let orders = [
             [0usize, 1, 2],
             [0usize, 2, 1],
@@ -725,8 +721,8 @@ fn run_wd(cache: &str, reps: usize) {
                 round_times[policy_index] = elapsed;
                 policy_times[policy_index].push(elapsed);
             }
-            soft_minus_trivial1.push(round_times[2] - round_times[0]);
-            soft_minus_trivial256.push(round_times[2] - round_times[1]);
+            agglomerative_minus_trivial1.push(round_times[2] - round_times[0]);
+            agglomerative_minus_trivial256.push(round_times[2] - round_times[1]);
         }
         let summarize = |samples: &[f64]| {
             let center = median(samples.to_vec());
@@ -738,20 +734,20 @@ fn run_wd(cache: &str, reps: usize) {
             );
             (center, mad)
         };
-        let (delta1, mad1) = summarize(&soft_minus_trivial1);
-        let (delta256, mad256) = summarize(&soft_minus_trivial256);
+        let (delta1, mad1) = summarize(&agglomerative_minus_trivial1);
+        let (delta256, mad256) = summarize(&agglomerative_minus_trivial256);
         println!(
             "=== counterbalanced star3 drain ({pairs} triplets, rows {}) ===",
             expected.0
         );
         println!(
-            "  trivial@1 {:>9.3} ms | trivial@256 {:>9.3} ms | soft-rho8 {:>9.3} ms",
+            "  trivial@1 {:>9.3} ms | trivial@256 {:>9.3} ms | agglomerative {:>9.3} ms",
             median(policy_times[0].clone()),
             median(policy_times[1].clone()),
             median(policy_times[2].clone()),
         );
         println!(
-            "  soft-trivial@1 delta {:>+9.3} ms (MAD {:>8.3}) | soft-trivial@256 delta {:>+9.3} ms (MAD {:>8.3})",
+            "  agglomerative-trivial@1 delta {:>+9.3} ms (MAD {:>8.3}) | agglomerative-trivial@256 delta {:>+9.3} ms (MAD {:>8.3})",
             delta1, mad1, delta256, mad256,
         );
 
