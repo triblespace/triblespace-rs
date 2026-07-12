@@ -45,12 +45,7 @@ thread_local = { version = "1", optional = true }
 
 [dev-dependencies]
 # Last pre-sidecar reader/writer, used by the bidirectional archive format gate.
-old-triblespace-core = {
-    package = "triblespace-core",
-    git = "https://github.com/triblespace/triblespace-rs.git",
-    rev = "fd5c7ad280bdf852d59d6aa0440802b57767eb90",
-    default-features = false,
-}
+old-triblespace-core = { package = "triblespace-core", git = "https://github.com/triblespace/triblespace-rs.git", rev = "fd5c7ad280bdf852d59d6aa0440802b57767eb90", default-features = false }
 criterion = "0.6.0"
 fake = "4.3.0"
 im = "15.1.0"

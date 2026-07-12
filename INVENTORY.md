@@ -151,6 +151,10 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Publish the checked Rank9 sidecar seam as a new Jerky crate version, then
+  replace the exact git-revision pins in `triblespace-core` and
+  `triblespace-search` before the next crates.io release. The git pin is an
+  intentional integration bridge, not the final publishable dependency.
 - Index-home kind IDs currently identify the implementation but not the full
   index recipe. Derive or persist recipe identity for configuration such as a
   BM25 content attribute/tokenizer version and HNSW dimensions/metric so
