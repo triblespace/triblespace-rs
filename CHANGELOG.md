@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Succinct archives expose decoded fixed-attribute AVE iteration.**
+  `SuccinctArchive::iter_attribute_value_entities` yields one raw
+  `(value, entity)` tuple per matching fact in byte-lexicographic AVE order.
+  The exact-size iterator is double-ended, enabling descending short-circuit
+  consumers via `.rev()`. Because values and IDs are decoded before leaving
+  each archive, callers can safely k-way merge independent LSM segments
+  without comparing segment-local universe codes; joins and deduplication
+  remain explicit caller responsibilities.
+
 ### Fixed
 
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**

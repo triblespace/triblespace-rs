@@ -311,6 +311,38 @@ where
         })
     }
 
+    /// Iterates over the facts for one fixed attribute in ascending AVE order.
+    ///
+    /// Each item is the decoded `(value, entity)` pair for one fact. Ordering is
+    /// byte-lexicographic by raw value, then by entity ID. The returned iterator
+    /// is double-ended, so `.rev()` walks the same attribute in descending
+    /// `(value, entity)` order.
+    ///
+    /// Archive-local universe codes never leave this iterator. Consequently,
+    /// iterators from independent archive segments can be merged by their
+    /// decoded tuples even when the same value has a different code in each
+    /// segment. Deduplication and any joins needed to interpret the facts remain
+    /// the caller's responsibility.
+    pub fn iter_attribute_value_entities<'a>(
+        &'a self,
+        attribute: &Id,
+    ) -> impl DoubleEndedIterator<Item = (RawInline, Id)> + ExactSizeIterator + 'a {
+        let range = base_range(&self.domain, &self.a_a, &id_into_value(attribute));
+        range.map(move |position| self.decode_ave_value_entity(position))
+    }
+
+    fn decode_ave_value_entity(&self, position: usize) -> (RawInline, Id) {
+        let entity_code = self.ave_c.access(position).unwrap();
+        let eav_position = self.e_a.select1(entity_code).unwrap() - entity_code
+            + self.ave_c.rank(position, entity_code).unwrap();
+        let value_code = self.eav_c.access(eav_position).unwrap();
+
+        let value = self.domain.access(value_code);
+        let entity = self.domain.access(entity_code);
+        let entity = Id::new(id_from_value(&entity).unwrap()).unwrap();
+        (value, entity)
+    }
+
     /// Count the number of set bits in `bv` within `range`.
     ///
     /// The bit vectors in this archive encode the first occurrence of each
@@ -2349,6 +2381,103 @@ mod tests {
                 assert_eq!(original, found);
             }
         }
+    }
+
+    fn ordered_id(last: u8) -> Id {
+        let mut raw = [0; 16];
+        raw[15] = last;
+        Id::new(raw).unwrap()
+    }
+
+    fn ordered_value(first: u8) -> Inline<UnknownInline> {
+        Inline::new([first; 32])
+    }
+
+    #[test]
+    fn fixed_attribute_ave_iteration_is_decoded_and_double_ended() {
+        let attribute = ordered_id(10);
+        let other_attribute = ordered_id(11);
+        let low = ordered_value(0x20);
+        let high = ordered_value(0x40);
+        let e1 = ordered_id(1);
+        let e2 = ordered_id(2);
+        let e3 = ordered_id(3);
+        let e4 = ordered_id(4);
+
+        let mut set = TribleSet::new();
+        set.insert(&Trible::force(&e3, &attribute, &high));
+        set.insert(&Trible::force(&e2, &attribute, &low));
+        set.insert(&Trible::force(&e1, &attribute, &low));
+        set.insert(&Trible::force(&e4, &other_attribute, &ordered_value(0x10)));
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let expected = vec![(low.raw, e1), (low.raw, e2), (high.raw, e3)];
+
+        assert_eq!(
+            archive
+                .iter_attribute_value_entities(&attribute)
+                .collect_vec(),
+            expected
+        );
+        assert_eq!(
+            archive
+                .iter_attribute_value_entities(&attribute)
+                .rev()
+                .collect_vec(),
+            expected.iter().copied().rev().collect_vec()
+        );
+
+        let mut from_both_ends = archive.iter_attribute_value_entities(&attribute);
+        assert_eq!(from_both_ends.len(), 3);
+        assert_eq!(from_both_ends.next(), Some(expected[0]));
+        assert_eq!(from_both_ends.next_back(), Some(expected[2]));
+        assert_eq!(from_both_ends.next(), Some(expected[1]));
+        assert_eq!(from_both_ends.next_back(), None);
+
+        assert_eq!(
+            archive.iter_attribute_value_entities(&ordered_id(99)).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn decoded_attribute_ave_iterators_kmerge_across_local_domains() {
+        let attribute = ordered_id(10);
+        let e1 = ordered_id(1);
+        let e2 = ordered_id(2);
+        let e3 = ordered_id(3);
+        let e4 = ordered_id(4);
+        let v1 = ordered_value(0x10);
+        let v2 = ordered_value(0x20);
+        let v3 = ordered_value(0x30);
+        let v4 = ordered_value(0x40);
+
+        let mut left = TribleSet::new();
+        left.insert(&Trible::force(&e1, &attribute, &v1));
+        left.insert(&Trible::force(&e3, &attribute, &v3));
+
+        let mut right = TribleSet::new();
+        right.insert(&Trible::force(&e2, &attribute, &v2));
+        right.insert(&Trible::force(&e3, &attribute, &v3));
+        right.insert(&Trible::force(&e4, &attribute, &v4));
+
+        let left: SuccinctArchive<OrderedUniverse> = (&left).into();
+        let right: SuccinctArchive<OrderedUniverse> = (&right).into();
+
+        // The shared `(v3, e3)` fact has different archive-local codes because
+        // the two segment domains contain different preceding entities/values.
+        let merged = [
+            left.iter_attribute_value_entities(&attribute),
+            right.iter_attribute_value_entities(&attribute),
+        ]
+        .into_iter()
+        .kmerge()
+        .dedup()
+        .collect_vec();
+
+        assert_eq!(
+            merged,
+            vec![(v1.raw, e1), (v2.raw, e2), (v3.raw, e3), (v4.raw, e4)]
+        );
     }
 
     #[test]
