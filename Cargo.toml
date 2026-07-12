@@ -124,5 +124,12 @@ debug = true
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 
+# Keep every CubeCL 0.10 consumer on the project's runtime fork. The fork adds
+# immutable external-buffer registration so mmap-backed storage can be exposed
+# to Metal without an upload when a caller has a suitable layout and lifetime.
+[patch.crates-io]
+cubecl-runtime = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "f299aed551ec97bf28b779bfed6e88a484a167e4" }
+cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "f299aed551ec97bf28b779bfed6e88a484a167e4" }
+
 [package.metadata.kani.flags]
 default-unwind = "1"

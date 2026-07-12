@@ -14,6 +14,17 @@ triblespace-core = { version = "0.47", default-features = false }
 triblespace-gpu = { version = "0.47", default-features = false, features = ["wgpu"] }
 ```
 
+`triblespace-gpu` requires Rust 1.92, matching CubeCL 0.10's declared MSRV.
+This does not raise the GPU-free `triblespace-core` crate's Rust 1.89 MSRV.
+
+Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
+fork, which exposes immutable external-buffer registration for mmap-to-Metal
+aliasing. Cargo patches are root-local, so application workspaces that need the
+aliasing seam must select the same fork themselves. The current compaction
+backend still uploads a newly materialized `u32` rotation and reads the packed
+planes back; merely selecting the fork does not make that transient path
+zero-copy.
+
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
 
@@ -83,12 +94,12 @@ WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL
 kernels and is compile-checked, but remains experimental until the parity gate
 has also run on CUDA hardware.
 
-Initial Apple Metal measurements from 2026-07-12 used CubeCL 0.9 (the Rust
-1.89-compatible line), three overlapping segments, and warm shaders and
-allocator state. They predate the materialize-once rotation pipeline,
-parallel source decode, and parallel packed CPU freeze, and are retained as the
-optimization baseline. The threshold column is the exact quantity compared by
-`min_input_rows`.
+Initial Apple Metal measurements from 2026-07-12 used CubeCL 0.9, three
+overlapping segments, and warm shaders and allocator state. They predate both
+the move to the project's shared CubeCL 0.10 runtime lineage and the
+materialize-once rotation pipeline, parallel source decode, and parallel packed
+CPU freeze, and are retained as the optimization baseline. The threshold
+column is the exact quantity compared by `min_input_rows`.
 
 | base rows/input | threshold input rows | output rows | old Jerky CPU | packed CPU | WGPU | WGPU speedup |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -117,3 +128,19 @@ case became substantially stronger:
 All remeasured outputs were again byte-identical. Below roughly 100k summed
 input rows WGPU only ties the CPU path, while the first point above the 300k
 activation threshold has a material win.
+
+After moving the same backend to the shared CubeCL 0.10 fork and Rust 1.92,
+recovered-system repeated runs produced the following medians. The 30k row is
+five runs and the 100k row is three; every output was byte-identical. These are
+not a controlled CubeCL-only comparison with the preceding one-shot table—the
+CPU path also became much faster—so the stable conclusion is the crossover
+shape, not the difference between individual historical timings.
+
+| base rows/input | threshold input rows | output rows | parallel CPU median (range) | WGPU median (range) | paired median speedup |
+|---:|---:|---:|---:|---:|---:|
+| 30,000 | 94,737 | 91,579 | 0.322 s (0.304–0.330) | 0.297 s (0.288–0.366) | 1.06x |
+| 100,000 | 315,792 | 305,264 | 0.533 s (0.529–0.534) | 0.420 s (0.418–0.454) | 1.27x |
+
+Thus 94k summed input rows remains effectively a tie, while 315k retains a
+material GPU win. The conservative 300,000-row activation threshold still
+selects the useful side of the crossover after the runtime migration.

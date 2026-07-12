@@ -216,14 +216,13 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
                     &self.client,
                     dispatch.clone(),
                     cube_dim,
-                    ArrayArg::from_raw_parts::<u32>(&current, geometry.len as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&layers, geometry.packed_words as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&block_zeros, geometry.num_blocks as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&count_params_handle, count_params.len(), 1),
+                    ArrayArg::from_raw_parts(current.clone(), geometry.len as usize),
+                    ArrayArg::from_raw_parts(layers.clone(), geometry.packed_words as usize),
+                    ArrayArg::from_raw_parts(block_zeros.clone(), geometry.num_blocks as usize),
+                    ArrayArg::from_raw_parts(count_params_handle, count_params.len()),
                     BLOCK_SIZE,
                 )
-            }
-            .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
+            };
 
             // The final plane is already packed above. Stable partitioning is
             // only needed to order the sequence consumed by the next plane.
@@ -238,12 +237,11 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
                     &self.client,
                     CubeCount::Static(1, 1, 1),
                     CubeDim::new_1d(1),
-                    ArrayArg::from_raw_parts::<u32>(&block_zeros, geometry.num_blocks as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&zero_offsets, geometry.num_blocks as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&total_zeros, 1, 1),
+                    ArrayArg::from_raw_parts(block_zeros, geometry.num_blocks as usize),
+                    ArrayArg::from_raw_parts(zero_offsets.clone(), geometry.num_blocks as usize),
+                    ArrayArg::from_raw_parts(total_zeros.clone(), 1),
                 )
-            }
-            .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
+            };
             let scatter_params = [geometry.len, shift, 0u32, geometry.num_blocks];
             let scatter_params_handle = self
                 .client
@@ -253,25 +251,23 @@ impl<R: Runtime> CubeClWaveletFreeze<R> {
                     &self.client,
                     dispatch.clone(),
                     cube_dim,
-                    ArrayArg::from_raw_parts::<u32>(&current, geometry.len as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&other, geometry.len as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&zero_offsets, geometry.num_blocks as usize, 1),
-                    ArrayArg::from_raw_parts::<u32>(&total_zeros, 1, 1),
-                    ArrayArg::from_raw_parts::<u32>(
-                        &scatter_params_handle,
-                        scatter_params.len(),
-                        1,
-                    ),
+                    ArrayArg::from_raw_parts(current.clone(), geometry.len as usize),
+                    ArrayArg::from_raw_parts(other.clone(), geometry.len as usize),
+                    ArrayArg::from_raw_parts(zero_offsets, geometry.num_blocks as usize),
+                    ArrayArg::from_raw_parts(total_zeros, 1),
+                    ArrayArg::from_raw_parts(scatter_params_handle, scatter_params.len()),
                     BLOCK_SIZE,
                 )
-            }
-            .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
+            };
             std::mem::swap(&mut current, &mut other);
         }
 
         cubecl::future::block_on(self.client.sync())
             .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
-        let packed_bytes = self.client.read_one(layers);
+        let packed_bytes = self
+            .client
+            .read_one(layers)
+            .map_err(|error| GpuFreezeError::Device(format!("{error:?}")))?;
         if packed_bytes.len() != geometry.packed_bytes {
             return Err(GpuFreezeError::ReadbackSize {
                 expected: geometry.packed_bytes,

@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The opt-in GPU companion now shares the project CubeCL 0.10 fork.**
+  `triblespace-gpu` no longer pulls a second CubeCL 0.9/WGPU 26 stack beside
+  the model and widget runtime. Its WGPU backend is ported to CubeCL 0.10,
+  repository builds pin the fork with the immutable external-buffer seam, and
+  the crate now declares Rust 1.92 to match CubeCL 0.10. The GPU-free core
+  remains on Rust 1.89. Selecting the fork only makes future mmap-to-Metal
+  query adapters possible; the existing structural merge still uploads its
+  transient rotation and reads canonical packed planes back.
 - **Succinct-archive structural merge decodes source rows once.** The merger
   now materializes the remapped, deduplicated EAV union and derives the other
   five canonical Ring rotations with stable linear counting sorts. This

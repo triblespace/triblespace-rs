@@ -3,7 +3,7 @@ name = "triblespace-gpu"
 version = "0.47.0"
 authors = ["⚫️ <jp@bultmann.eu>"]
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.92"
 description = "Opt-in GPU acceleration backends for TribleSpace"
 homepage = "https://trible.space"
 license = "MIT OR Apache-2.0"
@@ -21,7 +21,7 @@ wgpu = ["dep:cubecl", "cubecl/wgpu"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
 
 [dependencies]
-cubecl = { version = "=0.9.0", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 
 [[example]]
