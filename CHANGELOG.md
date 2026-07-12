@@ -62,7 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This removes both the old 256-row eligibility cutoff and the fixed 8× guard:
   batching tolerance now comes from the scheduler's existing logarithmic
   cardinality resolution and the query's influence topology. The configurable
-  probe is `agglomerative_partition()`.
+  probe is `agglomerative_partition()`. Total reusable scheduler scratch is
+  `O(RV + V²)` for `R` rows and `V` unbound variables; the agglomerator adds
+  `O(R + V²)` beyond the existing per-row estimate matrix.
   `Query::sequential()` explicitly selects the scalar
   block-of-one DFS specialization, while fresh rayon iteration retains its
   established DFS splitter. Fully-bound rows stay raw until the consumer pulls

@@ -201,7 +201,9 @@ independent width cutoff or fixed inflation factor. The choice affects order
 and batching only: `propose` and `confirm` still determine the exact solutions.
 
 For `R` rows and `V ≤ 128` unbound variables, planning is
-`O(RV + V³)` time and `O(R + V²)` reusable scratch space. It builds the
+`O(RV + V³)` time and the scheduler uses `O(RV + V²)` reusable scratch space
+in total. The `RV` estimate matrix is already required by exact per-row
+grouping; agglomeration adds `O(R + V²)` scratch beyond it. It builds the
 row/group compatibility table once, then rescans the active directed edges for
 at most `V - 1` absorptions.
 

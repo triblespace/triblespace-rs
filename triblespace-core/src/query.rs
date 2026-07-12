@@ -2037,9 +2037,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// unchanged.
     ///
     /// For `R` rows and `V ≤ 128` unbound variables, planning takes
-    /// `O(RV + V³)` time and `O(R + V²)` reusable scratch space: the planner
-    /// builds row/group compatibility once, then rescans the active directed
-    /// edges for at most `V - 1` absorptions.
+    /// `O(RV + V³)` time and the scheduler uses `O(RV + V²)` reusable scratch
+    /// space in total. The `RV` estimate matrix already belongs to exact
+    /// per-row grouping; agglomeration adds `O(R + V²)` scratch beyond it.
+    /// The planner builds row/group compatibility once, then rescans the
+    /// active directed edges for at most `V - 1` absorptions.
     ///
     /// Semantics: fully drained, the same result **multiset** as the
     /// sequential iterator and the eager DAG solver; row order differs.
@@ -3841,6 +3843,28 @@ mod tests {
     }
 
     #[test]
+    fn agglomeration_ignores_influence_neighbors_that_are_already_bound() {
+        // Moving group A to B costs two estimate-magnitude bits. An influence
+        // edge from B to already-bound variable 7 must not widen B's allowance;
+        // adding the still-unbound A edge does widen it and admits the merge.
+        let est = [1, 16, 4, 1];
+        let preferred = [0, 1];
+        let mut influences = [VariableSet::new_empty(); 128];
+        influences[1].set(7);
+
+        let (exact, exact_assignment) =
+            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &influences);
+        assert_eq!(exact.scheduled_groups, 2);
+        assert_eq!(exact_assignment, preferred);
+
+        influences[1].set(0);
+        let (merged, merged_assignment) =
+            agglomerative_matrix_plan_with_influences(&est, 2, 2, &preferred, &influences);
+        assert_eq!(merged.scheduled_groups, 1);
+        assert_eq!(merged_assignment, [1, 1]);
+    }
+
+    #[test]
     fn agglomeration_coalesces_near_skew_but_preserves_far_skew() {
         let (near, near_assignment) =
             agglomerative_matrix_plan(&[8, 8, 12, 12, 12, 12, 8, 8], 4, 2, &[0, 0, 1, 1]);
@@ -3910,6 +3934,80 @@ mod tests {
             agglomerative_matrix_plan(&[0, 0, 0, 0], 2, 2, &[0, 1]);
         assert_eq!(all_zero.scheduled_groups, 1);
         assert_eq!(all_zero_assignment, [0, 0]);
+    }
+
+    #[test]
+    fn agglomeration_reuses_scratch_across_different_matrix_shapes() {
+        let mut influences = [VariableSet::new_empty(); 128];
+        for variable in 0..3 {
+            for influenced in 0..3 {
+                if variable != influenced {
+                    influences[variable].set(influenced);
+                }
+            }
+        }
+
+        // Seed every buffer with stale data, then alternate R=4,V=2 and
+        // R=3,V=3 plans through the same storage. This exercises clear/resize,
+        // the owner/row-assignment swap, and accumulated group-cost reset.
+        let mut owners = vec![u32::MAX; 7];
+        let mut assignment = vec![u32::MAX; 11];
+        let mut group_sums = vec![u128::MAX; 13];
+        let mut compatible = vec![false; 17];
+        let mut active = vec![true; 19];
+
+        let near_est = [8, 8, 12, 12, 12, 12, 8, 8];
+        let near_preferred = [0, 0, 1, 1];
+        let first = plan_agglomerative_partition(
+            &near_est,
+            4,
+            &[0, 1],
+            &influences,
+            &near_preferred,
+            &[2, 2],
+            &mut owners,
+            &mut assignment,
+            &mut group_sums,
+            &mut compatible,
+            &mut active,
+        );
+        let first_assignment = assignment.clone();
+        assert_eq!(first.scheduled_estimate_sum, 40);
+        assert_eq!(first_assignment, [0, 0, 0, 0]);
+
+        let hierarchy_est = [34, 93, 94, 94, 33, 93, 94, 93, 33];
+        let hierarchy_preferred = [0, 1, 2];
+        let hierarchy = plan_agglomerative_partition(
+            &hierarchy_est,
+            3,
+            &[0, 1, 2],
+            &influences,
+            &hierarchy_preferred,
+            &[1, 1, 1],
+            &mut owners,
+            &mut assignment,
+            &mut group_sums,
+            &mut compatible,
+            &mut active,
+        );
+        assert_eq!(hierarchy.scheduled_estimate_sum, 220);
+        assert_eq!(assignment, [2, 2, 2]);
+
+        let repeated = plan_agglomerative_partition(
+            &near_est,
+            4,
+            &[0, 1],
+            &influences,
+            &near_preferred,
+            &[2, 2],
+            &mut owners,
+            &mut assignment,
+            &mut group_sums,
+            &mut compatible,
+            &mut active,
+        );
+        assert_eq!(repeated, first);
+        assert_eq!(assignment, first_assignment);
     }
 
     #[test]
