@@ -8,10 +8,14 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::Inline;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
+use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::Query;
+use crate::query::RowsView;
 use crate::query::TriblePattern;
 use crate::query::Variable;
 use crate::query::VariableContext;
@@ -661,9 +665,18 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
         }
         _ => {
             let (constraint, dest_idx) = build_join(set, body, start);
-            let mut binding = Binding::default();
-            binding.set(0, start);
-            constraint.estimate(dest_idx, &binding).unwrap_or(0)
+            let vars = [0usize];
+            let row = [*start];
+            let mut out = 0usize;
+            if constraint.estimate(
+                dest_idx,
+                &RowsView::new(&vars, &row),
+                &mut EstimateSink::Scalar(&mut out),
+            ) {
+                out
+            } else {
+                0
+            }
         }
     }
 }
@@ -978,41 +991,45 @@ impl RegularPathConstraint {
     }
 }
 
-impl<'a> Constraint<'a> for RegularPathConstraint {
-    fn variables(&self) -> VariableSet {
-        let mut vars = VariableSet::new_empty();
-        vars.set(self.start);
-        vars.set(self.end);
-        vars
-    }
-
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+impl RegularPathConstraint {
+    /// Candidate count for one row.
+    fn estimate_row(
+        &self,
+        variable: VariableId,
+        start_val: Option<&RawInline>,
+        end_val: Option<&RawInline>,
+    ) -> usize {
         // Same-Variable case: rough upper bound is set size; the
         // exact count requires scanning self-loops. Conservative
         // estimate avoids the O(N) scan on every call.
         if self.start == self.end && variable == self.start {
-            return Some(self.set.len());
+            return self.set.len();
         }
         if variable == self.end {
-            if let Some(start_val) = binding.get(self.start) {
-                return Some(estimate_from(&self.set, &self.expr, start_val).max(1));
+            if let Some(start_val) = start_val {
+                return estimate_from(&self.set, &self.expr, start_val).max(1);
             }
-            Some(self.set.len())
-        } else if variable == self.start {
-            if let Some(end_val) = binding.get(self.end) {
+            self.set.len()
+        } else {
+            if let Some(end_val) = end_val {
                 // Symmetric to the start-bound case: BFS backward
                 // via the inverted expression from the bound end,
                 // giving a tight estimate instead of the
                 // conservative set-len fallback.
-                return Some(estimate_from(&self.set, &self.inverse_expr, end_val).max(1));
+                return estimate_from(&self.set, &self.inverse_expr, end_val).max(1);
             }
-            Some(self.set.len())
-        } else {
-            None
+            self.set.len()
         }
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// Enumerates one row's candidates.
+    fn propose_row(
+        &self,
+        variable: VariableId,
+        start_val: Option<&RawInline>,
+        end_val: Option<&RawInline>,
+        proposals: &mut Vec<RawInline>,
+    ) {
         // Same-Variable case: `?x P+ ?x` (start and end map to
         // the same VariableId). Enumerate only nodes with a
         // self-loop via the path, rather than the cross-product
@@ -1049,7 +1066,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             return;
         }
         if variable == self.end {
-            if let Some(start_val) = binding.get(self.start) {
+            if let Some(start_val) = start_val {
                 let mut reachable = eval_from(&self.set, &self.expr, start_val);
                 // Zero-length-path scope rule (SPARQL §17.5):
                 // eval_from's nullable arms insert the seed
@@ -1070,7 +1087,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }
         if variable == self.start {
-            if let Some(end_val) = binding.get(self.end) {
+            if let Some(end_val) = end_val {
                 // End is bound; propose only those start terms that
                 // actually reach `end` via `expr`. Symmetric to the
                 // start-bound case: one BFS backward via the
@@ -1106,7 +1123,14 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// Filters one row's candidate values.
+    fn confirm_row(
+        &self,
+        variable: VariableId,
+        start_val: Option<&RawInline>,
+        end_val: Option<&RawInline>,
+        proposals: &mut Vec<RawInline>,
+    ) {
         // Same-Variable case: filter proposals to those with a
         // self-loop via the path expression.
         if self.start == self.end && variable == self.start {
@@ -1114,7 +1138,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             return;
         }
         if variable == self.start {
-            if let Some(end_val) = binding.get(self.end) {
+            if let Some(end_val) = end_val {
                 let end_val = *end_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, &end_val));
             } else if !nullable(&self.expr) {
@@ -1127,7 +1151,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 proposals.retain(|v| can_take_first_step(&self.set, &steps, v));
             }
         } else if variable == self.end {
-            if let Some(start_val) = binding.get(self.start) {
+            if let Some(start_val) = start_val {
                 let start_val = *start_val;
                 proposals.retain(|v| has_path_gated(&self.set, &self.expr, &start_val, v));
             } else if !nullable(&self.expr) {
@@ -1137,15 +1161,84 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }
     }
+}
+
+impl<'a> Constraint<'a> for RegularPathConstraint {
+    fn variables(&self) -> VariableSet {
+        let mut vars = VariableSet::new_empty();
+        vars.set(self.start);
+        vars.set(self.end);
+        vars
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != self.start && variable != self.end {
+            return false;
+        }
+        let ps = view.col(self.start);
+        let pe = view.col(self.end);
+        out.extend(
+            view.iter()
+                .map(|row| self.estimate_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]))),
+        );
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable != self.start && variable != self.end {
+            return;
+        }
+        let ps = view.col(self.start);
+        let pe = view.col(self.end);
+        let mut scratch: Vec<RawInline> = Vec::new();
+        for (i, row) in view.iter().enumerate() {
+            scratch.clear();
+            self.propose_row(
+                variable,
+                ps.map(|c| &row[c]),
+                pe.map(|c| &row[c]),
+                &mut scratch,
+            );
+            candidates.extend_row(i as u32, scratch.iter().copied());
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable != self.start && variable != self.end {
+            return;
+        }
+        let ps = view.col(self.start);
+        let pe = view.col(self.end);
+        confirm_per_row(view, candidates, |row, values| {
+            self.confirm_row(variable, ps.map(|c| &row[c]), pe.map(|c| &row[c]), values);
+        });
+    }
 
     /// Exact when both endpoints are bound: checks reachability from the
     /// bound start to the bound end (with the zero-length-path scope rule
-    /// applied). Returns `true` optimistically while either endpoint is
-    /// unbound. The same-variable case (`?x expr ?x`) is covered
-    /// naturally — both lookups read the same binding slot.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match (binding.get(self.start), binding.get(self.end)) {
-            (Some(from), Some(to)) => has_path_gated(&self.set, &self.expr, from, to),
+    /// applied) for every row. Returns `true` optimistically while either
+    /// endpoint is unbound. The same-variable case (`?x expr ?x`) is
+    /// covered naturally — both lookups read the same column.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match (view.col(self.start), view.col(self.end)) {
+            (Some(cs), Some(ce)) => view
+                .iter()
+                .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
             _ => true,
         }
     }

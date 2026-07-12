@@ -2,14 +2,17 @@ use core::panic;
 
 use crate::id::id_from_value;
 use crate::id::id_into_value;
+use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
-use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
 use crate::query::RawTerm;
+use crate::query::RowsView;
 use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -53,49 +56,109 @@ impl TribleSetConstraint {
     }
 }
 
-impl<'a> Constraint<'a> for TribleSetConstraint {
-    /// Returns the set of variable positions (constant positions are
-    /// invisible to the engine).
-    fn variables(&self) -> VariableSet {
-        let mut variables = VariableSet::new_empty();
-        self.term_e.add_to(&mut variables);
-        self.term_a.add_to(&mut variables);
-        self.term_v.add_to(&mut variables);
-        variables
+/// The per-call value source of one pattern position: a column of the
+/// current block (a variable bound in the view) or the constant pinned at
+/// construction (which behaves exactly like a bound variable, uniformly
+/// across all rows). Resolved once per protocol call; the per-row work is
+/// pure reads.
+#[derive(Clone, Copy)]
+enum Src {
+    /// The position's variable is bound at this column of the block.
+    Col(usize),
+    /// The position is a constant term.
+    Const(RawInline),
+}
+
+impl Src {
+    #[inline]
+    fn get<'r>(&'r self, row: &'r [RawInline]) -> &'r RawInline {
+        match self {
+            Src::Col(i) => &row[*i],
+            Src::Const(c) => c,
+        }
+    }
+}
+
+/// Resolves a term against the block layout: `None` for an unbound
+/// variable, the column for a bound one, the pinned value for a constant.
+fn term_src(term: &RawTerm, view: &RowsView<'_>) -> Option<Src> {
+    match term {
+        RawTerm::Var(v) => view.col(*v).map(Src::Col),
+        RawTerm::Const(c) => Some(Src::Const(*c)),
+    }
+}
+
+/// The hoisted per-row context of one [`TribleSetConstraint`] call: which
+/// positions hold the queried variable (`*_var` — never true for a
+/// constant term) and where the other positions' values come from (`p*`:
+/// block column or pinned constant). Computed once per protocol call; the
+/// per-row work is pure reads.
+struct Positions {
+    e_var: bool,
+    a_var: bool,
+    v_var: bool,
+    pe: Option<Src>,
+    pa: Option<Src>,
+    pv: Option<Src>,
+}
+
+impl Positions {
+    #[inline]
+    fn e<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pe.as_ref().map(|s| s.get(row))
     }
 
-    /// Uses the covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to
-    /// count matching entries via `segmented_len`. The index chosen
-    /// depends on which of the other two positions are already bound,
-    /// giving tight estimates regardless of access pattern.
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        let e_var = self.term_e.is_var(variable);
-        let a_var = self.term_a.is_var(variable);
-        let v_var = self.term_v.is_var(variable);
+    #[inline]
+    fn a<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pa.as_ref().map(|s| s.get(row))
+    }
 
-        if !e_var && !a_var && !v_var {
-            return None;
+    #[inline]
+    fn v<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
+        self.pv.as_ref().map(|s| s.get(row))
+    }
+}
+
+impl TribleSetConstraint {
+    fn positions(&self, variable: VariableId, view: &RowsView<'_>) -> Positions {
+        Positions {
+            e_var: self.term_e.is_var(variable),
+            a_var: self.term_a.is_var(variable),
+            v_var: self.term_v.is_var(variable),
+            pe: term_src(&self.term_e, view),
+            pa: term_src(&self.term_a, view),
+            pv: term_src(&self.term_v, view),
         }
+    }
 
-        let e_bound = if let Some(e) = self.term_e.bound(binding) {
-            let Some(e) = id_from_value(e) else {
-                return Some(0);
-            };
-            Some(e)
-        } else {
-            None
+    /// Candidate count for one row. Uses the covering indexes (EAV, EVA,
+    /// AEV, AVE, VEA, VAE) to count matching entries via `segmented_len`.
+    /// The index chosen depends on which of the other two positions have
+    /// values, giving tight estimates regardless of access pattern.
+    fn estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = match p.e(row) {
+            Some(e) => match id_from_value(e) {
+                Some(e) => Some(e),
+                None => return 0,
+            },
+            None => None,
         };
-        let a_bound = if let Some(a) = self.term_a.bound(binding) {
-            let Some(a) = id_from_value(a) else {
-                return Some(0);
-            };
-            Some(a)
-        } else {
-            None
+        let a_bound = match p.a(row) {
+            Some(a) => match id_from_value(a) {
+                Some(a) => Some(a),
+                None => return 0,
+            },
+            None => None,
         };
-        let v_bound = self.term_v.bound(binding);
+        let v_bound = p.v(row);
 
-        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+        (match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Legal distinct-position combinations (queried var
             // appears in exactly one trible position).
             (None, None, None, true, false, false) => self.set.eav.segmented_len(&[0; 0]),
@@ -193,114 +256,105 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 self.set.eav.segmented_len(&[0; 0])
             }
             _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
-        } as usize)
+        }) as usize
     }
 
-    /// Enumerates matching values from the most selective covering index
-    /// via `infixes`. The index is chosen to match the bound positions,
-    /// so proposals are generated directly from a prefix scan.
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let e_var = self.term_e.is_var(variable);
-        let a_var = self.term_a.is_var(variable);
-        let v_var = self.term_v.is_var(variable);
-
-        if !e_var && !a_var && !v_var {
-            return;
-        }
-
-        let e_bound = if let Some(e) = self.term_e.bound(binding) {
-            let Some(e) = id_from_value(e) else {
-                return;
-            };
-            Some(e)
-        } else {
-            None
+    /// Enumerates matching values for one row from the most selective
+    /// covering index via `infixes`, feeding a monomorphized `push` — the
+    /// sink dispatch happens once per protocol call in
+    /// [`Constraint::propose`], never in the enumeration loops.
+    /// The index is chosen to match the bound positions, so proposals are
+    /// generated directly from a prefix scan.
+    fn propose_row<F: FnMut(RawInline)>(&self, p: &Positions, row: &[RawInline], push: &mut F) {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
+        let e_bound = match p.e(row) {
+            Some(e) => match id_from_value(e) {
+                Some(e) => Some(e),
+                None => return,
+            },
+            None => None,
         };
-        let a_bound = if let Some(a) = self.term_a.bound(binding) {
-            let Some(a) = id_from_value(a) else {
-                return;
-            };
-            Some(a)
-        } else {
-            None
+        let a_bound = match p.a(row) {
+            Some(a) => match id_from_value(a) {
+                Some(a) => Some(a),
+                None => return,
+            },
+            None => None,
         };
-        let v_bound = self.term_v.bound(binding);
+        let v_bound = p.v(row);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Distinct-position combinations: the queried variable
             // appears in exactly one trible slot. Drive enumeration
             // from the most selective covering index.
             (None, None, None, true, false, false) => {
-                self.set.eav.infixes(&[0; 0], &mut |e: &[u8; 16]| {
-                    proposals.push(id_into_value(e))
-                });
+                self.set
+                    .eav
+                    .infixes(&[0; 0], &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, None, None, false, true, false) => {
-                self.set.aev.infixes(&[0; 0], &mut |a: &[u8; 16]| {
-                    proposals.push(id_into_value(a))
-                });
+                self.set
+                    .aev
+                    .infixes(&[0; 0], &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (None, None, None, false, false, true) => {
-                self.set
-                    .vea
-                    .infixes(&[0; 0], &mut |&v: &[u8; 32]| proposals.push(v));
+                self.set.vea.infixes(&[0; 0], &mut |&v: &[u8; 32]| push(v));
             }
 
             (Some(e), None, None, false, true, false) => {
                 self.set
                     .eav
-                    .infixes(&e, &mut |a: &[u8; 16]| proposals.push(id_into_value(a)));
+                    .infixes(&e, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (Some(e), None, None, false, false, true) => {
-                self.set
-                    .eva
-                    .infixes(&e, &mut |&v: &[u8; 32]| proposals.push(v));
+                self.set.eva.infixes(&e, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, Some(a), None, true, false, false) => {
                 self.set
                     .aev
-                    .infixes(&a, &mut |e: &[u8; 16]| proposals.push(id_into_value(e)));
+                    .infixes(&a, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, Some(a), None, false, false, true) => {
-                self.set
-                    .ave
-                    .infixes(&a, &mut |&v: &[u8; 32]| proposals.push(v));
+                self.set.ave.infixes(&a, &mut |&v: &[u8; 32]| push(v));
             }
 
             (None, None, Some(v), true, false, false) => {
                 self.set
                     .vea
-                    .infixes(v, &mut |e: &[u8; 16]| proposals.push(id_into_value(e)));
+                    .infixes(v, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (None, None, Some(v), false, true, false) => {
                 self.set
                     .vae
-                    .infixes(v, &mut |a: &[u8; 16]| proposals.push(id_into_value(a)));
+                    .infixes(v, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.ave.infixes(&prefix, &mut |e: &[u8; 16]| {
-                    proposals.push(id_into_value(e))
-                });
+                self.set
+                    .ave
+                    .infixes(&prefix, &mut |e: &[u8; 16]| push(id_into_value(e)));
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.eva.infixes(&prefix, &mut |a: &[u8; 16]| {
-                    proposals.push(id_into_value(a))
-                });
+                self.set
+                    .eva
+                    .infixes(&prefix, &mut |a: &[u8; 16]| push(id_into_value(a)));
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
-                self.set
-                    .eav
-                    .infixes(&prefix, &mut |&v: &[u8; 32]| proposals.push(v));
+                self.set.eav.infixes(&prefix, &mut |&v: &[u8; 32]| push(v));
             }
 
             // Same-Variable arms. The covering indexes already
@@ -315,7 +369,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -327,7 +381,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(e);
                     prefix[ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eva.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -339,7 +393,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -350,7 +404,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -362,7 +416,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(a));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -373,7 +427,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[0..ID_LEN].copy_from_slice(a);
                     prefix[ID_LEN..].copy_from_slice(&id_into_value(a));
                     if self.set.ave.has_prefix(&prefix) {
-                        proposals.push(id_into_value(a));
+                        push(id_into_value(a));
                     }
                 });
             }
@@ -387,7 +441,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(e);
                     prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(e));
                     if self.set.eav.has_prefix(&prefix) {
-                        proposals.push(id_into_value(e));
+                        push(id_into_value(e));
                     }
                 });
             }
@@ -395,54 +449,39 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         }
     }
 
-    /// Retains only proposals whose combined key (bound positions +
-    /// proposed value) has a matching prefix in the appropriate index.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        let e_var = self.term_e.is_var(variable);
-        let a_var = self.term_a.is_var(variable);
-        let v_var = self.term_v.is_var(variable);
-
-        if !e_var && !a_var && !v_var {
-            return;
-        }
-
-        let e_bound = if let Some(e) = self.term_e.bound(binding) {
-            let Some(e) = id_from_value(e) else {
-                proposals.clear();
-                return;
-            };
-            Some(e)
-        } else {
-            None
-        };
-        let a_bound = if let Some(a) = self.term_a.bound(binding) {
-            let Some(a) = id_from_value(a) else {
-                proposals.clear();
-                return;
-            };
-            Some(a)
-        } else {
-            None
-        };
-        let v_bound = self.term_v.bound(binding);
-
+    /// Per-candidate confirm predicate: does the combined key (this
+    /// row's bound positions + the proposed value) have a matching
+    /// prefix in the appropriate index?
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_value(
+        &self,
+        p: &Positions,
+        e_bound: Option<RawId>,
+        a_bound: Option<RawId>,
+        v_bound: Option<RawInline>,
+        value: &RawInline,
+    ) -> bool {
+        let Positions {
+            e_var,
+            a_var,
+            v_var,
+            ..
+        } = *p;
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => proposals.retain(|value| {
+            (None, None, None, true, false, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.eav.has_prefix(&id)
-            }),
-            (None, None, None, false, true, false) => proposals.retain(|value| {
+            }
+            (None, None, None, false, true, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.aev.has_prefix(&id)
-            }),
-            (None, None, None, false, false, true) => {
-                proposals.retain(|value| self.set.vea.has_prefix(value))
             }
-            (Some(e), None, None, false, true, false) => proposals.retain(|value| {
+            (None, None, None, false, false, true) => self.set.vea.has_prefix(value),
+            (Some(e), None, None, false, true, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -450,14 +489,14 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
-            }),
-            (Some(e), None, None, false, false, true) => proposals.retain(|value| {
+            }
+            (Some(e), None, None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eva.has_prefix(&prefix)
-            }),
-            (None, Some(a), None, true, false, false) => proposals.retain(|value| {
+            }
+            (None, Some(a), None, true, false, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -465,14 +504,14 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.aev.has_prefix(&prefix)
-            }),
-            (None, Some(a), None, false, false, true) => proposals.retain(|value| {
+            }
+            (None, Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.ave.has_prefix(&prefix)
-            }),
-            (None, None, Some(v), true, false, false) => proposals.retain(|value| {
+            }
+            (None, None, Some(v), true, false, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -480,8 +519,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vea.has_prefix(&prefix)
-            }),
-            (None, None, Some(v), false, true, false) => proposals.retain(|value| {
+            }
+            (None, None, Some(v), false, true, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -489,40 +528,40 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vae.has_prefix(&prefix)
-            }),
-            (None, Some(a), Some(v), true, false, false) => proposals.retain(|value: &[u8; 32]| {
+            }
+            (None, Some(a), Some(v), true, false, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v);
                 prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.ave.has_prefix(&prefix)
-            }),
-            (Some(e), None, Some(v), false, true, false) => proposals.retain(|value: &[u8; 32]| {
+            }
+            (Some(e), None, Some(v), false, true, false) => {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(&v);
                 prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eva.has_prefix(&prefix)
-            }),
-            (Some(e), Some(a), None, false, false, true) => proposals.retain(|value: &[u8; 32]| {
+            }
+            (Some(e), Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
                 prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eav.has_prefix(&prefix)
-            }),
+            }
 
             // Same-Variable arms. The proposal value plays two roles
             // (e and v, or e and a, or a and v); we build a full
             // 64-byte trible key from each proposal and check
             // `has_prefix` against the appropriate index.
-            (_, Some(a), _, true, false, true) => proposals.retain(|value| {
+            (_, Some(a), _, true, false, true) => {
                 // pattern(x, a, x): proposal is both entity and value.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -532,8 +571,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
-            }),
-            (_, None, _, true, false, true) => proposals.retain(|value| {
+            }
+            (_, None, _, true, false, true) => {
                 // pattern(x, ?, x): proposal is entity == value, any attr.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -542,8 +581,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eva.has_prefix(&prefix)
-            }),
-            (_, _, Some(v), true, true, false) => proposals.retain(|value| {
+            }
+            (_, _, Some(v), true, true, false) => {
                 // pattern(x, x, v): proposal is entity == attribute.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -553,8 +592,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
                 self.set.eav.has_prefix(&prefix)
-            }),
-            (_, _, None, true, true, false) => proposals.retain(|value| {
+            }
+            (_, _, None, true, true, false) => {
                 // pattern(x, x, ?): proposal is entity == attribute, any v.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -563,8 +602,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
-            }),
-            (Some(e), _, _, false, true, true) => proposals.retain(|value| {
+            }
+            (Some(e), _, _, false, true, true) => {
                 // pattern(e, x, x): proposal is attribute == value.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -574,8 +613,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
-            }),
-            (None, _, _, false, true, true) => proposals.retain(|value| {
+            }
+            (None, _, _, false, true, true) => {
                 // pattern(?, x, x): proposal is attribute == value, any e.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -584,8 +623,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.ave.has_prefix(&prefix)
-            }),
-            (_, _, _, true, true, true) => proposals.retain(|value| {
+            }
+            (_, _, _, true, true, true) => {
                 // pattern(x, x, x): proposal plays all three roles.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -595,32 +634,144 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
-            }),
+            }
             _ => panic!("invalid trible constraint state"),
         }
     }
+}
+
+impl<'a> Constraint<'a> for TribleSetConstraint {
+    /// Returns the set of variable positions (constant positions are
+    /// invisible to the engine).
+    fn variables(&self) -> VariableSet {
+        let mut variables = VariableSet::new_empty();
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
+        variables
+    }
+
+    /// One [`segmented_len`](crate::patch::PATCH::segmented_len) count per
+    /// row; the index dispatch is hoisted out of the row loop.
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
+        {
+            return false;
+        }
+        let p = self.positions(variable, view);
+        out.extend(view.iter().map(|row| self.estimate_row(&p, row)));
+        true
+    }
+
+    /// Per-row prefix scans of the most selective covering index. The
+    /// sink variant is matched once; each arm drives the enumeration with
+    /// a monomorphized push (the sequential `Values` arm never touches a
+    /// row tag).
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
+        {
+            return;
+        }
+        let p = self.positions(variable, view);
+        match candidates {
+            CandidateSink::Tagged(pairs) => {
+                for (i, row) in view.iter().enumerate() {
+                    self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                }
+            }
+            CandidateSink::Values(values) => {
+                for row in view.iter() {
+                    self.propose_row(&p, row, &mut |v| values.push(v));
+                }
+            }
+        }
+    }
+
+    /// One `has_prefix` probe per candidate; each row's bound positions
+    /// are decoded once (candidates are grouped by row). A row whose
+    /// bound id fails to decode rejects all of its candidates.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
+        {
+            return;
+        }
+        let p = self.positions(variable, view);
+        let mut current_row: Option<u32> = None;
+        let mut e_bound: Option<RawId> = None;
+        let mut a_bound: Option<RawId> = None;
+        let mut v_bound: Option<RawInline> = None;
+        let mut row_ok = true;
+        candidates.retain(|row_idx, value| {
+            if current_row != Some(row_idx) {
+                current_row = Some(row_idx);
+                let row = view.row(row_idx as usize);
+                row_ok = true;
+                e_bound = None;
+                a_bound = None;
+                v_bound = None;
+                if let Some(e) = p.e(row) {
+                    match id_from_value(e) {
+                        Some(e) => e_bound = Some(e),
+                        None => row_ok = false,
+                    }
+                }
+                if let Some(a) = p.a(row) {
+                    match id_from_value(a) {
+                        Some(a) => a_bound = Some(a),
+                        None => row_ok = false,
+                    }
+                }
+                if let Some(v) = p.v(row) {
+                    v_bound = Some(*v);
+                }
+            }
+            row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, value)
+        });
+    }
 
     /// When all three positions have values (bound or constant), checks
-    /// whether the triple exists in the EAV index. Returns `true`
+    /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        let e = self.term_e.bound(binding);
-        let a = self.term_a.bound(binding);
-        let v = self.term_v.bound(binding);
-        match (e, a, v) {
-            (Some(e_raw), Some(a_raw), Some(v_raw)) => {
-                let Some(e) = id_from_value(e_raw) else {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match (
+            term_src(&self.term_e, view),
+            term_src(&self.term_a, view),
+            term_src(&self.term_v, view),
+        ) {
+            (Some(se), Some(sa), Some(sv)) => view.iter().all(|row| {
+                let Some(e) = id_from_value(se.get(row)) else {
                     return false;
                 };
-                let Some(a) = id_from_value(a_raw) else {
+                let Some(a) = id_from_value(sa.get(row)) else {
                     return false;
                 };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN + ID_LEN..].copy_from_slice(v_raw);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(sv.get(row));
                 self.set.eav.has_prefix(&prefix)
-            }
+            }),
             _ => true,
         }
     }

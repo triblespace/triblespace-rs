@@ -28,33 +28,51 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         VariableSet::new_singleton(self.variable)
     }
 
-    /// Always returns `Some(1)` for the constrained variable.
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    /// Always estimates exactly one candidate, for every row.
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if self.variable != variable {
+            return false;
+        }
+        out.fill(1, view.len());
+        true
+    }
+
+    /// Proposes the single constant value for every row.
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable == variable {
-            Some(1)
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                candidates.push(i, self.constant);
+            }
         }
     }
 
-    /// Pushes the single constant value.
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// The constant is binding-independent, so confirm is a single retain
+    /// over the whole frontier — no per-row work at all.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable == variable {
-            proposals.push(self.constant);
+            candidates.retain(|_, v| *v == self.constant);
         }
     }
 
-    /// Retains only proposals that match the constant exactly.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable == variable {
-            proposals.retain(|v| *v == self.constant);
-        }
-    }
-
-    /// Returns `false` when the variable is bound to a different value.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable) {
-            Some(v) => *v == self.constant,
+    /// Returns `false` when any row binds the variable to another value.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable) {
+            Some(col) => view.iter().all(|row| row[col] == self.constant),
             None => true,
         }
     }

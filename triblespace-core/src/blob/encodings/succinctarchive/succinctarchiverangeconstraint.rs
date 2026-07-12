@@ -2,8 +2,10 @@ use super::*;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
-use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
+use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -83,33 +85,54 @@ where
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if variable != self.variable_v {
-            return None;
+            return false;
         }
-        Some(self.cached_estimate)
+        out.fill(self.cached_estimate, view.len());
+        true
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable != self.variable_v {
             return;
         }
-        let code_range = self.archive.domain.search_range(&self.min, &self.max);
-        proposals.extend(
-            self.archive
-                .enumerate_domain_in_range(&self.archive.v_a, code_range),
-        );
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if variable == self.variable_v {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+        for i in 0..view.len() as u32 {
+            let code_range = self.archive.domain.search_range(&self.min, &self.max);
+            candidates.extend_row(
+                i,
+                self.archive
+                    .enumerate_domain_in_range(&self.archive.v_a, code_range),
+            );
         }
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable_v) {
-            Some(v) => *v >= self.min && *v <= self.max,
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        if variable == self.variable_v {
+            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable_v) {
+            Some(col) => view
+                .iter()
+                .all(|row| row[col] >= self.min && row[col] <= self.max),
             None => true,
         }
     }

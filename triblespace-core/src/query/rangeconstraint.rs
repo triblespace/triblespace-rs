@@ -49,32 +49,50 @@ impl<'a> Constraint<'a> for InlineRange {
         VariableSet::new_singleton(self.variable)
     }
 
-    /// Returns `usize::MAX` so the intersection never chooses this
+    /// Estimates `usize::MAX` so the intersection never chooses this
     /// constraint as the proposer — it only confirms.
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if self.variable == variable {
-            Some(usize::MAX)
-        } else {
-            None
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if self.variable != variable {
+            return false;
         }
+        out.fill(usize::MAX, view.len());
+        true
     }
 
     /// Does not propose — the paired TribleSet constraint handles proposals.
-    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut Vec<RawInline>) {
+    fn propose(
+        &self,
+        _variable: VariableId,
+        _view: &RowsView<'_>,
+        _candidates: &mut CandidateSink<'_>,
+    ) {
         // Intentionally empty: this constraint only confirms.
     }
 
-    /// Retains only proposals whose raw bytes fall within [min, max] inclusive.
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    /// Retains only candidates whose raw bytes fall within [min, max]
+    /// inclusive — value-only, so one retain over the whole frontier.
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable == variable {
-            proposals.retain(|v| *v >= self.min && *v <= self.max);
+            candidates.retain(|_, v| *v >= self.min && *v <= self.max);
         }
     }
 
-    /// Returns `false` when the variable is bound to a value outside the range.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable) {
-            Some(v) => *v >= self.min && *v <= self.max,
+    /// Returns `false` when any row binds the variable outside the range.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable) {
+            Some(col) => view
+                .iter()
+                .all(|row| row[col] >= self.min && row[col] <= self.max),
             None => true,
         }
     }

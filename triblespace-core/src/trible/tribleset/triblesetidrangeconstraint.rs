@@ -4,9 +4,10 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
-use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
+use crate::query::EstimateSink;
+use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -48,31 +49,49 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         VariableSet::new_singleton(self.variable_e)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if variable != self.variable_e {
-            return None;
+            return false;
         }
         let count = self
             .set
             .eav
             .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
-        Some(count.min(usize::MAX as u64) as usize)
+        out.fill(count.min(usize::MAX as u64) as usize, view.len());
+        true
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable != self.variable_e {
             return;
         }
-        self.set
-            .eav
-            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
-                proposals.push(id_into_value(e));
-            });
+        for i in 0..view.len() as u32 {
+            self.set
+                .eav
+                .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
+                    candidates.push(i, id_into_value(e));
+                });
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable == self.variable_e {
-            proposals.retain(|v| {
+            candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };
@@ -81,14 +100,14 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable_e) {
-            Some(v) => {
-                let Some(id) = id_from_value(v) else {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable_e) {
+            Some(col) => view.iter().all(|row| {
+                let Some(id) = id_from_value(&row[col]) else {
                     return false;
                 };
                 id >= self.min && id <= self.max
-            }
+            }),
             None => true,
         }
     }
@@ -130,31 +149,49 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         VariableSet::new_singleton(self.variable_a)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
         if variable != self.variable_a {
-            return None;
+            return false;
         }
         let count = self
             .set
             .aev
             .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
-        Some(count.min(usize::MAX as u64) as usize)
+        out.fill(count.min(usize::MAX as u64) as usize, view.len());
+        true
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable != self.variable_a {
             return;
         }
-        self.set
-            .aev
-            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
-                proposals.push(id_into_value(a));
-            });
+        for i in 0..view.len() as u32 {
+            self.set
+                .aev
+                .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
+                    candidates.push(i, id_into_value(a));
+                });
+        }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if variable == self.variable_a {
-            proposals.retain(|v| {
+            candidates.retain(|_, v| {
                 let Some(id) = id_from_value(v) else {
                     return false;
                 };
@@ -163,14 +200,14 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         }
     }
 
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable_a) {
-            Some(v) => {
-                let Some(id) = id_from_value(v) else {
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable_a) {
+            Some(col) => view.iter().all(|row| {
+                let Some(id) = id_from_value(&row[col]) else {
                     return false;
                 };
                 id >= self.min && id <= self.max
-            }
+            }),
             None => true,
         }
     }

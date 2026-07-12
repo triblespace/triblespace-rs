@@ -362,26 +362,24 @@ find!(
 This is useful when the helper participates in joins but should not be
 projected.
 
-## Hide helpers with `ignore!`
+## Drop wildcard positions with `ignore!`
 
-Use [`ignore!`](triblespace::core::prelude::ignore) when a constraint needs internal
-variables that should not be visible to the outer planner.
+Use [`ignore!`](triblespace::core::prelude::ignore) when only some positions of
+a multi-column constraint should contribute to the outer query.
 
 ```rust,ignore
 find!(
     (person: Inline<_>),
     ignore!((friend),
-        pattern!(&kb, [
-            { ?person @ social::friend: ?friend },
-            { ?friend @ social::name: "Bob" }
-        ])
+        pattern!(&kb, [{ ?person @ social::friend: ?friend }])
     )
 )
 ```
 
-This is a more specialized tool than `temp!`. Reach for it when you already
-have a nested constraint that uses helper variables internally and you want to
-hide them from the outer query.
+The ignored position is an independent don't-care wildcard: it is never bound,
+and a clause mentioning only ignored positions is inert. Repeating an ignored
+name does not create a hidden join. Use `temp!` above when the non-projected
+helper must actually connect multiple clauses.
 
 ## Which macro should I use?
 
@@ -397,7 +395,7 @@ If you are:
 - requiring all clauses: use `and!`
 - allowing alternatives: use `or!`
 - introducing a fresh helper variable: use `temp!`
-- hiding helper variables from the outer query: use `ignore!`
+- dropping don't-care positions from a constraint: use `ignore!`
 
 From here, the best next stops are:
 

@@ -42,24 +42,41 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        // The current set length estimates the proposal count, per row.
+        out.fill(self.set.len(), view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
-            // use the current set length as the estimate for proposal count
-            Some(self.set.len())
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
-            proposals.extend(self.set.iter().map(|v| IntoInline::to_inline(v).raw));
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            proposals.retain(|v| {
+            candidates.retain(|_, v| {
                 match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
                     Ok(t) => self.set.contains(&t),
                     Err(_) => false,
@@ -68,15 +85,17 @@ where
         }
     }
 
-    /// Exact when the variable is bound: checks whether the bound value is
-    /// a member of the set. Returns `true` optimistically while the
-    /// variable is unbound.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable.index) {
-            Some(v) => match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
-                Ok(t) => self.set.contains(&t),
-                Err(_) => false,
-            },
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is a member of the set. Returns `true` optimistically while
+    /// the variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(&row[c])) {
+                    Ok(t) => self.set.contains(&t),
+                    Err(_) => false,
+                }
+            }),
             None => true,
         }
     }

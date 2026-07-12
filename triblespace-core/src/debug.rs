@@ -1,8 +1,9 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
-    use crate::inline::RawInline;
-    use crate::query::Binding;
+    use crate::query::CandidateSink;
     use crate::query::Constraint;
+    use crate::query::EstimateSink;
+    use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
     use std::cell::RefCell;
@@ -28,17 +29,36 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-            self.constraint.estimate(variable, binding)
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            self.constraint.estimate(variable, view, out)
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
             self.record.borrow_mut().push(variable);
-            self.constraint.propose(variable, binding, proposals);
+            self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint.confirm(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.constraint.satisfied(view)
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {
@@ -82,16 +102,40 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-            self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if let Some(estimate) = self.estimates[variable] {
+                out.fill(estimate, view.len());
+                true
+            } else {
+                self.constraint.estimate(variable, view, out)
+            }
         }
 
-        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.propose(variable, binding, proposals);
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint.propose(variable, view, candidates);
         }
 
-        fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-            self.constraint.confirm(variable, binding, proposals);
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            self.constraint.confirm(variable, view, candidates);
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            self.constraint.satisfied(view)
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {

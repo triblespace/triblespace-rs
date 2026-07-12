@@ -31,7 +31,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::query::regularpathconstraint::{PathOp, RegularPathConstraint};
 use triblespace_core::query::sortedsliceconstraint::SortedSlice;
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
+    Constraint, ContainsConstraint, RowsView, TriblePattern, Variable, VariableContext,
 };
 
 mod test_ns {
@@ -132,6 +132,8 @@ fn pattern_changes_monotone_growth_keeps_results() {
                 { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
             ])
         )
+        .solve_dag_lazy()
+        .agglomerative_partition()
         .map(|e: Inline<GenId>| e.raw)
         .collect()
     };
@@ -192,7 +194,9 @@ fn dead_union_variant_cannot_emit_impossible_rows() {
 
 /// Exercises every leaf constraint that gained an exact fully-bound
 /// `satisfied()`: bound-to-member ⇒ true, bound-to-non-member ⇒ false,
-/// unbound ⇒ optimistic true.
+/// unbound ⇒ optimistic true. The block-native protocol expresses "bound
+/// to v" as a single-row [`RowsView`] with one column; `RowsView::EMPTY`
+/// is the seed block (one zero-width row — nothing bound).
 #[test]
 fn set_constraint_satisfied_exact_when_bound() {
     let set: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
@@ -203,13 +207,17 @@ fn set_constraint_satisfied_exact_when_bound() {
     let member: Inline<ShortString> = "a".to_inline();
     let outsider: Inline<ShortString> = "z".to_inline();
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(x.index, &member.raw);
-    assert!(constraint.satisfied(&binding), "bound to member: true");
-    binding.set(x.index, &outsider.raw);
     assert!(
-        !constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let vars = [x.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&vars, &[member.raw])),
+        "bound to member: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&vars, &[outsider.raw])),
         "bound to non-member: false"
     );
 }
@@ -225,12 +233,19 @@ fn keys_constraint_satisfied_exact_when_bound() {
     let member: Inline<ShortString> = "a".to_inline();
     let outsider: Inline<ShortString> = "z".to_inline();
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(x.index, &member.raw);
-    assert!(constraint.satisfied(&binding), "bound to key: true");
-    binding.set(x.index, &outsider.raw);
-    assert!(!constraint.satisfied(&binding), "bound to non-key: false");
+    assert!(
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let vars = [x.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&vars, &[member.raw])),
+        "bound to key: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&vars, &[outsider.raw])),
+        "bound to non-key: false"
+    );
 }
 
 #[test]
@@ -244,13 +259,17 @@ fn sorted_slice_constraint_satisfied_exact_when_bound() {
     let member: Inline<ShortString> = "b".to_inline();
     let outsider: Inline<ShortString> = "z".to_inline();
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(x.index, &member.raw);
-    assert!(constraint.satisfied(&binding), "bound to member: true");
-    binding.set(x.index, &outsider.raw);
     assert!(
-        !constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let vars = [x.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&vars, &[member.raw])),
+        "bound to member: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&vars, &[outsider.raw])),
         "bound to non-member: false"
     );
 }
@@ -266,13 +285,17 @@ fn patch_value_constraint_satisfied_exact_when_bound() {
     let x: Variable<UnknownInline> = ctx.next_variable();
     let constraint = (&patch).has(x);
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(x.index, &member);
-    assert!(constraint.satisfied(&binding), "bound to member: true");
-    binding.set(x.index, &outsider);
     assert!(
-        !constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let vars = [x.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&vars, &[member])),
+        "bound to member: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&vars, &[outsider])),
         "bound to non-member: false"
     );
 }
@@ -288,13 +311,17 @@ fn patch_id_constraint_satisfied_exact_when_bound() {
     let x: Variable<GenId> = ctx.next_variable();
     let constraint = patch.has(x);
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(x.index, &id_value(&member_id));
-    assert!(constraint.satisfied(&binding), "bound to member: true");
-    binding.set(x.index, &id_value(&outsider_id));
     assert!(
-        !constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let vars = [x.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&vars, &[id_value(&member_id)])),
+        "bound to member: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&vars, &[id_value(&outsider_id)])),
         "bound to non-member: false"
     );
 }
@@ -316,18 +343,22 @@ fn regular_path_constraint_satisfied_exact_when_bound() {
     let b_val: Inline<GenId> = (&b).to_inline();
     let c_val: Inline<GenId> = (&c).to_inline();
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(s.index, &a_val.raw);
     assert!(
-        constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let s_vars = [s.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&s_vars, &[a_val.raw])),
         "one endpoint bound: optimistic true"
     );
-    binding.set(d.index, &b_val.raw);
-    assert!(constraint.satisfied(&binding), "a → b exists: true");
-    binding.set(d.index, &c_val.raw);
+    let sd_vars = [s.index, d.index];
     assert!(
-        !constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::new(&sd_vars, &[a_val.raw, b_val.raw])),
+        "a → b exists: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&sd_vars, &[a_val.raw, c_val.raw])),
         "a → c does not exist: false"
     );
 }
@@ -350,18 +381,24 @@ fn succinct_archive_constraint_satisfied_exact_when_bound() {
     let present: Inline<ShortString> = "x".to_inline();
     let absent: Inline<ShortString> = "y".to_inline();
 
-    let mut binding = Binding::default();
-    assert!(constraint.satisfied(&binding), "unbound: optimistic true");
-    binding.set(ve.index, &e_val.raw);
-    binding.set(va.index, &a_val);
     assert!(
-        constraint.satisfied(&binding),
+        constraint.satisfied(&RowsView::EMPTY),
+        "unbound: optimistic true"
+    );
+    let ea_vars = [ve.index, va.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&ea_vars, &[e_val.raw, a_val])),
         "value unbound: optimistic true"
     );
-    binding.set(vv.index, &present.raw);
-    assert!(constraint.satisfied(&binding), "triple present: true");
-    binding.set(vv.index, &absent.raw);
-    assert!(!constraint.satisfied(&binding), "triple absent: false");
+    let eav_vars = [ve.index, va.index, vv.index];
+    assert!(
+        constraint.satisfied(&RowsView::new(&eav_vars, &[e_val.raw, a_val, present.raw])),
+        "triple present: true"
+    );
+    assert!(
+        !constraint.satisfied(&RowsView::new(&eav_vars, &[e_val.raw, a_val, absent.raw])),
+        "triple absent: false"
+    );
 }
 
 // ── Property tests: union = setwise union of arms; monotonicity ────────
@@ -378,6 +415,8 @@ fn union_of_intersections(
         x: Inline<ShortString>,
         or!(and!(s1.has(x), s2.has(x)), and!(s3.has(x), s4.has(x)))
     )
+    .solve_dag_lazy()
+    .agglomerative_partition()
     .map(|x: Inline<ShortString>| x.raw)
     .collect()
 }

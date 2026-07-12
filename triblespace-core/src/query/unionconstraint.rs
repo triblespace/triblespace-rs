@@ -79,75 +79,140 @@ where
         self.constraints[0].variables()
     }
 
-    /// Returns the **sum** of estimates across all variants. A union can
-    /// produce candidates from any branch, so the cardinalities add.
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.constraints
-            .iter()
-            .filter_map(|c| c.estimate(variable, binding))
-            .reduce(|acc, e| acc + e)
+    /// Appends the elementwise **sum** of estimates across all variants.
+    /// A union can produce candidates from any branch, so the
+    /// cardinalities add.
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        match out {
+            EstimateSink::Scalar(slot) => {
+                let mut any = false;
+                let mut acc = 0usize;
+                for c in &self.constraints {
+                    let mut e = 0usize;
+                    if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
+                        any = true;
+                        acc = acc.saturating_add(e);
+                    }
+                }
+                if any {
+                    **slot = acc;
+                }
+                any
+            }
+            EstimateSink::Column(out) => {
+                let base = out.len();
+                let mut any = false;
+                let mut scratch: Vec<usize> = Vec::new();
+                for c in &self.constraints {
+                    if !any {
+                        any = c.estimate(variable, view, &mut EstimateSink::Column(out));
+                    } else {
+                        scratch.clear();
+                        if c.estimate(variable, view, &mut EstimateSink::Column(&mut scratch)) {
+                            for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
+                                *o = o.saturating_add(s);
+                            }
+                        }
+                    }
+                }
+                any
+            }
+        }
     }
 
-    /// Collects proposals from every *satisfied* variant, then sorts and
-    /// deduplicates. Dead variants (where [`satisfied`](Constraint::satisfied)
-    /// returns `false`) are skipped so their stale bindings cannot inject
-    /// values that no live variant would produce.
+    /// Per row: collects proposals from every *satisfied* variant (via a
+    /// single-row borrowed view), then sorts and deduplicates the row's
+    /// group. Dead variants (where [`satisfied`](Constraint::satisfied)
+    /// returns `false` for the row) are skipped so their stale bindings
+    /// cannot inject values that no live variant would produce.
     ///
     /// Each variant proposes into its **own empty buffer** and the union
     /// merges the independent per-variant outputs. This upholds the
     /// empty-sink law of [`propose`](Constraint::propose): a composite
     /// variant (e.g. an intersection) filters the sink it is handed via its
-    /// children's `confirm`, so sharing one vector across variants would let
+    /// children's `confirm`, so sharing one buffer across variants would let
     /// a later variant delete candidates an earlier variant produced —
     /// making the result depend on variant order and, worse, letting a
     /// monotonic growth of the underlying data *remove* results (a CALM
     /// violation observed in [`pattern_changes!`](crate::macros::pattern_changes)
     /// joins).
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         debug_assert!(
-            proposals.is_empty(),
+            candidates.is_empty(),
             "propose expects an empty sink (see the Constraint::propose protocol law)"
         );
-        let mut variant_proposals = Vec::new();
-        self.constraints
-            .iter()
-            .filter(|c| c.satisfied(binding))
-            .for_each(|c| {
-                c.propose(variable, binding, &mut variant_proposals);
-                // `append` drains the buffer, leaving it empty for the
-                // next variant.
-                proposals.append(&mut variant_proposals);
-            });
-        proposals.sort_unstable();
-        proposals.dedup();
+        let mut row_values: Vec<RawInline> = Vec::new();
+        let mut variant_values: Vec<RawInline> = Vec::new();
+        for (i, row) in view.iter().enumerate() {
+            let row_view = RowsView::new(view.vars, row);
+            row_values.clear();
+            self.constraints
+                .iter()
+                .filter(|c| c.satisfied(&row_view))
+                .for_each(|c| {
+                    c.propose(
+                        variable,
+                        &row_view,
+                        &mut CandidateSink::Values(&mut variant_values),
+                    );
+                    // `append` drains the buffer, leaving it empty for the
+                    // next variant.
+                    row_values.append(&mut variant_values);
+                });
+            row_values.sort_unstable();
+            row_values.dedup();
+            candidates.extend_row(i as u32, row_values.iter().copied());
+        }
     }
 
-    /// Confirms proposals against every *satisfied* variant independently,
-    /// then merges the per-variant survivors via
+    /// Confirms each row's candidate group against every *satisfied*
+    /// variant independently, then merges the per-variant survivors via
     /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
     /// passes if *any* live variant confirms it.
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawInline>) {
-        proposals.sort_unstable();
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        confirm_per_row(view, candidates, |row, values| {
+            let row_view = RowsView::new(view.vars, row);
+            values.sort_unstable();
 
-        let union: Vec<_> = self
-            .constraints
-            .iter()
-            .filter(|c| c.satisfied(binding))
-            .map(|c| {
-                let mut proposals = proposals.clone();
-                c.confirm(variable, binding, &mut proposals);
-                proposals
-            })
-            .kmerge()
-            .dedup()
-            .collect();
+            let union: Vec<RawInline> = self
+                .constraints
+                .iter()
+                .filter(|c| c.satisfied(&row_view))
+                .map(|c| {
+                    let mut vs: Vec<RawInline> = values.clone();
+                    c.confirm(variable, &row_view, &mut CandidateSink::Values(&mut vs));
+                    vs
+                })
+                .kmerge()
+                .dedup()
+                .collect();
 
-        _ = mem::replace(proposals, union);
+            _ = mem::replace(values, union);
+        });
     }
 
-    /// Returns `true` when **at least one** variant is satisfied.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        self.constraints.iter().any(|c| c.satisfied(binding))
+    /// Returns `true` when **at least one** variant is satisfied for
+    /// every row.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        view.iter().all(|row| {
+            let row_view = RowsView::new(view.vars, row);
+            self.constraints.iter().any(|c| c.satisfied(&row_view))
+        })
     }
 
     /// Returns the union of all variants' influence sets for `variable`.

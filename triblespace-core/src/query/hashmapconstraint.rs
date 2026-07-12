@@ -6,11 +6,12 @@ use std::sync::Arc;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::IntoInline;
-use crate::inline::RawInline;
 use crate::inline::TryFromInline;
-use crate::query::Binding;
+use crate::query::CandidateSink;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
+use crate::query::EstimateSink;
+use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
@@ -50,24 +51,41 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if self.variable.index != variable {
+            return false;
+        }
+        // The estimated proposal count equals the current number of keys.
+        out.fill(self.map.len(), view.len());
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
-            // the estimated proposal count equals the current number of keys
-            Some(self.map.len())
-        } else {
-            None
+            for i in 0..view.len() as u32 {
+                candidates.extend_row(i, self.map.keys().map(|k| IntoInline::to_inline(k).raw));
+            }
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
         if self.variable.index == variable {
-            proposals.extend(self.map.keys().map(|k| IntoInline::to_inline(k).raw));
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawInline>) {
-        if self.variable.index == variable {
-            proposals.retain(|v| {
+            candidates.retain(|_, v| {
                 self.map.contains_key(&match TryFromInline::try_from_inline(
                     Inline::<S>::as_transmute_raw(v),
                 ) {
@@ -78,15 +96,17 @@ where
         }
     }
 
-    /// Exact when the variable is bound: checks whether the bound value is
-    /// a key of the map. Returns `true` optimistically while the variable
-    /// is unbound.
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.variable.index) {
-            Some(v) => match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
-                Ok(k) => self.map.contains_key(&k),
-                Err(_) => false,
-            },
+    /// Exact when the variable is bound: checks whether every row's bound
+    /// value is a key of the map. Returns `true` optimistically while the
+    /// variable is unbound.
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        match view.col(self.variable.index) {
+            Some(c) => view.iter().all(|row| {
+                match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(&row[c])) {
+                    Ok(k) => self.map.contains_key(&k),
+                    Err(_) => false,
+                }
+            }),
             None => true,
         }
     }
