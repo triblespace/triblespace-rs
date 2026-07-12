@@ -973,8 +973,9 @@ impl Pile {
     /// Captures the current PATCH-backed locator state for differential testing
     /// against [`crate::repo::pile_index::MappedPileIndex`].
     ///
-    /// This does not opt the Pile into persistent indexing; it performs the
-    /// same full refresh as the existing default path.
+    /// An ordinary pile returns its replayed PATCH state directly. An indexed
+    /// pile materializes the mapped base plus tail overlays on demand; normal
+    /// readers do not pay this corpus-sized cost.
     pub fn patch_index(&mut self) -> Result<PatchPileIndex, ReadError> {
         self.refresh()?;
         Ok(PatchPileIndex {
@@ -1535,9 +1536,22 @@ impl Pile {
     /// applied, which would otherwise leave existing `Bytes` handles dangling
     /// and lead to undefined behavior.
     fn apply_next(&mut self) -> Result<Option<Applied>, ReadError> {
-        let file_len_u64 = self.file.metadata()?.len();
-        let file_len = usize::try_from(file_len_u64)
-            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
+        let file_len = self.observed_file_len()?;
+        self.ensure_mapped(file_len)?;
+        self.apply_next_bounded(file_len)
+    }
+
+    fn observed_file_len(&self) -> Result<usize, ReadError> {
+        usize::try_from(self.file.metadata()?.len())
+            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })
+    }
+
+    /// Applies one record from a file-length snapshot already covered by the
+    /// current mapping. Keeping the bound stable lets `refresh_locked` replay
+    /// a complete observed prefix with one metadata lookup instead of one
+    /// syscall per record. Appends after the snapshot are picked up by the
+    /// next refresh, while post-write readback continues to use `apply_next`.
+    fn apply_next_bounded(&mut self, file_len: usize) -> Result<Option<Applied>, ReadError> {
         if file_len < self.applied_length {
             // Truncation below `applied_length` invalidates previously issued
             // `Bytes` handles, so there is no safe recovery path.
@@ -1546,7 +1560,7 @@ impl Pile {
         if file_len == self.applied_length {
             return Ok(None);
         }
-        self.ensure_mapped(file_len)?;
+        debug_assert!(file_len <= self.mmap.len());
         let start_offset = self.applied_length;
         let slice = unsafe {
             slice_from_raw_parts(
@@ -1668,7 +1682,16 @@ impl Pile {
     }
 
     fn refresh_locked(&mut self) -> Result<(), ReadError> {
-        while self.apply_next()?.is_some() {}
+        // The observed length is the refresh linearization point. Small atomic
+        // writers share this lock and may append afterwards; those records are
+        // intentionally left for the next refresh. Exclusive writers and
+        // amputation remain excluded for the complete bounded replay.
+        let file_len = self.observed_file_len()?;
+        if file_len < self.applied_length {
+            std::process::abort();
+        }
+        self.ensure_mapped(file_len)?;
+        while self.apply_next_bounded(file_len)?.is_some() {}
         Ok(())
     }
 
@@ -1893,10 +1916,10 @@ impl BlobStoreList for PileReader {
         }
     }
 
-    /// Cheap PATCH-level set difference between this reader's blob index
-    /// and `old`'s. Both readers hold copy-on-write clones of their pile's
-    /// PATCH, so this gives the exact set of blob hashes added between
-    /// the two snapshots without having to enumerate either side.
+    /// Computes the exact set difference from `old` to this reader. Readers
+    /// sharing one mapped base, or two ordinary PATCH readers, use cheap PATCH
+    /// differences. Cross-base and indexed/PATCH comparisons deliberately
+    /// materialize sorted key vectors as an exact slow path.
     fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
         match (
             &self.base,
@@ -2160,7 +2183,8 @@ impl PinStore for Pile {
     }
 
     fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
-        // Pin index is already a PATCH; clone is an O(1) refcount bump.
+        // The ordinary pin index is already a PATCH (an O(1) clone); indexed
+        // mode explicitly materializes mapped base pins plus tail overlays.
         self.refresh()?;
         self.materialize_branches()
     }
@@ -3235,6 +3259,44 @@ mod tests {
             other => panic!("unexpected result: {other:?}"),
         }
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn bounded_replay_stops_at_its_observed_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "bounded-refresh.pile");
+
+        let (first, second) = {
+            let mut writer = Pile::open(&path).unwrap();
+            let first = writer
+                .put::<UnknownBlob, _>(Bytes::from_source(b"first".to_vec()))
+                .unwrap();
+            let second = writer
+                .put::<UnknownBlob, _>(Bytes::from_source(b"second".to_vec()))
+                .unwrap();
+            writer.close().unwrap();
+            (first, second)
+        };
+
+        let first_end = {
+            let mut records = PileRecords::open(&path).unwrap();
+            let record = records.next().unwrap().unwrap();
+            record.offset + record.len
+        };
+
+        let mut replay = Pile::open(&path).unwrap();
+        assert!(matches!(
+            replay.apply_next_bounded(first_end).unwrap(),
+            Some(Applied::Blob { hash }) if hash.raw == first.raw
+        ));
+        assert!(replay.apply_next_bounded(first_end).unwrap().is_none());
+        assert_eq!(replay.applied_length, first_end);
+        assert!(replay.blobs.get(&first.raw).is_some());
+        assert!(replay.blobs.get(&second.raw).is_none());
+
+        replay.refresh().unwrap();
+        assert!(replay.blobs.get(&second.raw).is_some());
+        replay.close().unwrap();
     }
 
     #[test]

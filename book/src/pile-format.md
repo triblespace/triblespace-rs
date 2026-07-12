@@ -222,9 +222,12 @@ fails at its absolute pile offset; neither is silently converted into absence or
 full replay. Cache fallback is lazy, matching `Pile::open`: the returned ordinary
 `Pile` builds its PATCH on the first `refresh`, reader, pin, or write operation.
 
-Tail replay currently inherits `apply_next`'s per-record file-length metadata
-check. Removing or batching that `fstat` is a separate benchmarked optimisation
-and remains a gate before making indexed open the default.
+Ordinary replay and indexed-tail replay snapshot the observed file length once
+per refresh and decode exactly that bounded prefix. Shared-lock atomic writers
+may append after the snapshot; those records are intentionally picked up by the
+next refresh. Post-write readback still observes the live length while looking
+for the caller's own record. This removes the former per-record `fstat` without
+weakening exact torn-tail offsets or amputation's exclusive retry.
 
 The default `Pile::open` / `PileReader` path is unchanged, and ordinary writes
 do not build, compact, or publish `.pidx` files. Its 16-byte format marker
