@@ -229,6 +229,17 @@ next refresh. Post-write readback still observes the live length while looking
 for the caller's own record. This removes the former per-record `fstat` without
 weakening exact torn-tail offsets or amputation's exclusive retry.
 
+Build or refresh the derived snapshot explicitly with:
+
+```console
+trible pile index build data.pile
+```
+
+The command rebuilds from the authoritative log with bounded external-sort
+runs and defaults to `data.pile.pidx`. It syncs a complete temporary snapshot
+before atomically renaming it over an older cache; it never modifies the pile.
+No open, refresh, or write path invokes this command implicitly.
+
 The default `Pile::open` / `PileReader` path is unchanged, and ordinary writes
 do not build, compact, or publish `.pidx` files. Its 16-byte format marker
 `080FB58E9F63E801C625DB2F2EFA292B` was minted with `trible genid` on

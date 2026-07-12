@@ -8,6 +8,7 @@ use triblespace_core::repo::pile::Pile;
 pub mod blob;
 pub mod branch;
 mod diagnose;
+mod index;
 mod merge;
 mod migrate;
 pub mod net;
@@ -65,6 +66,11 @@ pub enum PileCommand {
     Diagnose {
         #[command(subcommand)]
         cmd: diagnose::Command,
+    },
+    /// Build derived locator indexes for a pile.
+    Index {
+        #[command(subcommand)]
+        cmd: index::Command,
     },
     /// DESTRUCTIVE: truncate a pile at its first invalid record, deleting
     /// everything after it.
@@ -182,6 +188,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         }
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
+        PileCommand::Index { cmd } => index::run(cmd),
         PileCommand::Amputate { path } => {
             let before = fs::metadata(&path)?.len();
             let mut pile = Pile::open(&path)?;

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The `trible pile index build` command publishes `.pidx` locator snapshots.**
+  It exposes the existing bounded-memory `MappedPileIndex` builder as an
+  operational CLI, defaults to `<pile>.pidx`, and preserves the authoritative
+  append-only pile while atomically replacing only the derived cache after a
+  complete successful build.
 - **Succinct archives persist their Rank9/select indexes as additive sidecars.**
   Writers append exact native-`usize` Rank9 payloads, a canonical handle table,
   and a versioned footer immediately before the unchanged EOF

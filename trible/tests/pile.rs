@@ -6,6 +6,7 @@ use triblespace::prelude::BlobStore;
 use triblespace::prelude::BlobStoreList;
 use triblespace::prelude::PinStore;
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pile_index::{MappedPileIndex, PileIndex};
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
 
@@ -13,6 +14,196 @@ fn random_signing_key() -> SigningKey {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).expect("getrandom");
     SigningKey::from_bytes(&seed)
+}
+
+#[test]
+fn pile_index_build_refreshes_the_derived_snapshot_without_mutating_the_pile() {
+    use anybytes::Bytes;
+    use triblespace::prelude::blobencodings::UnknownBlob;
+    use triblespace::prelude::BlobStorePut;
+
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("indexed.pile");
+    let index_path = dir.path().join("indexed.pile.pidx");
+    std::fs::File::create(&pile_path).unwrap();
+
+    let first = {
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let handle = pile
+            .put::<UnknownBlob, _>(Bytes::from_source(b"first".to_vec()))
+            .unwrap();
+        pile.close().unwrap();
+        handle
+    };
+    let pile_before = std::fs::read(&pile_path).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "index", "build", pile_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 pile records"))
+        .stdout(predicate::str::contains("1 blobs"));
+
+    assert_eq!(std::fs::read(&pile_path).unwrap(), pile_before);
+    let first_snapshot = std::fs::read(&index_path).unwrap();
+    let mapped = MappedPileIndex::open(&pile_path, &index_path).unwrap();
+    assert!(mapped.blob_locator(first).unwrap().is_some());
+
+    let second = {
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let handle = pile
+            .put::<UnknownBlob, _>(Bytes::from_source(b"second".to_vec()))
+            .unwrap();
+        pile.close().unwrap();
+        handle
+    };
+    let pile_with_tail = std::fs::read(&pile_path).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "index", "build", pile_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 pile records"))
+        .stdout(predicate::str::contains("2 blobs"));
+
+    assert_eq!(std::fs::read(&pile_path).unwrap(), pile_with_tail);
+    assert_ne!(std::fs::read(&index_path).unwrap(), first_snapshot);
+    let mapped = MappedPileIndex::open(&pile_path, &index_path).unwrap();
+    assert!(mapped.blob_locator(first).unwrap().is_some());
+    assert!(mapped.blob_locator(second).unwrap().is_some());
+}
+
+#[test]
+fn pile_index_build_failure_preserves_the_previous_snapshot() {
+    use anybytes::Bytes;
+    use std::io::Write;
+    use triblespace::prelude::blobencodings::UnknownBlob;
+    use triblespace::prelude::BlobStorePut;
+
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("torn.pile");
+    let index_path = dir.path().join("custom.pidx");
+    std::fs::File::create(&pile_path).unwrap();
+
+    {
+        let mut pile = Pile::open(&pile_path).unwrap();
+        pile.put::<UnknownBlob, _>(Bytes::from_source(b"valid".to_vec()))
+            .unwrap();
+        pile.close().unwrap();
+    }
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "index",
+            "build",
+            pile_path.to_str().unwrap(),
+            "--output",
+            index_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let snapshot = std::fs::read(&index_path).unwrap();
+
+    let mut pile = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&pile_path)
+        .unwrap();
+    pile.write_all(b"torn").unwrap();
+    pile.sync_all().unwrap();
+    drop(pile);
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "index",
+            "build",
+            pile_path.to_str().unwrap(),
+            "--output",
+            index_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("build locator index"));
+
+    assert_eq!(std::fs::read(&index_path).unwrap(), snapshot);
+}
+
+#[test]
+fn pile_index_build_is_safe_with_a_concurrent_atomic_writer() {
+    use anybytes::Bytes;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+    use triblespace::prelude::blobencodings::UnknownBlob;
+    use triblespace::prelude::BlobStorePut;
+
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("concurrent.pile");
+    let index_path = dir.path().join("concurrent.pile.pidx");
+    std::fs::File::create(&pile_path).unwrap();
+
+    {
+        let mut pile = Pile::open(&pile_path).unwrap();
+        pile.put::<UnknownBlob, _>(Bytes::from_source(b"seed".to_vec()))
+            .unwrap();
+        pile.close().unwrap();
+    }
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "index", "build", pile_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let previous_snapshot = std::fs::read(&index_path).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_path = pile_path.clone();
+    let writer_barrier = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        let mut pile = Pile::open(&writer_path).unwrap();
+        writer_barrier.wait();
+        for value in 0u64..256 {
+            pile.put::<UnknownBlob, _>(Bytes::from_source(value.to_le_bytes().to_vec()))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        pile.close().unwrap();
+    });
+
+    barrier.wait();
+    let output = Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "index", "build", pile_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    writer.join().unwrap();
+
+    if !output.status.success() {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("build locator index"),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read(&index_path).unwrap(), previous_snapshot);
+    }
+
+    // A successful race may publish either the exact file or an older valid
+    // prefix. Both are safe: indexed open accepts that prefix and canonical
+    // tail replay recovers every concurrently appended record.
+    let mut indexed = Pile::open_indexed(&pile_path, &index_path).unwrap();
+    let logical = indexed.patch_index().unwrap();
+    assert_eq!(logical.blob_handles().count(), 257);
+    indexed.close().unwrap();
+
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
 }
 
 #[test]
