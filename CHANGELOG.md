@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The query-engine guide now describes the agglomerator's actual hub set.**
+  Agglomeration starts from nonempty exact-choice groups and only absorbs a
+  complete active group into another active target; it does not open a variable
+  preferred by no row as a new hub.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
