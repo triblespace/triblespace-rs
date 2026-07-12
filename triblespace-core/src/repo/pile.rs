@@ -602,6 +602,10 @@ enum Applied {
 pub struct Pile {
     file: File,
     mmap: Arc<MmapRaw>,
+    /// Whether this handle has appended or truncated bytes since its last
+    /// successful durability barrier. Refreshing bytes written by another
+    /// handle does not make this handle responsible for flushing them.
+    dirty: bool,
     /// Accepted immutable prefix. `None` is the unchanged full-PATCH path;
     /// when present, the PATCH fields below contain only the canonical tail.
     base: Option<IndexedPileBase>,
@@ -1384,6 +1388,7 @@ impl Pile {
         Ok(Self {
             file,
             mmap,
+            dirty: false,
             base: None,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             blob_additions: None,
@@ -1721,7 +1726,10 @@ impl Pile {
                     Ok(()) => Ok(()),
                     Err(ReadError::CorruptPile { valid_length }) => {
                         self.file.set_len(valid_length as u64)?;
-                        self.file.sync_all()?;
+                        self.dirty = true;
+                        self.flush().map_err(|err| match err {
+                            FlushError::IoError(err) => ReadError::IoError(err),
+                        })?;
                         self.applied_length = valid_length;
                         Ok(())
                     }
@@ -1737,13 +1745,21 @@ impl Pile {
     /// Persists all writes and metadata to the underlying pile file.
     pub fn flush(&mut self) -> Result<(), FlushError> {
         self.file.sync_all()?;
+        self.dirty = false;
         Ok(())
     }
 
-    /// Flushes pending data and consumes the pile, returning an error if the
-    /// flush fails.
+    fn flush_if_dirty(&mut self) -> Result<(), FlushError> {
+        if self.dirty {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes pending mutations made through this handle and consumes the
+    /// pile, returning an error if the flush fails.
     pub fn close(mut self) -> Result<(), FlushError> {
-        let res = self.flush();
+        let res = self.flush_if_dirty();
 
         let mut this = std::mem::ManuallyDrop::new(self);
         unsafe {
@@ -2101,6 +2117,10 @@ impl Pile {
             let actual_record_size = V3_HEADER_LEN + blob_size + padding;
             // post-pad is < 256.
             let zero_buf = [0u8; V3_ALIGNMENT];
+            // Mark before entering the syscall: partial writes and later
+            // read-back failures must still leave close responsible for the
+            // bytes this handle may have appended.
+            self.dirty = true;
             if use_atomic {
                 let bufs = [
                     IoSlice::new(header.as_bytes()),
@@ -2231,6 +2251,7 @@ impl PinStore for Pile {
             // V3 branch/tombstone records: fixed 256-byte header, no data, so the
             // record is exactly one 256-byte unit — keeping a pure-V3 pile
             // 256-aligned throughout (branches write under the exclusive lock).
+            self.dirty = true;
             let (expected, write_res) = match new {
                 Some(new) => {
                     let header = BranchHeaderV3::new(id, new);
@@ -2314,6 +2335,7 @@ impl Pile {
                 return Ok(());
             }
 
+            self.dirty = true;
             let write_res = if pin {
                 let header = WeakPinHeaderV3::new(handle);
                 self.file.write(header.as_bytes())
@@ -3444,6 +3466,68 @@ mod tests {
         let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
         assert_eq!(fetched.bytes.as_ref(), data.as_slice());
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn close_flushes_only_mutations_by_this_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+        let mut observer = Pile::open(&path).unwrap();
+        let mut writer = Pile::open(&path).unwrap();
+
+        assert!(!observer.dirty);
+        assert!(!writer.dirty);
+
+        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![4u8; 32]));
+        let handle = writer.put::<UnknownBlob, _>(blob).unwrap();
+        assert!(writer.dirty);
+
+        // Replaying an append made through another descriptor must not make a
+        // read-only observer responsible for a whole-file sync.
+        observer.refresh().unwrap();
+        assert!(!observer.dirty);
+        observer.flush_if_dirty().unwrap();
+        assert!(!observer.dirty);
+
+        writer.flush().unwrap();
+        assert!(!writer.dirty);
+        writer.flush().unwrap();
+        assert!(!writer.dirty);
+
+        let branch = Id::new([9u8; 16]).unwrap();
+        writer
+            .update(branch, None, Some(handle.transmute()))
+            .unwrap();
+        assert!(writer.dirty);
+        writer.flush().unwrap();
+        assert!(!writer.dirty);
+
+        // Conflicts and logical no-ops append nothing.
+        assert!(matches!(
+            writer
+                .update(branch, None, Some(handle.transmute()))
+                .unwrap(),
+            PushResult::Conflict(_)
+        ));
+        assert!(!writer.dirty);
+        writer
+            .update(branch, Some(handle.transmute()), Some(handle.transmute()))
+            .unwrap();
+        assert!(!writer.dirty);
+
+        writer.pin_weak(handle).unwrap();
+        assert!(writer.dirty);
+        writer.flush().unwrap();
+        assert!(!writer.dirty);
+        writer.pin_weak(handle).unwrap();
+        assert!(!writer.dirty);
+        writer.unpin_weak(handle).unwrap();
+        assert!(writer.dirty);
+        writer.flush().unwrap();
+        assert!(!writer.dirty);
+
+        observer.close().unwrap();
+        writer.close().unwrap();
     }
 
     #[test]

@@ -71,6 +71,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Read-only pile closes no longer issue a whole-file durability barrier.**
+  `Pile` now tracks mutations made through each handle, and `close` calls
+  `sync_all` only for a handle with unflushed appends or truncation. Replaying
+  bytes appended by another handle remains read-only. Explicit `flush` stays a
+  whole-file durability barrier, and blob, branch, weak-pin, and repair writes
+  retain the existing durability contract.
 - **The opt-in GPU companion now shares the project CubeCL 0.10 fork.**
   `triblespace-gpu` no longer pulls a second CubeCL 0.9/WGPU 26 stack beside
   the model and widget runtime. Its WGPU backend is ported to CubeCL 0.10,
