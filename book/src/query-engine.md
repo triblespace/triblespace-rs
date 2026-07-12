@@ -105,10 +105,11 @@ An expansion still performs the familiar Atreides negotiation:
 2. Choose the preferred next variable. In a multi-row block this decision is
    made per row, because different bound values can imply different
    cardinalities.
-3. If rows prefer more than one variable, consider every unbound variable as a
-   possible hub and score complete compatible source-group contractions against
-   exact grouping. Then partition by the scheduled variable with a stable
-   counting sort.
+3. If rows prefer more than one variable, start with the nonempty exact-choice
+   groups as active hubs. Repeatedly absorb one complete active source group
+   into the compatible active target that yields the least total candidate
+   estimate, then partition by the retained scheduled variable with a stable
+   counting sort. Variables preferred by no row are not opened as new hubs.
 4. For each group, ask the root constraint to propose that variable. An
    intersection chooses its tightest child per row to propose and runs the
    remaining children as whole-frontier confirmation passes. A union evaluates
