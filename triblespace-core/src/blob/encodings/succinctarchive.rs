@@ -693,11 +693,11 @@ fn remap_row(row: [usize; 3], remap: &[usize]) -> [usize; 3] {
 /// Device-agnostic seam for accelerating the expensive wavelet-freeze phase
 /// of a structural [`SuccinctArchive`] merge.
 ///
-/// Core performs the domain remap and sorted k-way merge of each Ring
-/// rotation. For every rotation it passes the resulting last-column code
-/// sequence to this backend together with preallocated canonical output bit
-/// planes. A backend may use a GPU, SIMD, or another accelerator; no such
-/// dependency is imposed on `triblespace-core` itself.
+/// Core performs the domain remap and sorted k-way merge of EAV once, derives
+/// the other Ring rotations by stable counting sort, and passes each resulting
+/// last-column code sequence to this backend together with preallocated
+/// canonical output bit planes. A backend may use a GPU, SIMD, or another
+/// accelerator; no such dependency is imposed on `triblespace-core` itself.
 ///
 /// `planes[0]` is the most-significant wavelet level. Bit `position` is stored
 /// in `planes[level][position / 64]` at `position % 64` (least-significant-bit
@@ -1506,10 +1506,11 @@ pub fn merge_ordered_archives(
 /// Structurally merge sorted succinct-archive segments while delegating only
 /// the six wavelet-freeze passes to `backend`.
 ///
-/// Domain remapping, k-way row merge, prefix/change vectors, canonical section
-/// order, and final blob attachment remain in `triblespace-core`; consequently
-/// an accelerator implementation can live in an optional companion crate and
-/// does not add GPU dependencies to the default core build.
+/// Domain remapping, the EAV k-way row merge, stable rotation sorts,
+/// prefix/change vectors, canonical section order, and final blob attachment
+/// remain in `triblespace-core`; consequently an accelerator implementation can
+/// live in an optional companion crate and does not add GPU dependencies to the
+/// default core build.
 ///
 /// The returned error covers backend-reported failures and the inexpensive
 /// output checks described by [`WaveletMatrixFreezeBackend`]. Allocation
