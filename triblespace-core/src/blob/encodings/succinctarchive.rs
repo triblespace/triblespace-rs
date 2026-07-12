@@ -1059,6 +1059,141 @@ struct PackedCpuWaveletOutputs<'area> {
     scratch: Vec<u32>,
 }
 
+#[cfg(feature = "parallel")]
+const PACKED_FREEZE_MIN_CHUNK_ROWS: usize = 64 * 1024;
+
+/// Choose at most two chunks per worker while keeping every nominal chunk
+/// large enough to amortise the two Rayon barriers at each wavelet level.
+/// Small inputs therefore densify to fewer tasks instead of crossing a single
+/// machine-specific row cutoff.
+#[cfg(feature = "parallel")]
+fn packed_freeze_chunk_rows(len: usize) -> Option<usize> {
+    let workers = rayon::current_num_threads();
+    if workers <= 1 {
+        return None;
+    }
+    let max_tasks = workers.saturating_mul(2);
+    let tasks = (len / PACKED_FREEZE_MIN_CHUNK_ROWS).min(max_tasks);
+    if tasks < 2 {
+        return None;
+    }
+    let chunk_words = len.div_ceil(64).div_ceil(tasks).max(1);
+    Some(chunk_words * 64)
+}
+
+/// Scatter one source range into its stable zero/one partition. Each recursive
+/// branch owns disjoint slices of both destinations, so Rayon can parallelise
+/// the scatter without raw pointers or another full-sized staging buffer.
+#[cfg(feature = "parallel")]
+fn scatter_packed_partition(
+    current: &[u32],
+    zero_counts: &[usize],
+    zero_output: &mut [u32],
+    one_output: &mut [u32],
+    shift: usize,
+    chunk_rows: usize,
+) {
+    debug_assert!(!zero_counts.is_empty());
+    debug_assert_eq!(zero_output.len() + one_output.len(), current.len());
+
+    if zero_counts.len() == 1 {
+        let mut zero = 0usize;
+        let mut one = 0usize;
+        for &code in current {
+            if (code >> shift) & 1 == 0 {
+                zero_output[zero] = code;
+                zero += 1;
+            } else {
+                one_output[one] = code;
+                one += 1;
+            }
+        }
+        debug_assert_eq!(zero, zero_output.len());
+        debug_assert_eq!(one, one_output.len());
+        return;
+    }
+
+    let middle_chunk = zero_counts.len() / 2;
+    let middle_row = (middle_chunk * chunk_rows).min(current.len());
+    let left_zeros = zero_counts[..middle_chunk].iter().sum();
+    let left_ones = middle_row - left_zeros;
+    let (left_current, right_current) = current.split_at(middle_row);
+    let (left_zero_output, right_zero_output) = zero_output.split_at_mut(left_zeros);
+    let (left_one_output, right_one_output) = one_output.split_at_mut(left_ones);
+    let (left_counts, right_counts) = zero_counts.split_at(middle_chunk);
+
+    rayon::join(
+        || {
+            scatter_packed_partition(
+                left_current,
+                left_counts,
+                left_zero_output,
+                left_one_output,
+                shift,
+                chunk_rows,
+            )
+        },
+        || {
+            scatter_packed_partition(
+                right_current,
+                right_counts,
+                right_zero_output,
+                right_one_output,
+                shift,
+                chunk_rows,
+            )
+        },
+    );
+}
+
+/// Pack one wavelet plane and, unless it is the final plane, produce the next
+/// stable partition. Source chunks align to output words and are sized from
+/// the active Rayon topology rather than a fixed machine width.
+#[cfg(feature = "parallel")]
+fn freeze_packed_plane_parallel(
+    current: &[u32],
+    next: Option<&mut [u32]>,
+    plane: &mut [u64],
+    shift: usize,
+    chunk_rows: usize,
+) {
+    use rayon::prelude::*;
+
+    debug_assert_eq!(plane.len(), current.len().div_ceil(64));
+    debug_assert_eq!(chunk_rows % 64, 0);
+    let chunk_words = chunk_rows / 64;
+    let zero_counts: Vec<usize> = plane
+        .par_chunks_mut(chunk_words)
+        .zip(current.par_chunks(chunk_rows))
+        .map(|(plane_chunk, current_chunk)| {
+            debug_assert_eq!(plane_chunk.len(), current_chunk.len().div_ceil(64));
+            let mut ones = 0usize;
+            for (word, codes) in plane_chunk.iter_mut().zip(current_chunk.chunks(64)) {
+                let mut packed = 0u64;
+                for (position, &code) in codes.iter().enumerate() {
+                    packed |= u64::from((code >> shift) & 1) << position;
+                }
+                *word = packed;
+                ones += packed.count_ones() as usize;
+            }
+            current_chunk.len() - ones
+        })
+        .collect();
+
+    if let Some(next) = next {
+        let zeros = zero_counts.iter().sum();
+        let (zero_output, one_output) = next.split_at_mut(zeros);
+        scatter_packed_partition(
+            current,
+            &zero_counts,
+            zero_output,
+            one_output,
+            shift,
+            chunk_rows,
+        );
+    }
+}
+
 impl MergedWaveletFactory for PackedCpuWaveletFactory {
     type Error = SuccinctArchiveMergeError<std::convert::Infallible>;
     type Outputs<'area> = PackedCpuWaveletOutputs<'area>;
@@ -1117,6 +1252,31 @@ impl MergedWaveletOutputs for PackedCpuWaveletOutputs<'_> {
         self.scratch.resize(self.sequence.len(), 0);
         let mut sequence_is_current = true;
         let width = planes.len();
+
+        #[cfg(feature = "parallel")]
+        if let Some(chunk_rows) = packed_freeze_chunk_rows(self.sequence.len()) {
+            for (depth, plane) in planes.iter_mut().enumerate() {
+                let shift = width - 1 - depth;
+                let has_next = depth + 1 < width;
+                let (current, next) = if sequence_is_current {
+                    (self.sequence.as_slice(), self.scratch.as_mut_slice())
+                } else {
+                    (self.scratch.as_slice(), self.sequence.as_mut_slice())
+                };
+                freeze_packed_plane_parallel(
+                    current,
+                    has_next.then_some(next),
+                    plane,
+                    shift,
+                    chunk_rows,
+                );
+                if has_next {
+                    sequence_is_current = !sequence_is_current;
+                }
+            }
+            self.sequence.clear();
+            return Ok(());
+        }
 
         for (depth, plane) in planes.iter_mut().enumerate() {
             plane.fill(0);
@@ -2619,6 +2779,65 @@ mod tests {
         data[0] |= 0x80;
         data[16] |= 0x80;
         Trible { data }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_packed_freeze_matches_serial_section_bytes() {
+        let len = 4 * PACKED_FREEZE_MIN_CHUNK_ROWS + 37;
+        let alphabet_size = 1usize << 17;
+        let sequence: Vec<u32> = (0..len)
+            .map(|position| {
+                let mixed = (position as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left(17);
+                (mixed % alphabet_size as u64) as u32
+            })
+            .collect();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let parallel_bytes = pool.install(|| {
+            let mut parallel_area = ByteArea::new().unwrap();
+            let mut parallel_sections = parallel_area.sections();
+            let mut parallel = PackedCpuWaveletFactory
+                .create(alphabet_size, len, &mut parallel_sections)
+                .unwrap();
+            for rotation in SuccinctRotation::ALL {
+                for (position, &code) in sequence.iter().enumerate() {
+                    parallel.set_int(rotation, position, code as usize).unwrap();
+                }
+                parallel.finish_rotation(rotation).unwrap();
+            }
+            parallel.freeze().unwrap();
+            drop(parallel_sections);
+            parallel_area.freeze().unwrap().as_ref().to_vec()
+        });
+
+        let reference_backend = ReferencePackedFreeze;
+        let reference_factory = BackendWaveletFactory {
+            backend: &reference_backend,
+        };
+        let mut reference_area = ByteArea::new().unwrap();
+        let mut reference_sections = reference_area.sections();
+        let mut reference = reference_factory
+            .create(alphabet_size, len, &mut reference_sections)
+            .unwrap();
+        for rotation in SuccinctRotation::ALL {
+            for (position, &code) in sequence.iter().enumerate() {
+                reference
+                    .set_int(rotation, position, code as usize)
+                    .unwrap();
+            }
+            reference.finish_rotation(rotation).unwrap();
+        }
+        reference.freeze().unwrap();
+        drop(reference_sections);
+        let reference_bytes = reference_area.freeze().unwrap();
+
+        assert_eq!(parallel_bytes.as_slice(), reference_bytes.as_ref());
     }
 
     #[cfg(feature = "parallel")]
