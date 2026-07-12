@@ -118,7 +118,6 @@
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -220,6 +219,20 @@ pub trait IndexKind {
     /// This is the LSMT maintenance primitive. The GPU-accelerated
     /// succinct merge drops in behind exactly this method.
     fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob>;
+
+    /// Fallible merge hook used by index-home maintenance.
+    ///
+    /// Existing kinds may keep implementing the infallible [`merge`](Self::merge)
+    /// primitive; the default implementation wraps it in `Ok`. Kinds whose
+    /// merge backend can fail (for example an accelerator or remote worker)
+    /// override this method so [`append_segment`] can preserve the old
+    /// manifest atomically on failure.
+    fn try_merge(
+        &self,
+        segments: &[Self::Segment],
+    ) -> Result<Blob<UnknownBlob>, Box<dyn Error + Send + Sync>> {
+        Ok(self.merge(segments))
+    }
 }
 
 /// One entry in a [`Manifest`]: a live segment, its LSMT level, and its
@@ -253,13 +266,25 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Reserve the next logical segment sequence number.
+    fn reserve_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+
+    /// Insert a segment using an already-reserved sequence number.
+    fn push_reserved(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64, seq: u64) {
+        debug_assert!(seq < self.next_seq, "segment sequence must be reserved");
+        self.segments.push(SegmentEntry { blob, level, seq });
+        self.segments.sort_by_key(|e| (e.level, e.seq));
+    }
+
     /// Append a segment, assigning it the next sequence number, then keep
     /// the segment list ordered by `(level, seq)`.
     fn push(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        self.segments.push(SegmentEntry { blob, level, seq });
-        self.segments.sort_by_key(|e| (e.level, e.seq));
+        let seq = self.reserve_seq();
+        self.push_reserved(blob, level, seq);
     }
 
     /// Adopt an already-built immutable segment at `level`.
@@ -270,19 +295,6 @@ impl Manifest {
     /// [`append_segment`] at level zero.
     pub fn adopt_segment(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
         self.push(blob, level);
-    }
-
-    /// The lowest LSMT level holding at least `fanout` segments, if any.
-    fn overflowing_level(&self, fanout: usize) -> Option<u64> {
-        let mut counts: HashMap<u64, usize> = HashMap::new();
-        for e in &self.segments {
-            *counts.entry(e.level).or_default() += 1;
-        }
-        counts
-            .into_iter()
-            .filter(|&(_, n)| n >= fanout)
-            .map(|(level, _)| level)
-            .min()
     }
 
     /// Remove and return every segment at `level`.
@@ -486,6 +498,9 @@ pub enum IndexError {
     /// A manifest referenced a segment that could not be decoded as this
     /// index kind. The manifest is repairable soft state.
     Segment(Box<dyn Error + Send + Sync>),
+    /// A kind-specific merge backend failed. No replacement segment or
+    /// manifest is published, so the existing victim segments remain live.
+    Merge(Box<dyn Error + Send + Sync>),
     /// The branch pin advanced between read and CAS-write (a concurrent
     /// commit or another index update). The caller may retry — segment
     /// blobs are content-addressed, so a retry dedupes against
@@ -498,6 +513,7 @@ impl fmt::Display for IndexError {
         match self {
             IndexError::Storage(e) => write!(f, "index-home storage error: {e}"),
             IndexError::Segment(e) => write!(f, "index-home segment decode error: {e}"),
+            IndexError::Merge(e) => write!(f, "index-home segment merge error: {e}"),
             IndexError::Conflict => write!(f, "index-home manifest pin advanced concurrently"),
         }
     }
@@ -536,24 +552,44 @@ where
 {
     let kind_id = kind.kind_id();
     let mut manifest = Manifest::from_tribles(head_set, kind_id);
-    // Build + append a fresh level-0 segment.
-    let segment_blob = kind.build(source);
-    let handle = storage.put::<UnknownBlob, _>(segment_blob).map_err(boxed)?;
-    manifest.push(handle, 0);
+    let mut pending = kind.build(source);
+    let mut level = 0;
 
-    // Size-tiered merge: while a level overflows, tenure the whole
-    // tier into a single merged segment one level up (Yard's shape).
-    while let Some(level) = manifest.overflowing_level(FANOUT) {
+    // Carry one pending blob upward entirely in memory. A valid manifest has
+    // at most FANOUT - 1 resident segments per level. If the new pending blob
+    // fills the level, attach the resident victims in sequence order, append
+    // the pending attachment last (the same order as the former
+    // put/push/drain implementation), merge, and carry that result upward.
+    // Only the first non-overflowing level persists and publishes `pending`.
+    loop {
+        // Preserve the historical sequence stream exactly: the previous
+        // implementation assigned one sequence at every visited level before
+        // immediately draining an overflowing tier. Reserving those logical
+        // intermediate sequences keeps successful manifests byte-for-byte
+        // compatible even though their blobs never enter storage now.
+        let seq = manifest.reserve_seq();
+        let resident = manifest
+            .segments
+            .iter()
+            .filter(|entry| entry.level == level)
+            .count();
+
+        if resident + 1 < FANOUT {
+            let handle = storage.put::<UnknownBlob, _>(pending).map_err(boxed)?;
+            manifest.push_reserved(handle, level, seq);
+            break;
+        }
+
         let victims = manifest.drain_level(level);
         let reader = storage.reader().map_err(boxed)?;
-        let mut attached = Vec::with_capacity(victims.len());
-        for v in &victims {
-            let blob: Blob<UnknownBlob> = reader.get(v.blob).map_err(boxed)?;
+        let mut attached = Vec::with_capacity(victims.len() + 1);
+        for victim in &victims {
+            let blob: Blob<UnknownBlob> = reader.get(victim.blob).map_err(boxed)?;
             attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
         }
-        let merged_blob = kind.merge(&attached);
-        let merged_handle = storage.put::<UnknownBlob, _>(merged_blob).map_err(boxed)?;
-        manifest.push(merged_handle, level + 1);
+        attached.push(kind.try_attach(pending).map_err(IndexError::Segment)?);
+        pending = kind.try_merge(&attached).map_err(IndexError::Merge)?;
+        level += 1;
     }
 
     // Rewrite this kind's manifest inside the branch-head tribleset:
@@ -814,11 +850,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use crate::examples::literature;
     use crate::id::fucid;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::InlineEncoding;
     use crate::inline::TryToInline;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::BlobStorePut;
+    use crate::repo::{BlobStoreGet, BlobStoreList, BlobStorePut};
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    type MemoryReader = <MemoryRepo as BlobStore>::Reader;
 
     fn person(name: &str) -> TribleSet {
         let id = fucid();
@@ -831,6 +876,233 @@ mod tests {
     // real branch pin that already carries branch metadata.
     fn source_branch() -> Id {
         *fucid()
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct InjectedFailure(&'static str);
+
+    impl fmt::Display for InjectedFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl Error for InjectedFailure {}
+
+    #[derive(Debug, Default)]
+    struct IoCounts {
+        puts: AtomicUsize,
+        gets: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CountingReader {
+        inner: MemoryReader,
+        counts: Arc<IoCounts>,
+    }
+
+    impl PartialEq for CountingReader {
+        fn eq(&self, other: &Self) -> bool {
+            self.inner == other.inner && Arc::ptr_eq(&self.counts, &other.counts)
+        }
+    }
+
+    impl Eq for CountingReader {}
+
+    impl BlobStoreList for CountingReader {
+        type Iter<'a> = <MemoryReader as BlobStoreList>::Iter<'a>;
+        type Err = <MemoryReader as BlobStoreList>::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.inner.blobs()
+        }
+
+        fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+            self.inner.blobs_diff(&old.inner)
+        }
+    }
+
+    impl BlobStoreGet for CountingReader {
+        type GetError<E: Error + Send + Sync + 'static> =
+            <MemoryReader as BlobStoreGet>::GetError<E>;
+
+        fn get<T, S>(
+            &self,
+            handle: Inline<Handle<S>>,
+        ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
+        where
+            S: BlobEncoding + 'static,
+            T: TryFromBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.counts.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(handle)
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: MemoryRepo,
+        counts: Arc<IoCounts>,
+        fail_put_at: Option<usize>,
+    }
+
+    impl CountingStore {
+        fn clone_from(inner: &MemoryRepo) -> Self {
+            Self {
+                inner: MemoryRepo {
+                    blobs: inner.blobs.clone(),
+                    branches: inner.branches.clone(),
+                    weak: inner.weak.clone(),
+                },
+                counts: Arc::new(IoCounts::default()),
+                fail_put_at: None,
+            }
+        }
+    }
+
+    impl BlobStorePut for CountingStore {
+        type PutError = InjectedFailure;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            let call = self.counts.puts.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fail_put_at == Some(call) {
+                return Err(InjectedFailure("injected put failure"));
+            }
+            match self.inner.put(item) {
+                Ok(handle) => Ok(handle),
+                Err(never) => match never {},
+            }
+        }
+    }
+
+    impl BlobStore for CountingStore {
+        type Reader = CountingReader;
+        type ReaderError = Infallible;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            Ok(CountingReader {
+                inner: self.inner.reader()?,
+                counts: Arc::clone(&self.counts),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum KindFailure {
+        None,
+        Attach,
+        Merge,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FailableSuccinct {
+        failure: KindFailure,
+    }
+
+    impl IndexKind for FailableSuccinct {
+        type Segment = <SuccinctRollup as IndexKind>::Segment;
+
+        fn kind_id(&self) -> Id {
+            SuccinctRollup.kind_id()
+        }
+
+        fn build(&self, source: &TribleSet) -> Blob<UnknownBlob> {
+            SuccinctRollup.build(source)
+        }
+
+        fn try_attach(
+            &self,
+            blob: Blob<UnknownBlob>,
+        ) -> Result<Self::Segment, Box<dyn Error + Send + Sync>> {
+            if self.failure == KindFailure::Attach {
+                return Err(Box::new(InjectedFailure("injected attach failure")));
+            }
+            SuccinctRollup.try_attach(blob)
+        }
+
+        fn merge(&self, segments: &[Self::Segment]) -> Blob<UnknownBlob> {
+            SuccinctRollup.merge(segments)
+        }
+
+        fn try_merge(
+            &self,
+            segments: &[Self::Segment],
+        ) -> Result<Blob<UnknownBlob>, Box<dyn Error + Send + Sync>> {
+            if self.failure == KindFailure::Merge {
+                return Err(Box::new(InjectedFailure("injected merge failure")));
+            }
+            Ok(self.merge(segments))
+        }
+    }
+
+    fn seeded_cascade(depth: usize) -> (MemoryRepo, TribleSet, Vec<Inline<Handle<UnknownBlob>>>) {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let mut manifest = Manifest::default();
+        let mut handles = Vec::with_capacity(depth * (FANOUT - 1));
+        for level in 0..depth {
+            for slot in 0..(FANOUT - 1) {
+                let blob = kind.build(&person(&format!("level-{level}-slot-{slot}")));
+                let handle = storage.put(blob).unwrap();
+                manifest.push(handle, level as u64);
+                handles.push(handle);
+            }
+        }
+        (storage, manifest.to_tribles(kind.kind_id()), handles)
+    }
+
+    /// Reference implementation of the former put/push/drain cascade.
+    fn legacy_append_segment<S, K>(
+        storage: &mut S,
+        kind: &K,
+        source: &TribleSet,
+        head_set: &mut TribleSet,
+    ) -> Result<(), IndexError>
+    where
+        S: BlobStore,
+        K: IndexKind,
+    {
+        let kind_id = kind.kind_id();
+        let mut manifest = Manifest::from_tribles(head_set, kind_id);
+        let handle = storage
+            .put::<UnknownBlob, _>(kind.build(source))
+            .map_err(boxed)?;
+        manifest.push(handle, 0);
+
+        while let Some(level) = manifest
+            .segments
+            .iter()
+            .map(|entry| entry.level)
+            .filter(|level| {
+                manifest
+                    .segments
+                    .iter()
+                    .filter(|entry| entry.level == *level)
+                    .count()
+                    >= FANOUT
+            })
+            .min()
+        {
+            let victims = manifest.drain_level(level);
+            let reader = storage.reader().map_err(boxed)?;
+            let mut attached = Vec::with_capacity(victims.len());
+            for victim in &victims {
+                let blob: Blob<UnknownBlob> = reader.get(victim.blob).map_err(boxed)?;
+                attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
+            }
+            let merged = kind.merge(&attached);
+            let handle = storage.put::<UnknownBlob, _>(merged).map_err(boxed)?;
+            manifest.push(handle, level + 1);
+        }
+
+        replace_manifest(head_set, kind_id, &manifest);
+        Ok(())
     }
 
     #[test]
@@ -1114,6 +1386,88 @@ mod tests {
     }
 
     #[test]
+    fn cascade_carries_pending_blob_in_memory_with_legacy_manifest_bytes() {
+        // The 4^k-th logical leaf finds three resident segments at each of k
+        // levels. The former cascade performed k + 1 puts and 4k gets: every
+        // intermediate pending blob was put, then immediately read back as
+        // the fourth victim. The in-memory carry performs one final put and
+        // 3k gets. For this k=4 fixture that is 1 vs 5 puts and 12 vs 16 gets.
+        const DEPTH: usize = 4;
+
+        let (base, initial_head, _victims) = seeded_cascade(DEPTH);
+        let source = person("carry-trigger");
+        let kind = SuccinctRollup;
+
+        let mut new_store = CountingStore::clone_from(&base);
+        let mut legacy_store = CountingStore::clone_from(&base);
+        let mut new_head = initial_head.clone();
+        let mut legacy_head = initial_head;
+
+        append_segment(&mut new_store, &kind, &source, &mut new_head).unwrap();
+        legacy_append_segment(&mut legacy_store, &kind, &source, &mut legacy_head).unwrap();
+
+        assert_eq!(new_store.counts.puts.load(Ordering::Relaxed), 1);
+        assert_eq!(legacy_store.counts.puts.load(Ordering::Relaxed), DEPTH + 1);
+        assert_eq!(
+            new_store.counts.gets.load(Ordering::Relaxed),
+            (FANOUT - 1) * DEPTH
+        );
+        assert_eq!(
+            legacy_store.counts.gets.load(Ordering::Relaxed),
+            FANOUT * DEPTH
+        );
+
+        // Sequence reservations deliberately reproduce the old final seq,
+        // so the complete manifest tribles (including intrinsic segment
+        // entity IDs) and the final canonical segment handle are identical.
+        assert_eq!(new_head, legacy_head);
+        let manifest = Manifest::from_tribles(&new_head, kind.kind_id());
+        assert_eq!(manifest.segments.len(), 1);
+        assert_eq!(manifest.segments[0].level, DEPTH as u64);
+        assert_eq!(
+            manifest.segments[0].seq,
+            (DEPTH * (FANOUT - 1) + DEPTH) as u64
+        );
+    }
+
+    #[test]
+    fn cascade_failures_leave_head_and_victim_blobs_untouched() {
+        let (base, initial_head, victim_handles) = seeded_cascade(1);
+        let source = person("failure-trigger");
+
+        for failure in [KindFailure::Attach, KindFailure::Merge, KindFailure::None] {
+            let mut storage = CountingStore::clone_from(&base);
+            if failure == KindFailure::None {
+                // With a full level zero, this is the sole put: publication
+                // of the carried level-one segment.
+                storage.fail_put_at = Some(1);
+            }
+            let kind = FailableSuccinct { failure };
+            let mut head = initial_head.clone();
+
+            let error = append_segment(&mut storage, &kind, &source, &mut head).unwrap_err();
+            match failure {
+                KindFailure::Attach => assert!(matches!(error, IndexError::Segment(_))),
+                KindFailure::Merge => assert!(matches!(error, IndexError::Merge(_))),
+                KindFailure::None => assert!(matches!(error, IndexError::Storage(_))),
+            }
+            assert_eq!(
+                head, initial_head,
+                "failed cascade must not rewrite head_set"
+            );
+
+            // Draining happened only in the local Manifest clone. Every old
+            // content-addressed victim remains readable and can be retried.
+            let reader = storage.reader().unwrap();
+            for handle in &victim_handles {
+                assert!(reader
+                    .get::<Blob<UnknownBlob>, UnknownBlob>(*handle)
+                    .is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn query_without_checkout_matches_checkout() {
         use crate::repo::Repository;
         use ed25519_dalek::SigningKey;
@@ -1275,12 +1629,15 @@ mod tests {
         for i in 0..FANOUT {
             deltas.push(person(&format!("n{i}")));
         }
-        // Content-addressed handles of the level-0 segments we expect to be
-        // orphaned after the merge.
-        let orphan_handles: Vec<Inline<Handle<UnknownBlob>>> = deltas
+        // The first FANOUT - 1 level-zero segments were published by earlier
+        // updates and become orphans after the merge. The final update is the
+        // in-memory carry input, so its level-zero representation is never
+        // materialized in storage at all.
+        let level_zero_handles: Vec<Inline<Handle<UnknownBlob>>> = deltas
             .iter()
             .map(|d| SuccinctRollup.build(d).get_handle())
             .collect();
+        let (orphan_handles, pending_handle) = level_zero_handles.split_at(FANOUT - 1);
 
         {
             let mut home = IndexHome::new(&mut yard, branch, SuccinctRollup::new());
@@ -1296,12 +1653,18 @@ mod tests {
         // Before GC the orphan blobs are still physically resident.
         {
             let reader = yard.reader().unwrap();
-            for h in &orphan_handles {
+            for h in orphan_handles {
                 assert!(
                     reader.get::<Blob<UnknownBlob>, UnknownBlob>(*h).is_ok(),
                     "orphan segment resident before GC"
                 );
             }
+            assert!(
+                reader
+                    .get::<Blob<UnknownBlob>, UnknownBlob>(pending_handle[0])
+                    .is_err(),
+                "carry-triggering level-zero segment was never materialized"
+            );
         }
 
         // Reachability GC + physical reclaim.
@@ -1311,7 +1674,7 @@ mod tests {
         // The orphaned level-0 segments are gone.
         {
             let reader = yard.reader().unwrap();
-            for h in &orphan_handles {
+            for h in orphan_handles {
                 assert!(
                     reader.get::<Blob<UnknownBlob>, UnknownBlob>(*h).is_err(),
                     "orphan segment reclaimed after GC"
