@@ -118,6 +118,7 @@
 //!   (compass:09ce3667) drops in behind this one method — the surface,
 //!   manifest, and tiering are unaffected.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 
@@ -257,7 +258,10 @@ pub struct SegmentEntry {
 /// rewritten as a whole on each [`IndexHome::update_index`].
 #[derive(Debug, Clone, Default)]
 pub struct Manifest {
-    /// Live segments, kept sorted by `(level, seq)`.
+    /// Live segments, kept sorted by `(level, seq)` by the built-in mutation
+    /// paths. This remains public for inspection and migration tooling;
+    /// [`append_segment`] tolerates externally constructed overfull levels and
+    /// repairs them before publishing its replacement manifest.
     pub segments: Vec<SegmentEntry>,
     /// Maximal source commits whose ancestor closures this manifest covers.
     /// Kept sorted and deduplicated for canonical serialization.
@@ -292,9 +296,28 @@ impl Manifest {
     /// This is primarily a migration seam: a verified legacy monolithic
     /// rollup can become the initial upper-tier segment without decoding and
     /// rebuilding it. New source deltas should normally enter through
-    /// [`append_segment`] at level zero.
+    /// [`append_segment`] at level zero. Adoption itself does not perform I/O
+    /// or compaction; the next append repairs any resulting overfull tier.
     pub fn adopt_segment(&mut self, blob: Inline<Handle<UnknownBlob>>, level: u64) {
         self.push(blob, level);
+    }
+
+    /// The lowest LSMT level holding at least `fanout` segments, if any.
+    ///
+    /// Although normal maintenance never publishes an overfull level, the
+    /// manifest has public construction/migration seams and is parsed from
+    /// soft-state tribles. Maintenance therefore repairs overfull levels
+    /// globally rather than assuming every input manifest is canonical.
+    fn overflowing_level(&self, fanout: usize) -> Option<u64> {
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for entry in &self.segments {
+            *counts.entry(entry.level).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count >= fanout)
+            .map(|(level, _)| level)
+            .min()
     }
 
     /// Remove and return every segment at `level`.
@@ -525,6 +548,24 @@ fn boxed<E: Error + Send + Sync + 'static>(e: E) -> IndexError {
     IndexError::Storage(Box::new(e))
 }
 
+fn attach_stored_segments<S, K>(
+    storage: &mut S,
+    kind: &K,
+    entries: &[SegmentEntry],
+) -> Result<Vec<K::Segment>, IndexError>
+where
+    S: BlobStore,
+    K: IndexKind,
+{
+    let reader = storage.reader().map_err(boxed)?;
+    let mut attached = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let blob: Blob<UnknownBlob> = reader.get(entry.blob).map_err(boxed)?;
+        attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
+    }
+    Ok(attached)
+}
+
 /// Build one level-0 segment for `kind` from `source` and fold the
 /// updated manifest into `head_set` (a branch-head tribleset under
 /// construction), running the size-tiered merge to keep fan-out bounded.
@@ -552,44 +593,55 @@ where
 {
     let kind_id = kind.kind_id();
     let mut manifest = Manifest::from_tribles(head_set, kind_id);
-    let mut pending = kind.build(source);
-    let mut level = 0;
+    let mut pending = Some((kind.build(source), 0));
 
-    // Carry one pending blob upward entirely in memory. A valid manifest has
-    // at most FANOUT - 1 resident segments per level. If the new pending blob
-    // fills the level, attach the resident victims in sequence order, append
-    // the pending attachment last (the same order as the former
-    // put/push/drain implementation), merge, and carry that result upward.
-    // Only the first non-overflowing level persists and publishes `pending`.
+    // Carry pending blobs upward entirely in memory, then repair any globally
+    // overfull tier admitted through the manifest's public/migration seams.
+    // A canonical manifest takes the first arm once and exits. A repaired tier
+    // becomes another pending blob at the next level, where the same in-memory
+    // cascade avoids materialising intermediate outputs.
     loop {
-        // Preserve the historical sequence stream exactly: the previous
-        // implementation assigned one sequence at every visited level before
-        // immediately draining an overflowing tier. Reserving those logical
-        // intermediate sequences keeps successful manifests byte-for-byte
-        // compatible even though their blobs never enter storage now.
-        let seq = manifest.reserve_seq();
-        let resident = manifest
-            .segments
-            .iter()
-            .filter(|entry| entry.level == level)
-            .count();
+        if let Some((mut blob, mut level)) = pending.take() {
+            loop {
+                // Preserve the historical sequence stream exactly: the
+                // previous implementation assigned one sequence at every
+                // visited level before immediately draining an overflowing
+                // tier. Reserving those logical intermediate sequences keeps
+                // successful manifests byte-for-byte compatible even though
+                // their blobs never enter storage now.
+                let seq = manifest.reserve_seq();
+                let resident = manifest
+                    .segments
+                    .iter()
+                    .filter(|entry| entry.level == level)
+                    .count();
 
-        if resident + 1 < FANOUT {
-            let handle = storage.put::<UnknownBlob, _>(pending).map_err(boxed)?;
-            manifest.push_reserved(handle, level, seq);
+                if resident + 1 < FANOUT {
+                    let handle = storage.put::<UnknownBlob, _>(blob).map_err(boxed)?;
+                    manifest.push_reserved(handle, level, seq);
+                    break;
+                }
+
+                let victims = manifest.drain_level(level);
+                let mut attached = attach_stored_segments(storage, kind, &victims)?;
+                attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
+                blob = kind.try_merge(&attached).map_err(IndexError::Merge)?;
+                level += 1;
+            }
+        }
+
+        let Some(level) = manifest.overflowing_level(FANOUT) else {
             break;
-        }
+        };
 
+        // This tier was already overfull before the current pending path
+        // reached it (possible via `Manifest::segments`, `adopt_segment`, or
+        // decoded soft state). Match the old global repair policy: merge every
+        // resident in sequence order, then carry the result from level + 1.
         let victims = manifest.drain_level(level);
-        let reader = storage.reader().map_err(boxed)?;
-        let mut attached = Vec::with_capacity(victims.len() + 1);
-        for victim in &victims {
-            let blob: Blob<UnknownBlob> = reader.get(victim.blob).map_err(boxed)?;
-            attached.push(kind.try_attach(blob).map_err(IndexError::Segment)?);
-        }
-        attached.push(kind.try_attach(pending).map_err(IndexError::Segment)?);
-        pending = kind.try_merge(&attached).map_err(IndexError::Merge)?;
-        level += 1;
+        let attached = attach_stored_segments(storage, kind, &victims)?;
+        let merged = kind.try_merge(&attached).map_err(IndexError::Merge)?;
+        pending = Some((merged, level + 1));
     }
 
     // Rewrite this kind's manifest inside the branch-head tribleset:
@@ -1041,20 +1093,27 @@ mod tests {
         }
     }
 
-    fn seeded_cascade(depth: usize) -> (MemoryRepo, TribleSet, Vec<Inline<Handle<UnknownBlob>>>) {
+    fn seeded_levels(
+        level_counts: &[(u64, usize)],
+    ) -> (MemoryRepo, TribleSet, Vec<Inline<Handle<UnknownBlob>>>) {
         let mut storage = MemoryRepo::default();
         let kind = SuccinctRollup;
         let mut manifest = Manifest::default();
-        let mut handles = Vec::with_capacity(depth * (FANOUT - 1));
-        for level in 0..depth {
-            for slot in 0..(FANOUT - 1) {
+        let mut handles = Vec::new();
+        for &(level, count) in level_counts {
+            for slot in 0..count {
                 let blob = kind.build(&person(&format!("level-{level}-slot-{slot}")));
                 let handle = storage.put(blob).unwrap();
-                manifest.push(handle, level as u64);
+                manifest.adopt_segment(handle, level);
                 handles.push(handle);
             }
         }
         (storage, manifest.to_tribles(kind.kind_id()), handles)
+    }
+
+    fn seeded_cascade(depth: usize) -> (MemoryRepo, TribleSet, Vec<Inline<Handle<UnknownBlob>>>) {
+        let levels: Vec<_> = (0..depth).map(|level| (level as u64, FANOUT - 1)).collect();
+        seeded_levels(&levels)
     }
 
     /// Reference implementation of the former put/push/drain cascade.
@@ -1075,20 +1134,7 @@ mod tests {
             .map_err(boxed)?;
         manifest.push(handle, 0);
 
-        while let Some(level) = manifest
-            .segments
-            .iter()
-            .map(|entry| entry.level)
-            .filter(|level| {
-                manifest
-                    .segments
-                    .iter()
-                    .filter(|entry| entry.level == *level)
-                    .count()
-                    >= FANOUT
-            })
-            .min()
-        {
+        while let Some(level) = manifest.overflowing_level(FANOUT) {
             let victims = manifest.drain_level(level);
             let reader = storage.reader().map_err(boxed)?;
             let mut attached = Vec::with_capacity(victims.len());
@@ -1428,6 +1474,79 @@ mod tests {
             manifest.segments[0].seq,
             (DEPTH * (FANOUT - 1) + DEPTH) as u64
         );
+    }
+
+    #[test]
+    fn distant_overfull_tier_is_repaired_without_materializing_its_carry() {
+        // Public adoption/decoded soft state can present a non-canonical
+        // manifest independently of the new level-zero leaf. Level 5 is
+        // already overfull and level 6 is one resident short of overflow, so
+        // repairing level 5 must cascade through level 6 even though level 0
+        // itself does not carry.
+        let (base, initial_head, _victims) = seeded_levels(&[(5, FANOUT), (6, FANOUT - 1)]);
+        let source = person("distant-repair-trigger");
+        let kind = SuccinctRollup;
+
+        let mut new_store = CountingStore::clone_from(&base);
+        let mut legacy_store = CountingStore::clone_from(&base);
+        let mut new_head = initial_head.clone();
+        let mut legacy_head = initial_head;
+
+        append_segment(&mut new_store, &kind, &source, &mut new_head).unwrap();
+        legacy_append_segment(&mut legacy_store, &kind, &source, &mut legacy_head).unwrap();
+
+        // Both paths publish the independent new L0. For the distant repair,
+        // the old path also put/read the transient L6 output; the new path
+        // carries it directly into L7.
+        assert_eq!(new_store.counts.puts.load(Ordering::Relaxed), 2);
+        assert_eq!(legacy_store.counts.puts.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            new_store.counts.gets.load(Ordering::Relaxed),
+            FANOUT + (FANOUT - 1)
+        );
+        assert_eq!(legacy_store.counts.gets.load(Ordering::Relaxed), 2 * FANOUT);
+
+        assert_eq!(new_head, legacy_head, "global repair remains canonical");
+        let manifest = Manifest::from_tribles(&new_head, kind.kind_id());
+        assert!(manifest.overflowing_level(FANOUT).is_none());
+        assert_eq!(
+            manifest
+                .segments
+                .iter()
+                .map(|entry| entry.level)
+                .collect::<Vec<_>>(),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn distant_repair_failure_keeps_manifest_update_atomic() {
+        // The independent L0 is successfully stored before maintenance finds
+        // the distant overfull tier. A later merge failure may leave that L0
+        // as an unreferenced blob, but must not publish a partial manifest or
+        // invalidate any existing victim.
+        let (base, initial_head, victim_handles) = seeded_levels(&[(5, FANOUT)]);
+        let mut storage = CountingStore::clone_from(&base);
+        let kind = FailableSuccinct {
+            failure: KindFailure::Merge,
+        };
+        let mut head = initial_head.clone();
+
+        let error = append_segment(
+            &mut storage,
+            &kind,
+            &person("distant-failure-trigger"),
+            &mut head,
+        )
+        .unwrap_err();
+        assert!(matches!(error, IndexError::Merge(_)));
+        assert_eq!(storage.counts.puts.load(Ordering::Relaxed), 1);
+        assert_eq!(head, initial_head);
+
+        let reader = storage.reader().unwrap();
+        for handle in victim_handles {
+            assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle).is_ok());
+        }
     }
 
     #[test]
