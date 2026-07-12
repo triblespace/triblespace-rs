@@ -1235,9 +1235,8 @@ impl PrefixAccumulator {
     }
 }
 
-fn fill_merged_rotation<O>(
-    segments: &[SuccinctArchive<OrderedUniverse>],
-    remaps: &[Vec<usize>],
+fn fill_materialized_rotation<O>(
+    rows: &[[usize; 3]],
     rotation: SuccinctRotation,
     wavelets: &mut O,
     changed_pair: &mut BitVectorBuilder<'_>,
@@ -1248,22 +1247,29 @@ fn fill_merged_rotation<O>(
 where
     O: MergedWaveletOutputs,
 {
+    let [first_component, middle_component, last_component] = match rotation {
+        SuccinctRotation::Eav => [0, 1, 2],
+        SuccinctRotation::Vea => [2, 0, 1],
+        SuccinctRotation::Ave => [1, 2, 0],
+        SuccinctRotation::Vae => [2, 1, 0],
+        SuccinctRotation::Eva => [0, 2, 1],
+        SuccinctRotation::Aev => [1, 0, 2],
+    };
     let mut last_pair = None;
     let mut prefix_accumulator = PrefixAccumulator::default();
-    let mut written = 0usize;
 
-    for (position, row) in MergedRows::new(segments, remaps, rotation).enumerate() {
-        wavelets.set_int(rotation, position, row[2])?;
-        let pair = [row[0], row[1]];
+    for (position, row) in rows.iter().enumerate() {
+        let first = row[first_component];
+        let pair = [first, row[middle_component]];
+        wavelets.set_int(rotation, position, row[last_component])?;
         let changed = last_pair != Some(pair);
         changed_pair.set_bit(position, changed).unwrap();
         last_pair = Some(pair);
         if let Some(builder) = prefix.as_deref_mut() {
-            prefix_accumulator.record(builder, position, row[0]);
+            prefix_accumulator.record(builder, position, first);
         }
-        written = position + 1;
     }
-    assert_eq!(written, triple_count, "all rotations have equal length");
+    assert_eq!(rows.len(), triple_count, "all rotations have equal length");
     wavelets.finish_rotation(rotation)?;
 
     Ok(match prefix {
@@ -1272,10 +1278,43 @@ where
     })
 }
 
+/// Stably makes `component` the primary key while retaining the relative order
+/// of the other two components. Ring rotations differ by exactly that move, so
+/// five linear counting-sort passes walk the canonical serialization order:
+/// EAV -> VEA -> AVE -> VAE -> EVA -> AEV.
+fn stable_sort_materialized_rows(
+    rows: &mut Vec<[usize; 3]>,
+    scratch: &mut Vec<[usize; 3]>,
+    counts: &mut [usize],
+    component: usize,
+) {
+    counts.fill(0);
+    for row in rows.iter() {
+        counts[row[component]] += 1;
+    }
+
+    let mut offset = 0usize;
+    for count in counts.iter_mut() {
+        let len = *count;
+        *count = offset;
+        offset += len;
+    }
+    debug_assert_eq!(offset, rows.len());
+
+    scratch.resize(rows.len(), [0; 3]);
+    for row in rows.iter().copied() {
+        let destination = &mut counts[row[component]];
+        scratch[*destination] = row;
+        *destination += 1;
+    }
+    std::mem::swap(rows, scratch);
+}
+
 /// Structurally merges sorted succinct-archive segments without reconstructing
 /// their six-PATCH [`TribleSet`] representation. Segment-local value domains
-/// are merged first; all six rotations are then k-way merged and fed directly
-/// into the existing succinct builders. The on-disk blob format is unchanged.
+/// are merged first. EAV is decoded, remapped, merged, and deduplicated once;
+/// the other five rotations are derived by stable linear counting sorts. The
+/// on-disk blob format is unchanged.
 fn merge_ordered_archives_with_factory<F>(
     segments: &[SuccinctArchive<OrderedUniverse>],
     factory: &F,
@@ -1309,7 +1348,16 @@ where
     }
     assert_eq!(next_code, domain_len, "domain merge and remap agree");
 
-    let triple_count = MergedRows::new(segments, &remaps, SuccinctRotation::Eav).count();
+    // Decoding a Ring row performs wavelet rank/select navigation. Materialise
+    // the canonical EAV union once rather than paying that cost for a count and
+    // again for every rotation. Once remapped, the source archives and remap
+    // tables are no longer touched by the rotation builder.
+    let mut rows: Vec<[usize; 3]> =
+        MergedRows::new(segments, &remaps, SuccinctRotation::Eav).collect();
+    let triple_count = rows.len();
+    drop(remaps);
+    let mut row_scratch = Vec::with_capacity(triple_count);
+    let mut radix_counts = vec![0usize; domain_len];
 
     // Reserve sections in exactly the historical serialization order so the
     // structural merge produces the same canonical bytes as a full rebuild.
@@ -1335,9 +1383,8 @@ where
     let mut changed_v_a_builder =
         BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
 
-    let entity_count = fill_merged_rotation(
-        segments,
-        &remaps,
+    let entity_count = fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Eav,
         &mut wavelets,
         &mut changed_e_a_builder,
@@ -1345,9 +1392,9 @@ where
         triple_count,
         domain_len,
     )?;
-    let value_count = fill_merged_rotation(
-        segments,
-        &remaps,
+    stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 2);
+    let value_count = fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Vea,
         &mut wavelets,
         &mut changed_v_e_builder,
@@ -1355,9 +1402,9 @@ where
         triple_count,
         domain_len,
     )?;
-    let attribute_count = fill_merged_rotation(
-        segments,
-        &remaps,
+    stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 1);
+    let attribute_count = fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Ave,
         &mut wavelets,
         &mut changed_a_v_builder,
@@ -1365,9 +1412,9 @@ where
         triple_count,
         domain_len,
     )?;
-    fill_merged_rotation(
-        segments,
-        &remaps,
+    stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 2);
+    fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Vae,
         &mut wavelets,
         &mut changed_v_a_builder,
@@ -1375,9 +1422,9 @@ where
         triple_count,
         domain_len,
     )?;
-    fill_merged_rotation(
-        segments,
-        &remaps,
+    stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 0);
+    fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Eva,
         &mut wavelets,
         &mut changed_e_v_builder,
@@ -1385,9 +1432,9 @@ where
         triple_count,
         domain_len,
     )?;
-    fill_merged_rotation(
-        segments,
-        &remaps,
+    stable_sort_materialized_rows(&mut rows, &mut row_scratch, &mut radix_counts, 1);
+    fill_materialized_rotation(
+        &rows,
         SuccinctRotation::Aev,
         &mut wavelets,
         &mut changed_a_e_builder,
@@ -1395,7 +1442,7 @@ where
         triple_count,
         domain_len,
     )?;
-    drop(remaps);
+    drop((rows, row_scratch, radix_counts));
 
     // Freeze to metadata and immediately drop the temporary indexes. The final
     // from-bytes attachment builds exactly one retained Rank9Sel index set.

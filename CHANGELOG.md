@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Succinct-archive structural merge decodes source rows once.** The merger
+  now materializes the remapped, deduplicated EAV union and derives the other
+  five canonical Ring rotations with stable linear counting sorts. This
+  replaces one counting decode plus five additional rank/select-heavy source
+  wavelet traversals with bounded `O(rows + domain)` scratch while preserving
+  byte-identical archive output and the accelerator freeze seam.
 - **The public `Constraint` protocol is now block-native.** Every verb receives
   a borrowed `RowsView` of sibling partial bindings; `EstimateSink` and
   `CandidateSink` provide scalar/plain-value representations for the explicit
