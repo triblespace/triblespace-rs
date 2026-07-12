@@ -26,9 +26,9 @@
 //! in the pile. So — like [`HnswRollup`] and its embedding handles —
 //! `Bm25Rollup` holds a blob reader to resolve those handles into the
 //! strings [`crate::tokens::hash_tokens`] tokenises. The reader is used
-//! only by [`build`](IndexKind::build) and [`merge`](IndexKind::merge);
-//! [`attach`](IndexKind::attach) is zero-copy (it decodes only the
-//! stored succinct blob).
+//! only by [`build`](IndexKind::build); merge operates directly on the
+//! persisted succinct segments, and [`attach`](IndexKind::attach) is
+//! zero-copy (it decodes only the stored succinct blob).
 //!
 //! # Multi-segment query semantics (cross-segment IDF caveat)
 //!
@@ -210,6 +210,16 @@ where
         let merged = SuccinctBM25Index::merge_segments(segments, defaults.k1, defaults.b);
         let blob: Blob<SuccinctBM25Blob> = (&merged).to_blob();
         blob.transmute()
+    }
+
+    fn try_merge(
+        &self,
+        segments: &[Self::Segment],
+    ) -> Result<Blob<UnknownBlob>, Box<dyn std::error::Error + Send + Sync>> {
+        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
+        let merged = SuccinctBM25Index::try_merge_segments(segments, defaults.k1, defaults.b)?;
+        let blob: Blob<SuccinctBM25Blob> = (&merged).to_blob();
+        Ok(blob.transmute())
     }
 }
 
@@ -554,6 +564,14 @@ mod tests {
         rows.sort_unstable_by_key(|(key, _)| key.raw);
         let materialized = kind.build_blob(rows);
         let direct = kind.merge(&segments);
+        let fallible = kind
+            .try_merge(&segments)
+            .expect("canonical segments merge through the fallible index-home seam");
+        assert_eq!(
+            fallible.bytes.as_ref(),
+            direct.bytes.as_ref(),
+            "fallible maintenance emits the same canonical bytes as direct merge"
+        );
         assert_eq!(
             direct.bytes.as_ref(),
             materialized.bytes.as_ref(),

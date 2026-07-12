@@ -260,8 +260,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AcceleratedSuccinctRollup` selects that backend at or above a caller-chosen
   input-row threshold; a returned failure opens a circuit breaker before the
   canonical CPU retry, without changing the kind id or bytes. BM25 compaction
-  streams persisted postings instead of reconstructing every document's token
-  bag, and the direct
+  recovers persisted postings once into an anonymous fixed-width spool and
+  replays it for score sizing and canonical serialization instead of
+  reconstructing every document's token bag or holding a corpus-sized posting
+  cache; its index-home path uses the fallible merge hook so spool and succinct
+  area errors cannot publish a partial manifest. The direct
   documented `SimpleArchive` → `SuccinctArchive` conversion is now wired. First
   kinds: `SuccinctRollup` in core (segments are
   `SuccinctArchive`s; `SuccinctRollup::union` gives cross-segment joins via
