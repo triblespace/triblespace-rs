@@ -222,6 +222,82 @@ fn persist_top_level_rank9_indexes(
 /// Writes the one canonical sidecar table/footer and the unchanged EOF
 /// metadata trailer. Every archive construction backend funnels through this
 /// function after all legacy raw sections have been reserved.
+fn try_finalize_succinct_archive<D>(
+    writer: &mut SectionWriter<'_>,
+    meta: &SuccinctArchiveMeta<D>,
+    index_handles: &[SectionHandle<usize>],
+) -> Result<(), jerky::error::Error>
+where
+    D: Metadata + Clone,
+{
+    let mut table = writer
+        .reserve::<SectionHandle<usize>>(index_handles.len())
+        .map_err(jerky::error::Error::from)?;
+    table.as_mut_slice().copy_from_slice(index_handles);
+    let table_handle = table.handle();
+    let table_end = table_handle
+        .offset
+        .checked_add(table_handle.len)
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table position overflow"))?;
+    table.freeze().map_err(jerky::error::Error::from)?;
+
+    // Keep the footer immediately adjacent to the possibly more-aligned
+    // generic metadata trailer. Padding belongs before the footer and is
+    // explicitly zeroed so there is only one canonical representation.
+    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
+    let meta_align = std::mem::align_of::<SuccinctArchiveMeta<D>>();
+    let meta_start = checked_align_up(
+        table_end
+            .checked_add(footer_size)
+            .ok_or_else(|| invalid_rank9_metadata("Rank9 footer position overflow"))?,
+        meta_align,
+    )?;
+    let footer_start = meta_start - footer_size;
+    let padding_len = footer_start - table_end;
+    if padding_len != 0 {
+        let mut padding = writer
+            .reserve::<u8>(padding_len)
+            .map_err(jerky::error::Error::from)?;
+        padding.as_mut_slice().fill(0);
+        if padding.handle().offset != table_end {
+            return Err(invalid_rank9_metadata(
+                "Rank9 trailer padding has an unexpected alignment gap",
+            ));
+        }
+        padding.freeze().map_err(jerky::error::Error::from)?;
+    }
+
+    let mut footer = writer
+        .reserve::<Rank9SidecarFooter>(1)
+        .map_err(jerky::error::Error::from)?;
+    if footer.handle().offset != footer_start {
+        return Err(invalid_rank9_metadata(
+            "Rank9 footer has an unexpected alignment gap",
+        ));
+    }
+    footer.as_mut_slice()[0] = Rank9SidecarFooter {
+        marker: RANK9_SIDECAR_MARKER,
+        version: RANK9_SIDECAR_VERSION,
+        flags: RANK9_SIDECAR_FLAGS,
+        indexes: table_handle,
+    };
+    footer.freeze().map_err(jerky::error::Error::from)?;
+
+    let mut meta_section = writer
+        .reserve::<SuccinctArchiveMeta<D>>(1)
+        .map_err(jerky::error::Error::from)?;
+    if meta_section.handle().offset != meta_start {
+        return Err(invalid_rank9_metadata(
+            "succinct archive metadata has an unexpected alignment gap",
+        ));
+    }
+    meta_section.as_mut_slice()[0] = meta.clone();
+    meta_section
+        .freeze()
+        .map_err(jerky::error::Error::from)?;
+    Ok(())
+}
+
 fn finalize_succinct_archive<D>(
     writer: &mut SectionWriter<'_>,
     meta: &SuccinctArchiveMeta<D>,
@@ -229,44 +305,8 @@ fn finalize_succinct_archive<D>(
 ) where
     D: Metadata + Clone,
 {
-    let mut table = writer
-        .reserve::<SectionHandle<usize>>(index_handles.len())
-        .unwrap();
-    table.as_mut_slice().copy_from_slice(index_handles);
-    let table_handle = table.handle();
-    let table_end = table_handle.offset.checked_add(table_handle.len).unwrap();
-    table.freeze().unwrap();
-
-    // Keep the footer immediately adjacent to the possibly more-aligned
-    // generic metadata trailer. Padding belongs before the footer and is
-    // explicitly zeroed so there is only one canonical representation.
-    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
-    let meta_align = std::mem::align_of::<SuccinctArchiveMeta<D>>();
-    let meta_start = checked_align_up(table_end.checked_add(footer_size).unwrap(), meta_align)
-        .expect("archive trailer size must fit usize");
-    let footer_start = meta_start - footer_size;
-    let padding_len = footer_start - table_end;
-    if padding_len != 0 {
-        let mut padding = writer.reserve::<u8>(padding_len).unwrap();
-        padding.as_mut_slice().fill(0);
-        assert_eq!(padding.handle().offset, table_end);
-        padding.freeze().unwrap();
-    }
-
-    let mut footer = writer.reserve::<Rank9SidecarFooter>(1).unwrap();
-    assert_eq!(footer.handle().offset, footer_start);
-    footer.as_mut_slice()[0] = Rank9SidecarFooter {
-        marker: RANK9_SIDECAR_MARKER,
-        version: RANK9_SIDECAR_VERSION,
-        flags: RANK9_SIDECAR_FLAGS,
-        indexes: table_handle,
-    };
-    footer.freeze().unwrap();
-
-    let mut meta_section = writer.reserve::<SuccinctArchiveMeta<D>>(1).unwrap();
-    assert_eq!(meta_section.handle().offset, meta_start);
-    meta_section.as_mut_slice()[0] = meta.clone();
-    meta_section.freeze().unwrap();
+    try_finalize_succinct_archive(writer, meta, index_handles)
+        .expect("temporary archive arena must remain writable");
 }
 
 fn build_prefix_bv<I>(
@@ -857,6 +897,77 @@ where
             eva_c: self.eva_c.metadata(),
             aev_c: self.aev_c.metadata(),
         }
+    }
+
+    /// Copies the canonical raw archive prefix and appends persisted indexes
+    /// for the Rank9/select structures already attached to this archive.
+    ///
+    /// This is a format migration, not an archive rebuild: it does not decode
+    /// or sort any tribles, and all raw data sections remain byte-identical.
+    fn persist_rank9_sidecars(&self) -> Result<Bytes, jerky::error::Error>
+    where
+        U: Serializable<Error = jerky::error::Error>,
+        U::Meta: Copy,
+    {
+        let meta = self.meta();
+        let raw_end = validate_raw_rank9_sources(&meta, &self.bytes, self.bytes.len())?;
+        // The replacement discards every byte after `raw_end`. Validate the
+        // generic universe against that exact retained prefix rather than the
+        // larger legacy/unknown-version arena, where a malformed handle could
+        // otherwise point into the suffix being removed.
+        U::validate_metadata_prefix(&meta.domain, &self.bytes, raw_end)?;
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+
+        if raw_end != 0 {
+            let mut raw_prefix = sections.reserve::<u8>(raw_end)?;
+            raw_prefix
+                .as_mut_slice()
+                .copy_from_slice(&self.bytes.as_ref()[..raw_end]);
+            raw_prefix.freeze()?;
+        }
+
+        let mut index_handles = [
+            &self.e_a,
+            &self.a_a,
+            &self.v_a,
+            &self.changed_e_a,
+            &self.changed_e_v,
+            &self.changed_a_e,
+            &self.changed_a_v,
+            &self.changed_v_e,
+            &self.changed_v_a,
+        ]
+        .into_iter()
+        .map(|vector| vector.index.persist(&mut sections))
+        .collect::<Result<Vec<_>, _>>()?;
+        for matrix in [
+            &self.eav_c,
+            &self.vea_c,
+            &self.ave_c,
+            &self.vae_c,
+            &self.eva_c,
+            &self.aev_c,
+        ] {
+            index_handles.extend(matrix.persist_layer_indexes(&mut sections)?);
+        }
+
+        try_finalize_succinct_archive(&mut sections, &meta, &index_handles)?;
+        drop(sections);
+        let upgraded = area.freeze()?;
+
+        // Legacy attachment is intentionally permissive. Certify the exact
+        // current format before exposing replacement bytes so dirty unused
+        // tail bits or another raw-layout inconsistency can never be
+        // checkpointed as an unreadable segment.
+        let meta_start = upgraded
+            .len()
+            .checked_sub(std::mem::size_of::<SuccinctArchiveMeta<U::Meta>>())
+            .ok_or_else(|| invalid_rank9_metadata("upgraded archive metadata is truncated"))?;
+        let handles = probe_rank9_sidecar_footer(&meta, &upgraded, meta_start)?
+            .ok_or_else(|| invalid_rank9_metadata("upgraded archive is missing its Rank9 footer"))?;
+        Self::from_bytes_with_rank9_indexes(meta, upgraded.clone(), &handles)?;
+        Ok(upgraded)
     }
 }
 
@@ -2706,20 +2817,96 @@ where
     }
 }
 
-/// Error returned when deserializing a [`SuccinctArchiveBlob`] into a [`SuccinctArchive`].
-pub struct SuccinctArchiveError;
+/// Error returned when deserializing or upgrading a [`SuccinctArchiveBlob`].
+pub struct SuccinctArchiveError(jerky::error::Error);
 
-impl std::error::Error for SuccinctArchiveError {}
+impl From<jerky::error::Error> for SuccinctArchiveError {
+    fn from(error: jerky::error::Error) -> Self {
+        Self(error)
+    }
+}
+
+impl std::error::Error for SuccinctArchiveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 impl std::fmt::Display for SuccinctArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SuccinctArchiveError")
+        write!(f, "invalid succinct archive: {}", self.0)
     }
 }
 
 impl std::fmt::Debug for SuccinctArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SuccinctArchiveError")
+        f.debug_tuple("SuccinctArchiveError").field(&self.0).finish()
+    }
+}
+
+impl<U> SuccinctArchive<U>
+where
+    U: Universe + Serializable<Error = jerky::error::Error>,
+    <U as Serializable>::Meta: Copy + 'static,
+{
+    /// Upgrades a legacy archive blob to the canonical persisted-Rank9
+    /// representation without decoding or rebuilding its tribles.
+    ///
+    /// The legacy archive is attached once, its byte-identical raw prefix is
+    /// copied into a new file-backed arena, and the already-built Rank9/select
+    /// indexes are serialized after it. A valid current-format blob is
+    /// returned unchanged, including its cached content handle; the boolean is
+    /// `true` only when new bytes were written. A malformed current-format
+    /// sidecar is rejected by the same exact validation used during ordinary
+    /// attachment.
+    pub fn upgrade_rank9_sidecars(
+        blob: Blob<SuccinctArchiveBlob>,
+    ) -> Result<(Blob<SuccinctArchiveBlob>, bool), SuccinctArchiveError> {
+        let bytes = blob.bytes.clone();
+        let mut tail = bytes.clone();
+        let meta = *tail
+            .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
+            .map_err(|err| {
+                SuccinctArchiveError(invalid_rank9_metadata(format!(
+                    "cannot read EOF metadata: {err}"
+                )))
+            })?;
+        let meta_start = tail.len();
+
+        match probe_rank9_sidecar_footer(&meta, &bytes, meta_start).map_err(SuccinctArchiveError)? {
+            Some(index_handles) => {
+                Self::from_bytes_with_rank9_indexes(meta, bytes, &index_handles)
+                    .map_err(SuccinctArchiveError)?;
+                Ok((blob, false))
+            }
+            None => {
+                // A recognized marker with an unknown version denotes an
+                // extension suffix, not legacy raw data. Bound every raw and
+                // universe handle before that footer; a no-marker V1 archive
+                // uses the EOF metadata start as its outer bound.
+                let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
+                let footer_start = meta_start.saturating_sub(footer_size);
+                let marker_end = footer_start.saturating_add(RANK9_SIDECAR_MARKER.len());
+                let raw_limit = if meta_start >= footer_size
+                    && marker_end <= meta_start
+                    && bytes.as_ref()[footer_start..marker_end] == RANK9_SIDECAR_MARKER
+                {
+                    footer_start
+                } else {
+                    meta_start
+                };
+                let raw_end = validate_raw_rank9_sources(&meta, &bytes, raw_limit)
+                    .map_err(SuccinctArchiveError)?;
+                U::validate_metadata_prefix(&meta.domain, &bytes, raw_end)
+                    .map_err(SuccinctArchiveError)?;
+                let archive = Self::from_bytes(meta, bytes.slice(0..raw_end))
+                    .map_err(SuccinctArchiveError)?;
+                let upgraded = archive
+                    .persist_rank9_sidecars()
+                    .map_err(SuccinctArchiveError)?;
+                Ok((Blob::new(upgraded), true))
+            }
+        }
     }
 }
 
@@ -2735,16 +2922,20 @@ where
         let mut tail = bytes.clone();
         let meta = *tail
             .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
-            .map_err(|_| SuccinctArchiveError)?;
+            .map_err(|err| {
+                SuccinctArchiveError(invalid_rank9_metadata(format!(
+                    "cannot read EOF metadata: {err}"
+                )))
+            })?;
         let meta_start = tail.len();
         match probe_rank9_sidecar_footer(&meta, &bytes, meta_start)
-            .map_err(|_| SuccinctArchiveError)?
+            .map_err(SuccinctArchiveError)?
         {
             Some(index_handles) => {
                 SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles)
-                    .map_err(|_| SuccinctArchiveError)
+                    .map_err(SuccinctArchiveError)
             }
-            None => SuccinctArchive::from_bytes(meta, bytes).map_err(|_| SuccinctArchiveError),
+            None => SuccinctArchive::from_bytes(meta, bytes).map_err(SuccinctArchiveError),
         }
     }
 }
@@ -3146,7 +3337,14 @@ mod tests {
         let (mut bytes, footer_start, footer) = ordered_archive_bytes(&set);
         mutate(&mut bytes, footer_start, footer);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_ordered_archive(bytes)
+            decode_ordered_archive(bytes.clone())
+        }));
+        assert!(matches!(result, Ok(Err(_))));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
+                Bytes::from_source(bytes),
+            ))
         }));
         assert!(matches!(result, Ok(Err(_))));
     }
@@ -3156,14 +3354,23 @@ mod tests {
         let set = varied_knights();
         let expected: SuccinctArchive<OrderedUniverse> = (&set).into();
         let (mut bytes, footer_start, _) = ordered_archive_bytes(&set);
+        let canonical = bytes.clone();
         write_u32(
             &mut bytes,
             footer_start + std::mem::offset_of!(Rank9SidecarFooter, version),
             RANK9_SIDECAR_VERSION + 1,
         );
-        let decoded = decode_ordered_archive(bytes).unwrap();
+        let decoded = decode_ordered_archive(bytes.clone()).unwrap();
         assert_eq!(decoded.iter().collect::<TribleSet>(), set);
         assert_eq!(decoded.iter().collect_vec(), expected.iter().collect_vec());
+
+        let (upgraded, changed) =
+            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
+                Bytes::from_source(bytes),
+            ))
+            .unwrap();
+        assert!(changed);
+        assert_eq!(upgraded.bytes.as_ref(), canonical);
     }
 
     #[test]
@@ -3173,6 +3380,92 @@ mod tests {
         bytes[footer_start] ^= 1;
         let decoded = decode_ordered_archive(bytes).unwrap();
         assert_eq!(decoded.iter().collect::<TribleSet>(), set);
+    }
+
+    #[test]
+    fn legacy_upgrade_rejects_dirty_unused_raw_tail_bits() {
+        type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
+
+        let set = varied_knights();
+        let (canonical, _, footer) = ordered_archive_bytes(&set);
+        let area = Bytes::from_source(canonical.clone());
+        let meta_start = canonical.len() - std::mem::size_of::<Meta>();
+        let meta = *area
+            .clone()
+            .slice(meta_start..)
+            .view::<Meta>()
+            .unwrap();
+        let raw_end = meta.changed_v_a.handle.offset + meta.changed_v_a.handle.len;
+        let mut legacy = canonical[..raw_end].to_vec();
+        legacy.extend_from_slice(&canonical[meta_start..]);
+
+        let vector = [
+            meta.e_a,
+            meta.a_a,
+            meta.v_a,
+            meta.changed_e_a,
+            meta.changed_e_v,
+            meta.changed_a_e,
+            meta.changed_a_v,
+            meta.changed_v_e,
+            meta.changed_v_a,
+        ]
+        .into_iter()
+        .find(|vector| vector.len % 64 != 0)
+        .expect("fixture has an unused raw tail bit");
+        let last_word = vector.handle.offset + vector.handle.len - std::mem::size_of::<u64>();
+        let mut word = u64::from_ne_bytes(
+            legacy[last_word..last_word + std::mem::size_of::<u64>()]
+                .try_into()
+                .unwrap(),
+        );
+        word |= 1u64 << (vector.len % 64);
+        legacy[last_word..last_word + std::mem::size_of::<u64>()]
+            .copy_from_slice(&word.to_ne_bytes());
+
+        // The pre-sidecar representation deliberately had permissive raw
+        // attachment. The maintenance upgrader must nevertheless refuse to
+        // publish bytes that the exact current reader would reject.
+        assert!(decode_ordered_archive(legacy.clone()).is_ok());
+        assert!(
+            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
+                Bytes::from_source(legacy),
+            ))
+            .is_err()
+        );
+        assert!(footer.indexes.offset >= raw_end);
+    }
+
+    #[test]
+    fn unknown_version_upgrade_rejects_domain_handle_in_discarded_suffix() {
+        type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
+
+        let set = varied_knights();
+        let (mut bytes, footer_start, footer) = ordered_archive_bytes(&set);
+        let meta_start = bytes.len() - std::mem::size_of::<Meta>();
+        write_u32(
+            &mut bytes,
+            footer_start + std::mem::offset_of!(Rank9SidecarFooter, version),
+            RANK9_SIDECAR_VERSION + 1,
+        );
+        write_usize(
+            &mut bytes,
+            meta_start
+                + std::mem::offset_of!(Meta, domain)
+                + std::mem::offset_of!(SectionHandle<RawInline>, offset),
+            footer.indexes.offset,
+        );
+
+        // The permissive legacy fallback can attach the domain while the
+        // unknown suffix is still present. Migration removes that suffix, so
+        // it must validate the domain against the retained raw prefix first.
+        assert!(decode_ordered_archive(bytes.clone()).is_ok());
+        assert!(
+            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
+                Bytes::from_source(bytes),
+            ))
+            .is_err()
+        );
     }
 
     #[test]

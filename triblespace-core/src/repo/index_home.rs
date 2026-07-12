@@ -129,7 +129,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
-    SuccinctArchiveBlob, Universe, WaveletMatrixFreezeBackend,
+    SuccinctArchiveBlob, SuccinctArchiveError, Universe, WaveletMatrixFreezeBackend,
 };
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
@@ -837,6 +837,23 @@ impl SuccinctRollup {
         segments: &'a [SuccinctArchive<OrderedUniverse>],
     ) -> UnionArchive<'a, OrderedUniverse> {
         UnionArchive::new(segments)
+    }
+
+    /// Upgrades one schema-erased segment to persisted Rank9 sidecars.
+    ///
+    /// The returned boolean is `false` when the input already used the current
+    /// representation; in that case the original blob and cached handle are
+    /// returned unchanged. This small schema-erased seam lets index-home
+    /// maintenance migrate manifest entries without depending on the archive's
+    /// universe or typed blob encoding.
+    pub fn upgrade_rank9_sidecars(
+        &self,
+        blob: Blob<UnknownBlob>,
+    ) -> Result<(Blob<UnknownBlob>, bool), SuccinctArchiveError> {
+        let (blob, changed) = SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(
+            blob.transmute::<SuccinctArchiveBlob>(),
+        )?;
+        Ok((blob.transmute(), changed))
     }
 }
 

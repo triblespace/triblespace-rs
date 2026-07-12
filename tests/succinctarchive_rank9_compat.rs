@@ -131,6 +131,26 @@ fn check_ordered(rows: &[RawTrible], expected_query_signature: [usize; 6]) {
     let new_archive: NewArchive<NewUniverse> = (&new_set(rows)).into();
     let old_archive: OldArchive<OldUniverse> = (&old_set(rows)).into();
 
+    let legacy_blob = new::blob::Blob::<NewBlobEncoding>::new(new_bytes(&old_archive.bytes));
+    let (upgraded_blob, changed) =
+        NewArchive::<NewUniverse>::upgrade_rank9_sidecars(legacy_blob).unwrap();
+    assert!(changed);
+    assert_eq!(upgraded_blob.bytes.as_ref(), new_archive.bytes.as_ref());
+    let upgraded_archive: NewArchive<NewUniverse> = upgraded_blob.clone().try_from_blob().unwrap();
+    assert_eq!(new_rows(&upgraded_archive), new_rows(&new_archive));
+    assert_eq!(
+        new_query_signature(&upgraded_archive),
+        expected_query_signature
+    );
+
+    let upgraded_handle = upgraded_blob.get_handle();
+    let upgraded_ptr = upgraded_blob.bytes.as_ref().as_ptr();
+    let (unchanged_blob, changed) =
+        NewArchive::<NewUniverse>::upgrade_rank9_sidecars(upgraded_blob).unwrap();
+    assert!(!changed);
+    assert_eq!(unchanged_blob.get_handle(), upgraded_handle);
+    assert_eq!(unchanged_blob.bytes.as_ref().as_ptr(), upgraded_ptr);
+
     let old_meta_len = std::mem::size_of_val(&old_archive.meta());
     let new_meta_len = std::mem::size_of_val(&new_archive.meta());
     assert_eq!(old_meta_len, new_meta_len);
@@ -175,6 +195,27 @@ fn check_compressed(rows: &[RawTrible], expected_query_signature: [usize; 6]) {
 
     let new_archive: NewArchive<NewUniverse> = (&new_set(rows)).into();
     let old_archive: OldArchive<OldUniverse> = (&old_set(rows)).into();
+
+    let legacy_blob = new::blob::Blob::<NewBlobEncoding>::new(new_bytes(&old_archive.bytes));
+    let (upgraded_blob, changed) =
+        NewArchive::<NewUniverse>::upgrade_rank9_sidecars(legacy_blob).unwrap();
+    assert!(changed);
+    assert_eq!(upgraded_blob.bytes.as_ref(), new_archive.bytes.as_ref());
+    let upgraded_archive: NewArchive<NewUniverse> = upgraded_blob.clone().try_from_blob().unwrap();
+    assert_eq!(new_rows(&upgraded_archive), new_rows(&new_archive));
+    assert_eq!(
+        new_query_signature(&upgraded_archive),
+        expected_query_signature
+    );
+
+    let upgraded_handle = upgraded_blob.get_handle();
+    let upgraded_ptr = upgraded_blob.bytes.as_ref().as_ptr();
+    let (unchanged_blob, changed) =
+        NewArchive::<NewUniverse>::upgrade_rank9_sidecars(upgraded_blob).unwrap();
+    assert!(!changed);
+    assert_eq!(unchanged_blob.get_handle(), upgraded_handle);
+    assert_eq!(unchanged_blob.bytes.as_ref().as_ptr(), upgraded_ptr);
+
     let old_meta_len = std::mem::size_of_val(&old_archive.meta());
     let new_meta_len = std::mem::size_of_val(&new_archive.meta());
     assert_eq!(old_meta_len, new_meta_len);

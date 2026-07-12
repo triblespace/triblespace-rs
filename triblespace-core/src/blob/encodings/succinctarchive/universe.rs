@@ -9,7 +9,7 @@ use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::Bytes;
 use anybytes::View;
 use indxvec::Search;
-use jerky::int_vectors::dacs_byte::DacsByteMeta;
+use jerky::int_vectors::dacs_byte::{DacsByteMeta, LevelMeta};
 use jerky::int_vectors::{Access, DacsByte, NumVals};
 use jerky::serialization::Serializable;
 use quick_cache::sync::Cache;
@@ -21,6 +21,43 @@ pub trait Universe: Serializable {
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawInline>;
+
+    /// Validate that every metadata handle needed by this universe lies in a
+    /// retained byte prefix.
+    ///
+    /// SuccinctArchive format migration can discard an extension suffix. This
+    /// seam prevents a generic universe from silently retaining a handle into
+    /// bytes that will no longer exist. Built-in universes override it with
+    /// non-panicking handle preflights; the default contains a third-party
+    /// implementation's deserializer and converts an unwind into metadata
+    /// failure.
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error>
+    where
+        Self::Meta: Copy,
+        Self::Error: std::fmt::Display,
+    {
+        if limit > bytes.len() {
+            return Err(super::invalid_rank9_metadata(format!(
+                "universe prefix limit {limit} exceeds {} bytes",
+                bytes.len()
+            )));
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::from_bytes(*meta, bytes.clone().slice(0..limit))
+        })) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(super::invalid_rank9_metadata(format!(
+                "universe metadata exceeds the retained prefix: {err}"
+            ))),
+            Err(_) => Err(super::invalid_rank9_metadata(
+                "universe metadata panicked while validating the retained prefix",
+            )),
+        }
+    }
 
     /// Builds a universe from an arbitrary iterator, sorting and deduplicating internally.
     fn with<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
@@ -126,6 +163,21 @@ impl Universe for OrderedUniverse {
     {
         let collected: Vec<_> = iter.collect();
         OrderedUniverse::from_slice(&collected, sections)
+    }
+
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error> {
+        if limit > bytes.len() {
+            return Err(super::invalid_rank9_metadata(format!(
+                "ordered-universe prefix limit {limit} exceeds {} bytes",
+                bytes.len()
+            )));
+        }
+        super::checked_section_range(*meta, limit, "ordered-universe values")?;
+        Ok(())
     }
 
     fn access(&self, pos: usize) -> RawInline {
@@ -256,6 +308,75 @@ impl Universe for CompressedUniverse {
         }
     }
 
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error> {
+        if limit > bytes.len() {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe prefix limit {limit} exceeds {} bytes",
+                bytes.len()
+            )));
+        }
+        super::checked_section_range(meta.fragments, limit, "compressed-universe fragments")?;
+
+        let levels = meta.data.num_levels;
+        let max_levels = usize::BITS.div_ceil(8) as usize;
+        if levels == 0 || levels > max_levels {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe DAC has invalid level count {levels}"
+            )));
+        }
+        let table = super::checked_section_range(
+            meta.data.levels,
+            limit,
+            "compressed-universe DAC level table",
+        )?;
+        let expected_table_len = levels
+            .checked_mul(std::mem::size_of::<LevelMeta>())
+            .ok_or_else(|| super::invalid_rank9_metadata("DAC level-table length overflow"))?;
+        if table.len() != expected_table_len {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe DAC level table has {} bytes, expected {expected_table_len}",
+                table.len()
+            )));
+        }
+        let infos = meta
+            .data
+            .levels
+            .view(bytes)
+            .map_err(jerky::error::Error::from)?;
+        for (index, info) in infos.iter().enumerate() {
+            super::checked_section_range(
+                info.level,
+                limit,
+                &format!("compressed-universe DAC payload level {index}"),
+            )?;
+            let flag_range = super::checked_section_range(
+                info.flag,
+                limit,
+                &format!("compressed-universe DAC flag level {index}"),
+            )?;
+            let expected_flag_len = if index + 1 < levels {
+                info.flag_bits
+                    .checked_add(63)
+                    .map(|bits| bits / 64)
+                    .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+                    .ok_or_else(|| super::invalid_rank9_metadata("DAC flag length overflow"))?
+            } else {
+                0
+            };
+            if flag_range.len() != expected_flag_len {
+                return Err(super::invalid_rank9_metadata(format!(
+                    "compressed-universe DAC flag level {index} has {} bytes, expected {expected_flag_len}",
+                    flag_range.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn access(&self, pos: usize) -> RawInline {
         let mut v: RawInline = [0; 32];
 
@@ -339,6 +460,18 @@ where
             search_cache: Cache::new(SEARCH_CACHE),
             inner: U::with_sorted_dedup(values, sections),
         }
+    }
+
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error>
+    where
+        Self::Meta: Copy,
+        Self::Error: std::fmt::Display,
+    {
+        U::validate_metadata_prefix(meta, bytes, limit)
     }
 
     fn access(&self, pos: usize) -> RawInline {
