@@ -47,7 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five canonical Ring rotations with stable linear counting sorts. This
   replaces one counting decode plus five additional rank/select-heavy source
   wavelet traversals with bounded `O(rows + domain)` scratch while preserving
-  byte-identical archive output and the accelerator freeze seam.
+  byte-identical archive output and the accelerator freeze seam. With the
+  `parallel` feature, merges of at least 4,096 input rows decode and remap two
+  or more non-empty source segments concurrently, then perform the small
+  deterministic k-way deduplication serially; single-segment and smaller
+  merges retain the original cursor path.
 - **The public `Constraint` protocol is now block-native.** Every verb receives
   a borrowed `RowsView` of sibling partial bindings; `EstimateSink` and
   `CandidateSink` provide scalar/plain-value representations for the explicit

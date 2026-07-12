@@ -643,6 +643,73 @@ struct MergedRows<'a> {
     last_emitted: Option<[usize; 3]>,
 }
 
+#[cfg(feature = "parallel")]
+const PARALLEL_EAV_DECODE_THRESHOLD: usize = 4 * 1024;
+
+/// Merge already-remapped, individually sorted EAV runs into their canonical
+/// set union. Decoding can fill the runs concurrently, while this deliberately
+/// small heap remains serial and deterministic.
+#[cfg(feature = "parallel")]
+fn merge_sorted_row_runs(row_runs: Vec<Vec<[usize; 3]>>) -> Vec<[usize; 3]> {
+    let input_rows = row_runs.iter().map(Vec::len).sum();
+    let mut rows = Vec::with_capacity(input_rows);
+    let mut heap = BinaryHeap::with_capacity(row_runs.len());
+
+    for (source, run) in row_runs.iter().enumerate() {
+        if let Some(&row) = run.first() {
+            heap.push(Reverse((row, source, 0usize)));
+        }
+    }
+
+    while let Some(Reverse((row, source, position))) = heap.pop() {
+        if rows.last() != Some(&row) {
+            rows.push(row);
+        }
+        let next_position = position + 1;
+        if let Some(&next) = row_runs[source].get(next_position) {
+            heap.push(Reverse((next, source, next_position)));
+        }
+    }
+    rows
+}
+
+fn materialize_merged_eav(
+    segments: &[SuccinctArchive<OrderedUniverse>],
+    remaps: &[Vec<usize>],
+) -> Vec<[usize; 3]> {
+    debug_assert_eq!(segments.len(), remaps.len());
+
+    #[cfg(feature = "parallel")]
+    {
+        let nonempty_segments = segments
+            .iter()
+            .filter(|segment| !segment.eav_c.is_empty())
+            .count();
+        let input_rows: usize = segments.iter().map(|segment| segment.eav_c.len()).sum();
+        if nonempty_segments > 1 && input_rows >= PARALLEL_EAV_DECODE_THRESHOLD {
+            use rayon::prelude::*;
+
+            let row_runs = segments
+                .par_iter()
+                .zip(remaps.par_iter())
+                .map(|(segment, remap)| {
+                    RotationCursor::new(segment, SuccinctRotation::Eav)
+                        .map(|row| remap_row(row, remap))
+                        .collect()
+                })
+                .collect();
+            let mut rows = merge_sorted_row_runs(row_runs);
+            // Heavy overlap can make the input-sized output allocation much
+            // larger than the union. The decode runs have been dropped here,
+            // so compact before the equally-sized rotation scratch is made.
+            rows.shrink_to_fit();
+            return rows;
+        }
+    }
+
+    MergedRows::new(segments, remaps, SuccinctRotation::Eav).collect()
+}
+
 impl<'a> MergedRows<'a> {
     fn new(
         segments: &'a [SuccinctArchive<OrderedUniverse>],
@@ -1352,8 +1419,7 @@ where
     // the canonical EAV union once rather than paying that cost for a count and
     // again for every rotation. Once remapped, the source archives and remap
     // tables are no longer touched by the rotation builder.
-    let mut rows: Vec<[usize; 3]> =
-        MergedRows::new(segments, &remaps, SuccinctRotation::Eav).collect();
+    let mut rows = materialize_merged_eav(segments, &remaps);
     let triple_count = rows.len();
     drop(remaps);
     let mut row_scratch = Vec::with_capacity(triple_count);
@@ -2553,6 +2619,62 @@ mod tests {
         data[0] |= 0x80;
         data[16] |= 0x80;
         Trible { data }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn sorted_row_runs_merge_interleaved_overlap_and_empty_inputs() {
+        let runs = vec![
+            vec![[0, 1, 2], [2, 3, 4], [6, 7, 8]],
+            Vec::new(),
+            vec![[1, 2, 3], [2, 3, 4], [5, 6, 7]],
+            vec![[0, 1, 2], [3, 4, 5], [9, 10, 11]],
+        ];
+
+        assert_eq!(
+            merge_sorted_row_runs(runs),
+            vec![
+                [0, 1, 2],
+                [1, 2, 3],
+                [2, 3, 4],
+                [3, 4, 5],
+                [5, 6, 7],
+                [6, 7, 8],
+                [9, 10, 11],
+            ]
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_eav_decode_preserves_canonical_bytes_with_overlap() {
+        let unique_rows = PARALLEL_EAV_DECODE_THRESHOLD + 1;
+        let mut sets: [TribleSet; 4] = std::array::from_fn(|_| TribleSet::new());
+        for ordinal in 0..unique_rows {
+            let segment = ordinal % 3;
+            let trible = synthetic_trible(ordinal);
+            sets[segment].insert(&trible);
+            if ordinal % 17 == 0 {
+                sets[(segment + 1) % 3].insert(&trible);
+            }
+        }
+
+        let archives: Vec<SuccinctArchive<OrderedUniverse>> = sets.iter().map(Into::into).collect();
+        assert!(
+            archives
+                .iter()
+                .map(|archive| archive.eav_c.len())
+                .sum::<usize>()
+                >= PARALLEL_EAV_DECODE_THRESHOLD
+        );
+        let merged = merge_ordered_archives(&archives);
+        let union = sets
+            .into_iter()
+            .fold(TribleSet::new(), |union, set| union + set);
+        let rebuilt: SuccinctArchive<OrderedUniverse> = (&union).into();
+
+        assert_eq!(TribleSet::from(&merged), union);
+        assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
     }
 
     #[test]
