@@ -117,6 +117,21 @@ impl Positions {
     fn v<'r>(&'r self, row: &'r [RawInline]) -> Option<&'r RawInline> {
         self.pv.as_ref().map(|s| s.get(row))
     }
+
+    /// Whether two rows induce the same PATCH lookup for the queried
+    /// variable. Constant sources are equal by construction; only bound
+    /// columns need comparing. This is deliberately narrower than whole-row
+    /// equality: unrelated bound variables may differ while this pattern's
+    /// prefix remains identical.
+    #[inline]
+    fn same_context(&self, left: &[RawInline], right: &[RawInline]) -> bool {
+        [self.pe, self.pa, self.pv]
+            .into_iter()
+            .all(|source| match source {
+                Some(Src::Col(col)) => left[col] == right[col],
+                Some(Src::Const(_)) | None => true,
+            })
+    }
 }
 
 impl TribleSetConstraint {
@@ -666,7 +681,26 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             return false;
         }
         let p = self.positions(variable, view);
-        out.extend(view.iter().map(|row| self.estimate_row(&p, row)));
+        match out {
+            EstimateSink::Scalar(slot) => {
+                debug_assert_eq!(view.len(), 1, "scalar estimate requires one row");
+                **slot = self.estimate_row(&p, view.row(0));
+            }
+            EstimateSink::Column(out) => {
+                let mut previous = None;
+                let mut estimate = 0usize;
+                for (row_index, row) in view.iter().enumerate() {
+                    if previous
+                        .map(|previous| !p.same_context(view.row(previous), row))
+                        .unwrap_or(true)
+                    {
+                        estimate = self.estimate_row(&p, row);
+                    }
+                    out.push(estimate);
+                    previous = Some(row_index);
+                }
+            }
+        }
         true
     }
 
@@ -689,8 +723,20 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         let p = self.positions(variable, view);
         match candidates {
             CandidateSink::Tagged(pairs) => {
+                let mut previous_start = 0usize;
+                let mut previous_end = 0usize;
                 for (i, row) in view.iter().enumerate() {
-                    self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                    let start = pairs.len();
+                    if i > 0 && p.same_context(view.row(i - 1), row) {
+                        for candidate in previous_start..previous_end {
+                            let value = pairs[candidate].1;
+                            pairs.push((i as u32, value));
+                        }
+                    } else {
+                        self.propose_row(&p, row, &mut |v| pairs.push((i as u32, v)));
+                    }
+                    previous_start = start;
+                    previous_end = pairs.len();
                 }
             }
             CandidateSink::Values(values) => {
@@ -717,37 +763,108 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             return;
         }
         let p = self.positions(variable, view);
-        let mut current_row: Option<u32> = None;
-        let mut e_bound: Option<RawId> = None;
-        let mut a_bound: Option<RawId> = None;
-        let mut v_bound: Option<RawInline> = None;
-        let mut row_ok = true;
-        candidates.retain(|row_idx, value| {
-            if current_row != Some(row_idx) {
-                current_row = Some(row_idx);
-                let row = view.row(row_idx as usize);
-                row_ok = true;
-                e_bound = None;
-                a_bound = None;
-                v_bound = None;
-                if let Some(e) = p.e(row) {
-                    match id_from_value(e) {
-                        Some(e) => e_bound = Some(e),
-                        None => row_ok = false,
-                    }
-                }
-                if let Some(a) = p.a(row) {
-                    match id_from_value(a) {
-                        Some(a) => a_bound = Some(a),
-                        None => row_ok = false,
-                    }
-                }
-                if let Some(v) = p.v(row) {
-                    v_bound = Some(*v);
-                }
+        match candidates {
+            CandidateSink::Values(values) => {
+                debug_assert_eq!(view.len(), 1, "plain candidates require one row");
+                let row = view.row(0);
+                let mut row_ok = true;
+                let e_bound = p.e(row).and_then(|e| {
+                    let decoded = id_from_value(e);
+                    row_ok &= decoded.is_some();
+                    decoded
+                });
+                let a_bound = p.a(row).and_then(|a| {
+                    let decoded = id_from_value(a);
+                    row_ok &= decoded.is_some();
+                    decoded
+                });
+                let v_bound = p.v(row).copied();
+                values.retain(|value| {
+                    row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, value)
+                });
             }
-            row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, value)
-        });
+            CandidateSink::Tagged(pairs) => {
+                // Confirmation is an order-preserving compaction. Adjacent
+                // rows with the same pattern context and candidate list can
+                // replay the prior keep mask; otherwise the ordinary scalar
+                // PATCH membership checks remain the semantic authority.
+                let original_len = pairs.len();
+                let mut read = 0usize;
+                let mut write = 0usize;
+                let mut cached_row: Option<u32> = None;
+                let mut cached_input: Vec<RawInline> = Vec::new();
+                let mut cached_keep: Vec<bool> = Vec::new();
+
+                while read < original_len {
+                    let row_index = pairs[read].0;
+                    let mut end = read + 1;
+                    while end < original_len && pairs[end].0 == row_index {
+                        end += 1;
+                    }
+                    let row = view.row(row_index as usize);
+                    let cache_hit = cached_row
+                        .map(|cached| p.same_context(view.row(cached as usize), row))
+                        .unwrap_or(false)
+                        && cached_input.len() == end - read
+                        && cached_input
+                            .iter()
+                            .zip(&pairs[read..end])
+                            .all(|(cached, (_, current))| cached == current);
+
+                    let next_same_context = if end < original_len {
+                        let next_row = pairs[end].0;
+                        p.same_context(row, view.row(next_row as usize))
+                    } else {
+                        false
+                    };
+
+                    if cache_hit {
+                        for (offset, keep) in cached_keep.iter().copied().enumerate() {
+                            if keep {
+                                let value = pairs[read + offset].1;
+                                pairs[write] = (row_index, value);
+                                write += 1;
+                            }
+                        }
+                        cached_row = next_same_context.then_some(row_index);
+                    } else {
+                        let mut row_ok = true;
+                        let e_bound = p.e(row).and_then(|e| {
+                            let decoded = id_from_value(e);
+                            row_ok &= decoded.is_some();
+                            decoded
+                        });
+                        let a_bound = p.a(row).and_then(|a| {
+                            let decoded = id_from_value(a);
+                            row_ok &= decoded.is_some();
+                            decoded
+                        });
+                        let v_bound = p.v(row).copied();
+
+                        if next_same_context {
+                            cached_input.clear();
+                            cached_keep.clear();
+                        }
+                        for candidate in read..end {
+                            let value = pairs[candidate].1;
+                            let keep =
+                                row_ok && self.confirm_value(&p, e_bound, a_bound, v_bound, &value);
+                            if next_same_context {
+                                cached_input.push(value);
+                                cached_keep.push(keep);
+                            }
+                            if keep {
+                                pairs[write] = (row_index, value);
+                                write += 1;
+                            }
+                        }
+                        cached_row = next_same_context.then_some(row_index);
+                    }
+                    read = end;
+                }
+                pairs.truncate(write);
+            }
+        }
     }
 
     /// When all three positions have values (bound or constant), checks
