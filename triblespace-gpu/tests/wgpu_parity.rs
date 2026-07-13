@@ -159,6 +159,66 @@ fn wgpu_query_confirm_matches_cpu_and_reports_batch_shape() {
 
 #[test]
 #[ignore = "requires a native WGPU adapter"]
+fn wgpu_archive_components_share_one_resident_context() {
+    let tribles = [trible(0xC011_0CA7, 0), trible(0xC011_0CA7, 1)];
+    let mut set = TribleSet::new();
+    for trible in &tribles {
+        set.insert(trible);
+    }
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = WgpuSuccinctArchive::new(archive.clone()).unwrap();
+    let foreign = WgpuSuccinctArchive::new(archive).unwrap();
+
+    // Inputs and outputs allocated through different resident components must
+    // compose because all of them clone the wrapper's one compatibility
+    // domain rather than constructing their own contexts.
+    let positions = gpu
+        .ring_col(SuccinctRotation::Eav)
+        .upload_u32(&[0, 1])
+        .unwrap();
+    let values = gpu
+        .ring_col(SuccinctRotation::Vea)
+        .upload_u32(&[0, 0])
+        .unwrap();
+    let mut output = gpu.entity_prefix().context().empty_u32(2).unwrap();
+    for rotation in [
+        SuccinctRotation::Eav,
+        SuccinctRotation::Vea,
+        SuccinctRotation::Ave,
+        SuccinctRotation::Vae,
+        SuccinctRotation::Eva,
+        SuccinctRotation::Aev,
+    ] {
+        gpu.ring_col(rotation)
+            .rank_batch_into(&positions, &values, &mut output)
+            .unwrap();
+    }
+
+    for prefix in [
+        gpu.entity_prefix(),
+        gpu.attribute_prefix(),
+        gpu.value_prefix(),
+    ] {
+        prefix.rank1_batch_into(&positions, &mut output).unwrap();
+        prefix.select1_batch_into(&values, &mut output).unwrap();
+    }
+
+    // A separately-created wrapper intentionally forms another compatibility
+    // domain even though both wrappers target the same physical WGPU device.
+    let mut foreign_output = foreign.context().empty_u32(2).unwrap();
+    assert!(gpu
+        .ring_col(SuccinctRotation::Eav)
+        .rank_batch_into(&positions, &values, &mut foreign_output)
+        .is_err());
+    assert!(gpu
+        .entity_prefix()
+        .rank1_batch_into(&positions, &mut foreign_output)
+        .is_err());
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
 fn wgpu_query_parallel_dag_matches_canonical_cpu_archive() {
     let mut set = TribleSet::new();
     let mut domain = HashSet::new();
