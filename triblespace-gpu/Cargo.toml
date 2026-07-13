@@ -41,9 +41,17 @@ name = "frontier_program"
 required-features = ["wgpu"]
 
 [[example]]
+name = "resident_transition"
+required-features = ["wgpu"]
+
+[[example]]
 name = "cpu_runtime_probe"
 required-features = ["cpu", "wgpu"]
 
 [[test]]
 name = "wgpu_parity"
+required-features = ["wgpu"]
+
+[[test]]
+name = "resident_transition"
 required-features = ["wgpu"]

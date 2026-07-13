@@ -25,6 +25,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   flat positive conjunction over one `SuccinctArchive`; differential DAG,
   row-homomorphism, and monotonic-extension tests define the semantic contract
   a future resident CubeCL backend must preserve.
+- **The first `QueryProgram` transition now executes end-to-end on resident
+  WGPU Ring structures.** `WgpuQueryProgram` accepts the deliberately narrow
+  single-pattern `(E,A) -> V` arm with both peers bound or constant, borrows the
+  exact `WgpuSuccinctArchive` compatibility domain, and keeps select/rank
+  probes, stable scans, indirect dispatch, AEV access, and child scatter on the
+  device. One packed result is the transition's only readback. Checked `u32`
+  geometry, exact archive identity, a proven `rows * max_EA_fanout` capacity,
+  and sticky device status reject overflow or malformed ranges without
+  truncation. Native Metal gates cover exact CPU order, every 65-row split,
+  0/1/63/64/65 block edges, duplicate parents, all insertion positions,
+  exact/one-short/zero capacity, constants, admission failures, and monotonic
+  archive extension. The caller still chooses the variable; general patterns,
+  sibling confirmation, and a fully resident multi-transition scheduler remain
+  future work.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
