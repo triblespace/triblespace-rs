@@ -1,4 +1,4 @@
-//! First archive-resident Ring pipeline for one [`QueryProgram`] transition.
+//! First archive-resident Ring pipelines for one [`QueryProgram`] pattern.
 //!
 //! This module deliberately specializes one honest, useful Ring arm:
 //! `transition_on(V)` for a single pattern whose entity and attribute terms
@@ -15,18 +15,26 @@
 //! first-occurrence `.unique()` is a no-op for this exact interval. Stable
 //! parent scans and contiguous AEV access therefore preserve CPU order and
 //! duplicate parent rows without a global deduplication stage.
+//!
+//! [`WgpuQueryProgram::execute_eav`] additionally admits one all-variable
+//! pattern (including every permutation of variable IDs across the axes) and
+//! keeps the forced `E -> A -> V` frontier chain resident until one final
+//! packed read. Its first stage deliberately scans the compact-code domain
+//! with paired `select1(e_a, code/code + 1)` probes; Jerky has no resident
+//! `select0`, so this is an explicit `O(domain)` probe.
 
 use std::error::Error;
 use std::fmt;
 
 use cubecl::prelude::*;
 use jerky::bit_vector::{NumBits, Select};
+use jerky::gpu::DeviceU32Buffer;
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ProgramFrontier, ProgramPattern, ProgramTerm, ProgramVariable, QueryProgram, QueryProgramError,
 };
 use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
-use crate::succinct_query::WgpuSuccinctArchive;
+use crate::succinct_query::{WgpuContext, WgpuSuccinctArchive};
 
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 
@@ -41,7 +49,7 @@ const STATUS_OK: u32 = 0;
 const STATUS_CAPACITY: u32 = 1;
 const STATUS_DEVICE_INVARIANT: u32 = 2;
 
-/// Failure to prepare or execute the resident two-bound transition.
+/// Failure to prepare or execute an admitted resident query operation.
 #[derive(Debug)]
 pub enum ResidentTransitionError {
     /// The compiled program is outside the deliberately narrow admitted arm.
@@ -114,17 +122,15 @@ impl From<jerky::Error> for ResidentTransitionError {
     }
 }
 
-/// WGPU-resident executor for the single-pattern two-bound `(E, A) -> V` arm.
+/// WGPU-resident executor for two deliberately narrow single-pattern paths.
 ///
-/// The four used Jerky structures borrow the compatibility domain already
-/// owned by [`WgpuSuccinctArchive`]. A transition uploads its affine parent
-/// frontier once, keeps selection/rank ranges, scan metadata, indirect
-/// dispatch, candidate positions/codes, and scatter state resident, then reads
-/// one packed buffer after the completed transition. The output canary is
-/// filled on device, but the sole read covers the caller's full allocated
-/// `2 + child_capacity * child_stride` words—including the poison tail—because
-/// the logical row count is not known on the host before that synchronization.
-/// Variable choice remains a caller/scheduler responsibility.
+/// [`Self::transition_on`] implements the two-bound `(E,A) -> V` arm.
+/// [`Self::execute_eav`] implements a forced all-variable `E -> A -> V` chain.
+/// Both borrow the compatibility domain already owned by
+/// [`WgpuSuccinctArchive`], keep intermediate navigation and scatter state
+/// resident, and read one packed buffer only at their public result boundary.
+/// General proposer selection, sibling confirmation, and unrelated fully
+/// bound pattern viability remain outside this specialization.
 pub struct WgpuQueryProgram<'program, 'archive, U>
 where
     U: Universe,
@@ -134,6 +140,36 @@ where
     pattern: ProgramPattern,
     target: ProgramVariable,
     max_ea_fanout: usize,
+}
+
+/// Private physical frontier passed between the forced resident stages.
+///
+/// Values are row-major compact codes. Logical geometry stays host-known from
+/// exact archive cardinality theorems, while the device status remains the
+/// authority on whether those theorems were reproduced by the kernels.
+struct ResidentFrontier {
+    values: DeviceU32Buffer<WgpuRuntime>,
+    rows: usize,
+    stride: usize,
+}
+
+#[derive(Clone, Copy)]
+struct EavAdmission {
+    entity: ProgramVariable,
+    attribute: ProgramVariable,
+    value: ProgramVariable,
+    canonical_sources: [u32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct EavGeometry {
+    domain: usize,
+    entities: usize,
+    pairs: usize,
+    triples: usize,
+    entity_rows: usize,
+    pair_rows: usize,
+    value_rows: usize,
 }
 
 impl<'program, 'archive, U> WgpuQueryProgram<'program, 'archive, U>
@@ -183,6 +219,43 @@ where
     /// pair, cached during resident setup from `changed_e_a` one-runs.
     pub fn max_ea_fanout(&self) -> usize {
         self.max_ea_fanout
+    }
+
+    /// Executes one all-variable pattern through a forced resident
+    /// `E -> A -> V` chain for `seed_rows` indistinguishable zero-width seeds.
+    ///
+    /// The pattern's three axes may use any permutation of program variables
+    /// `0..3`. Intermediate buffers use the private physical layouts `[E]`,
+    /// `[E,A]`, and `[E,A,V]`; only the final device scatter reorders those
+    /// axes into canonical ascending-variable columns. The E stage is an
+    /// explicit `O(domain)` paired-`select1` scan. All later geometry is fixed
+    /// from exact archive cardinalities (`entity_count`, changed-E/A ones, and
+    /// trible count), and any device disagreement fails closed.
+    ///
+    /// No intermediate buffer is read. Exactly one packed read occurs at the
+    /// end, including when `seed_rows == 0` or the archive is empty.
+    pub fn execute_eav(
+        &self,
+        seed_rows: usize,
+    ) -> Result<ProgramFrontier, ResidentTransitionError> {
+        let admission = self.validate_eav_admission()?;
+        let geometry = eav_geometry(self.program.archive(), seed_rows)?;
+        let context = self.resident.context();
+        let mut status = context.upload_u32(&[STATUS_OK, geometry.value_rows as u32])?;
+
+        let physical = if geometry.value_rows == 0 {
+            ResidentFrontier {
+                values: context.empty_u32(0)?,
+                rows: 0,
+                stride: 3,
+            }
+        } else {
+            let entities = self.enqueue_entity_stage(seed_rows, geometry, &mut status)?;
+            let pairs = self.enqueue_attribute_stage(&entities, geometry, &mut status)?;
+            self.enqueue_value_stage(&pairs, geometry, &mut status)?
+        };
+
+        self.finish_eav(admission, geometry, physical, status)
     }
 
     /// Executes the admitted two-bound transition with a checked no-readback
@@ -471,6 +544,567 @@ where
             .map_err(ResidentTransitionError::Program)
     }
 
+    fn validate_eav_admission(&self) -> Result<EavAdmission, ResidentTransitionError> {
+        let (
+            ProgramTerm::Variable(entity),
+            ProgramTerm::Variable(attribute),
+            ProgramTerm::Variable(value),
+        ) = (
+            self.pattern.entity,
+            self.pattern.attribute,
+            self.pattern.value,
+        )
+        else {
+            return Err(ResidentTransitionError::UnsupportedArm(
+                "execute_eav requires one all-variable pattern",
+            ));
+        };
+        if self.program.variable_count() != 3 {
+            return Err(ResidentTransitionError::UnsupportedArm(
+                "execute_eav requires exactly three program variables",
+            ));
+        }
+        if entity == attribute || entity == value || attribute == value {
+            return Err(ResidentTransitionError::UnsupportedArm(
+                "execute_eav requires three distinct axis variables",
+            ));
+        }
+
+        let mut canonical_sources = [0u32; 3];
+        canonical_sources[entity.index()] = 0;
+        canonical_sources[attribute.index()] = 1;
+        canonical_sources[value.index()] = 2;
+        Ok(EavAdmission {
+            entity,
+            attribute,
+            value,
+            canonical_sources,
+        })
+    }
+
+    fn enqueue_entity_stage(
+        &self,
+        seed_rows: usize,
+        geometry: EavGeometry,
+        status: &mut DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ResidentFrontier, ResidentTransitionError> {
+        debug_assert!(seed_rows != 0);
+        debug_assert!(geometry.domain != 0 && geometry.entities != 0);
+        let context = self.resident.context();
+        let domain_dispatch =
+            context.batch_dispatch(geometry.domain, geometry.domain, CubeDim::new_1d(THREADS))?;
+        let double_domain = geometry.domain * 2;
+        let mut select_queries = context.empty_u32(double_domain)?;
+        unsafe {
+            prepare_domain_select_queries::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                domain_dispatch.cube_count(),
+                domain_dispatch.cube_dim(),
+                select_queries.output_arg(),
+                geometry.domain as u32,
+            );
+        }
+
+        let mut selected = context.empty_u32(double_domain)?;
+        self.resident
+            .entity_prefix()
+            .select1_batch_into(&select_queries, &mut selected)?;
+        let mut flags = context.empty_u32(geometry.domain)?;
+        let mut errors = context.empty_u32(geometry.domain)?;
+        unsafe {
+            finish_domain_flags::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                domain_dispatch.cube_count(),
+                domain_dispatch.cube_dim(),
+                select_queries.input_arg(),
+                selected.input_arg(),
+                flags.output_arg(),
+                errors.output_arg(),
+                geometry.domain as u32,
+                geometry.triples as u32,
+            );
+        }
+        let (local_offsets, block_offsets) = enqueue_exact_scan(
+            context,
+            &flags,
+            &errors,
+            geometry.domain,
+            geometry.entities,
+            status,
+        )?;
+
+        let mut entity_codes = context.empty_u32(geometry.entities)?;
+        enqueue_fill(context, &mut entity_codes, 0)?;
+        unsafe {
+            compact_domain_codes::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                domain_dispatch.cube_count(),
+                domain_dispatch.cube_dim(),
+                flags.input_arg(),
+                local_offsets.input_arg(),
+                block_offsets.input_arg(),
+                status.input_arg(),
+                entity_codes.output_arg(),
+                geometry.domain as u32,
+                geometry.entities as u32,
+                BLOCK_ITEMS,
+            );
+        }
+
+        let mut values = context.empty_u32(geometry.entity_rows)?;
+        let row_dispatch = context.batch_dispatch(
+            geometry.entity_rows,
+            geometry.entity_rows,
+            CubeDim::new_1d(THREADS),
+        )?;
+        unsafe {
+            expand_seed_entities::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                entity_codes.input_arg(),
+                status.input_arg(),
+                values.output_arg(),
+                geometry.entity_rows as u32,
+                geometry.entities as u32,
+            );
+        }
+        Ok(ResidentFrontier {
+            values,
+            rows: geometry.entity_rows,
+            stride: 1,
+        })
+    }
+
+    fn enqueue_attribute_stage(
+        &self,
+        entities: &ResidentFrontier,
+        geometry: EavGeometry,
+        status: &mut DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ResidentFrontier, ResidentTransitionError> {
+        if entities.rows != geometry.entity_rows || entities.stride != 1 {
+            return Err(ResidentTransitionError::DeviceInvariant);
+        }
+        let context = self.resident.context();
+        let row_dispatch =
+            context.batch_dispatch(entities.rows, entities.rows, CubeDim::new_1d(THREADS))?;
+        let double_rows = entities.rows * 2;
+        let mut select_queries = context.empty_u32(double_rows)?;
+        unsafe {
+            prepare_entity_select_queries::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                entities.values.input_arg(),
+                select_queries.output_arg(),
+                entities.rows as u32,
+            );
+        }
+        let mut selected = context.empty_u32(double_rows)?;
+        self.resident
+            .entity_prefix()
+            .select1_batch_into(&select_queries, &mut selected)?;
+
+        let mut changed_rank_positions = context.empty_u32(double_rows)?;
+        let mut row_errors = context.empty_u32(entities.rows)?;
+        unsafe {
+            prepare_entity_ranges::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                select_queries.input_arg(),
+                selected.input_arg(),
+                changed_rank_positions.output_arg(),
+                row_errors.output_arg(),
+                entities.rows as u32,
+                geometry.triples as u32,
+            );
+        }
+        let changed = self.resident.entity_attribute_changes();
+        let mut pair_boundaries = context.empty_u32(double_rows)?;
+        changed.rank1_batch_into(&changed_rank_positions, &mut pair_boundaries)?;
+
+        let mut pair_rank_starts = context.empty_u32(entities.rows)?;
+        let mut pair_counts = context.empty_u32(entities.rows)?;
+        unsafe {
+            finish_changed_pair_ranges::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                pair_boundaries.input_arg(),
+                pair_rank_starts.output_arg(),
+                pair_counts.output_arg(),
+                row_errors.output_arg(),
+                entities.rows as u32,
+                geometry.pairs as u32,
+            );
+        }
+        let (local_offsets, block_offsets) = enqueue_exact_scan(
+            context,
+            &pair_counts,
+            &row_errors,
+            entities.rows,
+            geometry.pair_rows,
+            status,
+        )?;
+
+        let mut changed_ranks = context.empty_u32(geometry.pair_rows)?;
+        let mut owners = context.empty_u32(geometry.pair_rows)?;
+        enqueue_fill(context, &mut changed_ranks, 0)?;
+        enqueue_fill(context, &mut owners, 0)?;
+        unsafe {
+            generate_fixed_candidates::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                pair_rank_starts.input_arg(),
+                pair_counts.input_arg(),
+                local_offsets.input_arg(),
+                block_offsets.input_arg(),
+                status.input_arg(),
+                changed_ranks.output_arg(),
+                owners.output_arg(),
+                entities.rows as u32,
+                geometry.pair_rows as u32,
+                BLOCK_ITEMS,
+            );
+        }
+        let mut changed_positions = context.empty_u32(geometry.pair_rows)?;
+        changed.select1_batch_into(&changed_ranks, &mut changed_positions)?;
+
+        // CPU enumerate_in LF, entirely resident:
+        // idx = changed_e_a.select1(rank)
+        // val = eav_c.access(idx)
+        // vea_pos = select1(v_a,val) - val + eav_c.rank(idx,val)
+        // attribute = vea_c.access(vea_pos)
+        let eav_c = self.resident.ring_col(SuccinctRotation::Eav);
+        let mut eav_values = context.empty_u32(geometry.pair_rows)?;
+        eav_c.access_batch_into(&changed_positions, &mut eav_values)?;
+        let mut value_selected = context.empty_u32(geometry.pair_rows)?;
+        self.resident
+            .value_prefix()
+            .select1_batch_into(&eav_values, &mut value_selected)?;
+        let mut value_ranks = context.empty_u32(geometry.pair_rows)?;
+        eav_c.rank_batch_into(&changed_positions, &eav_values, &mut value_ranks)?;
+
+        let pair_dispatch = context.batch_dispatch(
+            geometry.pair_rows,
+            geometry.pair_rows,
+            CubeDim::new_1d(THREADS),
+        )?;
+        let mut vea_positions = context.empty_u32(geometry.pair_rows)?;
+        let mut lf_errors = context.empty_u32(geometry.pair_rows)?;
+        unsafe {
+            finish_changed_pair_lf::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                pair_dispatch.cube_count(),
+                pair_dispatch.cube_dim(),
+                changed_positions.input_arg(),
+                eav_values.input_arg(),
+                value_selected.input_arg(),
+                value_ranks.input_arg(),
+                vea_positions.output_arg(),
+                lf_errors.output_arg(),
+                geometry.pair_rows as u32,
+                geometry.triples as u32,
+                geometry.domain as u32,
+            );
+        }
+        let mut attributes = context.empty_u32(geometry.pair_rows)?;
+        self.resident
+            .ring_col(SuccinctRotation::Vea)
+            .access_batch_into(&vea_positions, &mut attributes)?;
+        let mut candidate_errors = context.empty_u32(geometry.pair_rows)?;
+        unsafe {
+            mark_codes_and_owners::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                pair_dispatch.cube_count(),
+                pair_dispatch.cube_dim(),
+                lf_errors.input_arg(),
+                attributes.input_arg(),
+                owners.input_arg(),
+                candidate_errors.output_arg(),
+                geometry.pair_rows as u32,
+                entities.rows as u32,
+                geometry.domain as u32,
+            );
+        }
+        enqueue_error_reduction(context, &candidate_errors, status)?;
+
+        let flat_words = geometry.pair_rows * 2;
+        let mut values = context.empty_u32(flat_words)?;
+        unsafe {
+            scatter_physical_ea::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                pair_dispatch.cube_count(),
+                pair_dispatch.cube_dim(),
+                entities.values.input_arg(),
+                attributes.input_arg(),
+                owners.input_arg(),
+                status.input_arg(),
+                values.output_arg(),
+                geometry.pair_rows as u32,
+            );
+        }
+        Ok(ResidentFrontier {
+            values,
+            rows: geometry.pair_rows,
+            stride: 2,
+        })
+    }
+
+    fn enqueue_value_stage(
+        &self,
+        pairs: &ResidentFrontier,
+        geometry: EavGeometry,
+        status: &mut DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ResidentFrontier, ResidentTransitionError> {
+        if pairs.rows != geometry.pair_rows || pairs.stride != 2 {
+            return Err(ResidentTransitionError::DeviceInvariant);
+        }
+        let context = self.resident.context();
+        let row_dispatch =
+            context.batch_dispatch(pairs.rows, pairs.rows, CubeDim::new_1d(THREADS))?;
+        let double_rows = pairs.rows * 2;
+        let mut entity_select_queries = context.empty_u32(double_rows)?;
+        let mut attribute_select_queries = context.empty_u32(pairs.rows)?;
+        let mut rank_values = context.empty_u32(double_rows)?;
+        unsafe {
+            prepare_two_bound::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                pairs.values.input_arg(),
+                entity_select_queries.output_arg(),
+                attribute_select_queries.output_arg(),
+                rank_values.output_arg(),
+                pairs.rows as u32,
+                2,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+
+        let mut entity_selected = context.empty_u32(double_rows)?;
+        self.resident
+            .entity_prefix()
+            .select1_batch_into(&entity_select_queries, &mut entity_selected)?;
+        let mut attribute_selected = context.empty_u32(pairs.rows)?;
+        self.resident
+            .attribute_prefix()
+            .select1_batch_into(&attribute_select_queries, &mut attribute_selected)?;
+
+        let eva_c = self.resident.ring_col(SuccinctRotation::Eva);
+        let aev_c = self.resident.ring_col(SuccinctRotation::Aev);
+        let mut rank_positions = context.empty_u32(double_rows)?;
+        let mut attribute_bases = context.empty_u32(pairs.rows)?;
+        let mut row_errors = context.empty_u32(pairs.rows)?;
+        unsafe {
+            prepare_rank_ranges::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                entity_select_queries.input_arg(),
+                entity_selected.input_arg(),
+                attribute_select_queries.input_arg(),
+                attribute_selected.input_arg(),
+                rank_positions.output_arg(),
+                attribute_bases.output_arg(),
+                row_errors.output_arg(),
+                pairs.rows as u32,
+                eva_c.len() as u32,
+            );
+        }
+        let mut ranks = context.empty_u32(double_rows)?;
+        eva_c.rank_batch_into(&rank_positions, &rank_values, &mut ranks)?;
+        let mut range_starts = context.empty_u32(pairs.rows)?;
+        let mut counts = context.empty_u32(pairs.rows)?;
+        unsafe {
+            finish_proposal_ranges::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                ranks.input_arg(),
+                attribute_bases.input_arg(),
+                range_starts.output_arg(),
+                counts.output_arg(),
+                row_errors.output_arg(),
+                pairs.rows as u32,
+                aev_c.len() as u32,
+                self.max_ea_fanout as u32,
+            );
+        }
+        let (local_offsets, block_offsets) = enqueue_exact_scan(
+            context,
+            &counts,
+            &row_errors,
+            pairs.rows,
+            geometry.value_rows,
+            status,
+        )?;
+
+        let mut positions = context.empty_u32(geometry.value_rows)?;
+        let mut owners = context.empty_u32(geometry.value_rows)?;
+        enqueue_fill(context, &mut positions, 0)?;
+        enqueue_fill(context, &mut owners, 0)?;
+        unsafe {
+            generate_fixed_candidates::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                range_starts.input_arg(),
+                counts.input_arg(),
+                local_offsets.input_arg(),
+                block_offsets.input_arg(),
+                status.input_arg(),
+                positions.output_arg(),
+                owners.output_arg(),
+                pairs.rows as u32,
+                geometry.value_rows as u32,
+                BLOCK_ITEMS,
+            );
+        }
+        let mut candidates = context.empty_u32(geometry.value_rows)?;
+        aev_c.access_batch_into(&positions, &mut candidates)?;
+        let candidate_dispatch = context.batch_dispatch(
+            geometry.value_rows,
+            geometry.value_rows,
+            CubeDim::new_1d(THREADS),
+        )?;
+        let mut candidate_errors = context.empty_u32(geometry.value_rows)?;
+        unsafe {
+            mark_codes_and_owners_simple::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                candidate_dispatch.cube_count(),
+                candidate_dispatch.cube_dim(),
+                candidates.input_arg(),
+                owners.input_arg(),
+                candidate_errors.output_arg(),
+                geometry.value_rows as u32,
+                pairs.rows as u32,
+                geometry.domain as u32,
+            );
+        }
+        enqueue_error_reduction(context, &candidate_errors, status)?;
+
+        let mut values = context.empty_u32(geometry.value_rows * 3)?;
+        unsafe {
+            scatter_physical_eav::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                candidate_dispatch.cube_count(),
+                candidate_dispatch.cube_dim(),
+                pairs.values.input_arg(),
+                candidates.input_arg(),
+                owners.input_arg(),
+                status.input_arg(),
+                values.output_arg(),
+                geometry.value_rows as u32,
+            );
+        }
+        Ok(ResidentFrontier {
+            values,
+            rows: geometry.value_rows,
+            stride: 3,
+        })
+    }
+
+    fn finish_eav(
+        &self,
+        admission: EavAdmission,
+        geometry: EavGeometry,
+        physical: ResidentFrontier,
+        status: DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ProgramFrontier, ResidentTransitionError> {
+        if physical.rows != geometry.value_rows || physical.stride != 3 {
+            return Err(ResidentTransitionError::DeviceInvariant);
+        }
+        let context = self.resident.context();
+        let body_words =
+            geometry
+                .value_rows
+                .checked_mul(3)
+                .ok_or(ResidentTransitionError::GeometryOverflow(
+                    "packed E/A/V frontier",
+                ))?;
+        let packed_words = body_words.checked_add(HEADER_WORDS).ok_or(
+            ResidentTransitionError::GeometryOverflow("packed E/A/V frontier"),
+        )?;
+        let mut packed = context.empty_u32(packed_words)?;
+        let packed_dispatch =
+            context.batch_dispatch(packed_words, packed_words, CubeDim::new_1d(THREADS))?;
+        unsafe {
+            fill_u32::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                packed_dispatch.cube_count(),
+                packed_dispatch.cube_dim(),
+                packed.output_arg(),
+                packed_words as u32,
+                OUTPUT_POISON,
+            );
+        }
+
+        if geometry.value_rows != 0 {
+            let row_dispatch = context.batch_dispatch(
+                geometry.value_rows,
+                geometry.value_rows,
+                CubeDim::new_1d(THREADS),
+            )?;
+            unsafe {
+                pack_canonical_eav::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    row_dispatch.cube_count(),
+                    row_dispatch.cube_dim(),
+                    physical.values.input_arg(),
+                    status.input_arg(),
+                    packed.output_arg(),
+                    geometry.value_rows as u32,
+                    admission.canonical_sources[0],
+                    admission.canonical_sources[1],
+                    admission.canonical_sources[2],
+                );
+            }
+        }
+        unsafe {
+            finalize_packed_header::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                status.input_arg(),
+                packed.output_arg(),
+            );
+        }
+
+        // The forced three-stage chain's literal sole synchronization/read.
+        let packed = packed.read();
+        let observed_rows = packed[0] as usize;
+        if packed[1] != STATUS_OK || observed_rows != geometry.value_rows {
+            return Err(ResidentTransitionError::DeviceInvariant);
+        }
+        if packed[HEADER_WORDS..].contains(&OUTPUT_POISON) {
+            return Err(ResidentTransitionError::DeviceInvariant);
+        }
+
+        let variables = vec![
+            ProgramVariable::new(0),
+            ProgramVariable::new(1),
+            ProgramVariable::new(2),
+        ];
+        debug_assert!(variables.contains(&admission.entity));
+        debug_assert!(variables.contains(&admission.attribute));
+        debug_assert!(variables.contains(&admission.value));
+        self.program
+            .frontier_from_indices(
+                variables,
+                packed[HEADER_WORDS..].to_vec(),
+                geometry.value_rows,
+            )
+            .map_err(ResidentTransitionError::Program)
+    }
+
     fn validate_transition(
         &self,
         variable: ProgramVariable,
@@ -613,6 +1247,180 @@ where
     maximum
 }
 
+fn eav_geometry<U: Universe>(
+    archive: &triblespace_core::blob::encodings::succinctarchive::SuccinctArchive<U>,
+    seed_rows: usize,
+) -> Result<EavGeometry, ResidentTransitionError> {
+    let domain = archive.domain.len();
+    let entities = archive.entity_count;
+    let pairs = archive.changed_e_a.num_ones();
+    let triples = archive.eav_c.len();
+    if archive.changed_e_a.num_bits() != triples
+        || archive.vea_c.len() != triples
+        || archive.aev_c.len() != triples
+    {
+        return Err(ResidentTransitionError::DeviceInvariant);
+    }
+
+    let entity_rows = checked_eav_product(seed_rows, entities, "E-stage rows")?;
+    let pair_rows = checked_eav_product(seed_rows, pairs, "E/A-stage rows")?;
+    let value_rows = checked_eav_product(seed_rows, triples, "E/A/V-stage rows")?;
+    let quantities = [
+        ("seed-row count", seed_rows),
+        ("archive code domain", domain),
+        ("paired domain select probes", domain.saturating_mul(2)),
+        ("distinct entity count", entities),
+        ("distinct E/A pair count", pairs),
+        ("archive trible count", triples),
+        ("E-stage rows", entity_rows),
+        ("paired E-stage probes", entity_rows.saturating_mul(2)),
+        ("E/A-stage rows", pair_rows),
+        ("paired E/A-stage probes", pair_rows.saturating_mul(2)),
+        ("E/A/V-stage rows", value_rows),
+        ("flat E/A frontier", pair_rows.saturating_mul(2)),
+        ("flat E/A/V frontier", value_rows.saturating_mul(3)),
+        (
+            "packed E/A/V frontier",
+            value_rows
+                .checked_mul(3)
+                .and_then(|words| words.checked_add(HEADER_WORDS))
+                .unwrap_or(usize::MAX),
+        ),
+    ];
+    if let Some((name, _)) = quantities
+        .into_iter()
+        .find(|&(_, quantity)| quantity > u32::MAX as usize)
+    {
+        return Err(ResidentTransitionError::GeometryOverflow(name));
+    }
+    if entities > pairs || pairs > triples {
+        return Err(ResidentTransitionError::DeviceInvariant);
+    }
+
+    Ok(EavGeometry {
+        domain,
+        entities,
+        pairs,
+        triples,
+        entity_rows,
+        pair_rows,
+        value_rows,
+    })
+}
+
+fn checked_eav_product(
+    left: usize,
+    right: usize,
+    name: &'static str,
+) -> Result<usize, ResidentTransitionError> {
+    left.checked_mul(right)
+        .ok_or(ResidentTransitionError::GeometryOverflow(name))
+}
+
+fn enqueue_exact_scan(
+    context: &WgpuContext,
+    counts: &DeviceU32Buffer<WgpuRuntime>,
+    row_errors: &DeviceU32Buffer<WgpuRuntime>,
+    rows: usize,
+    expected: usize,
+    status: &mut DeviceU32Buffer<WgpuRuntime>,
+) -> Result<(DeviceU32Buffer<WgpuRuntime>, DeviceU32Buffer<WgpuRuntime>), ResidentTransitionError> {
+    if rows == 0 || counts.len() != rows || row_errors.len() != rows {
+        return Err(ResidentTransitionError::DeviceInvariant);
+    }
+    let block_count = rows.div_ceil(BLOCK_ITEMS as usize);
+    let mut local_offsets = context.empty_u32(rows)?;
+    let mut block_sums = context.empty_u32(block_count)?;
+    let mut block_errors = context.empty_u32(block_count)?;
+    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    unsafe {
+        scan_blocks::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            block_dispatch.cube_count(),
+            block_dispatch.cube_dim(),
+            counts.input_arg(),
+            row_errors.input_arg(),
+            local_offsets.output_arg(),
+            block_sums.output_arg(),
+            block_errors.output_arg(),
+            rows as u32,
+            BLOCK_ITEMS,
+        );
+    }
+
+    let mut block_offsets = context.empty_u32(block_count)?;
+    unsafe {
+        scan_block_sums_exact::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            block_sums.input_arg(),
+            block_errors.input_arg(),
+            block_offsets.output_arg(),
+            status.output_arg(),
+            block_count as u32,
+            expected as u32,
+        );
+    }
+    Ok((local_offsets, block_offsets))
+}
+
+fn enqueue_error_reduction(
+    context: &WgpuContext,
+    errors: &DeviceU32Buffer<WgpuRuntime>,
+    status: &mut DeviceU32Buffer<WgpuRuntime>,
+) -> Result<(), ResidentTransitionError> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let block_count = errors.len().div_ceil(BLOCK_ITEMS as usize);
+    let mut block_errors = context.empty_u32(block_count)?;
+    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    unsafe {
+        reduce_error_blocks::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            block_dispatch.cube_count(),
+            block_dispatch.cube_dim(),
+            errors.input_arg(),
+            block_errors.output_arg(),
+            errors.len() as u32,
+            BLOCK_ITEMS,
+        );
+        merge_error_blocks::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            block_errors.input_arg(),
+            status.output_arg(),
+            block_count as u32,
+        );
+    }
+    Ok(())
+}
+
+fn enqueue_fill(
+    context: &WgpuContext,
+    output: &mut DeviceU32Buffer<WgpuRuntime>,
+    value: u32,
+) -> Result<(), ResidentTransitionError> {
+    if output.is_empty() {
+        return Ok(());
+    }
+    let len = output.len();
+    let dispatch = context.batch_dispatch(len, len, CubeDim::new_1d(THREADS))?;
+    unsafe {
+        fill_u32::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            dispatch.cube_count(),
+            dispatch.cube_dim(),
+            output.output_arg(),
+            len as u32,
+            value,
+        );
+    }
+    Ok(())
+}
+
 fn validate_archive_geometry<U: Universe>(
     archive: &triblespace_core::blob::encodings::succinctarchive::SuccinctArchive<U>,
 ) -> Result<(), ResidentTransitionError> {
@@ -624,6 +1432,10 @@ fn validate_archive_geometry<U: Universe>(
     for (name, len) in [
         ("entity prefix bits", archive.e_a.num_bits()),
         ("attribute prefix bits", archive.a_a.num_bits()),
+        ("value prefix bits", archive.v_a.num_bits()),
+        ("changed E/A bits", archive.changed_e_a.num_bits()),
+        ("EAV Ring length", archive.eav_c.len()),
+        ("VEA Ring length", archive.vea_c.len()),
         ("EVA Ring length", archive.eva_c.len()),
         ("AEV Ring length", archive.aev_c.len()),
     ] {
@@ -659,6 +1471,436 @@ fn validate_capacity_geometry(
         return Err(ResidentTransitionError::GeometryOverflow(name));
     }
     Ok(())
+}
+
+#[cube(launch_unchecked)]
+fn prepare_domain_select_queries(queries: &mut Array<u32>, domain: u32) {
+    let code = ABSOLUTE_POS;
+    if code < domain as usize {
+        let pair = code * 2usize;
+        queries[pair] = code as u32;
+        queries[pair + 1usize] = code as u32 + 1u32;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn finish_domain_flags(
+    queries: &Array<u32>,
+    selected: &Array<u32>,
+    flags: &mut Array<u32>,
+    errors: &mut Array<u32>,
+    domain: u32,
+    ring_len: u32,
+) {
+    let code = ABSOLUTE_POS;
+    if code < domain as usize {
+        let pair = code * 2usize;
+        let start_selected = selected[pair];
+        let end_selected = selected[pair + 1usize];
+        let start_query = queries[pair];
+        let end_query = queries[pair + 1usize];
+        let mut invalid = 0u32;
+        if start_selected == 0xFFFF_FFFFu32
+            || end_selected == 0xFFFF_FFFFu32
+            || start_selected < start_query
+            || end_selected < end_query
+        {
+            invalid = 1u32;
+        }
+        let mut present = 0u32;
+        if invalid == 0u32 {
+            let start = start_selected - start_query;
+            let end = end_selected - end_query;
+            if start > end || end > ring_len {
+                invalid = 1u32;
+            } else if start < end {
+                present = 1u32;
+            }
+        }
+        flags[code] = present;
+        errors[code] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn scan_block_sums_exact(
+    block_sums: &Array<u32>,
+    block_errors: &Array<u32>,
+    block_offsets: &mut Array<u32>,
+    status: &mut Array<u32>,
+    block_count: u32,
+    expected: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let mut total = 0u32;
+        let mut error = 0u32;
+        let mut block = 0usize;
+        while block < block_count as usize {
+            block_offsets[block] = total;
+            let next = block_sums[block];
+            if next > 0xFFFF_FFFFu32 - total {
+                error = 2u32;
+            } else {
+                total += next;
+            }
+            if block_errors[block] != 0u32 {
+                error = 2u32;
+            }
+            block += 1usize;
+        }
+        if total != expected {
+            error = 2u32;
+        }
+        if error != 0u32 {
+            status[0] = error;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn compact_domain_codes(
+    flags: &Array<u32>,
+    local_offsets: &Array<u32>,
+    block_offsets: &Array<u32>,
+    status: &Array<u32>,
+    entity_codes: &mut Array<u32>,
+    domain: u32,
+    entity_count: u32,
+    #[comptime] block_items: u32,
+) {
+    let code = ABSOLUTE_POS;
+    if code < domain as usize && status[0] == 0u32 && flags[code] != 0u32 {
+        let output = local_offsets[code] + block_offsets[code / block_items as usize];
+        if output < entity_count {
+            entity_codes[output as usize] = code as u32;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn expand_seed_entities(
+    entity_codes: &Array<u32>,
+    status: &Array<u32>,
+    output: &mut Array<u32>,
+    rows: u32,
+    entity_count: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let mut code = 0u32;
+        if status[0] == 0u32 {
+            code = entity_codes[row % entity_count as usize];
+        }
+        output[row] = code;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn prepare_entity_select_queries(entities: &Array<u32>, queries: &mut Array<u32>, rows: u32) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let entity = entities[row];
+        let pair = row * 2usize;
+        queries[pair] = entity;
+        queries[pair + 1usize] = entity + 1u32;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn prepare_entity_ranges(
+    queries: &Array<u32>,
+    selected: &Array<u32>,
+    rank_positions: &mut Array<u32>,
+    row_errors: &mut Array<u32>,
+    rows: u32,
+    ring_len: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let pair = row * 2usize;
+        let start_selected = selected[pair];
+        let end_selected = selected[pair + 1usize];
+        let start_query = queries[pair];
+        let end_query = queries[pair + 1usize];
+        let mut invalid = 0u32;
+        if start_selected == 0xFFFF_FFFFu32
+            || end_selected == 0xFFFF_FFFFu32
+            || start_selected < start_query
+            || end_selected < end_query
+        {
+            invalid = 1u32;
+        }
+        let mut start = 0u32;
+        let mut end = 0u32;
+        if invalid == 0u32 {
+            start = start_selected - start_query;
+            end = end_selected - end_query;
+            if start > end || end > ring_len {
+                invalid = 1u32;
+                start = 0u32;
+                end = 0u32;
+            }
+        }
+        rank_positions[pair] = start;
+        rank_positions[pair + 1usize] = end;
+        row_errors[row] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn finish_changed_pair_ranges(
+    pair_boundaries: &Array<u32>,
+    range_starts: &mut Array<u32>,
+    counts: &mut Array<u32>,
+    row_errors: &mut Array<u32>,
+    rows: u32,
+    pair_count: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let pair = row * 2usize;
+        let start = pair_boundaries[pair];
+        let end = pair_boundaries[pair + 1usize];
+        let mut invalid = row_errors[row];
+        if start == 0xFFFF_FFFFu32 || end == 0xFFFF_FFFFu32 || start > end || end > pair_count {
+            invalid = 1u32;
+        }
+        let mut safe_start = 0u32;
+        let mut count = 0u32;
+        if invalid == 0u32 {
+            safe_start = start;
+            count = end - start;
+        }
+        range_starts[row] = safe_start;
+        counts[row] = count;
+        row_errors[row] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn generate_fixed_candidates(
+    range_starts: &Array<u32>,
+    counts: &Array<u32>,
+    local_offsets: &Array<u32>,
+    block_offsets: &Array<u32>,
+    status: &Array<u32>,
+    positions: &mut Array<u32>,
+    owners: &mut Array<u32>,
+    rows: u32,
+    capacity: u32,
+    #[comptime] block_items: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize && status[0] == 0u32 {
+        let count = counts[row];
+        let output = local_offsets[row] + block_offsets[row / block_items as usize];
+        if output <= capacity && count <= capacity - output {
+            let mut offset = 0u32;
+            while offset < count {
+                let candidate = output + offset;
+                positions[candidate as usize] = range_starts[row] + offset;
+                owners[candidate as usize] = row as u32;
+                offset += 1u32;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finish_changed_pair_lf(
+    changed_positions: &Array<u32>,
+    eav_values: &Array<u32>,
+    value_selected: &Array<u32>,
+    value_ranks: &Array<u32>,
+    vea_positions: &mut Array<u32>,
+    errors: &mut Array<u32>,
+    rows: u32,
+    ring_len: u32,
+    domain: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let changed_position = changed_positions[row];
+        let value = eav_values[row];
+        let selected = value_selected[row];
+        let rank = value_ranks[row];
+        let mut invalid = 0u32;
+        if changed_position == 0xFFFF_FFFFu32
+            || changed_position >= ring_len
+            || value == 0xFFFF_FFFFu32
+            || value >= domain
+            || selected == 0xFFFF_FFFFu32
+            || selected < value
+            || rank == 0xFFFF_FFFFu32
+        {
+            invalid = 1u32;
+        }
+        let mut rotated = 0u32;
+        if invalid == 0u32 {
+            let base = selected - value;
+            if base >= ring_len || rank >= ring_len - base {
+                invalid = 1u32;
+            } else {
+                rotated = base + rank;
+            }
+        }
+        vea_positions[row] = rotated;
+        errors[row] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn mark_codes_and_owners(
+    prior_errors: &Array<u32>,
+    codes: &Array<u32>,
+    owners: &Array<u32>,
+    errors: &mut Array<u32>,
+    rows: u32,
+    owner_rows: u32,
+    domain: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let code = codes[row];
+        let mut invalid = prior_errors[row];
+        if code == 0xFFFF_FFFFu32 || code >= domain || owners[row] >= owner_rows {
+            invalid = 1u32;
+        }
+        errors[row] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn mark_codes_and_owners_simple(
+    codes: &Array<u32>,
+    owners: &Array<u32>,
+    errors: &mut Array<u32>,
+    rows: u32,
+    owner_rows: u32,
+    domain: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let code = codes[row];
+        let mut invalid = 0u32;
+        if code == 0xFFFF_FFFFu32 || code >= domain || owners[row] >= owner_rows {
+            invalid = 1u32;
+        }
+        errors[row] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn reduce_error_blocks(
+    errors: &Array<u32>,
+    block_errors: &mut Array<u32>,
+    rows: u32,
+    #[comptime] block_items: u32,
+) {
+    let block = CUBE_POS;
+    let start = block * block_items as usize;
+    if start < rows as usize {
+        let candidate_end = start + block_items as usize;
+        let mut end = rows as usize;
+        if candidate_end < end {
+            end = candidate_end;
+        }
+        let mut invalid = 0u32;
+        let mut row = start;
+        while row < end {
+            if errors[row] != 0u32 {
+                invalid = 1u32;
+            }
+            row += 1usize;
+        }
+        block_errors[block] = invalid;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn merge_error_blocks(block_errors: &Array<u32>, status: &mut Array<u32>, block_count: u32) {
+    if ABSOLUTE_POS == 0 {
+        let mut error = 0u32;
+        let mut block = 0usize;
+        while block < block_count as usize {
+            if block_errors[block] != 0u32 {
+                error = 2u32;
+            }
+            block += 1usize;
+        }
+        if error != 0u32 {
+            status[0] = error;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn scatter_physical_ea(
+    entities: &Array<u32>,
+    attributes: &Array<u32>,
+    owners: &Array<u32>,
+    status: &Array<u32>,
+    output: &mut Array<u32>,
+    rows: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let base = row * 2usize;
+        output[base] = 0u32;
+        output[base + 1usize] = 0u32;
+        if status[0] == 0u32 {
+            output[base] = entities[owners[row] as usize];
+            output[base + 1usize] = attributes[row];
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn scatter_physical_eav(
+    pairs: &Array<u32>,
+    candidates: &Array<u32>,
+    owners: &Array<u32>,
+    status: &Array<u32>,
+    output: &mut Array<u32>,
+    rows: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let base = row * 3usize;
+        output[base] = 0u32;
+        output[base + 1usize] = 0u32;
+        output[base + 2usize] = 0u32;
+        if status[0] == 0u32 {
+            let parent = owners[row] as usize * 2usize;
+            output[base] = pairs[parent];
+            output[base + 1usize] = pairs[parent + 1usize];
+            output[base + 2usize] = candidates[row];
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn pack_canonical_eav(
+    physical: &Array<u32>,
+    status: &Array<u32>,
+    packed: &mut Array<u32>,
+    rows: u32,
+    column0_source: u32,
+    column1_source: u32,
+    column2_source: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize && status[0] == 0u32 {
+        let physical_base = row * 3usize;
+        let packed_base = 2usize + physical_base;
+        packed[packed_base] = physical[physical_base + column0_source as usize];
+        packed[packed_base + 1usize] = physical[physical_base + column1_source as usize];
+        packed[packed_base + 2usize] = physical[physical_base + column2_source as usize];
+    }
 }
 
 #[cube(launch_unchecked)]

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **One all-variable `QueryProgram` pattern can run as a forced resident
+  E→A→V chain.** `WgpuQueryProgram::execute_eav` accepts every permutation of
+  three variable IDs across the axes, keeps private physical frontiers and
+  Jerky navigation device-to-device, and performs one final packed read even
+  for zero seeds or an empty archive. An explicit O(domain) paired-select E
+  scan, changed-E/A LF navigation, stable exact-capacity scans, checked
+  geometry, and sticky device invariants preserve the forced CPU interpreter's
+  seed-major order and multiplicity.
 - **WGPU succinct archives keep E/A pair-change boundaries resident.**
   `WgpuSuccinctArchive` now mirrors `changed_e_a` in the same private Jerky
   compatibility domain as its prefix vectors and Ring columns, exposes the

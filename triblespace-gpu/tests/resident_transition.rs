@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
+use jerky::bit_vector::NumBits;
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ArchiveCode, ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryProgramError,
     QueryTerm,
@@ -51,6 +52,29 @@ fn fixture() -> (SuccinctArchive<OrderedUniverse>, Vec<Id>, [Id; 2], Vec<Id>) {
     ((&set).into(), entities, attributes, values)
 }
 
+fn boundary_chain_fixture() -> SuccinctArchive<OrderedUniverse> {
+    let entities: Vec<_> = (0..65).map(|i| fixture_id(4, i)).collect();
+    let attributes: Vec<_> = (0..65).map(|i| fixture_id(5, i)).collect();
+    let values: Vec<_> = (0..65).map(|i| fixture_id(6, i)).collect();
+    let mut set = TribleSet::new();
+
+    // The hot entity owns every attribute; its first pair owns every value.
+    // The remaining entities each add one pair. The resulting stage sizes are
+    // deliberately one past successive 64-row scan boundaries:
+    // E = 65, E/A = 65 + 64 = 129, E/A/V = 65 + 64 + 64 = 193.
+    for &value in &values {
+        insert(&mut set, entities[0], attributes[0], value);
+    }
+    for index in 1..attributes.len() {
+        insert(&mut set, entities[0], attributes[index], values[index]);
+    }
+    for index in 1..entities.len() {
+        insert(&mut set, entities[index], attributes[0], values[index]);
+    }
+
+    (&set).into()
+}
+
 fn frontier(
     program: &QueryProgram<'_, OrderedUniverse>,
     variables: Vec<ProgramVariable>,
@@ -98,6 +122,17 @@ fn assert_exact_parity(
     let actual = resident_program.transition_on(target, parent).unwrap();
     assert_eq!(actual, expected);
     actual
+}
+
+fn forced_eav(
+    program: &QueryProgram<'_, OrderedUniverse>,
+    [entity, attribute, value]: [ProgramVariable; 3],
+    seed_rows: usize,
+) -> ProgramFrontier {
+    let seed = ProgramFrontier::new(Vec::new(), Vec::new(), seed_rows).unwrap();
+    let entities = program.transition_on(entity, &seed).unwrap();
+    let pairs = program.transition_on(attribute, &entities).unwrap();
+    program.transition_on(value, &pairs).unwrap()
 }
 
 fn resident_values_for_pair(
@@ -372,6 +407,121 @@ fn resident_two_bound_transition_preserves_exact_cpu_order_and_capacity_contract
     let peer_unbound = ProgramFrontier::new(vec![e], vec![complete_row.values()[0]], 1).unwrap();
     assert!(matches!(
         gpu.transition_on(v, &peer_unbound),
+        Err(ResidentTransitionError::UnsupportedArm(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn resident_eav_chain_matches_forced_cpu_for_every_axis_permutation() {
+    let (archive, _, _, _) = fixture();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let permutations = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+
+    for permutation in permutations {
+        let axes = permutation.map(ProgramVariable::new);
+        let program = QueryProgram::compile(
+            resident.archive(),
+            3,
+            [QueryPattern::new(axes[0], axes[1], axes[2])],
+        )
+        .unwrap();
+        let gpu = WgpuQueryProgram::new(&program, &resident).unwrap();
+
+        // Zero seeds exercises the still-exactly-one-read empty path. Two
+        // indistinguishable seeds prove that the chain preserves multiplicity
+        // instead of globally deduplicating complete rows.
+        for seed_rows in [0, 1, 2] {
+            assert_eq!(
+                gpu.execute_eav(seed_rows).unwrap(),
+                forced_eav(&program, axes, seed_rows),
+                "axis permutation {permutation:?}, seed rows {seed_rows}",
+            );
+        }
+    }
+
+    // Exercise every row-homomorphism split across the first scan-block
+    // boundary. Output equality is exact and ordered, not a sorted-set check.
+    let axes = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        resident.archive(),
+        3,
+        [QueryPattern::new(axes[0], axes[1], axes[2])],
+    )
+    .unwrap();
+    let gpu = WgpuQueryProgram::new(&program, &resident).unwrap();
+    let whole = gpu.execute_eav(BLOCK + 1).unwrap();
+    assert_eq!(whole, forced_eav(&program, axes, BLOCK + 1));
+    for split in 0..=BLOCK + 1 {
+        let left = gpu.execute_eav(split).unwrap();
+        let right = gpu.execute_eav(BLOCK + 1 - split).unwrap();
+        assert_eq!(whole, concatenate(&left, &right), "seed split {split}");
+    }
+
+    // Cross a different scan boundary at every physical depth, with enough
+    // skew to expose accidentally uniform-fanout arithmetic.
+    let boundary_resident = WgpuSuccinctArchive::new(boundary_chain_fixture()).unwrap();
+    assert_eq!(boundary_resident.archive().entity_count, 65);
+    assert_eq!(boundary_resident.archive().changed_e_a.num_ones(), 129);
+    let boundary_program = QueryProgram::compile(
+        boundary_resident.archive(),
+        3,
+        [QueryPattern::new(axes[0], axes[1], axes[2])],
+    )
+    .unwrap();
+    let boundary_gpu = WgpuQueryProgram::new(&boundary_program, &boundary_resident).unwrap();
+    let boundary_expected = forced_eav(&boundary_program, axes, 1);
+    assert_eq!(boundary_expected.len(), 193);
+    assert_eq!(boundary_gpu.execute_eav(1).unwrap(), boundary_expected);
+
+    // A truly empty resident archive still returns the complete output schema
+    // and performs the method's sole packed final read for both zero and
+    // nonzero virtual seed multiplicity.
+    let empty_set = TribleSet::new();
+    let empty_archive: SuccinctArchive<OrderedUniverse> = (&empty_set).into();
+    let empty_resident = WgpuSuccinctArchive::new(empty_archive).unwrap();
+    let empty_program = QueryProgram::compile(
+        empty_resident.archive(),
+        3,
+        [QueryPattern::new(axes[0], axes[1], axes[2])],
+    )
+    .unwrap();
+    let empty_gpu = WgpuQueryProgram::new(&empty_program, &empty_resident).unwrap();
+    for seed_rows in [0, 1, BLOCK + 1] {
+        assert_eq!(
+            empty_gpu.execute_eav(seed_rows).unwrap(),
+            forced_eav(&empty_program, axes, seed_rows),
+        );
+    }
+
+    // The general constructor also serves the proven two-bound arm, so some
+    // programs it admits are intentionally ineligible for this whole-chain
+    // specialization. execute_eav must reject them instead of silently
+    // skipping constants.
+    let constant_entity = QueryProgram::compile(
+        resident.archive(),
+        2,
+        [QueryPattern::new(
+            QueryTerm::Constant(raw(fixture_id(1, 0))),
+            ProgramVariable::new(0),
+            ProgramVariable::new(1),
+        )],
+    )
+    .unwrap();
+    let constant_gpu = WgpuQueryProgram::new(&constant_entity, &resident).unwrap();
+    assert!(matches!(
+        constant_gpu.execute_eav(1),
         Err(ResidentTransitionError::UnsupportedArm(_))
     ));
 }
