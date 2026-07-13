@@ -570,7 +570,7 @@ fn replace_manifest_subjects<K: IndexKind>(
 /// Carry every complete entity bearing `index_recipe` into a rebuilt branch
 /// head. Unknown attributes and unknown recipes are copied byte-for-byte;
 /// legacy `seg_kind`/`seg_blob` facts are neither recognised nor emitted.
-pub(crate) fn manifest_tribles(set: &TribleSet) -> TribleSet {
+pub fn manifest_tribles(set: &TribleSet) -> TribleSet {
     let entities: HashSet<Id> = find!(
         entity: Id,
         pattern!(set, [{ ?entity @ crate::repo::index_range::index_recipe: _?recipe }])

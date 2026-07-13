@@ -123,11 +123,11 @@ pub enum PileCommand {
     },
     /// Re-id every branch into a new pile, preserving names + full history.
     ///
-    /// Each branch keeps its name, head commit, and rollup, but receives a
-    /// freshly minted branch id; the full reachable blob graph is copied
-    /// unchanged (unlike `squash`, which collapses history). Use this to
-    /// de-alias two piles that share branch ids before `cat` + `branch
-    /// consolidate --by-name`.
+    /// Each branch keeps its name and head commit, but receives a freshly
+    /// minted branch id; the full reachable blob graph is copied unchanged
+    /// (unlike `squash`, which collapses history). Use this to de-alias two
+    /// piles that share branch ids before `cat` + `branch consolidate
+    /// --by-name`.
     Reid {
         /// Source pile file
         source: PathBuf,
