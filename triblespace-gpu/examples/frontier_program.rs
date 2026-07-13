@@ -28,8 +28,8 @@ const META_WORDS: usize = 2;
 fn dispatch(logical_len: usize) -> [u32; DISPATCH_WORDS] {
     let logical_len = u32::try_from(logical_len).expect("frontier exceeds u32 positions");
     let groups = logical_len.div_ceil(THREADS);
-    let x = groups.min(MAX_GROUPS_PER_DIM);
-    let y = if x == 0 { 1 } else { groups.div_ceil(x) };
+    let y = groups.div_ceil(MAX_GROUPS_PER_DIM).max(1);
+    let x = groups.div_ceil(y);
     [x, y, 1]
 }
 
@@ -128,13 +128,13 @@ fn scan_block_sums(
         if total <= output_meta[1] {
             let groups = total.div_ceil(threads);
             let max_groups = u32::cast_from(max_groups_per_dim);
-            let mut x = max_groups;
-            if groups < max_groups {
-                x = groups;
-            }
             let mut y = 1u32;
-            if x != 0u32 {
-                y = (groups + x - 1u32) / x;
+            if groups > max_groups {
+                y = (groups + max_groups - 1u32) / max_groups;
+            }
+            let mut x = 0u32;
+            if groups != 0u32 {
+                x = (groups + y - 1u32) / y;
             }
             output_dispatch[0] = x;
             output_dispatch[1] = y;

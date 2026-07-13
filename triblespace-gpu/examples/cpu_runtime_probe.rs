@@ -175,8 +175,8 @@ impl<R: Runtime> ResidentInputs<R> {
         // WGPU caps each dispatch dimension at 65,535. Fold large one-
         // dimensional launches into Y while retaining CubeCL's linear
         // `ABSOLUTE_POS` row numbering.
-        let cubes_x = cubes.min(65_535);
-        let cubes_y = cubes.div_ceil(65_535);
+        let cubes_y = cubes.div_ceil(65_535).max(1);
+        let cubes_x = cubes.div_ceil(cubes_y);
         let start = Instant::now();
         unsafe {
             rank1_rows::launch_unchecked::<R>(

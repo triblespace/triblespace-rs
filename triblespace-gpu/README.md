@@ -57,33 +57,34 @@ explicit number of query rows handled by each CubeCL unit:
 
 | runtime | cube | vec | warm median |
 |---|---:|---:|---:|
-| CubeCL CPU | 16 | 1 | 1.473 ms |
-| CubeCL CPU | 256 | 1 | **1.297 ms** |
-| CubeCL CPU | 16 | 2 | 1.399 ms |
-| CubeCL CPU | 256 | 2 | 1.450 ms |
-| CubeCL CPU | 16 | 4 | 1.380 ms |
-| CubeCL CPU | 256 | 4 | 1.396 ms |
-| WGPU/Metal | 16 | 1 | 2.706 ms |
-| WGPU/Metal | 256 | 1 | 1.365 ms |
-| WGPU/Metal | 16 | 2 | 1.333 ms |
-| WGPU/Metal | 256 | 2 | 1.329 ms |
-| WGPU/Metal | 16 | 4 | **1.318 ms** |
-| WGPU/Metal | 256 | 4 | 1.369 ms |
+| CubeCL CPU | 16 | 1 | 1.369 ms |
+| CubeCL CPU | 256 | 1 | 1.305 ms |
+| CubeCL CPU | 16 | 2 | 1.395 ms |
+| CubeCL CPU | 256 | 2 | 1.392 ms |
+| CubeCL CPU | 16 | 4 | **1.295 ms** |
+| CubeCL CPU | 256 | 4 | 1.360 ms |
+| WGPU/Metal | 16 | 1 | 1.381 ms |
+| WGPU/Metal | 256 | 1 | 1.351 ms |
+| WGPU/Metal | 16 | 2 | 1.364 ms |
+| WGPU/Metal | 256 | 2 | 1.349 ms |
+| WGPU/Metal | 16 | 4 | 1.352 ms |
+| WGPU/Metal | 256 | 4 | **1.319 ms** |
 
-The warmed native controls were 9.568 ms scalar and 1.374 ms through Rayon.
+The warmed native controls were 9.449 ms scalar and 1.150 ms through Rayon.
 Thus the CubeCL CPU runtime is already a credible *performance* executor for
 this independent, scattered rank stage, not merely a correctness oracle. Its
-best result matched both Rayon and Metal. Neither explicit vector widths nor
-GPU-like cubes improved CPU consistently; the scattered data-dependent loads
-leave little regular SIMD work, while the CPU runtime's worker scheduler
-already distributes cubes. On Metal, a width-16 scalar launch creates 65,536
-workgroups and is clearly too fine; either 256-wide cubes or packing multiple
-rows per unit removes that penalty.
+best result was within 13% of Rayon and matched Metal. Neither explicit vector
+widths nor GPU-like cubes improved either runtime consistently; the scattered
+data-dependent loads leave little regular SIMD work, while each runtime already
+distributes independent cubes. In particular, width-16 scalar work is not
+intrinsically pathological: a previous 2.706 ms observation came from a launch
+geometry bug that dispatched almost twice the requested work at the 65,536-
+group boundary. Using the smallest rectangular cover removes that artifact.
 
-The first CPU launch in a fresh process took 34.6 ms and subsequent first
-observations of a new geometry/vector variant took 14.9–17.8 ms, exposing the
-MLIR/LLVM JIT cost. CPU resident setup/enqueue was 9.4 ms. WGPU setup/enqueue
-was 15.5 ms and its first observed scalar launch took 8.2 ms. These first-use
+The first CPU launch in a fresh process took 35.6 ms and subsequent first
+observations of a new geometry/vector variant took 14.6–17.2 ms, exposing the
+MLIR/LLVM JIT cost. CPU resident setup/enqueue was 9.8 ms. WGPU setup/enqueue
+was 14.4 ms and its first observed scalar launch took 50.4 ms. These first-use
 figures are cache-order observations rather than independent cold processes;
 warm medians are the controlled comparison.
 
