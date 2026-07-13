@@ -43,7 +43,7 @@ anybytes = "0.20"
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the
 # wavelet-matrix-backed blobs.
-jerky = { version = "0.9", git = "https://github.com/triblespace/jerky.git", rev = "37160b8aa0384caab390852fd7be55c6f7282509", optional = true }
+jerky = { version = "0.9", git = "https://github.com/triblespace/jerky.git", rev = "a10486a8cda8c62d1e64ddb6b373ef7ca7153b8f", optional = true }
 # zerocopy — safe byte<->struct conversion for serializing
 # jerky's CompactVectorMeta into the succinct blob header. Pulled
 # in along with jerky, so no added transitive cost.

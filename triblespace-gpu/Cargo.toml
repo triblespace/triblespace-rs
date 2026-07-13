@@ -25,7 +25,7 @@ cpu = ["dep:cubecl", "cubecl/cpu"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
-jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "37160b8aa0384caab390852fd7be55c6f7282509", default-features = false, features = ["gpu"], optional = true }
+jerky = { version = "0.9.0", git = "https://github.com/triblespace/jerky.git", rev = "a10486a8cda8c62d1e64ddb6b373ef7ca7153b8f", default-features = false, features = ["gpu"], optional = true }
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 
 [dev-dependencies]
