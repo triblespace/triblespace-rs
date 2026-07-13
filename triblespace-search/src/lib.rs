@@ -108,6 +108,8 @@ pub mod hnsw;
 #[cfg(feature = "succinct")]
 pub mod index_hnsw;
 #[cfg(feature = "succinct")]
+pub mod index_schema;
+#[cfg(feature = "succinct")]
 pub mod ring;
 pub mod schemas;
 #[cfg(feature = "succinct")]
