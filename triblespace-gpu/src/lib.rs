@@ -5,6 +5,8 @@ use std::fmt;
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
 #[cfg(feature = "wgpu")]
+mod resident_program;
+#[cfg(feature = "wgpu")]
 mod succinct_query;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
@@ -13,6 +15,8 @@ pub use cubecl_backend::CubeClWaveletFreeze;
 pub use cubecl_backend::CudaWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use cubecl_backend::WgpuWaveletFreeze;
+#[cfg(feature = "wgpu")]
+pub use resident_program::{ResidentTransitionError, WgpuQueryProgram};
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
     WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,

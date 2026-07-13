@@ -155,6 +155,26 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Generalise `WgpuQueryProgram` from its first single-pattern `(E,A) -> V`
+  transition to all symmetric zero/one/two-bound Ring arms, then add resident
+  sibling confirmation and keep successive frontiers on device across the
+  caller's agglomerative variable-group plan. The current wrapper deliberately
+  uploads one parent and reads one child per transition.
+- Add a true end-to-end lazy/grouped-DAG benchmark that routes eligible work to
+  `WgpuQueryProgram`. The current `resident_transition` probe establishes the
+  CPU-IR crossover for one forced transition and reports canonical/hybrid
+  `Constraint::propose` only as component baselines; those columns omit
+  scheduler estimate/choice/reconvergence and child materialisation and must
+  not be used as a DAG crossover claim.
+- Replace the first resident transition's serial 64-row block scans and serial
+  block-total scan with a hierarchical stable scan after profiling shows the
+  scan—not final frontier transfer—is material at production batch sizes.
+- Let a resident scheduler retain the packed child frontier, logical length,
+  and indirect dispatch for the next transition without host observation. The
+  current one-read host API must transfer its full capacity to learn the length
+  and validate the spare-tail canary; a global max-fanout bound can make that
+  wasteful on skewed archives even though the poison fill itself is now a
+  device kernel rather than a bulk host upload.
 - Publish the checked Rank9 sidecar seam as a new Jerky crate version, then
   replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an

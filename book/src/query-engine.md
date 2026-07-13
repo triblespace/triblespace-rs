@@ -278,8 +278,32 @@ defines a compact `QueryProgram` for a deliberately smaller language: one flat
 positive conjunction of triple patterns over one immutable `SuccinctArchive`.
 Compilation lowers constants once, and affine frontier rows carry only `u32`
 archive-universe codes. Its CPU interpreter implements the same
-estimate/choose/propose/confirm transition as an executable reference for a
-future resident CubeCL backend; it does not route through `dyn Constraint`.
+estimate/choose/propose/confirm transition as an executable reference; it does
+not route through `dyn Constraint`.
+
+The opt-in GPU crate now implements the first real resident transition through
+`WgpuQueryProgram`. It admits exactly one useful arm: one pattern, caller-
+selected value variable, and entity/attribute peers already bound or constant.
+The wrapper must borrow the exact CPU archive inside the same
+`WgpuSuccinctArchive`; byte-identical clones are rejected because local codes
+and Jerky compatibility domains are snapshot-specific. Entity/attribute
+selects, EVA ranks, a stable device scan, indirect candidate dispatch, AEV
+access, and child-row scatter stay resident. The parent frontier is uploaded
+once and one packed child frontier is read after the transition; there is no
+intermediate synchronization. That sole read transfers the full
+`2 + child_capacity * child_stride` allocation, including its poison tail,
+because the logical length is not known before synchronization; the default
+global max-fanout bound can therefore over-read on skewed archives.
+
+The output allocation is a checked `rows * max_EA_fanout` upper bound derived
+during setup. A smaller explicit capacity is allowed for reusable schedulers,
+but overflow returns the exact required row count after the final readback and
+never exposes a truncated frontier. Canonical AEV ordering already makes the
+CPU arm's per-parent `.unique()` a no-op: stable scans preserve parent order,
+candidate order, and duplicate parents exactly. Native WGPU tests compare the
+full frontier—not a sorted set—at scan boundaries and every possible split,
+and separately guard monotonic archive extension after decoding snapshot-local
+codes.
 
 This seam is intentionally not the general query engine. It currently excludes
 union, negation, ranges, external constraints, result closures, and repeated
@@ -287,9 +311,12 @@ variables within one triple pattern. Archive codes are local to the exact
 borrowed snapshot and cannot be mixed across segments. The CPU interpreter also
 does not reproduce DAG reconvergence or agglomerative grouping because those
 change batching and order, not the positive conjunction's result multiset.
-Keeping these limitations explicit lets a device backend first prove one
-frontier transition and resident scan/scatter before taking on the complete
-constraint language.
+Keeping these limitations explicit lets this first device transition prove its
+resident scan/scatter algebra before taking on the complete constraint
+language. It is not yet a resident query engine: each call still uploads and
+reads one frontier, only the value two-bound arm exists, and variable planning,
+multi-pattern viability/confirmation, reconvergence, and agglomerative grouping
+remain above or outside the backend.
 
 A partially consumed ordinary DAG query converted through `into_par_iter()` is
 drained as one parallel leaf so its exact remaining state cannot be restarted.
