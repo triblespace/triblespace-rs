@@ -121,6 +121,7 @@ pub mod commit;
 pub mod hybridstore;
 /// LSMT-of-segments derived-index home (manifest pin + SuccinctArchive rollup).
 pub mod index_home;
+pub mod index_range;
 /// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
 pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.

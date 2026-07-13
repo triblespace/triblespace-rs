@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Derived-index manifests gain artifact-neutral commit-DAG ranges.**
+  `repo::index_range` models inclusive repeated start/end antichains, stable
+  explicit range-record identities, lossless opaque-fact carry-forward,
+  artifact-specific replacement, exact whole-head cover audits, and
+  convexity-checked range compaction. The `commit_start` id
+  `FC67FFBAD460A96D07EBA341CD4127E7` and `commit_end` id
+  `FAD9B5F3ABA90AC846D08C787A831C7D`, plus the `index_recipe` id
+  `8DB05C6453156E9F3424A2B4BE924513`, were minted with `trible genid` on
+  2026-07-13.
 - **The `trible pile index build` command publishes `.pidx` locator snapshots.**
   It exposes the existing bounded-memory `MappedPileIndex` builder as an
   operational CLI, defaults to `<pile>.pidx`, and preserves the authoritative
