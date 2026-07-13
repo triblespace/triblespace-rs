@@ -2,7 +2,8 @@ mod triblesetconstraint;
 pub mod triblesetidrangeconstraint;
 pub mod triblesetrangeconstraint;
 
-use triblesetconstraint::*;
+pub use triblesetconstraint::patch_confirm_probe;
+use triblesetconstraint::TribleSetConstraint;
 
 use crate::inline::Inline;
 use crate::query::TriblePattern;

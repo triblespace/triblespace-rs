@@ -17,6 +17,8 @@ use crate::inline::InlineEncoding;
 pub use fragment::Fragment;
 /// Re-export of [`Spread`](spread::Spread).
 pub use spread::Spread;
+/// Experimental telemetry and order controls for PATCH confirm-frontier probes.
+pub use tribleset::patch_confirm_probe;
 /// Re-export of [`TribleSet`](tribleset::TribleSet).
 pub use tribleset::TribleSet;
 /// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).

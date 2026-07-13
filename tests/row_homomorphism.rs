@@ -12,6 +12,7 @@ use triblespace::core::query::{
     CandidateSink, Candidates, Constraint, EstimateSink, RowsView, TriblePattern, Variable,
     VariableContext,
 };
+use triblespace::core::trible::patch_confirm_probe::{self, OrderMode};
 use triblespace::prelude::*;
 
 struct Fixture {
@@ -361,5 +362,100 @@ fn tribleset_adjacent_prefix_run_is_row_homomorphic() {
         assert_eq!(split_estimates, full_estimates, "estimate split {split}");
         assert_eq!(split_proposals, full_proposals, "propose split {split}");
         assert_eq!(split_confirmed, full_confirmed, "confirm split {split}");
+    }
+}
+
+#[test]
+fn tribleset_probe_orders_are_row_homomorphic_at_every_split() {
+    let fixture = fixture();
+    let mut context = VariableContext::new();
+    let entity = context.next_variable::<GenId>();
+    let value = context.next_variable::<UnknownInline>();
+    let constraint = fixture
+        .set
+        .pattern(entity, GenId::inline_from(fixture.attribute), value);
+
+    // Adjacent equal contexts include deliberately different candidate orders.
+    // LeaveSorted may expose its sorted per-row order, while GlobalScatter must
+    // scatter back exactly; both must remain homomorphic across every cut.
+    let entities = [
+        fixture.entities[0],
+        fixture.entities[0],
+        fixture.entities[1],
+        fixture.entities[1],
+        fixture.entities[0],
+    ];
+    let vars = [entity.index];
+    let rows: Vec<RawInline> = entities
+        .iter()
+        .map(|&id| GenId::inline_from(id).raw)
+        .collect();
+    let view = RowsView::new(&vars, &rows);
+    let mut input = Candidates::new();
+    for row in 0..entities.len() as u32 {
+        let values: Vec<_> = if row % 2 == 0 {
+            fixture.values.iter().copied().collect()
+        } else {
+            fixture.values.iter().rev().copied().collect()
+        };
+        input.extend(values.into_iter().map(|candidate| (row, candidate)));
+    }
+
+    let mut baseline = input.clone();
+    patch_confirm_probe::with_mode(OrderMode::Baseline, || {
+        constraint.confirm(
+            value.index,
+            &view,
+            &mut CandidateSink::Tagged(&mut baseline),
+        );
+    });
+
+    for mode in [
+        OrderMode::Baseline,
+        OrderMode::LeaveSorted,
+        OrderMode::GlobalScatter,
+    ] {
+        patch_confirm_probe::with_mode(mode, || {
+            let mut whole = input.clone();
+            constraint.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut whole));
+
+            for split in 1..view.len() {
+                let mut partitioned = Candidates::new();
+                for (start, end) in [(0, split), (split, view.len())] {
+                    let shard = RowsView::new(&vars, &rows[start..end]);
+                    let mut shard_candidates: Candidates = input
+                        .iter()
+                        .filter(|(row, _)| (*row as usize) >= start && (*row as usize) < end)
+                        .map(|(row, candidate)| (row - start as u32, *candidate))
+                        .collect();
+                    constraint.confirm(
+                        value.index,
+                        &shard,
+                        &mut CandidateSink::Tagged(&mut shard_candidates),
+                    );
+                    partitioned.extend(
+                        shard_candidates
+                            .into_iter()
+                            .map(|(row, candidate)| (row + start as u32, candidate)),
+                    );
+                }
+                assert_eq!(
+                    partitioned, whole,
+                    "{mode:?} violated row homomorphism at split {split}"
+                );
+            }
+
+            let mut whole_multiset = whole.clone();
+            whole_multiset.sort_unstable();
+            let mut baseline_multiset = baseline.clone();
+            baseline_multiset.sort_unstable();
+            assert_eq!(
+                whole_multiset, baseline_multiset,
+                "{mode:?} changed results"
+            );
+            if mode == OrderMode::GlobalScatter {
+                assert_eq!(whole, baseline, "GlobalScatter must restore exact order");
+            }
+        });
     }
 }
