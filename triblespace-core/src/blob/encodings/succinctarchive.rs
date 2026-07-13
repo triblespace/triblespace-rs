@@ -109,6 +109,46 @@ impl MetaDescribe for SuccinctArchiveRank9IndexBlob {
     }
 }
 
+impl SuccinctArchiveRank9IndexBlob {
+    /// Read the canonical raw-archive handle embedded at offset zero.
+    ///
+    /// This deliberately performs only the small, format-level header check
+    /// needed to pair unordered manifest handles. Full native-ABI and Rank9
+    /// validation remains the responsibility of
+    /// [`SuccinctArchive::from_blob_pair`].
+    pub fn source_handle(
+        blob: &Blob<Self>,
+    ) -> Result<Inline<Handle<SuccinctArchiveBlob>>, SuccinctArchiveError> {
+        if blob.bytes.len() < std::mem::size_of::<Rank9IndexHeader>() {
+            return Err(SuccinctArchiveError(invalid_rank9_metadata(
+                "Rank9 index blob is truncated before its source header",
+            )));
+        }
+        let header = *blob
+            .bytes
+            .clone()
+            .slice(0..std::mem::size_of::<Rank9IndexHeader>())
+            .view::<Rank9IndexHeader>()
+            .map_err(|error| {
+                SuccinctArchiveError(invalid_rank9_metadata(format!(
+                    "cannot read Rank9 source header: {error}"
+                )))
+            })?;
+        if header.marker != RANK9_INDEX_MARKER
+            || header.version != RANK9_INDEX_VERSION
+            || header.flags != RANK9_INDEX_FLAGS
+            || header.word_bytes != std::mem::size_of::<usize>() as u8
+            || header.endian != RANK9_INDEX_ENDIAN
+            || header.reserved != [0; 6]
+        {
+            return Err(SuccinctArchiveError(invalid_rank9_metadata(
+                "unsupported Rank9 index header or native ABI",
+            )));
+        }
+        Ok(Inline::new(header.source))
+    }
+}
+
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 /// Serialisation metadata trailer for a [`SuccinctArchive`].

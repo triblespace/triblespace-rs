@@ -1130,39 +1130,25 @@ where
     }
 
     /// Register an [`IndexKind`](index_home::IndexKind) for automatic,
-    /// incremental on-commit maintenance: every newly reachable commit
-    /// builds one level-0 segment from that commit's content and folds the
-    /// updated manifest into the same branch-head tribleset the push CAS's in
-    /// (via [`index_home::append_segment`]); the size-tiered merge keeps
-    /// read fan-out bounded. Kinds that select their own source subset
-    /// during `build` (like `Bm25Rollup`) need nothing more; to restrict
-    /// what a kind even sees, use
-    /// [`register_index_filtered`](Self::register_index_filtered).
+    /// range-native on-commit maintenance. Every newly reachable commit gets
+    /// one inclusive `[commit, commit]` logical record, including contentless
+    /// merge commits and canonical empty recipe projections. A large commit
+    /// may still produce several repeated physical artifacts on that record.
     pub fn register_index<K>(&mut self, kind: K)
     where
         K: index_home::IndexKind + Send + Sync + 'static,
     {
-        self.register_index_filtered(kind, |delta: &TribleSet| delta.clone());
-    }
-
-    /// Like [`register_index`](Self::register_index), but each source commit's
-    /// content is first passed through `filter` to select the
-    /// kind's source subset (e.g. only tribles under the attributes the
-    /// index covers). When the filtered source is empty the commit
-    /// appends no segment at all.
-    pub fn register_index_filtered<K, F>(&mut self, kind: K, mut filter: F)
-    where
-        K: index_home::IndexKind + Send + Sync + 'static,
-        F: FnMut(&TribleSet) -> TribleSet + Send + Sync + 'static,
-    {
         self.on_commit(move |storage, _branch, batch, head_meta| {
-            let kind_id = kind.kind_id();
-            let manifest = index_home::Manifest::from_tribles(head_meta, kind_id);
-            if !manifest.covers_head(batch.base_head) {
+            let reader = storage
+                .reader()
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
+            let manifest = index_home::Manifest::from_tribles(head_meta, &reader, &kind)
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
+            if !manifest.claims_head(batch.base_head) {
                 return Err(Box::new(index_home::CoverageMismatch {
-                    kind: kind_id,
+                    recipe: manifest.recipe(),
                     expected: batch.base_head,
-                    actual: manifest.covered,
+                    actual: manifest.head(),
                 }));
             }
 
@@ -1187,20 +1173,24 @@ where
                         as Box<dyn Error + Send + Sync>
                 })?
                 .map(|(handle,)| handle);
-                let Some(content_handle) = content_handle else {
-                    // Contentless merge commits still advance coverage.
-                    continue;
+                let source = if let Some(content_handle) = content_handle {
+                    reader
+                        .get(content_handle)
+                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?
+                } else {
+                    TribleSet::new()
                 };
-                let delta: TribleSet = reader
-                    .get(content_handle)
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                let source = filter(&delta);
-                if !source.is_empty() {
-                    index_home::append_segment(storage, &kind, &source, head_meta)
-                        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                }
+                index_home::append_range(
+                    storage,
+                    &kind,
+                    &source,
+                    index_home::CommitRange::leaf(*commit),
+                    head_meta,
+                )
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
             }
-            index_home::set_coverage(head_meta, kind_id, vec![batch.new_head]);
+            index_home::set_index_head(storage, &kind, head_meta, Some(batch.new_head))
+                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
             Ok(())
         });
     }
@@ -1209,8 +1199,7 @@ where
     /// last call. An entry here means a commit landed *without* that
     /// hook's contribution — for index hooks the index is soft state and
     /// simply missing that delta; it can be repaired by an explicit
-    /// [`IndexHome::update_index`](index_home::IndexHome::update_index)
-    /// over the missed range (or a rebuild), never by re-writing history.
+    /// an explicit range rebuild, never by re-writing history.
     pub fn take_hook_errors(&mut self) -> Vec<HookError> {
         std::mem::take(&mut self.hook_errors)
     }

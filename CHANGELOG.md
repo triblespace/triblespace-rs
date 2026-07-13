@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
+  descriptors are self-marked, losslessly retained manifest headers with an
+  optional certified head. Inclusive range records carry exactly one LSM
+  level/sequence and zero or more typed physical artifacts, so contentless
+  commits remain covered and large commits can be sharded without overlapping
+  logical ranges. Succinct records emit both the raw archive and detached
+  Rank9 handle and reconstruct a strict source-handle bijection before attach;
+  compaction counts logical records and rejects non-convex DAG unions. The
+  `index_head` (`42813BC8BB5BBF16870403E8A573162E`), `seg_succinct`
+  (`040E0073548E08298E732F7154C5703F`), and `seg_succinct_rank9`
+  (`0297BF2535F4FEDF7AFE6E5E7D125CF0`) attributes were minted with
+  `trible genid` on 2026-07-13. The unpublished schema-erased
+  `seg_kind`/`seg_blob`/`covered_tip` manifest and filtered registration API
+  were removed rather than carried as compatibility surface.
 - **Derived-index manifests gain artifact-neutral commit-DAG ranges.**
   `repo::index_range` models inclusive repeated start/end antichains, stable
   explicit range-record identities, lossless opaque-fact carry-forward,
