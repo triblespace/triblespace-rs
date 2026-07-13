@@ -99,6 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **PATCH-backed triple patterns reuse adjacent identical lookup prefixes.**
+  Block estimates and proposals replay the prior PATCH result when consecutive
+  rows bind the pattern to the same prefix; confirmation additionally requires
+  an exactly identical candidate list before replaying its keep mask. Row tags,
+  candidate order, and row-homomorphic split semantics remain unchanged.
+
 - **Piles use one authoritative PATCH replay path.** The unpublished alternate
   locator-sidecar API, overlays, and CLI were removed before release. Refresh
   retains the useful one-observed-length optimization: each pass decodes one

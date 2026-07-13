@@ -284,13 +284,27 @@ fn tribleset_adjacent_prefix_run_is_row_homomorphic() {
 
     let mut initial = Candidates::new();
     for row in 0..view.len() as u32 {
-        initial.extend(
-            fixture
-                .values
-                .iter()
-                .copied()
-                .map(|candidate| (row, candidate)),
-        );
+        if row == 2 {
+            // Same prefix and candidate set as the preceding row, but a
+            // different order: confirmation must recompute rather than replay
+            // a keep mask whose row-local input is not exactly identical.
+            initial.extend(
+                fixture
+                    .values
+                    .iter()
+                    .rev()
+                    .copied()
+                    .map(|candidate| (row, candidate)),
+            );
+        } else {
+            initial.extend(
+                fixture
+                    .values
+                    .iter()
+                    .copied()
+                    .map(|candidate| (row, candidate)),
+            );
+        }
     }
     let mut full_confirmed = initial.clone();
     constraint.confirm(
