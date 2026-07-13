@@ -19,9 +19,9 @@
 //! [`WgpuQueryProgram::execute_eav`] additionally admits one all-variable
 //! pattern (including every permutation of variable IDs across the axes) and
 //! keeps the forced `E -> A -> V` frontier chain resident until one final
-//! packed read. Its first stage deliberately scans the compact-code domain
-//! with paired `select1(e_a, code/code + 1)` probes; Jerky has no resident
-//! `select0`, so this is an explicit `O(domain)` probe.
+//! packed read. Its first stage expands the resident ascending entity-code
+//! list derived once when the archive wrapper is constructed, so query
+//! execution does no compact-domain scan.
 
 use std::error::Error;
 use std::fmt;
@@ -227,10 +227,10 @@ where
     /// The pattern's three axes may use any permutation of program variables
     /// `0..3`. Intermediate buffers use the private physical layouts `[E]`,
     /// `[E,A]`, and `[E,A,V]`; only the final device scatter reorders those
-    /// axes into canonical ascending-variable columns. The E stage is an
-    /// explicit `O(domain)` paired-`select1` scan. All later geometry is fixed
-    /// from exact archive cardinalities (`entity_count`, changed-E/A ones, and
-    /// trible count), and any device disagreement fails closed.
+    /// axes into canonical ascending-variable columns. The E stage expands the
+    /// resident ascending entity-code list directly. All later geometry is
+    /// fixed from exact archive cardinalities (`entity_count`, changed-E/A
+    /// ones, and trible count), and any device disagreement fails closed.
     ///
     /// No intermediate buffer is read. Exactly one packed read occurs at the
     /// end, including when `seed_rows == 0` or the archive is empty.
@@ -586,69 +586,14 @@ where
         &self,
         seed_rows: usize,
         geometry: EavGeometry,
-        status: &mut DeviceU32Buffer<WgpuRuntime>,
+        status: &DeviceU32Buffer<WgpuRuntime>,
     ) -> Result<ResidentFrontier, ResidentTransitionError> {
         debug_assert!(seed_rows != 0);
         debug_assert!(geometry.domain != 0 && geometry.entities != 0);
         let context = self.resident.context();
-        let domain_dispatch =
-            context.batch_dispatch(geometry.domain, geometry.domain, CubeDim::new_1d(THREADS))?;
-        let double_domain = geometry.domain * 2;
-        let mut select_queries = context.empty_u32(double_domain)?;
-        unsafe {
-            prepare_domain_select_queries::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                select_queries.output_arg(),
-                geometry.domain as u32,
-            );
-        }
-
-        let mut selected = context.empty_u32(double_domain)?;
-        self.resident
-            .entity_prefix()
-            .select1_batch_into(&select_queries, &mut selected)?;
-        let mut flags = context.empty_u32(geometry.domain)?;
-        let mut errors = context.empty_u32(geometry.domain)?;
-        unsafe {
-            finish_domain_flags::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                select_queries.input_arg(),
-                selected.input_arg(),
-                flags.output_arg(),
-                errors.output_arg(),
-                geometry.domain as u32,
-                geometry.triples as u32,
-            );
-        }
-        let (local_offsets, block_offsets) = enqueue_exact_scan(
-            context,
-            &flags,
-            &errors,
-            geometry.domain,
-            geometry.entities,
-            status,
-        )?;
-
-        let mut entity_codes = context.empty_u32(geometry.entities)?;
-        enqueue_fill(context, &mut entity_codes, 0)?;
-        unsafe {
-            compact_domain_codes::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                flags.input_arg(),
-                local_offsets.input_arg(),
-                block_offsets.input_arg(),
-                status.input_arg(),
-                entity_codes.output_arg(),
-                geometry.domain as u32,
-                geometry.entities as u32,
-                BLOCK_ITEMS,
-            );
+        let entity_codes = self.resident.present_entity_codes();
+        if entity_codes.len() != geometry.entities {
+            return Err(ResidentTransitionError::DeviceInvariant);
         }
 
         let mut values = context.empty_u32(geometry.entity_rows)?;
@@ -1474,55 +1419,6 @@ fn validate_capacity_geometry(
 }
 
 #[cube(launch_unchecked)]
-fn prepare_domain_select_queries(queries: &mut Array<u32>, domain: u32) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize {
-        let pair = code * 2usize;
-        queries[pair] = code as u32;
-        queries[pair + 1usize] = code as u32 + 1u32;
-    }
-}
-
-#[cube(launch_unchecked)]
-fn finish_domain_flags(
-    queries: &Array<u32>,
-    selected: &Array<u32>,
-    flags: &mut Array<u32>,
-    errors: &mut Array<u32>,
-    domain: u32,
-    ring_len: u32,
-) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize {
-        let pair = code * 2usize;
-        let start_selected = selected[pair];
-        let end_selected = selected[pair + 1usize];
-        let start_query = queries[pair];
-        let end_query = queries[pair + 1usize];
-        let mut invalid = 0u32;
-        if start_selected == 0xFFFF_FFFFu32
-            || end_selected == 0xFFFF_FFFFu32
-            || start_selected < start_query
-            || end_selected < end_query
-        {
-            invalid = 1u32;
-        }
-        let mut present = 0u32;
-        if invalid == 0u32 {
-            let start = start_selected - start_query;
-            let end = end_selected - end_query;
-            if start > end || end > ring_len {
-                invalid = 1u32;
-            } else if start < end {
-                present = 1u32;
-            }
-        }
-        flags[code] = present;
-        errors[code] = invalid;
-    }
-}
-
-#[cube(launch_unchecked)]
 fn scan_block_sums_exact(
     block_sums: &Array<u32>,
     block_errors: &Array<u32>,
@@ -1553,27 +1449,6 @@ fn scan_block_sums_exact(
         }
         if error != 0u32 {
             status[0] = error;
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn compact_domain_codes(
-    flags: &Array<u32>,
-    local_offsets: &Array<u32>,
-    block_offsets: &Array<u32>,
-    status: &Array<u32>,
-    entity_codes: &mut Array<u32>,
-    domain: u32,
-    entity_count: u32,
-    #[comptime] block_items: u32,
-) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize && status[0] == 0u32 && flags[code] != 0u32 {
-        let output = local_offsets[code] + block_offsets[code / block_items as usize];
-        if output < entity_count {
-            entity_codes[output as usize] = code as u32;
         }
     }
 }

@@ -8,7 +8,7 @@
 //! enqueue, query-program compilation, WGPU admission, and the first device
 //! synchronization; each is reported separately.
 //!
-//! A warm resident sample still includes the status upload, the eighteen
+//! A warm resident sample still includes the status upload, the fifteen
 //! exact-geometry dispatch-record uploads, every intermediate allocation and
 //! kernel, and the one final packed device-to-host read. It is therefore an
 //! end-to-end warm execution time for this archive-scan-shaped specialization,
@@ -120,7 +120,7 @@ fn main() {
         "# primary_comparator=forced CPU transition_on(E)->transition_on(A)->transition_on(V); adaptive execute is not timed"
     );
     println!(
-        "# setup=excluded; warm_resident=224 control H2D bytes (8 status + 18*12 dispatch records) + all allocations/kernels + exactly one final packed D2H"
+        "# setup=excluded; warm_resident=188 control H2D bytes (8 status + 15*12 dispatch records) + all allocations/kernels + exactly one final packed D2H"
     );
     println!(
         "# config=max_m={max_m} repetitions={repetitions} warmups={warmups}; p50 is the middle sorted sample"

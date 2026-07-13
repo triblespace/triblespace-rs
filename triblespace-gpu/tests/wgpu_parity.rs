@@ -7,8 +7,9 @@ use triblespace_core::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, RingBatchQuery,
     SuccinctArchive, SuccinctRotation,
 };
-use triblespace_core::id::Id;
+use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
+use triblespace_core::inline::InlineEncoding;
 use triblespace_core::query::{
     CandidateSink, Candidates, Constraint, ContainsConstraint, Query, RowsView, TriblePattern,
     Variable, VariableContext,
@@ -43,6 +44,20 @@ fn entity_value(trible: &Trible) -> [u8; 32] {
 
 fn inline_value(trible: &Trible) -> [u8; 32] {
     trible.data[32..].try_into().unwrap()
+}
+
+fn ordered_id(prefix: u8) -> Id {
+    let mut raw = [0u8; 16];
+    raw[0] = prefix;
+    Id::new(raw).expect("fixture id is non-zero")
+}
+
+fn role_trible(entity: Id, attribute: Id, value: Id) -> Trible {
+    Trible::new::<GenId>(
+        ExclusiveId::force_ref(&entity),
+        &attribute,
+        &GenId::inline_from(value),
+    )
 }
 
 #[test]
@@ -250,6 +265,54 @@ fn wgpu_archive_components_share_one_resident_context() {
         .entity_attribute_changes()
         .rank1_batch_into(&positions, &mut foreign_output)
         .is_err());
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn wgpu_present_axis_codes_match_sparse_interleaved_cpu_domain() {
+    // Every value has the same canonical GenId inline shape, so the leading
+    // byte of each Id deliberately interleaves the three role-specific lists
+    // in the shared ordered universe: E, A, E, V, A, V.
+    let entities = [ordered_id(1), ordered_id(3)];
+    let attributes = [ordered_id(2), ordered_id(5)];
+    let values = [ordered_id(4), ordered_id(6)];
+    let mut set = TribleSet::new();
+    set.insert(&role_trible(entities[0], attributes[0], values[0]));
+    set.insert(&role_trible(entities[1], attributes[1], values[1]));
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    assert_eq!(archive.entity_count, 2);
+    assert_eq!(archive.attribute_count, 2);
+    assert_eq!(archive.value_count, 2);
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    assert_eq!(resident.present_entity_codes().read(), vec![0, 2]);
+    assert_eq!(resident.present_attribute_codes().read(), vec![1, 4]);
+    assert_eq!(resident.present_value_codes().read(), vec![3, 5]);
+
+    // Empty logical lists retain bindable device allocations but read back as
+    // genuinely empty and agree exactly with all three canonical counts.
+    let empty = TribleSet::new();
+    let empty_archive: SuccinctArchive<OrderedUniverse> = (&empty).into();
+    let empty_resident = WgpuSuccinctArchive::new(empty_archive).unwrap();
+    assert!(empty_resident.present_entity_codes().read().is_empty());
+    assert!(empty_resident.present_attribute_codes().read().is_empty());
+    assert!(empty_resident.present_value_codes().read().is_empty());
+
+    // The resident derivation validates, rather than trusting, public archive
+    // cardinality metadata.
+    for axis in 0..3 {
+        let mut malformed = resident.archive().clone();
+        match axis {
+            0 => malformed.entity_count += 1,
+            1 => malformed.attribute_count += 1,
+            2 => malformed.value_count += 1,
+            _ => unreachable!(),
+        }
+        assert!(
+            WgpuSuccinctArchive::new(malformed).is_err(),
+            "axis count {axis} must be validated"
+        );
+    }
 }
 
 #[test]

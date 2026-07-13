@@ -2,7 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jerky::gpu::{GpuBitVector, GpuContext, GpuWaveletMatrix};
+use jerky::bit_vector::rank9sel::Rank9SelIndex;
+use jerky::bit_vector::{BitVector, NumBits, Select};
+use jerky::gpu::{DeviceU32Buffer, GpuBitVector, GpuContext, GpuWaveletMatrix};
 use triblespace_core::blob::encodings::succinctarchive::{
     RingBatchQuery, SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
 };
@@ -106,9 +108,9 @@ impl QueryStats {
     }
 }
 
-/// A [`SuccinctArchive`] with its three axis prefixes, entity/attribute change
-/// boundaries, and all six ring columns resident on WGPU in one compatibility
-/// domain.
+/// A [`SuccinctArchive`] with its three axis prefixes and present-code lists,
+/// entity/attribute change boundaries, and all six ring columns resident on
+/// WGPU in one compatibility domain.
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
 /// the wrapped CPU archive unchanged. Only the independent rank stream emitted
@@ -130,6 +132,12 @@ where
     v_a: WgpuBitVector,
     /// Resident mirror of [`SuccinctArchive::changed_e_a`].
     changed_e_a: WgpuBitVector,
+    /// Ascending compact codes that occur in the entity axis.
+    present_entities: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
+    /// Ascending compact codes that occur in the attribute axis.
+    present_attributes: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
+    /// Ascending compact codes that occur in the value axis.
+    present_values: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
     /// Resident mirror of [`SuccinctArchive::eav_c`].
     eav_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::vea_c`].
@@ -150,15 +158,41 @@ impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
 {
-    /// Prepares and enqueues the three canonical prefix vectors, the E/A pair
-    /// change vector, and all six Ring wavelet matrices on the default WGPU
-    /// device.
+    /// Prepares and enqueues the three canonical prefix vectors, derived
+    /// present-code lists, the E/A pair change vector, and all six Ring wavelet
+    /// matrices on the default WGPU device.
     ///
     /// CubeCL's buffer writes are asynchronous; the first rank query provides
     /// the synchronization boundary. Existing query operations other than
     /// accelerated confirmation ranks still use the canonical CPU archive.
     pub fn new(archive: SuccinctArchive<U>) -> jerky::Result<Self> {
+        let domain_len = archive.domain.len();
+        let triple_count = archive.eav_c.len();
+        let present_entities = collect_present_codes(
+            &archive.e_a,
+            domain_len,
+            triple_count,
+            archive.entity_count,
+            "entity",
+        )?;
+        let present_attributes = collect_present_codes(
+            &archive.a_a,
+            domain_len,
+            triple_count,
+            archive.attribute_count,
+            "attribute",
+        )?;
+        let present_values = collect_present_codes(
+            &archive.v_a,
+            domain_len,
+            triple_count,
+            archive.value_count,
+            "value",
+        )?;
         let context = WgpuContext::on_wgpu();
+        let present_entities = context.upload_u32(&present_entities)?;
+        let present_attributes = context.upload_u32(&present_attributes)?;
+        let present_values = context.upload_u32(&present_values)?;
         let e_a = WgpuBitVector::with_context(context.clone(), &archive.e_a.data)?;
         let a_a = WgpuBitVector::with_context(context.clone(), &archive.a_a.data)?;
         let v_a = WgpuBitVector::with_context(context.clone(), &archive.v_a.data)?;
@@ -176,6 +210,9 @@ where
             a_a,
             v_a,
             changed_e_a,
+            present_entities,
+            present_attributes,
+            present_values,
             eav_c,
             vea_c,
             ave_c,
@@ -257,6 +294,33 @@ where
         &self.changed_e_a
     }
 
+    /// Returns the resident ascending compact codes present in the entity axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_entity_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_entities
+    }
+
+    /// Returns the resident ascending compact codes present in the attribute axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_attribute_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_attributes
+    }
+
+    /// Returns the resident ascending compact codes present in the value axis.
+    ///
+    /// This buffer is derived from the canonical CPU prefix at resident-wrapper
+    /// construction time. It is accelerator state in this wrapper's
+    /// compatibility domain, not a persisted archive sidecar.
+    pub fn present_value_codes(&self) -> &DeviceU32Buffer<cubecl::wgpu::WgpuRuntime> {
+        &self.present_values
+    }
+
     /// Returns the resident last-column mirror of `rotation`.
     pub fn ring_col(&self, rotation: SuccinctRotation) -> &WgpuWaveletMatrix {
         match rotation {
@@ -268,6 +332,72 @@ where
             SuccinctRotation::Aev => &self.aev_c,
         }
     }
+}
+
+fn collect_present_codes(
+    prefix: &BitVector<Rank9SelIndex>,
+    domain_len: usize,
+    triple_count: usize,
+    expected_count: usize,
+    axis: &'static str,
+) -> jerky::Result<Vec<u32>> {
+    let expected_prefix_len = triple_count
+        .checked_add(domain_len)
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| jerky::Error::invalid_argument("prefix geometry overflow"))?;
+    let expected_delimiters = domain_len
+        .checked_add(1)
+        .ok_or_else(|| jerky::Error::invalid_argument("prefix delimiter count overflow"))?;
+    if domain_len >= u32::MAX as usize || expected_prefix_len >= u32::MAX as usize {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix does not fit Jerky's resident u32 domain"
+        )));
+    }
+    if expected_count > domain_len {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} count {expected_count} exceeds the archive domain length {domain_len}"
+        )));
+    }
+    if prefix.len() != expected_prefix_len || prefix.num_ones() != expected_delimiters {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix geometry does not match the archive domain and ring"
+        )));
+    }
+
+    let mut codes = Vec::with_capacity(expected_count);
+    for code in 0..domain_len {
+        let next = code + 1;
+        let start = prefix
+            .select1(code)
+            .and_then(|selected| selected.checked_sub(code));
+        let end = prefix
+            .select1(next)
+            .and_then(|selected| selected.checked_sub(next));
+        let (Some(start), Some(end)) = (start, end) else {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{axis} prefix delimiter is invalid at compact code {code}"
+            )));
+        };
+        if start > end || end > triple_count {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{axis} prefix range is invalid at compact code {code}"
+            )));
+        }
+        if start < end {
+            codes.push(u32::try_from(code).map_err(|_| {
+                jerky::Error::invalid_argument(format!(
+                    "{axis} compact code does not fit the resident u32 domain"
+                ))
+            })?);
+        }
+    }
+    if codes.len() != expected_count {
+        return Err(jerky::Error::invalid_argument(format!(
+            "{axis} prefix contains {} present codes but archive metadata declares {expected_count}",
+            codes.len()
+        )));
+    }
+    Ok(codes)
 }
 
 impl<U> RingBatchQuery for WgpuSuccinctArchive<U>

@@ -8,7 +8,7 @@
 //!
 //! Setup and each archive's first execution/synchronization are reported
 //! separately from warm samples. A warm resident sample remains end-to-end: it
-//! includes the 8-byte status upload, eighteen 12-byte persistent dispatch
+//! includes the 8-byte status upload, fifteen 12-byte persistent dispatch
 //! record uploads, all allocations and kernels, and one full packed final D2H
 //! read. Run with `--release` for publishable measurements; debug builds are
 //! useful only as smoke tests.
@@ -32,7 +32,7 @@ const DEFAULT_WARMUPS: usize = 3;
 const HEADER_WORDS: usize = 2;
 const EAV_STRIDE: usize = 3;
 const STATUS_UPLOAD_BYTES: usize = 2 * std::mem::size_of::<u32>();
-const DISPATCH_RECORDS: usize = 18;
+const DISPATCH_RECORDS: usize = 15;
 const DISPATCH_RECORD_BYTES: usize = 3 * std::mem::size_of::<u32>();
 const WARM_CONTROL_H2D_BYTES: usize =
     STATUS_UPLOAD_BYTES + DISPATCH_RECORDS * DISPATCH_RECORD_BYTES;
@@ -441,7 +441,7 @@ fn main() {
         "# semantics=one all-variable pattern; fixed canonical trible count; archive shape varies; forced CPU E->A->V versus resident execute_eav(1)"
     );
     println!(
-        "# setup=excluded; warm_resident=224-byte control H2D (8-byte status + 18*12-byte dispatch records) + all allocations/kernels + one full packed final D2H"
+        "# setup=excluded; warm_resident=188-byte control H2D (8-byte status + 15*12-byte dispatch records) + all allocations/kernels + one full packed final D2H"
     );
     println!(
         "# first_execution_sync=first synchronization for each archive and any not-yet-process-cached pipeline setup; later shapes may reuse globally cached shader pipelines"
