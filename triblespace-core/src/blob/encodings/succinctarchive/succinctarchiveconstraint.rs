@@ -6,6 +6,7 @@ use crate::inline::encodings::genid::GenId;
 use crate::query::*;
 use jerky::bit_vector::Select;
 
+#[derive(Clone, Copy)]
 pub struct SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
@@ -14,6 +15,7 @@ where
     term_a: RawTerm,
     term_v: RawTerm,
     archive: &'a SuccinctArchive<U>,
+    ring_batch: Option<&'a dyn RingBatchQuery>,
 }
 
 impl<'a, U> SuccinctArchiveConstraint<'a, U>
@@ -31,7 +33,30 @@ where
             term_a: a.into().erase(),
             term_v: v.into().erase(),
             archive,
+            ring_batch: None,
         }
+    }
+
+    /// Creates a constraint whose independent ring rank probes are evaluated
+    /// by `ring_batch`.
+    ///
+    /// All query planning, range construction, and candidate filtering stays
+    /// in the canonical CPU constraint. The backend receives only a single
+    /// ring column and equally-sized position/value streams, so evaluating the
+    /// stream in parallel cannot introduce cross-row state. `ring_batch` must
+    /// evaluate ranks over the exact same immutable `archive` snapshot; using
+    /// a backend built from another archive violates the contract and can
+    /// produce incorrect results.
+    pub fn with_ring_batch<V: InlineEncoding>(
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+        archive: &'a SuccinctArchive<U>,
+        ring_batch: &'a dyn RingBatchQuery,
+    ) -> Self {
+        let mut constraint = Self::new(e, a, v, archive);
+        constraint.ring_batch = Some(ring_batch);
+        constraint
     }
 }
 
@@ -458,7 +483,8 @@ where
     ///   cancels in the emptiness comparison, exactly as in
     ///   [`restrict_len`].
     ///
-    /// The probe stream is evaluated as one cache-friendly CPU batch.
+    /// The probe stream is evaluated as one batch, either by the archive's
+    /// CPU wavelet matrix or by the optional external ring backend.
     fn confirm(
         &self,
         variable: VariableId,
@@ -478,7 +504,7 @@ where
         let p = self.positions(variable, view);
         let archive = self.archive;
         type RangeFn<'f> = Box<dyn Fn(&[RawInline]) -> Range<usize> + 'f>;
-        let (col, range_fn): (RingCol, RangeFn<'_>) =
+        let (rotation, range_fn): (SuccinctRotation, RangeFn<'_>) =
             match (p.pe, p.pa, p.pv, p.e_var, p.a_var, p.v_var) {
                 // Nothing of this constraint bound: candidates are checked
                 // against the prefix bit vector only — row-independent, no
@@ -496,43 +522,43 @@ where
                     return;
                 }
                 (Some(se), None, None, false, true, false) => (
-                    RingCol::EvaC,
+                    SuccinctRotation::Eva,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.e_a, se.get(row))
                     }),
                 ),
                 (Some(se), None, None, false, false, true) => (
-                    RingCol::EavC,
+                    SuccinctRotation::Eav,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.e_a, se.get(row))
                     }),
                 ),
                 (None, Some(sa), None, true, false, false) => (
-                    RingCol::AveC,
+                    SuccinctRotation::Ave,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.a_a, sa.get(row))
                     }),
                 ),
                 (None, Some(sa), None, false, false, true) => (
-                    RingCol::AevC,
+                    SuccinctRotation::Aev,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.a_a, sa.get(row))
                     }),
                 ),
                 (None, None, Some(sv), true, false, false) => (
-                    RingCol::VaeC,
+                    SuccinctRotation::Vae,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.v_a, sv.get(row))
                     }),
                 ),
                 (None, None, Some(sv), false, true, false) => (
-                    RingCol::VeaC,
+                    SuccinctRotation::Vea,
                     Box::new(move |row: &[RawInline]| {
                         base_range(&archive.domain, &archive.v_a, sv.get(row))
                     }),
                 ),
                 (None, Some(sa), Some(sv), true, false, false) => (
-                    RingCol::VaeC,
+                    SuccinctRotation::Vae,
                     Box::new(move |row: &[RawInline]| {
                         let r = base_range(&archive.domain, &archive.a_a, sa.get(row));
                         restrict_range(
@@ -545,7 +571,7 @@ where
                     }),
                 ),
                 (Some(se), None, Some(sv), false, true, false) => (
-                    RingCol::VeaC,
+                    SuccinctRotation::Vea,
                     Box::new(move |row: &[RawInline]| {
                         let r = base_range(&archive.domain, &archive.e_a, se.get(row));
                         restrict_range(
@@ -558,7 +584,7 @@ where
                     }),
                 ),
                 (Some(se), Some(sa), None, false, false, true) => (
-                    RingCol::AevC,
+                    SuccinctRotation::Aev,
                     Box::new(move |row: &[RawInline]| {
                         let r = base_range(&archive.domain, &archive.e_a, se.get(row));
                         restrict_range(
@@ -601,13 +627,27 @@ where
             }
         });
 
-        // Evaluate the stream in a tight loop over one matrix.
-        let wm = archive.ring_col(col);
-        let ranks: Vec<usize> = probe_pos
-            .iter()
-            .zip(&probe_val)
-            .map(|(&pos, &d)| wm.rank(pos, d).unwrap())
-            .collect();
+        // A tagged sink is a whole frontier and can amortize an external
+        // batch backend. The sequential engine's plain-value sink remains on
+        // the CPU even when an accelerator is attached.
+        let ranks = match (&*candidates, self.ring_batch) {
+            (CandidateSink::Tagged(_), Some(ring_batch)) => {
+                ring_batch.rank_batch(rotation, &probe_pos, &probe_val)
+            }
+            _ => {
+                let wm = archive.ring_col(rotation);
+                probe_pos
+                    .iter()
+                    .zip(&probe_val)
+                    .map(|(&pos, &d)| wm.rank(pos, d).unwrap())
+                    .collect()
+            }
+        };
+        assert_eq!(
+            ranks.len(),
+            probe_pos.len(),
+            "ring batch backend returned the wrong number of ranks"
+        );
 
         let mut i = 0usize;
         let mut k = 0usize;

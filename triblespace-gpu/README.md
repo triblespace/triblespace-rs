@@ -14,8 +14,90 @@ triblespace-core = { version = "0.47", default-features = false }
 triblespace-gpu = { version = "0.47", default-features = false, features = ["wgpu"] }
 ```
 
+The facade crate also exposes the companion as `triblespace::gpu` when its
+`gpu` feature is enabled. That convenience feature selects WGPU and the Rayon
+query executor together:
+
+```toml
+[dependencies]
+triblespace = { version = "0.47", features = ["gpu"] }
+```
+
 `triblespace-gpu` requires Rust 1.92, matching CubeCL 0.10's declared MSRV.
-This does not raise the GPU-free `triblespace-core` crate's Rust 1.89 MSRV.
+Consequently the facade's `gpu` feature also requires Rust 1.92. This does not
+raise the GPU-free `triblespace-core` crate's Rust 1.89 MSRV.
+
+## Resident query batches
+
+With the `wgpu` feature, `WgpuSuccinctArchive` creates resident mirrors of the
+six Ring wavelet matrices and implements the same `TriblePattern` interface as
+the wrapped CPU archive. Construction prepares the host data and enqueues the
+device transfers; the first rank query provides the synchronization boundary.
+The canonical archive, query planner, domain searches, prefix navigation,
+proposals, estimates, and satisfaction checks remain on the CPU. Only
+whole-frontier `confirm` rank streams use Jerky's resident
+`GpuWaveletMatrix::rank_batch`; scalar queries retain the ordinary CPU path.
+
+```rust,no_run
+# use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+# #[cfg(feature = "wgpu")]
+# use triblespace_gpu::WgpuSuccinctArchive;
+# #[cfg(feature = "wgpu")]
+# fn wrap(archive: SuccinctArchive<OrderedUniverse>) {
+let gpu = WgpuSuccinctArchive::new(archive).expect("prepare succinct archive on WGPU");
+// `pattern!(&gpu, ..)` now uses the same constraint with a WGPU rank backend.
+// `gpu.stats()` reports dispatch/fallback counts and batch-size extrema.
+# let _ = gpu;
+# }
+```
+
+The default admission threshold is 8,192 rank probes (two probes per
+candidate), preserving the historical 4,096-candidate crossover. Smaller
+batches run against the wrapped CPU wavelet matrix. The threshold is explicit
+and hardware-dependent: `with_min_rank_batch(1)` forces every non-empty batch
+to WGPU for parity and fragmentation measurements, while
+`set_min_rank_batch` supports local calibration. Query-buffer upload, dispatch,
+synchronization, and result readback are part of every timed GPU batch; the
+one-time six-matrix preparation and first-query setup are not. Device/query
+failures currently panic because the `Constraint::confirm` protocol has no
+error channel.
+
+The reconvergent-DAG probe demonstrates why admission belongs at this seam.
+Measurements on an M4 Max with 16 Rayon workers (2026-07-13) use deterministic
+fixture IDs, eight timed repetitions per case and scheduler, and a balanced
+rotating order across four cases: the canonical archive, the wrapper forced
+entirely to its CPU rank path, every non-empty rank batch forced to WGPU, and
+the default 8K hybrid. After the one-time canonical/forced setup pair, each
+case receives the same exact-collection pass and tally warm-up. Exact sorted
+result vectors are compared outside timing. Values below are median
+milliseconds with `(min–max)` ranges:
+
+| fixture | scheduler | canonical CPU | wrapper CPU control | forced WGPU rank | 8K hybrid rank |
+|---|---|---:|---:|---:|---:|
+| 41,472 tribles / 1,152 rows | global DAG | 34.82 (33.58–35.56) | 34.39 (33.82–35.56) | 79.10 (77.65–82.69) | 32.21 (31.11–32.93) |
+| 41,472 tribles / 1,152 rows | Rayon DAG | 4.88 (4.78–5.88) | 4.96 (4.82–5.83) | 626.96 (555.54–673.61) | 5.02 (4.76–5.89) |
+| 1,769,472 tribles / 49,152 rows | global DAG | 3,220.11 (3,176.41–3,454.08) | 3,165.88 (3,118.05–3,491.64) | 2,585.21 (2,502.11–2,836.01) | 2,622.16 (2,520.10–2,932.40) |
+| 1,769,472 tribles / 49,152 rows | Rayon DAG | 389.77 (375.89–403.40) | 381.65 (374.00–396.83) | 775.05 (728.51–812.51) | 311.73 (295.17–323.49) |
+
+The small Rayon DAG produces 411 rank batches per timed run, all below the threshold;
+the hybrid therefore stays on CPU and tracks the wrapper control, while forcing
+those tiny batches through synchronizing device dispatches is roughly 126×
+slower. On each large Rayon-DAG timed run, the gate sends 54 batches /
+2,446,016 probes to Metal and retains 371 batches / 994,624 probes on CPU. The
+hybrid is 1.22× faster than its wrapper CPU control (1.25× versus the canonical
+archive), while forcing every non-empty rank batch emitted by the shards to
+WGPU is about 2× slower than CPU. For Rayon-sharded execution, the useful
+result is therefore hybrid admission rather than unconditional offload. The
+large global DAG is different: its 37 batches are all fat enough that forced
+WGPU has the best median, though its range overlaps the hybrid. These are
+one-machine crossover measurements, not portable constants; rerun the probe
+on deployment hardware.
+
+Adapter construction/device enqueue took 15 ms for the small fixture and 22 ms
+for the large one. Those are deliberately not called upload latency: CubeCL's
+buffer writes are asynchronous. The first forced global-DAG query, reported
+separately by the probe, synchronizes deferred transfer and pipeline setup in
+addition to executing the query.
 
 Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
 fork, which exposes immutable external-buffer registration for mmap-to-Metal
@@ -88,6 +170,7 @@ The WGPU parity gate and full structural benchmark are opt-in:
 ```sh
 cargo test -p triblespace-gpu --features wgpu --test wgpu_parity -- --ignored
 cargo run --release -p triblespace-gpu --features wgpu --example archive_merge -- 100000
+cargo run --release --features gpu --example dag_reconverge_bench -- 2048 16 8
 ```
 
 WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL

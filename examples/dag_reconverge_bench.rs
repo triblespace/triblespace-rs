@@ -18,12 +18,21 @@
 //! Usage:
 //!     cargo run --release --example dag_reconverge_bench -- \
 //!         [n_per_pop=48] [z_fan=16] [reps=5]
+//!     cargo run --release --features gpu --example dag_reconverge_bench -- \
+//!         [n_per_pop=48] [z_fan=16] [reps=5]
+//!     # Fat-shard GPU comparison (~1.77M tribles):
+//!     cargo run --release --features gpu --example dag_reconverge_bench -- \
+//!         2048 16 8
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
 //! blocked-v1 / grouped / dag / agglomerative / dag-unmerged on both backends
-//! and prints per mode: median wall time, parity signature, and for the
+//! and prints per mode: min/median/max wall time, parity signature, and for the
 //! frontier engines the group/batch structure, materialized rows, peak live
 //! row-store cells, and the DAG's bucket/merge census.
+//! With `--features gpu`, an additional controlled comparison interleaves the
+//! canonical CPU archive, the WGPU wrapper forced to its CPU rank path, forced
+//! WGPU rank dispatch, and the default gated hybrid. Each case is equally
+//! warmed and checked against the canonical archive by exact sorted output.
 //! Parallel timings include a parallel signature fold, so compare the two
 //! parallel schedulers directly; sequential/parallel ratios are end-to-end
 //! query-plus-consumer throughput rather than isolated engine scaling.
@@ -35,6 +44,8 @@ use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
 use triblespace::core::trible::TribleSet;
+#[cfg(feature = "gpu")]
+use triblespace::gpu::{WgpuQueryStats, WgpuSuccinctArchive, DEFAULT_MIN_RANK_BATCH};
 use triblespace::prelude::*;
 
 mod world {
@@ -92,14 +103,49 @@ fn tally_par<T: std::hash::Hash + Send>(items: impl ParallelIterator<Item = T>) 
         )
 }
 
+/// Deterministic UFOID-shaped IDs keep the archive layout reproducible while
+/// retaining a shared 32-bit locality prefix and pseudo-random suffixes.
+struct FixtureIds {
+    next: u64,
+}
+
+impl FixtureIds {
+    fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    fn splitmix64(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn mint(&mut self) -> ExclusiveId {
+        let counter = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("fixture ID space exhausted");
+
+        let mut raw = [0u8; 16];
+        raw[..4].copy_from_slice(&0xD46A_0001u32.to_be_bytes());
+        raw[4..12].copy_from_slice(&Self::splitmix64(counter).to_be_bytes());
+        raw[12..]
+            .copy_from_slice(&Self::splitmix64(counter ^ 0xD1B5_4A32_D192_ED03).to_be_bytes()[..4]);
+        ExclusiveId::force(Id::new(raw).expect("fixture prefix makes every ID non-nil"))
+    }
+}
+
 fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
     assert!(
         z_fan > 8,
         "z must be chosen after every x (fans go up to 8)"
     );
     let mut kb = TribleSet::new();
-    let markers: Vec<_> = (0..4).map(|_| ufoid()).collect();
-    let z_marker = ufoid();
+    let mut ids = FixtureIds::new();
+    let markers: Vec<_> = (0..4).map(|_| ids.mint()).collect();
+    let z_marker = ids.mint();
     let fans = [1usize, 2, 4, 8];
 
     let mut perms: Vec<[usize; 4]> = Vec::new();
@@ -121,9 +167,9 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
 
     for sigma in &perms {
         for _ in 0..n_per_pop {
-            let e = ufoid();
+            let e = ids.mint();
             for (k, &attr_idx) in sigma.iter().enumerate() {
-                let values: Vec<_> = (0..fans[k]).map(|_| ufoid()).collect();
+                let values: Vec<_> = (0..fans[k]).map(|_| ids.mint()).collect();
                 for v in &values {
                     kb += match attr_idx {
                         0 => entity! { &e @ world::rp1: v },
@@ -141,7 +187,7 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
                     _ => entity! { real @ world::rt4: marker },
                 };
             }
-            let z_values: Vec<_> = (0..z_fan).map(|_| ufoid()).collect();
+            let z_values: Vec<_> = (0..z_fan).map(|_| ids.mint()).collect();
             for v in &z_values {
                 kb += entity! { &e @ world::rs: v };
             }
@@ -208,10 +254,17 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
     }
 }
 
-fn median(v: &[f64]) -> f64 {
+fn timing_summary(v: &[f64]) -> (f64, f64, f64) {
+    assert!(!v.is_empty(), "timing summary requires at least one sample");
     let mut s = v.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    s[s.len() / 2]
+    let middle = s.len() / 2;
+    let median = if s.len().is_multiple_of(2) {
+        (s[middle - 1] + s[middle]) / 2.0
+    } else {
+        s[middle]
+    };
+    (s[0], median, s[s.len() - 1])
 }
 
 fn bench_backend<S: TriblePattern>(
@@ -233,6 +286,7 @@ fn bench_backend<S: TriblePattern>(
     ]);
     let mut sigs = Vec::new();
     let mut meds = Vec::new();
+    let mut ranges = Vec::new();
     for &(_, mode) in &modes {
         let mut times = Vec::new();
         let mut sig = (0, 0);
@@ -242,7 +296,9 @@ fn bench_backend<S: TriblePattern>(
             times.push(t.elapsed().as_secs_f64() * 1e3);
         }
         sigs.push(sig);
-        meds.push(median(&times));
+        let (min, med, max) = timing_summary(&times);
+        meds.push(med);
+        ranges.push((min, max));
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
@@ -250,8 +306,8 @@ fn bench_backend<S: TriblePattern>(
         sigs[0].0,
         if parity { "ok" } else { "MISMATCH" }
     );
-    for ((name, _), median) in modes.iter().zip(&meds) {
-        println!("  {name:<14} {median:>10.3} ms");
+    for (((name, _), median), (min, max)) in modes.iter().zip(&meds).zip(&ranges) {
+        println!("  {name:<14} {median:>10.3} ms  [{min:.3}..{max:.3}]");
     }
     #[cfg(feature = "parallel")]
     {
@@ -288,6 +344,320 @@ fn bench_backend<S: TriblePattern>(
     dag_stats::set_enabled(false);
 }
 
+#[cfg(feature = "gpu")]
+fn format_batch_range(stats: WgpuQueryStats) -> String {
+    match (stats.min_gpu_batch, stats.max_gpu_batch) {
+        (Some(min), Some(max)) => format!("{min}/{max}"),
+        _ => "n/a".to_owned(),
+    }
+}
+
+#[cfg(feature = "gpu")]
+type QueryRow = (
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+    Inline<inlineencodings::GenId>,
+);
+
+/// Collects a full result multiset for the two DAG scheduler shapes used by
+/// the controlled GPU comparison. Callers sort the result before comparison,
+/// because Rayon deliberately does not promise encounter order here.
+#[cfg(feature = "gpu")]
+fn collect_query<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    mode: Mode,
+) -> Vec<QueryRow> {
+    let (k1, k2, k3, k4, kz) = markers;
+    let q = find!(
+        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+        pattern!(kb, [
+            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+            { ?x1 @ world::rt1: k1 },
+            { ?x2 @ world::rt2: k2 },
+            { ?x3 @ world::rt3: k3 },
+            { ?x4 @ world::rt4: k4 },
+            { ?z @ world::rtz: kz }
+        ])
+    );
+    match mode {
+        Mode::Dag => q.solve_dag(),
+        Mode::ParDag => q.into_par_dag_iter().collect(),
+        _ => unreachable!("controlled WGPU comparison only uses DAG schedulers"),
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+struct RankCase {
+    label: &'static str,
+    threshold: Option<usize>,
+}
+
+#[cfg(feature = "gpu")]
+const RANK_CASES: [RankCase; 4] = [
+    RankCase {
+        label: "canonical-cpu",
+        threshold: None,
+    },
+    RankCase {
+        label: "wrapper-cpu-control",
+        threshold: Some(usize::MAX),
+    },
+    RankCase {
+        label: "forced-wgpu-rank",
+        threshold: Some(1),
+    },
+    RankCase {
+        label: "gated-hybrid",
+        threshold: Some(DEFAULT_MIN_RANK_BATCH),
+    },
+];
+
+/// A four-treatment balanced Latin square: across each four-repetition block,
+/// every case occupies every ordinal position and every ordered adjacent pair
+/// occurs once. Later blocks repeat the design deterministically.
+#[cfg(feature = "gpu")]
+const BALANCED_CASE_ORDERS: [[usize; 4]; 4] =
+    [[0, 1, 3, 2], [1, 2, 0, 3], [2, 3, 1, 0], [3, 0, 2, 1]];
+
+#[cfg(feature = "gpu")]
+struct RunMeasurement {
+    elapsed_ms: f64,
+    signature: (usize, u64),
+    stats: Option<WgpuQueryStats>,
+}
+
+#[cfg(feature = "gpu")]
+fn configure_rank_case(case: RankCase, gpu_archive: &mut WgpuSuccinctArchive<OrderedUniverse>) {
+    if let Some(threshold) = case.threshold {
+        gpu_archive.set_min_rank_batch(threshold);
+        gpu_archive.reset_stats();
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn run_rank_case(
+    case: RankCase,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    gpu_archive: &WgpuSuccinctArchive<OrderedUniverse>,
+    markers: (Id, Id, Id, Id, Id),
+    mode: Mode,
+) -> (usize, u64) {
+    if case.threshold.is_some() {
+        run_query(gpu_archive, markers, mode)
+    } else {
+        run_query(archive, markers, mode)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn collect_rank_case(
+    case: RankCase,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    gpu_archive: &WgpuSuccinctArchive<OrderedUniverse>,
+    markers: (Id, Id, Id, Id, Id),
+    mode: Mode,
+) -> Vec<QueryRow> {
+    let mut rows = if case.threshold.is_some() {
+        collect_query(gpu_archive, markers, mode)
+    } else {
+        collect_query(archive, markers, mode)
+    };
+    rows.sort_unstable();
+    rows
+}
+
+#[cfg(feature = "gpu")]
+fn rank_executor(stats: Option<WgpuQueryStats>) -> &'static str {
+    match stats {
+        None => "rank=CPU (canonical)",
+        Some(stats) => match (stats.gpu_dispatches != 0, stats.cpu_fallback_batches != 0) {
+            (true, false) => "rank=GPU",
+            (true, true) => "rank=mixed",
+            (false, true) => "rank=CPU",
+            (false, false) => "rank=none",
+        },
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn case_threshold(case: RankCase) -> String {
+    match case.threshold {
+        None => "canonical".to_owned(),
+        Some(usize::MAX) => "usize::MAX (CPU control)".to_owned(),
+        Some(threshold) => threshold.to_string(),
+    }
+}
+
+/// Measures the global and Rayon-sharded DAG schedulers with a controlled,
+/// interleaved rank-executor comparison.
+///
+/// Construction only measures host preparation and device enqueue. A separate
+/// first forced query accounts for any deferred synchronization and pipeline
+/// setup, outside the timed repetitions. Every policy then receives one exact
+/// collection pass plus one tally warm-up before the rotated timing rounds.
+#[cfg(feature = "gpu")]
+fn bench_wgpu_backend(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    markers: (Id, Id, Id, Id, Id),
+    expected: usize,
+    reps: usize,
+) {
+    let clone_started = Instant::now();
+    let device_source = archive.clone();
+    let clone_elapsed = clone_started.elapsed();
+    let enqueue_started = Instant::now();
+    let mut gpu_archive = WgpuSuccinctArchive::new(device_source)
+        .expect("failed to prepare SuccinctArchive ring columns for WGPU");
+    let enqueue_elapsed = enqueue_started.elapsed();
+    eprintln!(
+        "WGPU host preparation: archive clone {clone_elapsed:?}; adapter construction/device enqueue {enqueue_elapsed:?}",
+    );
+
+    let canonical_setup_signature = run_query(archive, markers, Mode::Dag);
+    gpu_archive.set_min_rank_batch(1);
+    gpu_archive.reset_stats();
+    let ready_started = Instant::now();
+    let ready_signature = run_query(&gpu_archive, markers, Mode::Dag);
+    let ready_elapsed = ready_started.elapsed();
+    let ready_stats = gpu_archive.stats();
+    assert_eq!(
+        ready_signature, canonical_setup_signature,
+        "first WGPU setup query differed from the canonical CPU archive"
+    );
+    eprintln!(
+        "first forced-WGPU DAG query/setup-to-ready: {ready_elapsed:?} (outside timed reps; includes deferred synchronization/pipeline setup; {} dispatches, {} probes)",
+        ready_stats.gpu_dispatches,
+        ready_stats.gpu_probes,
+    );
+
+    let modes = [("dag", Mode::Dag), ("par-dag", Mode::ParDag)];
+    println!(
+        "\n== Controlled SuccinctArchive rank executors ({} Rayon threads) ==",
+        rayon::current_num_threads(),
+    );
+    println!(
+        "   four cases are interleaved in a rotating order; min/median/max cover {reps} timed runs per case"
+    );
+
+    for (mode_index, &(mode_name, mode)) in modes.iter().enumerate() {
+        // Exact output parity is deliberately untimed and stronger than the
+        // compact signature used to guard every timed repetition.
+        configure_rank_case(RANK_CASES[0], &mut gpu_archive);
+        let canonical_rows = collect_rank_case(RANK_CASES[0], archive, &gpu_archive, markers, mode);
+        assert_eq!(
+            canonical_rows.len(),
+            expected,
+            "canonical {mode_name} output count"
+        );
+        let canonical_signature = tally(canonical_rows.iter());
+        for &case in &RANK_CASES[1..] {
+            configure_rank_case(case, &mut gpu_archive);
+            let rows = collect_rank_case(case, archive, &gpu_archive, markers, mode);
+            assert_eq!(
+                rows, canonical_rows,
+                "{} {mode_name} exact output differs from canonical CPU",
+                case.label,
+            );
+        }
+
+        // One additional, equally counted warm-up per policy and scheduler.
+        // Use a different balanced order row for each scheduler mode.
+        for case_index in BALANCED_CASE_ORDERS[mode_index] {
+            let case = RANK_CASES[case_index];
+            configure_rank_case(case, &mut gpu_archive);
+            let warm_signature = run_rank_case(case, archive, &gpu_archive, markers, mode);
+            assert_eq!(
+                warm_signature, canonical_signature,
+                "{} {mode_name} warm-up signature",
+                case.label,
+            );
+        }
+
+        let mut measurements: [Vec<RunMeasurement>; 4] =
+            std::array::from_fn(|_| Vec::with_capacity(reps));
+
+        // The balanced order keeps all four observations adjacent enough to
+        // share a thermal/cache regime without giving any case a fixed ordinal
+        // position or predecessor over a complete four-repetition block.
+        for repetition in 0..reps {
+            let order = BALANCED_CASE_ORDERS[(repetition + mode_index) % RANK_CASES.len()];
+            for case_index in order {
+                let case = RANK_CASES[case_index];
+                configure_rank_case(case, &mut gpu_archive);
+
+                let started = Instant::now();
+                let signature = run_rank_case(case, archive, &gpu_archive, markers, mode);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+                let stats = case.threshold.map(|_| gpu_archive.stats());
+                assert_eq!(
+                    signature,
+                    canonical_signature,
+                    "{} {mode_name} timed repetition {} signature",
+                    case.label,
+                    repetition + 1,
+                );
+                measurements[case_index].push(RunMeasurement {
+                    elapsed_ms,
+                    signature,
+                    stats,
+                });
+            }
+        }
+
+        println!("\n  scheduler: {mode_name} (exact sorted output parity: ok)");
+        for (case_index, case) in RANK_CASES.iter().copied().enumerate() {
+            let runs = &measurements[case_index];
+            let times: Vec<_> = runs.iter().map(|run| run.elapsed_ms).collect();
+            let (min, median, max) = timing_summary(&times);
+            let first_executor = rank_executor(runs[0].stats);
+            let stable_executor = runs
+                .iter()
+                .all(|run| rank_executor(run.stats) == first_executor);
+            println!(
+                "    {:<20} min/median/max {:>9.3}/{:>9.3}/{:>9.3} ms  {}  threshold {}",
+                case.label,
+                min,
+                median,
+                max,
+                if stable_executor {
+                    first_executor
+                } else {
+                    "rank=varies (see runs)"
+                },
+                case_threshold(case),
+            );
+            for (repetition, run) in runs.iter().enumerate() {
+                match run.stats {
+                    None => println!(
+                        "      run {:>2}: {:>9.3} ms  {}  rows {}",
+                        repetition + 1,
+                        run.elapsed_ms,
+                        rank_executor(None),
+                        run.signature.0,
+                    ),
+                    Some(stats) => println!(
+                        "      run {:>2}: {:>9.3} ms  {}  rows {}  GPU dispatches/probes {}/{}; CPU batches/probes {}/{}; GPU batch min/max {}",
+                        repetition + 1,
+                        run.elapsed_ms,
+                        rank_executor(Some(stats)),
+                        run.signature.0,
+                        stats.gpu_dispatches,
+                        stats.gpu_probes,
+                        stats.cpu_fallback_batches,
+                        stats.cpu_fallback_probes,
+                        format_batch_range(stats),
+                    ),
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let n_per_pop: usize = std::env::args()
         .nth(1)
@@ -301,11 +671,14 @@ fn main() {
         .nth(3)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    assert!(reps > 0, "reps must be at least one");
 
     eprintln!(
         "block row cap: {}",
         triblespace::core::query::block_row_cap()
     );
+    #[cfg(feature = "parallel")]
+    eprintln!("Rayon worker threads: {}", rayon::current_num_threads());
 
     let t0 = Instant::now();
     let (kb, markers, expected) = build_world(n_per_pop, z_fan);
@@ -325,4 +698,9 @@ fn main() {
 
     println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
     bench_backend("reconverge 24-route", &archive, markers, expected, reps);
+
+    #[cfg(feature = "gpu")]
+    {
+        bench_wgpu_backend(&archive, markers, expected, reps);
+    }
 }

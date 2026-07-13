@@ -252,6 +252,25 @@ explicit throughput request. This path preserves batches for block-oriented
 and accelerator-backed constraints even when scalar DFS is faster on CPU-only
 workloads.
 
+The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
+putting a device dependency in core. It wraps the canonical archive, keeps its
+six Jerky wavelet matrices resident, and routes tagged `confirm` rank streams
+through a device-neutral `RingBatchQuery`; estimates, proposals, prefix walks,
+domain lookups, satisfaction checks, and scalar sinks remain on CPU. GPU
+admission is per batch (8,192 rank probes by default), so affine sharding may
+still create CPU fallbacks. This is intentional: forcing every Rayon shard to
+emit synchronizing device work for every tiny rank batch is much slower than
+either executor, while fat batches amortize fixed dispatch/readback costs and
+use the device's rank throughput. `WgpuSuccinctArchive::stats` exposes
+dispatches, fallbacks, probe totals, and batch extrema so backend/scheduler
+economics are observable rather than hidden in a planner heuristic.
+On the deterministic 1.77M-trible reconvergence probe (M4 Max, 16 Rayon
+workers), each timed run kept 371 small rank batches on CPU and sent 54 batches
+to Metal, reducing the controlled parallel-DAG median from 382 ms to 312 ms.
+Forcing all 425 non-empty rank batches emitted by the shards to WGPU instead
+took 775 ms, demonstrating that the admission boundary is part of the
+algorithm rather than a backend detail.
+
 A partially consumed ordinary DAG query converted through `into_par_iter()` is
 drained as one parallel leaf so its exact remaining state cannot be restarted.
 The explicit DAG entry point requires a fresh query. With one Rayon worker it

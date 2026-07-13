@@ -1,8 +1,19 @@
+use std::collections::HashSet;
+
+use rayon::prelude::*;
+use triblespace_core::and;
 use triblespace_core::blob::encodings::succinctarchive::{
-    merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
+    merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, RingBatchQuery,
+    SuccinctArchive, SuccinctRotation,
+};
+use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
+use triblespace_core::query::{
+    CandidateSink, Candidates, Constraint, ContainsConstraint, Query, RowsView, TriblePattern,
+    Variable, VariableContext,
 };
 use triblespace_core::trible::{Trible, TribleSet};
-use triblespace_gpu::WgpuWaveletFreeze;
+use triblespace_gpu::{WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletFreeze};
 
 fn trible(seed: u64, ordinal: u64) -> Trible {
     let mut state = seed.wrapping_add(ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -21,6 +32,16 @@ fn trible(seed: u64, ordinal: u64) -> Trible {
     // unconditionally distinct rather than relying on the mixer above.
     data[56..].copy_from_slice(&ordinal.to_be_bytes());
     Trible { data }
+}
+
+fn entity_value(trible: &Trible) -> [u8; 32] {
+    let mut value = [0; 32];
+    value[16..].copy_from_slice(&trible.data[..16]);
+    value
+}
+
+fn inline_value(trible: &Trible) -> [u8; 32] {
+    trible.data[32..].try_into().unwrap()
 }
 
 #[test]
@@ -60,4 +81,163 @@ fn wgpu_merge_is_byte_identical_to_canonical_cpu_merge() {
         );
         assert_eq!(TribleSet::from(&gpu), TribleSet::from(&cpu));
     }
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn wgpu_query_confirm_matches_cpu_and_reports_batch_shape() {
+    let tribles = [trible(0xC0FF_EE00, 0), trible(0xC0FF_EE00, 1)];
+    let mut set = TribleSet::new();
+    for trible in &tribles {
+        set.insert(trible);
+    }
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let mut gpu = WgpuSuccinctArchive::new(archive.clone()).unwrap();
+    let mut context = VariableContext::new();
+    let e: Variable<GenId> = context.next_variable();
+    let a: Variable<GenId> = context.next_variable();
+    let v: Variable<UnknownInline> = context.next_variable();
+    let vars = [e.index];
+    let rows = [entity_value(&tribles[0]), entity_value(&tribles[1])];
+    let view = RowsView::new(&vars, &rows);
+    let candidates: Candidates = vec![
+        (0, inline_value(&tribles[0])),
+        (0, inline_value(&tribles[1])),
+        (1, inline_value(&tribles[0])),
+        (1, inline_value(&tribles[1])),
+    ];
+
+    let expected = {
+        let constraint = archive.pattern(e, a, v);
+        let mut confirmed = candidates.clone();
+        constraint.confirm(v.index, &view, &mut CandidateSink::Tagged(&mut confirmed));
+        confirmed
+    };
+
+    // The default threshold keeps this eight-probe batch on the CPU.
+    let fallback = {
+        let constraint = gpu.pattern(e, a, v);
+        let mut confirmed = candidates.clone();
+        constraint.confirm(v.index, &view, &mut CandidateSink::Tagged(&mut confirmed));
+        confirmed
+    };
+    assert_eq!(fallback, expected);
+    assert_eq!(
+        gpu.stats(),
+        WgpuQueryStats {
+            cpu_fallback_batches: 1,
+            cpu_fallback_probes: 8,
+            ..WgpuQueryStats::default()
+        }
+    );
+
+    gpu.set_min_rank_batch(1);
+    gpu.reset_stats();
+    let accelerated = {
+        let constraint = gpu.pattern(e, a, v);
+        let mut confirmed = candidates;
+        constraint.confirm(v.index, &view, &mut CandidateSink::Tagged(&mut confirmed));
+        confirmed
+    };
+    assert_eq!(accelerated, expected);
+    assert_eq!(
+        gpu.stats(),
+        WgpuQueryStats {
+            gpu_dispatches: 1,
+            gpu_probes: 8,
+            min_gpu_batch: Some(8),
+            max_gpu_batch: Some(8),
+            ..WgpuQueryStats::default()
+        }
+    );
+
+    gpu.reset_stats();
+    assert!(RingBatchQuery::rank_batch(&gpu, SuccinctRotation::Eav, &[], &[]).is_empty());
+    assert_eq!(gpu.stats(), WgpuQueryStats::default());
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn wgpu_query_parallel_dag_matches_canonical_cpu_archive() {
+    let mut set = TribleSet::new();
+    let mut domain = HashSet::new();
+    let shared_attribute: [u8; 16] = trible(0xD46A_DA60, u64::MAX).data[16..32]
+        .try_into()
+        .unwrap();
+    let attribute_domain = HashSet::from([Id::new(shared_attribute).unwrap()]);
+    for ordinal in 0..512 {
+        let mut row = trible(0xD46A_DA60, ordinal);
+        row.data[16..32].copy_from_slice(&shared_attribute);
+        if ordinal % 2 == 0 {
+            domain.insert(Id::new(row.data[..16].try_into().unwrap()).unwrap());
+        }
+        set.insert(&row);
+    }
+    assert_eq!(set.len(), 512, "the parity fixture must not collapse rows");
+    assert_eq!(domain.len(), 256);
+
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let expected = {
+        let mut context = VariableContext::new();
+        let e: Variable<GenId> = context.next_variable();
+        let a: Variable<GenId> = context.next_variable();
+        let v: Variable<UnknownInline> = context.next_variable();
+        let query = Query::new(
+            and!(
+                (&domain).has(e),
+                (&attribute_domain).has(a),
+                archive.pattern(e, a, v)
+            ),
+            move |binding| {
+                Some((
+                    *binding.get(e.index)?,
+                    *binding.get(a.index)?,
+                    *binding.get(v.index)?,
+                ))
+            },
+        );
+        let mut rows = query.sequential().collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(expected.len(), domain.len());
+
+    let gpu = WgpuSuccinctArchive::new(archive.clone())
+        .unwrap()
+        .with_min_rank_batch(1);
+    let mut context = VariableContext::new();
+    let e: Variable<GenId> = context.next_variable();
+    let a: Variable<GenId> = context.next_variable();
+    let v: Variable<UnknownInline> = context.next_variable();
+    let query = Query::new(
+        and!(
+            (&domain).has(e),
+            (&attribute_domain).has(a),
+            gpu.pattern(e, a, v)
+        ),
+        move |binding| {
+            Some((
+                *binding.get(e.index)?,
+                *binding.get(a.index)?,
+                *binding.get(v.index)?,
+            ))
+        },
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let mut actual = pool.install(|| query.into_par_dag_iter().collect::<Vec<_>>());
+    actual.sort_unstable();
+
+    assert_eq!(actual, expected);
+    let stats = gpu.stats();
+    assert!(
+        stats.gpu_dispatches > 0,
+        "forced parallel-DAG query never dispatched a WGPU rank batch: {stats:?}"
+    );
+    assert!(stats.gpu_probes > 0);
+    assert_eq!(stats.cpu_fallback_batches, 0);
+    assert_eq!(stats.cpu_fallback_probes, 0);
 }

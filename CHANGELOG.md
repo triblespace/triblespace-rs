@@ -137,9 +137,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the model and widget runtime. Its WGPU backend is ported to CubeCL 0.10,
   repository builds pin the fork with the immutable external-buffer seam, and
   the crate now declares Rust 1.92 to match CubeCL 0.10. The GPU-free core
-  remains on Rust 1.89. Selecting the fork only makes future mmap-to-Metal
-  query adapters possible; the existing structural merge still uploads its
-  transient rotation and reads canonical packed planes back.
+  remains on Rust 1.89. Core's device-neutral `RingBatchQuery` seam now lets
+  `triblespace-gpu::WgpuSuccinctArchive` keep all six Jerky wavelet matrices
+  resident and execute whole-frontier confirmation ranks in WGPU while the
+  canonical archive, planner, prefix navigation, proposals, estimates, and
+  scalar queries stay on CPU. An 8,192-rank default admission threshold,
+  per-wrapper fallback/fragmentation counters, a CPU fake-backend gate, and a
+  native Metal parity gate keep this hybrid explicit. A deterministic,
+  balanced M4 Max comparison with eight timed repetitions per case on the
+  1.77M-trible reconvergent fixture measured thresholded WGPU DAG Rayon at 312
+  ms versus 382 ms for the same wrapper's CPU rank path (1.22x); exact sorted
+  outputs matched. Per timed run, the gate sent 54 fat batches / 2.45M probes
+  to Metal and retained 371 small batches / 0.99M probes on CPU, while forcing
+  every non-empty rank batch to WGPU took 775 ms. Adapter
+  construction/device enqueue is reported separately from the first
+  synchronizing query rather than mislabeled as upload latency. Selecting the
+  fork still only makes future mmap-to-Metal aliasing possible: both this
+  resident query wrapper and the existing structural merge currently enqueue
+  device copies, and structural merge reads canonical packed planes back.
 - **Succinct-archive structural merge decodes source rows once.** The merger
   now materializes the remapped, deduplicated EAV union and derives the other
   five canonical Ring rotations with stable linear counting sorts. This

@@ -16,6 +16,12 @@ pub use triblespace_net as net;
 #[cfg(feature = "search")]
 pub use triblespace_search as search;
 
+/// Opt-in WGPU acceleration for succinct-archive construction and batched
+/// query confirmation. Gated behind the `gpu` feature, which also enables the
+/// parallel query executor.
+#[cfg(feature = "gpu")]
+pub use triblespace_gpu as gpu;
+
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{

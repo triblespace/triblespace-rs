@@ -4,6 +4,8 @@ use std::fmt;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
+#[cfg(feature = "wgpu")]
+mod succinct_query;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 pub use cubecl_backend::CubeClWaveletFreeze;
@@ -11,6 +13,10 @@ pub use cubecl_backend::CubeClWaveletFreeze;
 pub use cubecl_backend::CudaWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use cubecl_backend::WgpuWaveletFreeze;
+#[cfg(feature = "wgpu")]
+pub use succinct_query::{
+    WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix, DEFAULT_MIN_RANK_BATCH,
+};
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
 const BLOCK_SIZE: u32 = 256;
