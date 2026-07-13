@@ -121,9 +121,18 @@ impl<R> HnswRollup<R>
 where
     R: BlobStoreGet,
 {
+    fn validate_dimension(&self) -> Result<(), ArtifactError> {
+        if self.dim == 0 {
+            Err("HNSW embedding dimension must be greater than zero".into())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Resolve one embedding handle into its vector. A range certifies a
     /// complete projection, so unreadable and wrong-width vectors are errors.
     fn vector_of(&self, h: Inline<EmbHandle>) -> Result<Vec<f32>, ArtifactError> {
+        self.validate_dimension()?;
         let view: View<[f32]> = self
             .reader
             .get::<View<[f32]>, Embedding>(h)
@@ -138,24 +147,27 @@ where
             )
             .into());
         }
+        if v.iter().any(|value| !value.is_finite()) {
+            return Err(format!("embedding {:?} contains a non-finite value", h).into());
+        }
         Ok(v)
     }
 
     /// Build a succinct HNSW blob from an iterator of `(handle,
     /// vector)` pairs. Shared by `build` (over source tribles) and
     /// `merge` (over the segments' node handles).
-    fn build_blob<I>(&self, pairs: I) -> Blob<SuccinctHNSWBlob>
+    fn build_blob<I>(&self, pairs: I) -> Result<Blob<SuccinctHNSWBlob>, ArtifactError>
     where
         I: IntoIterator<Item = (Inline<EmbHandle>, Vec<f32>)>,
     {
         let mut builder = HNSWBuilder::new(self.dim).with_seed(self.seed);
         for (h, v) in pairs {
-            // `insert` only errors on a dim mismatch, which
-            // `vector_of` already excludes; ignore defensively.
-            let _ = builder.insert(h, v);
+            builder
+                .insert(h, v)
+                .map_err(|error| Box::new(error) as ArtifactError)?;
         }
         let idx = builder.build();
-        (&idx).to_blob()
+        Ok((&idx).to_blob())
     }
 }
 
@@ -178,6 +190,7 @@ where
     }
 
     fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+        self.validate_dimension()?;
         // Extract `entity -> Handle<Embedding>` tribles under our
         // attribute, dedup by handle (two entities can share one
         // content-addressed vector), and resolve each to its vector.
@@ -193,7 +206,7 @@ where
         if pairs.is_empty() {
             Ok(Vec::new())
         } else {
-            Ok(vec![self.build_blob(pairs)])
+            Ok(vec![self.build_blob(pairs)?])
         }
     }
 
@@ -239,6 +252,7 @@ where
         &self,
         segments: &[Self::Segment],
     ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
+        self.validate_dimension()?;
         if segments.is_empty() {
             return Ok(Vec::new());
         }
@@ -249,6 +263,14 @@ where
         let mut seen = HashSet::new();
         let mut pairs: Vec<(Inline<EmbHandle>, Vec<f32>)> = Vec::new();
         for seg in segments {
+            if seg.dim() != self.dim {
+                return Err(format!(
+                    "HNSW artifact has dimension {}, expected {}",
+                    seg.dim(),
+                    self.dim
+                )
+                .into());
+            }
             for i in 0..seg.doc_count() {
                 let h = seg.handle(i).expect("node in range");
                 if !seen.insert(h.raw) {
@@ -260,7 +282,7 @@ where
         if pairs.is_empty() {
             Ok(Vec::new())
         } else {
-            Ok(vec![self.build_blob(pairs)])
+            Ok(vec![self.build_blob(pairs)?])
         }
     }
 }
@@ -268,50 +290,90 @@ where
 /// Rank nearest neighbours across several attached HNSW artifacts.
 ///
 /// Each graph proposes candidates independently. The union is deduplicated
-/// and rescored with exact cosine against `query` before sorting.
+/// and rescored with exact cosine against the vector resolved from
+/// `query_handle` before sorting. Resolving one authoritative query source
+/// prevents a caller from walking the graph with one vector and reranking it
+/// with another. Any unreadable, wrong-width, or non-finite vector is an
+/// error; incomplete rankings are never returned as successes.
 pub fn nearest_across<B>(
     segments: &[SuccinctHNSWIndex],
     store: &B,
     query_handle: Inline<EmbHandle>,
-    query: &[f32],
     floor: f32,
-) -> Vec<(f32, Inline<EmbHandle>)>
+) -> Result<Vec<(f32, Inline<EmbHandle>)>, ArtifactError>
 where
     B: BlobStoreGet + Clone,
 {
+    if !floor.is_finite() {
+        return Err("HNSW score floor must be finite".into());
+    }
+    let query: View<[f32]> = store
+        .get::<View<[f32]>, Embedding>(query_handle)
+        .map_err(|error| Box::new(error) as ArtifactError)?;
+    let query = query.as_ref();
+    if query.is_empty() {
+        return Err("HNSW query dimension must be greater than zero".into());
+    }
+    if query.iter().any(|value| !value.is_finite()) {
+        return Err("HNSW query contains a non-finite value".into());
+    }
+    for segment in segments {
+        if segment.dim() == 0 {
+            return Err("HNSW artifact dimension must be greater than zero".into());
+        }
+        if segment.dim() != query.len() {
+            return Err(format!(
+                "HNSW query dimension {}, artifact dimension {}",
+                query.len(),
+                segment.dim()
+            )
+            .into());
+        }
+    }
+
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     for segment in segments {
         let attached = segment.attach(store);
-        let Ok(candidates) = attached.candidates_above(query_handle, floor) else {
-            continue;
-        };
+        let candidates = attached
+            .candidates_above(query_handle, floor)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
         for handle in candidates {
             if !seen.insert(handle.raw) {
                 continue;
             }
-            let Ok(vector): Result<View<[f32]>, _> = store.get::<View<[f32]>, Embedding>(handle)
-            else {
-                continue;
-            };
+            let vector: View<[f32]> = store
+                .get::<View<[f32]>, Embedding>(handle)
+                .map_err(|error| Box::new(error) as ArtifactError)?;
             if vector.len() != query.len() {
-                continue;
+                return Err(format!(
+                    "HNSW candidate {:?} has dimension {}, expected {}",
+                    handle,
+                    vector.len(),
+                    query.len()
+                )
+                .into());
+            }
+            if vector.iter().any(|value| !value.is_finite()) {
+                return Err(
+                    format!("HNSW candidate {:?} contains a non-finite value", handle).into(),
+                );
             }
             let cosine: f32 = query
                 .iter()
                 .zip(vector.iter())
                 .map(|(left, right)| left * right)
                 .sum();
+            if !cosine.is_finite() {
+                return Err(
+                    format!("HNSW candidate {:?} produced a non-finite cosine", handle).into(),
+                );
+            }
             rows.push((cosine, handle));
         }
     }
-    rows.sort_by(|left, right| {
-        right
-            .0
-            .partial_cmp(&left.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    rows
+    rows.sort_by(|left, right| right.0.total_cmp(&left.0));
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -444,7 +506,7 @@ mod tests {
         assert_eq!(segment.doc_count(), table.len());
         let (_, probe, vector) = &table[7];
         let reader = storage.reader().unwrap();
-        let ranked = nearest_across(&[segment], &reader, *probe, vector, 0.0);
+        let ranked = nearest_across(&[segment], &reader, *probe, 0.0).unwrap();
         assert_eq!(ranked[0].1, *probe);
         assert_eq!(ranked[0].1, brute_top1(&table, vector));
     }
@@ -474,7 +536,8 @@ mod tests {
             .iter()
             .take(8)
             .filter(|(_, probe, vector)| {
-                nearest_across(std::slice::from_ref(&merged), &reader, *probe, vector, 0.0)
+                nearest_across(std::slice::from_ref(&merged), &reader, *probe, 0.0)
+                    .unwrap()
                     .first()
                     .map(|row| row.1)
                     == Some(brute_top1(&table, vector))
@@ -504,7 +567,8 @@ mod tests {
             .iter()
             .take(8)
             .filter(|(_, probe, vector)| {
-                nearest_across(&segments, &reader, *probe, vector, 0.0)
+                nearest_across(&segments, &reader, *probe, 0.0)
+                    .unwrap()
                     .first()
                     .map(|row| row.1)
                     == Some(brute_top1(&table, vector))
@@ -561,7 +625,7 @@ mod tests {
         assert_eq!(segments.len(), 2);
         let (_, probe, vector) = &table[0];
         assert_eq!(
-            nearest_across(&segments, &reader, *probe, vector, 0.0)[0].1,
+            nearest_across(&segments, &reader, *probe, 0.0).unwrap()[0].1,
             brute_top1(&table, vector)
         );
     }
@@ -584,7 +648,7 @@ mod tests {
         let reader = storage.reader().unwrap();
         let (_, probe, vector) = &table[0];
         assert_eq!(
-            nearest_across(&[merged], &reader, *probe, vector, 0.0)[0].1,
+            nearest_across(&[merged], &reader, *probe, 0.0).unwrap()[0].1,
             brute_top1(&table, vector)
         );
     }
@@ -608,7 +672,7 @@ mod tests {
         let attached = kind.attach(&reader, &stored).unwrap();
         assert_eq!(attached.doc_count(), 1);
         assert_eq!(
-            nearest_across(&[attached], &reader, handle, &[1.0, 0.0], 0.0)[0].1,
+            nearest_across(&[attached], &reader, handle, 0.0).unwrap()[0].1,
             handle
         );
     }
@@ -642,6 +706,72 @@ mod tests {
         let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
         let error = kind.build(&wrong_dimension).unwrap_err().to_string();
         assert!(error.contains("dimension 3, expected 2"));
+    }
+
+    #[test]
+    fn zero_dimension_and_non_finite_embeddings_are_rejected() {
+        let mut storage = MemoryRepo::default();
+        let zero = HnswRollup::new(storage.reader().unwrap(), 0, emb.id());
+        assert!(zero
+            .build(&TribleSet::new())
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+        assert!(zero
+            .merge(&[])
+            .unwrap_err()
+            .to_string()
+            .contains("greater than zero"));
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (source, _) = stage(&mut storage, emb.id(), *fucid(), vec![1.0, bad]);
+            let kind = HnswRollup::new(storage.reader().unwrap(), 2, emb.id());
+            assert!(kind
+                .build(&source)
+                .unwrap_err()
+                .to_string()
+                .contains("non-finite"));
+        }
+    }
+
+    #[test]
+    fn nearest_across_surfaces_invalid_queries_and_candidate_read_failures() {
+        let mut source_storage = MemoryRepo::default();
+        let (source, _) = stage(&mut source_storage, emb.id(), *fucid(), vec![1.0, 0.0]);
+        let source_kind = HnswRollup::new(source_storage.reader().unwrap(), 2, emb.id());
+        let segment = build_segment(&source_kind, &source);
+
+        let mut query_storage = MemoryRepo::default();
+        let query = put_embedding(&mut query_storage, vec![0.0, 1.0]).unwrap();
+        let reader = query_storage.reader().unwrap();
+        assert!(nearest_across(std::slice::from_ref(&segment), &reader, query, 0.0).is_err());
+
+        let wrong_width = put_embedding(&mut query_storage, vec![0.0, 1.0, 0.0]).unwrap();
+        let reader = query_storage.reader().unwrap();
+        assert!(
+            nearest_across(std::slice::from_ref(&segment), &reader, wrong_width, 0.0,)
+                .unwrap_err()
+                .to_string()
+                .contains("query dimension")
+        );
+
+        let non_finite = put_embedding(&mut query_storage, vec![f32::NAN, 0.0]).unwrap();
+        let reader = query_storage.reader().unwrap();
+        assert!(
+            nearest_across(std::slice::from_ref(&segment), &reader, non_finite, 0.0,)
+                .unwrap_err()
+                .to_string()
+                .contains("non-finite")
+        );
+        assert!(nearest_across(
+            std::slice::from_ref(&segment),
+            &reader,
+            non_finite,
+            f32::NAN,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("score floor"));
     }
 
     #[test]
