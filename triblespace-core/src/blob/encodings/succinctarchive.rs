@@ -113,9 +113,10 @@ impl MetaDescribe for SuccinctArchiveRank9IndexBlob {
 #[repr(C)]
 /// Serialisation metadata trailer for a [`SuccinctArchive`].
 ///
-/// Stored at the very end of the blob; the `D` parameter captures the
-/// domain (universe) metadata layout. Additive data may precede this trailer,
-/// but its bytes and EOF position remain the compatibility anchor.
+/// Stored at the very end of the canonical raw [`SuccinctArchiveBlob`]; the
+/// `D` parameter captures the domain (universe) metadata layout. Accelerator
+/// bytes never occur before this trailer: its exact EOF position is part of
+/// the raw archive's content identity.
 pub struct SuccinctArchiveMeta<D: Metadata> {
     /// Number of distinct entities in the archive.
     pub entity_count: usize,
@@ -313,7 +314,7 @@ fn try_finalize_rank9_index(
     let table_end = table_handle
         .offset
         .checked_add(table_handle.len)
-        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table position overflow"))?;
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 index table position overflow"))?;
     table.freeze().map_err(jerky::error::Error::from)?;
 
     let mut footer = writer
@@ -485,7 +486,7 @@ fn expected_rank9_index_count<D: Metadata>(
         }
         count = count
             .checked_add(matrix.alph_width)
-            .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar count overflow"))?;
+            .ok_or_else(|| invalid_rank9_metadata("Rank9 index count overflow"))?;
     }
     Ok(count)
 }
@@ -599,7 +600,7 @@ fn validate_rank9_index_handles<D: Metadata>(
     let expected_count = expected_rank9_index_count(meta)?;
     if handles.len() != expected_count {
         return Err(invalid_rank9_metadata(format!(
-            "Rank9 sidecar table has {} handles, expected {expected_count}",
+            "Rank9 index table has {} handles, expected {expected_count}",
             handles.len()
         )));
     }
@@ -1508,7 +1509,7 @@ trait MergedWaveletOutputs {
 
     fn finish_rotation(&mut self, rotation: SuccinctRotation) -> Result<(), Self::Error>;
 
-    fn freeze_with_rank9_sidecars(
+    fn freeze_with_rank9_indexes(
         self,
         writer: &mut SectionWriter<'_>,
     ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error>;
@@ -1577,7 +1578,7 @@ impl MergedWaveletOutputs for JerkyWaveletOutputs<'_> {
         Ok(())
     }
 
-    fn freeze_with_rank9_sidecars(
+    fn freeze_with_rank9_indexes(
         self,
         writer: &mut SectionWriter<'_>,
     ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
@@ -1670,7 +1671,7 @@ impl<'area> PackedWaveletBuilder<'area> {
         }
     }
 
-    fn freeze_with_rank9_sidecars(
+    fn freeze_with_rank9_indexes(
         self,
         writer: &mut SectionWriter<'_>,
     ) -> (WaveletMatrixMeta, Vec<SectionHandle<usize>>) {
@@ -1971,14 +1972,14 @@ impl MergedWaveletOutputs for PackedCpuWaveletOutputs<'_> {
         Ok(())
     }
 
-    fn freeze_with_rank9_sidecars(
+    fn freeze_with_rank9_indexes(
         self,
         writer: &mut SectionWriter<'_>,
     ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
         let mut metadata = Vec::with_capacity(SuccinctRotation::ALL.len());
         let mut handles = Vec::new();
         for builder in self.builders {
-            let (meta, layer_handles) = builder.freeze_with_rank9_sidecars(writer);
+            let (meta, layer_handles) = builder.freeze_with_rank9_indexes(writer);
             metadata.push(meta);
             handles.extend(layer_handles);
         }
@@ -2076,14 +2077,14 @@ where
         Ok(())
     }
 
-    fn freeze_with_rank9_sidecars(
+    fn freeze_with_rank9_indexes(
         self,
         writer: &mut SectionWriter<'_>,
     ) -> Result<([WaveletMatrixMeta; 6], Vec<SectionHandle<usize>>), Self::Error> {
         let mut metadata = Vec::with_capacity(SuccinctRotation::ALL.len());
         let mut handles = Vec::new();
         for builder in self.builders {
-            let (meta, layer_handles) = builder.freeze_with_rank9_sidecars(writer);
+            let (meta, layer_handles) = builder.freeze_with_rank9_indexes(writer);
             metadata.push(meta);
             handles.extend(layer_handles);
         }
@@ -2366,7 +2367,7 @@ where
         ],
     );
     let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
-        wavelets.freeze_with_rank9_sidecars(&mut rank9_sections)?;
+        wavelets.freeze_with_rank9_indexes(&mut rank9_sections)?;
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
@@ -2656,7 +2657,7 @@ where
         ],
     );
     let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
-        wavelets.freeze_with_rank9_sidecars(&mut rank9_sections)?;
+        wavelets.freeze_with_rank9_indexes(&mut rank9_sections)?;
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
@@ -3861,7 +3862,7 @@ mod tests {
                 parallel.finish_rotation(rotation).unwrap();
             }
             parallel
-                .freeze_with_rank9_sidecars(&mut parallel_sections)
+                .freeze_with_rank9_indexes(&mut parallel_sections)
                 .unwrap();
             drop(parallel_sections);
             parallel_area.freeze().unwrap().as_ref().to_vec()
@@ -3885,7 +3886,7 @@ mod tests {
             reference.finish_rotation(rotation).unwrap();
         }
         reference
-            .freeze_with_rank9_sidecars(&mut reference_sections)
+            .freeze_with_rank9_indexes(&mut reference_sections)
             .unwrap();
         drop(reference_sections);
         let reference_bytes = reference_area.freeze().unwrap();

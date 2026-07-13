@@ -1,9 +1,13 @@
 use triblespace::core::blob::encodings::succinctarchive::{
     CompressedUniverse, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
-    SuccinctArchiveRank9IndexBlob,
 };
-use triblespace::core::blob::{Blob, Bytes};
+use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::blob::{Blob, Bytes, MemoryBlobStore};
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::Inline;
+use triblespace::core::repo::{reachable, BlobStore, BlobStoreGet};
 use triblespace::core::trible::{Trible, TribleSet};
+use triblespace::prelude::blobencodings::SuccinctArchiveRank9IndexBlob;
 
 type RawTrible = [u8; 64];
 
@@ -43,6 +47,36 @@ fn rank9_blob_starts_with_its_source_handle_and_pair_roundtrips() {
 
     let archive = SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap();
     assert_eq!(archive.iter().collect::<TribleSet>(), expected);
+}
+
+#[test]
+fn rank9_root_discovers_and_retains_its_raw_archive() {
+    let (raw, rank9) = pair(5);
+    let mut store = MemoryBlobStore::new();
+    let raw_handle = store.insert(raw);
+    let rank9_handle = store.insert(rank9);
+    let orphan_handle = store.insert(Blob::<UnknownBlob>::new(Bytes::from_source(vec![0xA5; 64])));
+
+    let root: Inline<Handle<UnknownBlob>> = rank9_handle.transmute();
+    let raw_unknown: Inline<Handle<UnknownBlob>> = raw_handle.transmute();
+    let reader = store.reader().unwrap();
+    let reachable_from_rank9: Vec<_> = reachable(&reader, [root]).collect();
+    assert_eq!(reachable_from_rank9[0], root);
+    assert!(reachable_from_rank9.contains(&raw_unknown));
+    assert_eq!(reachable_from_rank9.len(), 2);
+
+    store.keep(reachable(&reader, [root]));
+    let retained = store.reader().unwrap();
+    assert_eq!(retained.len(), 2);
+    assert!(retained
+        .get::<Blob<SuccinctArchiveRank9IndexBlob>, SuccinctArchiveRank9IndexBlob>(rank9_handle)
+        .is_ok());
+    assert!(retained
+        .get::<Blob<SuccinctArchiveBlob>, SuccinctArchiveBlob>(raw_handle)
+        .is_ok());
+    assert!(retained
+        .get::<Blob<UnknownBlob>, UnknownBlob>(orphan_handle)
+        .is_err());
 }
 
 #[test]
