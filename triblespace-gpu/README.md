@@ -27,6 +27,75 @@ triblespace = { version = "0.47", features = ["gpu"] }
 Consequently the facade's `gpu` feature also requires Rust 1.92. This does not
 raise the GPU-free `triblespace-core` crate's Rust 1.89 MSRV.
 
+## Experimental CubeCL CPU probe
+
+The non-default `cpu` feature exists only to measure CubeCL's MLIR/LLVM CPU
+runtime against WGPU; no production TribleSpace backend selects it. The focused
+probe runs the same independent `rank1(position)` kernel on both runtimes,
+checks exact output parity, and reports first-observed and warm timings for
+near-core and GPU-like cube dimensions plus explicit row-vector widths:
+
+```sh
+cargo run --release -p triblespace-gpu --features cpu,wgpu \
+  --example cpu_runtime_probe
+```
+
+CubeCL 0.10's CPU compiler currently leaves atomic operations unimplemented.
+Its advertised plane size is one, `sync_plane` is a no-op, and other plane
+operations are unsupported. The probe deliberately does not hide those gaps
+behind serial atomics or a pretend plane scan: a resident cross-backend query
+engine needs backend-specific scan/compact primitives or upstream CPU-runtime
+support. This makes the current CPU runtime useful for checking the shared
+row-homomorphic kernel algebra, while its suitability as a performance backend
+must be established empirically rather than assumed from LLVM code generation.
+
+On an M4 Max with 16 workers (2026-07-13), the deterministic release probe used
+1,048,576 positions over a 4,194,304-bit vector. Every measured configuration
+was checked exactly against the native scalar result. The table reports the
+median of seven warm launch/synchronization/readback measurements; `vec` is the
+explicit number of query rows handled by each CubeCL unit:
+
+| runtime | cube | vec | warm median |
+|---|---:|---:|---:|
+| CubeCL CPU | 16 | 1 | 1.473 ms |
+| CubeCL CPU | 256 | 1 | **1.297 ms** |
+| CubeCL CPU | 16 | 2 | 1.399 ms |
+| CubeCL CPU | 256 | 2 | 1.450 ms |
+| CubeCL CPU | 16 | 4 | 1.380 ms |
+| CubeCL CPU | 256 | 4 | 1.396 ms |
+| WGPU/Metal | 16 | 1 | 2.706 ms |
+| WGPU/Metal | 256 | 1 | 1.365 ms |
+| WGPU/Metal | 16 | 2 | 1.333 ms |
+| WGPU/Metal | 256 | 2 | 1.329 ms |
+| WGPU/Metal | 16 | 4 | **1.318 ms** |
+| WGPU/Metal | 256 | 4 | 1.369 ms |
+
+The warmed native controls were 9.568 ms scalar and 1.374 ms through Rayon.
+Thus the CubeCL CPU runtime is already a credible *performance* executor for
+this independent, scattered rank stage, not merely a correctness oracle. Its
+best result matched both Rayon and Metal. Neither explicit vector widths nor
+GPU-like cubes improved CPU consistently; the scattered data-dependent loads
+leave little regular SIMD work, while the CPU runtime's worker scheduler
+already distributes cubes. On Metal, a width-16 scalar launch creates 65,536
+workgroups and is clearly too fine; either 256-wide cubes or packing multiple
+rows per unit removes that penalty.
+
+The first CPU launch in a fresh process took 34.6 ms and subsequent first
+observations of a new geometry/vector variant took 14.9–17.8 ms, exposing the
+MLIR/LLVM JIT cost. CPU resident setup/enqueue was 9.4 ms. WGPU setup/enqueue
+was 15.5 ms and its first observed scalar launch took 8.2 ms. These first-use
+figures are cache-order observations rather than independent cold processes;
+warm medians are the controlled comparison.
+
+The opt-in CPU feature is also expensive to distribute. Relative to this
+crate's WGPU graph it added 116 package/version entries on the measured Cargo
+resolution, including `cubecl-cpu`, `cubecl-opt`, `tracel-llvm`, MLIR bindings,
+the LLVM bundler, bindgen, and their download stack. With this repository's
+debug-enabled release profile, the combined CPU/WGPU probe binary was 151 MiB.
+The initial combined release build in a fresh worktree target took 55 seconds
+on the same host. Those costs reinforce keeping `cpu` experimental and
+non-default even though its warm row-kernel performance is promising.
+
 ## Resident query batches
 
 With the `wgpu` feature, `WgpuSuccinctArchive` creates resident mirrors of the

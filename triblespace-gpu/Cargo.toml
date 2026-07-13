@@ -19,6 +19,9 @@ features = ["wgpu", "cuda"]
 default = []
 wgpu = ["dep:cubecl", "cubecl/wgpu", "dep:jerky"]
 cuda = ["dep:cubecl", "cubecl/cuda"]
+# Experimental only: this enables CubeCL's MLIR/LLVM CPU runtime for the
+# `cpu_runtime_probe` example. No production backend selects it.
+cpu = ["dep:cubecl", "cubecl/cpu"]
 
 [dependencies]
 cubecl = { version = "=0.10.0", default-features = false, features = ["std"], optional = true }
@@ -36,6 +39,10 @@ required-features = ["wgpu"]
 [[example]]
 name = "frontier_program"
 required-features = ["wgpu"]
+
+[[example]]
+name = "cpu_runtime_probe"
+required-features = ["cpu", "wgpu"]
 
 [[test]]
 name = "wgpu_parity"

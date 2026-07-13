@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An opt-in CubeCL CPU-runtime probe compares one rank-style kernel across
+  MLIR/LLVM CPU and WGPU.** The `triblespace-gpu` `cpu` feature remains outside
+  production defaults and exists to run `cpu_runtime_probe`, which checks exact
+  cross-backend parity and measures first-observed versus warm launches,
+  near-core versus GPU-like cube widths, and legal explicit row-vector widths.
+  The probe records CubeCL 0.10 CPU's missing atomics and plane operations as a
+  blocker for a portable resident frontier/scan rather than emulating them with
+  unsafe or misleading semantics.
+
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
