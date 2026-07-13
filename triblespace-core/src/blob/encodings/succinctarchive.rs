@@ -12,6 +12,7 @@ use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::UnknownInline;
 use crate::inline::Encodes;
 use crate::inline::Inline;
@@ -82,6 +83,32 @@ impl MetaDescribe for SuccinctArchiveBlob {
     }
 }
 
+/// Persisted Rank9/select accelerator for one exact [`SuccinctArchiveBlob`].
+///
+/// The first 32 bytes are the source archive's content handle. Keeping that
+/// dependency at aligned offset zero makes ordinary blob reachability follow
+/// the accelerator to its raw archive without format-specific traversal code.
+/// The remaining bytes are native-ABI Rank9 payloads and their relative
+/// section table; unlike [`SuccinctArchiveBlob`], this representation is an
+/// explicitly replaceable accelerator rather than part of the archive's
+/// content identity.
+pub struct SuccinctArchiveRank9IndexBlob;
+
+impl BlobEncoding for SuccinctArchiveRank9IndexBlob {}
+
+impl MetaDescribe for SuccinctArchiveRank9IndexBlob {
+    fn describe() -> Fragment {
+        // Minted with `trible genid` on 2026-07-13.
+        let id: Id = id_hex!("9F22887EAA90E13E646147353DFCDE06");
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "succinctarchive-rank9-index",
+                metadata::description: "Native-ABI Rank9/select accelerator for one exact SuccinctArchiveBlob. The source archive handle occupies the first 32 bytes so reachability follows the dependency generically; the remaining versioned payload is replaceable and excluded from the raw archive's identity.",
+                metadata::tag: metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 /// Serialisation metadata trailer for a [`SuccinctArchive`].
@@ -130,24 +157,40 @@ pub struct SuccinctArchiveMeta<D: Metadata> {
     pub aev_c: WaveletMatrixMeta,
 }
 
-/// Stable marker for the optional Rank9/select sidecar footer.
-///
-/// Minted with `trible genid` on 2026-07-12. The raw bytes are compared before
-/// the surrounding footer is interpreted, so an archive written by an older
-/// binary continues down the legacy rebuild path.
-const RANK9_SIDECAR_MARKER: [u8; 16] = [
-    0x6B, 0xE4, 0xFF, 0xC8, 0xE6, 0xF5, 0xA5, 0x1A, 0x12, 0x94, 0xBE, 0x9B, 0x0F, 0x49, 0x8F, 0xEA,
+/// Stable marker for the detached Rank9 index format, minted with
+/// `trible genid` on 2026-07-13.
+const RANK9_INDEX_MARKER: [u8; 16] = [
+    0xFE, 0xFF, 0x44, 0xEF, 0x2D, 0x61, 0xBD, 0x45, 0x0F, 0xE2, 0x54, 0xA0, 0xAA, 0xE8, 0xB4, 0xA5,
 ];
-const RANK9_SIDECAR_VERSION: u32 = 1;
-const RANK9_SIDECAR_FLAGS: u32 = 0;
+const RANK9_INDEX_VERSION: u32 = 1;
+const RANK9_INDEX_FLAGS: u32 = 0;
+#[cfg(target_endian = "little")]
+const RANK9_INDEX_ENDIAN: u8 = 1;
+#[cfg(target_endian = "big")]
+const RANK9_INDEX_ENDIAN: u8 = 2;
 const TOP_LEVEL_RANK9_INDEX_COUNT: usize = 9;
 
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
-struct Rank9SidecarFooter {
+struct Rank9IndexHeader {
+    source: [u8; 32],
     marker: [u8; 16],
     version: u32,
     flags: u32,
+    word_bytes: u8,
+    endian: u8,
+    reserved: [u8; 6],
+}
+
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
+struct Rank9IndexFooter {
+    marker: [u8; 16],
+    version: u32,
+    flags: u32,
+    word_bytes: u8,
+    endian: u8,
+    reserved: [u8; 6],
     indexes: SectionHandle<SectionHandle<usize>>,
 }
 
@@ -219,17 +262,49 @@ fn persist_top_level_rank9_indexes(
         .collect()
 }
 
-/// Writes the one canonical sidecar table/footer and the unchanged EOF
-/// metadata trailer. Every archive construction backend funnels through this
-/// function after all legacy raw sections have been reserved.
+fn reserve_rank9_index_header<'area>(
+    writer: &mut SectionWriter<'area>,
+) -> Section<'area, Rank9IndexHeader> {
+    let mut header = writer
+        .reserve::<Rank9IndexHeader>(1)
+        .expect("temporary Rank9 arena must remain writable");
+    assert_eq!(header.handle().offset, 0, "source handle must be first");
+    header[0] = Rank9IndexHeader {
+        source: [0; 32],
+        marker: RANK9_INDEX_MARKER,
+        version: RANK9_INDEX_VERSION,
+        flags: RANK9_INDEX_FLAGS,
+        word_bytes: std::mem::size_of::<usize>() as u8,
+        endian: RANK9_INDEX_ENDIAN,
+        reserved: [0; 6],
+    };
+    header
+}
+
+/// Appends the canonical EOF metadata trailer to the raw archive. Rank/select
+/// structures deliberately live in a different blob and cannot affect this
+/// blob's content identity.
 fn try_finalize_succinct_archive<D>(
     writer: &mut SectionWriter<'_>,
     meta: &SuccinctArchiveMeta<D>,
-    index_handles: &[SectionHandle<usize>],
 ) -> Result<(), jerky::error::Error>
 where
     D: Metadata + Clone,
 {
+    let mut meta_section = writer
+        .reserve::<SuccinctArchiveMeta<D>>(1)
+        .map_err(jerky::error::Error::from)?;
+    meta_section.as_mut_slice()[0] = meta.clone();
+    meta_section.freeze().map_err(jerky::error::Error::from)?;
+    Ok(())
+}
+
+/// Appends the relative index table and exact native-ABI footer to a detached
+/// Rank9 blob. Its fixed header must already occupy offset zero.
+fn try_finalize_rank9_index(
+    writer: &mut SectionWriter<'_>,
+    index_handles: &[SectionHandle<usize>],
+) -> Result<(), jerky::error::Error> {
     let mut table = writer
         .reserve::<SectionHandle<usize>>(index_handles.len())
         .map_err(jerky::error::Error::from)?;
@@ -241,71 +316,32 @@ where
         .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table position overflow"))?;
     table.freeze().map_err(jerky::error::Error::from)?;
 
-    // Keep the footer immediately adjacent to the possibly more-aligned
-    // generic metadata trailer. Padding belongs before the footer and is
-    // explicitly zeroed so there is only one canonical representation.
-    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
-    let meta_align = std::mem::align_of::<SuccinctArchiveMeta<D>>();
-    let meta_start = checked_align_up(
-        table_end
-            .checked_add(footer_size)
-            .ok_or_else(|| invalid_rank9_metadata("Rank9 footer position overflow"))?,
-        meta_align,
-    )?;
-    let footer_start = meta_start - footer_size;
-    let padding_len = footer_start - table_end;
-    if padding_len != 0 {
-        let mut padding = writer
-            .reserve::<u8>(padding_len)
-            .map_err(jerky::error::Error::from)?;
-        padding.as_mut_slice().fill(0);
-        if padding.handle().offset != table_end {
-            return Err(invalid_rank9_metadata(
-                "Rank9 trailer padding has an unexpected alignment gap",
-            ));
-        }
-        padding.freeze().map_err(jerky::error::Error::from)?;
-    }
-
     let mut footer = writer
-        .reserve::<Rank9SidecarFooter>(1)
+        .reserve::<Rank9IndexFooter>(1)
         .map_err(jerky::error::Error::from)?;
-    if footer.handle().offset != footer_start {
+    if footer.handle().offset != table_end {
         return Err(invalid_rank9_metadata(
             "Rank9 footer has an unexpected alignment gap",
         ));
     }
-    footer.as_mut_slice()[0] = Rank9SidecarFooter {
-        marker: RANK9_SIDECAR_MARKER,
-        version: RANK9_SIDECAR_VERSION,
-        flags: RANK9_SIDECAR_FLAGS,
+    footer.as_mut_slice()[0] = Rank9IndexFooter {
+        marker: RANK9_INDEX_MARKER,
+        version: RANK9_INDEX_VERSION,
+        flags: RANK9_INDEX_FLAGS,
+        word_bytes: std::mem::size_of::<usize>() as u8,
+        endian: RANK9_INDEX_ENDIAN,
+        reserved: [0; 6],
         indexes: table_handle,
     };
     footer.freeze().map_err(jerky::error::Error::from)?;
-
-    let mut meta_section = writer
-        .reserve::<SuccinctArchiveMeta<D>>(1)
-        .map_err(jerky::error::Error::from)?;
-    if meta_section.handle().offset != meta_start {
-        return Err(invalid_rank9_metadata(
-            "succinct archive metadata has an unexpected alignment gap",
-        ));
-    }
-    meta_section.as_mut_slice()[0] = meta.clone();
-    meta_section
-        .freeze()
-        .map_err(jerky::error::Error::from)?;
     Ok(())
 }
 
-fn finalize_succinct_archive<D>(
-    writer: &mut SectionWriter<'_>,
-    meta: &SuccinctArchiveMeta<D>,
-    index_handles: &[SectionHandle<usize>],
-) where
+fn finalize_succinct_archive<D>(writer: &mut SectionWriter<'_>, meta: &SuccinctArchiveMeta<D>)
+where
     D: Metadata + Clone,
 {
-    try_finalize_succinct_archive(writer, meta, index_handles)
+    try_finalize_succinct_archive(writer, meta)
         .expect("temporary archive arena must remain writable");
 }
 
@@ -351,8 +387,10 @@ where
 /// `pattern!` queries alongside regular [`TribleSet`]s.
 #[derive(Debug, Clone)]
 pub struct SuccinctArchive<U> {
-    /// The underlying blob bytes (shared, zero-copy).
+    /// The canonical raw archive blob bytes (shared, zero-copy).
     pub bytes: Bytes,
+    /// Detached persisted Rank9/select accelerator bytes.
+    rank9_index_bytes: Bytes,
     /// The universe — maps integer codes to raw 32-byte values (the
     /// domain of all distinct values appearing in E, A, or V positions).
     pub domain: U,
@@ -534,11 +572,29 @@ fn validate_raw_rank9_sources<D: Metadata>(
     Ok(raw_end)
 }
 
-fn validate_rank9_index_handles<D: Metadata>(
+fn validate_raw_archive<D: Metadata>(
     meta: &SuccinctArchiveMeta<D>,
     bytes: &Bytes,
+    meta_start: usize,
+) -> Result<usize, jerky::error::Error> {
+    let raw_end = validate_raw_rank9_sources(meta, bytes, meta_start)?;
+    let expected_meta_start =
+        checked_align_up(raw_end, std::mem::align_of::<SuccinctArchiveMeta<D>>())?;
+    if meta_start != expected_meta_start {
+        return Err(invalid_rank9_metadata(format!(
+            "raw archive metadata starts at {meta_start}, expected {expected_meta_start}"
+        )));
+    }
+    ensure_zero_bytes(bytes, raw_end..meta_start, "raw archive metadata padding")?;
+    Ok(raw_end)
+}
+
+fn validate_rank9_index_handles<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+    raw_bytes: &Bytes,
+    index_bytes: &Bytes,
     handles: &[SectionHandle<usize>],
-    sidecar_limit: usize,
+    index_limit: usize,
 ) -> Result<usize, jerky::error::Error> {
     let expected_count = expected_rank9_index_count(meta)?;
     if handles.len() != expected_count {
@@ -550,60 +606,120 @@ fn validate_rank9_index_handles<D: Metadata>(
 
     let first = handles
         .first()
-        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table is empty"))?;
-    checked_section_range(*first, sidecar_limit, "first Rank9 sidecar")?;
-    let raw_end = validate_raw_rank9_sources(meta, bytes, first.offset)?;
-    let expected_start = checked_align_up(raw_end, std::mem::align_of::<usize>())?;
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 index table is empty"))?;
+    checked_section_range(*first, index_limit, "first Rank9 index")?;
+    let expected_start = checked_align_up(
+        std::mem::size_of::<Rank9IndexHeader>(),
+        std::mem::align_of::<usize>(),
+    )?;
     if first.offset != expected_start {
         return Err(invalid_rank9_metadata(format!(
-            "first Rank9 sidecar starts at {}, expected {expected_start}",
+            "first Rank9 index starts at {}, expected {expected_start}",
             first.offset
         )));
     }
-    ensure_zero_bytes(bytes, raw_end..expected_start, "raw-to-sidecar gap")?;
+    ensure_zero_bytes(
+        index_bytes,
+        std::mem::size_of::<Rank9IndexHeader>()..expected_start,
+        "Rank9 header-to-index gap",
+    )?;
 
     let mut cursor = expected_start;
     for (position, handle) in handles.iter().copied().enumerate() {
         if handle.offset != cursor {
             return Err(invalid_rank9_metadata(format!(
-                "Rank9 sidecar {position} starts at {}, expected {cursor}",
+                "Rank9 index {position} starts at {}, expected {cursor}",
                 handle.offset
             )));
         }
         if handle.len == 0 {
             return Err(invalid_rank9_metadata(format!(
-                "Rank9 sidecar {position} is empty"
+                "Rank9 index {position} is empty"
             )));
         }
         cursor =
-            checked_section_range(handle, sidecar_limit, &format!("Rank9 sidecar {position}"))?.end;
+            checked_section_range(handle, index_limit, &format!("Rank9 index {position}"))?.end;
     }
+
+    // Rank9's own loader checks the exact native layout, rank totals, select
+    // hints, and unused bits against each corresponding raw bit-vector.
+    let mut handle_cursor = 0usize;
+    for raw_meta in top_level_bitvector_meta(meta) {
+        let data = BitVectorData::from_bytes(raw_meta, raw_bytes.clone())?;
+        Rank9SelIndex::<true, true>::from_bytes_for_data(
+            &data,
+            handles[handle_cursor].bytes(index_bytes),
+        )?;
+        handle_cursor += 1;
+    }
+    for matrix in wavelet_meta(meta) {
+        let layers = matrix.layers.view(raw_bytes)?;
+        for layer in layers.iter().copied() {
+            let data = BitVectorData::from_bytes(
+                BitVectorDataMeta {
+                    handle: layer,
+                    len: matrix.len,
+                },
+                raw_bytes.clone(),
+            )?;
+            Rank9SelIndex::<true, true>::from_bytes_for_data(
+                &data,
+                handles[handle_cursor].bytes(index_bytes),
+            )?;
+            handle_cursor += 1;
+        }
+    }
+    debug_assert_eq!(handle_cursor, handles.len());
     Ok(cursor)
 }
 
-fn probe_rank9_sidecar_footer<D: Metadata>(
+fn parse_rank9_index<D: Metadata>(
     meta: &SuccinctArchiveMeta<D>,
-    bytes: &Bytes,
-    meta_start: usize,
-) -> Result<Option<Vec<SectionHandle<usize>>>, jerky::error::Error> {
-    let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
-    let Some(footer_start) = meta_start.checked_sub(footer_size) else {
-        return Ok(None);
-    };
-    let marker_end = footer_start + RANK9_SIDECAR_MARKER.len();
-    if bytes.as_ref()[footer_start..marker_end] != RANK9_SIDECAR_MARKER {
-        return Ok(None);
+    raw_bytes: &Bytes,
+    source: Inline<Handle<SuccinctArchiveBlob>>,
+    index_bytes: &Bytes,
+) -> Result<Vec<SectionHandle<usize>>, jerky::error::Error> {
+    let header_size = std::mem::size_of::<Rank9IndexHeader>();
+    let footer_size = std::mem::size_of::<Rank9IndexFooter>();
+    if index_bytes.len() < header_size + footer_size {
+        return Err(invalid_rank9_metadata("Rank9 index blob is truncated"));
+    }
+    let header = *index_bytes
+        .clone()
+        .slice(0..header_size)
+        .view::<Rank9IndexHeader>()?;
+    if header.source != source.raw {
+        return Err(invalid_rank9_metadata(
+            "Rank9 index source handle does not match the raw archive",
+        ));
+    }
+    if header.marker != RANK9_INDEX_MARKER
+        || header.version != RANK9_INDEX_VERSION
+        || header.flags != RANK9_INDEX_FLAGS
+        || header.word_bytes != std::mem::size_of::<usize>() as u8
+        || header.endian != RANK9_INDEX_ENDIAN
+        || header.reserved != [0; 6]
+    {
+        return Err(invalid_rank9_metadata(
+            "unsupported Rank9 index format or native ABI",
+        ));
     }
 
-    let footer = *bytes
-        .slice(footer_start..meta_start)
-        .view::<Rank9SidecarFooter>()?;
-    if footer.version != RANK9_SIDECAR_VERSION {
-        return Ok(None);
+    let footer_start = index_bytes.len() - footer_size;
+    let footer = *index_bytes
+        .clone()
+        .slice(footer_start..)
+        .view::<Rank9IndexFooter>()?;
+    if footer.marker != RANK9_INDEX_MARKER || footer.version != RANK9_INDEX_VERSION {
+        return Err(invalid_rank9_metadata("unsupported Rank9 index footer"));
     }
-    if footer.flags != RANK9_SIDECAR_FLAGS {
+    if footer.flags != RANK9_INDEX_FLAGS
+        || footer.word_bytes != std::mem::size_of::<usize>() as u8
+        || footer.endian != RANK9_INDEX_ENDIAN
+        || footer.reserved != [0; 6]
+    {
         return Err(invalid_rank9_metadata(format!(
-            "unsupported Rank9 sidecar flags {:#x}",
+            "unsupported Rank9 index flags or native ABI ({:#x})",
             footer.flags
         )));
     }
@@ -611,50 +727,36 @@ fn probe_rank9_sidecar_footer<D: Metadata>(
     let expected_count = expected_rank9_index_count(meta)?;
     let expected_table_len = expected_count
         .checked_mul(std::mem::size_of::<SectionHandle<usize>>())
-        .ok_or_else(|| invalid_rank9_metadata("Rank9 sidecar table length overflow"))?;
+        .ok_or_else(|| invalid_rank9_metadata("Rank9 index table length overflow"))?;
     let table_range =
-        checked_section_range(footer.indexes, footer_start, "Rank9 sidecar handle table")?;
+        checked_section_range(footer.indexes, footer_start, "Rank9 index handle table")?;
     if table_range.len() != expected_table_len {
         return Err(invalid_rank9_metadata(format!(
-            "Rank9 sidecar handle table has {} bytes, expected {expected_table_len}",
+            "Rank9 index handle table has {} bytes, expected {expected_table_len}",
             table_range.len()
         )));
     }
-    let handles_view = footer.indexes.view(bytes)?;
+    if table_range.end != footer_start {
+        return Err(invalid_rank9_metadata(
+            "Rank9 index footer is not immediately after its handle table",
+        ));
+    }
+    let handles_view = footer.indexes.view(index_bytes)?;
     let handles: Vec<_> = handles_view.iter().copied().collect();
-    let sidecar_end = validate_rank9_index_handles(meta, bytes, &handles, footer.indexes.offset)?;
-    if sidecar_end != footer.indexes.offset {
+    let index_end = validate_rank9_index_handles(
+        meta,
+        raw_bytes,
+        index_bytes,
+        &handles,
+        footer.indexes.offset,
+    )?;
+    if index_end != footer.indexes.offset {
         return Err(invalid_rank9_metadata(format!(
-            "Rank9 sidecars end at {sidecar_end}, table starts at {}",
+            "Rank9 indexes end at {index_end}, table starts at {}",
             footer.indexes.offset
         )));
     }
-
-    let canonical_meta_start = checked_align_up(
-        table_range
-            .end
-            .checked_add(footer_size)
-            .ok_or_else(|| invalid_rank9_metadata("Rank9 footer position overflow"))?,
-        std::mem::align_of::<SuccinctArchiveMeta<D>>(),
-    )?;
-    if canonical_meta_start != meta_start {
-        return Err(invalid_rank9_metadata(format!(
-            "Rank9 footer/meta trailer starts at {meta_start}, expected {canonical_meta_start}"
-        )));
-    }
-    let canonical_footer_start = canonical_meta_start - footer_size;
-    if canonical_footer_start != footer_start {
-        return Err(invalid_rank9_metadata(
-            "Rank9 footer is not immediately adjacent to EOF metadata",
-        ));
-    }
-    ensure_zero_bytes(
-        bytes,
-        table_range.end..footer_start,
-        "sidecar-table-to-footer gap",
-    )?;
-
-    Ok(Some(handles))
+    Ok(handles)
 }
 
 /// Names one of the six ring wavelet-matrix columns of a
@@ -899,33 +1001,34 @@ where
         }
     }
 
-    /// Copies the canonical raw archive prefix and appends persisted indexes
-    /// for the Rank9/select structures already attached to this archive.
-    ///
-    /// This is a format migration, not an archive rebuild: it does not decode
-    /// or sort any tribles, and all raw data sections remain byte-identical.
-    fn persist_rank9_sidecars(&self) -> Result<Bytes, jerky::error::Error>
+    /// Persists the attached Rank9/select structures as a detached accelerator
+    /// bound to `source`. The raw archive bytes are never copied or modified.
+    fn persist_rank9_index(
+        &self,
+        source: Inline<Handle<SuccinctArchiveBlob>>,
+    ) -> Result<Bytes, jerky::error::Error>
     where
         U: Serializable<Error = jerky::error::Error>,
         U::Meta: Copy,
     {
         let meta = self.meta();
-        let raw_end = validate_raw_rank9_sources(&meta, &self.bytes, self.bytes.len())?;
-        // The replacement discards every byte after `raw_end`. Validate the
-        // generic universe against that exact retained prefix rather than the
-        // larger legacy/unknown-version arena, where a malformed handle could
-        // otherwise point into the suffix being removed.
-        U::validate_metadata_prefix(&meta.domain, &self.bytes, raw_end)?;
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
-
-        if raw_end != 0 {
-            let mut raw_prefix = sections.reserve::<u8>(raw_end)?;
-            raw_prefix
-                .as_mut_slice()
-                .copy_from_slice(&self.bytes.as_ref()[..raw_end]);
-            raw_prefix.freeze()?;
+        let mut header = sections.reserve::<Rank9IndexHeader>(1)?;
+        if header.handle().offset != 0 {
+            return Err(invalid_rank9_metadata(
+                "Rank9 source handle is not at offset zero",
+            ));
         }
+        header[0] = Rank9IndexHeader {
+            source: source.raw,
+            marker: RANK9_INDEX_MARKER,
+            version: RANK9_INDEX_VERSION,
+            flags: RANK9_INDEX_FLAGS,
+            word_bytes: std::mem::size_of::<usize>() as u8,
+            endian: RANK9_INDEX_ENDIAN,
+            reserved: [0; 6],
+        };
 
         let mut index_handles = [
             &self.e_a,
@@ -952,22 +1055,11 @@ where
             index_handles.extend(matrix.persist_layer_indexes(&mut sections)?);
         }
 
-        try_finalize_succinct_archive(&mut sections, &meta, &index_handles)?;
-        drop(sections);
-        let upgraded = area.freeze()?;
-
-        // Legacy attachment is intentionally permissive. Certify the exact
-        // current format before exposing replacement bytes so dirty unused
-        // tail bits or another raw-layout inconsistency can never be
-        // checkpointed as an unreadable segment.
-        let meta_start = upgraded
-            .len()
-            .checked_sub(std::mem::size_of::<SuccinctArchiveMeta<U::Meta>>())
-            .ok_or_else(|| invalid_rank9_metadata("upgraded archive metadata is truncated"))?;
-        let handles = probe_rank9_sidecar_footer(&meta, &upgraded, meta_start)?
-            .ok_or_else(|| invalid_rank9_metadata("upgraded archive is missing its Rank9 footer"))?;
-        Self::from_bytes_with_rank9_indexes(meta, upgraded.clone(), &handles)?;
-        Ok(upgraded)
+        try_finalize_rank9_index(&mut sections, &index_handles)?;
+        header.freeze()?;
+        let index = area.freeze()?;
+        parse_rank9_index(&meta, &self.bytes, source, &index)?;
+        Ok(index)
     }
 }
 
@@ -2127,6 +2219,9 @@ where
 {
     let mut area = ByteArea::new().unwrap();
     let mut sections = area.sections();
+    let mut rank9_area = ByteArea::new().unwrap();
+    let mut rank9_sections = rank9_area.sections();
+    let mut rank9_header = reserve_rank9_index_header(&mut rank9_sections);
 
     let domain_values = DomainEntries::new(segments)
         .map(|(value, _, _)| value)
@@ -2257,7 +2352,7 @@ where
     let changed_v_a = changed_v_a_builder.freeze::<Rank9SelIndex>();
 
     let mut index_handles = persist_top_level_rank9_indexes(
-        &mut sections,
+        &mut rank9_sections,
         [
             &e_a,
             &a_a,
@@ -2271,7 +2366,7 @@ where
         ],
     );
     let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
-        wavelets.freeze_with_rank9_sidecars(&mut sections)?;
+        wavelets.freeze_with_rank9_sidecars(&mut rank9_sections)?;
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
@@ -2296,7 +2391,9 @@ where
         aev_c,
     };
 
-    finalize_succinct_archive(&mut sections, &meta, &index_handles);
+    finalize_succinct_archive(&mut sections, &meta);
+    try_finalize_rank9_index(&mut rank9_sections, &index_handles)
+        .expect("temporary Rank9 arena must remain writable");
     drop((
         e_a,
         a_a,
@@ -2309,7 +2406,11 @@ where
         changed_v_a,
     ));
     let bytes = area.freeze().unwrap();
-    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles).unwrap())
+    let raw_blob = Blob::<SuccinctArchiveBlob>::new(bytes.clone());
+    rank9_header[0].source = raw_blob.get_handle().raw;
+    rank9_header.freeze().unwrap();
+    let rank9_bytes = rank9_area.freeze().unwrap();
+    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, rank9_bytes).unwrap())
 }
 
 /// Structurally merge sorted succinct-archive segments on the default CPU
@@ -2391,6 +2492,9 @@ where
 
     let mut area = ByteArea::new().unwrap();
     let mut sections = area.sections();
+    let mut rank9_area = ByteArea::new().unwrap();
+    let mut rank9_sections = rank9_area.sections();
+    let mut rank9_header = reserve_rank9_index_header(&mut rank9_sections);
 
     let domain_iter = e_iter.merge(a_iter).merge(v_iter).dedup();
     let domain = U::with_sorted_dedup(domain_iter, &mut sections);
@@ -2538,7 +2642,7 @@ where
     };
 
     let mut index_handles = persist_top_level_rank9_indexes(
-        &mut sections,
+        &mut rank9_sections,
         [
             &e_a,
             &a_a,
@@ -2552,7 +2656,7 @@ where
         ],
     );
     let ([eav_c, vea_c, ave_c, vae_c, eva_c, aev_c], wavelet_index_handles) =
-        wavelets.freeze_with_rank9_sidecars(&mut sections)?;
+        wavelets.freeze_with_rank9_sidecars(&mut rank9_sections)?;
     index_handles.extend(wavelet_index_handles);
 
     let meta = SuccinctArchiveMeta {
@@ -2577,7 +2681,9 @@ where
         aev_c,
     };
 
-    finalize_succinct_archive(&mut sections, &meta, &index_handles);
+    finalize_succinct_archive(&mut sections, &meta);
+    try_finalize_rank9_index(&mut rank9_sections, &index_handles)
+        .expect("temporary Rank9 arena must remain writable");
     drop((
         e_a,
         a_a,
@@ -2591,8 +2697,12 @@ where
     ));
 
     let bytes = area.freeze().unwrap();
+    let raw_blob = Blob::<SuccinctArchiveBlob>::new(bytes.clone());
+    rank9_header[0].source = raw_blob.get_handle().raw;
+    rank9_header.freeze().unwrap();
+    let rank9_bytes = rank9_area.freeze().unwrap();
 
-    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles).unwrap())
+    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, rank9_bytes).unwrap())
 }
 
 impl<U> From<&TribleSet> for SuccinctArchive<U>
@@ -2672,9 +2782,10 @@ where
     fn from_bytes_with_rank9_indexes(
         meta: SuccinctArchiveMeta<U::Meta>,
         bytes: Bytes,
-        index_handles: &[SectionHandle<usize>],
+        rank9_index_bytes: Bytes,
     ) -> Result<Self, jerky::error::Error> {
-        validate_rank9_index_handles(&meta, &bytes, index_handles, bytes.len())?;
+        let source = Blob::<SuccinctArchiveBlob>::new(bytes.clone()).get_handle();
+        let index_handles = parse_rank9_index(&meta, &bytes, source, &rank9_index_bytes)?;
 
         let top_level_meta = top_level_bitvector_meta(&meta);
         let wavelet_metadata = wavelet_meta(&meta);
@@ -2687,7 +2798,8 @@ where
             // `validate_rank9_index_handles` preflights this raw handle before
             // BitVectorData/AnyBytes can slice with it.
             let data = BitVectorData::from_bytes(raw_meta, bytes.clone())?;
-            let index = Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&bytes))?;
+            let index =
+                Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&rank9_index_bytes))?;
             top_level.push(BitVector::new(data, index));
         }
         let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]: [
@@ -2705,7 +2817,9 @@ where
             let matrix = WaveletMatrix::from_bytes_with_persisted_indexes(
                 matrix_meta,
                 bytes.clone(),
-                matrix_handles.iter().map(|handle| handle.bytes(&bytes)),
+                matrix_handles
+                    .iter()
+                    .map(|handle| handle.bytes(&rank9_index_bytes)),
             )?;
             wavelets.push(matrix);
             handle_cursor = handle_end;
@@ -2716,6 +2830,7 @@ where
 
         Ok(SuccinctArchive {
             bytes,
+            rank9_index_bytes,
             domain,
             entity_count: meta.entity_count,
             attribute_count: meta.attribute_count,
@@ -2742,6 +2857,7 @@ where
 impl<U> Serializable for SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
+    U::Meta: Copy + 'static,
 {
     type Meta = SuccinctArchiveMeta<U::Meta>;
     type Error = jerky::error::Error;
@@ -2751,6 +2867,12 @@ where
     }
 
     fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
+        let meta_start = bytes
+            .len()
+            .checked_sub(std::mem::size_of::<SuccinctArchiveMeta<U::Meta>>())
+            .ok_or_else(|| invalid_rank9_metadata("raw succinct archive is truncated"))?;
+        let raw_end = validate_raw_archive(&meta, &bytes, meta_start)?;
+        U::validate_metadata_prefix(&meta.domain, &bytes, raw_end)?;
         let domain = U::from_bytes(meta.domain, bytes.clone())?;
 
         let e_a = BitVector::from_bytes(meta.e_a, bytes.clone())?;
@@ -2770,8 +2892,9 @@ where
         let eva_c = WaveletMatrix::from_bytes(meta.eva_c, bytes.clone())?;
         let aev_c = WaveletMatrix::from_bytes(meta.aev_c, bytes.clone())?;
 
-        Ok(SuccinctArchive {
+        let mut archive = SuccinctArchive {
             bytes,
+            rank9_index_bytes: Bytes::empty(),
             domain,
             entity_count: meta.entity_count,
             attribute_count: meta.attribute_count,
@@ -2791,7 +2914,10 @@ where
             vae_c,
             eva_c,
             aev_c,
-        })
+        };
+        let source = Blob::<SuccinctArchiveBlob>::new(archive.bytes.clone()).get_handle();
+        archive.rank9_index_bytes = archive.persist_rank9_index(source)?;
+        Ok(archive)
     }
 }
 
@@ -2817,7 +2943,7 @@ where
     }
 }
 
-/// Error returned when deserializing or upgrading a [`SuccinctArchiveBlob`].
+/// Error returned when attaching a raw succinct archive and its Rank9 index.
 pub struct SuccinctArchiveError(jerky::error::Error);
 
 impl From<jerky::error::Error> for SuccinctArchiveError {
@@ -2840,7 +2966,9 @@ impl std::fmt::Display for SuccinctArchiveError {
 
 impl std::fmt::Debug for SuccinctArchiveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SuccinctArchiveError").field(&self.0).finish()
+        f.debug_tuple("SuccinctArchiveError")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -2849,64 +2977,73 @@ where
     U: Universe + Serializable<Error = jerky::error::Error>,
     <U as Serializable>::Meta: Copy + 'static,
 {
-    /// Upgrades a legacy archive blob to the canonical persisted-Rank9
-    /// representation without decoding or rebuilding its tribles.
-    ///
-    /// The legacy archive is attached once, its byte-identical raw prefix is
-    /// copied into a new file-backed arena, and the already-built Rank9/select
-    /// indexes are serialized after it. A valid current-format blob is
-    /// returned unchanged, including its cached content handle; the boolean is
-    /// `true` only when new bytes were written. A malformed current-format
-    /// sidecar is rejected by the same exact validation used during ordinary
-    /// attachment.
-    pub fn upgrade_rank9_sidecars(
-        blob: Blob<SuccinctArchiveBlob>,
-    ) -> Result<(Blob<SuccinctArchiveBlob>, bool), SuccinctArchiveError> {
-        let bytes = blob.bytes.clone();
+    /// Builds a queryable archive and returns its raw and Rank9 artifacts.
+    pub fn build_blob_pair(
+        source: &TribleSet,
+    ) -> (
+        Blob<SuccinctArchiveBlob>,
+        Blob<SuccinctArchiveRank9IndexBlob>,
+    ) {
+        let archive: Self = source.into();
+        archive.to_blob_pair()
+    }
+
+    /// Returns the canonical raw archive and its detached, source-bound Rank9
+    /// accelerator as two independently content-addressed blobs.
+    pub fn to_blob_pair(
+        &self,
+    ) -> (
+        Blob<SuccinctArchiveBlob>,
+        Blob<SuccinctArchiveRank9IndexBlob>,
+    ) {
+        (
+            Blob::new(self.bytes.clone()),
+            Blob::new(self.rank9_index_bytes.clone()),
+        )
+    }
+
+    /// Rebuilds only the detached Rank9 artifact for a canonical raw archive.
+    /// The raw blob is exact-validated and its bytes/identity remain unchanged.
+    pub fn build_rank9_index(
+        raw: Blob<SuccinctArchiveBlob>,
+    ) -> Result<Blob<SuccinctArchiveRank9IndexBlob>, SuccinctArchiveError> {
+        let archive = <Self as TryFromBlob<SuccinctArchiveBlob>>::try_from_blob(raw)?;
+        Ok(Blob::new(archive.rank9_index_bytes))
+    }
+
+    /// Attaches an exact raw/index pair without rebuilding rank/select data.
+    pub fn from_blob_pair(
+        raw: Blob<SuccinctArchiveBlob>,
+        rank9: Blob<SuccinctArchiveRank9IndexBlob>,
+    ) -> Result<Self, SuccinctArchiveError> {
+        let bytes = raw.bytes;
         let mut tail = bytes.clone();
         let meta = *tail
             .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
             .map_err(|err| {
                 SuccinctArchiveError(invalid_rank9_metadata(format!(
-                    "cannot read EOF metadata: {err}"
+                    "cannot read raw archive EOF metadata: {err}"
                 )))
             })?;
         let meta_start = tail.len();
+        let raw_end =
+            validate_raw_archive(&meta, &bytes, meta_start).map_err(SuccinctArchiveError)?;
+        U::validate_metadata_prefix(&meta.domain, &bytes, raw_end).map_err(SuccinctArchiveError)?;
+        Self::from_bytes_with_rank9_indexes(meta, bytes, rank9.bytes).map_err(SuccinctArchiveError)
+    }
 
-        match probe_rank9_sidecar_footer(&meta, &bytes, meta_start).map_err(SuccinctArchiveError)? {
-            Some(index_handles) => {
-                Self::from_bytes_with_rank9_indexes(meta, bytes, &index_handles)
-                    .map_err(SuccinctArchiveError)?;
-                Ok((blob, false))
-            }
-            None => {
-                // A recognized marker with an unknown version denotes an
-                // extension suffix, not legacy raw data. Bound every raw and
-                // universe handle before that footer; a no-marker V1 archive
-                // uses the EOF metadata start as its outer bound.
-                let footer_size = std::mem::size_of::<Rank9SidecarFooter>();
-                let footer_start = meta_start.saturating_sub(footer_size);
-                let marker_end = footer_start.saturating_add(RANK9_SIDECAR_MARKER.len());
-                let raw_limit = if meta_start >= footer_size
-                    && marker_end <= meta_start
-                    && bytes.as_ref()[footer_start..marker_end] == RANK9_SIDECAR_MARKER
-                {
-                    footer_start
-                } else {
-                    meta_start
-                };
-                let raw_end = validate_raw_rank9_sources(&meta, &bytes, raw_limit)
-                    .map_err(SuccinctArchiveError)?;
-                U::validate_metadata_prefix(&meta.domain, &bytes, raw_end)
-                    .map_err(SuccinctArchiveError)?;
-                let archive = Self::from_bytes(meta, bytes.slice(0..raw_end))
-                    .map_err(SuccinctArchiveError)?;
-                let upgraded = archive
-                    .persist_rank9_sidecars()
-                    .map_err(SuccinctArchiveError)?;
-                Ok((Blob::new(upgraded), true))
-            }
-        }
+    /// Store-facing pair attachment that reports a missing Rank9 artifact as
+    /// the same structured archive error as a malformed artifact.
+    pub fn from_optional_blob_pair(
+        raw: Blob<SuccinctArchiveBlob>,
+        rank9: Option<Blob<SuccinctArchiveRank9IndexBlob>>,
+    ) -> Result<Self, SuccinctArchiveError> {
+        let rank9 = rank9.ok_or_else(|| {
+            SuccinctArchiveError(invalid_rank9_metadata(
+                "missing SuccinctArchive Rank9 index blob",
+            ))
+        })?;
+        Self::from_blob_pair(raw, rank9)
     }
 }
 
@@ -2927,16 +3064,7 @@ where
                     "cannot read EOF metadata: {err}"
                 )))
             })?;
-        let meta_start = tail.len();
-        match probe_rank9_sidecar_footer(&meta, &bytes, meta_start)
-            .map_err(SuccinctArchiveError)?
-        {
-            Some(index_handles) => {
-                SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, &index_handles)
-                    .map_err(SuccinctArchiveError)
-            }
-            None => SuccinctArchive::from_bytes(meta, bytes).map_err(SuccinctArchiveError),
-        }
+        SuccinctArchive::from_bytes(meta, bytes).map_err(SuccinctArchiveError)
     }
 }
 
@@ -3053,6 +3181,10 @@ mod tests {
                 build_archive_from_tribleset_with_factory(&set, &JerkyWaveletFactory).unwrap();
 
             prop_assert_eq!(packed.bytes.as_ref(), jerky.bytes.as_ref());
+            prop_assert_eq!(
+                packed.rank9_index_bytes.as_ref(),
+                jerky.rank9_index_bytes.as_ref()
+            );
             prop_assert_eq!(TribleSet::from(&packed), set);
         }
 
@@ -3302,413 +3434,35 @@ mod tests {
         assert_eq!(kb, kb2);
     }
 
-    fn ordered_archive_bytes(set: &TribleSet) -> (Vec<u8>, usize, Rank9SidecarFooter) {
-        let archive: SuccinctArchive<OrderedUniverse> = set.into();
-        let meta_start = archive.bytes.len()
-            - std::mem::size_of::<SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>>();
-        let footer_start = meta_start - std::mem::size_of::<Rank9SidecarFooter>();
-        let footer = *archive
-            .bytes
-            .clone()
-            .slice(footer_start..meta_start)
-            .view::<Rank9SidecarFooter>()
-            .unwrap();
-        (archive.bytes.as_ref().to_vec(), footer_start, footer)
-    }
-
-    fn write_usize(bytes: &mut [u8], offset: usize, value: usize) {
-        bytes[offset..offset + std::mem::size_of::<usize>()].copy_from_slice(&value.to_ne_bytes());
-    }
-
-    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
-        bytes[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
-    }
-
-    fn decode_ordered_archive(
-        bytes: Vec<u8>,
-    ) -> Result<SuccinctArchive<OrderedUniverse>, SuccinctArchiveError> {
-        Blob::<SuccinctArchiveBlob>::new(Bytes::from_source(bytes)).try_from_blob()
-    }
-
-    fn assert_supported_sidecar_corruption_rejected(
-        mutate: impl FnOnce(&mut Vec<u8>, usize, Rank9SidecarFooter),
-    ) {
-        let set = varied_knights();
-        let (mut bytes, footer_start, footer) = ordered_archive_bytes(&set);
-        mutate(&mut bytes, footer_start, footer);
+    fn assert_detached_rank9_corruption_rejected(mutate: impl FnOnce(&mut Vec<u8>)) {
+        let archive: SuccinctArchive<OrderedUniverse> = (&varied_knights()).into();
+        let (raw, rank9) = archive.to_blob_pair();
+        let mut bytes = rank9.bytes.as_ref().to_vec();
+        mutate(&mut bytes);
+        let corrupted = Blob::<SuccinctArchiveRank9IndexBlob>::new(Bytes::from_source(bytes));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_ordered_archive(bytes.clone())
-        }));
-        assert!(matches!(result, Ok(Err(_))));
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
-                Bytes::from_source(bytes),
-            ))
+            SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, corrupted)
         }));
         assert!(matches!(result, Ok(Err(_))));
     }
 
     #[test]
-    fn unknown_rank9_footer_version_falls_back_to_legacy_rebuild() {
-        let set = varied_knights();
-        let expected: SuccinctArchive<OrderedUniverse> = (&set).into();
-        let (mut bytes, footer_start, _) = ordered_archive_bytes(&set);
-        let canonical = bytes.clone();
-        write_u32(
-            &mut bytes,
-            footer_start + std::mem::offset_of!(Rank9SidecarFooter, version),
-            RANK9_SIDECAR_VERSION + 1,
-        );
-        let decoded = decode_ordered_archive(bytes.clone()).unwrap();
-        assert_eq!(decoded.iter().collect::<TribleSet>(), set);
-        assert_eq!(decoded.iter().collect_vec(), expected.iter().collect_vec());
-
-        let (upgraded, changed) =
-            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
-                Bytes::from_source(bytes),
-            ))
-            .unwrap();
-        assert!(changed);
-        assert_eq!(upgraded.bytes.as_ref(), canonical);
-    }
-
-    #[test]
-    fn damaged_rank9_footer_marker_falls_back_to_legacy_rebuild() {
-        let set = varied_knights();
-        let (mut bytes, footer_start, _) = ordered_archive_bytes(&set);
-        bytes[footer_start] ^= 1;
-        let decoded = decode_ordered_archive(bytes).unwrap();
-        assert_eq!(decoded.iter().collect::<TribleSet>(), set);
-    }
-
-    #[test]
-    fn legacy_upgrade_rejects_dirty_unused_raw_tail_bits() {
-        type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
-
-        let set = varied_knights();
-        let (canonical, _, footer) = ordered_archive_bytes(&set);
-        let area = Bytes::from_source(canonical.clone());
-        let meta_start = canonical.len() - std::mem::size_of::<Meta>();
-        let meta = *area
-            .clone()
-            .slice(meta_start..)
-            .view::<Meta>()
-            .unwrap();
-        let raw_end = meta.changed_v_a.handle.offset + meta.changed_v_a.handle.len;
-        let mut legacy = canonical[..raw_end].to_vec();
-        legacy.extend_from_slice(&canonical[meta_start..]);
-
-        let vector = [
-            meta.e_a,
-            meta.a_a,
-            meta.v_a,
-            meta.changed_e_a,
-            meta.changed_e_v,
-            meta.changed_a_e,
-            meta.changed_a_v,
-            meta.changed_v_e,
-            meta.changed_v_a,
-        ]
-        .into_iter()
-        .find(|vector| vector.len % 64 != 0)
-        .expect("fixture has an unused raw tail bit");
-        let last_word = vector.handle.offset + vector.handle.len - std::mem::size_of::<u64>();
-        let mut word = u64::from_ne_bytes(
-            legacy[last_word..last_word + std::mem::size_of::<u64>()]
-                .try_into()
-                .unwrap(),
-        );
-        word |= 1u64 << (vector.len % 64);
-        legacy[last_word..last_word + std::mem::size_of::<u64>()]
-            .copy_from_slice(&word.to_ne_bytes());
-
-        // The pre-sidecar representation deliberately had permissive raw
-        // attachment. The maintenance upgrader must nevertheless refuse to
-        // publish bytes that the exact current reader would reject.
-        assert!(decode_ordered_archive(legacy.clone()).is_ok());
-        assert!(
-            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
-                Bytes::from_source(legacy),
-            ))
-            .is_err()
-        );
-        assert!(footer.indexes.offset >= raw_end);
-    }
-
-    #[test]
-    fn unknown_version_upgrade_rejects_domain_handle_in_discarded_suffix() {
-        type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
-
-        let set = varied_knights();
-        let (mut bytes, footer_start, footer) = ordered_archive_bytes(&set);
-        let meta_start = bytes.len() - std::mem::size_of::<Meta>();
-        write_u32(
-            &mut bytes,
-            footer_start + std::mem::offset_of!(Rank9SidecarFooter, version),
-            RANK9_SIDECAR_VERSION + 1,
-        );
-        write_usize(
-            &mut bytes,
-            meta_start
-                + std::mem::offset_of!(Meta, domain)
-                + std::mem::offset_of!(SectionHandle<RawInline>, offset),
-            footer.indexes.offset,
-        );
-
-        // The permissive legacy fallback can attach the domain while the
-        // unknown suffix is still present. Migration removes that suffix, so
-        // it must validate the domain against the retained raw prefix first.
-        assert!(decode_ordered_archive(bytes.clone()).is_ok());
-        assert!(
-            SuccinctArchive::<OrderedUniverse>::upgrade_rank9_sidecars(Blob::new(
-                Bytes::from_source(bytes),
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn supported_rank9_footer_rejects_flags_table_and_handle_corruption_without_panicking() {
-        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, _| {
-            write_u32(
-                bytes,
-                footer_start + std::mem::offset_of!(Rank9SidecarFooter, flags),
-                1,
-            );
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, footer| {
-            write_usize(
-                bytes,
-                footer_start
-                    + std::mem::offset_of!(Rank9SidecarFooter, indexes)
-                    + std::mem::offset_of!(SectionHandle<SectionHandle<usize>>, len),
-                footer.indexes.len - std::mem::size_of::<SectionHandle<usize>>(),
-            );
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            write_usize(bytes, footer.indexes.offset, usize::MAX);
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            write_usize(bytes, footer.indexes.offset, usize::MAX - 3);
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            let first_offset = usize::from_ne_bytes(
-                bytes[footer.indexes.offset..footer.indexes.offset + std::mem::size_of::<usize>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            write_usize(bytes, footer.indexes.offset, first_offset + 1);
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            let first_offset = usize::from_ne_bytes(
-                bytes[footer.indexes.offset..footer.indexes.offset + std::mem::size_of::<usize>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            write_usize(
-                bytes,
-                footer.indexes.offset + std::mem::size_of::<SectionHandle<usize>>(),
-                first_offset,
-            );
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, footer_start, _| {
-            write_usize(
-                bytes,
-                footer_start + std::mem::offset_of!(Rank9SidecarFooter, indexes),
-                usize::MAX,
-            );
-        });
-        assert_supported_sidecar_corruption_rejected(|bytes, _, _| {
-            type Meta = SuccinctArchiveMeta<<OrderedUniverse as Serializable>::Meta>;
-            let meta_start = bytes.len() - std::mem::size_of::<Meta>();
-            let raw_handle_offset = meta_start
-                + std::mem::offset_of!(Meta, e_a)
-                + std::mem::offset_of!(BitVectorDataMeta, handle)
-                + std::mem::offset_of!(SectionHandle<u64>, offset);
-            write_usize(bytes, raw_handle_offset, usize::MAX);
-        });
-    }
-
-    #[test]
-    fn supported_rank9_footer_rejects_rank_and_trailing_payload_corruption() {
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            let first_handle = footer
-                .indexes
-                .view(&Bytes::from_source(bytes.clone()))
-                .unwrap()[0];
-            let rank_word = first_handle.offset + 2 * std::mem::size_of::<usize>();
-            let old = usize::from_ne_bytes(
-                bytes[rank_word..rank_word + std::mem::size_of::<usize>()]
-                    .try_into()
-                    .unwrap(),
-            );
-            write_usize(bytes, rank_word, old ^ 1);
+    fn detached_rank9_rejects_header_table_and_payload_corruption_without_panicking() {
+        assert_detached_rank9_corruption_rejected(|bytes| {
+            bytes[std::mem::offset_of!(Rank9IndexHeader, marker)] ^= 1;
         });
 
-        assert_supported_sidecar_corruption_rejected(|bytes, _, footer| {
-            let area = Bytes::from_source(bytes.clone());
-            let handles = footer.indexes.view(&area).unwrap();
-            let first = handles[0];
-            let second = handles[1];
-            write_usize(
-                bytes,
-                footer.indexes.offset + std::mem::size_of::<usize>(),
-                first.len + std::mem::size_of::<usize>(),
-            );
-            write_usize(
-                bytes,
-                footer.indexes.offset + std::mem::size_of::<SectionHandle<usize>>(),
-                second.offset + std::mem::size_of::<usize>(),
-            );
-            write_usize(
-                bytes,
-                footer.indexes.offset
-                    + std::mem::size_of::<SectionHandle<usize>>()
-                    + std::mem::size_of::<usize>(),
-                second.len - std::mem::size_of::<usize>(),
-            );
+        assert_detached_rank9_corruption_rejected(|bytes| {
+            let footer_start = bytes.len() - std::mem::size_of::<Rank9IndexFooter>();
+            let table_offset = footer_start + std::mem::offset_of!(Rank9IndexFooter, indexes);
+            bytes[table_offset..table_offset + std::mem::size_of::<usize>()]
+                .copy_from_slice(&usize::MAX.to_ne_bytes());
         });
-    }
 
-    #[test]
-    fn supported_rank9_footer_rejects_hint_corruption() {
-        let rows = (0..1026).map(|ordinal| {
-            let mut data = [0u8; 64];
-            data[..16].fill(0x31);
-            data[16..32].fill(0x41);
-            data[32..56].fill(0x90);
-            data[56..].copy_from_slice(&(ordinal as u64).to_be_bytes());
-            Trible { data }
+        assert_detached_rank9_corruption_rejected(|bytes| {
+            let first_payload = std::mem::size_of::<Rank9IndexHeader>();
+            bytes[first_payload + 2 * std::mem::size_of::<usize>()] ^= 1;
         });
-        let set: TribleSet = rows.collect();
-        let (mut bytes, _, footer) = ordered_archive_bytes(&set);
-        let area = Bytes::from_source(bytes.clone());
-        let handles = footer.indexes.view(&area).unwrap();
-        let changed_e_v = handles[4];
-        let read_word = |position: usize| {
-            usize::from_ne_bytes(
-                bytes[position..position + std::mem::size_of::<usize>()]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        let brp_len = read_word(changed_e_v.offset + std::mem::size_of::<usize>());
-        let select1_flag = changed_e_v.offset + (2 + brp_len) * std::mem::size_of::<usize>();
-        assert_eq!(read_word(select1_flag), 1);
-        let first_hint = select1_flag + 2 * std::mem::size_of::<usize>();
-        let old_hint = read_word(first_hint);
-        write_usize(&mut bytes, first_hint, old_hint ^ 1);
-        assert!(decode_ordered_archive(bytes).is_err());
-    }
-
-    #[derive(
-        Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable,
-    )]
-    #[repr(C, align(64))]
-    struct Align64Meta([u8; 64]);
-
-    #[test]
-    fn high_alignment_metadata_uses_zero_pre_footer_padding() {
-        let mut area = ByteArea::new().unwrap();
-        let mut sections = area.sections();
-        let mut leading = sections.reserve::<u64>(1).unwrap();
-        leading[0] = 0;
-        leading.freeze().unwrap();
-
-        let prefix_builders: Vec<_> = (0..3)
-            .map(|_| BitVectorBuilder::from_bit(false, 1, &mut sections).unwrap())
-            .collect();
-        let mut wavelet_builders: Vec<_> = (0..6)
-            .map(|_| WaveletMatrixBuilder::with_capacity(1, 1, &mut sections).unwrap())
-            .collect();
-        for builder in &mut wavelet_builders {
-            builder.set_int(0, 0).unwrap();
-        }
-        let changed_builders: Vec<_> = (0..6)
-            .map(|_| BitVectorBuilder::from_bit(false, 1, &mut sections).unwrap())
-            .collect();
-
-        let mut prefix: Vec<_> = prefix_builders
-            .into_iter()
-            .map(|builder| builder.freeze::<Rank9SelIndex>())
-            .collect();
-        let mut changed: Vec<_> = changed_builders
-            .into_iter()
-            .map(|builder| builder.freeze::<Rank9SelIndex>())
-            .collect();
-        let mut index_handles = persist_top_level_rank9_indexes(
-            &mut sections,
-            [
-                &prefix[0],
-                &prefix[1],
-                &prefix[2],
-                &changed[0],
-                &changed[1],
-                &changed[2],
-                &changed[3],
-                &changed[4],
-                &changed[5],
-            ],
-        );
-        let mut matrix_meta = Vec::new();
-        for builder in wavelet_builders {
-            let matrix = builder.freeze::<Rank9SelIndex>().unwrap();
-            matrix_meta.push(matrix.metadata());
-            index_handles.extend(matrix.persist_layer_indexes(&mut sections).unwrap());
-        }
-        let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [WaveletMatrixMeta; 6] =
-            matrix_meta.try_into().unwrap();
-        let meta = SuccinctArchiveMeta {
-            entity_count: 0,
-            attribute_count: 0,
-            value_count: 0,
-            domain: Align64Meta([0; 64]),
-            e_a: prefix[0].metadata(),
-            a_a: prefix[1].metadata(),
-            v_a: prefix[2].metadata(),
-            changed_e_a: changed[0].metadata(),
-            changed_e_v: changed[1].metadata(),
-            changed_a_e: changed[2].metadata(),
-            changed_a_v: changed[3].metadata(),
-            changed_v_e: changed[4].metadata(),
-            changed_v_a: changed[5].metadata(),
-            eav_c,
-            vea_c,
-            ave_c,
-            vae_c,
-            eva_c,
-            aev_c,
-        };
-        finalize_succinct_archive(&mut sections, &meta, &index_handles);
-        prefix.clear();
-        changed.clear();
-        let bytes = area.freeze().unwrap();
-
-        let meta_start = bytes.len() - std::mem::size_of::<SuccinctArchiveMeta<Align64Meta>>();
-        let footer_start = meta_start - std::mem::size_of::<Rank9SidecarFooter>();
-        let footer = *bytes
-            .clone()
-            .slice(footer_start..meta_start)
-            .view::<Rank9SidecarFooter>()
-            .unwrap();
-        let table_end = footer.indexes.offset + footer.indexes.len;
-        assert!(footer_start > table_end);
-        assert!(bytes.as_ref()[table_end..footer_start]
-            .iter()
-            .all(|byte| *byte == 0));
-        assert_eq!(
-            footer_start + std::mem::size_of::<Rank9SidecarFooter>(),
-            meta_start
-        );
-        assert!(probe_rank9_sidecar_footer(&meta, &bytes, meta_start)
-            .unwrap()
-            .is_some());
-
-        let mut corrupted = bytes.as_ref().to_vec();
-        corrupted[table_end] = 1;
-        let corrupted = Bytes::from_source(corrupted);
-        assert!(probe_rank9_sidecar_footer(&meta, &corrupted, meta_start).is_err());
     }
 
     fn rotation_codes(
@@ -4193,6 +3947,10 @@ mod tests {
 
         assert_eq!(TribleSet::from(&merged), union);
         assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
+        assert_eq!(
+            merged.rank9_index_bytes.as_ref(),
+            rebuilt.rank9_index_bytes.as_ref()
+        );
     }
 
     #[test]
@@ -4223,6 +3981,11 @@ mod tests {
             let jerky: SuccinctArchive<OrderedUniverse> =
                 build_archive_from_tribleset_with_factory(&set, &JerkyWaveletFactory).unwrap();
             assert_eq!(packed.bytes.as_ref(), jerky.bytes.as_ref(), "{rows} rows");
+            assert_eq!(
+                packed.rank9_index_bytes.as_ref(),
+                jerky.rank9_index_bytes.as_ref(),
+                "{rows} Rank9 bytes"
+            );
 
             let packed_compressed: SuccinctArchive<CompressedUniverse> =
                 build_archive_from_tribleset_with_factory(&set, &PackedCpuWaveletFactory).unwrap();
@@ -4232,6 +3995,11 @@ mod tests {
                 packed_compressed.bytes.as_ref(),
                 jerky_compressed.bytes.as_ref(),
                 "{rows} compressed rows"
+            );
+            assert_eq!(
+                packed_compressed.rank9_index_bytes.as_ref(),
+                jerky_compressed.rank9_index_bytes.as_ref(),
+                "{rows} compressed Rank9 bytes"
             );
         }
     }

@@ -25,12 +25,11 @@ pub trait Universe: Serializable {
     /// Validate that every metadata handle needed by this universe lies in a
     /// retained byte prefix.
     ///
-    /// SuccinctArchive format migration can discard an extension suffix. This
-    /// seam prevents a generic universe from silently retaining a handle into
-    /// bytes that will no longer exist. Built-in universes override it with
-    /// non-panicking handle preflights; the default contains a third-party
-    /// implementation's deserializer and converts an unwind into metadata
-    /// failure.
+    /// Exact raw-archive validation uses this seam to prevent a generic
+    /// universe from retaining a handle outside the canonical raw section
+    /// prefix. Built-in universes override it with non-panicking handle
+    /// preflights; the default contains a third-party implementation's
+    /// deserializer and converts an unwind into metadata failure.
     fn validate_metadata_prefix(
         meta: &Self::Meta,
         bytes: &Bytes,
