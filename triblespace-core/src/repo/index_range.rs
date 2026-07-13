@@ -466,9 +466,32 @@ where
             }
         }
     }
-    let (start, end) = view.boundaries(&union)?;
+
+    // Every victim has already been expanded to its exact member set.  For an
+    // order-convex union, its poset minima/maxima are therefore exactly the
+    // vertices with no direct parent/child inside that union.  Deriving those
+    // induced boundaries avoids walking from a late carry all the way back to
+    // genesis merely to rediscover the same frontier.
+    //
+    // A non-convex union can have a hidden ancestry relation through commits
+    // outside `union` (A < B < C for victims {A, C}).  The candidate expansion
+    // below remains the correctness gate: comparable induced boundaries or a
+    // hull that fills such a hole are rejected as `NonConvexUnion`.
+    let children = view.children_within(&union)?;
+    view.ensure_acyclic_within(&union, &children)?;
+    let (start, end) = view.direct_boundaries(&union, &children)?;
     let candidate = CommitRange::new(start, end)?;
-    if view.range_members(&candidate)? != union {
+    let candidate_members = match view.range_members(&candidate) {
+        Ok(members) => members,
+        Err(RangeValidationError::Graph(error)) => {
+            return Err(RangeValidationError::Graph(error));
+        }
+        Err(RangeValidationError::CyclicGraph) => {
+            return Err(RangeValidationError::CyclicGraph);
+        }
+        Err(_) => return Err(RangeValidationError::NonConvexUnion),
+    };
+    if candidate_members != union {
         return Err(RangeValidationError::NonConvexUnion);
     }
     Ok(candidate)
@@ -787,6 +810,41 @@ impl<'a, D: CommitDag> DagView<'a, D> {
             }
         }
         Ok(children)
+    }
+
+    fn ensure_acyclic_within(
+        &mut self,
+        members: &HashSet<CommitHandle>,
+        children: &HashMap<CommitHandle, Vec<CommitHandle>>,
+    ) -> Result<(), RangeValidationError<D::Error>> {
+        let mut indegree = HashMap::with_capacity(members.len());
+        for commit in members.iter().copied() {
+            let count = self
+                .parents(commit)?
+                .into_iter()
+                .filter(|parent_| members.contains(parent_))
+                .count();
+            indegree.insert(commit, count);
+        }
+        let mut ready: Vec<_> = indegree
+            .iter()
+            .filter_map(|(commit, degree)| (*degree == 0).then_some(*commit))
+            .collect();
+        let mut visited = 0usize;
+        while let Some(commit) = ready.pop() {
+            visited += 1;
+            for child in children.get(&commit).into_iter().flatten().copied() {
+                let degree = indegree.get_mut(&child).expect("member child has indegree");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+        if visited != members.len() {
+            return Err(RangeValidationError::CyclicGraph);
+        }
+        Ok(())
     }
 
     fn direct_boundaries(
@@ -1202,6 +1260,66 @@ mod tests {
         graph.reads = 0;
         validate_exact_cover(&mut graph, &[range], Some(numbered_commit(COUNT - 1))).unwrap();
         assert!(graph.reads <= COUNT as usize);
+    }
+
+    #[test]
+    fn repeated_base_four_carries_read_only_their_victim_members() {
+        const FANOUT: usize = 4;
+        const COUNT: u64 = 4_096;
+        let mut commits = Vec::with_capacity(COUNT as usize);
+        let mut graph = HashMap::with_capacity(COUNT as usize);
+        for number in 0..COUNT {
+            let current = numbered_commit(number);
+            graph.insert(
+                current,
+                (number > 0)
+                    .then(|| numbered_commit(number - 1))
+                    .into_iter()
+                    .collect(),
+            );
+            commits.push(current);
+        }
+
+        let mut graph = CountingDag { graph, reads: 0 };
+        let mut levels: Vec<(usize, CommitRange, usize)> = Vec::new();
+        let mut carries = 0usize;
+        for current in commits.iter().copied() {
+            levels.push((0, CommitRange::leaf(current), 1));
+            let mut level = 0usize;
+            loop {
+                let victim_indices: Vec<_> = levels
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, (candidate, _, _))| (*candidate == level).then_some(index))
+                    .collect();
+                if victim_indices.len() < FANOUT {
+                    break;
+                }
+                let victims: Vec<_> = victim_indices
+                    .iter()
+                    .map(|index| levels[*index].1.clone())
+                    .collect();
+                let victim_members: usize =
+                    victim_indices.iter().map(|index| levels[*index].2).sum();
+                let reads_before = graph.reads;
+                let merged = convex_union(&mut graph, &victims).unwrap();
+                let carry_reads = graph.reads - reads_before;
+                assert!(
+                    carry_reads <= victim_members,
+                    "level {level} carry over {victim_members} members read {carry_reads} parents"
+                );
+                for index in victim_indices.into_iter().rev() {
+                    levels.remove(index);
+                }
+                levels.push((level + 1, merged, victim_members));
+                level += 1;
+                carries += 1;
+            }
+        }
+
+        assert!(carries > COUNT as usize / FANOUT);
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].2, COUNT as usize);
     }
 
     proptest! {
