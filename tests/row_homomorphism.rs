@@ -235,3 +235,117 @@ fn succinctarchive_pattern_is_row_homomorphic() {
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
     check_backend("SuccinctArchive", &archive, &fixture);
 }
+
+#[test]
+fn tribleset_adjacent_prefix_run_is_row_homomorphic() {
+    let fixture = fixture();
+    let mut context = VariableContext::new();
+    let entity = context.next_variable::<GenId>();
+    let value = context.next_variable::<UnknownInline>();
+    let unrelated = context.next_variable::<UnknownInline>();
+    let constraint = fixture
+        .set
+        .pattern(entity, GenId::inline_from(fixture.attribute), value);
+
+    // Three copies of one entity followed by two copies of another. The
+    // unrelated column changes on every row, proving that replay is keyed to
+    // this pattern's bound prefix rather than accidental whole-row equality.
+    // Every split exercises the same semantics; splits 1, 2, and 4 cut through
+    // an adjacent prefix run and force one shard to recompute the PATCH answer
+    // that the whole block may replay.
+    let entity_vars = [entity.index, unrelated.index];
+    let entities = [
+        fixture.entities[0],
+        fixture.entities[0],
+        fixture.entities[0],
+        fixture.entities[1],
+        fixture.entities[1],
+    ];
+    let entity_rows: Vec<RawInline> = entities
+        .into_iter()
+        .enumerate()
+        .flat_map(|(row, id)| [GenId::inline_from(id).raw, [row as u8 + 20; 32]])
+        .collect();
+    let view = RowsView::new(&entity_vars, &entity_rows);
+
+    let mut full_estimates = Vec::new();
+    assert!(constraint.estimate(
+        value.index,
+        &view,
+        &mut EstimateSink::Column(&mut full_estimates),
+    ));
+
+    let mut full_proposals = Candidates::new();
+    constraint.propose(
+        value.index,
+        &view,
+        &mut CandidateSink::Tagged(&mut full_proposals),
+    );
+
+    let mut initial = Candidates::new();
+    for row in 0..view.len() as u32 {
+        initial.extend(
+            fixture
+                .values
+                .iter()
+                .copied()
+                .map(|candidate| (row, candidate)),
+        );
+    }
+    let mut full_confirmed = initial.clone();
+    constraint.confirm(
+        value.index,
+        &view,
+        &mut CandidateSink::Tagged(&mut full_confirmed),
+    );
+
+    for split in 1..view.len() {
+        let mut split_estimates = Vec::new();
+        let mut split_proposals = Candidates::new();
+        let mut split_confirmed = Candidates::new();
+
+        for (start, end) in [(0, split), (split, view.len())] {
+            let shard = RowsView::new(
+                &entity_vars,
+                &entity_rows[start * entity_vars.len()..end * entity_vars.len()],
+            );
+            assert!(constraint.estimate(
+                value.index,
+                &shard,
+                &mut EstimateSink::Column(&mut split_estimates),
+            ));
+
+            let mut proposals = Candidates::new();
+            constraint.propose(
+                value.index,
+                &shard,
+                &mut CandidateSink::Tagged(&mut proposals),
+            );
+            split_proposals.extend(
+                proposals
+                    .into_iter()
+                    .map(|(row, candidate)| (row + start as u32, candidate)),
+            );
+
+            let mut confirmed: Candidates = initial
+                .iter()
+                .filter(|(row, _)| (*row as usize) >= start && (*row as usize) < end)
+                .map(|(row, candidate)| (row - start as u32, *candidate))
+                .collect();
+            constraint.confirm(
+                value.index,
+                &shard,
+                &mut CandidateSink::Tagged(&mut confirmed),
+            );
+            split_confirmed.extend(
+                confirmed
+                    .into_iter()
+                    .map(|(row, candidate)| (row + start as u32, candidate)),
+            );
+        }
+
+        assert_eq!(split_estimates, full_estimates, "estimate split {split}");
+        assert_eq!(split_proposals, full_proposals, "propose split {split}");
+        assert_eq!(split_confirmed, full_confirmed, "confirm split {split}");
+    }
+}
