@@ -141,9 +141,12 @@ The crate also ships with these blob encodings:
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
   type](https://docs.rs/triblespace/latest/triblespace/core/blob/encodings/succinctarchive/struct.SuccinctArchive.html)
-  for offline queries. The `SuccinctArchive` helper exposes high-level
-  iterators while the `SuccinctArchiveBlob` encoding is responsible for the
-  serialized byte layout.
+  for offline queries. It contains only deterministic Ring/wavelet data and EOF
+  metadata. `SuccinctArchiveRank9IndexBlob` is the separately
+  content-addressed, source-bound native Rank9/select accelerator; its first 32
+  bytes identify the exact raw archive it indexes. The `SuccinctArchive`
+  helper exposes high-level iterators, returns both artifacts with
+  `to_blob_pair`, and attaches an existing pair with `from_blob_pair`.
 - `WasmCode` for WebAssembly bytecode stored as a blob.
 - `UnknownBlob` for data of unknown type.
 

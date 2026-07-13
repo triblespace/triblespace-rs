@@ -14,18 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operational CLI, defaults to `<pile>.pidx`, and preserves the authoritative
   append-only pile while atomically replacing only the derived cache after a
   complete successful build.
-- **Succinct archives persist their Rank9/select indexes as additive sidecars.**
-  Writers append exact native-`usize` Rank9 payloads, a canonical handle table,
-  and a versioned footer immediately before the unchanged EOF
-  `SuccinctArchiveMeta`; all legacy raw sections and offsets remain
-  byte-identical, so pre-sidecar readers still query new archives and new
-  readers rebuild indexes for legacy or unknown-version archives. Supported
-  sidecar attachment avoids index-sized allocation, exactly validates every raw
-  bit plane, and treats malformed v1 footers as corruption. Structural,
-  direct, packed CPU, Jerky fallback, and accelerator-backed builders share the
-  same finalizer and canonical handle order. The 16-byte footer marker
-  `6BE4FFC8E6F5A51A1294BE9B0F498FEA` was minted with `trible genid` on
-  2026-07-12.
+- **Succinct archives separate canonical raw data from Rank9 acceleration.**
+  `SuccinctArchiveBlob` now ends after the deterministic Ring/wavelet sections
+  and EOF metadata, while `SuccinctArchiveRank9IndexBlob` carries the exact
+  native-ABI Rank9/select payloads as a replaceable artifact. Its source raw
+  handle occupies aligned offset zero for generic reachability; exact version,
+  ABI, relative-section, raw-source, rank/select, and source-handle validation
+  prevents mismatched or corrupt pairs from attaching. Direct, structural,
+  packed CPU, Jerky fallback, and accelerator-backed builders stream the two
+  blobs in parallel and preserve canonical raw parity without an index-sized
+  intermediate allocation. The blob encoding id
+  `9F22887EAA90E13E646147353DFCDE06` and format marker
+  `FEFF44EF2D61BD450FE254A0AAE8B4A5` were minted with `trible genid` on
+  2026-07-13. The unpublished embedded-suffix format and compatibility paths
+  were removed rather than retained as legacy surface.
 - **Piles have an experimental, opt-in mapped locator snapshot.**
   `MappedPileIndex` builds a checksummed `.pidx` cache with sorted blob, pin,
   and weak-pin tables, using bounded external-sort runs instead of another
