@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **WGPU succinct archives keep E/A pair-change boundaries resident.**
+  `WgpuSuccinctArchive` now mirrors `changed_e_a` in the same private Jerky
+  compatibility domain as its prefix vectors and Ring columns, exposes the
+  documented `entity_attribute_changes` accessor, and checks native parity and
+  fail-closed rejection of buffers from a separately constructed wrapper.
 - **An opt-in CubeCL CPU-runtime probe compares one rank-style kernel across
   MLIR/LLVM CPU and WGPU.** The `triblespace-gpu` `cpu` feature remains outside
   production defaults and exists to run `cpu_runtime_probe`, which checks exact

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use jerky::bit_vector::{NumBits, Rank, Select};
 use rayon::prelude::*;
 use triblespace_core::and;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -168,7 +169,7 @@ fn wgpu_archive_components_share_one_resident_context() {
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let gpu = WgpuSuccinctArchive::new(archive.clone()).unwrap();
-    let foreign = WgpuSuccinctArchive::new(archive).unwrap();
+    let foreign = WgpuSuccinctArchive::new(archive.clone()).unwrap();
 
     // Inputs and outputs allocated through different resident components must
     // compose because all of them clone the wrapper's one compatibility
@@ -181,7 +182,15 @@ fn wgpu_archive_components_share_one_resident_context() {
         .ring_col(SuccinctRotation::Vea)
         .upload_u32(&[0, 0])
         .unwrap();
-    let mut output = gpu.entity_prefix().context().empty_u32(2).unwrap();
+    let change_ranks = gpu
+        .ring_col(SuccinctRotation::Aev)
+        .upload_u32(&[0, 1])
+        .unwrap();
+    let mut output = gpu
+        .entity_attribute_changes()
+        .context()
+        .empty_u32(2)
+        .unwrap();
     for rotation in [
         SuccinctRotation::Eav,
         SuccinctRotation::Vea,
@@ -204,6 +213,28 @@ fn wgpu_archive_components_share_one_resident_context() {
         prefix.select1_batch_into(&values, &mut output).unwrap();
     }
 
+    let changes = gpu.entity_attribute_changes();
+    assert_eq!(changes.len(), archive.changed_e_a.len());
+    assert_eq!(changes.num_ones(), archive.changed_e_a.num_ones());
+    changes.rank1_batch_into(&positions, &mut output).unwrap();
+    assert_eq!(
+        output.read(),
+        [0, 1]
+            .into_iter()
+            .map(|position| archive.changed_e_a.rank1(position).unwrap() as u32)
+            .collect::<Vec<_>>()
+    );
+    changes
+        .select1_batch_into(&change_ranks, &mut output)
+        .unwrap();
+    assert_eq!(
+        output.read(),
+        [0, 1]
+            .into_iter()
+            .map(|rank| archive.changed_e_a.select1(rank).unwrap() as u32)
+            .collect::<Vec<_>>()
+    );
+
     // A separately-created wrapper intentionally forms another compatibility
     // domain even though both wrappers target the same physical WGPU device.
     let mut foreign_output = foreign.context().empty_u32(2).unwrap();
@@ -213,6 +244,10 @@ fn wgpu_archive_components_share_one_resident_context() {
         .is_err());
     assert!(gpu
         .entity_prefix()
+        .rank1_batch_into(&positions, &mut foreign_output)
+        .is_err());
+    assert!(gpu
+        .entity_attribute_changes()
         .rank1_batch_into(&positions, &mut foreign_output)
         .is_err());
 }

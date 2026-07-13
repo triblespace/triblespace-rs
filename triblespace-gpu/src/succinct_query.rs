@@ -106,8 +106,9 @@ impl QueryStats {
     }
 }
 
-/// A [`SuccinctArchive`] with its three axis prefixes and all six ring columns
-/// resident on WGPU in one compatibility domain.
+/// A [`SuccinctArchive`] with its three axis prefixes, entity/attribute change
+/// boundaries, and all six ring columns resident on WGPU in one compatibility
+/// domain.
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
 /// the wrapped CPU archive unchanged. Only the independent rank stream emitted
@@ -127,6 +128,8 @@ where
     a_a: WgpuBitVector,
     /// Resident mirror of [`SuccinctArchive::v_a`].
     v_a: WgpuBitVector,
+    /// Resident mirror of [`SuccinctArchive::changed_e_a`].
+    changed_e_a: WgpuBitVector,
     /// Resident mirror of [`SuccinctArchive::eav_c`].
     eav_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::vea_c`].
@@ -147,8 +150,9 @@ impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
 {
-    /// Prepares and enqueues the three canonical prefix vectors and all six
-    /// Ring wavelet matrices on the default WGPU device.
+    /// Prepares and enqueues the three canonical prefix vectors, the E/A pair
+    /// change vector, and all six Ring wavelet matrices on the default WGPU
+    /// device.
     ///
     /// CubeCL's buffer writes are asynchronous; the first rank query provides
     /// the synchronization boundary. Existing query operations other than
@@ -158,6 +162,7 @@ where
         let e_a = WgpuBitVector::with_context(context.clone(), &archive.e_a.data)?;
         let a_a = WgpuBitVector::with_context(context.clone(), &archive.a_a.data)?;
         let v_a = WgpuBitVector::with_context(context.clone(), &archive.v_a.data)?;
+        let changed_e_a = WgpuBitVector::with_context(context.clone(), &archive.changed_e_a.data)?;
         let eav_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eav_c)?;
         let vea_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vea_c)?;
         let ave_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.ave_c)?;
@@ -170,6 +175,7 @@ where
             e_a,
             a_a,
             v_a,
+            changed_e_a,
             eav_c,
             vea_c,
             ave_c,
@@ -239,6 +245,16 @@ where
     /// Returns the resident value-axis prefix bit vector.
     pub fn value_prefix(&self) -> &WgpuBitVector {
         &self.v_a
+    }
+
+    /// Returns the resident EAV entity/attribute pair-change bit vector.
+    ///
+    /// This mirrors [`SuccinctArchive::changed_e_a`] in the same compatibility
+    /// domain as the prefix vectors and Ring columns. Jerky reserves
+    /// `u32::MAX` as its device miss sentinel, so resident construction keeps
+    /// the bit-vector geometry strictly below that length.
+    pub fn entity_attribute_changes(&self) -> &WgpuBitVector {
+        &self.changed_e_a
     }
 
     /// Returns the resident last-column mirror of `rotation`.
