@@ -119,7 +119,7 @@ pub mod capability;
 pub mod commit;
 /// Storage adapter that delegates blobs and branches to separate backends.
 pub mod hybridstore;
-/// LSMT-of-segments derived-index home (manifest pin + SuccinctArchive rollup).
+/// Range-native derived-index manifests and typed artifacts.
 pub mod index_home;
 pub mod index_range;
 /// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
@@ -218,7 +218,6 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::inline::encodings::ed25519 as ed;
 use crate::inline::encodings::shortstring::ShortString;
 use crate::prelude::*;
@@ -244,39 +243,22 @@ attributes! {
     "9DF34F84959928F93A3C40AEB6E9E499" as pub signature_r: ed::ED25519RComponent;
     /// The `s` part of a ed25519 signature.
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
-    /// Optional SuccinctArchive rollup of the branch HEAD's logical contents.
-    ///
-    /// Readers can fetch this blob via the repository's blob store to obtain
-    /// a compact, instantly-queryable representation of the branch's state
-    /// without having to materialise the TribleSet from the commit chain.
-    /// Absent on branches that haven't had a rollup built yet. Soft state:
-    /// the rollup is redundant with (and must agree with) whatever
-    /// `ws.checkout(..)` would return for the same HEAD.
-    "D7D14C6737AA27A51E1E08D380D13EF9" as pub rollup: Handle<SuccinctArchiveBlob>;
 }
 
-/// Rebuild a branch-head metadata tribleset against a new commit head and
-/// rollup, carrying the index-home LSMT manifest forward from the previous
-/// head (`base_meta`).
+/// Rebuild branch-head metadata against a new commit head while carrying the
+/// range-native index manifests forward from `base_meta`.
 ///
 /// [`branch_metadata`] builds a fresh head that omits the manifest, so a
-/// rebuild (a `push`, a `compute_rollup`) would otherwise wipe it each time
-/// — forcing every [`IndexHome::update_index`](index_home::IndexHome::update_index)
-/// to start over with a single fresh segment and keeping the tiered merge
-/// and reachability GC from ever firing live. Unioning the previous head's
-/// manifest tribles back in makes segments accumulate across rebuilds. The
-/// manifest stays ephemeral (still re-derivable from the commit chain);
-/// only the rebuild cadence changes from wipe-every-commit to
-/// carry-and-compact.
+/// rebuild would otherwise wipe soft derived state. Unknown recipe-owned
+/// facts are copied losslessly alongside known typed manifests.
 fn rebuild_branch_meta(
     signing_key: &SigningKey,
     branch_id: Id,
     name: Inline<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup_handle: Option<Inline<Handle<SuccinctArchiveBlob>>>,
     base_meta: &TribleSet,
 ) -> TribleSet {
-    let mut meta = branch_metadata(signing_key, branch_id, name, commit_head, rollup_handle);
+    let mut meta = branch_metadata(signing_key, branch_id, name, commit_head);
     meta += index_home::manifest_tribles(base_meta);
     meta
 }
@@ -822,35 +804,6 @@ pub enum MergeError {
 }
 
 /// Error returned by [`Repository::push`] and [`Repository::try_push`].
-/// Error type for [`Repository::compute_rollup`].
-#[derive(Debug)]
-pub enum RollupError<Storage: PinStore + BlobStore> {
-    /// The branch was not found in the underlying storage.
-    UnknownBranch,
-    /// The branch is empty — no HEAD to roll up.
-    EmptyBranch,
-    /// The branch HEAD advanced between checkout and CAS-update. The
-    /// caller may retry (`compute_rollup` is content-addressed so repeat
-    /// calls dedupe against already-uploaded blobs).
-    HeadAdvanced,
-    /// Underlying push / storage error during the attach step.
-    Push(PushError<Storage>),
-    /// Could not pull the branch to obtain a workspace.
-    Pull(
-        PullError<
-            Storage::HeadError,
-            <Storage as BlobStore>::ReaderError,
-            <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-        >,
-    ),
-    /// Could not check out the branch state to build the archive.
-    Checkout(
-        WorkspaceCheckoutError<
-            <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-        >,
-    ),
-}
-
 #[derive(Debug)]
 pub enum PushError<Storage: PinStore + BlobStore> {
     /// An error occurred while enumerating the branch storage branches.
@@ -1142,13 +1095,14 @@ where
             let reader = storage
                 .reader()
                 .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
+            index_home::validate_monotone_batch(&reader, batch.base_head, batch.new_head)?;
             let manifest = index_home::Manifest::from_tribles(head_meta, &reader, &kind)
                 .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
             if !manifest.claims_head(batch.base_head) {
                 return Err(Box::new(index_home::CoverageMismatch {
                     recipe: manifest.recipe(),
                     expected: batch.base_head,
-                    actual: manifest.head(),
+                    actual: manifest.frontier().to_vec(),
                 }));
             }
 
@@ -1198,8 +1152,8 @@ where
     /// Drain the hook failures recorded (and skipped) by pushes since the
     /// last call. An entry here means a commit landed *without* that
     /// hook's contribution — for index hooks the index is soft state and
-    /// simply missing that delta; it can be repaired by an explicit
-    /// an explicit range rebuild, never by re-writing history.
+    /// simply missing that delta; it can be repaired by an explicit range
+    /// rebuild, never by re-writing history.
     pub fn take_hook_errors(&mut self) -> Vec<HookError> {
         std::mem::take(&mut self.hook_errors)
     }
@@ -1275,15 +1229,9 @@ where
                 .map_err(|e| BranchError::StorageReader(e))?;
             let set: TribleSet = reader.get(commit).map_err(|e| BranchError::StorageGet(e))?;
 
-            branch::branch_metadata(
-                &signing_key,
-                *branch_id,
-                name_handle,
-                Some(set.to_blob()),
-                None,
-            )
+            branch::branch_metadata(&signing_key, *branch_id, name_handle, Some(set.to_blob()))
         } else {
-            branch::branch_unsigned(*branch_id, name_handle, None, None)
+            branch::branch_unsigned(*branch_id, name_handle, None)
         };
 
         let branch_blob = branch_set.to_blob();
@@ -1519,10 +1467,6 @@ where
             workspace.base_branch_id,
             branch_name,
             Some(head_.to_blob()),
-            // A fresh commit invalidates any prior rollup (it was computed
-            // against the old HEAD). Readers fall back to checkout until
-            // `compute_rollup` runs against the new HEAD.
-            None,
             &base_branch_meta,
         );
 
@@ -1644,94 +1588,6 @@ where
 
                 Ok(Some(conflict_ws))
             }
-        }
-    }
-
-    /// Builds a [`SuccinctArchive`](crate::blob::encodings::succinctarchive::SuccinctArchive) rollup of the branch's current HEAD,
-    /// stores it as a blob in the underlying storage, and attaches the
-    /// resulting handle to the branch metadata via CAS.
-    ///
-    /// Returns the new rollup handle on success.
-    ///
-    /// Returns [`RollupError::HeadAdvanced`] if the branch HEAD moved
-    /// between `pull` and the CAS-update. The caller may retry — the
-    /// archive blob is content-addressed, so subsequent calls dedupe
-    /// against already-uploaded blobs.
-    ///
-    /// Returns [`RollupError::EmptyBranch`] if the branch has no HEAD
-    /// commit yet (nothing to roll up).
-    ///
-    /// This is the sole public write-path for rollups. The companion
-    /// read-path is [`Workspace::rollup`].
-    pub fn compute_rollup(
-        &mut self,
-        branch_id: Id,
-    ) -> Result<
-        Inline<Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>>,
-        RollupError<Storage>,
-    > {
-        use crate::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-        use crate::blob::IntoBlob;
-
-        let mut ws = self.pull(branch_id).map_err(RollupError::Pull)?;
-        let head_handle = ws.head().ok_or(RollupError::EmptyBranch)?;
-
-        // Materialise the branch state from its commit chain and build the
-        // succinct index over it.
-        let space = ws.checkout(..).map_err(RollupError::Checkout)?;
-        let archive: SuccinctArchive<OrderedUniverse> = (&*space).into();
-        drop(space);
-
-        // Upload the archive blob directly to storage — no workspace-local
-        // staging needed; the CAS below references it by handle.
-        let archive_blob = (&archive).to_blob();
-        let handle: Inline<Handle<crate::blob::encodings::succinctarchive::SuccinctArchiveBlob>> =
-            self.storage
-                .put(archive_blob)
-                .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
-
-        // Construct a fresh branch meta that carries the same head as
-        // `base_branch_meta` plus the new rollup attribute.
-        let reader = self
-            .storage
-            .reader()
-            .map_err(|e| RollupError::Push(PushError::StorageReader(e)))?;
-        let base_meta: TribleSet = reader
-            .get(ws.base_branch_meta)
-            .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
-        let (branch_name,) = find!(
-            (name: Inline<Handle<LongString>>),
-            pattern!(&base_meta, [{ crate::metadata::name: ?name }])
-        )
-        .exactly_one()
-        .map_err(|_| RollupError::Push(PushError::BadBranchMetadata()))?;
-        let head_blob: TribleSet = reader
-            .get(head_handle)
-            .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
-
-        let new_meta = rebuild_branch_meta(
-            &ws.signing_key,
-            branch_id,
-            branch_name,
-            Some(head_blob.to_blob()),
-            Some(handle),
-            &base_meta,
-        );
-        let new_meta_handle = self
-            .storage
-            .put(new_meta)
-            .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
-
-        // CAS: swap `base_branch_meta` for the new meta. On conflict, the
-        // head advanced between our pull and this CAS — the rollup we built
-        // is stale against the new head, so report upstream.
-        let update_result = self
-            .storage
-            .update(branch_id, Some(ws.base_branch_meta), Some(new_meta_handle))
-            .map_err(|e| RollupError::Push(PushError::BranchUpdate(e)))?;
-        match update_result {
-            PushResult::Success() => Ok(handle),
-            PushResult::Conflict(_) => Err(RollupError::HeadAdvanced),
         }
     }
 }
@@ -2570,42 +2426,6 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
     /// Returns the workspace metadata handle.
     pub fn metadata(&self) -> MetadataHandle {
         self.commit_metadata
-    }
-
-    /// Reads the rollup handle, if any, from the workspace's base branch
-    /// metadata. Returns `None` if the branch has no rollup yet or if the
-    /// metadata is missing the attribute. Readers can use this to fetch
-    /// the archive blob directly and skip `checkout(..)` for warm queries:
-    ///
-    /// ```rust,ignore
-    /// let mut ws = repo.pull(branch)?;
-    /// match ws.rollup()? {
-    ///     Some(h) => {
-    ///         let archive: SuccinctArchive<_> = ws.get(h)?;
-    ///         // query archive
-    ///     }
-    ///     None => {
-    ///         let space = ws.checkout(..)?;
-    ///         // query space (commit-chain materialisation)
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// Writers don't go through this — attach a rollup via
-    /// [`Repository::compute_rollup`] instead.
-    pub fn rollup(
-        &mut self,
-    ) -> Result<
-        Option<Inline<Handle<SuccinctArchiveBlob>>>,
-        <Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-    > {
-        let base_meta: TribleSet = self.base_blobs.get(self.base_branch_meta)?;
-        Ok(find!(
-            (r: Inline<Handle<SuccinctArchiveBlob>>),
-            pattern!(&base_meta, [{ rollup: ?r }])
-        )
-        .next()
-        .map(|(r,)| r))
     }
 
     /// Adds a blob to the workspace's local blob store.

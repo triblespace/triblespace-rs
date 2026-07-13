@@ -9,7 +9,6 @@ use ed25519_dalek::VerifyingKey;
 use itertools::Itertools;
 
 use crate::blob::encodings::longstring::LongString;
-use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::Id;
@@ -54,7 +53,6 @@ pub fn branch_metadata(
     branch_id: Id,
     name: Inline<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Inline<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let (head_handle, signed_by, signature) = match commit_head.as_ref() {
         Some(blob) => (
@@ -72,7 +70,6 @@ pub fn branch_metadata(
         super::signed_by?: signed_by,
         super::signature_r?: signature,
         super::signature_s?: signature,
-        super::rollup?: rollup,
         metadata::name: name,
         metadata::updated_at: updated_at,
     };
@@ -87,7 +84,6 @@ pub fn branch_unsigned(
     branch_id: Id,
     name: Inline<Handle<LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
-    rollup: Option<Inline<Handle<SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let head_handle = commit_head.as_ref().map(|blob| blob.get_handle());
     let updated_at = now_updated_at();
@@ -95,7 +91,6 @@ pub fn branch_unsigned(
     let fragment = entity! {
         super::branch: branch_id,
         super::head?: head_handle,
-        super::rollup?: rollup,
         metadata::name: name,
         metadata::updated_at: updated_at,
     };

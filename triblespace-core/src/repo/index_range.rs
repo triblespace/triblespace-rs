@@ -522,11 +522,26 @@ pub fn validate_exact_cover<D>(
 where
     D: CommitDag,
 {
+    validate_exact_frontier_cover(dag, ranges, &head.into_iter().collect::<Vec<_>>())
+}
+
+/// Verify that `ranges` form a pairwise-disjoint exact cover of the union of
+/// every commit in `frontier` and its ancestors. The frontier must be an
+/// antichain; an empty frontier requires zero covered commits.
+pub fn validate_exact_frontier_cover<D>(
+    dag: &mut D,
+    ranges: &[CommitRange],
+    frontier: &[CommitHandle],
+) -> Result<(), RangeValidationError<D::Error>>
+where
+    D: CommitDag,
+{
     let mut view = DagView::new(dag);
-    let expected = match head {
-        Some(head) => view.ancestors(head)?,
-        None => HashSet::new(),
-    };
+    view.ensure_antichain("head", frontier)?;
+    let mut expected = HashSet::new();
+    for head in frontier {
+        expected.extend(view.ancestors(*head)?);
+    }
     let mut actual = HashSet::new();
     for range in ranges {
         for commit in view.range_members(range)? {
@@ -539,6 +554,30 @@ where
         return Err(RangeValidationError::IncompleteCover);
     }
     Ok(())
+}
+
+/// Return whether `ancestor` is reachable from `descendant` by following zero
+/// or more parent edges. The iterative walk is used by commit-batch guards
+/// before an index hook starts extending a certified manifest.
+pub fn is_ancestor<D>(
+    dag: &mut D,
+    ancestor: CommitHandle,
+    descendant: CommitHandle,
+) -> Result<bool, RangeValidationError<D::Error>>
+where
+    D: CommitDag,
+{
+    let mut visited = HashSet::new();
+    let mut stack = vec![descendant];
+    while let Some(commit) = stack.pop() {
+        if commit == ancestor {
+            return Ok(true);
+        }
+        if visited.insert(commit) {
+            stack.extend(dag.parents(commit).map_err(RangeValidationError::Graph)?);
+        }
+    }
+    Ok(false)
 }
 
 struct DagView<'a, D: CommitDag> {

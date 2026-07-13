@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
-  descriptors are self-marked, losslessly retained manifest headers with an
-  optional certified head. Inclusive range records carry exactly one LSM
+  descriptors are self-marked, losslessly retained manifest headers with a
+  repeated maximal certified frontier. Inclusive range records carry one LSM
   level/sequence and zero or more typed physical artifacts, so contentless
   commits remain covered and large commits can be sharded without overlapping
   logical ranges. Succinct records emit both the raw archive and detached
@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`0297BF2535F4FEDF7AFE6E5E7D125CF0`) attributes were minted with
   `trible genid` on 2026-07-13. The unpublished schema-erased
   `seg_kind`/`seg_blob`/`covered_tip` manifest and filtered registration API
-  were removed rather than carried as compatibility surface.
+  were removed rather than carried as compatibility surface. The obsolete
+  monolithic branch `rollup` attribute, `Repository::compute_rollup`, and
+  `Workspace::rollup` were likewise removed; typed IndexHome artifacts are now
+  the only production derived-index path.
 - **Derived-index manifests gain artifact-neutral commit-DAG ranges.**
   `repo::index_range` models inclusive repeated start/end antichains, stable
   explicit range-record identities, lossless opaque-fact carry-forward,
@@ -319,68 +322,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Index-home: derived indexes as an LSMT of segments, manifest in the
-  branch head.** New `triblespace_core::repo::index_home` module. Each
-  index *kind* (`IndexKind`: `build` / `attach` / `merge`) maintains a
-  log-structured merge tree of immutable, content-addressed segment blobs;
-  the *manifest* (one entity per segment: kind tag, blob handle, LSMT
-  level, sequence number, plus a source-commit coverage frontier) lives as
-  tribles unioned directly into the
-  **branch-head tribleset** — no separate pin, and GC of superseded
-  segments is the store's existing reachability sweep because the branch
-  head is already a reachability root. Reads go branch-head → manifest
-  subset → bounded segment fetches (`IndexHome::attach_all`) — **query
-  without checkout**, no commit walk. Maintenance is a cheap level-0
-  append plus a size-tiered merge (`FANOUT = 4`) via
-  `IndexHome::update_index` (explicit, CAS-repoints the branch pin) or —
-  the usual path — **on-commit hooks**: `Repository::register_index` /
-  `register_index_filtered` / `on_commit` fold the new segment's manifest
-  into the same branch-head tribleset the push is about to CAS in, so a
-  commit and its index maintenance land in one atomic repoint. Hooks receive
-  a parents-first `CommitBatch` and build one logical leaf per newly reachable
-  source commit instead of materialising one push-sized union; contentless
-  merge commits advance coverage without creating empty segments. A stale
-  frontier (for example after an unhooked writer) is detected rather than
-  silently skipped. Carry chains now keep intermediate merged segments in
-  memory and store only the final stable blob while preserving the historical
-  sequence stream and canonical manifest bytes; maintenance also repairs the
-  lowest overfull tier globally when public or migration seams supply a
-  non-canonical manifest. Segment attachment is fallible
-  (`IndexKind::try_attach`), and kinds may surface merge failures through
-  `IndexKind::try_merge` / `IndexError::Merge`; either failure leaves the prior
-  manifest and all victim blobs live (an already-stored content-addressed leaf
-  may merely become collectible garbage),
-  so missing/corrupt soft state can be rebuilt instead of panicking; explicit
-  `IndexHome::update_index` clears commit coverage because its arbitrary source
-  view cannot certify a frontier. Hooks re-run
-  per push attempt; content-addressed segments make that idempotent, and a
-  hook failure is recorded and drained via `take_hook_errors`, never
-  blocking the commit). Branch-metadata rebuilds (`push`,
-  `compute_rollup`) carry the manifest forward (`rebuild_branch_meta`), so
-  segments **accumulate across commits** instead of being wiped by each
-  rebuild. Succinct compaction structurally merges the six sorted rotations
-  with bounded working memory. The canonical CPU merge now writes packed
-  wavelet planes with a two-buffer O(n) scratch reused across rotations,
-  avoiding Jerky's transient Rank9 indexes and O(n log² σ) cycle-rotation
-  freeze. Its wavelet-freeze phase also has a GPU-free
-  `WaveletMatrixFreezeBackend` seam plus
-  `merge_ordered_archives_with_backend`; core still owns domain remapping,
-  sorted rotation merge, canonical section layout, and blob assembly, while an
-  optional `triblespace-gpu` workspace companion fills preallocated packed bit
-  planes through CubeCL/WGPU or CUDA without adding GPU dependencies to core.
-  `AcceleratedSuccinctRollup` selects that backend at or above a caller-chosen
-  input-row threshold; a returned failure opens a circuit breaker before the
-  canonical CPU retry, without changing the kind id or bytes. BM25 compaction
-  recovers persisted postings once into an anonymous fixed-width spool and
-  replays it for score sizing and canonical serialization instead of
-  reconstructing every document's token bag or holding a corpus-sized posting
-  cache; its index-home path uses the fallible merge hook so spool and succinct
-  area errors cannot publish a partial manifest. The direct
-  documented `SimpleArchive` → `SuccinctArchive` conversion is now wired. First
-  kinds: `SuccinctRollup` in core (segments are
-  `SuccinctArchive`s; `SuccinctRollup::union` gives cross-segment joins via
-  `UnionConstraint`), and in `triblespace-search` the `Bm25Rollup` (term
-  search) and `HnswRollup` (vector search) kinds ride the same surface.
+- **Index-home provides bounded query-without-checkout maintenance.** Typed
+  recipe manifests live in the branch-head tribleset, so their artifact
+  handles participate in the existing reachability GC without a separate pin.
+  `Repository::register_index` receives parents-first `CommitBatch` values and
+  appends one inclusive logical leaf per newly reachable commit; hook mutation
+  is scratch-atomic and failures remain drainable through `take_hook_errors`
+  without blocking the source commit. Reads attach the bounded artifact set
+  through `IndexHome::attach_all`. Succinct compaction structurally merges the
+  six Ring rotations with bounded working memory; its packed CPU freeze has a
+  `WaveletMatrixFreezeBackend` seam used by `AcceleratedSuccinctRollup`, whose
+  returned device failures open a circuit breaker before canonical CPU retry.
+  `SuccinctRollup::union` provides cross-artifact joins through
+  `UnionConstraint`. BM25 and HNSW recipes in `triblespace-search` use the same
+  typed range surface.
 - **Async blob-store trait family.** New
   `triblespace_core::repo::async_store` module: `AsyncBlobStoreGet` /
   `AsyncBlobStorePut` / `AsyncBlobStoreList` / `AsyncBlobStore` /

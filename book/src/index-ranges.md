@@ -70,6 +70,50 @@ that is the canonical completed-empty projection. `replace_range_records`
 removes every fact under a retired entity and is used when compacting the
 complete recipe/range slot and all artifacts owned by it.
 
+## Typed index-home manifests
+
+`repo::index_home` gives the artifact-neutral range model a typed maintenance
+surface. An `IndexKind` supplies one deterministic, inline-only
+`recipe_fragment()` with exactly one exported root. That recipe entity is also
+the manifest header and carries a self-marker:
+
+```text
+recipe @ index_recipe: recipe
+```
+
+The marker makes even an empty manifest discoverable during a generic branch
+metadata rebuild. All facts on a discovered recipe or range subject are copied
+verbatim, including attributes unknown to the current binary. Parsing checks
+the known control fields without reconstructing those real entities from a
+lossy Rust projection.
+
+The header's repeated `index_head*` values are the maximal antichain currently
+certified by the manifest. Empty history uses an empty frontier; a fully
+caught-up branch normally uses the singleton `{HEAD}`. A partial durable replay
+across a fork may instead use several tips. The exact-cover audit compares the
+live ranges with the union of every frontier tip's ancestor closure.
+
+Each logical range entity has exactly one `seg_level` and `seg_seq`, plus zero
+or more recipe-typed physical artifacts. Fanout and compaction count logical
+range records, not their physical shards. `store_artifact` can therefore persist
+independently prepared shards as they finish, while `append_stored_range`
+publishes all of their typed handles on one shared source range. The prepared
+convenience stores the vector first and then performs the same logical append.
+
+The Succinct recipe emits both repeated attributes for every shard:
+
+```text
+range @ seg_succinct*: raw_archives,
+        seg_succinct_rank9*: rank9_accelerators
+```
+
+The facts are intentionally unordered. Parsing loads each Rank9 header, reads
+its embedded raw-source handle, and requires a bijection: every declared raw
+archive has exactly one accelerator, every accelerator names a declared raw
+archive, and no source is claimed twice. Attachment then uses
+`SuccinctArchive::from_blob_pair` and never rebuilds Rank9 data on the read
+path. A range with no pairs remains a complete empty/contentless certificate.
+
 ## Exact compaction
 
 Compaction may merge ranges only when their logical commit sets are disjoint
@@ -91,17 +135,17 @@ when the equality does not hold.
 
 ## Whole-cover audit
 
-For each typed artifact attribute independently, live ranges across *all* LSM
-levels form one partition:
+For each recipe, live ranges across *all* LSM levels form one partition:
 
 ```text
 pairwise-disjoint union(ranges) == ancestors(branch HEAD)
 ```
 
-`validate_exact_cover` performs this audit and catches interior holes,
-overlapping live ranges, and artifacts from unreachable forks. An empty branch
-requires zero ranges. Different artifact types may use different partitions;
-overlap across those independent typed covers is expected.
+`validate_exact_frontier_cover` performs this audit and catches interior holes,
+overlapping live ranges, and artifacts from unreachable forks. The singleton
+helper `validate_exact_cover` covers the common branch-HEAD case. An empty
+frontier requires zero ranges. Different recipes may use different partitions;
+overlap across those independent covers is expected.
 
 Filtered or contentless commits still belong to a cover. Their canonical empty
 range record contains the recipe and boundaries with zero typed handles;

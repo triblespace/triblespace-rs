@@ -28,8 +28,8 @@ use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{Term, TriblePattern};
 use crate::repo::index_range::{
-    convex_union, validate_exact_cover, RangeRecord, RangeRecordError, RangeValidationError,
-    StoredCommitDag,
+    convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
+    RangeValidationError, StoredCommitDag,
 };
 use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore};
 use crate::trible::{Fragment, TribleSet};
@@ -37,8 +37,9 @@ use crate::trible::{Fragment, TribleSet};
 pub use crate::repo::index_range::CommitRange;
 
 attributes! {
-    /// Optional source head certified by one recipe manifest. Minted with
-    /// `trible genid` on 2026-07-13.
+    /// Maximal source-commit frontier certified by one recipe manifest.
+    /// Repeated values are a canonical antichain; caught-up branch state is a
+    /// singleton HEAD. Minted with `trible genid` on 2026-07-13.
     "42813BC8BB5BBF16870403E8A573162E" as pub index_head: Handle<SimpleArchive>;
     /// Raw SuccinctArchive artifact. Minted with `trible genid` on 2026-07-13.
     "040E0073548E08298E732F7154C5703F" as pub seg_succinct: Handle<SuccinctArchiveBlob>;
@@ -63,8 +64,8 @@ pub struct CoverageMismatch {
     pub recipe: Id,
     /// Head the incoming commit batch extends.
     pub expected: Option<CommitHandle>,
-    /// Head certified by the manifest snapshot.
-    pub actual: Option<CommitHandle>,
+    /// Maximal frontier certified by the manifest snapshot.
+    pub actual: Vec<CommitHandle>,
 }
 
 impl fmt::Display for CoverageMismatch {
@@ -78,6 +79,46 @@ impl fmt::Display for CoverageMismatch {
 }
 
 impl Error for CoverageMismatch {}
+
+/// A commit batch attempted to replace/rewind a certified head rather than
+/// monotonically extend it.
+#[derive(Debug, Clone)]
+pub struct NonMonotoneCommitBatch {
+    /// Previously certified base head.
+    pub base: CommitHandle,
+    /// Proposed replacement head.
+    pub proposed: CommitHandle,
+}
+
+impl fmt::Display for NonMonotoneCommitBatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "index commit batch is non-monotone: {:?} is not an ancestor of {:?}",
+            self.base, self.proposed
+        )
+    }
+}
+
+impl Error for NonMonotoneCommitBatch {}
+
+/// Validate the monotone head relation of a commit batch before building any
+/// artifacts. A genesis batch (`base == None`) is monotone by definition.
+pub fn validate_monotone_batch<R: BlobStoreGet>(
+    reader: &R,
+    base: Option<CommitHandle>,
+    proposed: CommitHandle,
+) -> Result<(), ArtifactError> {
+    let Some(base) = base else {
+        return Ok(());
+    };
+    let mut dag = StoredCommitDag::new(reader);
+    if is_ancestor(&mut dag, base, proposed).map_err(|error| Box::new(error) as ArtifactError)? {
+        Ok(())
+    } else {
+        Err(Box::new(NonMonotoneCommitBatch { base, proposed }))
+    }
+}
 
 /// Dynamically reported recipe/artifact failure.
 pub type ArtifactError = Box<dyn Error + Send + Sync>;
@@ -142,13 +183,13 @@ pub trait IndexKind {
 #[derive(Debug, Clone)]
 pub struct RangeEntry<A> {
     /// Losslessly retained range entity.
-    pub record: RangeRecord,
+    record: RangeRecord,
     /// LSM tier.
-    pub level: u64,
+    level: u64,
     /// Recipe-local sequence number.
-    pub seq: u64,
+    seq: u64,
     /// Typed physical artifacts carried by the record.
-    pub artifacts: Vec<A>,
+    artifacts: Vec<A>,
 }
 
 impl<A> RangeEntry<A> {
@@ -160,6 +201,21 @@ impl<A> RangeEntry<A> {
     /// Inclusive source range.
     pub fn range(&self) -> &CommitRange {
         self.record.range()
+    }
+
+    /// LSM tier of this logical record.
+    pub fn level(&self) -> u64 {
+        self.level
+    }
+
+    /// Recipe-local sequence number.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Typed physical artifacts carried by this logical record.
+    pub fn artifacts(&self) -> &[A] {
+        &self.artifacts
     }
 }
 
@@ -175,8 +231,6 @@ pub enum ManifestError {
     InvalidHeaderMarker { recipe: Id },
     /// A required descriptor fact was missing from the stored header.
     MissingRecipeDescriptor { recipe: Id },
-    /// More than one source head was attached to the recipe header.
-    HeadCardinality { recipe: Id },
     /// A range did not contain exactly one level and one sequence number.
     LsmCardinality { entity: Id },
     /// The same intrinsic `(recipe, range)` record was appended twice.
@@ -206,9 +260,6 @@ impl fmt::Display for ManifestError {
             ),
             Self::MissingRecipeDescriptor { recipe } => {
                 write!(f, "index recipe {recipe:x} is missing descriptor facts")
-            }
-            Self::HeadCardinality { recipe } => {
-                write!(f, "index recipe {recipe:x} has more than one index_head")
             }
             Self::LsmCardinality { entity } => write!(
                 f,
@@ -251,9 +302,9 @@ impl From<RangeRecordError> for ManifestError {
 pub struct Manifest<K: IndexKind> {
     recipe: Id,
     header: TribleSet,
-    head: Option<CommitHandle>,
+    frontier: Vec<CommitHandle>,
     /// Live logical range records ordered by `(level, seq)`.
-    pub ranges: Vec<RangeEntry<K::StoredArtifact>>,
+    ranges: Vec<RangeEntry<K::StoredArtifact>>,
     next_seq: u64,
 }
 
@@ -268,7 +319,7 @@ impl<K: IndexKind> Manifest<K> {
         Ok(Self {
             recipe,
             header,
-            head: None,
+            frontier: Vec::new(),
             ranges: Vec::new(),
             next_seq: 0,
         })
@@ -289,7 +340,11 @@ impl<K: IndexKind> Manifest<K> {
         .collect();
 
         if owned_entities.is_empty() {
-            return Self::new(kind);
+            return if entity_facts(set, recipe).is_empty() {
+                Self::new(kind)
+            } else {
+                Err(ManifestError::InvalidHeaderMarker { recipe })
+            };
         }
         if !owned_entities.contains(&recipe) {
             return Err(ManifestError::MissingHeader { recipe });
@@ -308,18 +363,16 @@ impl<K: IndexKind> Manifest<K> {
             return Err(ManifestError::MissingRecipeDescriptor { recipe });
         }
 
-        let heads: Vec<CommitHandle> = find!(
+        let mut frontier: Vec<CommitHandle> = find!(
             head: CommitHandle,
             pattern!(&header, [{ recipe @ index_head: ?head }])
         )
         .collect();
-        let head = match heads.as_slice() {
-            [] => None,
-            [head] => Some(*head),
-            _ => return Err(ManifestError::HeadCardinality { recipe }),
-        };
+        frontier.sort_unstable_by_key(|head| head.raw);
+        frontier.dedup();
 
         let mut ranges = Vec::new();
+        let mut seen_seq = HashSet::new();
         for entity in owned_entities
             .into_iter()
             .filter(|entity| *entity != recipe)
@@ -359,6 +412,9 @@ impl<K: IndexKind> Manifest<K> {
             let seq = seq
                 .try_from_inline::<u64>()
                 .map_err(|_| ManifestError::InvalidLsmValue { entity })?;
+            if !seen_seq.insert(seq) {
+                return Err(ManifestError::InvalidLsmValue { entity });
+            }
             let artifacts = kind
                 .parse(reader, &facts, entity)
                 .map_err(ManifestError::Artifact)?;
@@ -380,7 +436,7 @@ impl<K: IndexKind> Manifest<K> {
         Ok(Self {
             recipe,
             header,
-            head,
+            frontier,
             ranges,
             next_seq,
         })
@@ -391,14 +447,18 @@ impl<K: IndexKind> Manifest<K> {
         self.recipe
     }
 
-    /// Source head claimed by the header.
-    pub fn head(&self) -> Option<CommitHandle> {
-        self.head
+    /// Maximal source frontier claimed by the header.
+    pub fn frontier(&self) -> &[CommitHandle] {
+        &self.frontier
     }
 
-    /// Whether this snapshot claims exactly `head`.
+    /// Whether this snapshot is empty for `None`, or fully caught up at the
+    /// singleton `head` for `Some`.
     pub fn claims_head(&self, head: Option<CommitHandle>) -> bool {
-        self.head == head
+        match head {
+            None => self.frontier.is_empty(),
+            Some(head) => self.frontier.as_slice() == [head],
+        }
     }
 
     /// Losslessly retained recipe-header facts.
@@ -406,9 +466,16 @@ impl<K: IndexKind> Manifest<K> {
         &self.header
     }
 
+    /// Live logical records ordered by `(level, seq)`.
+    pub fn ranges(&self) -> &[RangeEntry<K::StoredArtifact>] {
+        &self.ranges
+    }
+
     /// Replace only this recipe's optional source-head fact, retaining every
     /// unknown header fact.
-    pub fn set_head(&mut self, head: Option<CommitHandle>) {
+    pub fn set_frontier(&mut self, mut frontier: Vec<CommitHandle>) {
+        frontier.sort_unstable_by_key(|head| head.raw);
+        frontier.dedup();
         let mut next = TribleSet::new();
         for fact in self
             .header
@@ -417,11 +484,11 @@ impl<K: IndexKind> Manifest<K> {
         {
             next.insert(fact);
         }
-        if let Some(head) = head {
-            next += entity! { ExclusiveId::force_ref(&self.recipe) @ index_head: head };
-        }
+        next += entity! { ExclusiveId::force_ref(&self.recipe) @
+            index_head*: frontier.iter().copied(),
+        };
         self.header = next;
-        self.head = head;
+        self.frontier = frontier;
     }
 
     /// Perform the intentionally slow exact-cover audit against stored commit
@@ -436,7 +503,7 @@ impl<K: IndexKind> Manifest<K> {
             .iter()
             .map(|entry| entry.range().clone())
             .collect();
-        validate_exact_cover(&mut dag, &ranges, self.head)
+        validate_exact_frontier_cover(&mut dag, &ranges, &self.frontier)
     }
 
     /// Serialise the actual retained header and range entities; no entity is
@@ -465,6 +532,9 @@ impl<K: IndexKind> Manifest<K> {
 
 fn recipe_descriptor<K: IndexKind>(kind: &K) -> Result<(Id, TribleSet), ManifestError> {
     let fragment = kind.recipe_fragment();
+    if !fragment.blobs().is_empty() {
+        return Err(ManifestError::InvalidRecipeFragment);
+    }
     let recipe = fragment
         .root()
         .ok_or(ManifestError::InvalidRecipeFragment)?;
@@ -483,12 +553,12 @@ fn entity_facts(set: &TribleSet, entity: Id) -> TribleSet {
     facts
 }
 
-fn replace_manifest<K: IndexKind>(
+fn replace_manifest_subjects<K: IndexKind>(
     head_set: &mut TribleSet,
-    old: &Manifest<K>,
+    retired: impl IntoIterator<Item = Id>,
     replacement: &Manifest<K>,
 ) {
-    let retired: HashSet<_> = old.subjects().collect();
+    let retired: HashSet<_> = retired.into_iter().collect();
     let mut next = TribleSet::new();
     for fact in head_set.iter().filter(|fact| !retired.contains(fact.e())) {
         next.insert(fact);
@@ -518,11 +588,12 @@ pub(crate) fn manifest_tribles(set: &TribleSet) -> TribleSet {
 /// missing or malformed accelerators can make typed parsing fail, but never
 /// prevent an operator from stripping and rebuilding the recipe manifest.
 pub fn strip_recipe_manifest(head_set: &mut TribleSet, recipe: Id) {
-    let entities: HashSet<Id> = find!(
+    let mut entities: HashSet<Id> = find!(
         entity: Id,
         pattern!(&*head_set, [{ ?entity @ crate::repo::index_range::index_recipe: recipe }])
     )
     .collect();
+    entities.insert(recipe);
     let mut next = TribleSet::new();
     for fact in head_set.iter().filter(|fact| !entities.contains(fact.e())) {
         next.insert(fact);
@@ -651,8 +722,8 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
     head_set: &mut TribleSet,
 ) -> Result<(), IndexError> {
     let reader = storage.reader().map_err(storage_error)?;
-    let old = Manifest::from_tribles(head_set, &reader, kind)?;
     let mut manifest = Manifest::from_tribles(head_set, &reader, kind)?;
+    let retired: Vec<_> = manifest.subjects().collect();
     let pending_entity = RangeRecord::new(manifest.recipe, range.clone()).entity();
     if manifest
         .ranges
@@ -719,10 +790,13 @@ pub fn append_stored_range<S: BlobStore, K: IndexKind>(
         for index in resident_indices.into_iter().rev() {
             manifest.ranges.remove(index);
         }
-        pending = (merged_range, stored, level + 1);
+        let next_level = level.checked_add(1).ok_or(ManifestError::InvalidLsmValue {
+            entity: pending_entity,
+        })?;
+        pending = (merged_range, stored, next_level);
     }
 
-    replace_manifest(head_set, &old, &manifest);
+    replace_manifest_subjects(head_set, retired, &manifest);
     Ok(())
 }
 
@@ -754,20 +828,72 @@ pub fn append_range<S: BlobStore, K: IndexKind>(
     append_prepared_range(storage, kind, range, prepared, head_set)
 }
 
-/// Replace the optional head certificate for one typed recipe while retaining
+/// Replace the maximal source frontier for one typed recipe while retaining
 /// every range and unknown recipe-owned fact.
+///
+/// This hot-path primitive assumes the caller established monotonicity and
+/// appended exactly the incoming batch's disjoint ranges. Repository hooks do
+/// so through [`validate_monotone_batch`] and their internally constructed
+/// [`crate::repo::CommitBatch`]. Use [`set_index_head_audited`] for an
+/// untrusted/repaired range set.
+pub fn set_index_frontier<S: BlobStore, K: IndexKind>(
+    storage: &mut S,
+    kind: &K,
+    head_set: &mut TribleSet,
+    frontier: Vec<CommitHandle>,
+) -> Result<(), IndexError> {
+    let reader = storage.reader().map_err(storage_error)?;
+    let mut replacement = Manifest::from_tribles(head_set, &reader, kind)?;
+    let retired: Vec<_> = replacement.subjects().collect();
+    replacement.set_frontier(frontier);
+    replace_manifest_subjects(head_set, retired, &replacement);
+    Ok(())
+}
+
+/// Publish the common empty/singleton branch-head frontier.
 pub fn set_index_head<S: BlobStore, K: IndexKind>(
     storage: &mut S,
     kind: &K,
     head_set: &mut TribleSet,
     head: Option<CommitHandle>,
 ) -> Result<(), IndexError> {
+    set_index_frontier(storage, kind, head_set, head.into_iter().collect())
+}
+
+/// Audit a complete untrusted/repaired cover before publishing its frontier.
+/// This deliberately walks commit history and is not used by the incremental
+/// hook hot path.
+pub fn set_index_frontier_audited<S: BlobStore, K: IndexKind>(
+    storage: &mut S,
+    kind: &K,
+    head_set: &mut TribleSet,
+    frontier: Vec<CommitHandle>,
+) -> Result<(), IndexError> {
     let reader = storage.reader().map_err(storage_error)?;
-    let old = Manifest::from_tribles(head_set, &reader, kind)?;
     let mut replacement = Manifest::from_tribles(head_set, &reader, kind)?;
-    replacement.set_head(head);
-    replace_manifest(head_set, &old, &replacement);
+    let retired: Vec<_> = replacement.subjects().collect();
+    {
+        let mut dag = StoredCommitDag::new(&reader);
+        let ranges: Vec<_> = replacement
+            .ranges
+            .iter()
+            .map(|entry| entry.range().clone())
+            .collect();
+        validate_exact_frontier_cover(&mut dag, &ranges, &frontier).map_err(range_error)?;
+    }
+    replacement.set_frontier(frontier);
+    replace_manifest_subjects(head_set, retired, &replacement);
     Ok(())
+}
+
+/// Audit and publish the common empty/singleton branch-head frontier.
+pub fn set_index_head_audited<S: BlobStore, K: IndexKind>(
+    storage: &mut S,
+    kind: &K,
+    head_set: &mut TribleSet,
+    head: Option<CommitHandle>,
+) -> Result<(), IndexError> {
+    set_index_frontier_audited(storage, kind, head_set, head.into_iter().collect())
 }
 
 /// Read-only index-home surface for one `(source branch, recipe)`.
@@ -837,18 +963,30 @@ where
 #[derive(Debug, Clone)]
 pub struct PreparedSuccinctArtifact {
     /// Canonical raw archive.
-    pub raw: Blob<SuccinctArchiveBlob>,
+    raw: Blob<SuccinctArchiveBlob>,
     /// Replaceable native-ABI accelerator.
-    pub rank9: Blob<SuccinctArchiveRank9IndexBlob>,
+    rank9: Blob<SuccinctArchiveRank9IndexBlob>,
 }
 
 /// Stored typed handles for one Succinct physical shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredSuccinctArtifact {
     /// Canonical raw archive handle.
-    pub raw: Inline<Handle<SuccinctArchiveBlob>>,
+    raw: Inline<Handle<SuccinctArchiveBlob>>,
     /// Accelerator handle whose embedded source is `raw`.
-    pub rank9: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
+    rank9: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
+}
+
+impl StoredSuccinctArtifact {
+    /// Canonical raw archive handle.
+    pub fn raw(&self) -> Inline<Handle<SuccinctArchiveBlob>> {
+        self.raw
+    }
+
+    /// Detached Rank9 accelerator handle.
+    pub fn rank9(&self) -> Inline<Handle<SuccinctArchiveRank9IndexBlob>> {
+        self.rank9
+    }
 }
 
 /// SuccinctArchive range recipe.
@@ -952,6 +1090,12 @@ impl IndexKind for SuccinctRollup {
         storage: &mut S,
         artifact: Self::PreparedArtifact,
     ) -> Result<Self::StoredArtifact, ArtifactError> {
+        let raw_handle = artifact.raw.get_handle();
+        let source = SuccinctArchiveRank9IndexBlob::source_handle(&artifact.rank9)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        if source != raw_handle {
+            return Err("Succinct Rank9 artifact refers to a different raw archive".into());
+        }
         let raw = storage
             .put(artifact.raw)
             .map_err(|error| Box::new(error) as ArtifactError)?;
@@ -1155,9 +1299,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::IntoBlob;
     use crate::examples::literature;
     use crate::id::fucid;
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::{BlobStorePut, CommitHandle};
+    use ed25519_dalek::SigningKey;
+    use std::convert::Infallible;
 
     fn commit(byte: u8) -> CommitHandle {
         Inline::new([byte; 32])
@@ -1166,6 +1314,70 @@ mod tests {
     fn source(name: &str) -> TribleSet {
         let person = fucid();
         entity! { &person @ literature::firstname: name }.into_facts()
+    }
+
+    fn stored_commit(
+        storage: &mut MemoryRepo,
+        key: &SigningKey,
+        parents: impl IntoIterator<Item = CommitHandle>,
+        source: Option<&TribleSet>,
+    ) -> CommitHandle {
+        let content = source.map(IntoBlob::to_blob);
+        let metadata = crate::repo::commit::commit_metadata(key, parents, None, content, None);
+        storage.put(metadata).unwrap()
+    }
+
+    fn stored_chain(storage: &mut MemoryRepo, count: usize) -> Vec<CommitHandle> {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut commits = Vec::new();
+        for index in 0..count {
+            let facts = source(&format!("person-{index}"));
+            let commit = stored_commit(storage, &key, commits.last().copied(), Some(&facts));
+            commits.push(commit);
+        }
+        commits
+    }
+
+    #[derive(Debug)]
+    struct InjectedPutFailure;
+
+    impl fmt::Display for InjectedPutFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "injected put failure")
+        }
+    }
+
+    impl Error for InjectedPutFailure {}
+
+    struct FailingPutStore {
+        inner: MemoryRepo,
+        successful_puts_left: usize,
+    }
+
+    impl BlobStorePut for FailingPutStore {
+        type PutError = InjectedPutFailure;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: crate::blob::BlobEncoding + 'static,
+            T: crate::blob::IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            if self.successful_puts_left == 0 {
+                return Err(InjectedPutFailure);
+            }
+            self.successful_puts_left -= 1;
+            Ok(self.inner.put(item).expect("MemoryRepo put is infallible"))
+        }
+    }
+
+    impl BlobStore for FailingPutStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = Infallible;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
     }
 
     #[test]
@@ -1238,6 +1450,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_rank9_sources_are_rejected() {
+        let mut storage = MemoryRepo::default();
+        let kind = SuccinctRollup;
+        let prepared = kind.build(&source("A")).unwrap().remove(0);
+        let mut duplicate_bytes = prepared.rank9.bytes.as_ref().to_vec();
+        duplicate_bytes.push(0);
+        let duplicate = Blob::<SuccinctArchiveRank9IndexBlob>::new(anybytes::Bytes::from_source(
+            duplicate_bytes,
+        ));
+        let duplicate_handle = storage.put(duplicate).unwrap();
+        let stored = kind.put(&mut storage, prepared).unwrap();
+        let entity = *fucid();
+        let facts = entity! { ExclusiveId::force_ref(&entity) @
+            seg_succinct: stored.raw,
+            seg_succinct_rank9*: [stored.rank9, duplicate_handle],
+        }
+        .into_facts();
+        let reader = storage.reader().unwrap();
+        assert!(kind.parse(&reader, &facts, entity).is_err());
+    }
+
+    #[test]
     fn one_logical_leaf_can_hold_multiple_physical_pairs() {
         let mut storage = MemoryRepo::default();
         let kind = SuccinctRollup;
@@ -1278,6 +1512,293 @@ mod tests {
     }
 
     #[test]
+    fn diamond_compacts_exactly_and_audited_head_rejects_a_hole() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let kind = SuccinctRollup;
+        let mut storage = MemoryRepo::default();
+        let g_facts = source("g");
+        let a_facts = source("a");
+        let b_facts = source("b");
+        let g = stored_commit(&mut storage, &key, [], Some(&g_facts));
+        let a = stored_commit(&mut storage, &key, [g], Some(&a_facts));
+        let b = stored_commit(&mut storage, &key, [g], Some(&b_facts));
+        let m = stored_commit(&mut storage, &key, [a, b], None);
+
+        let mut complete = TribleSet::new();
+        for (commit, facts) in [(g, &g_facts), (a, &a_facts), (b, &b_facts)] {
+            append_range(
+                &mut storage,
+                &kind,
+                facts,
+                CommitRange::leaf(commit),
+                &mut complete,
+            )
+            .unwrap();
+        }
+        set_index_frontier_audited(&mut storage, &kind, &mut complete, vec![b, a]).unwrap();
+        let reader = storage.reader().unwrap();
+        let prefix = Manifest::from_tribles(&complete, &reader, &kind).unwrap();
+        let mut expected_frontier = vec![a, b];
+        expected_frontier.sort_unstable_by_key(|commit| commit.raw);
+        assert_eq!(prefix.frontier(), expected_frontier);
+
+        append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(m),
+            &mut complete,
+        )
+        .unwrap();
+        set_index_head_audited(&mut storage, &kind, &mut complete, Some(m)).unwrap();
+        let reader = storage.reader().unwrap();
+        let manifest = Manifest::from_tribles(&complete, &reader, &kind).unwrap();
+        assert_eq!(manifest.ranges().len(), 1);
+        assert_eq!(manifest.ranges()[0].range().start(), &[g]);
+        assert_eq!(manifest.ranges()[0].range().end(), &[m]);
+
+        let mut hole = TribleSet::new();
+        for (commit, facts) in [(g, &g_facts), (a, &a_facts)] {
+            append_range(
+                &mut storage,
+                &kind,
+                facts,
+                CommitRange::leaf(commit),
+                &mut hole,
+            )
+            .unwrap();
+        }
+        append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(m),
+            &mut hole,
+        )
+        .unwrap();
+        let before = hole.clone();
+        assert!(set_index_head_audited(&mut storage, &kind, &mut hole, Some(m)).is_err());
+        assert_eq!(hole, before);
+    }
+
+    #[derive(Clone)]
+    struct FailingEmptyKind {
+        tag: Id,
+    }
+
+    impl IndexKind for FailingEmptyKind {
+        type Segment = ();
+        type PreparedArtifact = ();
+        type StoredArtifact = ();
+
+        fn recipe_fragment(&self) -> Fragment {
+            entity! { _ @ metadata::tag: self.tag }
+        }
+
+        fn build(&self, _source: &TribleSet) -> Result<Vec<()>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn put<S: BlobStorePut>(
+            &self,
+            _storage: &mut S,
+            _artifact: (),
+        ) -> Result<(), ArtifactError> {
+            Ok(())
+        }
+
+        fn emit(&self, _range_entity: Id, _artifact: &()) -> TribleSet {
+            TribleSet::new()
+        }
+
+        fn parse<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _facts: &TribleSet,
+            _range_entity: Id,
+        ) -> Result<Vec<()>, ArtifactError> {
+            Ok(Vec::new())
+        }
+
+        fn attach<R: BlobStoreGet>(
+            &self,
+            _reader: &R,
+            _artifact: &(),
+        ) -> Result<(), ArtifactError> {
+            Ok(())
+        }
+
+        fn merge(&self, _segments: &[()]) -> Result<Vec<()>, ArtifactError> {
+            Err("injected merge failure".into())
+        }
+    }
+
+    #[test]
+    fn merge_failure_leaves_manifest_bytes_untouched() {
+        let mut storage = MemoryRepo::default();
+        let commits = stored_chain(&mut storage, FANOUT);
+        let kind = FailingEmptyKind { tag: *fucid() };
+        let mut head = TribleSet::new();
+        for commit in &commits[..FANOUT - 1] {
+            append_range(
+                &mut storage,
+                &kind,
+                &TribleSet::new(),
+                CommitRange::leaf(*commit),
+                &mut head,
+            )
+            .unwrap();
+        }
+        let before = head.clone();
+        assert!(append_range(
+            &mut storage,
+            &kind,
+            &TribleSet::new(),
+            CommitRange::leaf(commits[FANOUT - 1]),
+            &mut head,
+        )
+        .is_err());
+        assert_eq!(head, before);
+    }
+
+    #[test]
+    fn non_monotone_batch_is_rejected_before_extension() {
+        let mut storage = MemoryRepo::default();
+        let commits = stored_chain(&mut storage, 3);
+        let reader = storage.reader().unwrap();
+        validate_monotone_batch(&reader, Some(commits[0]), commits[2]).unwrap();
+        assert!(validate_monotone_batch(&reader, Some(commits[2]), commits[1]).is_err());
+        let unrelated = stored_commit(
+            &mut storage,
+            &SigningKey::from_bytes(&[11; 32]),
+            [],
+            Some(&source("fork")),
+        );
+        let reader = storage.reader().unwrap();
+        assert!(validate_monotone_batch(&reader, Some(commits[2]), unrelated).is_err());
+    }
+
+    #[test]
+    fn repository_hook_tracks_each_commit_and_bounds_logical_fanout() {
+        use crate::repo::Repository;
+
+        let storage = MemoryRepo::default();
+        let mut repo =
+            Repository::new(storage, SigningKey::from_bytes(&[17; 32]), TribleSet::new()).unwrap();
+        repo.register_index(SuccinctRollup);
+        let branch = repo.create_branch("main", None).unwrap();
+
+        let count = 2 * FANOUT - 1;
+        for index in 0..count {
+            let mut workspace = repo.pull(*branch).unwrap();
+            workspace.commit(source(&format!("p{index}")), "commit");
+            repo.push(&mut workspace).unwrap();
+        }
+        assert!(repo.take_hook_errors().is_empty());
+
+        let current_head = repo.pull(*branch).unwrap().head();
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(current_head));
+        assert!(manifest.ranges().len() < count);
+        let mut per_level = HashMap::new();
+        for range in manifest.ranges() {
+            *per_level.entry(range.level()).or_insert(0usize) += 1;
+        }
+        assert!(per_level.values().all(|count| *count < FANOUT));
+
+        let segments = home.attach_manifest(&manifest).unwrap();
+        let union = SuccinctRollup::union(&segments);
+        assert_eq!(
+            find!(
+                name: Inline<crate::inline::encodings::shortstring::ShortString>,
+                pattern!(&union, [{ _?person @ literature::firstname: ?name }])
+            )
+            .count(),
+            count
+        );
+    }
+
+    #[test]
+    fn unhooked_gap_remains_stale_and_next_commit_still_lands() {
+        use crate::repo::Repository;
+
+        let key = SigningKey::from_bytes(&[19; 32]);
+        let mut indexed =
+            Repository::new(MemoryRepo::default(), key.clone(), TribleSet::new()).unwrap();
+        indexed.register_index(SuccinctRollup);
+        let branch = indexed.create_branch("main", None).unwrap();
+        let mut first = indexed.pull(*branch).unwrap();
+        first.commit(source("indexed"), "indexed");
+        indexed.push(&mut first).unwrap();
+        let indexed_head = first.head();
+
+        let mut unhooked =
+            Repository::new(indexed.into_storage(), key.clone(), TribleSet::new()).unwrap();
+        let mut missed = unhooked.pull(*branch).unwrap();
+        missed.commit(source("missed"), "missed");
+        unhooked.push(&mut missed).unwrap();
+
+        let mut resumed = Repository::new(unhooked.into_storage(), key, TribleSet::new()).unwrap();
+        resumed.register_index(SuccinctRollup);
+        let mut later = resumed.pull(*branch).unwrap();
+        later.commit(source("later"), "later");
+        let later_head = later.head();
+        resumed.push(&mut later).unwrap();
+
+        let errors = resumed.take_hook_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].error.to_string().contains("stale"));
+        assert_eq!(resumed.pull(*branch).unwrap().head(), later_head);
+        let mut home = IndexHome::new(resumed.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(indexed_head));
+        assert_eq!(manifest.ranges().len(), 1);
+    }
+
+    #[test]
+    fn conflict_retry_covers_the_contentless_merge_leaf() {
+        use crate::repo::Repository;
+
+        let mut repo = Repository::new(
+            MemoryRepo::default(),
+            SigningKey::from_bytes(&[23; 32]),
+            TribleSet::new(),
+        )
+        .unwrap();
+        repo.register_index(SuccinctRollup);
+        let branch = repo.create_branch("main", None).unwrap();
+        let mut left = repo.pull(*branch).unwrap();
+        let mut right = repo.pull(*branch).unwrap();
+        left.commit(source("left"), "left");
+        right.commit(source("right"), "right");
+        repo.push(&mut left).unwrap();
+        repo.push(&mut right).unwrap();
+        assert!(repo.take_hook_errors().is_empty());
+
+        let head = right.head();
+        let mut home = IndexHome::new(repo.storage_mut(), *branch, SuccinctRollup);
+        let manifest = home.read_manifest().unwrap();
+        assert!(manifest.claims_head(head));
+        assert_eq!(
+            manifest.ranges().len(),
+            3,
+            "two authored leaves + merge leaf"
+        );
+        assert_eq!(
+            manifest
+                .ranges()
+                .iter()
+                .filter(|range| range.artifacts().is_empty())
+                .count(),
+            1
+        );
+        drop(home);
+        let reader = repo.storage_mut().reader().unwrap();
+        manifest.audit_exact_cover(&reader).unwrap();
+    }
+
+    #[test]
     fn generic_manifest_carry_is_lossless_and_ignores_legacy_facts() {
         let kind = SuccinctRollup;
         let manifest = Manifest::new(&kind).unwrap();
@@ -1292,6 +1813,53 @@ mod tests {
             .iter()
             .any(|fact| { *fact.e() == recipe && fact.a() == &metadata::tag.id() }));
         assert!(!carried.iter().any(|fact| *fact.e() == *legacy_entity));
+    }
+
+    #[test]
+    fn strip_recipe_manifest_repairs_a_missing_self_marker() {
+        let kind = SuccinctRollup;
+        let manifest = Manifest::new(&kind).unwrap();
+        let recipe = manifest.recipe();
+        let marker = entity! { ExclusiveId::force_ref(&recipe) @
+            crate::repo::index_range::index_recipe: recipe,
+        }
+        .into_facts();
+        let unrelated = fucid();
+        let mut malformed = manifest.to_tribles().difference(&marker);
+        malformed += entity! { &unrelated @ metadata::tag: recipe };
+        assert!(malformed.iter().any(|fact| *fact.e() == recipe));
+        let mut storage = MemoryRepo::default();
+        let reader = storage.reader().unwrap();
+        assert!(Manifest::from_tribles(&malformed, &reader, &kind).is_err());
+
+        strip_recipe_manifest(&mut malformed, recipe);
+        assert!(!malformed.iter().any(|fact| *fact.e() == recipe));
+        assert!(malformed.iter().any(|fact| *fact.e() == *unrelated));
+    }
+
+    #[test]
+    fn partial_pair_put_failure_leaves_head_untouched() {
+        let mut storage = FailingPutStore {
+            inner: MemoryRepo::default(),
+            successful_puts_left: 1,
+        };
+        let mut head = TribleSet::new();
+        let before = head.clone();
+        let error = append_range(
+            &mut storage,
+            &SuccinctRollup,
+            &source("Ada"),
+            CommitRange::leaf(commit(1)),
+            &mut head,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("put failure"));
+        assert_eq!(head, before);
+        assert_eq!(
+            storage.inner.blobs.len(),
+            1,
+            "the raw half may remain as unreachable CAS garbage"
+        );
     }
 
     #[test]
