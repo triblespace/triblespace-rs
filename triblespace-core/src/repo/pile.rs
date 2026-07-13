@@ -22,6 +22,7 @@ use anybytes::Bytes;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fs::File;
@@ -31,7 +32,7 @@ use std::io::Write;
 use std::path::Path;
 use std::ptr::slice_from_raw_parts;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use zerocopy::Immutable;
@@ -136,10 +137,9 @@ fn should_parallelize_validation(len: usize) -> bool {
 
 #[derive(Debug, Clone, Copy)]
 enum ValidationStrategy {
-    /// Hash inside the `OnceLock` initializer on the calling thread.
+    /// Hash on the calling thread.
     Serial,
-    /// For a sufficiently large first miss, hash outside the initializer with
-    /// BLAKE3's Rayon join strategy, then race only to publish the result.
+    /// For a sufficiently large first miss, use BLAKE3's Rayon join strategy.
     ParallelIfLarge,
 }
 
@@ -154,25 +154,12 @@ fn classify_validation(
     }
 }
 
-/// Return the cached result of validating one immutable pile payload.
-///
-/// Every lazy pile-validation site goes through this helper so mapped and heap
-/// indices share identical digest comparison and cache semantics. Parallel
-/// validation is restricted to lock-free reader paths. It must happen outside
-/// the `OnceLock` initializer: otherwise an external initializer can inject
-/// Rayon work while all pool workers block on the same cell. Concurrent reader
-/// first misses may duplicate hash work, but converge on the same immutable
-/// result when they publish it.
-fn validation_state(
-    state: &OnceLock<ValidationState>,
+/// Computes the validation state of one immutable pile payload.
+fn compute_validation_state(
     bytes: &Bytes,
     expected: &Inline<Hash<Blake3>>,
     strategy: ValidationStrategy,
 ) -> ValidationState {
-    if let Some(cached) = state.get() {
-        return *cached;
-    }
-
     #[cfg(not(feature = "parallel"))]
     let _ = strategy;
 
@@ -183,29 +170,60 @@ fn validation_state(
         let mut hasher = blake3::Hasher::new();
         hasher.update_rayon(bytes);
         let computed = Inline::new(*hasher.finalize().as_bytes());
-        let computed_state = classify_validation(computed, expected);
-        return *state.get_or_init(|| computed_state);
+        return classify_validation(computed, expected);
     }
 
-    *state.get_or_init(|| classify_validation(Hash::<Blake3>::digest(bytes), expected))
+    classify_validation(Hash::<Blake3>::digest(bytes), expected)
 }
 
-#[derive(Debug, Clone)]
+/// Sparse validation state shared by a pile and all reader snapshots derived
+/// from it. Replay itself leaves this empty; entries appear only when a blob is
+/// read or an on-disk duplicate challenges an earlier candidate.
+///
+/// Hashing happens outside the mutex. Concurrent first misses may duplicate
+/// deterministic work, then converge through `or_insert` without blocking the
+/// cache while Rayon executes.
+#[derive(Debug, Clone, Default)]
+struct ValidationCache {
+    states: Arc<Mutex<HashMap<usize, ValidationState>>>,
+}
+
+impl ValidationCache {
+    fn state(
+        &self,
+        record_offset: usize,
+        bytes: &Bytes,
+        expected: &Inline<Hash<Blake3>>,
+        strategy: ValidationStrategy,
+    ) -> ValidationState {
+        if let Some(cached) = self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&record_offset)
+            .copied()
+        {
+            return cached;
+        }
+
+        let computed = compute_validation_state(bytes, expected, strategy);
+        *self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(record_offset)
+            .or_insert(computed)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct IndexEntry {
-    state: Arc<OnceLock<ValidationState>>,
-    offset: usize,
-    len: u64,
-    timestamp: u64,
+    record_offset: usize,
 }
 
 impl IndexEntry {
-    fn new(offset: usize, len: u64, timestamp: u64) -> Self {
-        Self {
-            state: Arc::new(OnceLock::new()),
-            offset,
-            len,
-            timestamp,
-        }
+    fn new(record_offset: usize) -> Self {
+        Self { record_offset }
     }
 }
 
@@ -562,6 +580,72 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     }
 }
 
+/// Payload and metadata recovered from the immutable record named by one
+/// in-memory blob index entry.
+struct IndexedBlobRecord {
+    bytes: Bytes,
+    #[cfg(test)]
+    payload_offset: usize,
+    timestamp: u64,
+}
+
+/// Resolves an offset-only index entry through the canonical record decoder.
+///
+/// Entries are created only after `decode_record` accepted the complete record,
+/// and `covered_len` is the exact accepted prefix captured with this mapping.
+/// A failure here therefore means bytes below an applied boundary changed,
+/// which violates Pile's append-only safety contract.
+fn indexed_blob_record(
+    mmap: &Arc<MmapRaw>,
+    covered_len: usize,
+    entry: IndexEntry,
+    expected: &Inline<Hash<Blake3>>,
+) -> IndexedBlobRecord {
+    assert!(
+        entry.record_offset < covered_len,
+        "blob index offset lies outside its accepted pile prefix"
+    );
+    assert!(
+        covered_len <= mmap.len(),
+        "accepted pile prefix lies outside its mapping"
+    );
+    let record_bytes = unsafe {
+        slice_from_raw_parts(
+            mmap.as_ptr().add(entry.record_offset),
+            covered_len - entry.record_offset,
+        )
+        .as_ref()
+        .unwrap()
+    };
+    let record = decode_record(record_bytes, entry.record_offset)
+        .expect("indexed blob record changed below the accepted pile prefix");
+    let PileRecordContent::Blob {
+        timestamp,
+        hash,
+        data_offset,
+        data_len,
+    } = record.content
+    else {
+        panic!("blob index offset no longer names a blob record");
+    };
+    assert_eq!(
+        hash, *expected,
+        "blob index key no longer matches its record header"
+    );
+    let bytes = unsafe {
+        let slice = slice_from_raw_parts(mmap.as_ptr().add(data_offset), data_len)
+            .as_ref()
+            .unwrap();
+        Bytes::from_raw_parts(slice, mmap.clone())
+    };
+    IndexedBlobRecord {
+        bytes,
+        #[cfg(test)]
+        payload_offset: data_offset,
+        timestamp,
+    }
+}
+
 /// Iterator over the raw records of a pile file, in log order.
 ///
 /// This is the record-level view of the append-only log: every blob, branch
@@ -659,6 +743,7 @@ pub struct Pile {
     /// handle does not make this handle responsible for flushing them.
     dirty: bool,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
@@ -682,7 +767,9 @@ fn padding_for_blob(blob_size: usize) -> usize {
 /// the same underlying pile data.
 pub struct PileReader {
     mmap: Arc<MmapRaw>,
+    covered_len: usize,
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
+    validations: ValidationCache,
 }
 
 impl PartialEq for PileReader {
@@ -694,8 +781,18 @@ impl PartialEq for PileReader {
 impl Eq for PileReader {}
 
 impl PileReader {
-    fn new(mmap: Arc<MmapRaw>, blobs: PATCH<32, IdentitySchema, IndexEntry>) -> Self {
-        Self { mmap, blobs }
+    fn new(
+        mmap: Arc<MmapRaw>,
+        covered_len: usize,
+        blobs: PATCH<32, IdentitySchema, IndexEntry>,
+        validations: ValidationCache,
+    ) -> Self {
+        Self {
+            mmap,
+            covered_len,
+            blobs,
+            validations,
+        }
     }
 
     /// Returns an iterator over all blobs currently stored in the pile.
@@ -710,8 +807,10 @@ impl PileReader {
         let inner = for_iter.into_iter();
         PileBlobStoreIter {
             mmap: self.mmap.clone(),
+            covered_len: self.covered_len,
             inner,
             lookup,
+            validations: self.validations.clone(),
         }
     }
 
@@ -734,27 +833,25 @@ impl BlobStoreGet for PileReader {
         let Some(entry) = self.blobs.get(&hash.raw) else {
             return Err(GetBlobError::BlobNotFound);
         };
-        let IndexEntry {
-            state, offset, len, ..
-        } = entry.clone();
-        let bytes = unsafe {
-            let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                .as_ref()
-                .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
-        };
-        let state = validation_state(&state, &bytes, hash, ValidationStrategy::ParallelIfLarge);
+        let entry = *entry;
+        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
+        let state = self.validations.state(
+            entry.record_offset,
+            &record.bytes,
+            hash,
+            ValidationStrategy::ParallelIfLarge,
+        );
         match state {
             ValidationState::Validated => {
                 // The handle is what we just validated against — reuse
                 // it to skip Blake3 recomputation in Blob::new.
-                let blob: Blob<S> = Blob::with_handle(bytes.clone(), handle);
+                let blob: Blob<S> = Blob::with_handle(record.bytes.clone(), handle);
                 match blob.try_from_blob() {
                     Ok(value) => Ok(value),
                     Err(e) => Err(GetBlobError::ConversionError(e)),
                 }
             }
-            ValidationState::Invalid => Err(GetBlobError::ValidationError(bytes)),
+            ValidationState::Invalid => Err(GetBlobError::ValidationError(record.bytes)),
         }
     }
 }
@@ -767,7 +864,12 @@ impl BlobStore for Pile {
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.refresh()?;
-        Ok(PileReader::new(self.mmap.clone(), self.blobs.clone()))
+        Ok(PileReader::new(
+            self.mmap.clone(),
+            self.applied_length,
+            self.blobs.clone(),
+            self.validations.clone(),
+        ))
     }
 }
 
@@ -995,6 +1097,7 @@ impl Pile {
             mmap,
             dirty: false,
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
+            validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
@@ -1079,43 +1182,26 @@ impl Pile {
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
         let applied = match record.content {
-            PileRecordContent::Blob {
-                timestamp,
-                hash,
-                data_offset,
-                data_len,
-            } => {
-                let entry = Entry::with_value(
-                    &hash.raw,
-                    IndexEntry::new(data_offset, data_len as u64, timestamp),
-                );
-                match self.blobs.get(&hash.raw) {
+            PileRecordContent::Blob { hash, .. } => {
+                let candidate = IndexEntry::new(start_offset);
+                match self.blobs.get(&hash.raw).copied() {
                     None => {
-                        self.blobs.insert(&entry);
+                        self.blobs.insert(&Entry::with_value(&hash.raw, candidate));
                     }
-                    Some(entry_ref) => {
+                    Some(existing) => {
                         // Duplicate hash: keep the existing record unless it
                         // turns out to be corrupt, in which case the fresh
                         // copy replaces it.
-                        let IndexEntry {
-                            state, offset, len, ..
-                        } = entry_ref.clone();
-                        let state = if let Some(cached) = state.get() {
-                            *cached
-                        } else {
-                            let bytes = unsafe {
-                                let slice = slice_from_raw_parts(
-                                    self.mmap.as_ptr().add(offset),
-                                    len as usize,
-                                )
-                                .as_ref()
-                                .unwrap();
-                                Bytes::from_raw_parts(slice, self.mmap.clone())
-                            };
-                            validation_state(&state, &bytes, &hash, ValidationStrategy::Serial)
-                        };
+                        let record =
+                            indexed_blob_record(&self.mmap, self.applied_length, existing, &hash);
+                        let state = self.validations.state(
+                            existing.record_offset,
+                            &record.bytes,
+                            &hash,
+                            ValidationStrategy::Serial,
+                        );
                         if let ValidationState::Invalid = state {
-                            self.blobs.replace(&entry);
+                            self.blobs.replace(&Entry::with_value(&hash.raw, candidate));
                         }
                     }
                 }
@@ -1227,6 +1313,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.mmap);
             std::ptr::drop_in_place(&mut this.file);
             std::ptr::drop_in_place(&mut this.blobs);
+            std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.weak_pins);
         }
@@ -1278,8 +1365,10 @@ use super::WeakPinStore;
 /// borrow the underlying [`PATCH`] and can live independently of the [`Pile`].
 pub struct PileBlobStoreIter {
     mmap: Arc<MmapRaw>,
+    covered_len: usize,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
     lookup: PATCH<32, IdentitySchema, IndexEntry>,
+    validations: ValidationCache,
 }
 
 impl Iterator for PileBlobStoreIter {
@@ -1291,22 +1380,20 @@ impl Iterator for PileBlobStoreIter {
         let Some(entry) = self.lookup.get(&key) else {
             return Some(Err(GetBlobError::BlobNotFound));
         };
-        let IndexEntry {
-            state, offset, len, ..
-        } = entry.clone();
-        let bytes = unsafe {
-            let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                .as_ref()
-                .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
-        };
-        match validation_state(&state, &bytes, &hash, ValidationStrategy::ParallelIfLarge) {
+        let entry = *entry;
+        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, &hash);
+        match self.validations.state(
+            entry.record_offset,
+            &record.bytes,
+            &hash,
+            ValidationStrategy::ParallelIfLarge,
+        ) {
             ValidationState::Validated => {
                 let handle: Inline<Handle<UnknownBlob>> = hash.into();
-                let blob = Blob::with_handle(bytes, handle);
+                let blob = Blob::with_handle(record.bytes, handle);
                 Some(Ok((handle, blob)))
             }
-            ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(bytes))),
+            ValidationState::Invalid => Some(Err(GetBlobError::ValidationError(record.bytes))),
         }
     }
 }
@@ -1423,22 +1510,14 @@ impl Pile {
             let handle: Inline<Handle<S>> = blob.get_handle();
             let hash: Inline<Hash<Blake3>> = handle.into();
 
-            if let Some(IndexEntry {
-                state, offset, len, ..
-            }) = self.blobs.get(&hash.raw)
-            {
-                let state = if let Some(cached) = state.get() {
-                    *cached
-                } else {
-                    let bytes = unsafe {
-                        let slice =
-                            slice_from_raw_parts(self.mmap.as_ptr().add(*offset), *len as usize)
-                                .as_ref()
-                                .unwrap();
-                        Bytes::from_raw_parts(slice, self.mmap.clone())
-                    };
-                    validation_state(state, &bytes, &hash, ValidationStrategy::Serial)
-                };
+            if let Some(entry) = self.blobs.get(&hash.raw).copied() {
+                let record = indexed_blob_record(&self.mmap, self.applied_length, entry, &hash);
+                let state = self.validations.state(
+                    entry.record_offset,
+                    &record.bytes,
+                    &hash,
+                    ValidationStrategy::Serial,
+                );
                 if matches!(state, ValidationState::Validated) {
                     return Ok(handle.transmute());
                 }
@@ -1745,23 +1824,18 @@ impl crate::repo::BlobStoreMeta for PileReader {
         let Some(entry) = self.blobs.get(&hash.raw) else {
             return Ok(None);
         };
-        let IndexEntry {
-            state,
-            timestamp,
-            offset,
-            len,
-        } = entry.clone();
-        let bytes = unsafe {
-            let slice = slice_from_raw_parts(self.mmap.as_ptr().add(offset), len as usize)
-                .as_ref()
-                .unwrap();
-            Bytes::from_raw_parts(slice, self.mmap.clone())
-        };
-        let state = validation_state(&state, &bytes, hash, ValidationStrategy::ParallelIfLarge);
+        let entry = *entry;
+        let record = indexed_blob_record(&self.mmap, self.covered_len, entry, hash);
+        let state = self.validations.state(
+            entry.record_offset,
+            &record.bytes,
+            hash,
+            ValidationStrategy::ParallelIfLarge,
+        );
         match state {
             ValidationState::Validated => Ok(Some(crate::repo::BlobMetadata {
-                timestamp,
-                length: bytes.len() as u64,
+                timestamp: record.timestamp,
+                length: record.bytes.len() as u64,
             })),
             ValidationState::Invalid => Ok(None),
         }
@@ -1789,6 +1863,31 @@ mod tests {
         path
     }
 
+    fn append_v3_blob_candidate(
+        path: &Path,
+        hash: Inline<Hash<Blake3>>,
+        payload: &[u8],
+        timestamp: u64,
+    ) -> usize {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        let record_offset = file.metadata().unwrap().len() as usize;
+        let header = BlobHeaderV3::new(timestamp, payload.len() as u64, hash);
+        file.write_all(header.as_bytes()).unwrap();
+        file.write_all(payload).unwrap();
+        file.write_all(&vec![0; v3_post_pad(payload.len())])
+            .unwrap();
+        file.sync_all().unwrap();
+        record_offset
+    }
+
+    #[test]
+    fn index_entry_is_one_machine_word() {
+        assert_eq!(
+            std::mem::size_of::<IndexEntry>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
     #[test]
     fn payload_validation_matches_and_rejects_around_parallel_threshold() {
         for strategy in [
@@ -1807,17 +1906,15 @@ mod tests {
                 );
                 let expected = Hash::<Blake3>::digest(&bytes);
 
-                let valid = OnceLock::new();
                 assert!(matches!(
-                    validation_state(&valid, &bytes, &expected, strategy),
+                    compute_validation_state(&bytes, &expected, strategy),
                     ValidationState::Validated
                 ));
 
                 let mut wrong = expected;
                 wrong.raw[0] ^= 1;
-                let invalid = OnceLock::new();
                 assert!(matches!(
-                    validation_state(&invalid, &bytes, &wrong, strategy),
+                    compute_validation_state(&bytes, &wrong, strategy),
                     ValidationState::Invalid
                 ));
             }
@@ -1828,18 +1925,130 @@ mod tests {
     fn payload_validation_keeps_the_first_cached_result() {
         let bytes = Bytes::from_source(vec![0x5A; PARALLEL_BLAKE3_THRESHOLD]);
         let expected = Hash::<Blake3>::digest(&bytes);
-        let state = OnceLock::new();
+        let cache = ValidationCache::default();
         assert!(matches!(
-            validation_state(&state, &bytes, &expected, ValidationStrategy::Serial),
+            cache.state(7, &bytes, &expected, ValidationStrategy::Serial),
             ValidationState::Validated
         ));
 
         let mut wrong = expected;
         wrong.raw[0] ^= 1;
         assert!(matches!(
-            validation_state(&state, &bytes, &wrong, ValidationStrategy::ParallelIfLarge),
+            cache.state(7, &bytes, &wrong, ValidationStrategy::ParallelIfLarge),
             ValidationState::Validated
         ));
+        assert_eq!(cache.states.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replay_keeps_validation_cache_sparse_and_readers_share_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "sparse-validation.pile");
+
+        let (first, second) = {
+            let mut writer = Pile::open(&path).unwrap();
+            let first = writer
+                .put::<UnknownBlob, _>(Bytes::from_source(b"first".to_vec()))
+                .unwrap();
+            let second = writer
+                .put::<UnknownBlob, _>(Bytes::from_source(b"second".to_vec()))
+                .unwrap();
+            writer.close().unwrap();
+            (first, second)
+        };
+
+        let mut replay = Pile::open(&path).unwrap();
+        replay.refresh().unwrap();
+        assert!(replay.validations.states.lock().unwrap().is_empty());
+
+        let reader = replay.reader().unwrap();
+        let cloned = reader.clone();
+        assert!(Arc::ptr_eq(
+            &reader.validations.states,
+            &cloned.validations.states
+        ));
+        let _: Blob<UnknownBlob> = reader.get(first).unwrap();
+        assert_eq!(replay.validations.states.lock().unwrap().len(), 1);
+        let _: Blob<UnknownBlob> = cloned.get(first).unwrap();
+        assert_eq!(replay.validations.states.lock().unwrap().len(), 1);
+        assert!(!replay
+            .validations
+            .states
+            .lock()
+            .unwrap()
+            .contains_key(&replay.blobs.get(&second.raw).unwrap().record_offset));
+
+        drop(reader);
+        drop(cloned);
+        replay.close().unwrap();
+    }
+
+    #[test]
+    fn duplicate_validation_is_isolated_by_record_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "offset-validation.pile");
+        let payload = b"target";
+        let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
+        let hash: Inline<Hash<Blake3>> = handle.into();
+
+        let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
+        let second = append_v3_blob_candidate(&path, hash, payload, 2);
+        let _third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(pile.blobs.get(&hash.raw).unwrap().record_offset, second);
+        let states = pile.validations.states.lock().unwrap();
+        assert!(matches!(states.get(&first), Some(ValidationState::Invalid)));
+        assert!(matches!(
+            states.get(&second),
+            Some(ValidationState::Validated)
+        ));
+        assert_eq!(states.len(), 2);
+        drop(states);
+
+        let reader = pile.reader().unwrap();
+        let blob: Blob<UnknownBlob> = reader.get(handle).unwrap();
+        assert_eq!(blob.bytes.as_ref(), payload);
+        drop(reader);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn all_invalid_duplicates_leave_the_last_candidate_lazy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "all-invalid.pile");
+        let expected = b"target";
+        let handle = Blob::<UnknownBlob>::new(Bytes::from_source(expected.to_vec())).get_handle();
+        let hash: Inline<Hash<Blake3>> = handle.into();
+
+        let first = append_v3_blob_candidate(&path, hash, b"bad-01", 1);
+        let second = append_v3_blob_candidate(&path, hash, b"bad-02", 2);
+        let third = append_v3_blob_candidate(&path, hash, b"bad-03", 3);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(pile.blobs.get(&hash.raw).unwrap().record_offset, third);
+        let states = pile.validations.states.lock().unwrap();
+        assert!(matches!(states.get(&first), Some(ValidationState::Invalid)));
+        assert!(matches!(
+            states.get(&second),
+            Some(ValidationState::Invalid)
+        ));
+        assert!(!states.contains_key(&third));
+        drop(states);
+
+        let reader = pile.reader().unwrap();
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, UnknownBlob>(handle),
+            Err(GetBlobError::ValidationError(_))
+        ));
+        assert!(matches!(
+            pile.validations.states.lock().unwrap().get(&third),
+            Some(ValidationState::Invalid)
+        ));
+        drop(reader);
+        pile.close().unwrap();
     }
 
     #[cfg(feature = "parallel")]
@@ -1855,12 +2064,7 @@ mod tests {
         one_worker.install(|| {
             assert!(!should_parallelize_validation(PARALLEL_BLAKE3_THRESHOLD));
             assert!(matches!(
-                validation_state(
-                    &OnceLock::new(),
-                    &bytes,
-                    &expected,
-                    ValidationStrategy::ParallelIfLarge
-                ),
+                compute_validation_state(&bytes, &expected, ValidationStrategy::ParallelIfLarge),
                 ValidationState::Validated
             ));
         });
@@ -1875,21 +2079,11 @@ mod tests {
             ));
             assert!(should_parallelize_validation(PARALLEL_BLAKE3_THRESHOLD));
             assert!(matches!(
-                validation_state(
-                    &OnceLock::new(),
-                    &bytes,
-                    &expected,
-                    ValidationStrategy::ParallelIfLarge
-                ),
+                compute_validation_state(&bytes, &expected, ValidationStrategy::ParallelIfLarge),
                 ValidationState::Validated
             ));
             assert!(matches!(
-                validation_state(
-                    &OnceLock::new(),
-                    &bytes,
-                    &expected,
-                    ValidationStrategy::Serial
-                ),
+                compute_validation_state(&bytes, &expected, ValidationStrategy::Serial),
                 ValidationState::Validated
             ));
         });
@@ -1976,22 +2170,20 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
-            let entry = pile
+            let entry = *pile
                 .blobs
                 .get(&hash.raw)
-                .expect("V3 blob missing after reopen")
-                .clone();
-            let IndexEntry { offset, len, .. } = entry;
+                .expect("V3 blob missing after reopen");
+            let record = indexed_blob_record(&pile.mmap, pile.applied_length, entry, hash);
             assert_eq!(
-                offset % GPU_DATA_ALIGNMENT,
+                record.payload_offset % GPU_DATA_ALIGNMENT,
                 0,
-                "V3 data offset {offset} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
+                "V3 data offset {} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
+                record.payload_offset,
                 expected.len()
             );
-            let got =
-                unsafe { std::slice::from_raw_parts(pile.mmap.as_ptr().add(offset), len as usize) };
             assert_eq!(
-                got,
+                record.bytes.as_ref(),
                 &expected[..],
                 "V3 roundtrip mismatch (size {})",
                 expected.len()
@@ -2065,21 +2257,21 @@ mod tests {
             "cat-merged pile was truncated — cat is not a valid V3 merge"
         );
         for (hash, expected) in &handles {
-            let entry = merged
+            let entry = *merged
                 .blobs
                 .get(&hash.raw)
-                .expect("blob lost after cat-merge")
-                .clone();
-            let IndexEntry { offset, len, .. } = entry;
+                .expect("blob lost after cat-merge");
+            let record = indexed_blob_record(&merged.mmap, merged.applied_length, entry, hash);
             assert_eq!(
-                offset % V3_ALIGNMENT,
+                record.payload_offset % V3_ALIGNMENT,
                 0,
                 "post-cat data offset not 256-aligned"
             );
-            let got = unsafe {
-                std::slice::from_raw_parts(merged.mmap.as_ptr().add(offset), len as usize)
-            };
-            assert_eq!(got, &expected[..], "blob bytes wrong after cat-merge");
+            assert_eq!(
+                record.bytes.as_ref(),
+                &expected[..],
+                "blob bytes wrong after cat-merge"
+            );
         }
         // Still 256-aligned, so it can be cat'd again.
         assert_eq!(

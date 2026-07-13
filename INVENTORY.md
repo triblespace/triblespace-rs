@@ -53,6 +53,10 @@
 - Benchmark PATCH performance across typical workloads.
 - Investigate the theoretical complexity of PATCH operations.
 - Measure practical space usage for PATCH with varying dataset sizes.
+- Explore hash-prefix-partitioned Pile bootstrap PATCH construction: keep all
+  duplicate candidates for a key in one ordered worker, retain serial pin LWW,
+  and merge only disjoint key ranges so value-insensitive PATCH union cannot
+  alter first-valid duplicate selection.
 - Extend PATCH to associate values with keys, turning it into a map structure.
 - Expose value-aware PATCH iterators and lookup helpers so callers can access
   stored payloads.

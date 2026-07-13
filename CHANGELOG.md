@@ -104,12 +104,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retains the useful one-observed-length optimization: each pass decodes one
   bounded prefix, while persistent PATCH clones give readers immutable
   snapshots and cheap structural differences.
+- **Plain Pile replay keeps one record offset per blob.** The in-memory blob
+  locator shrinks from a 32-byte payload locator plus one eagerly allocated
+  validation cell to an 8-byte record offset. Reads recover payload length,
+  location, and timestamp from the canonical immutable record header, bounded
+  by the reader's accepted pile prefix. Validation results live in a shared
+  sparse offset-keyed cache populated only by reads and duplicate challenges;
+  corrupt candidates cannot poison later replacements at different offsets.
+  On the 93.36 GB working archive this reduced replay's peak process footprint
+  from 1.123 GB to 674 MB (40%) while preserving first-valid duplicate choice,
+  lazy payload hashing, pin LWW, and bounded append replay.
 - **Large pile payload validation now uses BLAKE3's Rayon join strategy.**
   With the existing `parallel` feature enabled, lock-free `PileReader` blob and
   metadata reads validate a contiguous payload of at least 1 MiB with
   `update_rayon` when the current Rayon pool has more than one worker. The
-  parallel digest is computed outside the `OnceLock` initializer before racing
-  to publish the immutable result, avoiding cache/pool liveness cycles;
+  parallel digest is computed outside the sparse validation-cache mutex before
+  racing to publish the immutable result, avoiding cache/pool liveness cycles;
   concurrent first misses may duplicate hash work and then converge. Replay,
   duplicate repair, and deduplicating puts remain serial because they can run
   under file locks. Smaller inputs, single-worker
