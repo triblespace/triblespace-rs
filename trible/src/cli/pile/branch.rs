@@ -1715,18 +1715,10 @@ pub fn run(cmd: Command) -> Result<()> {
                         .put(new_name.clone().to_blob())
                         .map_err(|e| anyhow::anyhow!("put name blob: {e:?}"))?;
 
-                    // Build new branch metadata with the new name. Rename
-                    // doesn't touch rollup state; if the existing metadata
-                    // had one, we'd need to carry it forward — for now
-                    // rename drops any existing rollup (readers fall back
-                    // to checkout).
-                    let new_meta = branch_mod::branch_metadata(
-                        &key,
-                        branch_id,
-                        name_handle,
-                        commit_blob,
-                        None,
-                    );
+                    // Build new branch metadata with the new name.
+                    let mut new_meta =
+                        branch_mod::branch_metadata(&key, branch_id, name_handle, commit_blob);
+                    new_meta += triblespace_core::repo::index_home::manifest_tribles(&meta);
 
                     let new_meta_handle = pile
                         .put(new_meta)

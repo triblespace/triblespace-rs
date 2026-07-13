@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were removed rather than carried as compatibility surface. The obsolete
   monolithic branch `rollup` attribute, `Repository::compute_rollup`, and
   `Workspace::rollup` were likewise removed; typed IndexHome artifacts are now
-  the only production derived-index path.
+  the only production derived-index path. CLI re-id and rename operations carry
+  complete recipe-owned entities losslessly, while squash drops them together
+  with the history it replaces.
 - **Derived-index manifests gain artifact-neutral commit-DAG ranges.**
   `repo::index_range` models inclusive repeated start/end antichains, stable
   explicit range-record identities, lossless opaque-fact carry-forward,

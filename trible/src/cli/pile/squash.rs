@@ -229,17 +229,8 @@ pub fn run(
             .map_err(|e| anyhow!("put name: {e:?}"))?;
 
         let branch_id = triblespace_core::id::genid();
-        let branch_meta = repo::branch::branch_metadata(
-            &key,
-            *branch_id,
-            name_handle,
-            Some(head_blob.to_blob()),
-            // Squash drops any existing rollup; the new single-commit head
-            // may not match the previous rollup's contents, and squash has
-            // no visibility into archive state. Readers fall back to
-            // checkout until a new rollup is published.
-            None,
-        );
+        let branch_meta =
+            repo::branch::branch_metadata(&key, *branch_id, name_handle, Some(head_blob.to_blob()));
 
         let branch_meta_handle = dst_pile
             .put(branch_meta)

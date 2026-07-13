@@ -4,7 +4,6 @@ use std::path::PathBuf;
 use triblespace::prelude::*;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo;
@@ -15,11 +14,11 @@ use super::signing::load_signing_key;
 
 /// Re-id every branch in `source`, writing the result to `dest`.
 ///
-/// Unlike `squash`, the commit chain and rollup are preserved verbatim:
-/// each destination branch points at the *exact same* head commit (and
-/// rollup) as the source, with the full reachable blob graph copied
-/// unchanged. The only thing that changes is the branch *id*: every
-/// branch gets a freshly minted `genid()` while keeping its name.
+/// Unlike `squash`, the commit chain is preserved verbatim: each destination
+/// branch points at the *exact same* head commit as the source, with the full
+/// reachable blob graph copied unchanged. The only thing that changes is the
+/// branch *id*: every branch gets a freshly minted `genid()` while keeping its
+/// name.
 ///
 /// This is the tool for de-aliasing two piles that were minted with the
 /// same branch ids: re-id one of them, `cat` it onto the other, and then
@@ -51,7 +50,6 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
     let name_attr = triblespace_core::metadata::name.id();
     let head_attr = repo::head.id();
-    let rollup_attr = repo::rollup.id();
 
     let mut total_branches = 0usize;
     let mut total_blobs = 0usize;
@@ -74,7 +72,7 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             .reader()
             .map_err(|e| anyhow!("source reader: {e:?}"))?;
 
-        // Decode the branch metadata to recover name / head / rollup.
+        // Decode the branch metadata to recover name and head.
         let meta: TribleSet = match src_reader.get::<TribleSet, SimpleArchive>(meta_handle) {
             Ok(m) => m,
             Err(e) => {
@@ -85,14 +83,11 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
 
         let mut name_handle: Option<Inline<Handle<LongString>>> = None;
         let mut head_handle: Option<Inline<Handle<SimpleArchive>>> = None;
-        let mut rollup_handle: Option<Inline<Handle<SuccinctArchiveBlob>>> = None;
         for t in meta.iter() {
             if t.a() == &name_attr {
                 name_handle = Some(*t.v::<Handle<LongString>>());
             } else if t.a() == &head_attr {
                 head_handle = Some(*t.v::<Handle<SimpleArchive>>());
-            } else if t.a() == &rollup_attr {
-                rollup_handle = Some(*t.v::<Handle<SuccinctArchiveBlob>>());
             }
         }
 
@@ -125,8 +120,8 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             None => None,
         };
 
-        // Copy the full reachable blob graph (commit chain, content,
-        // rollup, name, signatures) into the destination unchanged.
+        // Copy the full reachable blob graph (commit chain, content, name,
+        // signatures) into the destination unchanged.
         let handles = repo::reachable(&src_reader, std::iter::once(meta_handle.transmute()));
         let mut branch_blobs = 0usize;
         for r in repo::transfer(&src_reader, &mut dst_pile, handles) {
@@ -139,10 +134,10 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             }
         }
 
-        // Mint a fresh branch id, keep the same name + head + rollup.
+        // Mint a fresh branch id, keep the same name and head.
         let branch_id = triblespace_core::id::genid();
-        let new_meta =
-            repo::branch::branch_metadata(&key, *branch_id, name_handle, head_blob, rollup_handle);
+        let mut new_meta = repo::branch::branch_metadata(&key, *branch_id, name_handle, head_blob);
+        new_meta += repo::index_home::manifest_tribles(&meta);
 
         let new_meta_handle = dst_pile
             .put(new_meta)
@@ -153,12 +148,8 @@ pub fn run(source: PathBuf, dest: PathBuf, signing_key: Option<PathBuf>) -> Resu
             .map_err(|e| anyhow!("update branch: {e:?}"))?;
 
         println!(
-            "reid {name}: {bid:X} -> {:X} ({branch_blobs} blobs{})",
-            *branch_id,
-            match rollup_handle {
-                Some(_) => ", rollup preserved",
-                None => "",
-            }
+            "reid {name}: {bid:X} -> {:X} ({branch_blobs} blobs)",
+            *branch_id
         );
 
         total_branches += 1;

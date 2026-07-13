@@ -3,6 +3,7 @@ use ed25519_dalek::SigningKey;
 use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStore;
+use triblespace::prelude::BlobStoreGet;
 use triblespace::prelude::BlobStoreList;
 use triblespace::prelude::PinStore;
 use triblespace_core::repo::pile::Pile;
@@ -712,6 +713,85 @@ fn pile_branch_create_outputs_id() {
         .assert()
         .success()
         .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tmain\\n$").unwrap());
+}
+
+#[test]
+fn reid_and_rename_preserve_typed_manifest_facts() {
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::BlobStorePut;
+    use triblespace_core::repo;
+    use triblespace_core::repo::index_home::{Manifest, SuccinctRollup};
+
+    let dir = tempdir().unwrap();
+    let source_path = dir.path().join("manifest-source.pile");
+    let reid_path = dir.path().join("manifest-reid.pile");
+    std::fs::File::create(&source_path).unwrap();
+
+    let manifest_facts = Manifest::new(&SuccinctRollup).unwrap().to_tribles();
+    {
+        let mut pile = Pile::open(&source_path).unwrap();
+        let branch_id = triblespace_core::id::genid();
+        let name = pile.put::<LongString, _>("original".to_string()).unwrap();
+        let mut metadata =
+            repo::branch::branch_metadata(&random_signing_key(), *branch_id, name, None);
+        metadata += manifest_facts.clone();
+        let metadata_handle = pile.put(metadata).unwrap();
+        pile.update(*branch_id, None, Some(metadata_handle))
+            .unwrap();
+        pile.close().unwrap();
+    }
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "reid",
+            source_path.to_str().unwrap(),
+            reid_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let reid_branch = {
+        let mut pile = Pile::open(&reid_path).unwrap();
+        pile.refresh().unwrap();
+        let branch = pile.pins().unwrap().next().unwrap().unwrap();
+        let metadata_handle = pile.head(branch).unwrap().unwrap();
+        let reader = pile.reader().unwrap();
+        let metadata: TribleSet = reader.get(metadata_handle).unwrap();
+        assert_eq!(
+            repo::index_home::manifest_tribles(&metadata),
+            manifest_facts
+        );
+        drop(reader);
+        pile.close().unwrap();
+        branch
+    };
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "branch",
+            "rename",
+            reid_path.to_str().unwrap(),
+            &format!("{reid_branch:X}"),
+            "renamed",
+        ])
+        .assert()
+        .success();
+
+    let mut pile = Pile::open(&reid_path).unwrap();
+    pile.refresh().unwrap();
+    let metadata_handle = pile.head(reid_branch).unwrap().unwrap();
+    let reader = pile.reader().unwrap();
+    let metadata: TribleSet = reader.get(metadata_handle).unwrap();
+    assert_eq!(
+        repo::index_home::manifest_tribles(&metadata),
+        manifest_facts
+    );
+    drop(reader);
+    pile.close().unwrap();
 }
 
 /// A corrupt (torn-tail) source pile must make `reid`, `squash`, and
