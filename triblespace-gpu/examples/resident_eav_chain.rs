@@ -8,10 +8,11 @@
 //! enqueue, query-program compilation, WGPU admission, and the first device
 //! synchronization; each is reported separately.
 //!
-//! A warm resident sample still includes the status upload, every intermediate
-//! allocation and kernel, and the one final packed device-to-host read. It is
-//! therefore an end-to-end warm execution time for this archive-scan-shaped
-//! specialization, not a kernel-only number.
+//! A warm resident sample still includes the status upload, the eighteen
+//! exact-geometry dispatch-record uploads, every intermediate allocation and
+//! kernel, and the one final packed device-to-host read. It is therefore an
+//! end-to-end warm execution time for this archive-scan-shaped specialization,
+//! not a kernel-only number.
 
 use std::env;
 use std::hint::black_box;
@@ -119,7 +120,7 @@ fn main() {
         "# primary_comparator=forced CPU transition_on(E)->transition_on(A)->transition_on(V); adaptive execute is not timed"
     );
     println!(
-        "# setup=excluded; warm_resident=status H2D + all allocations/kernels + exactly one final packed D2H"
+        "# setup=excluded; warm_resident=224 control H2D bytes (8 status + 18*12 dispatch records) + all allocations/kernels + exactly one final packed D2H"
     );
     println!(
         "# config=max_m={max_m} repetitions={repetitions} warmups={warmups}; p50 is the middle sorted sample"
@@ -128,7 +129,7 @@ fn main() {
         "# timing_order=alternating per repetition; even CPU->resident, odd resident->CPU; sample distributions remain separate"
     );
     println!(
-        "m,tribles,domain_rows,e_rows,ea_rows,eav_rows,final_read_bytes,fixture_ms,archive_ms,resident_enqueue_ms,program_compile_ms,wgpu_admission_ms,first_sync_ms,cpu_min_ms,cpu_p50_ms,cpu_max_ms,resident_min_ms,resident_p50_ms,resident_max_ms,cpu_eav_rows_per_s,resident_eav_rows_per_s,resident_over_cpu_p50,cpu_over_resident_speedup"
+        "m,tribles,domain_rows,e_rows,ea_rows,eav_rows,final_read_bytes,fixture_ms,archive_ms,resident_enqueue_ms,program_compile_ms,wgpu_admission_ms,first_execution_sync_ms,cpu_min_ms,cpu_p50_ms,cpu_max_ms,resident_min_ms,resident_p50_ms,resident_max_ms,cpu_eav_rows_per_s,resident_eav_rows_per_s,resident_over_cpu_p50,cpu_over_resident_speedup"
     );
 
     for m in POINTS.into_iter().filter(|&point| point <= max_m) {
@@ -204,9 +205,11 @@ fn main() {
         let expected = forced_eav(&program, entity, attribute, value);
         assert_eq!(expected.len(), eav_rows);
 
-        // The first resident execution is the first synchronization of the
-        // asynchronously enqueued archive and includes cold kernel setup. It
-        // is deliberately reported rather than mixed into warm samples.
+        // This point's first resident execution is its first synchronization
+        // of the asynchronously enqueued archive. It includes any pipeline
+        // setup not already cached by an earlier point in this process, so it
+        // is reported as first-execution latency rather than claimed as an
+        // independently cold compile for every point.
         let first_sync_started = Instant::now();
         let first_actual = gpu.execute_eav(1).expect("first resident E/A/V execution");
         let first_sync = first_sync_started.elapsed();
