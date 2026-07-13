@@ -19,13 +19,19 @@
 //!     cargo run --release --example dag_reconverge_bench -- \
 //!         [n_per_pop=48] [z_fan=16] [reps=5]
 //!
-//! Runs sequential / blocked-v1 / grouped / dag / agglomerative / dag-unmerged on both
-//! backends and prints per mode: median wall time, parity signature, and
-//! for the frontier engines the group/batch structure, materialized rows,
-//! peak live row-store cells, and the DAG's bucket/merge census.
+//! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
+//! blocked-v1 / grouped / dag / agglomerative / dag-unmerged on both backends
+//! and prints per mode: median wall time, parity signature, and for the
+//! frontier engines the group/batch structure, materialized rows, peak live
+//! row-store cells, and the DAG's bucket/merge census.
+//! Parallel timings include a parallel signature fold, so compare the two
+//! parallel schedulers directly; sequential/parallel ratios are end-to-end
+//! query-plus-consumer throughput rather than isolated engine scaling.
 
 use std::time::Instant;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
 use triblespace::core::trible::TribleSet;
@@ -60,6 +66,30 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
         count += 1;
     }
     (count, acc)
+}
+
+/// Parallel equivalent of [`tally`]: the query and the signature are both
+/// consumed through Rayon's fold/reduce path, so the parallel modes do not pay
+/// for an intermediate `Vec` and a second scalar pass.
+#[cfg(feature = "parallel")]
+fn tally_par<T: std::hash::Hash + Send>(items: impl ParallelIterator<Item = T>) -> (usize, u64) {
+    use std::hash::{DefaultHasher, Hasher};
+
+    items
+        .fold(
+            || (0usize, 0u64),
+            |(count, acc), item| {
+                let mut h = DefaultHasher::new();
+                item.hash(&mut h);
+                (count + 1, acc.wrapping_add(h.finish()))
+            },
+        )
+        .reduce(
+            || (0usize, 0u64),
+            |(left_count, left_acc), (right_count, right_acc)| {
+                (left_count + right_count, left_acc.wrapping_add(right_acc))
+            },
+        )
 }
 
 fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, Id), usize) {
@@ -135,6 +165,10 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Seq,
+    #[cfg(feature = "parallel")]
+    ParScalar,
+    #[cfg(feature = "parallel")]
+    ParDag,
     Blk,
     Grp,
     Dag,
@@ -157,6 +191,10 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
     );
     match mode {
         Mode::Seq => tally(q.sequential()),
+        #[cfg(feature = "parallel")]
+        Mode::ParScalar => tally_par(q.into_par_iter()),
+        #[cfg(feature = "parallel")]
+        Mode::ParDag => tally_par(q.into_par_dag_iter()),
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
@@ -183,14 +221,16 @@ fn bench_backend<S: TriblePattern>(
     expected: usize,
     reps: usize,
 ) {
-    let modes = [
-        ("seq", Mode::Seq),
+    let mut modes = vec![("seq", Mode::Seq)];
+    #[cfg(feature = "parallel")]
+    modes.extend([("par-scalar", Mode::ParScalar), ("par-dag", Mode::ParDag)]);
+    modes.extend([
         ("blk", Mode::Blk),
         ("grp", Mode::Grp),
         ("dag", Mode::Dag),
         ("agglomerative", Mode::Agglomerative),
         ("dagu", Mode::DagU),
-    ];
+    ]);
     let mut sigs = Vec::new();
     let mut meds = Vec::new();
     for &(_, mode) in &modes {
@@ -206,19 +246,28 @@ fn bench_backend<S: TriblePattern>(
     }
     let parity = sigs.iter().all(|&s| s == sigs[0]) && sigs[0].0 == expected;
     println!(
-        "{label:<24} rows {:>7}  seq {:>8.3} ms  blk {:>8.3}  grp {:>8.3}  dag {:>8.3}  aggl {:>8.3}  dagu {:>8.3}  \
-         aggl/dag {:>6.3}x  dag/dagu {:>6.3}x  {}",
+        "{label:<24} rows {:>7}  {}",
         sigs[0].0,
-        meds[0],
-        meds[1],
-        meds[2],
-        meds[3],
-        meds[4],
-        meds[5],
-        meds[4] / meds[3],
-        meds[3] / meds[5],
         if parity { "ok" } else { "MISMATCH" }
     );
+    for ((name, _), median) in modes.iter().zip(&meds) {
+        println!("  {name:<14} {median:>10.3} ms");
+    }
+    #[cfg(feature = "parallel")]
+    {
+        let par_scalar = meds[modes
+            .iter()
+            .position(|(name, _)| *name == "par-scalar")
+            .unwrap()];
+        let par_dag = meds[modes
+            .iter()
+            .position(|(name, _)| *name == "par-dag")
+            .unwrap()];
+        println!(
+            "  scheduler ratio  dag/scalar {:>7.3}x",
+            par_scalar / par_dag,
+        );
+    }
     // Instrumented single passes: group/batch structure, intermediates,
     // peak cells; bucket/merge census for the dag modes.
     blocked_stats::set_enabled(true);
@@ -228,7 +277,10 @@ fn bench_backend<S: TriblePattern>(
         dag_stats::reset();
         run_query(kb, markers, mode);
         println!("  {name}: {}", blocked_stats::report());
-        if matches!(mode, Mode::Dag | Mode::Agglomerative | Mode::DagU) {
+        let is_dag = matches!(mode, Mode::Dag | Mode::Agglomerative | Mode::DagU);
+        #[cfg(feature = "parallel")]
+        let is_dag = is_dag || matches!(mode, Mode::ParDag);
+        if is_dag {
             println!("  {name} buckets: {}", dag_stats::report());
         }
     }

@@ -64,7 +64,7 @@ Six methods perform the query negotiation:
 | `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
 | `influence` | Report which variables may need fresh estimates after another variable changes binding state. |
 
-Three laws are load-bearing for correctness:
+Four laws are load-bearing for correctness:
 
 1. `propose` is always given an **empty** sink. A composite must preserve that
    ownership when delegating. In particular, each arm of a union proposes into
@@ -74,6 +74,15 @@ Three laws are load-bearing for correctness:
 3. `satisfied` may optimistically return `true` while one of the constraint's
    variables is unbound, but it **must be exact once all of them are bound**.
    This includes zero-variable constraints, which are fully bound at the seed.
+4. Every row-taking verb is a **row homomorphism**. Splitting a block into
+   non-empty consecutive sub-blocks, evaluating them independently, and
+   concatenating the outputs (with candidate row tags remapped) must equal
+   evaluating the whole block. In particular, estimates and proposals
+   concatenate, confirmation is local to each candidate's row, and whole-block
+   `satisfied` is the conjunction of the sub-block answers. Batched
+   implementations may fuse physical work, but block-global top-k or first-row
+   decisions are invalid. Diagnostics may observe call boundaries, but those
+   observations must never feed back into protocol answers.
 
 The third law is easy to mistake for an optimization hook, but it is a
 soundness rule. An [`or!`](triblespace::core::prelude::or) constraint uses it to
@@ -223,6 +232,37 @@ agglomerative ordinary iterator.
 [`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
 saturated-width form. Fully drained schedulers produce the same result
 **multiset**, but worklist scheduling may produce a different row order.
+
+## Parallel execution
+
+With the `parallel` feature, ordinary `IntoParallelIterator` consumption keeps
+the established scalar DFS proposal splitter. This remains the CPU-oriented
+default: inexpensive one-row probes can outperform the bookkeeping and wider
+batches of a DAG worklist.
+
+[`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
+is the explicit block-native alternative. It partitions a fresh query's affine
+DAG frontier into at most one worklist shard per worker. Seed negotiation
+proceeds until rows actually branch, so a deterministic prefix does not force
+the explicit path back to its scalar cursor. Every shard retains block-native
+estimation, per-row grouping, and route reconvergence among the rows it owns.
+Cross-shard reconvergence is intentionally traded for CPU concurrency, and the
+DAG starts at the configured row cap because full parallel enumeration is an
+explicit throughput request. This path preserves batches for block-oriented
+and accelerator-backed constraints even when scalar DFS is faster on CPU-only
+workloads.
+
+A partially consumed ordinary DAG query converted through `into_par_iter()` is
+drained as one parallel leaf so its exact remaining state cannot be restarted.
+The explicit DAG entry point requires a fresh query. With one Rayon worker it
+has a zero split budget; with `N` workers it permits at most `N - 1` splits. In
+every case the result guarantee is multiset equality, not iteration order.
+
+Both parallel paths clone the constraint tree and result postprocessor per
+shard. Code that needs aggregate observations across clones should use shared
+synchronization such as `Arc<AtomicU64>`; clone-local interior state is not a
+global invocation counter. The row-homomorphism law above is what permits the
+engine to change chunk and shard boundaries without changing results.
 
 ## Queries as Schemas
 

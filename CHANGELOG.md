@@ -180,11 +180,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probe is `agglomerative_partition()`. Total reusable scheduler scratch is
   `O(RV + V²)` for `R` rows and `V` unbound variables; the agglomerator adds
   `O(R + V²)` beyond the existing per-row estimate matrix.
-  `Query::sequential()` explicitly selects the scalar
-  block-of-one DFS specialization, while fresh rayon iteration retains its
-  established DFS splitter. Fully-bound rows stay raw until the consumer pulls
-  them: the worklist never stores projected `R`s, preserving `Query` auto
-  traits and allowing exact mid-iteration clones without `R: Clone`.
+  `Query::sequential()` explicitly selects the scalar block-of-one DFS
+  specialization, and ordinary fresh rayon iteration retains its established
+  scalar DFS splitter. The new explicit `Query::into_par_dag_iter()` path
+  instead partitions the lazy DAG's affine row frontier into at most one
+  saturated worklist shard per worker, retaining block-native probes, adaptive
+  grouping, and local reconvergence for accelerator-oriented backends. A
+  partially consumed ordinary DAG query still drains its exact remainder as
+  one rayon leaf. The constraint protocol now states the required
+  row-homomorphism law that makes chunking and sharding semantics-neutral.
+  Fully-bound rows stay raw until the consumer pulls them: the worklist never
+  stores projected `R`s, preserving `Query` auto traits and allowing exact
+  mid-iteration clones without `R: Clone`.
   `Query::solve_dag_lazy` remains the configurable entry point and `solve_dag`
   exposes the eager saturated form. Fully drained schedulers preserve the same
   result multiset, but result order may differ. Probe solvers require a

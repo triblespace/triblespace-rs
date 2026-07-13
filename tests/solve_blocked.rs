@@ -8,11 +8,24 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::query::TriblePattern;
 use triblespace::prelude::inlineencodings::*;
 use triblespace::prelude::*;
+
+#[cfg(feature = "parallel")]
+fn parallel_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-worker query test pool")
+    })
+}
 
 mod world {
     use triblespace::prelude::*;
@@ -152,6 +165,27 @@ macro_rules! gate {
             "solve_dag_lazy (cap 3, harvest regime) diverged from the sequential engine on {}",
             $name
         );
+        #[cfg(feature = "parallel")]
+        {
+            // A dedicated multi-worker pool prevents CI configured with a
+            // single global Rayon worker from silently exercising zero DAG
+            // splits. The reconvergence gates below run both parallel paths
+            // on TribleSet and SuccinctArchive.
+            let parallel_scalar =
+                parallel_pool().install(|| multiset(($q).into_par_iter().collect::<Vec<_>>()));
+            assert_eq!(
+                sequential, parallel_scalar,
+                "ordinary parallel scalar DFS diverged from the sequential engine on {}",
+                $name
+            );
+            let parallel_dag =
+                parallel_pool().install(|| multiset(($q).into_par_dag_iter().collect::<Vec<_>>()));
+            assert_eq!(
+                sequential, parallel_dag,
+                "explicit parallel DAG frontier diverged from the sequential engine on {}",
+                $name
+            );
+        }
         assert!(
             !sequential.is_empty() || $name.contains("empty"),
             "{} matched nothing — gate is vacuous",
@@ -160,7 +194,7 @@ macro_rules! gate {
     }};
 }
 
-fn gate_backend<S: TriblePattern>(kb: &S, human: Id, anchor: Id) {
+fn gate_backend<S: TriblePattern + Sync>(kb: &S, human: Id, anchor: Id) {
     gate!(
         "point <s> ?a ?v",
         find!(
@@ -223,7 +257,7 @@ fn gate_backend<S: TriblePattern>(kb: &S, human: Id, anchor: Id) {
 /// ~9 inline `Query` values, and debug builds don't reuse their stack
 /// slots — folding these into `gate_backend`'s already-large frame
 /// overflowed the default test-thread stack.
-fn gate_fully_constant<S: TriblePattern>(kb: &S, human: Id, anchor: Id) {
+fn gate_fully_constant<S: TriblePattern + Sync>(kb: &S, human: Id, anchor: Id) {
     gate!(
         "fully-constant existence check (present)",
         find!((), pattern!(kb, [{ &anchor @ world::kind: human }]))
@@ -372,7 +406,7 @@ fn build_skew_world(n_per_pop: usize, fan: usize) -> (TribleSet, usize) {
     (kb, 2 * n_per_pop)
 }
 
-fn gate_skew<S: TriblePattern>(kb: &S, expected: usize) {
+fn gate_skew<S: TriblePattern + Sync>(kb: &S, expected: usize) {
     let seq: Vec<_> = find!(
         (e: Inline<_>, x: Inline<_>, y: Inline<_>),
         pattern!(kb, [{ ?e @ world::p: ?x, world::q: ?y }, { ?x @ world::r: ?y }])
@@ -482,7 +516,11 @@ fn build_reconverge_world(
     )
 }
 
-fn gate_reconverge<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), expected: usize) {
+fn gate_reconverge<S: TriblePattern + Sync>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+    expected: usize,
+) {
     let (k1, k2, k3, k4, kz) = markers;
     let seq: Vec<_> = find!(
         (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
@@ -578,7 +616,7 @@ fn build_flip_world(n_rows: usize) -> (TribleSet, usize) {
     (kb, expected)
 }
 
-fn gate_flip<S: TriblePattern>(kb: &S, expected: usize) {
+fn gate_flip<S: TriblePattern + Sync>(kb: &S, expected: usize) {
     let seq: Vec<_> = find!(
         (y: Inline<_>, x: Inline<_>),
         and!(

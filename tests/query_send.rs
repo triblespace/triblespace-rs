@@ -1,10 +1,13 @@
 //! Auto-trait and resumable-state regressions for the ordinary query iterator.
 
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use triblespace::core::inline::encodings::iu256::U256BE;
 use triblespace::core::query::{dag_stats, Query, VariableContext};
 use triblespace::prelude::*;
+
+static DAG_STATS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn assert_send<T: Send>(_: T) {}
 
@@ -33,6 +36,7 @@ fn ordinary_query_with_non_send_output_is_send() {
 
 #[test]
 fn ordinary_query_uses_lazy_dag_by_default() {
+    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = variable.is(U256BE::inline_from(1u64));
@@ -124,14 +128,26 @@ fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
     });
 
     assert!(query.next().is_some());
+    let started_for_explicit_dag = query.clone();
     let expected = query.clone().collect::<Vec<_>>();
     let actual = query.into_par_iter().collect::<Vec<_>>();
     assert_eq!(actual, expected);
+
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _ = started_for_explicit_dag.into_par_dag_iter();
+    }))
+    .expect_err("the explicit parallel DAG entry point must require a fresh query");
+    let message = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(message.contains("cannot initialize parallel DAG iteration"));
 }
 
 #[cfg(feature = "parallel")]
 #[test]
-fn fresh_query_into_par_iter_matches_dag_default() {
+fn fresh_query_into_par_iter_matches_scalar_scheduler() {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     let mut context = VariableContext::new();
@@ -147,11 +163,86 @@ fn fresh_query_into_par_iter_matches_dag_default() {
         binding.get(variable.index).copied()
     });
 
-    let mut expected = query.clone().collect::<Vec<_>>();
+    let mut expected = query.clone().sequential().collect::<Vec<_>>();
     let mut actual = query.into_par_iter().collect::<Vec<_>>();
     expected.sort_unstable();
     actual.sort_unstable();
     assert_eq!(actual, expected);
+}
+
+/// The explicit parallel-DAG path must descend through an initially
+/// deterministic chain, split a late block-native branch within the `N - 1`
+/// budget, and preserve postprocessor filtering (`None`) in every shard.
+#[cfg(feature = "parallel")]
+#[test]
+fn fresh_parallel_query_splits_a_deep_late_branch() {
+    use rayon::iter::ParallelIterator;
+
+    let mut context = VariableContext::new();
+    let a = context.next_variable::<U256BE>();
+    let b = context.next_variable::<U256BE>();
+    let c = context.next_variable::<U256BE>();
+    let d = context.next_variable::<U256BE>();
+    let branch = context.next_variable::<U256BE>();
+    let values = [10u64, 11, 12, 13, 14, 15, 16, 17].map(U256BE::inline_from);
+    let constraint = and!(
+        a.is(U256BE::inline_from(1u64)),
+        b.is(U256BE::inline_from(2u64)),
+        c.is(U256BE::inline_from(3u64)),
+        d.is(U256BE::inline_from(4u64)),
+        or!(
+            branch.is(values[0]),
+            branch.is(values[1]),
+            branch.is(values[2]),
+            branch.is(values[3]),
+            branch.is(values[4]),
+            branch.is(values[5]),
+            branch.is(values[6]),
+            branch.is(values[7])
+        )
+    );
+    let query = Query::new(constraint, move |binding| {
+        let value = *binding.get(branch.index)?;
+        values
+            .iter()
+            .position(|candidate| candidate.raw == value)
+            .filter(|index| index % 2 == 0)
+            .map(|_| value)
+    });
+    let one_worker = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let four_workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+
+    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
+    dag_stats::reset();
+    dag_stats::set_enabled(true);
+    let mut one_actual =
+        one_worker.install(|| query.clone().into_par_dag_iter().collect::<Vec<_>>());
+    let one_splits = dag_stats::parallel_splits();
+
+    dag_stats::reset();
+    let mut actual = four_workers.install(|| query.into_par_dag_iter().collect::<Vec<_>>());
+    let pops = dag_stats::pops();
+    let splits = dag_stats::parallel_splits();
+    dag_stats::set_enabled(false);
+
+    one_actual.sort_unstable();
+    actual.sort_unstable();
+    let mut expected = [values[0].raw, values[2].raw, values[4].raw, values[6].raw];
+    expected.sort_unstable();
+    assert_eq!(one_actual, expected);
+    assert_eq!(actual, expected);
+    assert_eq!(one_splits, 0, "one worker must create no DAG shards");
+    assert!(pops > 0, "parallel query bypassed the DAG worklist");
+    assert!(
+        (1..=3).contains(&splits),
+        "four-worker query must split its late affine frontier without exceeding N-1; got {splits}"
+    );
 }
 
 #[test]

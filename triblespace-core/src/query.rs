@@ -732,6 +732,29 @@ pub fn confirm_per_row(
 /// therefore answers relevance once per block, and a constraint either
 /// estimates a variable for every row or for none.
 ///
+/// # Row homomorphism
+///
+/// Every row-taking protocol verb is row-local. If a block is split into
+/// non-empty consecutive sub-blocks, evaluating those sub-blocks independently
+/// and concatenating their outputs (with candidate row tags remapped to the
+/// original rows) MUST be equivalent to evaluating the original block at once:
+///
+/// - `estimate` yields the concatenation of the per-sub-block estimate columns;
+/// - `propose` yields the concatenation of the per-sub-block candidate groups;
+/// - `confirm` keeps exactly the candidates that their own row would keep; and
+/// - `satisfied` on the whole block is the conjunction of `satisfied` on the
+///   sub-blocks.
+///
+/// Implementations may fuse scans or accelerator dispatch across many rows,
+/// but must not use block-global top-k limits, first-row decisions, or any
+/// other operation whose answers change when the engine chunks, reconverges,
+/// or parallel-shards a frontier. Violating this law can add or remove query
+/// results merely by changing scheduler width.
+///
+/// Diagnostic side effects may observe those call boundaries, but MUST NOT
+/// feed back into any estimate, candidate, confirmation, or satisfaction
+/// answer.
+///
 /// # Composability
 ///
 /// Constraints combine via [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
@@ -1748,6 +1771,7 @@ pub mod dag_stats {
     static MAX_LIVE_BUCKETS: AtomicU64 = AtomicU64::new(0);
     static MERGE_EVENTS: AtomicU64 = AtomicU64::new(0);
     static MERGED_ROWS: AtomicU64 = AtomicU64::new(0);
+    static PARALLEL_SPLITS: AtomicU64 = AtomicU64::new(0);
     /// PROBE (lazy-dag): chunk width per engine resumption, in resumption
     /// order — the slow-start trajectory.
     static WIDTHS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -1768,6 +1792,7 @@ pub mod dag_stats {
         MAX_LIVE_BUCKETS.store(0, Ordering::Relaxed);
         MERGE_EVENTS.store(0, Ordering::Relaxed);
         MERGED_ROWS.store(0, Ordering::Relaxed);
+        PARALLEL_SPLITS.store(0, Ordering::Relaxed);
         WIDTHS.lock().unwrap().clear();
     }
 
@@ -1795,6 +1820,11 @@ pub mod dag_stats {
         MERGED_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "parallel")]
+    pub(crate) fn record_parallel_split() {
+        PARALLEL_SPLITS.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Number of merge events (filings that appended to a non-empty
     /// bucket from a different pop).
     pub fn merge_events() -> u64 {
@@ -1804,6 +1834,12 @@ pub mod dag_stats {
     /// Number of bucket pops performed by DAG-backed query iteration.
     pub fn pops() -> u64 {
         POPS.load(Ordering::Relaxed)
+    }
+
+    /// Number of successful affine-frontier splits performed for fresh
+    /// parallel DAG queries while recording was enabled.
+    pub fn parallel_splits() -> u64 {
+        PARALLEL_SPLITS.load(Ordering::Relaxed)
     }
 
     /// Terse counter summary.
@@ -1822,12 +1858,13 @@ pub mod dag_stats {
             )
         };
         format!(
-            "pops {} / buckets created {} / max live {} / merge events {} ({} rows merged){}",
+            "pops {} / buckets created {} / max live {} / merge events {} ({} rows merged) / parallel splits {}{}",
             POPS.load(Ordering::Relaxed),
             BUCKETS_CREATED.load(Ordering::Relaxed),
             MAX_LIVE_BUCKETS.load(Ordering::Relaxed),
             MERGE_EVENTS.load(Ordering::Relaxed),
             MERGED_ROWS.load(Ordering::Relaxed),
+            PARALLEL_SPLITS.load(Ordering::Relaxed),
             widths_str,
         )
     }
@@ -1923,6 +1960,26 @@ fn dag_gate_check(buckets: &[DagBucket]) {
             "counting gate diverged from the subset scan on bucket {:?}",
             b.set
         );
+    }
+}
+
+/// Rebuild the readiness gate after a parallel frontier split.
+///
+/// A split moves complete affine rows (or whole buckets) into an independent
+/// worklist. Cross-shard contributors can no longer reconverge, so each shard
+/// must count only the strict-subset buckets it still owns. Recomputing here is
+/// deliberately simple: splitting happens at most a bounded number of times
+/// at the Rayon boundary, while the hot worklist path keeps using incremental
+/// admit/retire maintenance.
+#[cfg(feature = "parallel")]
+fn dag_gate_rebuild(buckets: &mut [DagBucket]) {
+    for i in 0..buckets.len() {
+        let set = buckets[i].set;
+        let pending = buckets
+            .iter()
+            .filter(|other| other.set != set && other.set.is_subset_of(&set))
+            .count() as u32;
+        buckets[i].pending = pending;
     }
 }
 
@@ -2343,6 +2400,137 @@ impl DagState {
             scratch: DagScratch::default(),
             #[cfg(test)]
             coalesced_pops: 0,
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl DagState {
+    /// Construct an empty worklist with the same scheduler policy as `self`.
+    /// Raw frontier rows are installed by [`split_for_parallel`](Self::split_for_parallel).
+    fn parallel_sibling(&self) -> Self {
+        DagState {
+            full: self.full,
+            buckets: Vec::new(),
+            pop_id: self.pop_id,
+            binding: Binding::default(),
+            emit_vars: Vec::new(),
+            emit_rows: Vec::new(),
+            emit_next: 0,
+            emit_count: 0,
+            width: self.width,
+            growth: self.growth,
+            cap: self.cap,
+            merge: self.merge,
+            grouped: self.grouped,
+            trivial_partition_width: self.trivial_partition_width,
+            agglomerative_partition: self.agglomerative_partition,
+            scratch: DagScratch::default(),
+            #[cfg(test)]
+            coalesced_pops: 0,
+        }
+    }
+
+    /// Partition the current affine frontier into two independent worklists.
+    ///
+    /// Every active row represents one disjoint remainder of the search. The
+    /// worklist consumes parents when filing children, so moving rows between
+    /// shards neither duplicates nor loses a possible complete binding. Each
+    /// shard rebuilds its readiness gate because only contributors remaining
+    /// in that shard can reconverge there.
+    ///
+    /// If the frontier is still the one-row seed (or another unsplittable
+    /// one-row chain), advance it serially until a proposal creates at least
+    /// two affine rows. This is planning work only: result projection remains
+    /// deferred to the Rayon fold leaves.
+    fn split_for_parallel<'a, C: Constraint<'a>>(
+        &mut self,
+        constraint: &C,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<Self> {
+        loop {
+            debug_assert_eq!(self.emit_next, 0, "Rayon splits before fold consumption");
+
+            // A full-bound block is already a disjoint result frontier. Split
+            // it directly without invoking user postprocessing.
+            if self.emit_count >= 2 {
+                let right_count = self.emit_count / 2;
+                let left_count = self.emit_count - right_count;
+                let stride = self.emit_vars.len();
+                debug_assert!(stride > 0, "a zero-variable query has one result");
+
+                let mut right = self.parallel_sibling();
+                right.emit_vars = self.emit_vars.clone();
+                right.emit_rows = self.emit_rows.split_off(left_count * stride);
+                right.emit_count = right_count;
+                self.emit_count = left_count;
+                return Some(right);
+            }
+
+            // Keep a staged singleton as one shard while another shard drains
+            // the remaining worklist.
+            if self.emit_count == 1 && !self.buckets.is_empty() {
+                let mut right = self.parallel_sibling();
+                right.emit_vars = std::mem::take(&mut self.emit_vars);
+                right.emit_rows = std::mem::take(&mut self.emit_rows);
+                right.emit_count = 1;
+                self.emit_count = 0;
+                return Some(right);
+            }
+
+            // Prefer splitting rows inside one bucket: this is the common
+            // case immediately after the seed proposes its first variable and
+            // gives both workers similarly shaped block-native work.
+            if let Some(index) = self.buckets.iter().position(|bucket| {
+                let stride = bucket.vars.len();
+                stride > 0 && bucket.rows.len() / stride >= 2
+            }) {
+                let bucket = &mut self.buckets[index];
+                let stride = bucket.vars.len();
+                let rows = bucket.rows.len() / stride;
+                let left_rows = rows - rows / 2;
+                let right_rows = bucket.rows.split_off(left_rows * stride);
+                let right_bucket = DagBucket {
+                    set: bucket.set,
+                    vars: bucket.vars.clone(),
+                    rows: right_rows,
+                    writer: bucket.writer,
+                    pending: 0,
+                };
+
+                let mut right = self.parallel_sibling();
+                right.buckets.push(right_bucket);
+                if self.merge {
+                    dag_gate_rebuild(&mut self.buckets);
+                    dag_gate_rebuild(&mut right.buckets);
+                }
+                return Some(right);
+            }
+
+            // Multiple singleton buckets are also independent frontier
+            // components. Moving one whole bucket avoids descending either
+            // component merely to manufacture a split point.
+            if self.buckets.len() >= 2 {
+                let mut right = self.parallel_sibling();
+                right
+                    .buckets
+                    .push(self.buckets.pop().expect("at least two buckets"));
+                if self.merge {
+                    dag_gate_rebuild(&mut self.buckets);
+                    dag_gate_rebuild(&mut right.buckets);
+                }
+                return Some(right);
+            }
+
+            if self.buckets.is_empty() {
+                return None;
+            }
+
+            // One unsplittable row remains. Expand it through the normal DAG
+            // negotiation; a branching proposal will create the row frontier
+            // split by the next loop iteration.
+            self.pop_once(constraint, influences, base_estimates, self.width.max(1));
         }
     }
 }
@@ -3190,16 +3378,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 //
 // Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
 //
-// The producer's `split` uses the "split-or-descend" rule: while the current
-// top-of-stack has a single remaining proposal, bind it and descend one level;
-// when the top has ≥2 remaining, bisect them between two sub-queries. This
-// keeps the invariant that every non-top stack level has zero remaining
-// proposals, so backtracking out of a sub-search unwinds cleanly to done
-// without any re-enumeration across clones.
+// Ordinary `IntoParallelIterator` retains the established scalar
+// split-or-descend path. `Query::into_par_dag_iter` explicitly selects the
+// block-native alternative: seed negotiation runs until a bucket contains
+// multiple rows, then Rayon bisects those affine rows into independent
+// worklists. Each DAG fold leaf therefore keeps batching, per-row variable
+// selection, and local route reconvergence. A partially consumed ordinary DAG
+// query remains one exact-remainder leaf when converted through the ordinary
+// `IntoParallelIterator` path.
 //
-// `fold_with` is the terminal leaf: it just drives the existing sequential
-// `Iterator::next()` and feeds results into the folder. No duplicated
-// execution logic.
+// `fold_with` is the terminal leaf: it drives the ordinary `Iterator::next()`
+// on whichever scheduler state the producer owns. No duplicated execution
+// loop.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "parallel")]
@@ -3211,13 +3401,18 @@ mod parallel {
     use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    /// Parallel iterator over the results of a [`Query`]. Obtained via
-    /// [`IntoParallelIterator::into_par_iter`] on a `Query`.
+    /// Parallel iterator over the results of a [`Query`]. Obtained either via
+    /// ordinary [`IntoParallelIterator::into_par_iter`] (the scalar DFS
+    /// splitter) or [`Query::into_par_dag_iter`] (affine DAG-frontier
+    /// sharding).
     ///
     /// Drives rayon's work-stealing scheduler through an `UnindexedProducer`
-    /// impl on the underlying query state. The sequential `Iterator::next`
-    /// on `Query` is reused as the fold leaf — parallel execution is purely
-    /// additional, no duplicated engine logic.
+    /// impl on the underlying query state. Ordinary parallel iteration uses
+    /// the established scalar cursor splitter. The explicit DAG entry point
+    /// partitions the lazy DAG's affine row frontier, so each fold leaf
+    /// continues through the block-native scheduler. `Query::next` is reused
+    /// as the fold leaf in both cases — parallel execution adds no duplicate
+    /// engine loop.
     ///
     /// The inner query is stored in a [`Box`] so rayon's work-stealing
     /// `split` (which clones the producer) doesn't memcpy ~15 KB of query
@@ -3226,14 +3421,75 @@ mod parallel {
     ///
     /// `split_budget` bounds the number of splits this sub-producer will
     /// perform. Rayon's default `Splitter` *resets* its budget on every
-    /// stolen task, so on a busy thread pool the split tree could grow
-    /// unboundedly deep — the Query always has more proposals to bisect.
-    /// A bounded per-producer budget (`num_threads²`) caps the split tree
-    /// at ~N² leaves — enough for each worker to have roughly N chunks to
-    /// rebalance via stealing — regardless of stealing pressure.
+    /// stolen task, so on a busy thread pool the split tree could otherwise
+    /// grow without a query-owned limit. A fresh DAG receives `N - 1` total
+    /// splits (at most one shard per worker); the scalar cursor retains its
+    /// historical `N²` spare chunks for finer work stealing.
+    ///
+    /// Rayon clones the constraint tree and postprocessor for each shard.
+    /// Clone-local interior state is therefore clone-local by definition;
+    /// aggregate observations belong behind shared synchronization such as
+    /// `Arc<AtomicU64>` rather than a `Cell` copied with the closure.
     pub struct QueryParIter<C, P: Fn(&Binding) -> Option<R>, R> {
         inner: Box<Query<C, P, R>>,
         split_budget: usize,
+    }
+
+    impl<'a, C, P, R> Query<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        /// Consume a fresh query as a block-native parallel DAG iterator.
+        ///
+        /// Unlike ordinary [`IntoParallelIterator::into_par_iter`], which
+        /// retains the established scalar DFS splitter, this explicit path
+        /// starts the lazy DAG at saturated width and partitions its affine
+        /// row frontier into at most one worklist shard per Rayon worker.
+        /// Each shard preserves backend batches, per-row variable selection,
+        /// and route reconvergence among the rows it owns; reconvergence across
+        /// shards is traded for parallelism. Fully drained results preserve the
+        /// query's result multiset, not its iteration order.
+        ///
+        /// This path is intended for block-oriented or accelerator-backed
+        /// constraints. The scalar splitter can remain faster for CPU-only
+        /// constraints with inexpensive one-row probes.
+        ///
+        /// # Panics
+        ///
+        /// Panics once [`Iterator::next`] has been called. Initializing a new
+        /// DAG from the seed after partial consumption would duplicate prior
+        /// results; use ordinary `into_par_iter()` to drain a partially
+        /// consumed query's exact remaining state as one leaf.
+        pub fn into_par_dag_iter(mut self) -> QueryParIter<C, P, R> {
+            assert!(
+                !self.iteration_started
+                    && self.dag.is_none()
+                    && self.stack.is_empty()
+                    && self.bound.is_empty()
+                    && self.touched_variables.is_empty()
+                    && matches!(self.mode, Search::NextVariable | Search::Done),
+                "cannot initialize parallel DAG iteration after Iterator::next has been called; \
+                 use ordinary into_par_iter() to drain the exact remainder"
+            );
+
+            self.scheduler = QueryScheduler::LazyDag;
+            let mut state = DagState::new(self.constraint.variables());
+            // Full parallel enumeration is an explicit throughput request, so
+            // do not repeat the ordinary iterator's first-result slow start in
+            // every shard.
+            state.width = state.cap;
+            if matches!(self.mode, Search::Done) {
+                state.buckets.clear();
+            }
+            self.dag = Some(Box::new(state));
+
+            QueryParIter {
+                inner: Box::new(self),
+                split_budget: rayon::current_num_threads().saturating_sub(1),
+            }
+        }
     }
 
     impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
@@ -3245,14 +3501,26 @@ mod parallel {
         type Item = R;
         type Iter = QueryParIter<C, P, R>;
 
-        fn into_par_iter(self) -> Self::Iter {
-            // num_threads² chunks: intuition is "every worker has one spare
-            // chunk for every other worker," giving N²/N = N chunks apiece
-            // for rebalancing. log₂(N²) = 2·log₂(N), so depth stays modest
-            // (8 on a 16-thread box, 10 on a 32-thread) — well below any
-            // stack concern.
+        fn into_par_iter(mut self) -> Self::Iter {
             let n = rayon::current_num_threads();
-            let split_budget = n.saturating_mul(n).max(2);
+
+            // Ordinary fresh parallel iteration is deliberately the stable
+            // scalar DFS path. Marking the scheduler explicitly prevents an
+            // unsplittable zero-/one-row leaf from lazily creating a DAG when
+            // `fold_with` first calls `Query::next`.
+            if !self.iteration_started && self.dag.is_none() {
+                self.scheduler = QueryScheduler::Sequential;
+            }
+
+            // A partially consumed ordinary DAG already owns its exact
+            // remaining worklist and must not restart or shard it. All fresh
+            // ordinary queries retain the established N² scalar spare chunks.
+            let split_budget = if self.dag.is_some() {
+                0
+            } else {
+                n.saturating_mul(n).max(2)
+            };
+
             QueryParIter {
                 inner: Box::new(self),
                 split_budget,
@@ -3268,20 +3536,17 @@ mod parallel {
     {
         type Item = R;
 
-        /// Advance the Query's state machine until either the current
-        /// top-of-stack has ≥2 remaining proposals (bisect, return a
-        /// right half) or the sub-query is exhausted (return `None`,
-        /// leaving `self` as a leaf that `fold_with` will fold
-        /// sequentially). Single-value levels are descended through —
-        /// see the module doc comment for why this preserves correctness
-        /// without re-enumeration.
+        /// Partition whichever scheduler state this producer owns. The
+        /// explicit DAG path bisects affine frontier rows; the ordinary path
+        /// descends scalar single-value levels until it can bisect a proposal
+        /// vector. Exhaustion returns `None`, leaving `self` as a leaf for
+        /// `fold_with`. See the module comment for both non-re-enumeration
+        /// arguments.
         fn split(mut self) -> (Self, Option<Self>) {
-            // A query converted to a parallel iterator after an ordinary
-            // `next()` already owns a resumable DAG worklist. The DFS cursor
-            // is still untouched, so splitting it would restart the query and
-            // duplicate rows. Keep this producer as one leaf and let
-            // `fold_with` drain the exact remaining DAG state.
-            if self.inner.dag.is_some() {
+            // A query converted after an ordinary `next()` already owns a
+            // resumable DAG worklist with projected progress. Keep it as one
+            // leaf so the exact remainder is neither restarted nor reordered.
+            if self.inner.dag.is_some() && self.inner.iteration_started {
                 self.split_budget = 0;
                 return (self, None);
             }
@@ -3289,6 +3554,48 @@ mod parallel {
                 return (self, None);
             }
             self.split_budget -= 1;
+
+            // Explicit parallel-DAG query: split the affine frontier. `right`
+            // owns disjoint raw rows and receives its own cloned constraint
+            // and postprocessor when the surrounding Query is cloned.
+            if self.inner.dag.is_some() {
+                let right_state = {
+                    let q = &mut *self.inner;
+                    q.dag.as_mut().expect("checked above").split_for_parallel(
+                        &q.constraint,
+                        &q.influences,
+                        &q.base_estimates,
+                    )
+                };
+                let Some(right_state) = right_state else {
+                    self.split_budget = 0;
+                    return (self, None);
+                };
+                if dag_stats::enabled() {
+                    dag_stats::record_parallel_split();
+                }
+
+                // Clone only the small Query shell plus constraint and
+                // postprocessor. Temporarily remove the left worklist so a
+                // split does not deep-clone all of its frontier rows merely
+                // to overwrite them with `right_state`.
+                let left_state = self.inner.dag.take().expect("checked above");
+                let mut right = (*self.inner).clone();
+                self.inner.dag = Some(left_state);
+                right.dag = Some(Box::new(right_state));
+                let left_budget = self.split_budget / 2;
+                let right_budget = self.split_budget - left_budget;
+                self.split_budget = left_budget;
+                return (
+                    self,
+                    Some(QueryParIter {
+                        inner: Box::new(right),
+                        split_budget: right_budget,
+                    }),
+                );
+            }
+
+            // Explicit scalar scheduler: historical split-or-descend path.
             let q = &mut *self.inner;
             loop {
                 // Advance the state machine until we're in NextValue with

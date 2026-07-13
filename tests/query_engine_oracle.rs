@@ -9,6 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use proptest::prelude::*;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -48,6 +50,27 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
         *counts.entry(item).or_default() += 1;
     }
     counts
+}
+
+#[cfg(feature = "parallel")]
+fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
+    static ONE: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    static FOUR: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    match threads {
+        1 => ONE.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+        }),
+        4 => FOUR.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap()
+        }),
+        _ => unreachable!("oracle only exercises one and four workers"),
+    }
 }
 
 /// Assert against an independent oracle, not against another engine.
@@ -106,10 +129,31 @@ macro_rules! assert_all_engines_match {
         );
         prop_assert_eq!(
             multiset(($query).solve_dag_lazy().cap(2)),
-            expected,
+            expected.clone(),
             "{}: lazy dag forced harvest",
             $label
         );
+        #[cfg(feature = "parallel")]
+        for threads in [1usize, 4] {
+            let scalar = parallel_pool(threads)
+                .install(|| multiset(($query).into_par_iter().collect::<Vec<_>>()));
+            prop_assert_eq!(
+                scalar,
+                expected.clone(),
+                "{}: ordinary parallel scalar DFS ({} workers)",
+                $label,
+                threads
+            );
+            let dag = parallel_pool(threads)
+                .install(|| multiset(($query).into_par_dag_iter().collect::<Vec<_>>()));
+            prop_assert_eq!(
+                dag,
+                expected.clone(),
+                "{}: explicit parallel DAG ({} workers)",
+                $label,
+                threads
+            );
+        }
     }};
 }
 

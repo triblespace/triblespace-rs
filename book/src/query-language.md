@@ -527,6 +527,16 @@ tagged candidate frontiers. Implementations without a specialized batch
 operation can loop over the rows, use `CandidateSink::extend_row`, and use the
 `confirm_per_row` adapter.
 
+The four row-taking operations must also be row-homomorphic: evaluating
+non-empty consecutive sub-blocks independently and concatenating their
+row-remapped outputs must equal evaluating the original block. The DAG
+scheduler, including the explicit `Query::into_par_dag_iter()`
+frontier-sharding path, is free to change block boundaries; block-global top-k
+or first-row semantics would therefore be incorrect. Diagnostics may observe
+call boundaries, but must not feed those observations back into protocol
+answers. Ordinary `into_par_iter()` retains the scalar DFS splitter for
+CPU-oriented workloads.
+
 `propose` owns the empty sink it receives, whereas `confirm` may only remove
 entries from an existing sink. `satisfied` may conservatively return `true`
 while a relevant variable remains unbound, but its result must be exact once
