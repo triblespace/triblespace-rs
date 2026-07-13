@@ -19,9 +19,9 @@
 //! [`WgpuQueryProgram::execute_eav`] additionally admits one all-variable
 //! pattern (including every permutation of variable IDs across the axes) and
 //! keeps the forced `E -> A -> V` frontier chain resident until one final
-//! packed read. Its first stage deliberately scans the compact-code domain
-//! with paired `select1(e_a, code/code + 1)` probes; Jerky has no resident
-//! `select0`, so this is an explicit `O(domain)` probe.
+//! packed read. Its first stage expands the resident ascending entity-code
+//! list derived once when the archive wrapper is constructed, so query
+//! execution does no compact-domain scan.
 
 use std::error::Error;
 use std::fmt;
@@ -142,7 +142,7 @@ where
     max_ea_fanout: usize,
 }
 
-/// Private physical frontier passed between the forced resident stages.
+/// Private physical frontier passed between the first two resident stages.
 ///
 /// Values are row-major compact codes. Logical geometry stays host-known from
 /// exact archive cardinality theorems, while the device status remains the
@@ -153,12 +153,22 @@ struct ResidentFrontier {
     stride: usize,
 }
 
+/// Private final carrier whose body is already in canonical variable order.
+///
+/// The two-word header and every body word are poison-filled before the value
+/// stage writes through it. This makes the public boundary's sole read both
+/// the result transfer and the completeness check without materializing a
+/// physical `[E,A,V]` frontier first.
+struct ResidentPackedEav {
+    words: DeviceU32Buffer<WgpuRuntime>,
+    rows: usize,
+}
+
 #[derive(Clone, Copy)]
 struct EavAdmission {
     entity: ProgramVariable,
     attribute: ProgramVariable,
     value: ProgramVariable,
-    canonical_sources: [u32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -225,12 +235,13 @@ where
     /// `E -> A -> V` chain for `seed_rows` indistinguishable zero-width seeds.
     ///
     /// The pattern's three axes may use any permutation of program variables
-    /// `0..3`. Intermediate buffers use the private physical layouts `[E]`,
-    /// `[E,A]`, and `[E,A,V]`; only the final device scatter reorders those
-    /// axes into canonical ascending-variable columns. The E stage is an
-    /// explicit `O(domain)` paired-`select1` scan. All later geometry is fixed
-    /// from exact archive cardinalities (`entity_count`, changed-E/A ones, and
-    /// trible count), and any device disagreement fails closed.
+    /// `0..3`. Intermediate buffers use the private physical layouts `[E]`
+    /// and `[E,A]`; the value stage writes all three axes directly into a
+    /// poison-filled packed result in canonical ascending-variable columns.
+    /// The E stage expands the resident ascending entity-code list directly.
+    /// All later geometry is
+    /// fixed from exact archive cardinalities (`entity_count`, changed-E/A
+    /// ones, and trible count), and any device disagreement fails closed.
     ///
     /// No intermediate buffer is read. Exactly one packed read occurs at the
     /// end, including when `seed_rows == 0` or the archive is empty.
@@ -243,19 +254,15 @@ where
         let context = self.resident.context();
         let mut status = context.upload_u32(&[STATUS_OK, geometry.value_rows as u32])?;
 
-        let physical = if geometry.value_rows == 0 {
-            ResidentFrontier {
-                values: context.empty_u32(0)?,
-                rows: 0,
-                stride: 3,
-            }
+        let packed = if geometry.value_rows == 0 {
+            self.enqueue_poisoned_eav(geometry)?
         } else {
-            let entities = self.enqueue_entity_stage(seed_rows, geometry, &mut status)?;
+            let entities = self.enqueue_entity_stage(seed_rows, geometry, &status)?;
             let pairs = self.enqueue_attribute_stage(&entities, geometry, &mut status)?;
-            self.enqueue_value_stage(&pairs, geometry, &mut status)?
+            self.enqueue_value_stage(&pairs, admission, geometry, &mut status)?
         };
 
-        self.finish_eav(admission, geometry, physical, status)
+        self.finish_eav(geometry, packed, status)
     }
 
     /// Executes the admitted two-bound transition with a checked no-readback
@@ -570,15 +577,10 @@ where
             ));
         }
 
-        let mut canonical_sources = [0u32; 3];
-        canonical_sources[entity.index()] = 0;
-        canonical_sources[attribute.index()] = 1;
-        canonical_sources[value.index()] = 2;
         Ok(EavAdmission {
             entity,
             attribute,
             value,
-            canonical_sources,
         })
     }
 
@@ -586,73 +588,18 @@ where
         &self,
         seed_rows: usize,
         geometry: EavGeometry,
-        status: &mut DeviceU32Buffer<WgpuRuntime>,
+        status: &DeviceU32Buffer<WgpuRuntime>,
     ) -> Result<ResidentFrontier, ResidentTransitionError> {
         debug_assert!(seed_rows != 0);
         debug_assert!(geometry.domain != 0 && geometry.entities != 0);
         let context = self.resident.context();
-        let domain_dispatch =
-            context.batch_dispatch(geometry.domain, geometry.domain, CubeDim::new_1d(THREADS))?;
-        let double_domain = geometry.domain * 2;
-        let mut select_queries = context.empty_u32(double_domain)?;
-        unsafe {
-            prepare_domain_select_queries::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                select_queries.output_arg(),
-                geometry.domain as u32,
-            );
-        }
-
-        let mut selected = context.empty_u32(double_domain)?;
-        self.resident
-            .entity_prefix()
-            .select1_batch_into(&select_queries, &mut selected)?;
-        let mut flags = context.empty_u32(geometry.domain)?;
-        let mut errors = context.empty_u32(geometry.domain)?;
-        unsafe {
-            finish_domain_flags::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                select_queries.input_arg(),
-                selected.input_arg(),
-                flags.output_arg(),
-                errors.output_arg(),
-                geometry.domain as u32,
-                geometry.triples as u32,
-            );
-        }
-        let (local_offsets, block_offsets) = enqueue_exact_scan(
-            context,
-            &flags,
-            &errors,
-            geometry.domain,
-            geometry.entities,
-            status,
-        )?;
-
-        let mut entity_codes = context.empty_u32(geometry.entities)?;
-        enqueue_fill(context, &mut entity_codes, 0)?;
-        unsafe {
-            compact_domain_codes::launch_unchecked::<WgpuRuntime>(
-                context.client(),
-                domain_dispatch.cube_count(),
-                domain_dispatch.cube_dim(),
-                flags.input_arg(),
-                local_offsets.input_arg(),
-                block_offsets.input_arg(),
-                status.input_arg(),
-                entity_codes.output_arg(),
-                geometry.domain as u32,
-                geometry.entities as u32,
-                BLOCK_ITEMS,
-            );
+        let entity_codes = self.resident.present_entity_codes();
+        if entity_codes.len() != geometry.entities {
+            return Err(ResidentTransitionError::DeviceInvariant);
         }
 
         let mut values = context.empty_u32(geometry.entity_rows)?;
-        let row_dispatch = context.batch_dispatch(
+        let row_dispatch = context.static_batch_dispatch(
             geometry.entity_rows,
             geometry.entity_rows,
             CubeDim::new_1d(THREADS),
@@ -686,8 +633,11 @@ where
             return Err(ResidentTransitionError::DeviceInvariant);
         }
         let context = self.resident.context();
-        let row_dispatch =
-            context.batch_dispatch(entities.rows, entities.rows, CubeDim::new_1d(THREADS))?;
+        let row_dispatch = context.static_batch_dispatch(
+            entities.rows,
+            entities.rows,
+            CubeDim::new_1d(THREADS),
+        )?;
         let double_rows = entities.rows * 2;
         let mut select_queries = context.empty_u32(double_rows)?;
         unsafe {
@@ -787,7 +737,7 @@ where
         let mut value_ranks = context.empty_u32(geometry.pair_rows)?;
         eav_c.rank_batch_into(&changed_positions, &eav_values, &mut value_ranks)?;
 
-        let pair_dispatch = context.batch_dispatch(
+        let pair_dispatch = context.static_batch_dispatch(
             geometry.pair_rows,
             geometry.pair_rows,
             CubeDim::new_1d(THREADS),
@@ -856,15 +806,16 @@ where
     fn enqueue_value_stage(
         &self,
         pairs: &ResidentFrontier,
+        admission: EavAdmission,
         geometry: EavGeometry,
         status: &mut DeviceU32Buffer<WgpuRuntime>,
-    ) -> Result<ResidentFrontier, ResidentTransitionError> {
+    ) -> Result<ResidentPackedEav, ResidentTransitionError> {
         if pairs.rows != geometry.pair_rows || pairs.stride != 2 {
             return Err(ResidentTransitionError::DeviceInvariant);
         }
         let context = self.resident.context();
         let row_dispatch =
-            context.batch_dispatch(pairs.rows, pairs.rows, CubeDim::new_1d(THREADS))?;
+            context.static_batch_dispatch(pairs.rows, pairs.rows, CubeDim::new_1d(THREADS))?;
         let double_rows = pairs.rows * 2;
         let mut entity_select_queries = context.empty_u32(double_rows)?;
         let mut attribute_select_queries = context.empty_u32(pairs.rows)?;
@@ -970,7 +921,7 @@ where
         }
         let mut candidates = context.empty_u32(geometry.value_rows)?;
         aev_c.access_batch_into(&positions, &mut candidates)?;
-        let candidate_dispatch = context.batch_dispatch(
+        let candidate_dispatch = context.static_batch_dispatch(
             geometry.value_rows,
             geometry.value_rows,
             CubeDim::new_1d(THREADS),
@@ -991,9 +942,14 @@ where
         }
         enqueue_error_reduction(context, &candidate_errors, status)?;
 
-        let mut values = context.empty_u32(geometry.value_rows * 3)?;
+        // The error reduction precedes this scatter in the same command queue.
+        // Only a still-OK sticky status permits owners to index `pairs`, so a
+        // malformed owner can never become an unsafe device read. Write the
+        // final variable-order columns directly into the poison-filled packed
+        // result instead of materializing and then repacking physical E/A/V.
+        let mut packed = self.enqueue_poisoned_eav(geometry)?;
         unsafe {
-            scatter_physical_eav::launch_unchecked::<WgpuRuntime>(
+            scatter_canonical_eav::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 candidate_dispatch.cube_count(),
                 candidate_dispatch.cube_dim(),
@@ -1001,27 +957,20 @@ where
                 candidates.input_arg(),
                 owners.input_arg(),
                 status.input_arg(),
-                values.output_arg(),
+                packed.words.output_arg(),
                 geometry.value_rows as u32,
+                admission.entity.index() as u32,
+                admission.attribute.index() as u32,
+                admission.value.index() as u32,
             );
         }
-        Ok(ResidentFrontier {
-            values,
-            rows: geometry.value_rows,
-            stride: 3,
-        })
+        Ok(packed)
     }
 
-    fn finish_eav(
+    fn enqueue_poisoned_eav(
         &self,
-        admission: EavAdmission,
         geometry: EavGeometry,
-        physical: ResidentFrontier,
-        status: DeviceU32Buffer<WgpuRuntime>,
-    ) -> Result<ProgramFrontier, ResidentTransitionError> {
-        if physical.rows != geometry.value_rows || physical.stride != 3 {
-            return Err(ResidentTransitionError::DeviceInvariant);
-        }
+    ) -> Result<ResidentPackedEav, ResidentTransitionError> {
         let context = self.resident.context();
         let body_words =
             geometry
@@ -1035,7 +984,7 @@ where
         )?;
         let mut packed = context.empty_u32(packed_words)?;
         let packed_dispatch =
-            context.batch_dispatch(packed_words, packed_words, CubeDim::new_1d(THREADS))?;
+            context.static_batch_dispatch(packed_words, packed_words, CubeDim::new_1d(THREADS))?;
         unsafe {
             fill_u32::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -1047,39 +996,42 @@ where
             );
         }
 
-        if geometry.value_rows != 0 {
-            let row_dispatch = context.batch_dispatch(
-                geometry.value_rows,
-                geometry.value_rows,
-                CubeDim::new_1d(THREADS),
-            )?;
-            unsafe {
-                pack_canonical_eav::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    row_dispatch.cube_count(),
-                    row_dispatch.cube_dim(),
-                    physical.values.input_arg(),
-                    status.input_arg(),
-                    packed.output_arg(),
-                    geometry.value_rows as u32,
-                    admission.canonical_sources[0],
-                    admission.canonical_sources[1],
-                    admission.canonical_sources[2],
-                );
-            }
+        Ok(ResidentPackedEav {
+            words: packed,
+            rows: geometry.value_rows,
+        })
+    }
+
+    fn finish_eav(
+        &self,
+        geometry: EavGeometry,
+        mut packed: ResidentPackedEav,
+        status: DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ProgramFrontier, ResidentTransitionError> {
+        let expected_words = geometry
+            .value_rows
+            .checked_mul(3)
+            .and_then(|words| words.checked_add(HEADER_WORDS))
+            .ok_or(ResidentTransitionError::GeometryOverflow(
+                "packed E/A/V frontier",
+            ))?;
+        if packed.rows != geometry.value_rows || packed.words.len() != expected_words {
+            return Err(ResidentTransitionError::DeviceInvariant);
         }
+        let context = self.resident.context();
+
         unsafe {
             finalize_packed_header::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
                 status.input_arg(),
-                packed.output_arg(),
+                packed.words.output_arg(),
             );
         }
 
         // The forced three-stage chain's literal sole synchronization/read.
-        let packed = packed.read();
+        let packed = packed.words.read();
         let observed_rows = packed[0] as usize;
         if packed[1] != STATUS_OK || observed_rows != geometry.value_rows {
             return Err(ResidentTransitionError::DeviceInvariant);
@@ -1093,9 +1045,6 @@ where
             ProgramVariable::new(1),
             ProgramVariable::new(2),
         ];
-        debug_assert!(variables.contains(&admission.entity));
-        debug_assert!(variables.contains(&admission.attribute));
-        debug_assert!(variables.contains(&admission.value));
         self.program
             .frontier_from_indices(
                 variables,
@@ -1278,7 +1227,7 @@ fn eav_geometry<U: Universe>(
         ("paired E/A-stage probes", pair_rows.saturating_mul(2)),
         ("E/A/V-stage rows", value_rows),
         ("flat E/A frontier", pair_rows.saturating_mul(2)),
-        ("flat E/A/V frontier", value_rows.saturating_mul(3)),
+        ("packed E/A/V body", value_rows.saturating_mul(3)),
         (
             "packed E/A/V frontier",
             value_rows
@@ -1332,7 +1281,8 @@ fn enqueue_exact_scan(
     let mut local_offsets = context.empty_u32(rows)?;
     let mut block_sums = context.empty_u32(block_count)?;
     let mut block_errors = context.empty_u32(block_count)?;
-    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    let block_dispatch =
+        context.static_batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
     unsafe {
         scan_blocks::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -1375,7 +1325,8 @@ fn enqueue_error_reduction(
     }
     let block_count = errors.len().div_ceil(BLOCK_ITEMS as usize);
     let mut block_errors = context.empty_u32(block_count)?;
-    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    let block_dispatch =
+        context.static_batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
     unsafe {
         reduce_error_blocks::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -1407,7 +1358,7 @@ fn enqueue_fill(
         return Ok(());
     }
     let len = output.len();
-    let dispatch = context.batch_dispatch(len, len, CubeDim::new_1d(THREADS))?;
+    let dispatch = context.static_batch_dispatch(len, len, CubeDim::new_1d(THREADS))?;
     unsafe {
         fill_u32::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -1474,55 +1425,6 @@ fn validate_capacity_geometry(
 }
 
 #[cube(launch_unchecked)]
-fn prepare_domain_select_queries(queries: &mut Array<u32>, domain: u32) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize {
-        let pair = code * 2usize;
-        queries[pair] = code as u32;
-        queries[pair + 1usize] = code as u32 + 1u32;
-    }
-}
-
-#[cube(launch_unchecked)]
-fn finish_domain_flags(
-    queries: &Array<u32>,
-    selected: &Array<u32>,
-    flags: &mut Array<u32>,
-    errors: &mut Array<u32>,
-    domain: u32,
-    ring_len: u32,
-) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize {
-        let pair = code * 2usize;
-        let start_selected = selected[pair];
-        let end_selected = selected[pair + 1usize];
-        let start_query = queries[pair];
-        let end_query = queries[pair + 1usize];
-        let mut invalid = 0u32;
-        if start_selected == 0xFFFF_FFFFu32
-            || end_selected == 0xFFFF_FFFFu32
-            || start_selected < start_query
-            || end_selected < end_query
-        {
-            invalid = 1u32;
-        }
-        let mut present = 0u32;
-        if invalid == 0u32 {
-            let start = start_selected - start_query;
-            let end = end_selected - end_query;
-            if start > end || end > ring_len {
-                invalid = 1u32;
-            } else if start < end {
-                present = 1u32;
-            }
-        }
-        flags[code] = present;
-        errors[code] = invalid;
-    }
-}
-
-#[cube(launch_unchecked)]
 fn scan_block_sums_exact(
     block_sums: &Array<u32>,
     block_errors: &Array<u32>,
@@ -1553,27 +1455,6 @@ fn scan_block_sums_exact(
         }
         if error != 0u32 {
             status[0] = error;
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn compact_domain_codes(
-    flags: &Array<u32>,
-    local_offsets: &Array<u32>,
-    block_offsets: &Array<u32>,
-    status: &Array<u32>,
-    entity_codes: &mut Array<u32>,
-    domain: u32,
-    entity_count: u32,
-    #[comptime] block_items: u32,
-) {
-    let code = ABSOLUTE_POS;
-    if code < domain as usize && status[0] == 0u32 && flags[code] != 0u32 {
-        let output = local_offsets[code] + block_offsets[code / block_items as usize];
-        if output < entity_count {
-            entity_codes[output as usize] = code as u32;
         }
     }
 }
@@ -1859,47 +1740,31 @@ fn scatter_physical_ea(
 }
 
 #[cube(launch_unchecked)]
-fn scatter_physical_eav(
+#[allow(clippy::too_many_arguments)]
+fn scatter_canonical_eav(
     pairs: &Array<u32>,
     candidates: &Array<u32>,
     owners: &Array<u32>,
     status: &Array<u32>,
-    output: &mut Array<u32>,
-    rows: u32,
-) {
-    let row = ABSOLUTE_POS;
-    if row < rows as usize {
-        let base = row * 3usize;
-        output[base] = 0u32;
-        output[base + 1usize] = 0u32;
-        output[base + 2usize] = 0u32;
-        if status[0] == 0u32 {
-            let parent = owners[row] as usize * 2usize;
-            output[base] = pairs[parent];
-            output[base + 1usize] = pairs[parent + 1usize];
-            output[base + 2usize] = candidates[row];
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn pack_canonical_eav(
-    physical: &Array<u32>,
-    status: &Array<u32>,
     packed: &mut Array<u32>,
     rows: u32,
-    column0_source: u32,
-    column1_source: u32,
-    column2_source: u32,
+    #[comptime] entity_column: u32,
+    #[comptime] attribute_column: u32,
+    #[comptime] value_column: u32,
 ) {
     let row = ABSOLUTE_POS;
     if row < rows as usize && status[0] == 0u32 {
-        let physical_base = row * 3usize;
-        let packed_base = 2usize + physical_base;
-        packed[packed_base] = physical[physical_base + column0_source as usize];
-        packed[packed_base + 1usize] = physical[physical_base + column1_source as usize];
-        packed[packed_base + 2usize] = physical[physical_base + column2_source as usize];
+        // `owners` has already been range-checked and reduced into `status`.
+        // Keep this indirect pair read inside the status gate: malformed
+        // device navigation must fail closed rather than index the frontier.
+        let parent = owners[row] as usize * 2usize;
+        let entity = pairs[parent];
+        let attribute = pairs[parent + 1usize];
+        let value = candidates[row];
+        let packed_base = 2usize + row * 3usize;
+        packed[packed_base + entity_column as usize] = entity;
+        packed[packed_base + attribute_column as usize] = attribute;
+        packed[packed_base + value_column as usize] = value;
     }
 }
 

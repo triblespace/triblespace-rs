@@ -8,11 +8,12 @@
 //! enqueue, query-program compilation, WGPU admission, and the first device
 //! synchronization; each is reported separately.
 //!
-//! A warm resident sample still includes the status upload, the eighteen
-//! exact-geometry dispatch-record uploads, every intermediate allocation and
-//! kernel, and the one final packed device-to-host read. It is therefore an
-//! end-to-end warm execution time for this archive-scan-shaped specialization,
-//! not a kernel-only number.
+//! A warm resident sample still includes the status upload, every intermediate
+//! allocation and kernel, and the one final packed device-to-host read. Its
+//! fourteen host-exact local launches use direct rectangles rather than
+//! uploaded indirect-dispatch records. It is therefore an end-to-end warm
+//! execution time for this archive-scan-shaped specialization, not a
+//! kernel-only number.
 
 use std::env;
 use std::hint::black_box;
@@ -120,7 +121,7 @@ fn main() {
         "# primary_comparator=forced CPU transition_on(E)->transition_on(A)->transition_on(V); adaptive execute is not timed"
     );
     println!(
-        "# setup=excluded; warm_resident=224 control H2D bytes (8 status + 18*12 dispatch records) + all allocations/kernels + exactly one final packed D2H"
+        "# setup=excluded; warm_resident=8 control H2D bytes (status only; 14 host-exact launches use direct rectangles) + all allocations/kernels + exactly one final packed D2H"
     );
     println!(
         "# config=max_m={max_m} repetitions={repetitions} warmups={warmups}; p50 is the middle sorted sample"
