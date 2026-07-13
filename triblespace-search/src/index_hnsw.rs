@@ -553,9 +553,9 @@ mod tests {
         let reader = storage.reader().unwrap();
         let manifest = Manifest::from_tribles(&branch_set, &reader, &kind).unwrap();
         let segments: Vec<_> = manifest
-            .ranges
+            .ranges()
             .iter()
-            .flat_map(|range| range.artifacts.iter())
+            .flat_map(|range| range.artifacts().iter())
             .map(|artifact| kind.attach(&reader, artifact).unwrap())
             .collect();
         assert_eq!(segments.len(), 2);
@@ -709,8 +709,8 @@ mod tests {
         let manifest_a = Manifest::from_tribles(&branch_set, &reader, &kind_a).unwrap();
         let manifest_b = Manifest::from_tribles(&branch_set, &reader, &kind_b).unwrap();
         assert_ne!(manifest_a.recipe(), manifest_b.recipe());
-        assert_eq!(manifest_a.ranges[0].artifacts, vec![stored_a]);
-        assert_eq!(manifest_b.ranges[0].artifacts, vec![stored_b]);
+        assert_eq!(manifest_a.ranges()[0].artifacts(), &[stored_a]);
+        assert_eq!(manifest_b.ranges()[0].artifacts(), &[stored_b]);
     }
 
     #[test]
