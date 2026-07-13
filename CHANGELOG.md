@@ -142,6 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Host-exact resident E/A/V launches use direct CubeCL rectangles.** The
+  eighteen local launches in one warm `execute_eav` no longer allocate and
+  upload indirect-dispatch records intended for device-produced lengths. A
+  checked private planner retains the actual device limits, capacity envelope,
+  and flattened-`u32` safety proof; the dynamic two-bound transition keeps its
+  device-written dispatch record unchanged.
 - **PATCH-backed triple patterns reuse adjacent identical lookup prefixes.**
   Block estimates and proposals replay the prior PATCH result when consecutive
   rows bind the pattern to the same prefix; confirmation additionally requires

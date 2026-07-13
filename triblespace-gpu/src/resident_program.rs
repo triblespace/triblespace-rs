@@ -153,6 +153,22 @@ struct ResidentFrontier {
     stride: usize,
 }
 
+/// A host-known launch rectangle that requires no indirect-dispatch buffer.
+struct StaticDispatch {
+    cube_count: CubeCount,
+    cube_dim: CubeDim,
+}
+
+impl StaticDispatch {
+    fn cube_count(&self) -> CubeCount {
+        self.cube_count.clone()
+    }
+
+    fn cube_dim(&self) -> CubeDim {
+        self.cube_dim
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EavAdmission {
     entity: ProgramVariable,
@@ -591,8 +607,12 @@ where
         debug_assert!(seed_rows != 0);
         debug_assert!(geometry.domain != 0 && geometry.entities != 0);
         let context = self.resident.context();
-        let domain_dispatch =
-            context.batch_dispatch(geometry.domain, geometry.domain, CubeDim::new_1d(THREADS))?;
+        let domain_dispatch = static_batch_dispatch(
+            context,
+            geometry.domain,
+            geometry.domain,
+            CubeDim::new_1d(THREADS),
+        )?;
         let double_domain = geometry.domain * 2;
         let mut select_queries = context.empty_u32(double_domain)?;
         unsafe {
@@ -652,7 +672,8 @@ where
         }
 
         let mut values = context.empty_u32(geometry.entity_rows)?;
-        let row_dispatch = context.batch_dispatch(
+        let row_dispatch = static_batch_dispatch(
+            context,
             geometry.entity_rows,
             geometry.entity_rows,
             CubeDim::new_1d(THREADS),
@@ -686,8 +707,12 @@ where
             return Err(ResidentTransitionError::DeviceInvariant);
         }
         let context = self.resident.context();
-        let row_dispatch =
-            context.batch_dispatch(entities.rows, entities.rows, CubeDim::new_1d(THREADS))?;
+        let row_dispatch = static_batch_dispatch(
+            context,
+            entities.rows,
+            entities.rows,
+            CubeDim::new_1d(THREADS),
+        )?;
         let double_rows = entities.rows * 2;
         let mut select_queries = context.empty_u32(double_rows)?;
         unsafe {
@@ -787,7 +812,8 @@ where
         let mut value_ranks = context.empty_u32(geometry.pair_rows)?;
         eav_c.rank_batch_into(&changed_positions, &eav_values, &mut value_ranks)?;
 
-        let pair_dispatch = context.batch_dispatch(
+        let pair_dispatch = static_batch_dispatch(
+            context,
             geometry.pair_rows,
             geometry.pair_rows,
             CubeDim::new_1d(THREADS),
@@ -864,7 +890,7 @@ where
         }
         let context = self.resident.context();
         let row_dispatch =
-            context.batch_dispatch(pairs.rows, pairs.rows, CubeDim::new_1d(THREADS))?;
+            static_batch_dispatch(context, pairs.rows, pairs.rows, CubeDim::new_1d(THREADS))?;
         let double_rows = pairs.rows * 2;
         let mut entity_select_queries = context.empty_u32(double_rows)?;
         let mut attribute_select_queries = context.empty_u32(pairs.rows)?;
@@ -970,7 +996,8 @@ where
         }
         let mut candidates = context.empty_u32(geometry.value_rows)?;
         aev_c.access_batch_into(&positions, &mut candidates)?;
-        let candidate_dispatch = context.batch_dispatch(
+        let candidate_dispatch = static_batch_dispatch(
+            context,
             geometry.value_rows,
             geometry.value_rows,
             CubeDim::new_1d(THREADS),
@@ -1034,8 +1061,12 @@ where
             ResidentTransitionError::GeometryOverflow("packed E/A/V frontier"),
         )?;
         let mut packed = context.empty_u32(packed_words)?;
-        let packed_dispatch =
-            context.batch_dispatch(packed_words, packed_words, CubeDim::new_1d(THREADS))?;
+        let packed_dispatch = static_batch_dispatch(
+            context,
+            packed_words,
+            packed_words,
+            CubeDim::new_1d(THREADS),
+        )?;
         unsafe {
             fill_u32::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -1048,7 +1079,8 @@ where
         }
 
         if geometry.value_rows != 0 {
-            let row_dispatch = context.batch_dispatch(
+            let row_dispatch = static_batch_dispatch(
+                context,
                 geometry.value_rows,
                 geometry.value_rows,
                 CubeDim::new_1d(THREADS),
@@ -1317,6 +1349,138 @@ fn checked_eav_product(
         .ok_or(ResidentTransitionError::GeometryOverflow(name))
 }
 
+/// Builds a direct launch for a host-known batch without allocating the
+/// indirect dispatch record required by device-produced lengths.
+///
+/// `capacity` remains part of the proof even though `execute_eav` currently
+/// uses exact geometry (`logical_len == capacity`): first derive a legal
+/// capacity rectangle, then fit the logical rectangle inside that envelope.
+/// This preserves the dynamic path's device-limit and flattened-`u32` checks.
+fn static_batch_dispatch(
+    context: &WgpuContext,
+    logical_len: usize,
+    capacity: usize,
+    cube_dim: CubeDim,
+) -> Result<StaticDispatch, ResidentTransitionError> {
+    if logical_len > capacity {
+        return Err(ResidentTransitionError::Device(
+            jerky::Error::invalid_argument(format!(
+                "logical batch length {logical_len} exceeds capacity {capacity}"
+            )),
+        ));
+    }
+    if logical_len > u32::MAX as usize || capacity > u32::MAX as usize {
+        return Err(ResidentTransitionError::GeometryOverflow(
+            "static dispatch batch length",
+        ));
+    }
+
+    let units = cube_dim
+        .x
+        .checked_mul(cube_dim.y)
+        .and_then(|xy| xy.checked_mul(cube_dim.z))
+        .filter(|&units| units != 0)
+        .ok_or_else(|| {
+            ResidentTransitionError::Device(jerky::Error::invalid_argument(
+                "cube dimensions must be nonzero and not overflow",
+            ))
+        })?;
+    let hardware = &context.client().properties().hardware;
+    let max_dim = hardware.max_cube_dim;
+    if cube_dim.x > max_dim.0 || cube_dim.y > max_dim.1 || cube_dim.z > max_dim.2 {
+        return Err(ResidentTransitionError::Device(
+            jerky::Error::invalid_argument(format!(
+                "cube dimensions ({}, {}, {}) exceed device limit ({}, {}, {})",
+                cube_dim.x, cube_dim.y, cube_dim.z, max_dim.0, max_dim.1, max_dim.2
+            )),
+        ));
+    }
+    if units > hardware.max_units_per_cube {
+        return Err(ResidentTransitionError::Device(
+            jerky::Error::invalid_argument(format!(
+                "cube has {units} units, device limit is {}",
+                hardware.max_units_per_cube
+            )),
+        ));
+    }
+
+    let max_cube_count = hardware.max_cube_count;
+    if max_cube_count.0 == 0 || max_cube_count.1 == 0 || max_cube_count.2 == 0 {
+        return Err(ResidentTransitionError::Device(
+            jerky::Error::invalid_argument("device workgroup-count dimensions must be nonzero"),
+        ));
+    }
+    let capacity_groups = (capacity as u32).div_ceil(units);
+    let (max_x, max_y) = bounded_dispatch_rectangle(
+        capacity_groups,
+        max_cube_count.0,
+        max_cube_count.1,
+    )
+    .ok_or_else(|| {
+        ResidentTransitionError::Device(jerky::Error::invalid_argument(format!(
+            "batch capacity {capacity} needs {capacity_groups} workgroups, device 2-D limit is {}x{}",
+            max_cube_count.0, max_cube_count.1
+        )))
+    })?;
+    if max_x as u64 * max_y as u64 * units as u64 > u32::MAX as u64 + 1 {
+        return Err(ResidentTransitionError::GeometryOverflow(
+            "static dispatch flattened position",
+        ));
+    }
+
+    let logical_groups = (logical_len as u32).div_ceil(units);
+    let (x, y) = bounded_dispatch_rectangle(logical_groups, max_x, max_y)
+        .ok_or(ResidentTransitionError::DeviceInvariant)?;
+    Ok(StaticDispatch {
+        cube_count: CubeCount::Static(x, y, 1),
+        cube_dim,
+    })
+}
+
+/// Constant-time rectangle with fewer than `y` spare workgroups.
+fn bounded_dispatch_rectangle(groups: u32, max_x: u32, max_y: u32) -> Option<(u32, u32)> {
+    if groups == 0 {
+        return Some((0, 1));
+    }
+    if max_x == 0 || max_y == 0 || groups as u64 > max_x as u64 * max_y as u64 {
+        return None;
+    }
+    let y = groups.div_ceil(max_x);
+    let x = groups.div_ceil(y);
+    debug_assert!(x <= max_x && y <= max_y);
+    Some((x, y))
+}
+
+#[cfg(test)]
+mod static_dispatch_tests {
+    use super::bounded_dispatch_rectangle;
+
+    #[test]
+    fn logical_rectangles_stay_inside_the_capacity_envelope() {
+        for hardware_x in 1..=16u32 {
+            for hardware_y in 1..=16u32 {
+                let hardware_area = hardware_x * hardware_y;
+                for capacity in 0..=hardware_area {
+                    let (capacity_x, capacity_y) =
+                        bounded_dispatch_rectangle(capacity, hardware_x, hardware_y).unwrap();
+                    for logical in 0..=capacity {
+                        let (x, y) =
+                            bounded_dispatch_rectangle(logical, capacity_x, capacity_y).unwrap();
+                        assert!(x <= capacity_x && y <= capacity_y);
+                        assert!(x * y >= logical);
+                        if logical != 0 {
+                            assert!(x * y - logical < y);
+                        }
+                    }
+                }
+                assert!(
+                    bounded_dispatch_rectangle(hardware_area + 1, hardware_x, hardware_y).is_none()
+                );
+            }
+        }
+    }
+}
+
 fn enqueue_exact_scan(
     context: &WgpuContext,
     counts: &DeviceU32Buffer<WgpuRuntime>,
@@ -1332,7 +1496,8 @@ fn enqueue_exact_scan(
     let mut local_offsets = context.empty_u32(rows)?;
     let mut block_sums = context.empty_u32(block_count)?;
     let mut block_errors = context.empty_u32(block_count)?;
-    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    let block_dispatch =
+        static_batch_dispatch(context, block_count, block_count, CubeDim::new_1d(1))?;
     unsafe {
         scan_blocks::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -1375,7 +1540,8 @@ fn enqueue_error_reduction(
     }
     let block_count = errors.len().div_ceil(BLOCK_ITEMS as usize);
     let mut block_errors = context.empty_u32(block_count)?;
-    let block_dispatch = context.batch_dispatch(block_count, block_count, CubeDim::new_1d(1))?;
+    let block_dispatch =
+        static_batch_dispatch(context, block_count, block_count, CubeDim::new_1d(1))?;
     unsafe {
         reduce_error_blocks::launch_unchecked::<WgpuRuntime>(
             context.client(),
@@ -1407,7 +1573,7 @@ fn enqueue_fill(
         return Ok(());
     }
     let len = output.len();
-    let dispatch = context.batch_dispatch(len, len, CubeDim::new_1d(THREADS))?;
+    let dispatch = static_batch_dispatch(context, len, len, CubeDim::new_1d(THREADS))?;
     unsafe {
         fill_u32::launch_unchecked::<WgpuRuntime>(
             context.client(),
