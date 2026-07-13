@@ -17,6 +17,7 @@ type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
 const BLOCK_ITEMS: u32 = THREADS;
 const MAX_FANOUT: u32 = 4;
+const MAX_GROUPS_PER_DIM: u32 = 65_535;
 const DISPATCH_WORDS: usize = 3;
 const META_WORDS: usize = 2;
 
@@ -26,7 +27,10 @@ const META_WORDS: usize = 2;
 // separate [logical_len, capacity] metadata buffer.
 fn dispatch(logical_len: usize) -> [u32; DISPATCH_WORDS] {
     let logical_len = u32::try_from(logical_len).expect("frontier exceeds u32 positions");
-    [logical_len.div_ceil(THREADS), 1, 1]
+    let groups = logical_len.div_ceil(THREADS);
+    let x = groups.min(MAX_GROUPS_PER_DIM);
+    let y = if x == 0 { 1 } else { groups.div_ceil(x) };
+    [x, y, 1]
 }
 
 fn meta(logical_len: usize, capacity: usize) -> [u32; META_WORDS] {
@@ -109,6 +113,7 @@ fn scan_block_sums(
     output_meta: &mut Array<u32>,
     overflow: &mut Array<u32>,
     #[comptime] threads: u32,
+    #[comptime] max_groups_per_dim: u32,
 ) {
     if ABSOLUTE_POS == 0 {
         let block_count = source_meta[0].div_ceil(threads) as usize;
@@ -121,8 +126,18 @@ fn scan_block_sums(
         }
 
         if total <= output_meta[1] {
-            output_dispatch[0] = total.div_ceil(threads);
-            output_dispatch[1] = 1u32;
+            let groups = total.div_ceil(threads);
+            let max_groups = u32::cast_from(max_groups_per_dim);
+            let mut x = max_groups;
+            if groups < max_groups {
+                x = groups;
+            }
+            let mut y = 1u32;
+            if x != 0u32 {
+                y = (groups + x - 1u32) / x;
+            }
+            output_dispatch[0] = x;
+            output_dispatch[1] = y;
             output_dispatch[2] = 1u32;
             output_meta[0] = total;
         } else {
@@ -312,6 +327,7 @@ fn launch_program(
                 ArrayArg::from_raw_parts(candidate_meta.clone(), META_WORDS),
                 ArrayArg::from_raw_parts(overflow.clone(), 1),
                 THREADS,
+                MAX_GROUPS_PER_DIM,
             );
             generate_candidates::launch_unchecked::<WgpuRuntime>(
                 client,
@@ -357,6 +373,7 @@ fn launch_program(
                 ArrayArg::from_raw_parts(output_meta.clone(), META_WORDS),
                 ArrayArg::from_raw_parts(overflow.clone(), 1),
                 THREADS,
+                MAX_GROUPS_PER_DIM,
             );
             scatter_survivors::launch_unchecked::<WgpuRuntime>(
                 client,
