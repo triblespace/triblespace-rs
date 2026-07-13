@@ -37,11 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FAD9B5F3ABA90AC846D08C787A831C7D`, plus the `index_recipe` id
   `8DB05C6453156E9F3424A2B4BE924513`, were minted with `trible genid` on
   2026-07-13.
-- **The `trible pile index build` command publishes `.pidx` locator snapshots.**
-  It exposes the existing bounded-memory `MappedPileIndex` builder as an
-  operational CLI, defaults to `<pile>.pidx`, and preserves the authoritative
-  append-only pile while atomically replacing only the derived cache after a
-  complete successful build.
 - **Succinct archives separate canonical raw data from Rank9 acceleration.**
   `SuccinctArchiveBlob` now ends after the deterministic Ring/wavelet sections
   and EOF metadata, while `SuccinctArchiveRank9IndexBlob` carries the exact
@@ -56,24 +51,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FEFF44EF2D61BD450FE254A0AAE8B4A5` were minted with `trible genid` on
   2026-07-13. The unpublished embedded-suffix format and compatibility paths
   were removed rather than retained as legacy surface.
-- **Piles have an experimental, opt-in mapped locator snapshot.**
-  `MappedPileIndex` builds a checksummed `.pidx` cache with sorted blob, pin,
-  and weak-pin tables, using bounded external-sort runs instead of another
-  corpus-sized heap index. `Pile::open_indexed` now binds that immutable prefix
-  to the pile's retained file descriptor and mapping; normal operations then
-  canonically replay only later records into sparse blob, pin, weak-pin, and
-  negative overlays.
-  `PileReader` point reads consult the tail before the mapped base; explicit
-  enumeration and PATCH snapshots merge both views on demand. Strict opens
-  preserve cache-error provenance, while `open_indexed_or_replay` may discard a
-  missing, malformed, stale, or wrong-identity cache only before accepting its
-  watermark. Tail corruption always fails loud. Writes do not rebuild or
-  publish `.pidx`; the format remains an opt-in static cache. The new error
-  provenance is source-visible: `GetBlobError` and `ReadError` gain index-error
-  variants, and `PileReader` metadata changes its error from `Infallible` to
-  `PileIndexError`. Ordinary and indexed-tail refresh now snapshot the observed
-  file length once per pass instead of issuing one metadata syscall per record;
-  appends after that boundary are applied by the next refresh.
 - **Succinct archives expose decoded fixed-attribute AVE iteration.**
   `SuccinctArchive::iter_attribute_value_entities` yields one raw
   `(value, entity)` tuple per matching fact in byte-lexicographic AVE order.
@@ -122,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Piles use one authoritative PATCH replay path.** The unpublished alternate
+  locator-sidecar API, overlays, and CLI were removed before release. Refresh
+  retains the useful one-observed-length optimization: each pass decodes one
+  bounded prefix, while persistent PATCH clones give readers immutable
+  snapshots and cheap structural differences.
 - **Large pile payload validation now uses BLAKE3's Rayon join strategy.**
   With the existing `parallel` feature enabled, lock-free `PileReader` blob and
   metadata reads validate a contiguous payload of at least 1 MiB with
@@ -129,8 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parallel digest is computed outside the `OnceLock` initializer before racing
   to publish the immutable result, avoiding cache/pool liveness cycles;
   concurrent first misses may duplicate hash work and then converge. Replay,
-  duplicate repair, deduplicating puts, and pile-side mapped-base lookups remain
-  serial because they can run under file locks. Smaller inputs, single-worker
+  duplicate repair, and deduplicating puts remain serial because they can run
+  under file locks. Smaller inputs, single-worker
   pools, and no-default-feature builds also retain the serial digest path. All
   paths share one strategy-aware validation helper and preserve the existing
   cached-result and corruption behavior.

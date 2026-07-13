@@ -182,68 +182,19 @@ mode. (Records above the threshold use the exclusive-lock fallback and don't
 rely on filesystem atomicity.) Using an atomicity-lacking filesystem for
 small records risks pile corruption.
 
-## Experimental static locator snapshots
+## Bounded refresh snapshots
 
-`MappedPileIndex` is an opt-in proof that the replayed blob, pin, and weak-pin
-state can live in a compact mapped `.pidx` cache instead of a corpus-sized heap
-index. The pile remains authoritative: deleting or rejecting the cache simply
-returns the caller to normal PATCH replay. Snapshot construction uses the
-canonical `PileRecords` decoder, bounded external-sort runs, checksummed sorted
-tables, and an atomic rename after the completed file is synced.
+Replay snapshots the observed file length once per refresh and decodes exactly
+that bounded prefix. Shared-lock atomic writers may append after the snapshot;
+those records are intentionally picked up by the next refresh. Post-write
+readback still observes the live length while looking for the caller's own
+record. This avoids a metadata syscall per record without weakening exact
+torn-tail offsets or amputation's exclusive retry.
 
-The format itself remains deliberately static: it describes one immutable pile
-prefix, bound to the OS file identity and covered byte length observed through
-the same descriptor as its mapping. `MappedPileIndex::open` retains the original
-exact-length diagnostic surface. The opt-in `Pile::open_indexed` path instead
-accepts later appends, seeds `applied_length` from the covered prefix, and runs
-the canonical decoder over only the tail. Blob candidates stay in sparse tail
-overlays, including the first-valid-duplicate rule across the boundary. Pin and
-weak-pin heads use positive and negative tail cells so a tombstone never
-accidentally reveals an older base value. Point reads stay mapped; APIs whose
-return types require a PATCH snapshot materialize the merged view only when
-called. Attach itself leaves the tail lazy, just like `Pile::open`, so a caller
-can observe a torn-tail error and explicitly `amputate` from the accepted prefix
-without first rebuilding the corpus PATCH.
-
-Readers sharing one mapped base compute blob differences from their tail
-addition PATCHes. Equality or difference across independently attached bases
-(or between indexed and full-PATCH readers) currently materializes sorted key
-vectors to preserve exact semantics; this is an explicit slow path, not cold-open
-state.
-
-Opening verifies the header and table checksums, canonical section bounds,
-strict key ordering, and first/last prefix anchors. That v1 validation still
-touches the `.pidx` body, so attach time is proportional to the sidecar size,
-even though private heap state is proportional to the tail. Missing, malformed,
-stale, and wrong-identity caches can be discarded by
-`Pile::open_indexed_or_replay` before the base watermark is accepted. Once
-accepted, index failures remain index failures and authoritative tail corruption
-fails at its absolute pile offset; neither is silently converted into absence or
-full replay. Cache fallback is lazy, matching `Pile::open`: the returned ordinary
-`Pile` builds its PATCH on the first `refresh`, reader, pin, or write operation.
-
-Ordinary replay and indexed-tail replay snapshot the observed file length once
-per refresh and decode exactly that bounded prefix. Shared-lock atomic writers
-may append after the snapshot; those records are intentionally picked up by the
-next refresh. Post-write readback still observes the live length while looking
-for the caller's own record. This removes the former per-record `fstat` without
-weakening exact torn-tail offsets or amputation's exclusive retry.
-
-Build or refresh the derived snapshot explicitly with:
-
-```console
-trible pile index build data.pile
-```
-
-The command rebuilds from the authoritative log with bounded external-sort
-runs and defaults to `data.pile.pidx`. It syncs a complete temporary snapshot
-before atomically renaming it over an older cache; it never modifies the pile.
-No open, refresh, or write path invokes this command implicitly.
-
-The default `Pile::open` / `PileReader` path is unchanged, and ordinary writes
-do not build, compact, or publish `.pidx` files. Its 16-byte format marker
-`080FB58E9F63E801C625DB2F2EFA292B` was minted with `trible genid` on
-2026-07-12 rather than derived from a name.
+`PileReader` receives one persistent PATCH snapshot when it is created. Later
+refreshes can extend the pile's copy without changing existing readers, and
+`blobs_diff` can compare two snapshots through PATCH's structurally shared set
+difference instead of enumerating either complete index.
 
 Tools that need the raw log rather than the collapsed state—reflogs,
 consolidation, forensics—should use
