@@ -673,6 +673,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    /// Software-prefetches this head's body into L1 without dereferencing it.
+    ///
+    /// A group-processing (AMAC) descent stores the child head one round and
+    /// reads its body the next; issuing the prefetch now gives the otherwise
+    /// cold body line a full round to arrive. The child head itself is inline
+    /// in the parent branch and already hot, so the body is the miss worth
+    /// hiding. Hint only — no architectural effect beyond timing.
+    #[inline(always)]
+    pub(crate) fn prefetch_body(&self) {
+        let body = self
+            .tptr
+            .as_ptr()
+            .map_addr(|addr| ((addr as u64) & Self::BODY_MASK) as usize)
+            as *const u8;
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `prfm` is a pure hint; any address is legal and has no
+        // architectural effect except warming the cache.
+        unsafe {
+            core::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) body,
+                options(nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = body;
+        }
+    }
+
     pub(crate) fn count(&self) -> u64 {
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
@@ -2210,6 +2240,106 @@ where
             root.has_prefix(0, prefix)
         } else {
             PREFIX_LEN == 0
+        }
+    }
+
+    /// Batched membership: writes `out[i] = self.has_prefix(&prefixes[i])` for
+    /// every `i`. Semantically identical to calling [`PATCH::has_prefix`] on
+    /// each prefix, but the descents are advanced as a group of in-flight
+    /// cursors — one node per cursor per round — so the independent cache
+    /// misses of distinct prefixes overlap (group-processing / AMAC) instead of
+    /// each descent stalling serially on its own pointer chase. This is the
+    /// whole-frontier `confirm` path: a batch of distinct probes down the same
+    /// immutable trie.
+    ///
+    /// # Panics
+    /// Panics if `out.len() != prefixes.len()`.
+    pub fn has_prefix_batch<const PREFIX_LEN: usize>(
+        &self,
+        prefixes: &[[u8; PREFIX_LEN]],
+        out: &mut [bool],
+    ) {
+        const {
+            assert!(PREFIX_LEN <= KEY_LEN);
+        }
+        assert_eq!(
+            prefixes.len(),
+            out.len(),
+            "has_prefix_batch: prefixes and out must have equal length"
+        );
+        /// In-flight descents kept simultaneously; sized so the cursor array
+        /// stays hot while enough independent misses are outstanding to fill
+        /// the load/store queue.
+        const GROUP: usize = 32;
+
+        let Some(root) = &self.root else {
+            out.fill(PREFIX_LEN == 0);
+            return;
+        };
+
+        struct Cursor<'a, const K: usize, O: KeySchema<K>, V> {
+            idx: usize,
+            head: &'a Head<K, O, V>,
+            at_depth: usize,
+        }
+
+        let mut active: Vec<Cursor<'_, KEY_LEN, O, V>> = Vec::with_capacity(GROUP);
+        let mut next = 0usize;
+        while next < prefixes.len() || !active.is_empty() {
+            while active.len() < GROUP && next < prefixes.len() {
+                active.push(Cursor {
+                    idx: next,
+                    head: root,
+                    at_depth: 0,
+                });
+                next += 1;
+            }
+            // One node per cursor; successive closure calls issue independent
+            // dependent-load chains that the out-of-order engine overlaps.
+            active.retain_mut(|c| match c.head.body_ref() {
+                BodyRef::Leaf(leaf) => {
+                    out[c.idx] = leaf.has_prefix::<O>(c.at_depth, &prefixes[c.idx]);
+                    false
+                }
+                BodyRef::LocalLeaf(bytes) => {
+                    out[c.idx] = leaf::key_ops::has_prefix::<KEY_LEN, O>(
+                        bytes,
+                        c.at_depth,
+                        &prefixes[c.idx],
+                    );
+                    false
+                }
+                BodyRef::Branch(branch) => {
+                    let end = branch.end_depth as usize;
+                    let limit = core::cmp::min(PREFIX_LEN, end);
+                    if !leaf::key_ops::has_prefix::<KEY_LEN, O>(
+                        branch.childleaf_key(),
+                        c.at_depth,
+                        &prefixes[c.idx][..limit],
+                    ) {
+                        out[c.idx] = false;
+                        return false;
+                    }
+                    if PREFIX_LEN <= end {
+                        out[c.idx] = true;
+                        return false;
+                    }
+                    match branch.child_table.table_get(prefixes[c.idx][end]) {
+                        Some(child) => {
+                            c.head = child;
+                            c.at_depth = end;
+                            // Warm the child's body now; a full round of other
+                            // cursors' work passes before we deref it next round.
+                            child.prefetch_body();
+                            true
+                        }
+                        None => {
+                            out[c.idx] = false;
+                            false
+                        }
+                    }
+                }
+            });
         }
     }
 

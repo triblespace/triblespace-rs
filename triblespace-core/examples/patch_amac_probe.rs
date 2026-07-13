@@ -147,6 +147,18 @@ fn run_shape(shape: KeyShape, n_keys: usize, n_probes: usize, present_permille: 
 
     let (rand_ns, hits_rand) = measure(reps, || hits(&probes));
     let (sorted_ns, hits_sorted) = measure(reps, || hits(&probes_sorted));
+    // Group-processing (AMAC) batched descent, on unsorted and sorted input.
+    // The trailing count pass is a small conservative handicap on the batched
+    // numbers (the sequential modes fold the count into the probe loop).
+    let mut out = vec![false; n_probes];
+    let (batch_rand_ns, hits_batch_rand) = measure(reps, || {
+        patch.has_prefix_batch(&probes, &mut out);
+        out.iter().filter(|&&b| b).count() as u64
+    });
+    let (batch_sorted_ns, hits_batch_sorted) = measure(reps, || {
+        patch.has_prefix_batch(&probes_sorted, &mut out);
+        out.iter().filter(|&&b| b).count() as u64
+    });
     let (hash_ns, hits_hash) = measure(reps, || {
         let mut n = 0u64;
         for k in &probes {
@@ -167,13 +179,27 @@ fn run_shape(shape: KeyShape, n_keys: usize, n_probes: usize, present_permille: 
     });
 
     assert_eq!(hits_rand, hits_sorted, "sorted order changed hit count");
-    assert_eq!(hits_rand, hits_hash, "HashSet disagrees with PATCH membership");
+    assert_eq!(
+        hits_rand, hits_hash,
+        "HashSet disagrees with PATCH membership"
+    );
     assert_eq!(hits_rand, hits_bsearch, "binary search disagrees");
+    assert_eq!(
+        hits_rand, hits_batch_rand,
+        "batched descent disagrees (random)"
+    );
+    assert_eq!(
+        hits_rand, hits_batch_sorted,
+        "batched descent disagrees (sorted)"
+    );
 
     let per = |ns: u128| ns as f64 / n_probes as f64;
     let mps = |ns: u128| n_probes as f64 / (ns as f64 / 1000.0); // M probes/s
 
-    println!("── key shape: {} ─────────────────────────────", shape.label());
+    println!(
+        "── key shape: {} ─────────────────────────────",
+        shape.label()
+    );
     println!(
         "trie: len={} inner_heads={inner} leaf_heads={leaf_heads} branch_bodies={branch_bodies} leaf_bodies={leaf_bodies} table_slots={} mean_traversal_depth≈{mean_depth:.2}  hits={hits_rand}/{n_probes}",
         patch.len(),
@@ -190,6 +216,18 @@ fn run_shape(shape: KeyShape, n_keys: usize, n_probes: usize, present_permille: 
         per(sorted_ns),
         mps(sorted_ns),
         rand_ns as f64 / sorted_ns as f64
+    );
+    println!(
+        "PATCH batch(32) random   {:8.2}     {:8.2}      {:.2}x   (AMAC: MLP, no sort)",
+        per(batch_rand_ns),
+        mps(batch_rand_ns),
+        rand_ns as f64 / batch_rand_ns as f64
+    );
+    println!(
+        "PATCH batch(32) sorted   {:8.2}     {:8.2}      {:.2}x   (AMAC + locality)",
+        per(batch_sorted_ns),
+        mps(batch_sorted_ns),
+        rand_ns as f64 / batch_sorted_ns as f64
     );
     println!(
         "HashSet contains         {:8.2}     {:8.2}      {:.2}x   (latency floor)",
@@ -212,8 +250,14 @@ fn run_shape(shape: KeyShape, n_keys: usize, n_probes: usize, present_permille: 
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let n_keys: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_000_000);
-    let n_probes: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_000_000);
+    let n_keys: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1_000_000);
+    let n_probes: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1_000_000);
     let present_permille: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(500);
     let reps = 7;
 
