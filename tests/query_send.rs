@@ -221,12 +221,15 @@ fn fresh_parallel_query_splits_a_deep_late_branch() {
     let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
     dag_stats::reset();
     dag_stats::set_enabled(true);
-    let mut one_actual =
-        one_worker.install(|| query.clone().into_par_dag_iter().collect::<Vec<_>>());
+    // Construct outside the custom pool: shard budgets must be derived when
+    // the iterator is consumed, not from whichever pool happened to create it.
+    let one_iter = query.clone().into_par_dag_iter();
+    let mut one_actual = one_worker.install(|| one_iter.collect::<Vec<_>>());
     let one_splits = dag_stats::parallel_splits();
 
     dag_stats::reset();
-    let mut actual = four_workers.install(|| query.into_par_dag_iter().collect::<Vec<_>>());
+    let four_iter = query.into_par_dag_iter();
+    let mut actual = four_workers.install(|| four_iter.collect::<Vec<_>>());
     let pops = dag_stats::pops();
     let splits = dag_stats::parallel_splits();
     dag_stats::set_enabled(false);

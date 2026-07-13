@@ -3420,11 +3420,14 @@ mod parallel {
     /// paid only by the child.
     ///
     /// `split_budget` bounds the number of splits this sub-producer will
-    /// perform. Rayon's default `Splitter` *resets* its budget on every
-    /// stolen task, so on a busy thread pool the split tree could otherwise
-    /// grow without a query-owned limit. A fresh DAG receives `N - 1` total
-    /// splits (at most one shard per worker); the scalar cursor retains its
-    /// historical `N²` spare chunks for finer work stealing.
+    /// perform. It is initialized by [`ParallelIterator::drive_unindexed`]
+    /// from the pool that actually consumes the iterator, so moving a prepared
+    /// iterator into a custom pool still uses that pool's worker count. Rayon's
+    /// default `Splitter` *resets* its budget on every stolen task, so on a
+    /// busy pool the split tree could otherwise grow without a query-owned
+    /// limit. A fresh DAG receives `N - 1` total splits (at most one shard per
+    /// worker); the scalar cursor retains its historical `N²` spare chunks for
+    /// finer work stealing.
     ///
     /// Rayon clones the constraint tree and postprocessor for each shard.
     /// Clone-local interior state is therefore clone-local by definition;
@@ -3487,7 +3490,8 @@ mod parallel {
 
             QueryParIter {
                 inner: Box::new(self),
-                split_budget: rayon::current_num_threads().saturating_sub(1),
+                // Filled at `drive_unindexed`, inside the consuming pool.
+                split_budget: 0,
             }
         }
     }
@@ -3502,8 +3506,6 @@ mod parallel {
         type Iter = QueryParIter<C, P, R>;
 
         fn into_par_iter(mut self) -> Self::Iter {
-            let n = rayon::current_num_threads();
-
             // Ordinary fresh parallel iteration is deliberately the stable
             // scalar DFS path. Marking the scheduler explicitly prevents an
             // unsplittable zero-/one-row leaf from lazily creating a DAG when
@@ -3512,18 +3514,10 @@ mod parallel {
                 self.scheduler = QueryScheduler::Sequential;
             }
 
-            // A partially consumed ordinary DAG already owns its exact
-            // remaining worklist and must not restart or shard it. All fresh
-            // ordinary queries retain the established N² scalar spare chunks.
-            let split_budget = if self.dag.is_some() {
-                0
-            } else {
-                n.saturating_mul(n).max(2)
-            };
-
             QueryParIter {
                 inner: Box::new(self),
-                split_budget,
+                // Filled at `drive_unindexed`, inside the consuming pool.
+                split_budget: 0,
             }
         }
     }
@@ -3696,10 +3690,19 @@ mod parallel {
     {
         type Item = R;
 
-        fn drive_unindexed<Con>(self, consumer: Con) -> Con::Result
+        fn drive_unindexed<Con>(mut self, consumer: Con) -> Con::Result
         where
             Con: UnindexedConsumer<Self::Item>,
         {
+            let workers = rayon::current_num_threads();
+            self.split_budget = match (&self.inner.dag, self.inner.iteration_started) {
+                // Explicit fresh DAG: at most one affine shard per worker.
+                (Some(_), false) => workers.saturating_sub(1),
+                // Partially consumed ordinary DAG: exact remainder, one leaf.
+                (Some(_), true) => 0,
+                // Scalar cursor: retain the established spare work chunks.
+                (None, _) => workers.saturating_mul(workers).max(2),
+            };
             bridge_unindexed(self, consumer)
         }
     }
