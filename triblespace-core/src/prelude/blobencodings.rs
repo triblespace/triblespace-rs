@@ -11,8 +11,10 @@ pub use crate::blob::encodings::rawbytes::RawBytes;
 /// Re-export of [`SimpleArchive`].
 pub use crate::blob::encodings::simplearchive::SimpleArchive;
 
-/// Re-export of [`SuccinctArchive`] and [`SuccinctArchiveBlob`].
-pub use crate::blob::encodings::succinctarchive::{SuccinctArchive, SuccinctArchiveBlob};
+/// Re-export of the succinct archive and its raw/index blob encodings.
+pub use crate::blob::encodings::succinctarchive::{
+    SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
+};
 /// Re-export of [`WasmCode`].
 pub use crate::blob::encodings::wasmcode::WasmCode;
 /// Re-export of [`UnknownBlob`].
