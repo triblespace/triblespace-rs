@@ -1,8 +1,8 @@
-//! WGPU-resident ring columns for [`SuccinctArchive`] query confirmation.
+//! WGPU-resident Ring columns and prefix data for [`SuccinctArchive`] queries.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use jerky::gpu::GpuWaveletMatrix;
+use jerky::gpu::{GpuBitVector, GpuContext, GpuWaveletMatrix};
 use triblespace_core::blob::encodings::succinctarchive::{
     RingBatchQuery, SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
 };
@@ -12,6 +12,12 @@ use triblespace_core::query::{Term, TriblePattern};
 
 /// Jerky's wavelet matrix resident on the default CubeCL WGPU device.
 pub type WgpuWaveletMatrix = GpuWaveletMatrix<cubecl::wgpu::WgpuRuntime>;
+
+/// Jerky's shared compatibility domain on the default CubeCL WGPU device.
+pub type WgpuContext = GpuContext<cubecl::wgpu::WgpuRuntime>;
+
+/// Jerky's raw bit-vector data resident on the default CubeCL WGPU device.
+pub type WgpuBitVector = GpuBitVector<cubecl::wgpu::WgpuRuntime>;
 
 /// Default number of rank probes required before confirmation uses WGPU.
 ///
@@ -100,7 +106,8 @@ impl QueryStats {
     }
 }
 
-/// A [`SuccinctArchive`] with all six ring columns resident on WGPU.
+/// A [`SuccinctArchive`] with its three axis prefixes and all six ring columns
+/// resident on WGPU in one compatibility domain.
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
 /// the wrapped CPU archive unchanged. Only the independent rank stream emitted
@@ -112,6 +119,14 @@ where
     U: Universe,
 {
     archive: SuccinctArchive<U>,
+    /// Shared compatibility domain for every resident archive component.
+    context: WgpuContext,
+    /// Resident mirror of [`SuccinctArchive::e_a`].
+    e_a: WgpuBitVector,
+    /// Resident mirror of [`SuccinctArchive::a_a`].
+    a_a: WgpuBitVector,
+    /// Resident mirror of [`SuccinctArchive::v_a`].
+    v_a: WgpuBitVector,
     /// Resident mirror of [`SuccinctArchive::eav_c`].
     eav_c: WgpuWaveletMatrix,
     /// Resident mirror of [`SuccinctArchive::vea_c`].
@@ -132,21 +147,29 @@ impl<U> WgpuSuccinctArchive<U>
 where
     U: Universe,
 {
-    /// Prepares and enqueues all six ring wavelet matrices on the default
-    /// WGPU device.
+    /// Prepares and enqueues the three canonical prefix vectors and all six
+    /// Ring wavelet matrices on the default WGPU device.
     ///
     /// CubeCL's buffer writes are asynchronous; the first rank query provides
-    /// the synchronization boundary. The archive itself remains on the CPU
-    /// for every non-rank operation.
+    /// the synchronization boundary. Existing query operations other than
+    /// accelerated confirmation ranks still use the canonical CPU archive.
     pub fn new(archive: SuccinctArchive<U>) -> jerky::Result<Self> {
-        let eav_c = WgpuWaveletMatrix::on_wgpu(&archive.eav_c)?;
-        let vea_c = WgpuWaveletMatrix::on_wgpu(&archive.vea_c)?;
-        let ave_c = WgpuWaveletMatrix::on_wgpu(&archive.ave_c)?;
-        let vae_c = WgpuWaveletMatrix::on_wgpu(&archive.vae_c)?;
-        let eva_c = WgpuWaveletMatrix::on_wgpu(&archive.eva_c)?;
-        let aev_c = WgpuWaveletMatrix::on_wgpu(&archive.aev_c)?;
+        let context = WgpuContext::on_wgpu();
+        let e_a = WgpuBitVector::with_context(context.clone(), &archive.e_a.data)?;
+        let a_a = WgpuBitVector::with_context(context.clone(), &archive.a_a.data)?;
+        let v_a = WgpuBitVector::with_context(context.clone(), &archive.v_a.data)?;
+        let eav_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eav_c)?;
+        let vea_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vea_c)?;
+        let ave_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.ave_c)?;
+        let vae_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vae_c)?;
+        let eva_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eva_c)?;
+        let aev_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.aev_c)?;
         Ok(Self {
             archive,
+            context,
+            e_a,
+            a_a,
+            v_a,
             eav_c,
             vea_c,
             ave_c,
@@ -196,6 +219,26 @@ where
     /// Removes the resident adapter and returns its canonical CPU archive.
     pub fn into_archive(self) -> SuccinctArchive<U> {
         self.archive
+    }
+
+    /// Returns the compatibility domain shared by all resident components.
+    pub fn context(&self) -> &WgpuContext {
+        &self.context
+    }
+
+    /// Returns the resident entity-axis prefix bit vector.
+    pub fn entity_prefix(&self) -> &WgpuBitVector {
+        &self.e_a
+    }
+
+    /// Returns the resident attribute-axis prefix bit vector.
+    pub fn attribute_prefix(&self) -> &WgpuBitVector {
+        &self.a_a
+    }
+
+    /// Returns the resident value-axis prefix bit vector.
+    pub fn value_prefix(&self) -> &WgpuBitVector {
+        &self.v_a
     }
 
     /// Returns the resident last-column mirror of `rotation`.
