@@ -142,7 +142,7 @@ where
     max_ea_fanout: usize,
 }
 
-/// Private physical frontier passed between the forced resident stages.
+/// Private physical frontier passed between the first two resident stages.
 ///
 /// Values are row-major compact codes. Logical geometry stays host-known from
 /// exact archive cardinality theorems, while the device status remains the
@@ -153,12 +153,22 @@ struct ResidentFrontier {
     stride: usize,
 }
 
+/// Private final carrier whose body is already in canonical variable order.
+///
+/// The two-word header and every body word are poison-filled before the value
+/// stage writes through it. This makes the public boundary's sole read both
+/// the result transfer and the completeness check without materializing a
+/// physical `[E,A,V]` frontier first.
+struct ResidentPackedEav {
+    words: DeviceU32Buffer<WgpuRuntime>,
+    rows: usize,
+}
+
 #[derive(Clone, Copy)]
 struct EavAdmission {
     entity: ProgramVariable,
     attribute: ProgramVariable,
     value: ProgramVariable,
-    canonical_sources: [u32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -225,12 +235,13 @@ where
     /// `E -> A -> V` chain for `seed_rows` indistinguishable zero-width seeds.
     ///
     /// The pattern's three axes may use any permutation of program variables
-    /// `0..3`. Intermediate buffers use the private physical layouts `[E]`,
-    /// `[E,A]`, and `[E,A,V]`; only the final device scatter reorders those
-    /// axes into canonical ascending-variable columns. The E stage is an
-    /// explicit `O(domain)` paired-`select1` scan. All later geometry is fixed
-    /// from exact archive cardinalities (`entity_count`, changed-E/A ones, and
-    /// trible count), and any device disagreement fails closed.
+    /// `0..3`. Intermediate buffers use the private physical layouts `[E]`
+    /// and `[E,A]`; the value stage writes all three axes directly into a
+    /// poison-filled packed result in canonical ascending-variable columns.
+    /// The E stage is an explicit `O(domain)` paired-`select1` scan. All later
+    /// geometry is fixed from exact archive cardinalities (`entity_count`,
+    /// changed-E/A ones, and trible count), and any device disagreement fails
+    /// closed.
     ///
     /// No intermediate buffer is read. Exactly one packed read occurs at the
     /// end, including when `seed_rows == 0` or the archive is empty.
@@ -243,19 +254,15 @@ where
         let context = self.resident.context();
         let mut status = context.upload_u32(&[STATUS_OK, geometry.value_rows as u32])?;
 
-        let physical = if geometry.value_rows == 0 {
-            ResidentFrontier {
-                values: context.empty_u32(0)?,
-                rows: 0,
-                stride: 3,
-            }
+        let packed = if geometry.value_rows == 0 {
+            self.enqueue_poisoned_eav(geometry)?
         } else {
             let entities = self.enqueue_entity_stage(seed_rows, geometry, &mut status)?;
             let pairs = self.enqueue_attribute_stage(&entities, geometry, &mut status)?;
-            self.enqueue_value_stage(&pairs, geometry, &mut status)?
+            self.enqueue_value_stage(&pairs, admission, geometry, &mut status)?
         };
 
-        self.finish_eav(admission, geometry, physical, status)
+        self.finish_eav(geometry, packed, status)
     }
 
     /// Executes the admitted two-bound transition with a checked no-readback
@@ -570,15 +577,10 @@ where
             ));
         }
 
-        let mut canonical_sources = [0u32; 3];
-        canonical_sources[entity.index()] = 0;
-        canonical_sources[attribute.index()] = 1;
-        canonical_sources[value.index()] = 2;
         Ok(EavAdmission {
             entity,
             attribute,
             value,
-            canonical_sources,
         })
     }
 
@@ -856,9 +858,10 @@ where
     fn enqueue_value_stage(
         &self,
         pairs: &ResidentFrontier,
+        admission: EavAdmission,
         geometry: EavGeometry,
         status: &mut DeviceU32Buffer<WgpuRuntime>,
-    ) -> Result<ResidentFrontier, ResidentTransitionError> {
+    ) -> Result<ResidentPackedEav, ResidentTransitionError> {
         if pairs.rows != geometry.pair_rows || pairs.stride != 2 {
             return Err(ResidentTransitionError::DeviceInvariant);
         }
@@ -991,9 +994,14 @@ where
         }
         enqueue_error_reduction(context, &candidate_errors, status)?;
 
-        let mut values = context.empty_u32(geometry.value_rows * 3)?;
+        // The error reduction precedes this scatter in the same command queue.
+        // Only a still-OK sticky status permits owners to index `pairs`, so a
+        // malformed owner can never become an unsafe device read. Write the
+        // final variable-order columns directly into the poison-filled packed
+        // result instead of materializing and then repacking physical E/A/V.
+        let mut packed = self.enqueue_poisoned_eav(geometry)?;
         unsafe {
-            scatter_physical_eav::launch_unchecked::<WgpuRuntime>(
+            scatter_canonical_eav::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 candidate_dispatch.cube_count(),
                 candidate_dispatch.cube_dim(),
@@ -1001,27 +1009,20 @@ where
                 candidates.input_arg(),
                 owners.input_arg(),
                 status.input_arg(),
-                values.output_arg(),
+                packed.words.output_arg(),
                 geometry.value_rows as u32,
+                admission.entity.index() as u32,
+                admission.attribute.index() as u32,
+                admission.value.index() as u32,
             );
         }
-        Ok(ResidentFrontier {
-            values,
-            rows: geometry.value_rows,
-            stride: 3,
-        })
+        Ok(packed)
     }
 
-    fn finish_eav(
+    fn enqueue_poisoned_eav(
         &self,
-        admission: EavAdmission,
         geometry: EavGeometry,
-        physical: ResidentFrontier,
-        status: DeviceU32Buffer<WgpuRuntime>,
-    ) -> Result<ProgramFrontier, ResidentTransitionError> {
-        if physical.rows != geometry.value_rows || physical.stride != 3 {
-            return Err(ResidentTransitionError::DeviceInvariant);
-        }
+    ) -> Result<ResidentPackedEav, ResidentTransitionError> {
         let context = self.resident.context();
         let body_words =
             geometry
@@ -1047,39 +1048,42 @@ where
             );
         }
 
-        if geometry.value_rows != 0 {
-            let row_dispatch = context.batch_dispatch(
-                geometry.value_rows,
-                geometry.value_rows,
-                CubeDim::new_1d(THREADS),
-            )?;
-            unsafe {
-                pack_canonical_eav::launch_unchecked::<WgpuRuntime>(
-                    context.client(),
-                    row_dispatch.cube_count(),
-                    row_dispatch.cube_dim(),
-                    physical.values.input_arg(),
-                    status.input_arg(),
-                    packed.output_arg(),
-                    geometry.value_rows as u32,
-                    admission.canonical_sources[0],
-                    admission.canonical_sources[1],
-                    admission.canonical_sources[2],
-                );
-            }
+        Ok(ResidentPackedEav {
+            words: packed,
+            rows: geometry.value_rows,
+        })
+    }
+
+    fn finish_eav(
+        &self,
+        geometry: EavGeometry,
+        mut packed: ResidentPackedEav,
+        status: DeviceU32Buffer<WgpuRuntime>,
+    ) -> Result<ProgramFrontier, ResidentTransitionError> {
+        let expected_words = geometry
+            .value_rows
+            .checked_mul(3)
+            .and_then(|words| words.checked_add(HEADER_WORDS))
+            .ok_or(ResidentTransitionError::GeometryOverflow(
+                "packed E/A/V frontier",
+            ))?;
+        if packed.rows != geometry.value_rows || packed.words.len() != expected_words {
+            return Err(ResidentTransitionError::DeviceInvariant);
         }
+        let context = self.resident.context();
+
         unsafe {
             finalize_packed_header::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
                 status.input_arg(),
-                packed.output_arg(),
+                packed.words.output_arg(),
             );
         }
 
         // The forced three-stage chain's literal sole synchronization/read.
-        let packed = packed.read();
+        let packed = packed.words.read();
         let observed_rows = packed[0] as usize;
         if packed[1] != STATUS_OK || observed_rows != geometry.value_rows {
             return Err(ResidentTransitionError::DeviceInvariant);
@@ -1093,9 +1097,6 @@ where
             ProgramVariable::new(1),
             ProgramVariable::new(2),
         ];
-        debug_assert!(variables.contains(&admission.entity));
-        debug_assert!(variables.contains(&admission.attribute));
-        debug_assert!(variables.contains(&admission.value));
         self.program
             .frontier_from_indices(
                 variables,
@@ -1278,7 +1279,7 @@ fn eav_geometry<U: Universe>(
         ("paired E/A-stage probes", pair_rows.saturating_mul(2)),
         ("E/A/V-stage rows", value_rows),
         ("flat E/A frontier", pair_rows.saturating_mul(2)),
-        ("flat E/A/V frontier", value_rows.saturating_mul(3)),
+        ("packed E/A/V body", value_rows.saturating_mul(3)),
         (
             "packed E/A/V frontier",
             value_rows
@@ -1859,47 +1860,31 @@ fn scatter_physical_ea(
 }
 
 #[cube(launch_unchecked)]
-fn scatter_physical_eav(
+#[allow(clippy::too_many_arguments)]
+fn scatter_canonical_eav(
     pairs: &Array<u32>,
     candidates: &Array<u32>,
     owners: &Array<u32>,
     status: &Array<u32>,
-    output: &mut Array<u32>,
-    rows: u32,
-) {
-    let row = ABSOLUTE_POS;
-    if row < rows as usize {
-        let base = row * 3usize;
-        output[base] = 0u32;
-        output[base + 1usize] = 0u32;
-        output[base + 2usize] = 0u32;
-        if status[0] == 0u32 {
-            let parent = owners[row] as usize * 2usize;
-            output[base] = pairs[parent];
-            output[base + 1usize] = pairs[parent + 1usize];
-            output[base + 2usize] = candidates[row];
-        }
-    }
-}
-
-#[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
-fn pack_canonical_eav(
-    physical: &Array<u32>,
-    status: &Array<u32>,
     packed: &mut Array<u32>,
     rows: u32,
-    column0_source: u32,
-    column1_source: u32,
-    column2_source: u32,
+    #[comptime] entity_column: u32,
+    #[comptime] attribute_column: u32,
+    #[comptime] value_column: u32,
 ) {
     let row = ABSOLUTE_POS;
     if row < rows as usize && status[0] == 0u32 {
-        let physical_base = row * 3usize;
-        let packed_base = 2usize + physical_base;
-        packed[packed_base] = physical[physical_base + column0_source as usize];
-        packed[packed_base + 1usize] = physical[physical_base + column1_source as usize];
-        packed[packed_base + 2usize] = physical[physical_base + column2_source as usize];
+        // `owners` has already been range-checked and reduced into `status`.
+        // Keep this indirect pair read inside the status gate: malformed
+        // device navigation must fail closed rather than index the frontier.
+        let parent = owners[row] as usize * 2usize;
+        let entity = pairs[parent];
+        let attribute = pairs[parent + 1usize];
+        let value = candidates[row];
+        let packed_base = 2usize + row * 3usize;
+        packed[packed_base + entity_column as usize] = entity;
+        packed[packed_base + attribute_column as usize] = attribute;
+        packed[packed_base + value_column as usize] = value;
     }
 }
 
