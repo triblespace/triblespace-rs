@@ -1,5 +1,6 @@
 mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
+pub mod query_program;
 mod universe;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};

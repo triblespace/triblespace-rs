@@ -17,7 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The probe records CubeCL 0.10 CPU's missing atomics and plane operations as a
   blocker for a portable resident frontier/scan rather than emulating them with
   unsafe or misleading semantics.
-
+- **Succinct queries gain an experimental code-space program IR.** A compact
+  `QueryProgram` lowers constants into one immutable archive's local `u32`
+  universe, carries affine frontier rows without raw-value decoding, and
+  provides a canonical CPU estimate/choose/propose/confirm transition plus a
+  complete reference interpreter. The deliberately small first language is a
+  flat positive conjunction over one `SuccinctArchive`; differential DAG,
+  row-homomorphism, and monotonic-extension tests define the semantic contract
+  a future resident CubeCL backend must preserve.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM

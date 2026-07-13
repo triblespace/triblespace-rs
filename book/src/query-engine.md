@@ -271,6 +271,26 @@ Forcing all 425 non-empty rank batches emitted by the shards to WGPU instead
 took 775 ms, demonstrating that the admission boundary is part of the
 algorithm rather than a backend detail.
 
+### Experimental resident-program seam
+
+[`succinctarchive::query_program`](triblespace::core::blob::encodings::succinctarchive::query_program)
+defines a compact `QueryProgram` for a deliberately smaller language: one flat
+positive conjunction of triple patterns over one immutable `SuccinctArchive`.
+Compilation lowers constants once, and affine frontier rows carry only `u32`
+archive-universe codes. Its CPU interpreter implements the same
+estimate/choose/propose/confirm transition as an executable reference for a
+future resident CubeCL backend; it does not route through `dyn Constraint`.
+
+This seam is intentionally not the general query engine. It currently excludes
+union, negation, ranges, external constraints, result closures, and repeated
+variables within one triple pattern. Archive codes are local to the exact
+borrowed snapshot and cannot be mixed across segments. The CPU interpreter also
+does not reproduce DAG reconvergence or agglomerative grouping because those
+change batching and order, not the positive conjunction's result multiset.
+Keeping these limitations explicit lets a device backend first prove one
+frontier transition and resident scan/scatter before taking on the complete
+constraint language.
+
 A partially consumed ordinary DAG query converted through `into_par_iter()` is
 drained as one parallel leaf so its exact remaining state cannot be restarted.
 The explicit DAG entry point requires a fresh query. With one Rayon worker it
