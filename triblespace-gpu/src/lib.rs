@@ -15,7 +15,8 @@ pub use cubecl_backend::CudaWaveletFreeze;
 pub use cubecl_backend::WgpuWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
-    WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix, DEFAULT_MIN_RANK_BATCH,
+    WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,
+    DEFAULT_MIN_RANK_BATCH,
 };
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
