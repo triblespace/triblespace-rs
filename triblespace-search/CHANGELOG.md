@@ -4,6 +4,27 @@ All notable changes to `triblespace-search`.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased
+
+### Range-native typed search artifacts
+
+- Ported `Bm25Rollup` and `HnswRollup` to the fallible, range-native
+  `IndexKind` contract. Prepared and stored artifacts now retain their exact
+  `SuccinctBM25Blob` / `SuccinctHNSWBlob` types throughout put, manifest,
+  parse, and attach paths; the search recipes no longer erase blobs through
+  `UnknownBlob`.
+- Added stable typed artifact attributes plus intrinsic recipe descriptors.
+  BM25 identity includes its source-content attribute. HNSW identity includes
+  its source-embedding attribute, dimension, and deterministic seed, so
+  parameter-distinct recipes coexist safely in one branch manifest.
+- Empty projections now produce zero physical artifacts while retaining their
+  logical range record. Repeated typed handle facts represent repeated physical
+  artifacts on one logical range.
+- Builds now fail closed on unreadable source content, unreadable embeddings,
+  and embedding dimension mismatches. HNSW compaction also fails when a source
+  embedding can no longer be resolved instead of certifying an incomplete
+  merged range.
+
 ## [0.41.4] - 2026-05-17
 
 Lock-step bump alongside the trailing-dot-leak +

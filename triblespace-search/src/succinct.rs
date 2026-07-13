@@ -1826,13 +1826,9 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     /// and final serialization. In particular, there is no `O(total token
     /// multiplicity)` token-bag materialization or corpus-sized in-memory
     /// posting cache.
-    pub(crate) fn merge_segments(segments: &[Self], k1: f32, b: f32) -> Self {
-        Self::try_merge_segments(segments, k1, b).expect("merge canonical BM25 segments")
-    }
-
-    /// Fallible counterpart to [`Self::merge_segments`]. This is the entry
-    /// point used by rollup code that must preserve its old metadata when an
-    /// anonymous spool or succinct-area operation fails.
+    /// Fallible merge entry point used by range maintenance. Failure leaves
+    /// the previous manifest intact rather than certifying an incomplete
+    /// compacted range.
     pub(crate) fn try_merge_segments(
         segments: &[Self],
         k1: f32,

@@ -153,7 +153,12 @@ fn main() {
     let baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
     let merge_started = Instant::now();
-    let merged_blob = kind.merge(&segments);
+    let merged_blob = kind
+        .merge(&segments)
+        .expect("canonical segments merge")
+        .into_iter()
+        .next()
+        .expect("non-empty benchmark input produces one artifact");
     let elapsed = merge_started.elapsed();
     let extra_heap = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
     let digest = blake3::hash(merged_blob.bytes.as_ref());
