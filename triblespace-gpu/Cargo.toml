@@ -49,6 +49,10 @@ name = "resident_eav_chain"
 required-features = ["wgpu"]
 
 [[example]]
+name = "resident_eav_shapes"
+required-features = ["wgpu"]
+
+[[example]]
 name = "cpu_runtime_probe"
 required-features = ["cpu", "wgpu"]
 
