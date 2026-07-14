@@ -17,8 +17,12 @@
 //! its tightest proposer for that scheduled variable. Occupancy scheduling
 //! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
-//! gate. Separately planned groups can therefore assemble in one canonical
-//! action bucket without sacrificing width-one depth-first latency. Ready and
+//! gate. When a full Propose or Confirm action advances to an underfilled
+//! successor, an exact physical filing token keeps at most that newly appended
+//! tail hot until it emits or dies. Readiness pops and planning-state splits do
+//! not start a sprint, so saturated reconvergence and uniform-action assembly
+//! remain intact. The token is not part of canonical state identity and never
+//! consumes an older cohort already merged under the same state. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states remain
 //! parent-atomic while any unchecked whole-group confirmer remains; once the
 //! residual continuation contains only page-local confirms, they measure and
@@ -26,11 +30,11 @@
 //! descend while preserving group-global Union/custom semantics at their
 //! atomic boundary. Proposal remains eager for each selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
-//! Lazy width is unchanged while nonempty successors advance—even when they
-//! merge into an already-live bucket—and grows geometrically after an action
-//! dies or raw rows reach projection. A successful first depth-first path thus
-//! keeps its exact width-one trace, while a negative prefix can widen within a
-//! single pull.
+//! Lazy width is unchanged while nonempty successors advance. Once a partial
+//! action activates an exact continuation cohort, that lineage outranks cold
+//! siblings—even when it merges into an already-live bucket—until it emits or
+//! dies. Width grows geometrically after an action dies or raw rows reach
+//! projection, so a negative prefix can widen within a single pull.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -180,6 +184,13 @@ pub struct ResidualStateStats {
     /// because no live state could fill the desired width. The eager solver
     /// counts every one of its readiness-gated pops here.
     pub readiness_pops: usize,
+    /// Physical continuation-cohort chunks selected after a full action
+    /// partially survived. These pops deliberately bypass global occupancy
+    /// harvesting without changing canonical state identity.
+    pub continuation_pops: usize,
+    /// Continuation-cohort pops whose exact newly filed payload was smaller
+    /// than the current desired width.
+    pub underfilled_continuation_pops: usize,
     /// Pops that left unprocessed parent rows or candidate occurrences live
     /// under the same state.
     pub partial_pops: usize,
@@ -787,6 +798,54 @@ impl StateBucket {
 
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 
+/// Exact physical tail appended by one transition to a canonical state.
+///
+/// This token is deliberately absent from [`StateDesc`] and the interner: two
+/// histories with identical future computation retain one semantic state even
+/// while the lazy scheduler temporarily keeps the newly advanced cohort hot.
+/// Single-threaded filing appends the cohort at the payload tail, so its exact
+/// row/candidate occupancy can be removed without consuming an older cohort
+/// that already occupied the same state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContinuationToken {
+    rank: usize,
+    state: StateId,
+    rows: usize,
+    candidates: usize,
+}
+
+impl ContinuationToken {
+    fn occupancy(self, desc: &StateDesc, plan: &ResidualPlan) -> usize {
+        if desc.uses_candidate_pages(plan) {
+            self.candidates
+        } else {
+            self.rows
+        }
+    }
+
+    fn scheduling_key(self) -> (usize, StateId) {
+        (self.rank, self.state)
+    }
+}
+
+fn prefer_continuation(
+    selected: &mut Option<ContinuationToken>,
+    candidate: Option<ContinuationToken>,
+) {
+    if let Some(candidate) = candidate {
+        if selected.is_none_or(|current| candidate.scheduling_key() > current.scheduling_key()) {
+            *selected = Some(candidate);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionKind {
+    Full,
+    Readiness,
+    Continuation,
+}
+
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
     RowsView::new_with_row_count(vars, rows, row_count)
 }
@@ -798,25 +857,35 @@ fn file(
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
-) -> bool {
-    if bucket.row_count() == 0 {
-        return false;
+) -> Option<ContinuationToken> {
+    let rows = bucket.row_count();
+    if rows == 0 {
+        return None;
     }
+    let candidates = match &bucket {
+        StateBucket::Rows(_) => 0,
+        StateBucket::Candidates(batch) => batch.candidate_count(),
+    };
     let rank = desc.rank(leaf_count);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
-        stats.rows_merged += bucket.row_count();
+        stats.rows_merged += rows;
         existing.append(bucket);
     } else {
         if known {
             stats.state_reentries += 1;
-            stats.rows_reentered += bucket.row_count();
+            stats.rows_reentered += rows;
         }
         level.insert(id, bucket);
     }
-    true
+    Some(ContinuationToken {
+        rank,
+        state: id,
+        rows,
+        candidates,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -876,7 +945,7 @@ fn ready_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> bool {
+) -> ContinuationToken {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -1020,14 +1089,14 @@ fn ready_plan_transition<'a>(
         debug_assert_eq!(indices.len(), rows.row_count);
         // The common case transfers ownership of the whole parent block:
         // no row copy is necessary when every row chose the same action.
-        file_propose_group(action, rows)
+        file_propose_group(action, rows).expect("Ready planning filed an empty action")
     } else {
-        let mut advanced = false;
+        let mut continuation = None;
         for (action, indices) in groups {
             let selected = rows.selected(vars.len(), &indices);
-            advanced |= file_propose_group(action, selected);
+            prefer_continuation(&mut continuation, file_propose_group(action, selected));
         }
-        advanced
+        continuation.expect("Ready planning filed no action")
     }
 }
 
@@ -1042,7 +1111,7 @@ fn propose_action_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> bool {
+) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -1084,7 +1153,7 @@ fn propose_action_transition<'a>(
             stats,
         )
     } else {
-        false
+        None
     }
 }
 
@@ -1096,7 +1165,7 @@ fn commit_candidates(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> bool {
+) -> Option<ContinuationToken> {
     let parent_vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let mut next_bound = desc.bound;
     next_bound.set(variable);
@@ -1150,10 +1219,11 @@ fn candidate_plan_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> bool {
+) -> ContinuationToken {
     let leaf_count = plan.len();
     if relevant == checked {
-        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
+        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats)
+            .expect("fully checked candidates committed no rows");
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -1223,13 +1293,13 @@ fn candidate_plan_transition<'a>(
     if confirmers.iter().all(|&leaf| leaf == first) {
         // The common case keeps ownership of the whole ragged block: no
         // parent copy, candidate rescan, or row-tag remap is necessary.
-        file_confirm_group(first, batch)
+        file_confirm_group(first, batch).expect("Candidate planning filed an empty action")
     } else {
-        let mut advanced = false;
+        let mut continuation = None;
         for (leaf, selected) in batch.partition(vars.len(), &confirmers) {
-            advanced |= file_confirm_group(leaf, selected);
+            prefer_continuation(&mut continuation, file_confirm_group(leaf, selected));
         }
-        advanced
+        continuation.expect("Candidate planning filed no action")
     }
 }
 
@@ -1245,7 +1315,7 @@ fn confirm_action_transition<'a>(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
-) -> bool {
+) -> Option<ContinuationToken> {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
@@ -1281,7 +1351,7 @@ fn confirm_action_transition<'a>(
             stats,
         )
     } else {
-        false
+        None
     }
 }
 
@@ -1290,7 +1360,7 @@ fn confirm_action_transition<'a>(
 enum StepOutcome {
     /// At least one nonempty successor was filed, including a merge into an
     /// already-live canonical bucket.
-    Advanced,
+    Advanced(ContinuationToken),
     /// An action compacted to no successor rows.
     Dead,
     /// Full-bound rows are ready for projection.
@@ -1320,7 +1390,7 @@ fn execute_state<'a>(
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
-            let advanced = ready_plan_transition(
+            let continuation = ready_plan_transition(
                 root,
                 plan,
                 desc,
@@ -1332,8 +1402,7 @@ fn execute_state<'a>(
                 interner,
                 stats,
             );
-            assert!(advanced, "Ready planning must file a nonempty action");
-            StepOutcome::Advanced
+            StepOutcome::Advanced(continuation)
         }
         (
             ResidualPhase::Propose {
@@ -1344,11 +1413,11 @@ fn execute_state<'a>(
             StateBucket::Rows(rows),
         ) => {
             stats.propose_action_pops += 1;
-            let advanced = propose_action_transition(
+            let continuation = propose_action_transition(
                 root, plan, desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
             );
-            if advanced {
-                StepOutcome::Advanced
+            if let Some(continuation) = continuation {
+                StepOutcome::Advanced(continuation)
             } else {
                 stats.dead_action_pops += 1;
                 StepOutcome::Dead
@@ -1363,11 +1432,10 @@ fn execute_state<'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.candidate_plan_pops += 1;
-            let advanced = candidate_plan_transition(
+            let continuation = candidate_plan_transition(
                 root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
             );
-            assert!(advanced, "Candidate planning must file a nonempty action");
-            StepOutcome::Advanced
+            StepOutcome::Advanced(continuation)
         }
         (
             ResidualPhase::Confirm {
@@ -1379,12 +1447,12 @@ fn execute_state<'a>(
             StateBucket::Candidates(batch),
         ) => {
             stats.confirm_action_pops += 1;
-            let advanced = confirm_action_transition(
+            let continuation = confirm_action_transition(
                 root, plan, desc, *variable, relevant, checked, *confirmer, batch, worklist,
                 interner, stats,
             );
-            if advanced {
-                StepOutcome::Advanced
+            if let Some(continuation) = continuation {
+                StepOutcome::Advanced(continuation)
             } else {
                 stats.dead_action_pops += 1;
                 StepOutcome::Dead
@@ -1410,6 +1478,13 @@ struct ResidualStateMachine {
     emit_rows: Vec<RawInline>,
     emit_next: usize,
     emit_count: usize,
+    /// Exact physical cohort activated by a partially surviving full action.
+    /// Its lineage is consumed before returning to global batch harvesting.
+    continuation: Option<ContinuationToken>,
+    #[cfg(test)]
+    continuation_sprint_enabled: bool,
+    last_selection: SelectionKind,
+    last_was_action: bool,
     width: usize,
     growth: usize,
     cap: usize,
@@ -1429,6 +1504,11 @@ impl ResidualStateMachine {
             emit_rows: Vec::new(),
             emit_next: 0,
             emit_count: 0,
+            continuation: None,
+            #[cfg(test)]
+            continuation_sprint_enabled: true,
+            last_selection: SelectionKind::Readiness,
+            last_was_action: false,
             width: lazy_start_width().clamp(1, cap),
             growth: lazy_growth(),
             cap,
@@ -1543,10 +1623,80 @@ impl ResidualStateMachine {
         self.stats.state_pops += 1;
         if is_full {
             self.stats.full_pops += 1;
+            self.last_selection = SelectionKind::Full;
         } else {
             self.stats.readiness_pops += 1;
+            self.last_selection = SelectionKind::Readiness;
         }
         Some((desc, chunk))
+    }
+
+    /// Removes one chunk exclusively from the tail appended by the preceding
+    /// advancing transition.
+    ///
+    /// A global strict-deepest flag is insufficient here: another history may
+    /// already occupy a deeper state, and an older cohort may already occupy
+    /// this exact state. The token limits the tail cut to the newly filed
+    /// cohort, preserving DFS latency without weakening readiness or semantic
+    /// state merging.
+    fn take_continuation(
+        &mut self,
+        plan: &ResidualPlan,
+        token: ContinuationToken,
+        width: usize,
+    ) -> (StateDesc, StateBucket) {
+        let desc = self.interner.get(token.state).clone();
+        assert_eq!(
+            desc.rank(self.leaf_count),
+            token.rank,
+            "continuation token disagrees with canonical state rank"
+        );
+        let candidate_pages = desc.uses_candidate_pages(plan);
+        let cohort_occupancy = token.occupancy(&desc, plan);
+        assert!(cohort_occupancy > 0, "continuation cohort is empty");
+        let take = cohort_occupancy.min(width.max(1));
+
+        let (mut bucket, remove_level) = {
+            let level = self
+                .worklist
+                .get_mut(&token.rank)
+                .expect("continuation rank remains live");
+            let bucket = level
+                .remove(&token.state)
+                .expect("continuation state remains live");
+            (bucket, level.is_empty())
+        };
+        if remove_level {
+            self.worklist.remove(&token.rank);
+        }
+
+        let before = bucket.occupancy(candidate_pages);
+        assert!(
+            before >= cohort_occupancy,
+            "canonical bucket lost part of its newly filed continuation cohort"
+        );
+        let chunk = bucket.take_tail(desc.bound.count(), take, candidate_pages);
+        let remainder = bucket.occupancy(candidate_pages);
+        if remainder != 0 {
+            self.stats.partial_pops += 1;
+            assert!(
+                self.worklist
+                    .entry(token.rank)
+                    .or_default()
+                    .insert(token.state, bucket)
+                    .is_none(),
+                "a continuation remainder collided with another live bucket"
+            );
+        }
+        debug_assert_eq!(chunk.occupancy(candidate_pages), take);
+
+        self.stats.state_pops += 1;
+        self.stats.continuation_pops += 1;
+        self.last_selection = SelectionKind::Continuation;
+        if cohort_occupancy < width.max(1) {
+            self.stats.underfilled_continuation_pops += 1;
+        }
+        (desc, chunk)
     }
 
     fn pop_once<'a>(
@@ -1557,9 +1707,16 @@ impl ResidualStateMachine {
         base_estimates: &[usize; 128],
         width: usize,
     ) -> StepOutcome {
-        let (desc, bucket) = self
-            .take_next_with_plan(plan, width)
-            .expect("pop_once requires a non-empty residual worklist");
+        let (desc, bucket) = if let Some(token) = self.continuation.take() {
+            self.take_continuation(plan, token, width)
+        } else {
+            self.take_next_with_plan(plan, width)
+                .expect("pop_once requires a non-empty residual worklist")
+        };
+        self.last_was_action = matches!(
+            desc.phase,
+            ResidualPhase::Propose { .. } | ResidualPhase::Confirm { .. }
+        );
         let outcome = execute_state(
             root,
             plan,
@@ -1585,6 +1742,27 @@ impl ResidualStateMachine {
             self.stats.width_increases += 1;
         }
         self.width = next;
+    }
+
+    fn continuation_after_advanced(
+        &self,
+        plan: &ResidualPlan,
+        width: usize,
+        continuation: ContinuationToken,
+    ) -> Option<ContinuationToken> {
+        #[cfg(test)]
+        if !self.continuation_sprint_enabled {
+            return None;
+        }
+        let desc = self.interner.get(continuation.state);
+        let successor_is_underfilled = continuation.occupancy(desc, plan) < width.max(1);
+        match self.last_selection {
+            SelectionKind::Continuation => Some(continuation),
+            SelectionKind::Full if self.last_was_action && successor_is_underfilled => {
+                Some(continuation)
+            }
+            SelectionKind::Full | SelectionKind::Readiness => None,
+        }
     }
 
     fn stage_emit(&mut self, rows: RowBatch) {
@@ -1626,9 +1804,15 @@ impl ResidualStateMachine {
 
             let width = self.width;
             match self.pop_once(root, plan, influences, base_estimates, width) {
-                StepOutcome::Advanced => {}
-                StepOutcome::Dead => self.increase_width(),
+                StepOutcome::Advanced(continuation) => {
+                    self.continuation = self.continuation_after_advanced(plan, width, continuation);
+                }
+                StepOutcome::Dead => {
+                    self.continuation = None;
+                    self.increase_width();
+                }
                 StepOutcome::Emit(rows) => {
+                    self.continuation = None;
                     self.stage_emit(rows);
                     self.increase_width();
                 }
@@ -1644,10 +1828,15 @@ impl ResidualStateMachine {
 /// values are evaluated.
 /// With a growth factor above one, semantic branch death or raw terminal output
 /// immediately prepares a geometrically wider width for later frontier work;
-/// filing any nonempty successor leaves the width unchanged. The deepest live
-/// bucket able to fill it wins; if none can, the minimum-rank bucket drains
-/// through the strict readiness gate. The cap only bounds geometric width
-/// growth and does not select a scheduling mode.
+/// filing any nonempty successor leaves the width unchanged. When a full
+/// Propose or Confirm action files fewer actionable atoms than that width, the
+/// exact newly appended physical cohort becomes hot and outranks cold sibling
+/// harvesting until it emits or dies. Planning splits and readiness pops do not
+/// activate a sprint, preserving their batching/reconvergence behavior. The
+/// token never changes canonical identity or consumes an older cohort merged
+/// under the same state. With no hot continuation, the deepest live bucket able
+/// to fill the width wins; if none can, the minimum-rank bucket drains through
+/// the strict readiness gate. The cap only bounds geometric width growth.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
 /// it produces the same result multiset as [`Query::solve_residual_state`].
@@ -1783,7 +1972,7 @@ where
                 &mut interner,
                 &mut stats,
             ) {
-                StepOutcome::Advanced | StepOutcome::Dead => {}
+                StepOutcome::Advanced(_) | StepOutcome::Dead => {}
                 StepOutcome::Emit(rows) => {
                     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
                     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -1823,12 +2012,15 @@ where
     /// Lazily executes any root constraint through canonical residual states.
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
-    /// nonempty successor preserves that width; an action with no successor or
-    /// raw terminal output grows it geometrically for later work. This keeps a
-    /// successful first path at width one while allowing negative prefixes to
-    /// ramp within one pull. Whenever no live state can fill the desired width,
-    /// the minimum-rank state drains readiness-safely. Result order may differ
-    /// from the ordinary iterator; a full drain preserves its result multiset.
+    /// nonempty successor preserves that width. When a full proposal or
+    /// confirmation action partially survives, only its exact newly appended
+    /// physical cohort becomes the next continuation; it remains ahead of cold
+    /// sibling harvesting until it emits or dies. Planning splits and
+    /// readiness-selected work continue to harvest normally. Death or raw
+    /// terminal output grows the width geometrically for later work. Whenever
+    /// no continuation is hot and no live state can fill the desired width, the
+    /// minimum-rank state drains readiness-safely. Result order may differ from
+    /// the ordinary iterator; a full drain preserves its result multiset.
     ///
     /// # Panics
     ///
@@ -2471,7 +2663,7 @@ mod tests {
         let mut interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
 
-        assert!(ready_plan_transition(
+        let _continuation = ready_plan_transition(
             &root,
             &plan,
             &desc,
@@ -2482,7 +2674,7 @@ mod tests {
             &mut worklist,
             &mut interner,
             &mut stats,
-        ));
+        );
 
         let mut actions = Vec::new();
         for level in worklist.values() {
@@ -3038,6 +3230,40 @@ mod tests {
         ])
     }
 
+    fn paged_filter_first_trace(
+        accepted: RawInline,
+        sprint: bool,
+    ) -> (
+        Option<RawInline>,
+        Vec<usize>,
+        Vec<usize>,
+        ResidualStateStats,
+        usize,
+    ) {
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        let root = paged_filter_fixture(
+            (0..64).map(raw).collect(),
+            accepted,
+            Arc::clone(&first_calls),
+            Arc::clone(&second_calls),
+        );
+        let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy()
+            .cap(64);
+        lazy.state.continuation_sprint_enabled = sprint;
+        let result = lazy.next();
+        let first = first_calls.lock().unwrap().clone();
+        let second = second_calls.lock().unwrap().clone();
+        (
+            result,
+            first,
+            second,
+            lazy.stats().clone(),
+            lazy.current_width(),
+        )
+    }
+
     #[test]
     fn width_one_confirms_one_candidate_then_descends() {
         let first_calls = Arc::new(Mutex::new(Vec::new()));
@@ -3062,6 +3288,53 @@ mod tests {
         assert_eq!(lazy.stats().candidates_confirmed, 2);
         assert_eq!(lazy.stats().max_confirm_candidates, 1);
         assert_eq!(lazy.stats().partial_pops, 1);
+    }
+
+    #[test]
+    fn surviving_second_page_sprints_to_emit_before_cold_candidates() {
+        let (result, first_calls, second_calls, stats, width) =
+            paged_filter_first_trace(raw(62), true);
+        assert_eq!(result, Some(raw(62)));
+        // The first width-one page dies; the second width-two page survives.
+        // Cold candidate harvesting must not run another page before that
+        // underfilled survivor commits and emits.
+        assert_eq!(first_calls, [1, 2]);
+        assert_eq!(second_calls, [1, 2]);
+        assert_eq!(stats.candidates_confirmed, 6);
+        assert_eq!(stats.max_confirm_candidates, 2);
+        assert_eq!(stats.underfilled_continuation_pops, 2);
+        assert_eq!(stats.width_increases, 2);
+        assert_eq!(width, 4);
+
+        let (old_result, old_first, old_second, old_stats, _) =
+            paged_filter_first_trace(raw(62), false);
+        assert_eq!(old_result, result);
+        let old_pages = [1, 2, 2, 4, 8, 16, 31];
+        assert_eq!(old_first, old_pages);
+        assert_eq!(old_second, old_pages);
+        assert_eq!(old_stats.continuation_pops, 0);
+    }
+
+    #[test]
+    fn surviving_midpoint_page_sprints_without_scanning_its_cold_prefix() {
+        let (result, first_calls, second_calls, stats, width) =
+            paged_filter_first_trace(raw(32), true);
+        assert_eq!(result, Some(raw(32)));
+        let expected_pages = [1, 2, 4, 8, 16, 32];
+        assert_eq!(first_calls, expected_pages);
+        assert_eq!(second_calls, expected_pages);
+        assert_eq!(stats.candidates_confirmed, 126);
+        assert_eq!(stats.max_confirm_candidates, 32);
+        assert_eq!(stats.underfilled_continuation_pops, 2);
+        assert_eq!(stats.width_increases, 6);
+        assert_eq!(width, 64);
+
+        let (old_result, old_first, old_second, old_stats, _) =
+            paged_filter_first_trace(raw(32), false);
+        assert_eq!(old_result, result);
+        assert_eq!(old_first, [1, 2, 4, 8, 16, 32, 1]);
+        assert_eq!(old_second, [1, 2, 4, 8, 16, 32, 1]);
+        assert_eq!(old_stats.continuation_pops, 0);
     }
 
     #[test]
@@ -3125,7 +3398,7 @@ mod tests {
     }
 
     #[test]
-    fn page_reconvergence_preserves_multiple_zero_width_parent_rows() {
+    fn zero_width_parent_multiplicity_survives_forced_reconvergence_and_default_sprint() {
         let make = |calls: Arc<Mutex<Vec<usize>>>| {
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
@@ -3141,22 +3414,40 @@ mod tests {
             ])
         };
 
-        // Width one rejects candidate 7. Width two then leaves 6 from page
-        // [5, 6] and 4 from page [3, 4]. Those pages reconverge in the same
-        // checked Candidate state as two parent occurrences with no committed
+        // Mechanism coverage: width one rejects candidate 7. Width two then
+        // leaves 6 from page [5, 6] and 4 from page [3, 4]. Those pages
+        // reconverge in the same checked Candidate state as two parent
+        // occurrences with no committed
         // columns: rows=[], row_count=2. Draining through a projection that
         // rejects every terminal row forces that merged bucket to execute.
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let profiled = Query::new(make(Arc::clone(&calls)), |_| None::<()>)
-            .solve_residual_state_lazy()
-            .cap(8)
-            .start_width(1)
-            .growth(2)
-            .collect_profiled();
+        let projected = Arc::new(Mutex::new(0usize));
+        let projected_rows = Arc::clone(&projected);
+        let mut profiled = Query::new(make(Arc::clone(&calls)), move |_| {
+            *projected_rows.lock().unwrap() += 1;
+            None::<()>
+        })
+        .solve_residual_state_lazy()
+        .cap(8)
+        .start_width(1)
+        .growth(2);
+        // This is specifically a reconvergence regression: the default
+        // continuation sprint now follows each surviving page before its cold
+        // sibling can merge. Pin the old physical schedule so the fixture
+        // continues to exercise several zero-width parent occurrences under
+        // one canonical state. The default sprint remains enabled in the
+        // exact-bag comparison below.
+        profiled.state.continuation_sprint_enabled = false;
+        let profiled = profiled.collect_profiled();
         assert!(profiled.results.is_empty());
-        assert!(profiled.stats.bucket_merges > 0);
-        assert_eq!(&calls.lock().unwrap()[..3], [1, 2, 2]);
+        assert_eq!(profiled.stats.bucket_merges, 1);
+        assert_eq!(profiled.stats.rows_merged, 1);
+        assert_eq!(*projected.lock().unwrap(), 4);
+        assert_eq!(&*calls.lock().unwrap(), &[1, 2, 2, 3]);
 
+        // Production-schedule coverage: with sprinting enabled, the same
+        // pages need not reconverge, but every affine occurrence must remain
+        // in the exact output bag.
         let project = |binding: &Binding| binding.get(0).copied();
         let mut residual: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
             .solve_residual_state_lazy()
@@ -3269,6 +3560,155 @@ mod tests {
         assert_eq!(chunk.row_count(), 1);
         assert_eq!(machine.stats.full_pops, 1);
         assert_eq!(machine.stats.readiness_pops, 0);
+    }
+
+    #[test]
+    fn continuation_token_cuts_only_the_new_tail_of_a_merged_state() {
+        const PARENT: VariableId = 0;
+        const VARIABLE: VariableId = 1;
+        let root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: VARIABLE,
+                page_local: true,
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let desc = StateDesc {
+            // A nonzero row stride makes the old/new cohort boundary directly
+            // observable instead of relying on the virtual seed row.
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Candidate {
+                variable: VARIABLE,
+                relevant,
+                checked,
+            },
+        };
+        assert!(desc.uses_candidate_pages(&plan));
+
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let old = StateBucket::Candidates(CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(10)],
+                row_count: 1,
+            },
+            candidates: vec![(0, raw(1)), (0, raw(2)), (0, raw(3))],
+        });
+        let _old_token = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            old,
+            &mut machine.stats,
+        )
+        .unwrap();
+        let hot = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(99)],
+                    row_count: 1,
+                },
+                candidates: vec![(0, raw(42))],
+            }),
+            &mut machine.stats,
+        )
+        .unwrap();
+
+        // A deeper unrelated state is also live. A global "strict deepest"
+        // flag would be free to steal it; the physical token is exact.
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(3),
+            ready_bucket(3, 1, 77),
+            &mut machine.stats,
+        );
+
+        let (selected, chunk) = machine.take_continuation(&plan, hot, 8);
+        assert_eq!(selected, desc);
+        let StateBucket::Candidates(chunk) = chunk else {
+            panic!("continuation returned a row payload")
+        };
+        assert_eq!(chunk.parents.rows, [raw(99)]);
+        assert_eq!(chunk.candidates, [(0, raw(42))]);
+        assert_eq!(machine.stats.continuation_pops, 1);
+        assert_eq!(machine.stats.underfilled_continuation_pops, 1);
+
+        let rank = selected.rank(plan.len());
+        let level = machine
+            .worklist
+            .get(&rank)
+            .expect("old cohort remains live");
+        let old = level
+            .values()
+            .next()
+            .expect("merged state retained its old payload");
+        let StateBucket::Candidates(old) = old else {
+            panic!("old cohort changed payload shape")
+        };
+        assert_eq!(old.parents.rows, [raw(10)]);
+        assert_eq!(old.candidates, [(0, raw(1)), (0, raw(2)), (0, raw(3))]);
+        assert!(machine
+            .worklist
+            .values()
+            .flat_map(|level| level.keys())
+            .any(|&id| machine.interner.get(id) == &ready_desc(3)));
+    }
+
+    #[test]
+    fn full_action_successor_that_fills_width_returns_to_global_batching() {
+        let root = CapabilityLeaf {
+            variable: 127,
+            page_local: true,
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let successor = file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(1),
+            ready_bucket(1, 2, 11),
+            &mut machine.stats,
+        )
+        .unwrap();
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            ready_desc(2),
+            ready_bucket(2, 2, 22),
+            &mut machine.stats,
+        );
+
+        machine.last_selection = SelectionKind::Full;
+        machine.last_was_action = true;
+        assert_eq!(
+            machine.continuation_after_advanced(&plan, 2, successor),
+            None,
+            "a width-filling successor must remain globally schedulable"
+        );
+
+        let (selected, chunk) = machine
+            .take_next_with_plan(&plan, 2)
+            .expect("global work remains live");
+        assert_eq!(selected, ready_desc(2));
+        assert_eq!(chunk.row_count(), 2);
+        assert_eq!(machine.stats.continuation_pops, 0);
     }
 
     #[test]
@@ -3476,7 +3916,7 @@ mod tests {
 
         assert!(matches!(
             machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
         assert_eq!(machine.stats.ready_preferred_variable_groups, 1);
@@ -3489,7 +3929,7 @@ mod tests {
 
         assert!(matches!(
             machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         assert_eq!(machine.stats.propose_action_pops, 1);
         assert_eq!(machine.stats.propose_calls, 1);
@@ -3532,7 +3972,8 @@ mod tests {
                 candidates: vec![(0, raw(7))],
             }),
             &mut stats,
-        ));
+        )
+        .is_some());
         let propose_desc = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Propose {
@@ -3555,7 +3996,7 @@ mod tests {
             &mut stats,
         );
 
-        assert!(matches!(outcome, StepOutcome::Advanced));
+        assert!(matches!(outcome, StepOutcome::Advanced(_)));
         assert_eq!(stats.bucket_merges, 1);
         assert_eq!(stats.rows_merged, 1);
         assert_eq!(stats.dead_action_pops, 0);
@@ -3604,7 +4045,7 @@ mod tests {
             &mut stats,
         );
 
-        assert!(matches!(outcome, StepOutcome::Advanced));
+        assert!(matches!(outcome, StepOutcome::Advanced(_)));
         assert_eq!(stats.dead_action_pops, 0);
         assert_eq!((stats.propose_rows, stats.max_propose_rows), (2, 2));
         let (_, level) = worklist.first_key_value().expect("one parent survived");
@@ -3692,7 +4133,7 @@ mod tests {
                 &mut interner,
                 &mut stats,
             ),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         assert_eq!(stats.candidate_plan_pops, 1);
         assert_eq!(stats.confirm_action_pops, 0);
@@ -3719,7 +4160,7 @@ mod tests {
                 &mut interner,
                 &mut stats,
             ),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         assert_eq!(stats.confirm_action_pops, 1);
         assert_eq!(stats.confirm_calls, 1);
@@ -3771,7 +4212,7 @@ mod tests {
                 &mut interner,
                 &mut stats,
             ),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         assert_eq!(stats.candidate_plan_pops, 1);
         assert_eq!(stats.propose_calls, 0);
@@ -3851,7 +4292,7 @@ mod tests {
                 &mut interner,
                 &mut stats,
             ),
-            StepOutcome::Advanced
+            StepOutcome::Advanced(_)
         ));
         let (&rank, _) = worklist
             .first_key_value()
@@ -3960,7 +4401,7 @@ mod tests {
                     &mut interner,
                     &mut stats,
                 ),
-                StepOutcome::Advanced
+                StepOutcome::Advanced(_)
             ));
         }
         assert_eq!(stats.candidate_plan_pops, 2);
@@ -3992,7 +4433,7 @@ mod tests {
                     &mut interner,
                     &mut stats,
                 ),
-                StepOutcome::Advanced
+                StepOutcome::Advanced(_)
             ));
         }
         assert_eq!(stats.confirm_action_pops, 2);

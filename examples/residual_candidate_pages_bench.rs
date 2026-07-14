@@ -1,4 +1,5 @@
-//! PROBE: candidate-granular residual confirmation on one high-fanout parent.
+//! PROBE: candidate-granular residual confirmation plus exact physical
+//! continuation sprinting on one high-fanout parent.
 //!
 //! Usage:
 //!     cargo run --release --example residual_candidate_pages_bench -- [fanout=16384] [reps=21]
@@ -280,7 +281,8 @@ fn bench_backend<S: TriblePattern>(
     let (_, stats) = paged_first_profile(store, fixture);
     println!(
         "    paged first profile: propose {} calls, {} candidates (max {}); \
-         confirm {} calls, {} candidates (max page {}); pops {} partial {}, width grows {}",
+         confirm {} calls, {} candidates (max page {}); pops {} continuation {} \
+         (underfilled {}) partial {}, width grows {}",
         stats.propose_calls,
         stats.candidates_proposed,
         stats.max_propose_candidates,
@@ -288,6 +290,8 @@ fn bench_backend<S: TriblePattern>(
         stats.candidates_confirmed,
         stats.max_confirm_candidates,
         stats.state_pops,
+        stats.continuation_pops,
+        stats.underfilled_continuation_pops,
         stats.partial_pops,
         stats.width_increases,
     );
@@ -304,8 +308,10 @@ fn main() {
     assert!(reps > 0);
 
     for (label, common) in [
-        ("common-low", Some(0)),
-        ("common-high", Some(fanout - 1)),
+        ("first-page", Some(fanout - 1)),
+        ("second-page", Some(fanout - 2)),
+        ("midpoint", Some(fanout / 2)),
+        ("late", Some(0)),
         ("absent", None),
     ] {
         let (set, fixture) = build(fanout, common);
