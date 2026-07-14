@@ -116,6 +116,11 @@ pub struct ResidualStateStats {
     pub rows_merged: usize,
     /// Number of canonical bucket chunks processed.
     pub state_pops: usize,
+    /// State pops executed directly from a sole successor filing after the
+    /// ordinary occupancy rule proved that it was the immediate next choice.
+    /// These pops remain included in [`state_pops`](Self::state_pops) and in
+    /// the full/readiness and phase partitions below.
+    pub hot_continuation_pops: usize,
     /// Ready-state chunks that planned row-local proposal actions without
     /// invoking the constraint protocol.
     pub ready_plan_pops: usize,
@@ -650,6 +655,139 @@ impl StateBucket {
 
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 
+/// One nonempty successor whose exact canonical identity has already been
+/// interned, but whose payload has not yet been inserted into the worklist.
+///
+/// Deferring the first filing lets the lazy scheduler execute it directly when
+/// the ordinary occupancy rule proves that it is the immediate next pop. The
+/// descriptor is still interned, and reentry statistics are recorded at the
+/// normal filing point, so elision changes neither canonical identity nor the
+/// observable scheduler profile.
+#[derive(Debug)]
+struct PreparedFiling {
+    rank: usize,
+    id: StateId,
+    desc: StateDesc,
+    bucket: StateBucket,
+}
+
+impl PreparedFiling {
+    fn insert(self, worklist: &mut Worklist) {
+        assert!(
+            worklist
+                .entry(self.rank)
+                .or_default()
+                .insert(self.id, self.bucket)
+                .is_none(),
+            "a prepared residual successor collided with a live bucket"
+        );
+    }
+}
+
+/// Canonical successor filing with an optional one-successor deferral.
+///
+/// A second nonempty filing, a filing into an already-live descriptor, or an
+/// immediate-mode caller spills to the ordinary worklist path. Consequently a
+/// returned [`PreparedFiling`] is the sole nonempty successor of one executed
+/// state and has no live merge target.
+struct SuccessorFiler<'m> {
+    worklist: &'m mut Worklist,
+    interner: &'m mut StateInterner,
+    stats: &'m mut ResidualStateStats,
+    leaf_count: usize,
+    defer_single: bool,
+    pending: Option<PreparedFiling>,
+}
+
+impl<'m> SuccessorFiler<'m> {
+    fn immediate(
+        worklist: &'m mut Worklist,
+        interner: &'m mut StateInterner,
+        stats: &'m mut ResidualStateStats,
+        leaf_count: usize,
+    ) -> Self {
+        Self {
+            worklist,
+            interner,
+            stats,
+            leaf_count,
+            defer_single: false,
+            pending: None,
+        }
+    }
+
+    fn deferred(
+        worklist: &'m mut Worklist,
+        interner: &'m mut StateInterner,
+        stats: &'m mut ResidualStateStats,
+        leaf_count: usize,
+    ) -> Self {
+        Self {
+            worklist,
+            interner,
+            stats,
+            leaf_count,
+            defer_single: true,
+            pending: None,
+        }
+    }
+
+    fn spill_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.insert(self.worklist);
+        }
+    }
+
+    fn file(&mut self, desc: StateDesc, bucket: StateBucket) -> bool {
+        if bucket.row_count() == 0 {
+            return false;
+        }
+
+        // More than one nonempty successor is a real partition. Preserve its
+        // normal canonical assembly and let occupancy choose after every
+        // partition has been filed.
+        if self.pending.is_some() {
+            self.spill_pending();
+            self.defer_single = false;
+        }
+
+        let rank = desc.rank(self.leaf_count);
+        let (id, known) = self.interner.intern_with_status(desc.clone(), self.stats);
+        if let Some(existing) = self
+            .worklist
+            .get_mut(&rank)
+            .and_then(|level| level.get_mut(&id))
+        {
+            self.defer_single = false;
+            self.stats.bucket_merges += 1;
+            self.stats.rows_merged += bucket.row_count();
+            existing.append(bucket);
+            return true;
+        }
+
+        if known {
+            self.stats.state_reentries += 1;
+            self.stats.rows_reentered += bucket.row_count();
+        }
+        let prepared = PreparedFiling {
+            rank,
+            id,
+            desc,
+            bucket,
+        };
+        if self.defer_single {
+            self.pending = Some(prepared);
+        } else {
+            prepared.insert(self.worklist);
+        }
+        true
+    }
+
+    fn finish(mut self) -> Option<PreparedFiling> {
+        self.pending.take()
+    }
+}
+
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
     assert_eq!(
         rows.len(),
@@ -673,24 +811,7 @@ fn file(
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
 ) -> bool {
-    if bucket.row_count() == 0 {
-        return false;
-    }
-    let rank = desc.rank(leaf_count);
-    let (id, known) = interner.intern_with_status(desc, stats);
-    let level = worklist.entry(rank).or_default();
-    if let Some(existing) = level.get_mut(&id) {
-        stats.bucket_merges += 1;
-        stats.rows_merged += bucket.row_count();
-        existing.append(bucket);
-    } else {
-        if known {
-            stats.state_reentries += 1;
-            stats.rows_reentered += bucket.row_count();
-        }
-        level.insert(id, bucket);
-    }
-    true
+    SuccessorFiler::immediate(worklist, interner, stats, leaf_count).file(desc, bucket)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -749,9 +870,7 @@ fn ready_plan_transition<'a>(
     full: VariableSet,
     influences: &[VariableSet; 128],
     base_estimates: &[usize; 128],
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> bool {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -833,10 +952,7 @@ fn ready_plan_transition<'a>(
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
-        file(
-            worklist,
-            interner,
-            leaf_count,
+        filer.file(
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Propose {
@@ -846,7 +962,6 @@ fn ready_plan_transition<'a>(
                 },
             },
             StateBucket::Rows(selected),
-            stats,
         )
     };
 
@@ -874,9 +989,7 @@ fn propose_action_transition<'a>(
     relevant: &ChildSet,
     proposer: usize,
     rows: RowBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> bool {
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -890,9 +1003,9 @@ fn propose_action_transition<'a>(
         &view,
         &mut CandidateSink::Tagged(&mut candidates),
     );
-    stats.propose_calls += 1;
-    stats.propose_rows += rows.row_count;
-    stats.max_propose_rows = stats.max_propose_rows.max(rows.row_count);
+    filer.stats.propose_calls += 1;
+    filer.stats.propose_rows += rows.row_count;
+    filer.stats.max_propose_rows = filer.stats.max_propose_rows.max(rows.row_count);
 
     let mut checked = ChildSet::empty(leaf_count);
     checked.insert(proposer);
@@ -901,10 +1014,7 @@ fn propose_action_transition<'a>(
         candidates,
     };
     if let Some(candidate) = candidate.compact(vars.len()) {
-        file(
-            worklist,
-            interner,
-            leaf_count,
+        filer.file(
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -914,7 +1024,6 @@ fn propose_action_transition<'a>(
                 },
             },
             StateBucket::Candidates(candidate),
-            stats,
         )
     } else {
         false
@@ -925,10 +1034,7 @@ fn commit_candidates(
     desc: &StateDesc,
     variable: VariableId,
     batch: CandidateBatch,
-    leaf_count: usize,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> bool {
     let parent_vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let mut next_bound = desc.bound;
@@ -956,10 +1062,7 @@ fn commit_candidates(
     } else {
         next_rows.len() / next_vars.len()
     };
-    file(
-        worklist,
-        interner,
-        leaf_count,
+    filer.file(
         StateDesc {
             bound: next_bound,
             phase: ResidualPhase::Ready,
@@ -968,7 +1071,6 @@ fn commit_candidates(
             rows: next_rows,
             row_count,
         }),
-        stats,
     )
 }
 
@@ -980,13 +1082,11 @@ fn candidate_plan_transition<'a>(
     relevant: &ChildSet,
     checked: &ChildSet,
     batch: CandidateBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> bool {
     let leaf_count = plan.len();
     if relevant == checked {
-        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
+        return commit_candidates(desc, variable, batch, filer);
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -1029,10 +1129,7 @@ fn candidate_plan_transition<'a>(
     );
 
     let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
-        file(
-            worklist,
-            interner,
-            leaf_count,
+        filer.file(
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Confirm {
@@ -1043,7 +1140,6 @@ fn candidate_plan_transition<'a>(
                 },
             },
             StateBucket::Candidates(selected),
-            stats,
         )
     };
 
@@ -1070,11 +1166,8 @@ fn confirm_action_transition<'a>(
     checked: &ChildSet,
     confirmer: usize,
     mut batch: CandidateBatch,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> bool {
-    let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     confirm_leaf(
@@ -1085,15 +1178,12 @@ fn confirm_action_transition<'a>(
         &view,
         &mut CandidateSink::Tagged(&mut batch.candidates),
     );
-    stats.confirm_calls += 1;
-    stats.confirm_rows += batch.parents.row_count;
-    stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+    filer.stats.confirm_calls += 1;
+    filer.stats.confirm_rows += batch.parents.row_count;
+    filer.stats.max_confirm_rows = filer.stats.max_confirm_rows.max(batch.parents.row_count);
 
     if let Some(batch) = batch.compact(vars.len()) {
-        file(
-            worklist,
-            interner,
-            leaf_count,
+        filer.file(
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -1103,7 +1193,6 @@ fn confirm_action_transition<'a>(
                 },
             },
             StateBucket::Candidates(batch),
-            stats,
         )
     } else {
         false
@@ -1126,7 +1215,7 @@ enum StepOutcome {
 /// affine payload chunk. The explicit outcome lets eager and lazy callers
 /// distinguish semantic progress, branch death, and terminal projection
 /// without inferring any of them from worklist size.
-fn execute_state<'a>(
+fn execute_state_with_filer<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
@@ -1134,17 +1223,15 @@ fn execute_state<'a>(
     full: VariableSet,
     influences: &[VariableSet; 128],
     base_estimates: &[usize; 128],
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
+    filer: &mut SuccessorFiler<'_>,
 ) -> StepOutcome {
     match (&desc.phase, bucket) {
         (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
-            stats.emit_pops += 1;
+            filer.stats.emit_pops += 1;
             StepOutcome::Emit(rows)
         }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
-            stats.ready_plan_pops += 1;
+            filer.stats.ready_plan_pops += 1;
             let advanced = ready_plan_transition(
                 root,
                 plan,
@@ -1153,9 +1240,7 @@ fn execute_state<'a>(
                 full,
                 influences,
                 base_estimates,
-                worklist,
-                interner,
-                stats,
+                filer,
             );
             assert!(advanced, "Ready planning must file a nonempty action");
             StepOutcome::Advanced
@@ -1168,14 +1253,14 @@ fn execute_state<'a>(
             },
             StateBucket::Rows(rows),
         ) => {
-            stats.propose_action_pops += 1;
+            filer.stats.propose_action_pops += 1;
             let advanced = propose_action_transition(
-                root, plan, desc, *variable, relevant, *proposer, rows, worklist, interner, stats,
+                root, plan, desc, *variable, relevant, *proposer, rows, filer,
             );
             if advanced {
                 StepOutcome::Advanced
             } else {
-                stats.dead_action_pops += 1;
+                filer.stats.dead_action_pops += 1;
                 StepOutcome::Dead
             }
         }
@@ -1187,9 +1272,9 @@ fn execute_state<'a>(
             },
             StateBucket::Candidates(batch),
         ) => {
-            stats.candidate_plan_pops += 1;
+            filer.stats.candidate_plan_pops += 1;
             let advanced = candidate_plan_transition(
-                root, plan, desc, *variable, relevant, checked, batch, worklist, interner, stats,
+                root, plan, desc, *variable, relevant, checked, batch, filer,
             );
             assert!(advanced, "Candidate planning must file a nonempty action");
             StepOutcome::Advanced
@@ -1203,20 +1288,47 @@ fn execute_state<'a>(
             },
             StateBucket::Candidates(batch),
         ) => {
-            stats.confirm_action_pops += 1;
+            filer.stats.confirm_action_pops += 1;
             let advanced = confirm_action_transition(
-                root, plan, desc, *variable, relevant, checked, *confirmer, batch, worklist,
-                interner, stats,
+                root, plan, desc, *variable, relevant, checked, *confirmer, batch, filer,
             );
             if advanced {
                 StepOutcome::Advanced
             } else {
-                stats.dead_action_pops += 1;
+                filer.stats.dead_action_pops += 1;
                 StepOutcome::Dead
             }
         }
         _ => panic!("canonical residual state received the wrong payload shape"),
     }
+}
+
+/// Immediate-filing compatibility path used by eager execution and focused
+/// transition tests.
+fn execute_state<'a>(
+    root: &dyn Constraint<'a>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    bucket: StateBucket,
+    full: VariableSet,
+    influences: &[VariableSet; 128],
+    base_estimates: &[usize; 128],
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> StepOutcome {
+    let leaf_count = plan.len();
+    let mut filer = SuccessorFiler::immediate(worklist, interner, stats, leaf_count);
+    execute_state_with_filer(
+        root,
+        plan,
+        desc,
+        bucket,
+        full,
+        influences,
+        base_estimates,
+        &mut filer,
+    )
 }
 
 /// Resumable execution state for [`ResidualStateIter`].
@@ -1351,6 +1463,73 @@ impl ResidualStateMachine {
         Some((desc, chunk))
     }
 
+    /// Takes a deferred sole successor directly when it is provably the exact
+    /// next choice of [`take_next`](Self::take_next).
+    ///
+    /// A full successor is safe only when its rank is strictly above every
+    /// other full bucket. Equal-rank ties deliberately spill rather than
+    /// duplicating the StateId tie-break here. An underfilled successor is safe
+    /// only as the sole live bucket, which is the smallest exact form of the
+    /// readiness rule. Wider payloads leave the same canonical remainder that
+    /// `take_next` would have reinserted.
+    fn take_hot_if_next(
+        &mut self,
+        mut prepared: PreparedFiling,
+        width: usize,
+    ) -> Result<(StateDesc, StateBucket), PreparedFiling> {
+        let width = width.max(1);
+        debug_assert!(
+            self.worklist
+                .get(&prepared.rank)
+                .is_none_or(|level| !level.contains_key(&prepared.id)),
+            "a deferred residual successor had a live merge target"
+        );
+
+        let before = prepared.bucket.row_count();
+        let is_full = before >= width;
+        let selected = if is_full {
+            let deepest_other_full = self.worklist.iter().rev().find_map(|(&rank, level)| {
+                level
+                    .values()
+                    .any(|bucket| bucket.row_count() >= width)
+                    .then_some(rank)
+            });
+            deepest_other_full.is_none_or(|rank| prepared.rank > rank)
+        } else {
+            self.worklist.is_empty()
+        };
+        if !selected {
+            return Err(prepared);
+        }
+
+        let chunk = prepared
+            .bucket
+            .take_tail(prepared.desc.bound.count(), width);
+        let remainder = prepared.bucket.row_count();
+        if remainder != 0 {
+            assert!(is_full, "only a full hot pop may leave a remainder");
+            self.stats.partial_pops += 1;
+            assert!(
+                self.worklist
+                    .entry(prepared.rank)
+                    .or_default()
+                    .insert(prepared.id, prepared.bucket)
+                    .is_none(),
+                "a hot residual remainder collided with another live bucket"
+            );
+        }
+        debug_assert_eq!(chunk.row_count(), before.min(width));
+
+        self.stats.state_pops += 1;
+        self.stats.hot_continuation_pops += 1;
+        if is_full {
+            self.stats.full_pops += 1;
+        } else {
+            self.stats.readiness_pops += 1;
+        }
+        Ok((prepared.desc, chunk))
+    }
+
     fn pop_once<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -1359,26 +1538,59 @@ impl ResidualStateMachine {
         base_estimates: &[usize; 128],
         width: usize,
     ) -> StepOutcome {
-        let (desc, bucket) = self
+        let (mut desc, mut bucket) = self
             .take_next(width)
             .expect("pop_once requires a non-empty residual worklist");
-        let outcome = execute_state(
-            root,
-            plan,
-            &desc,
-            bucket,
-            self.full,
-            influences,
-            base_estimates,
-            &mut self.worklist,
-            &mut self.interner,
-            &mut self.stats,
-        );
-        if matches!(&outcome, StepOutcome::Emit(_)) {
-            self.emit_vars.clear();
-            self.emit_vars.extend(desc.bound);
+        loop {
+            let (outcome, pending) = {
+                let mut filer = SuccessorFiler::deferred(
+                    &mut self.worklist,
+                    &mut self.interner,
+                    &mut self.stats,
+                    self.leaf_count,
+                );
+                let outcome = execute_state_with_filer(
+                    root,
+                    plan,
+                    &desc,
+                    bucket,
+                    self.full,
+                    influences,
+                    base_estimates,
+                    &mut filer,
+                );
+                let pending = filer.finish();
+                (outcome, pending)
+            };
+
+            match outcome {
+                StepOutcome::Advanced => {
+                    let Some(pending) = pending else {
+                        return StepOutcome::Advanced;
+                    };
+                    match self.take_hot_if_next(pending, width) {
+                        Ok((next_desc, next_bucket)) => {
+                            desc = next_desc;
+                            bucket = next_bucket;
+                        }
+                        Err(pending) => {
+                            pending.insert(&mut self.worklist);
+                            return StepOutcome::Advanced;
+                        }
+                    }
+                }
+                StepOutcome::Dead => {
+                    debug_assert!(pending.is_none(), "a dead action filed a successor");
+                    return StepOutcome::Dead;
+                }
+                StepOutcome::Emit(rows) => {
+                    debug_assert!(pending.is_none(), "a terminal state filed a successor");
+                    self.emit_vars.clear();
+                    self.emit_vars.extend(desc.bound);
+                    return StepOutcome::Emit(rows);
+                }
+            }
         }
-        outcome
     }
 
     fn increase_width(&mut self) {
@@ -1962,6 +2174,126 @@ mod tests {
         machine
     }
 
+    fn prepare_filing(
+        machine: &mut ResidualStateMachine,
+        desc: StateDesc,
+        bucket: StateBucket,
+    ) -> PreparedFiling {
+        let mut filer = SuccessorFiler::deferred(
+            &mut machine.worklist,
+            &mut machine.interner,
+            &mut machine.stats,
+            machine.leaf_count,
+        );
+        assert!(filer.file(desc, bucket));
+        filer.finish().expect("one new successor stays deferred")
+    }
+
+    #[test]
+    fn hot_continuation_requires_the_exact_occupancy_choice() {
+        // A shallower full successor cannot jump over a deeper full bucket.
+        let mut deeper = scheduler_fixture(&[(2, 1, 2)]);
+        let prepared = prepare_filing(&mut deeper, ready_desc(1), ready_bucket(1, 1, 1));
+        assert!(deeper.take_hot_if_next(prepared, 1).is_err());
+        assert_eq!(deeper.stats.hot_continuation_pops, 0);
+
+        // Equal-rank states deliberately spill even when the deferred StateId
+        // would win today's tie-break. This keeps the proof independent of ID
+        // ordering.
+        let mut equal = scheduler_fixture(&[(1, 1, 1)]);
+        let pending_desc = StateDesc {
+            bound: VariableSet::new_singleton(1),
+            phase: ResidualPhase::Ready,
+        };
+        let prepared = prepare_filing(&mut equal, pending_desc.clone(), ready_bucket(1, 1, 2));
+        let prepared = equal
+            .take_hot_if_next(prepared, 1)
+            .expect_err("equal-rank competition must spill");
+        prepared.insert(&mut equal.worklist);
+        let (selected, _) = equal.take_next(1).expect("both equal-rank states are live");
+        assert_eq!(selected, pending_desc);
+
+        // Strictly deeper than every competing full bucket is the exact normal
+        // selection and can execute directly.
+        let mut shallower = scheduler_fixture(&[(1, 1, 1)]);
+        let prepared = prepare_filing(&mut shallower, ready_desc(2), ready_bucket(2, 1, 2));
+        let (selected, chunk) = shallower
+            .take_hot_if_next(prepared, 1)
+            .expect("strictly deepest full successor is exact");
+        assert_eq!(selected, ready_desc(2));
+        assert_eq!(chunk.row_count(), 1);
+        assert_eq!(shallower.stats.hot_continuation_pops, 1);
+    }
+
+    #[test]
+    fn hot_continuation_preserves_a_wider_bucket_remainder() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let desc = ready_desc(1);
+        let prepared = prepare_filing(&mut machine, desc.clone(), ready_bucket(1, 5, 7));
+
+        let (selected, chunk) = machine
+            .take_hot_if_next(prepared, 2)
+            .expect("sole full successor is exact");
+        assert_eq!(selected, desc);
+        assert_eq!(chunk.row_count(), 2);
+        assert_eq!(
+            (
+                machine.stats.hot_continuation_pops,
+                machine.stats.full_pops,
+                machine.stats.partial_pops,
+            ),
+            (1, 1, 1)
+        );
+
+        let (remainder_desc, remainder) = machine.take_next(2).expect("remainder stays live");
+        assert_eq!(remainder_desc, desc);
+        assert_eq!(remainder.row_count(), 2);
+        let (_, level) = machine
+            .worklist
+            .first_key_value()
+            .expect("one final parent remains");
+        assert_eq!(level.first_key_value().unwrap().1.row_count(), 1);
+    }
+
+    #[test]
+    fn deferred_successors_spill_on_partition_or_existing_merge_target() {
+        let mut partition = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut filer = SuccessorFiler::deferred(
+            &mut partition.worklist,
+            &mut partition.interner,
+            &mut partition.stats,
+            partition.leaf_count,
+        );
+        assert!(filer.file(ready_desc(1), ready_bucket(1, 1, 1)));
+        assert!(filer.file(ready_desc(2), ready_bucket(2, 1, 2)));
+        assert!(filer.finish().is_none(), "a partition cannot stay hot");
+        assert_eq!(
+            partition
+                .worklist
+                .values()
+                .map(BTreeMap::len)
+                .sum::<usize>(),
+            2
+        );
+
+        let mut merged = scheduler_fixture(&[(1, 1, 1)]);
+        let merges_before = merged.stats.bucket_merges;
+        let mut filer = SuccessorFiler::deferred(
+            &mut merged.worklist,
+            &mut merged.interner,
+            &mut merged.stats,
+            merged.leaf_count,
+        );
+        assert!(filer.file(ready_desc(1), ready_bucket(1, 2, 2)));
+        assert!(
+            filer.finish().is_none(),
+            "an existing canonical merge target cannot stay hot"
+        );
+        assert_eq!(merged.stats.bucket_merges, merges_before + 1);
+        let (_, level) = merged.worklist.first_key_value().unwrap();
+        assert_eq!(level.first_key_value().unwrap().1.row_count(), 3);
+    }
+
     #[test]
     fn box_and_arc_forward_object_safe_residual_shapes() {
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
@@ -2355,8 +2687,20 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
 
+        let (ready_desc, ready_bucket) = machine.take_next(1).expect("seed Ready state");
         assert!(matches!(
-            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            execute_state(
+                &root,
+                &plan,
+                &ready_desc,
+                ready_bucket,
+                machine.full,
+                &influences,
+                &base_estimates,
+                &mut machine.worklist,
+                &mut machine.interner,
+                &mut machine.stats,
+            ),
             StepOutcome::Advanced
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
@@ -2364,8 +2708,20 @@ mod tests {
         assert_eq!(machine.stats.propose_calls, 0);
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
 
+        let (action_desc, action_bucket) = machine.take_next(1).expect("Propose action state");
         assert!(matches!(
-            machine.pop_once(&root, &plan, &influences, &base_estimates, 1),
+            execute_state(
+                &root,
+                &plan,
+                &action_desc,
+                action_bucket,
+                machine.full,
+                &influences,
+                &base_estimates,
+                &mut machine.worklist,
+                &mut machine.interner,
+                &mut machine.stats,
+            ),
             StepOutcome::Advanced
         ));
         assert_eq!(machine.stats.propose_action_pops, 1);

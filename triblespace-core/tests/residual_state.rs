@@ -1524,6 +1524,10 @@ fn occupancy_plans_striped_ready_chunks_before_invoking_uniform_actions() {
     assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
     assert_eq!(stats.max_propose_rows, W);
     assert!(stats.max_confirm_rows <= W);
+    assert!(
+        stats.bucket_merges > 0,
+        "striped partitions must still assemble in canonical live buckets"
+    );
     assert_eq!(
         stats.state_pops,
         stats.ready_plan_pops
@@ -1586,6 +1590,55 @@ fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
 }
 
 #[test]
+fn one_leaf_hot_continuations_preserve_default_and_cap_one_bags() {
+    let one = encoded(b'h', 0);
+    let (single, _) = finite_domain(P, vec![one], 1);
+    let single = Query::new(single, |binding: &Binding| binding.get(P).copied())
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1)
+        .growth(2)
+        .collect_profiled();
+    assert_eq!(single.results, [one]);
+    assert_eq!(single.stats.state_pops, 4);
+    assert_eq!(single.stats.hot_continuation_pops, 3);
+    assert_eq!(
+        single.stats.state_pops,
+        single.stats.ready_plan_pops
+            + single.stats.candidate_plan_pops
+            + single.stats.propose_action_pops
+            + single.stats.confirm_action_pops
+            + single.stats.emit_pops
+    );
+
+    let values: Vec<_> = (0..9).map(|index| encoded(b'h', index)).collect();
+    let run = |cap: Option<usize>| {
+        let (domain, _) = finite_domain(P, values.clone(), values.len());
+        let lazy = Query::new(domain, |binding: &Binding| binding.get(P).copied())
+            .solve_residual_state_lazy();
+        match cap {
+            Some(cap) => lazy.cap(cap).start_width(1).growth(2).collect_profiled(),
+            None => lazy.collect_profiled(),
+        }
+    };
+    let mut default = run(None);
+    let mut cap_one = run(Some(1));
+    let (sequential_domain, _) = finite_domain(P, values, 9);
+    let mut sequential: Vec<_> = Query::new(sequential_domain, |binding: &Binding| {
+        binding.get(P).copied()
+    })
+    .sequential()
+    .collect();
+    default.results.sort_unstable();
+    cap_one.results.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(default.results, sequential);
+    assert_eq!(cap_one.results, sequential);
+    assert!(default.stats.hot_continuation_pops > 0);
+    assert!(cap_one.stats.hot_continuation_pops > 0);
+}
+
+#[test]
 fn lazy_projection_panic_consumes_the_row_before_resume() {
     const N: usize = 4;
     let (root, _) = fixture(N);
@@ -1608,6 +1661,7 @@ fn lazy_projection_panic_consumes_the_row_before_resume() {
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lazy.next()));
     assert!(panic.is_err());
+    assert!(lazy.stats().hot_continuation_pops > 0);
     let resumed = lazy.next().expect("a later row remains after the panic");
     let seen = seen.borrow();
     assert_eq!(seen.len(), 2);
