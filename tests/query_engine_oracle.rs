@@ -167,6 +167,18 @@ macro_rules! assert_residual_engines_match {
     ($label:expr, $expected:expr, $query:expr) => {{
         let expected = multiset($expected);
         prop_assert_eq!(
+            multiset(($query).sequential()),
+            expected.clone(),
+            "{}: scalar DFS reference",
+            $label
+        );
+        prop_assert_eq!(
+            multiset(($query).solve_dag_lazy()),
+            expected.clone(),
+            "{}: lazy DAG reference",
+            $label
+        );
+        prop_assert_eq!(
             multiset(($query).solve_residual_state()),
             expected.clone(),
             "{}: eager residual state",
@@ -196,6 +208,18 @@ macro_rules! assert_residual_engines_match {
             "{}: residual forced harvest",
             $label
         );
+        #[cfg(feature = "parallel")]
+        for threads in [1usize, 4] {
+            let residual = parallel_pool(threads)
+                .install(|| multiset(($query).into_par_residual_state_iter().collect::<Vec<_>>()));
+            prop_assert_eq!(
+                residual,
+                expected.clone(),
+                "{}: explicit parallel residual state ({} workers)",
+                $label,
+                threads
+            );
+        }
     }};
 }
 
