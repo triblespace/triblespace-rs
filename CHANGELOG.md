@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds now evaluate fully-bound pattern support entirely on
+  WGPU.** Private canonical E-A-V descriptors flatten every support/row lane
+  through jointly validated code resolution, entity and attribute prefix
+  selects, EVA range ranks, AEV anchoring, and exact value ranks. Every invalid
+  source, delimiter, rank, range, or checked addition is poisoned before it can
+  become a later Jerky input, while one final invocation per row conjunctively
+  updates viability so duplicate and heterogeneous supports cannot race. The
+  opaque archive/round/schema frontier boundary and no-readback estimate path
+  remain unchanged; native gates cover all Constant/Column shapes, exact CPU
+  parity, projection-present but triple-absent cases, block/split boundaries,
+  malformed lanes, global death, and snapshot-local monotonic extension.
 - **Resident affine rounds now produce exact two-peer restricted estimates
   entirely on WGPU.** Private five-word descriptors resolve Constant/Column
   sources for both bound peers, poison both prefix queries and both wavelet

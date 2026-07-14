@@ -8,9 +8,11 @@
 //! [`WgpuResidentRound`] initializes every estimate to its exact zero-peer
 //! count or the reserved dead sentinel, then overwrites one-peer
 //! `PairDistinct` and two-peer `Restricted` arms through resident
-//! prefix-select and rank pipelines. The affine frontier, descriptors,
-//! scratch, estimate matrix, and planner choices remain in one compatibility
-//! domain without a readback. Fully-bound support still fails explicitly.
+//! prefix-select and rank pipelines. Fully-bound source patterns are reduced
+//! through one canonical E-A-V membership pipeline and conjunctively update
+//! row viability with exactly one writer per row. The affine frontier,
+//! descriptors, scratch, estimate matrix, and planner choices remain in one
+//! compatibility domain without a readback.
 
 use std::error::Error;
 use std::fmt;
@@ -34,6 +36,7 @@ type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
 const PAIR_DESCRIPTOR_WORDS: usize = 3;
 const RESTRICTED_DESCRIPTOR_WORDS: usize = 5;
+const SUPPORT_DESCRIPTOR_WORDS: usize = 6;
 const CONSTANT_SOURCE: u32 = 0;
 const COLUMN_SOURCE: u32 = 1;
 
@@ -44,11 +47,6 @@ pub enum ResidentSupportError {
     Round(ResidentRoundError),
     /// The compiled program belongs to another immutable archive snapshot.
     ArchiveOwnership,
-    /// This first producer slice cannot yet evaluate fully-bound support.
-    UnsupportedFullyBoundSupport {
-        /// Stable source-pattern position requiring a support probe.
-        source_pattern_index: u32,
-    },
     /// A resident frontier was minted for another archive/context capability.
     FrontierOwnership,
     /// The frontier schema or resident storage geometry does not match this round.
@@ -71,12 +69,6 @@ impl fmt::Display for ResidentSupportError {
             Self::ArchiveOwnership => {
                 f.write_str("resident round program belongs to another archive snapshot")
             }
-            Self::UnsupportedFullyBoundSupport {
-                source_pattern_index,
-            } => write!(
-                f,
-                "resident source pattern {source_pattern_index} requires an unsupported fully-bound support probe"
-            ),
             Self::FrontierOwnership => {
                 f.write_str("resident frontier belongs to another archive/context")
             }
@@ -99,7 +91,6 @@ impl Error for ResidentSupportError {
         match self {
             Self::Round(error) => Some(error),
             Self::ArchiveOwnership
-            | Self::UnsupportedFullyBoundSupport { .. }
             | Self::FrontierOwnership
             | Self::MalformedFrontier
             | Self::FrontierCodeOutOfBounds { .. }
@@ -183,6 +174,7 @@ pub struct FullyBoundSupport {
 
 impl FullyBoundSupport {
     /// Stable source-pattern position in [`QueryProgram::patterns`].
+    #[cfg(test)]
     pub const fn source_pattern_index(self) -> u32 {
         self.source_pattern_index
     }
@@ -399,6 +391,13 @@ struct WgpuRestrictedGroup {
     descriptors: DeviceU32Buffer<WgpuRuntime>,
 }
 
+/// Persistent canonical E-A-V descriptors for every fully-bound source.
+struct WgpuFullyBoundGroup {
+    support_count: usize,
+    /// Six words per support: kind/payload pairs in canonical E-A-V order.
+    descriptors: DeviceU32Buffer<WgpuRuntime>,
+}
+
 /// WGPU facade binding one plan and planner to one exact resident archive.
 pub struct WgpuResidentRound<'a, U: Universe> {
     archive: &'a WgpuSuccinctArchive<U>,
@@ -408,6 +407,7 @@ pub struct WgpuResidentRound<'a, U: Universe> {
     initial_estimates: DeviceU32Buffer<WgpuRuntime>,
     pair_groups: Box<[WgpuPairGroup]>,
     restricted_groups: Box<[WgpuRestrictedGroup]>,
+    fully_bound_group: Option<WgpuFullyBoundGroup>,
 }
 
 impl<'a, U: Universe> WgpuResidentRound<'a, U> {
@@ -431,6 +431,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let initial_estimates = archive.context().upload_u32(&initial_estimates(&plan))?;
         let pair_groups = build_pair_groups(archive, &plan)?;
         let restricted_groups = build_restricted_groups(archive, &plan)?;
+        let fully_bound_group = build_fully_bound_group(archive, &plan)?;
         Ok(Self {
             archive,
             plan,
@@ -439,6 +440,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             initial_estimates,
             pair_groups,
             restricted_groups,
+            fully_bound_group,
         })
     }
 
@@ -493,17 +495,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         })
     }
 
-    /// Allocates planner-owned inputs and enqueues exact zero/one/two-peer estimates.
+    /// Allocates planner-owned inputs and enqueues exact estimates and support.
     ///
     /// The common launch initializes viability plus every arm-major cell.
-    /// Each nonempty pair or restricted rotation then performs prepare, prefix
-    /// select, normalization, rank, and scatter without a device read.
-    /// Unsupported fully-bound support fails before allocation or launch.
+    /// Each nonempty pair or restricted rotation performs prepare, prefix
+    /// select, normalization, rank, and scatter without a device read. Every
+    /// fully-bound source then follows one canonical E-A-V membership pipeline;
+    /// its final launch has exactly one invocation and writer per row.
     pub fn initialize_inputs(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
     ) -> Result<ResidentRoundInputs<WgpuRuntime>, ResidentSupportError> {
-        self.require_supported_slice()?;
         self.validate_frontier(frontier)?;
         let rows = frontier.rows;
         let mut inputs = self.planner.allocate_inputs(rows)?;
@@ -536,6 +538,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         for group in &self.restricted_groups {
             self.enqueue_restricted_group(group, frontier, &mut inputs)?;
         }
+        if let Some(group) = &self.fully_bound_group {
+            self.enqueue_fully_bound_group(group, frontier, &mut inputs)?;
+        }
         Ok(inputs)
     }
 
@@ -545,18 +550,6 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         inputs: &ResidentRoundInputs<WgpuRuntime>,
     ) -> Result<ResidentRowChoices<WgpuRuntime>, ResidentRoundError> {
         self.planner.enqueue(inputs)
-    }
-
-    fn require_supported_slice(&self) -> Result<(), ResidentSupportError> {
-        if self.plan.is_global_dead() {
-            return Ok(());
-        }
-        if let Some(support) = self.plan.fully_bound_supports().first() {
-            return Err(ResidentSupportError::UnsupportedFullyBoundSupport {
-                source_pattern_index: support.source_pattern_index(),
-            });
-        }
-        Ok(())
     }
 
     fn validate_frontier(
@@ -715,6 +708,124 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
                 ring.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+        Ok(())
+    }
+
+    fn enqueue_fully_bound_group(
+        &self,
+        group: &WgpuFullyBoundGroup,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        inputs: &mut ResidentRoundInputs<WgpuRuntime>,
+    ) -> Result<(), ResidentSupportError> {
+        let (lanes, endpoints) = fully_bound_group_geometry(group.support_count, frontier.rows)?;
+        if lanes == 0 {
+            return Ok(());
+        }
+
+        let context = self.planner.context();
+        let lane_dispatch =
+            context.static_batch_dispatch(lanes, lanes, CubeDim::new_1d(THREADS))?;
+        let mut entity_queries = context.empty_u32(endpoints)?;
+        let mut attribute_queries = context.empty_u32(lanes)?;
+        let mut eva_values = context.empty_u32(endpoints)?;
+        let mut aev_values = context.empty_u32(endpoints)?;
+        unsafe {
+            prepare_fully_bound_support::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                lane_dispatch.cube_count(),
+                lane_dispatch.cube_dim(),
+                group.descriptors.input_arg(),
+                frontier.values.input_arg(),
+                entity_queries.output_arg(),
+                attribute_queries.output_arg(),
+                eva_values.output_arg(),
+                aev_values.output_arg(),
+                frontier.rows as u32,
+                frontier.stride as u32,
+                group.support_count as u32,
+                self.archive.archive().domain.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let mut entity_selected = context.empty_u32(endpoints)?;
+        self.archive
+            .entity_prefix()
+            .select1_batch_into(&entity_queries, &mut entity_selected)?;
+        let mut attribute_selected = context.empty_u32(lanes)?;
+        self.archive
+            .attribute_prefix()
+            .select1_batch_into(&attribute_queries, &mut attribute_selected)?;
+
+        let eva = self.archive.ring_col(SuccinctRotation::Eva);
+        let aev = self.archive.ring_col(SuccinctRotation::Aev);
+        let mut eva_positions = context.empty_u32(endpoints)?;
+        let mut attribute_bases = context.empty_u32(lanes)?;
+        unsafe {
+            normalize_prepare_eva::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                lane_dispatch.cube_count(),
+                lane_dispatch.cube_dim(),
+                entity_queries.output_arg(),
+                entity_selected.input_arg(),
+                attribute_queries.output_arg(),
+                attribute_selected.input_arg(),
+                eva_values.output_arg(),
+                aev_values.output_arg(),
+                eva_positions.output_arg(),
+                attribute_bases.output_arg(),
+                lanes as u32,
+                eva.len() as u32,
+                aev.len() as u32,
+                self.archive.archive().domain.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let mut eva_ranks = context.empty_u32(endpoints)?;
+        eva.rank_batch_into(&eva_positions, &eva_values, &mut eva_ranks)?;
+
+        let mut aev_positions = context.empty_u32(endpoints)?;
+        unsafe {
+            anchor_prepare_aev::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                lane_dispatch.cube_count(),
+                lane_dispatch.cube_dim(),
+                eva_positions.input_arg(),
+                eva_ranks.input_arg(),
+                attribute_bases.input_arg(),
+                aev_values.output_arg(),
+                aev_positions.output_arg(),
+                lanes as u32,
+                eva.len() as u32,
+                aev.len() as u32,
+                self.archive.archive().domain.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let mut aev_ranks = context.empty_u32(endpoints)?;
+        aev.rank_batch_into(&aev_positions, &aev_values, &mut aev_ranks)?;
+
+        let row_dispatch = context.static_batch_dispatch(
+            frontier.rows,
+            frontier.rows,
+            CubeDim::new_1d(THREADS),
+        )?;
+        unsafe {
+            reduce_fully_bound_support::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                row_dispatch.cube_count(),
+                row_dispatch.cube_dim(),
+                aev_positions.input_arg(),
+                aev_ranks.input_arg(),
+                inputs.viability_output_arg(),
+                frontier.rows as u32,
+                group.support_count as u32,
+                aev.len() as u32,
                 DEAD_ROW_SENTINEL,
             );
         }
@@ -937,6 +1048,15 @@ fn restricted_group_geometry(
     Ok((probes, endpoints))
 }
 
+fn fully_bound_group_geometry(
+    support_count: usize,
+    rows: usize,
+) -> Result<(usize, usize), ResidentRoundError> {
+    let lanes = checked_device_product(support_count, rows, "resident fully-bound support lanes")?;
+    let endpoints = checked_device_product(lanes, 2, "resident fully-bound support endpoints")?;
+    Ok((lanes, endpoints))
+}
+
 fn build_pair_groups<U: Universe>(
     archive: &WgpuSuccinctArchive<U>,
     plan: &ResidentRoundPlan,
@@ -1018,6 +1138,39 @@ fn build_restricted_groups<U: Universe>(
         });
     }
     Ok(groups.into_boxed_slice())
+}
+
+fn build_fully_bound_group<U: Universe>(
+    archive: &WgpuSuccinctArchive<U>,
+    plan: &ResidentRoundPlan,
+) -> Result<Option<WgpuFullyBoundGroup>, ResidentSupportError> {
+    let supports = plan.fully_bound_supports();
+    if supports.is_empty() {
+        return Ok(None);
+    }
+    checked_device_product(
+        supports.len(),
+        SUPPORT_DESCRIPTOR_WORDS,
+        "resident fully-bound descriptor table",
+    )?;
+    let mut descriptors = Vec::with_capacity(supports.len() * SUPPORT_DESCRIPTOR_WORDS);
+    for &support in supports {
+        let (entity_kind, entity_payload) = encode_source(support.entity);
+        let (attribute_kind, attribute_payload) = encode_source(support.attribute);
+        let (value_kind, value_payload) = encode_source(support.value);
+        descriptors.extend([
+            entity_kind,
+            entity_payload,
+            attribute_kind,
+            attribute_payload,
+            value_kind,
+            value_payload,
+        ]);
+    }
+    Ok(Some(WgpuFullyBoundGroup {
+        support_count: supports.len(),
+        descriptors: archive.context().upload_u32(&descriptors)?,
+    }))
 }
 
 fn encode_source(source: CodeSource) -> (u32, u32) {
@@ -1274,6 +1427,336 @@ fn scatter_restricted(
     }
 }
 
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_fully_bound_support(
+    descriptors: &Array<u32>,
+    frontier: &Array<u32>,
+    entity_queries: &mut Array<u32>,
+    attribute_queries: &mut Array<u32>,
+    eva_values: &mut Array<u32>,
+    aev_values: &mut Array<u32>,
+    rows: u32,
+    stride: u32,
+    support_count: u32,
+    domain: u32,
+    dead: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    let lanes = rows as usize * support_count as usize;
+    if lane < lanes {
+        let pair = lane * 2usize;
+        if pair + 1usize < entity_queries.len()
+            && lane < attribute_queries.len()
+            && pair + 1usize < eva_values.len()
+            && pair + 1usize < aev_values.len()
+        {
+            // Poison every Jerky query/value lane before inspecting an
+            // untrusted descriptor or frontier word. Only the joint E/A/V
+            // validation below can make any of them live.
+            entity_queries[pair] = dead;
+            entity_queries[pair + 1usize] = dead;
+            attribute_queries[lane] = dead;
+            eva_values[pair] = dead;
+            eva_values[pair + 1usize] = dead;
+            aev_values[pair] = dead;
+            aev_values[pair + 1usize] = dead;
+
+            let support = lane / rows as usize;
+            let row = lane % rows as usize;
+            let descriptor = support * SUPPORT_DESCRIPTOR_WORDS;
+            if descriptor + 5usize < descriptors.len() {
+                let entity_kind = descriptors[descriptor];
+                let entity_payload = descriptors[descriptor + 1usize];
+                let attribute_kind = descriptors[descriptor + 2usize];
+                let attribute_payload = descriptors[descriptor + 3usize];
+                let value_kind = descriptors[descriptor + 4usize];
+                let value_payload = descriptors[descriptor + 5usize];
+                let mut entity = dead;
+                let mut attribute = dead;
+                let mut value = dead;
+
+                if entity_kind == CONSTANT_SOURCE {
+                    entity = entity_payload;
+                } else if entity_kind == COLUMN_SOURCE && entity_payload < stride {
+                    let offset = row * stride as usize + entity_payload as usize;
+                    if offset < frontier.len() {
+                        entity = frontier[offset];
+                    }
+                }
+                if attribute_kind == CONSTANT_SOURCE {
+                    attribute = attribute_payload;
+                } else if attribute_kind == COLUMN_SOURCE && attribute_payload < stride {
+                    let offset = row * stride as usize + attribute_payload as usize;
+                    if offset < frontier.len() {
+                        attribute = frontier[offset];
+                    }
+                }
+                if value_kind == CONSTANT_SOURCE {
+                    value = value_payload;
+                } else if value_kind == COLUMN_SOURCE && value_payload < stride {
+                    let offset = row * stride as usize + value_payload as usize;
+                    if offset < frontier.len() {
+                        value = frontier[offset];
+                    }
+                }
+
+                // This is the trust boundary before the first Jerky launch.
+                // The entity also needs a representable exclusive successor.
+                if entity < domain
+                    && entity < dead - 1u32
+                    && attribute < domain
+                    && attribute != dead
+                    && value < domain
+                    && value != dead
+                {
+                    entity_queries[pair] = entity;
+                    entity_queries[pair + 1usize] = entity + 1u32;
+                    attribute_queries[lane] = attribute;
+                    eva_values[pair] = attribute;
+                    eva_values[pair + 1usize] = attribute;
+                    aev_values[pair] = value;
+                    aev_values[pair + 1usize] = value;
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn normalize_prepare_eva(
+    entity_queries: &mut Array<u32>,
+    entity_selected: &Array<u32>,
+    attribute_queries: &mut Array<u32>,
+    attribute_selected: &Array<u32>,
+    eva_values: &mut Array<u32>,
+    aev_values: &mut Array<u32>,
+    eva_positions: &mut Array<u32>,
+    attribute_bases: &mut Array<u32>,
+    lanes: u32,
+    eva_len: u32,
+    aev_len: u32,
+    domain: u32,
+    dead: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if lane < lanes as usize {
+        let pair = lane * 2usize;
+        if pair + 1usize < entity_queries.len()
+            && pair + 1usize < entity_selected.len()
+            && lane < attribute_queries.len()
+            && lane < attribute_selected.len()
+            && pair + 1usize < eva_values.len()
+            && pair + 1usize < aev_values.len()
+            && pair + 1usize < eva_positions.len()
+            && lane < attribute_bases.len()
+        {
+            eva_positions[pair] = dead;
+            eva_positions[pair + 1usize] = dead;
+            attribute_bases[lane] = dead;
+
+            let e0_query = entity_queries[pair];
+            let e1_query = entity_queries[pair + 1usize];
+            let e0_selected = entity_selected[pair];
+            let e1_selected = entity_selected[pair + 1usize];
+            let attribute_query = attribute_queries[lane];
+            let attribute_selected = attribute_selected[lane];
+            let eva0_value = eva_values[pair];
+            let eva1_value = eva_values[pair + 1usize];
+            let aev0_value = aev_values[pair];
+            let aev1_value = aev_values[pair + 1usize];
+
+            let mut valid = e0_query != dead
+                && e1_query != dead
+                && e0_query < domain
+                && e1_query <= domain
+                && e0_query < dead - 1u32
+                && e1_query == e0_query + 1u32
+                && attribute_query != dead
+                && attribute_query < domain
+                && eva0_value == attribute_query
+                && eva1_value == attribute_query
+                && aev0_value != dead
+                && aev0_value < domain
+                && aev1_value == aev0_value
+                && e0_selected != dead
+                && e1_selected != dead
+                && attribute_selected != dead
+                && e0_selected >= e0_query
+                && e1_selected >= e1_query
+                && attribute_selected >= attribute_query;
+
+            let mut e0 = dead;
+            let mut e1 = dead;
+            let mut attribute_base = dead;
+            if valid {
+                let candidate_e0 = e0_selected - e0_query;
+                let candidate_e1 = e1_selected - e1_query;
+                let candidate_attribute_base = attribute_selected - attribute_query;
+                if candidate_e0 <= candidate_e1
+                    && candidate_e1 <= eva_len
+                    && candidate_attribute_base <= aev_len
+                {
+                    e0 = candidate_e0;
+                    e1 = candidate_e1;
+                    attribute_base = candidate_attribute_base;
+                } else {
+                    valid = false;
+                }
+            }
+
+            if valid {
+                eva_positions[pair] = e0;
+                eva_positions[pair + 1usize] = e1;
+                attribute_bases[lane] = attribute_base;
+            } else {
+                // Any malformed delimiter result poisons every later Jerky
+                // value/position lane as well as the original query lanes.
+                entity_queries[pair] = dead;
+                entity_queries[pair + 1usize] = dead;
+                attribute_queries[lane] = dead;
+                eva_values[pair] = dead;
+                eva_values[pair + 1usize] = dead;
+                aev_values[pair] = dead;
+                aev_values[pair + 1usize] = dead;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn anchor_prepare_aev(
+    eva_positions: &Array<u32>,
+    eva_ranks: &Array<u32>,
+    attribute_bases: &Array<u32>,
+    aev_values: &mut Array<u32>,
+    aev_positions: &mut Array<u32>,
+    lanes: u32,
+    eva_len: u32,
+    aev_len: u32,
+    domain: u32,
+    dead: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if lane < lanes as usize {
+        let pair = lane * 2usize;
+        if pair + 1usize < eva_positions.len()
+            && pair + 1usize < eva_ranks.len()
+            && lane < attribute_bases.len()
+            && pair + 1usize < aev_values.len()
+            && pair + 1usize < aev_positions.len()
+        {
+            aev_positions[pair] = dead;
+            aev_positions[pair + 1usize] = dead;
+
+            let e0 = eva_positions[pair];
+            let e1 = eva_positions[pair + 1usize];
+            let rank0 = eva_ranks[pair];
+            let rank1 = eva_ranks[pair + 1usize];
+            let base = attribute_bases[lane];
+            let value0 = aev_values[pair];
+            let value1 = aev_values[pair + 1usize];
+            let mut valid = e0 != dead
+                && e1 != dead
+                && e0 <= e1
+                && e1 <= eva_len
+                && rank0 != dead
+                && rank1 != dead
+                && rank0 <= rank1
+                && rank1 <= eva_len
+                && rank0 <= e0
+                && rank1 <= e1
+                && base != dead
+                && base <= aev_len
+                && value0 != dead
+                && value0 < domain
+                && value1 == value0;
+
+            let mut a0 = dead;
+            let mut a1 = dead;
+            if valid {
+                // Guard both additions before executing either one. This also
+                // rejects a rank that is in the EVA range but cannot be
+                // anchored inside the AEV Ring.
+                let remaining = aev_len - base;
+                if rank0 <= remaining && rank1 <= remaining {
+                    let candidate_a0 = base + rank0;
+                    let candidate_a1 = base + rank1;
+                    if candidate_a0 <= candidate_a1 && candidate_a1 <= aev_len {
+                        a0 = candidate_a0;
+                        a1 = candidate_a1;
+                    } else {
+                        valid = false;
+                    }
+                } else {
+                    valid = false;
+                }
+            }
+
+            if valid {
+                aev_positions[pair] = a0;
+                aev_positions[pair + 1usize] = a1;
+            } else {
+                aev_values[pair] = dead;
+                aev_values[pair + 1usize] = dead;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn reduce_fully_bound_support(
+    aev_positions: &Array<u32>,
+    aev_ranks: &Array<u32>,
+    viable: &mut Array<u32>,
+    rows: u32,
+    support_count: u32,
+    aev_len: u32,
+    dead: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize && row < viable.len() {
+        // This invocation is the sole writer of viability[row]. Support lanes
+        // never race one another, including duplicate source patterns.
+        let mut supported = viable[row] == 1u32;
+        let mut support = 0usize;
+        while support < support_count as usize {
+            let lane = support * rows as usize + row;
+            let pair = lane * 2usize;
+            let mut lane_supported = false;
+            if pair + 1usize < aev_positions.len() && pair + 1usize < aev_ranks.len() {
+                let a0 = aev_positions[pair];
+                let a1 = aev_positions[pair + 1usize];
+                let rank0 = aev_ranks[pair];
+                let rank1 = aev_ranks[pair + 1usize];
+                if a0 != dead
+                    && a1 != dead
+                    && a0 <= a1
+                    && a1 <= aev_len
+                    && rank0 != dead
+                    && rank1 != dead
+                    && rank0 <= rank1
+                    && rank1 <= aev_len
+                    && rank0 <= a0
+                    && rank1 <= a1
+                    && rank1 > rank0
+                {
+                    lane_supported = true;
+                }
+            }
+            supported = supported && lane_supported;
+            support += 1usize;
+        }
+        if supported {
+            viable[row] = 1u32;
+        } else {
+            viable[row] = 0u32;
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "resident_support_lowering_tests.rs"]
 mod lowering_tests;
@@ -1285,3 +1768,7 @@ mod pair_distinct_tests;
 #[cfg(test)]
 #[path = "resident_restricted_tests.rs"]
 mod restricted_tests;
+
+#[cfg(test)]
+#[path = "resident_fully_bound_tests.rs"]
+mod fully_bound_tests;

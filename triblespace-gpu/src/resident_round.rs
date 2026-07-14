@@ -347,6 +347,15 @@ impl<R: Runtime> ResidentRoundInputs<R> {
         self.estimates.output_arg()
     }
 
+    /// Borrows only the row-viability allocation for a support producer.
+    ///
+    /// Keeping this seam crate-private lets the final support reduction update
+    /// one row from one invocation without exposing either resident buffer as
+    /// part of the public capability boundary.
+    pub(crate) fn viability_output_arg(&mut self) -> ArrayArg<R> {
+        self.viable.output_arg()
+    }
+
     #[cfg(test)]
     pub(crate) fn read_producer_outputs(&self) -> (Vec<u32>, Vec<u32>) {
         (self.viable.read(), self.estimates.read())

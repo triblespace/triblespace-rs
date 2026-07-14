@@ -888,7 +888,7 @@ fn exact_zero_is_viable_and_restricted_counts_grow_after_snapshot_recompile() {
 }
 
 #[test]
-fn fully_bound_support_remains_an_explicit_preallocation_error() {
+fn fully_bound_support_follows_the_restricted_stage_without_relabeling() {
     let (set, ids) = fixture_set();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let resident = WgpuSuccinctArchive::new(archive).unwrap();
@@ -907,11 +907,8 @@ fn fully_bound_support_remains_an_explicit_preallocation_error() {
             1,
         )
         .unwrap();
-    let frontier = round.upload_frontier(&host).unwrap();
-    assert!(matches!(
-        round.initialize_inputs(&frontier),
-        Err(ResidentSupportError::UnsupportedFullyBoundSupport {
-            source_pattern_index: 0
-        })
-    ));
+    let (viable, estimates, choices) = run_outputs(&round, &host);
+    assert_eq!(viable, vec![1]);
+    assert!(estimates.is_empty());
+    assert_eq!(choices, vec![ResidentRowChoice::dead()]);
 }

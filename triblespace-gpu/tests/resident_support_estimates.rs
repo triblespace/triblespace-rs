@@ -104,7 +104,7 @@ fn facade_rejects_foreign_archive_and_cross_round_inputs() {
 }
 
 #[test]
-fn pair_and_restricted_are_supported_while_support_fails_before_inputs() {
+fn pair_restricted_and_fully_bound_support_initialize_without_readback() {
     let source = fixture();
     let archive = WgpuSuccinctArchive::new(source.archive).unwrap();
     let program =
@@ -123,12 +123,7 @@ fn pair_and_restricted_are_supported_while_support_fails_before_inputs() {
     let support = WgpuResidentRound::new(&archive, &program, &[v(0), v(1), v(2)]).unwrap();
     let support_host = ProgramFrontier::new(vec![v(0), v(1), v(2)], Vec::new(), 0).unwrap();
     let support_frontier = support.upload_frontier(&support_host).unwrap();
-    assert!(matches!(
-        support.initialize_inputs(&support_frontier),
-        Err(ResidentSupportError::UnsupportedFullyBoundSupport {
-            source_pattern_index: 0,
-        })
-    ));
+    assert!(support.initialize_inputs(&support_frontier).is_ok());
 }
 
 fn cpu_zero_peer_choice(
