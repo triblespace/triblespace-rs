@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident support now retains one exact proof-carrying interval witness per
+  arm and row.** Present, PairDistinct, and Restricted producers write
+  `[base_lo, base_hi, enum_lo, enum_hi]`; the planner derives counts only from
+  the enumerated span after validating every record, including unchosen arms
+  and semantically dead rows. The former estimate allocation is gone, keeping
+  the planner at seven user arrays. A private `Arc` freezes the sole witness
+  allocation when choices are minted, makes later producer writes fail with a
+  typed ownership error, and carries the indivisible witness capability into
+  proposal inputs without a relabeling seam.
 - **The private wired Present round now publishes confirmed children through a
   distinct stable survivor arena.** A capacity-wide tri-state scan validates
   every keep word, proves the zero tail beyond provisional `T`, and derives

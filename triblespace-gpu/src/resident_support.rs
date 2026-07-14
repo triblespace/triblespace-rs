@@ -1,20 +1,20 @@
-//! Host lowering and the first bounded resident estimate/support producer.
+//! Host lowering and the first bounded resident witness/support producer.
 //!
 //! [`ResidentRoundPlan`] is the complete physical host IR for one affine
 //! [`QueryProgram`] round. It retains exact stable arm IDs, groups arms only by
 //! their physical primitive and canonical Ring rotation, and records every
-//! fully-bound support check separately from proposal estimates.
+//! fully-bound support check separately from proposal witnesses.
 //!
-//! [`WgpuResidentRound`] initializes every estimate to its exact zero-peer
-//! count or a provisional invariant sentinel, then overwrites one-peer
+//! [`WgpuResidentRound`] initializes every interval witness to its exact
+//! zero-peer record or provisional invariant poison, then overwrites one-peer
 //! `PairDistinct` and two-peer `Restricted` arms through resident
 //! prefix-select and rank pipelines. Fully-bound source patterns are reduced
 //! through one canonical E-A-V membership pipeline and conjunctively update
 //! tri-state row viability with exactly one writer per row. Globally
-//! contradicted rounds use canonical zero estimates because viability already
-//! carries their semantics. The affine frontier,
-//! descriptors, scratch, estimate matrix, and planner choices remain in one
-//! compatibility domain without a readback.
+//! contradicted rounds use canonical zero witnesses because viability already
+//! carries their semantics. The affine frontier, descriptors, scratch,
+//! witnesses, and planner choices remain in one compatibility domain without a
+//! readback.
 
 use std::error::Error;
 use std::fmt;
@@ -30,7 +30,7 @@ use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Unive
 use crate::resident_round::{
     checked_device_product, validate_rows, ResidentRoundError, ResidentRoundInputs,
     ResidentRoundMetadata, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
-    RESIDENT_U32_SENTINEL,
+    PROPOSAL_WITNESS_WORDS, RESIDENT_U32_SENTINEL,
 };
 use crate::succinct_query::{WgpuBitVector, WgpuSuccinctArchive};
 
@@ -159,7 +159,7 @@ pub enum CodeSource {
     Column(u8),
 }
 
-/// Complete physical estimate instruction for one stable planner arm.
+/// Complete physical witness instruction for one stable planner arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArmSpec {
     /// No peer is bound: every row has the same axis cardinality.
@@ -239,7 +239,7 @@ impl FullyBoundSupport {
     }
 }
 
-/// Physical primitive shared by one stable estimate dispatch group.
+/// Physical primitive shared by one stable witness dispatch group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArmGroupKind {
     /// Zero-peer axis-cardinality initialization.
@@ -366,7 +366,7 @@ impl ResidentRoundPlan {
         &self.metadata
     }
 
-    /// Physical estimate instructions in stable arm-ID order.
+    /// Physical witness instructions in stable arm-ID order.
     pub fn arm_specs(&self) -> &[ArmSpec] {
         &self.arm_specs
     }
@@ -387,7 +387,7 @@ impl ResidentRoundPlan {
         &self.arm_groups
     }
 
-    /// Fully-bound source patterns in source order, kept separate from estimates.
+    /// Fully-bound source patterns in source order, kept separate from witnesses.
     pub fn fully_bound_supports(&self) -> &[FullyBoundSupport] {
         &self.fully_bound_supports
     }
@@ -440,6 +440,9 @@ impl<U: Universe> WgpuResidentFrontier<'_, U> {
 pub(crate) struct ResidentProposalInputs {
     pub(crate) frontier: ArrayArg<WgpuRuntime>,
     pub(crate) choices: ArrayArg<WgpuRuntime>,
+    /// Exact immutable witness retained by and obtained only from `choices`.
+    #[allow(dead_code)] // Consumed by the next Pair proposal slice.
+    pub(crate) proposal_witness: ArrayArg<WgpuRuntime>,
     pub(crate) rows: usize,
     pub(crate) parent_stride: usize,
     pub(crate) round_owner: Arc<()>,
@@ -475,7 +478,7 @@ pub struct WgpuResidentRound<'a, U: Universe> {
     plan: ResidentRoundPlan,
     planner: WgpuResidentRowPlanner,
     frontier_owner: Arc<()>,
-    initial_estimates: DeviceU32Buffer<WgpuRuntime>,
+    initial_witnesses: DeviceU32Buffer<WgpuRuntime>,
     pair_groups: Box<[WgpuPairGroup]>,
     restricted_groups: Box<[WgpuRestrictedGroup]>,
     fully_bound_group: Option<WgpuFullyBoundGroup>,
@@ -499,7 +502,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let plan = ResidentRoundPlan::lower(program, bound_variables)?;
         let planner =
             ResidentRowPlanner::from_metadata(plan.metadata().clone(), archive.context().clone())?;
-        let initial_estimates = archive.context().upload_u32(&initial_estimates(&plan))?;
+        let initial_witnesses = archive.context().upload_u32(&initial_witnesses(&plan)?)?;
         let pair_groups = build_pair_groups(archive, &plan)?;
         let restricted_groups = build_restricted_groups(archive, &plan)?;
         let fully_bound_group = build_fully_bound_group(archive, &plan)?;
@@ -508,7 +511,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             plan,
             planner,
             frontier_owner: Arc::new(()),
-            initial_estimates,
+            initial_witnesses,
             pair_groups,
             restricted_groups,
             fully_bound_group,
@@ -567,7 +570,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         })
     }
 
-    /// Allocates planner-owned inputs and enqueues exact estimates and support.
+    /// Allocates planner-owned inputs and enqueues exact witnesses and support.
     ///
     /// The common launch initializes viability plus every arm-major cell.
     /// Each nonempty pair or restricted rotation performs prepare, prefix
@@ -590,15 +593,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             self.planner
                 .context()
                 .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))?;
-        let (viable, estimates) = inputs.producer_output_args();
+        let (viable, proposal_witness) = inputs.producer_output_args()?;
         unsafe {
             initialize_present_round::launch_unchecked::<WgpuRuntime>(
                 self.planner.context().client(),
                 dispatch.cube_count(),
                 dispatch.cube_dim(),
-                self.initial_estimates.input_arg(),
+                self.initial_witnesses.input_arg(),
                 viable,
-                estimates,
+                proposal_witness,
                 rows as u32,
                 self.plan.metadata().arms().len() as u32,
                 u32::from(!self.plan.is_global_dead()),
@@ -656,10 +659,18 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         frontier: &WgpuResidentFrontier<'_, U>,
         choices: &ResidentRowChoices<WgpuRuntime>,
     ) -> Result<ResidentProposalInputs, ResidentSupportError> {
-        let choices = self.choice_input_arg(frontier, choices)?;
+        self.validate_frontier(frontier)?;
+        if choices.len() != frontier.rows {
+            return Err(ResidentSupportError::MalformedChoices);
+        }
+        if !choices.has_frontier_lineage(&frontier.lineage) {
+            return Err(ResidentSupportError::ChoiceFrontierOwnership);
+        }
+        let (choice_words, proposal_witness) = self.planner.proposal_input_args(choices)?;
         Ok(ResidentProposalInputs {
             frontier: frontier.values.input_arg(),
-            choices,
+            choices: choice_words,
+            proposal_witness,
             rows: frontier.rows,
             parent_stride: frontier.stride,
             round_owner: frontier.owner.clone(),
@@ -693,8 +704,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         Ok((frontier.rows, frontier.stride))
     }
 
-    /// Test-only construction of malformed but correctly branded choices.
-    /// Device consumers must still reject their contents before publication.
+    /// Test-only construction of malformed but correctly branded Present
+    /// choices with synthetic zero-peer witnesses. Device consumers must still
+    /// reject their contents before publication. Pair/Restricted tests must use
+    /// [`Self::force_choice_words_from_inputs_for_test`] so they retain real
+    /// producer intervals.
     #[cfg(test)]
     pub(crate) fn upload_choice_words_for_test(
         &self,
@@ -705,6 +719,24 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.planner
             .upload_choice_words_for_test(words, frontier.rows, frontier.lineage.clone())
             .map_err(Into::into)
+    }
+
+    /// Test-only forced choices retaining the exact immutable producer witness.
+    #[cfg(test)]
+    pub(crate) fn force_choice_words_from_inputs_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        inputs: &ResidentRoundInputs<WgpuRuntime>,
+        words: &[u32],
+    ) -> Result<ResidentRowChoices<WgpuRuntime>, ResidentSupportError> {
+        self.validate_frontier(frontier)?;
+        let choices = self
+            .planner
+            .force_choice_words_from_inputs_for_test(inputs, words)?;
+        if !choices.has_frontier_lineage(&frontier.lineage) {
+            return Err(ResidentSupportError::ChoiceFrontierOwnership);
+        }
+        Ok(choices)
     }
 
     fn validate_frontier(
@@ -781,7 +813,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
 
         let changes = self.archive.pair_changes(group.rotation);
         changes.rank1_batch_into(&queries, &mut results)?;
-        let estimates = inputs.estimates_output_arg();
+        let proposal_witness = inputs.proposal_witness_output_arg()?;
         unsafe {
             scatter_pair_distinct::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -790,7 +822,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 group.descriptors.input_arg(),
                 queries.input_arg(),
                 results.input_arg(),
-                estimates,
+                proposal_witness,
                 frontier.rows as u32,
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
@@ -852,7 +884,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
 
         let ring = self.archive.ring_col(group.rotation);
         ring.rank_batch_into(&positions, &values, &mut results)?;
-        let estimates = inputs.estimates_output_arg();
+        let proposal_witness = inputs.proposal_witness_output_arg()?;
         unsafe {
             scatter_restricted::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -861,7 +893,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 group.descriptors.input_arg(),
                 positions.input_arg(),
                 results.input_arg(),
-                estimates,
+                proposal_witness,
                 frontier.rows as u32,
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
@@ -1195,19 +1227,26 @@ fn group_arms(specs: &[ArmSpec]) -> Box<[ArmGroup]> {
         .into_boxed_slice()
 }
 
-fn initial_estimates(plan: &ResidentRoundPlan) -> Box<[u32]> {
+fn initial_witnesses(plan: &ResidentRoundPlan) -> Result<Box<[u32]>, ResidentRoundError> {
+    let word_count = checked_device_product(
+        plan.metadata().arms().len(),
+        PROPOSAL_WITNESS_WORDS,
+        "initial proposal witness words",
+    )?;
     if plan.is_global_dead() {
-        return vec![0; plan.metadata().arms().len()].into_boxed_slice();
+        return Ok(vec![0; word_count].into_boxed_slice());
     }
-    plan.arm_specs()
-        .iter()
-        .copied()
-        .map(|spec| match spec {
-            ArmSpec::Present { count, .. } => count,
-            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => RESIDENT_U32_SENTINEL,
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+    let mut witnesses = Vec::with_capacity(word_count);
+    for &spec in plan.arm_specs() {
+        let witness = match spec {
+            ArmSpec::Present { count, .. } => [0, count, 0, count],
+            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => {
+                [RESIDENT_U32_SENTINEL; PROPOSAL_WITNESS_WORDS]
+            }
+        };
+        witnesses.extend(witness);
+    }
+    Ok(witnesses.into_boxed_slice())
 }
 
 fn pair_group_geometry(
@@ -1373,9 +1412,9 @@ fn first_axis_prefix<U: Universe>(
 
 #[cube(launch_unchecked)]
 fn initialize_present_round(
-    initial_estimates: &Array<u32>,
+    initial_witnesses: &Array<u32>,
     viable: &mut Array<u32>,
-    estimates: &mut Array<u32>,
+    proposal_witness: &mut Array<u32>,
     rows: u32,
     arm_count: u32,
     initial_viability: u32,
@@ -1385,7 +1424,12 @@ fn initialize_present_round(
         viable[row] = initial_viability;
         let mut arm = 0u32;
         while arm < arm_count {
-            estimates[arm as usize * rows as usize + row] = initial_estimates[arm as usize];
+            let source = arm as usize * PROPOSAL_WITNESS_WORDS;
+            let destination = (arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+            proposal_witness[destination] = initial_witnesses[source];
+            proposal_witness[destination + 1usize] = initial_witnesses[source + 1usize];
+            proposal_witness[destination + 2usize] = initial_witnesses[source + 2usize];
+            proposal_witness[destination + 3usize] = initial_witnesses[source + 3usize];
             arm += 1u32;
         }
     }
@@ -1539,7 +1583,7 @@ fn scatter_pair_distinct(
     descriptors: &Array<u32>,
     positions: &Array<u32>,
     ranks: &Array<u32>,
-    estimates: &mut Array<u32>,
+    proposal_witness: &mut Array<u32>,
     rows: u32,
     local_arm_count: u32,
     global_arm_count: u32,
@@ -1556,9 +1600,10 @@ fn scatter_pair_distinct(
         if descriptor + 2usize < descriptors.len() {
             let global_arm = descriptors[descriptor];
             if global_arm < global_arm_count {
-                let destination = global_arm as usize * rows as usize + row;
+                let destination =
+                    (global_arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
                 let pair = probe * 2usize;
-                if destination < estimates.len()
+                if destination + 3usize < proposal_witness.len()
                     && pair + 1usize < positions.len()
                     && pair + 1usize < ranks.len()
                 {
@@ -1566,7 +1611,7 @@ fn scatter_pair_distinct(
                     let position_hi = positions[pair + 1usize];
                     let lo = ranks[pair];
                     let hi = ranks[pair + 1usize];
-                    let mut count = dead;
+                    let mut valid = false;
                     if position_lo != dead
                         && position_hi != dead
                         && position_lo <= position_hi
@@ -1581,10 +1626,19 @@ fn scatter_pair_distinct(
                         let position_span = position_hi - position_lo;
                         let rank_span = hi - lo;
                         if rank_span <= position_span {
-                            count = rank_span;
+                            valid = true;
                         }
                     }
-                    estimates[destination] = count;
+                    proposal_witness[destination] = dead;
+                    proposal_witness[destination + 1usize] = dead;
+                    proposal_witness[destination + 2usize] = dead;
+                    proposal_witness[destination + 3usize] = dead;
+                    if valid {
+                        proposal_witness[destination] = position_lo;
+                        proposal_witness[destination + 1usize] = position_hi;
+                        proposal_witness[destination + 2usize] = lo;
+                        proposal_witness[destination + 3usize] = hi;
+                    }
                 }
             }
         }
@@ -1597,7 +1651,7 @@ fn scatter_restricted(
     descriptors: &Array<u32>,
     positions: &Array<u32>,
     ranks: &Array<u32>,
-    estimates: &mut Array<u32>,
+    proposal_witness: &mut Array<u32>,
     rows: u32,
     local_arm_count: u32,
     global_arm_count: u32,
@@ -1613,9 +1667,10 @@ fn scatter_restricted(
         if descriptor + 4usize < descriptors.len() {
             let global_arm = descriptors[descriptor];
             if global_arm < global_arm_count {
-                let destination = global_arm as usize * rows as usize + row;
+                let destination =
+                    (global_arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
                 let pair = probe * 2usize;
-                if destination < estimates.len()
+                if destination + 3usize < proposal_witness.len()
                     && pair + 1usize < positions.len()
                     && pair + 1usize < ranks.len()
                 {
@@ -1623,7 +1678,7 @@ fn scatter_restricted(
                     let position_hi = positions[pair + 1usize];
                     let lo = ranks[pair];
                     let hi = ranks[pair + 1usize];
-                    let mut count = dead;
+                    let mut valid = false;
                     if position_lo != dead
                         && position_hi != dead
                         && position_lo <= position_hi
@@ -1638,10 +1693,19 @@ fn scatter_restricted(
                         let position_span = position_hi - position_lo;
                         let rank_span = hi - lo;
                         if rank_span <= position_span {
-                            count = rank_span;
+                            valid = true;
                         }
                     }
-                    estimates[destination] = count;
+                    proposal_witness[destination] = dead;
+                    proposal_witness[destination + 1usize] = dead;
+                    proposal_witness[destination + 2usize] = dead;
+                    proposal_witness[destination + 3usize] = dead;
+                    if valid {
+                        proposal_witness[destination] = position_lo;
+                        proposal_witness[destination + 1usize] = position_hi;
+                        proposal_witness[destination + 2usize] = lo;
+                        proposal_witness[destination + 3usize] = hi;
+                    }
                 }
             }
         }

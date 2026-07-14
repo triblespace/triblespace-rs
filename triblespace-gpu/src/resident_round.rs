@@ -3,8 +3,8 @@
 //! This module is deliberately narrower than a resident query executor. It
 //! lowers one [`QueryProgram`] plus an affine frontier schema into stable
 //! variable-to-arm CSR metadata, then chooses the exact proposer and next
-//! variable for each row from an arm-major matrix of exact proposal counts.
-//! The next resident microprogram is responsible for producing that matrix and
+//! variable for each row from arm-major proof-carrying interval witnesses. The
+//! next resident microprogram is responsible for producing those witnesses and
 //! the row-viability mask; proposal generation and sibling confirmation remain
 //! separate stages.
 //!
@@ -37,6 +37,7 @@ type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 
 const THREADS: u32 = 64;
 const CHOICE_WORDS: usize = 3;
+pub(crate) const PROPOSAL_WITNESS_WORDS: usize = 4;
 
 /// Device sentinel for invariant poison and absent choice fields.
 pub const RESIDENT_U32_SENTINEL: u32 = u32::MAX;
@@ -171,7 +172,7 @@ impl ResidentRoundMetadata {
         &self.bound_variables
     }
 
-    /// Stable arm table. Estimate matrices are arm-major in this order.
+    /// Stable arm table. Proposal witnesses are arm-major in this order.
     pub fn arms(&self) -> &[ResidentRoundArm] {
         &self.arms
     }
@@ -202,8 +203,16 @@ impl ResidentRoundMetadata {
         )
     }
 
-    fn expected_estimates(&self, rows: usize) -> Result<usize, ResidentRoundError> {
-        checked_device_product(self.arms.len(), rows, "arm-major estimate matrix")
+    fn expected_witness_records(&self, rows: usize) -> Result<usize, ResidentRoundError> {
+        checked_device_product(self.arms.len(), rows, "arm-major proposal witnesses")
+    }
+
+    fn expected_witness_words(&self, rows: usize) -> Result<usize, ResidentRoundError> {
+        checked_device_product(
+            self.expected_witness_records(rows)?,
+            PROPOSAL_WITNESS_WORDS,
+            "proposal witness words",
+        )
     }
 }
 
@@ -254,10 +263,14 @@ pub enum ResidentRoundError {
     },
     /// Inputs were prepared by another planner compatibility capability.
     InputOwnership,
+    /// The exact proposal witness was already frozen into one or more choices.
+    ProposalWitnessOwnership,
     /// Packed choices were produced by another exact planner capability.
     ChoiceOwnership,
     /// Packed choice metadata or storage does not match the exact planner.
     MalformedChoiceBuffer,
+    /// Retained proposal-witness storage does not match the exact planner.
+    MalformedProposalWitness,
     /// The device returned a malformed choice triple.
     MalformedDeviceChoice {
         /// Row containing the malformed triple.
@@ -300,9 +313,15 @@ impl fmt::Display for ResidentRoundError {
             Self::InputOwnership => {
                 f.write_str("resident row-planner input belongs to another planner")
             }
+            Self::ProposalWitnessOwnership => {
+                f.write_str("resident proposal witness is frozen and no longer uniquely writable")
+            }
             Self::ChoiceOwnership => f.write_str("resident row choices belong to another planner"),
             Self::MalformedChoiceBuffer => {
                 f.write_str("resident row-choice metadata or storage is malformed")
+            }
+            Self::MalformedProposalWitness => {
+                f.write_str("resident proposal-witness storage is malformed")
             }
             Self::MalformedDeviceChoice { row } => {
                 write!(
@@ -330,8 +349,10 @@ impl Error for ResidentRoundError {
             | Self::GeometryOverflow(_)
             | Self::EstimateMatrixShape { .. }
             | Self::InputOwnership
+            | Self::ProposalWitnessOwnership
             | Self::ChoiceOwnership
             | Self::MalformedChoiceBuffer
+            | Self::MalformedProposalWitness
             | Self::MalformedDeviceChoice { .. }
             | Self::PoisonedDeviceChoice { .. } => None,
         }
@@ -347,13 +368,15 @@ impl From<jerky::Error> for ResidentRoundError {
 /// Typed device inputs for one exact planner invocation.
 ///
 /// The fields remain opaque so arbitrary buffers cannot be relabelled as
-/// planner-owned. The next resident estimate/support microprogram can fill an
-/// allocation created by this planner without any intermediate readback.
+/// planner-owned. The next resident support microprogram can fill an allocation
+/// created by this planner without any intermediate readback. Once planning
+/// clones the exact witness allocation into a choice capability, every writer
+/// seam fails closed because the private [`Arc`] is no longer unique.
 pub struct ResidentRoundInputs<R: Runtime> {
     owner: Arc<()>,
     frontier_lineage: Option<Arc<()>>,
     viable: DeviceU32Buffer<R>,
-    estimates: DeviceU32Buffer<R>,
+    proposal_witness: Arc<DeviceU32Buffer<R>>,
     rows: usize,
 }
 
@@ -364,12 +387,22 @@ impl<R: Runtime> ResidentRoundInputs<R> {
     }
 
     /// Borrows the two distinct allocations as one producer-stage capability.
-    pub(crate) fn producer_output_args(&mut self) -> (ArrayArg<R>, ArrayArg<R>) {
-        (self.viable.output_arg(), self.estimates.output_arg())
+    pub(crate) fn producer_output_args(
+        &mut self,
+    ) -> Result<(ArrayArg<R>, ArrayArg<R>), ResidentRoundError> {
+        let proposal_witness = Arc::get_mut(&mut self.proposal_witness)
+            .ok_or(ResidentRoundError::ProposalWitnessOwnership)?
+            .output_arg();
+        Ok((self.viable.output_arg(), proposal_witness))
     }
 
-    pub(crate) fn estimates_output_arg(&mut self) -> ArrayArg<R> {
-        self.estimates.output_arg()
+    /// Borrows the sole witness allocation while it is still producer-owned.
+    pub(crate) fn proposal_witness_output_arg(
+        &mut self,
+    ) -> Result<ArrayArg<R>, ResidentRoundError> {
+        Arc::get_mut(&mut self.proposal_witness)
+            .map(DeviceU32Buffer::output_arg)
+            .ok_or(ResidentRoundError::ProposalWitnessOwnership)
     }
 
     /// Borrows only the row-viability allocation for a support producer.
@@ -404,7 +437,30 @@ impl<R: Runtime> ResidentRoundInputs<R> {
 
     #[cfg(test)]
     pub(crate) fn read_producer_outputs(&self) -> (Vec<u32>, Vec<u32>) {
-        (self.viable.read(), self.estimates.read())
+        let witnesses = self.proposal_witness.read();
+        let estimates = witnesses
+            .chunks_exact(PROPOSAL_WITNESS_WORDS)
+            .map(|witness| {
+                let [base_lo, base_hi, enum_lo, enum_hi] =
+                    [witness[0], witness[1], witness[2], witness[3]];
+                if witness.contains(&RESIDENT_U32_SENTINEL)
+                    || base_lo > base_hi
+                    || enum_lo > enum_hi
+                    || enum_hi - enum_lo > base_hi - base_lo
+                {
+                    RESIDENT_U32_SENTINEL
+                } else {
+                    enum_hi - enum_lo
+                }
+            })
+            .collect();
+        (self.viable.read(), estimates)
+    }
+
+    /// Exact arm-major `[base_lo, base_hi, enum_lo, enum_hi]` records.
+    #[cfg(test)]
+    pub(crate) fn read_proposal_witnesses_for_test(&self) -> Vec<u32> {
+        self.proposal_witness.read()
     }
 }
 
@@ -472,7 +528,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         })
     }
 
-    /// Immutable host metadata which defines estimate-matrix arm order.
+    /// Immutable host metadata which defines proposal-witness arm order.
     pub fn metadata(&self) -> &ResidentRoundMetadata {
         &self.metadata
     }
@@ -482,19 +538,19 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         &self.context
     }
 
-    /// Allocates uninitialized resident inputs for a future estimate/support
+    /// Allocates uninitialized resident inputs for a future witness/support
     /// producer. No readback or synchronization occurs.
     pub fn allocate_inputs(
         &self,
         rows: usize,
     ) -> Result<ResidentRoundInputs<R>, ResidentRoundError> {
         validate_rows(rows)?;
-        let estimate_count = self.metadata.expected_estimates(rows)?;
+        let witness_words = self.metadata.expected_witness_words(rows)?;
         Ok(ResidentRoundInputs {
             owner: self.owner.clone(),
             frontier_lineage: None,
             viable: self.context.empty_u32(rows)?,
-            estimates: self.context.empty_u32(estimate_count)?,
+            proposal_witness: Arc::new(self.context.empty_u32(witness_words)?),
             rows,
         })
     }
@@ -509,7 +565,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         estimates: &[u32],
     ) -> Result<ResidentRoundInputs<R>, ResidentRoundError> {
         validate_rows(viable.len())?;
-        let expected = self.metadata.expected_estimates(viable.len())?;
+        let expected = self.metadata.expected_witness_records(viable.len())?;
         if estimates.len() != expected {
             return Err(ResidentRoundError::EstimateMatrixShape {
                 rows: viable.len(),
@@ -521,11 +577,39 @@ impl<R: Runtime> ResidentRowPlanner<R> {
             .iter()
             .map(|&is_viable| u32::from(is_viable))
             .collect::<Vec<_>>();
+        let mut witnesses = Vec::with_capacity(self.metadata.expected_witness_words(viable.len())?);
+        for &count in estimates {
+            if count == RESIDENT_U32_SENTINEL {
+                witnesses.extend([RESIDENT_U32_SENTINEL; PROPOSAL_WITNESS_WORDS]);
+            } else {
+                witnesses.extend([0, count, 0, count]);
+            }
+        }
         Ok(ResidentRoundInputs {
             owner: self.owner.clone(),
             frontier_lineage: None,
             viable: self.context.upload_u32(&viability)?,
-            estimates: self.context.upload_u32(estimates)?,
+            proposal_witness: Arc::new(self.context.upload_u32(&witnesses)?),
+            rows: viable.len(),
+        })
+    }
+
+    /// Test-only injection of exact witness records, including malformed ones.
+    #[cfg(test)]
+    pub(crate) fn upload_witness_inputs_for_test(
+        &self,
+        viable: &[u32],
+        witnesses: &[u32],
+    ) -> Result<ResidentRoundInputs<R>, ResidentRoundError> {
+        validate_rows(viable.len())?;
+        if witnesses.len() != self.metadata.expected_witness_words(viable.len())? {
+            return Err(ResidentRoundError::MalformedProposalWitness);
+        }
+        Ok(ResidentRoundInputs {
+            owner: self.owner.clone(),
+            frontier_lineage: None,
+            viable: self.context.upload_u32(viable)?,
+            proposal_witness: Arc::new(self.context.upload_u32(witnesses)?),
             rows: viable.len(),
         })
     }
@@ -536,17 +620,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         &self,
         inputs: &ResidentRoundInputs<R>,
     ) -> Result<ResidentRowChoices<R>, ResidentRoundError> {
-        if !Arc::ptr_eq(&self.owner, &inputs.owner) {
-            return Err(ResidentRoundError::InputOwnership);
-        }
-        let expected = self.metadata.expected_estimates(inputs.rows)?;
-        if inputs.viable.len() != inputs.rows || inputs.estimates.len() != expected {
-            return Err(ResidentRoundError::EstimateMatrixShape {
-                rows: inputs.rows,
-                arms: self.metadata.arms.len(),
-                estimates: inputs.estimates.len(),
-            });
-        }
+        self.validate_inputs(inputs)?;
         let output_words = checked_device_product(inputs.rows, CHOICE_WORDS, "packed row choices")?;
         let mut words = self.context.empty_u32(output_words)?;
         if inputs.rows != 0 {
@@ -561,7 +635,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
                     dispatch.cube_count(),
                     dispatch.cube_dim(),
                     inputs.viable.input_arg(),
-                    inputs.estimates.input_arg(),
+                    inputs.proposal_witness.input_arg(),
                     self.variable_offsets.input_arg(),
                     self.variable_arms.input_arg(),
                     self.arm_patterns.input_arg(),
@@ -574,14 +648,41 @@ impl<R: Runtime> ResidentRowPlanner<R> {
                 );
             }
         }
-        Ok(ResidentRowChoices {
+        Ok(self.seal_choices(inputs, words))
+    }
+
+    fn validate_inputs(&self, inputs: &ResidentRoundInputs<R>) -> Result<(), ResidentRoundError> {
+        if !Arc::ptr_eq(&self.owner, &inputs.owner) {
+            return Err(ResidentRoundError::InputOwnership);
+        }
+        let expected_witness_words = self.metadata.expected_witness_words(inputs.rows)?;
+        if inputs.viable.len() != inputs.rows {
+            return Err(ResidentRoundError::EstimateMatrixShape {
+                rows: inputs.rows,
+                arms: self.metadata.arms.len(),
+                estimates: inputs.proposal_witness.len() / PROPOSAL_WITNESS_WORDS,
+            });
+        }
+        if inputs.proposal_witness.len() != expected_witness_words {
+            return Err(ResidentRoundError::MalformedProposalWitness);
+        }
+        Ok(())
+    }
+
+    fn seal_choices(
+        &self,
+        inputs: &ResidentRoundInputs<R>,
+        words: DeviceU32Buffer<R>,
+    ) -> ResidentRowChoices<R> {
+        ResidentRowChoices {
             owner: self.owner.clone(),
             frontier_lineage: inputs.frontier_lineage.clone(),
+            proposal_witness: inputs.proposal_witness.clone(),
             words,
             rows: inputs.rows,
             variable_count: self.metadata.variable_count,
             arm_targets: self.arm_targets.clone(),
-        })
+        }
     }
 
     /// Returns the packed choice input for a downstream resident kernel only
@@ -595,6 +696,23 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         &self,
         choices: &ResidentRowChoices<R>,
     ) -> Result<ArrayArg<R>, ResidentRoundError> {
+        self.validate_choices(choices)?;
+        Ok(choices.words.input_arg())
+    }
+
+    /// Returns the indivisible choice/witness input pair for proposal stages.
+    pub(crate) fn proposal_input_args(
+        &self,
+        choices: &ResidentRowChoices<R>,
+    ) -> Result<(ArrayArg<R>, ArrayArg<R>), ResidentRoundError> {
+        self.validate_choices(choices)?;
+        Ok((
+            choices.words.input_arg(),
+            choices.proposal_witness.input_arg(),
+        ))
+    }
+
+    fn validate_choices(&self, choices: &ResidentRowChoices<R>) -> Result<(), ResidentRoundError> {
         if !Arc::ptr_eq(&self.owner, &choices.owner)
             || !Arc::ptr_eq(&self.arm_targets, &choices.arm_targets)
         {
@@ -605,16 +723,22 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         {
             return Err(ResidentRoundError::MalformedChoiceBuffer);
         }
-        Ok(choices.words.input_arg())
+        if choices.proposal_witness.len() != self.metadata.expected_witness_words(choices.rows)? {
+            return Err(ResidentRoundError::MalformedProposalWitness);
+        }
+        Ok(())
     }
 
     /// Constructs a planner- and frontier-branded packed choice allocation
     /// without running the planner.
     ///
     /// This exists only for adversarial device-boundary tests of the next
-    /// resident stage. Production code can mint choices only through
-    /// [`Self::enqueue`]. The ordinary private seam still validates the shape
-    /// and exact planner identities before exposing an input argument.
+    /// resident Present stage. Its synthetic `[0, count, 0, count]` witnesses
+    /// are intentionally valid only for that zero-peer test surface. Future
+    /// Pair/Restricted tests must force words from real inputs through
+    /// [`Self::force_choice_words_from_inputs_for_test`] instead of fabricating
+    /// interval bytes. Production code can mint choices only through
+    /// [`Self::enqueue`].
     #[cfg(test)]
     pub(crate) fn upload_choice_words_for_test(
         &self,
@@ -627,14 +751,41 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         if words.len() != expected {
             return Err(ResidentRoundError::MalformedChoiceBuffer);
         }
+        let witness_words = self.metadata.expected_witness_words(rows)?;
+        let mut witnesses = vec![0; witness_words];
+        for (row, choice) in words.chunks_exact(CHOICE_WORDS).enumerate() {
+            let arm = choice[1];
+            let count = choice[2];
+            if arm < self.metadata.arms.len() as u32 && count != RESIDENT_U32_SENTINEL {
+                let base = (arm as usize * rows + row) * PROPOSAL_WITNESS_WORDS;
+                witnesses[base..base + PROPOSAL_WITNESS_WORDS]
+                    .copy_from_slice(&[0, count, 0, count]);
+            }
+        }
         Ok(ResidentRowChoices {
             owner: self.owner.clone(),
             frontier_lineage: Some(frontier_lineage),
+            proposal_witness: Arc::new(self.context.upload_u32(&witnesses)?),
             words: self.context.upload_u32(words)?,
             rows,
             variable_count: self.metadata.variable_count,
             arm_targets: self.arm_targets.clone(),
         })
+    }
+
+    /// Forces choice words while retaining the exact producer witness Arc.
+    #[cfg(test)]
+    pub(crate) fn force_choice_words_from_inputs_for_test(
+        &self,
+        inputs: &ResidentRoundInputs<R>,
+        words: &[u32],
+    ) -> Result<ResidentRowChoices<R>, ResidentRoundError> {
+        self.validate_inputs(inputs)?;
+        let expected = checked_device_product(inputs.rows, CHOICE_WORDS, "packed row choices")?;
+        if words.len() != expected {
+            return Err(ResidentRoundError::MalformedChoiceBuffer);
+        }
+        Ok(self.seal_choices(inputs, self.context.upload_u32(words)?))
     }
 }
 
@@ -648,6 +799,8 @@ pub struct ResidentRowChoices<R: Runtime> {
     owner: Arc<()>,
     #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
     frontier_lineage: Option<Arc<()>>,
+    /// Exact immutable support record consumed by the chosen proposal stage.
+    proposal_witness: Arc<DeviceU32Buffer<R>>,
     words: DeviceU32Buffer<R>,
     rows: usize,
     variable_count: usize,
@@ -768,7 +921,8 @@ pub(crate) fn checked_device_product(
 mod tests {
     use super::{
         checked_device_product, decode_choices, validate_rows, ResidentRoundError,
-        ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, RESIDENT_U32_SENTINEL,
+        ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, PROPOSAL_WITNESS_WORDS,
+        RESIDENT_U32_SENTINEL,
     };
     use crate::succinct_query::WgpuContext;
     use std::sync::Arc;
@@ -809,6 +963,24 @@ mod tests {
         assert!(matches!(
             checked_device_product(largest_rows + 1, CHOICE_WORDS, "packed"),
             Err(ResidentRoundError::GeometryOverflow("packed"))
+        ));
+
+        let largest_witnesses = (limit - 1) / PROPOSAL_WITNESS_WORDS;
+        assert!(checked_device_product(
+            largest_witnesses,
+            PROPOSAL_WITNESS_WORDS,
+            "proposal witness words"
+        )
+        .is_ok());
+        assert!(matches!(
+            checked_device_product(
+                largest_witnesses + 1,
+                PROPOSAL_WITNESS_WORDS,
+                "proposal witness words"
+            ),
+            Err(ResidentRoundError::GeometryOverflow(
+                "proposal witness words"
+            ))
         ));
     }
 
@@ -859,8 +1031,9 @@ mod tests {
         let planner =
             ResidentRowPlanner::with_context(&program, &[], WgpuContext::on_wgpu()).unwrap();
         let rows = 4usize;
-        let mut estimates = vec![0; planner.metadata.arms().len() * rows];
-        estimates[2 * rows + 1] = RESIDENT_U32_SENTINEL;
+        let mut witnesses = vec![0; planner.metadata.expected_witness_words(rows).unwrap()];
+        let poison_base = (2 * rows + 1) * PROPOSAL_WITNESS_WORDS;
+        witnesses[poison_base..poison_base + PROPOSAL_WITNESS_WORDS].fill(RESIDENT_U32_SENTINEL);
         let inputs = super::ResidentRoundInputs {
             owner: planner.owner.clone(),
             frontier_lineage: None,
@@ -868,7 +1041,7 @@ mod tests {
                 .context
                 .upload_u32(&[0, 0, 1, RESIDENT_U32_SENTINEL])
                 .unwrap(),
-            estimates: planner.context.upload_u32(&estimates).unwrap(),
+            proposal_witness: Arc::new(planner.context.upload_u32(&witnesses).unwrap()),
             rows,
         };
         let choices = planner.enqueue(&inputs).unwrap();
@@ -896,6 +1069,85 @@ mod tests {
     }
 
     #[test]
+    fn malformed_unchosen_witnesses_poison_before_semantic_viability() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let v2 = ProgramVariable::new(2);
+        let program = QueryProgram::compile(&archive, 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+        let planner =
+            ResidentRowPlanner::with_context(&program, &[], WgpuContext::on_wgpu()).unwrap();
+
+        let mut witnesses = vec![0, 0, 0, 0, 0, 4, 0, 4, 0, 8, 0, 8];
+        let live_zero = planner
+            .upload_witness_inputs_for_test(&[1], &witnesses)
+            .unwrap();
+        assert_eq!(
+            planner.enqueue(&live_zero).unwrap().read().unwrap()[0].proposal_count,
+            0
+        );
+
+        witnesses[8..12].copy_from_slice(&[2, 1, 0, 0]);
+        let malformed_base = planner
+            .upload_witness_inputs_for_test(&[0], &witnesses)
+            .unwrap();
+        assert!(matches!(
+            planner.enqueue(&malformed_base).unwrap().read(),
+            Err(ResidentRoundError::PoisonedDeviceChoice { row: 0 })
+        ));
+
+        witnesses[8..12].copy_from_slice(&[0, 8, 5, 4]);
+        let malformed_enum = planner
+            .upload_witness_inputs_for_test(&[0], &witnesses)
+            .unwrap();
+        assert!(matches!(
+            planner.enqueue(&malformed_enum).unwrap().read(),
+            Err(ResidentRoundError::PoisonedDeviceChoice { row: 0 })
+        ));
+    }
+
+    #[test]
+    fn first_enqueue_freezes_witness_writers_but_repeated_planning_is_immutable() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let v2 = ProgramVariable::new(2);
+        let program = QueryProgram::compile(&archive, 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+        let planner =
+            ResidentRowPlanner::with_context(&program, &[], WgpuContext::on_wgpu()).unwrap();
+        let mut inputs = planner.upload_inputs(&[true], &[0, 1, 2]).unwrap();
+
+        let first = planner.enqueue(&inputs).unwrap();
+        assert!(Arc::ptr_eq(
+            &inputs.proposal_witness,
+            &first.proposal_witness
+        ));
+        assert!(matches!(
+            inputs.proposal_witness_output_arg(),
+            Err(ResidentRoundError::ProposalWitnessOwnership)
+        ));
+        assert!(matches!(
+            inputs.producer_output_args(),
+            Err(ResidentRoundError::ProposalWitnessOwnership)
+        ));
+
+        let second = planner.enqueue(&inputs).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.proposal_witness,
+            &second.proposal_witness
+        ));
+        assert_eq!(first.read().unwrap(), second.read().unwrap());
+
+        let forced = planner
+            .force_choice_words_from_inputs_for_test(&inputs, &[0, 0, 0])
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &inputs.proposal_witness,
+            &forced.proposal_witness
+        ));
+    }
+
+    #[test]
     fn zero_arm_planner_distinguishes_semantic_and_noncanonical_viability() {
         let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
         let v0 = ProgramVariable::new(0);
@@ -914,7 +1166,7 @@ mod tests {
                 .context
                 .upload_u32(&[0, 1, RESIDENT_U32_SENTINEL, 2])
                 .unwrap(),
-            estimates: planner.context.upload_u32(&[]).unwrap(),
+            proposal_witness: Arc::new(planner.context.upload_u32(&[]).unwrap()),
             rows,
         };
         let choices = planner.enqueue(&inputs).unwrap();
@@ -975,7 +1227,7 @@ mod tests {
 #[allow(clippy::too_many_arguments)]
 fn exact_row_planner(
     viable: &Array<u32>,
-    estimates: &Array<u32>,
+    proposal_witness: &Array<u32>,
     variable_offsets: &Array<u32>,
     variable_arms: &Array<u32>,
     arm_patterns: &Array<u32>,
@@ -993,11 +1245,36 @@ fn exact_row_planner(
         output[output_base + 1usize] = dead;
         output[output_base + 2usize] = dead;
 
-        // Invariant poison is the default. Visit every variable/arm for every
-        // row, including semantically dead rows, so a contradicted sibling can
-        // never mask corruption in another producer lane. This is also the
-        // ordinary selection pass: each exact estimate is read only once.
-        let mut valid_estimates = true;
+        // Invariant poison is the default. Validate every witness for every
+        // row, including semantically dead rows and arms which cannot win the
+        // choice, so a contradiction can never mask producer corruption.
+        let mut valid_witnesses = true;
+        let mut witness_arm = 0u32;
+        while witness_arm < arm_count {
+            let witness_base =
+                (witness_arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+            let base_lo = proposal_witness[witness_base];
+            let base_hi = proposal_witness[witness_base + 1usize];
+            let enum_lo = proposal_witness[witness_base + 2usize];
+            let enum_hi = proposal_witness[witness_base + 3usize];
+            if base_lo == dead
+                || base_hi == dead
+                || enum_lo == dead
+                || enum_hi == dead
+                || base_lo > base_hi
+                || enum_lo > enum_hi
+            {
+                valid_witnesses = false;
+            } else {
+                let base_span = base_hi - base_lo;
+                let enum_span = enum_hi - enum_lo;
+                if enum_span > base_span {
+                    valid_witnesses = false;
+                }
+            }
+            witness_arm += 1u32;
+        }
+
         let mut have_variable = false;
         let mut best_variable = 0u32;
         let mut best_arm = 0u32;
@@ -1013,16 +1290,23 @@ fn exact_row_planner(
                 let mut cursor = start;
                 let mut proposer = variable_arms[cursor as usize];
                 let mut proposer_pattern = arm_patterns[proposer as usize];
-                let mut proposal_count = estimates[proposer as usize * rows as usize + row];
-                if proposal_count == dead {
-                    valid_estimates = false;
+                let mut witness_base =
+                    (proposer as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                let mut enum_lo = proposal_witness[witness_base + 2usize];
+                let mut enum_hi = proposal_witness[witness_base + 3usize];
+                let mut proposal_count = dead;
+                if enum_lo != dead && enum_hi != dead && enum_lo <= enum_hi {
+                    proposal_count = enum_hi - enum_lo;
                 }
                 cursor += 1u32;
                 while cursor < end {
                     let arm = variable_arms[cursor as usize];
-                    let count = estimates[arm as usize * rows as usize + row];
-                    if count == dead {
-                        valid_estimates = false;
+                    witness_base = (arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                    enum_lo = proposal_witness[witness_base + 2usize];
+                    enum_hi = proposal_witness[witness_base + 3usize];
+                    let mut count = dead;
+                    if enum_lo != dead && enum_hi != dead && enum_lo <= enum_hi {
+                        count = enum_hi - enum_lo;
                     }
                     let source_pattern = arm_patterns[arm as usize];
                     if count < proposal_count
@@ -1056,11 +1340,11 @@ fn exact_row_planner(
             variable += 1u32;
         }
 
-        if valid_estimates && viable[row] == 1u32 && have_variable {
+        if valid_witnesses && viable[row] == 1u32 && have_variable {
             output[output_base] = best_variable;
             output[output_base + 1usize] = best_arm;
             output[output_base + 2usize] = best_count;
-        } else if valid_estimates
+        } else if valid_witnesses
             && (viable[row] == 0u32 || (viable[row] == 1u32 && !have_variable))
         {
             // Canonical semantic contradiction. A live zero-arm frontier has

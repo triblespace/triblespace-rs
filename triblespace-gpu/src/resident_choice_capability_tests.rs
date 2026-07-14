@@ -35,11 +35,23 @@ fn choices_keep_exact_frontier_lineage_and_low_level_choices_fail_closed() {
     let frontier_b = round.upload_frontier(&host).unwrap();
     let inputs = round.initialize_inputs(&frontier_a).unwrap();
     let choices = round.enqueue(&inputs).unwrap();
+    let forced = round
+        .force_choice_words_from_inputs_for_test(
+            &frontier_a,
+            &inputs,
+            &choices.read_words_for_test(),
+        )
+        .unwrap();
 
     assert!(round.choice_input_arg(&frontier_a, &choices).is_ok());
+    assert!(round.proposal_inputs(&frontier_a, &forced).is_ok());
     assert_eq!(choices.read().unwrap().len(), 2);
     assert!(matches!(
         round.choice_input_arg(&frontier_b, &choices),
+        Err(ResidentSupportError::ChoiceFrontierOwnership)
+    ));
+    assert!(matches!(
+        round.proposal_inputs(&frontier_b, &forced),
         Err(ResidentSupportError::ChoiceFrontierOwnership)
     ));
 

@@ -95,6 +95,16 @@ fn cpu_restricted_count(
     first: u32,
     last: u32,
 ) -> u32 {
+    let witness = cpu_restricted_witness(archive, rotation, first, last);
+    witness[3] - witness[2]
+}
+
+fn cpu_restricted_witness(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    first: u32,
+    last: u32,
+) -> [u32; PROPOSAL_WITNESS_WORDS] {
     let prefix = match rotation {
         SuccinctRotation::Eav | SuccinctRotation::Eva => &archive.e_a,
         SuccinctRotation::Aev | SuccinctRotation::Ave => &archive.a_a,
@@ -107,7 +117,7 @@ fn cpu_restricted_count(
     let ring = archive.ring_col(rotation);
     let lo_rank = ring.rank(lo, last).unwrap();
     let hi_rank = ring.rank(hi, last).unwrap();
-    u32::try_from(hi_rank - lo_rank).unwrap()
+    [lo as u32, hi as u32, lo_rank as u32, hi_rank as u32]
 }
 
 fn source_code(source: CodeSource, frontier: &ProgramFrontier, row: usize) -> u32 {
@@ -179,10 +189,10 @@ fn reconfigure_restricted_round(
     }
     round.plan.arm_specs = specs.into_boxed_slice();
     round.plan.arm_groups = group_arms(&round.plan.arm_specs);
-    round.initial_estimates = round
+    round.initial_witnesses = round
         .archive
         .context()
-        .upload_u32(&initial_estimates(&round.plan))
+        .upload_u32(&initial_witnesses(&round.plan).unwrap())
         .unwrap();
     round.pair_groups = build_pair_groups(round.archive, &round.plan).unwrap();
     round.restricted_groups = build_restricted_groups(round.archive, &round.plan).unwrap();
@@ -209,6 +219,35 @@ fn representative_pairs(
         }
     }
     [zero.unwrap(), one.unwrap(), many.unwrap()]
+}
+
+#[test]
+fn restricted_producer_retains_exact_interval_witnesses_including_zero_width() {
+    let (set, _) = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let program =
+        QueryProgram::compile(resident.archive(), 3, [QueryPattern::new(v(0), v(1), v(2))])
+            .unwrap();
+    let round = WgpuResidentRound::new(&resident, &program, &[v(0), v(1)]).unwrap();
+    let ArmSpec::Restricted { rotation, .. } = round.plan.arm_specs()[0] else {
+        panic!("two-peer round lowered a non-Restricted witness")
+    };
+    let peers = representative_pairs(round.archive.archive(), rotation);
+    let values = repeated_pairs(&peers, peers.len());
+    let host = program
+        .frontier_from_indices(vec![v(0), v(1)], values, peers.len())
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let expected = peers
+        .into_iter()
+        .flat_map(|(first, last)| {
+            cpu_restricted_witness(round.archive.archive(), rotation, first, last)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.read_proposal_witnesses_for_test(), expected);
+    assert_eq!(expected[3] - expected[2], 0);
 }
 
 fn repeated_pairs(pairs: &[(u32, u32)], rows: usize) -> Vec<u32> {
@@ -777,7 +816,9 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
             5,
         ])
         .unwrap();
-    let mut estimates = context.upload_u32(&[77; 8]).unwrap();
+    let mut witnesses = context
+        .upload_u32(&[77; 8 * PROPOSAL_WITNESS_WORDS])
+        .unwrap();
     let dispatch = context
         .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
         .unwrap();
@@ -789,7 +830,7 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
             descriptors.input_arg(),
             positions.input_arg(),
             ranks.input_arg(),
-            estimates.output_arg(),
+            witnesses.output_arg(),
             rows as u32,
             1,
             1,
@@ -798,14 +839,38 @@ fn normalization_and_scatter_independently_reject_poison_reversal_and_range_erro
         );
     }
     assert_eq!(
-        estimates.read(),
+        witnesses.read(),
         vec![
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
-            0,
-            3,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            2,
+            2,
+            2,
+            2,
+            2,
+            5,
+            2,
+            5,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
         ]

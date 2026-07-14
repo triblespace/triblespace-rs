@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::resident_round::ResidentRowChoice;
-use jerky::bit_vector::Select;
+use jerky::bit_vector::{Rank, Select};
 use triblespace_core::blob::encodings::succinctarchive::query_program::{QueryPattern, QueryTerm};
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::{ExclusiveId, Id};
@@ -70,11 +70,29 @@ fn code(program: &QueryProgram<'_, OrderedUniverse>, id: Id) -> u32 {
         .get()
 }
 
+fn source_code(source: CodeSource, frontier: &ProgramFrontier, row: usize) -> u32 {
+    match source {
+        CodeSource::Constant(code) => code,
+        CodeSource::Column(column) => {
+            frontier.values()[row * frontier.variables().len() + column as usize].get()
+        }
+    }
+}
+
 fn cpu_pair_count(
     archive: &SuccinctArchive<OrderedUniverse>,
     rotation: SuccinctRotation,
     peer: u32,
 ) -> u32 {
+    let witness = cpu_pair_witness(archive, rotation, peer);
+    witness[3] - witness[2]
+}
+
+fn cpu_pair_witness(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    peer: u32,
+) -> [u32; PROPOSAL_WITNESS_WORDS] {
     let prefix = match rotation {
         SuccinctRotation::Eav | SuccinctRotation::Eva => &archive.e_a,
         SuccinctRotation::Aev | SuccinctRotation::Ave => &archive.a_a,
@@ -84,7 +102,13 @@ fn cpu_pair_count(
     let next = peer + 1;
     let lo = prefix.select1(peer).unwrap() - peer;
     let hi = prefix.select1(next).unwrap() - next;
-    archive.distinct_in(archive.pair_changes(rotation), &(lo..hi)) as u32
+    let changes = archive.pair_changes(rotation);
+    [
+        lo as u32,
+        hi as u32,
+        changes.rank1(lo).unwrap() as u32,
+        changes.rank1(hi).unwrap() as u32,
+    ]
 }
 
 fn expected_matrix(
@@ -212,6 +236,68 @@ fn append_arm_major(
         destination.extend_from_slice(&left[arm * left_rows..(arm + 1) * left_rows]);
         destination.extend_from_slice(&right[arm * right_rows..(arm + 1) * right_rows]);
     }
+}
+
+#[test]
+fn present_and_pair_producers_retain_exact_interval_witnesses() {
+    let (set, ids) = fixture_set();
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let resident = WgpuSuccinctArchive::new(archive).unwrap();
+    let program =
+        QueryProgram::compile(resident.archive(), 3, [QueryPattern::new(v(0), v(1), v(2))])
+            .unwrap();
+
+    let present = WgpuResidentRound::new(&resident, &program, &[]).unwrap();
+    let present_frontier = present
+        .upload_frontier(&ProgramFrontier::new(Vec::new(), Vec::new(), 1).unwrap())
+        .unwrap();
+    let present_inputs = present.initialize_inputs(&present_frontier).unwrap();
+    let expected_present = present
+        .plan
+        .arm_specs()
+        .iter()
+        .flat_map(|spec| match spec {
+            ArmSpec::Present { count, .. } => [0, *count, 0, *count],
+            ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => {
+                panic!("zero-peer round lowered a non-Present witness")
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        present_inputs.read_proposal_witnesses_for_test(),
+        expected_present
+    );
+
+    let pair = WgpuResidentRound::new(&resident, &program, &[v(0)]).unwrap();
+    let peers = [
+        code(&program, ids.entities[0]),
+        code(&program, ids.values[2]),
+    ];
+    let pair_host = program
+        .frontier_from_indices(vec![v(0)], peers.to_vec(), peers.len())
+        .unwrap();
+    let pair_frontier = pair.upload_frontier(&pair_host).unwrap();
+    let pair_inputs = pair.initialize_inputs(&pair_frontier).unwrap();
+    let mut expected_pair = Vec::new();
+    for &spec in pair.plan.arm_specs() {
+        let ArmSpec::PairDistinct { rotation, peer, .. } = spec else {
+            panic!("one-peer round lowered a non-Pair witness")
+        };
+        for row in 0..peers.len() {
+            expected_pair.extend(cpu_pair_witness(
+                pair.archive.archive(),
+                rotation,
+                source_code(peer, &pair_host, row),
+            ));
+        }
+    }
+    assert_eq!(
+        pair_inputs.read_proposal_witnesses_for_test(),
+        expected_pair
+    );
+    assert!(expected_pair
+        .chunks_exact(PROPOSAL_WITNESS_WORDS)
+        .any(|witness| witness[2] == witness[3]));
 }
 
 #[test]
@@ -530,7 +616,9 @@ fn pair_scatter_rejects_noncanonical_and_non_lipschitz_rank_intervals() {
     let ranks = context
         .upload_u32(&[1, 1, 1, 4, 0, 1, 1, 2, 1, 2, 1, 3])
         .unwrap();
-    let mut estimates = context.upload_u32(&[77; 6]).unwrap();
+    let mut witnesses = context
+        .upload_u32(&[77; 6 * PROPOSAL_WITNESS_WORDS])
+        .unwrap();
     let dispatch = context
         .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
         .unwrap();
@@ -542,7 +630,7 @@ fn pair_scatter_rejects_noncanonical_and_non_lipschitz_rank_intervals() {
             descriptors.input_arg(),
             positions.input_arg(),
             ranks.input_arg(),
-            estimates.output_arg(),
+            witnesses.output_arg(),
             rows as u32,
             1,
             1,
@@ -552,10 +640,28 @@ fn pair_scatter_rejects_noncanonical_and_non_lipschitz_rank_intervals() {
         );
     }
     assert_eq!(
-        estimates.read(),
+        witnesses.read(),
         vec![
-            0,
-            3,
+            2,
+            2,
+            1,
+            1,
+            2,
+            5,
+            1,
+            4,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
+            RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
             RESIDENT_U32_SENTINEL,
