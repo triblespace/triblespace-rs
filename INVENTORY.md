@@ -155,6 +155,22 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
+- Candidate-granular residual pages can reconverge multiple virtual
+  zero-column parents into one state, although `RowsView` has exactly one
+  canonical empty-binding seed row. The ignored
+  `candidate_pages_preserve_zero_stride_parent` regression reproduces the
+  resulting assertion; normalize zero-stride parent identity during candidate
+  append/split before promoting the probe.
+- A partially surviving candidate page with occupancy below the current lazy
+  width is parked while untouched lower-rank sibling pages continue scanning.
+  At fanout 16,384 this erases the first-result win for even a second-page hit;
+  add an explicit depth-first continuation preference that remains compatible
+  with canonical bucket merging and geometric growth.
+- WGPU rank admission should account for the residual scheduler's geometric
+  page fragmentation. On the measured M4, the shared 8K-probe gate slowed a
+  16K-fanout page drain, while a 32K-probe gate avoided that loss and reduced
+  32K/65K absent drains with one/two device dispatches. Calibrate this as an
+  execution-policy choice rather than transplanting one backend threshold.
 - Publish the checked Rank9 sidecar seam as a new Jerky crate version, then
   replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an

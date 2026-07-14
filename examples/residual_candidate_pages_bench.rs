@@ -1,7 +1,8 @@
 //! PROBE: candidate-granular residual confirmation on one high-fanout parent.
 //!
 //! Usage:
-//!     cargo run --release --example residual_candidate_pages_bench -- [fanout=16384] [reps=21]
+//!     cargo run --release --example residual_candidate_pages_bench -- \
+//!         [fanout=16384] [reps=21] [case=all]
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Instant;
@@ -15,6 +16,8 @@ use triblespace::core::query::{
     VariableContext, VariableId, VariableSet,
 };
 use triblespace::core::trible::{Trible, TribleSet};
+#[cfg(feature = "gpu")]
+use triblespace::gpu::{WgpuQueryStats, WgpuSuccinctArchive, DEFAULT_MIN_RANK_BATCH};
 use triblespace::prelude::*;
 
 #[derive(Clone)]
@@ -188,6 +191,46 @@ fn run<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode, first: bool) -
     }
 }
 
+#[cfg(feature = "gpu")]
+type ExactRow = (RawInline, RawInline);
+
+#[cfg(feature = "gpu")]
+fn collect_exact<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode) -> Vec<ExactRow> {
+    let mut context = VariableContext::new();
+    let p = context.next_variable::<inlineencodings::GenId>();
+    let x = context.next_variable::<inlineencodings::GenId>();
+    let attrs = fixture.attrs.map(inlineencodings::GenId::inline_from);
+
+    let mut rows = match mode {
+        Mode::ResidualAtomic => {
+            let root = IntersectionConstraint::new(vec![
+                Atomic(store.pattern(p, attrs[0], x)),
+                Atomic(store.pattern(p, attrs[1], x)),
+                Atomic(store.pattern(p, attrs[2], x)),
+            ]);
+            Query::new(root, move |binding| project(binding, p.index, x.index))
+                .solve_residual_state_lazy()
+                .collect()
+        }
+        Mode::Sequential | Mode::Dag | Mode::ResidualPaged => {
+            let root = IntersectionConstraint::new(vec![
+                store.pattern(p, attrs[0], x),
+                store.pattern(p, attrs[1], x),
+                store.pattern(p, attrs[2], x),
+            ]);
+            let query = Query::new(root, move |binding| project(binding, p.index, x.index));
+            match mode {
+                Mode::Sequential => query.sequential().collect(),
+                Mode::Dag => query.solve_dag(),
+                Mode::ResidualPaged => query.solve_residual_state_lazy().collect(),
+                Mode::ResidualAtomic => unreachable!(),
+            }
+        }
+    };
+    rows.sort_unstable();
+    rows
+}
+
 fn paged_first_profile<S: TriblePattern>(
     store: &S,
     fixture: Fixture,
@@ -293,6 +336,269 @@ fn bench_backend<S: TriblePattern>(
     );
 }
 
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+struct RankCase {
+    label: &'static str,
+    threshold: Option<usize>,
+}
+
+#[cfg(feature = "gpu")]
+const RANK_CASES: [RankCase; 5] = [
+    RankCase {
+        label: "canonical-cpu",
+        threshold: None,
+    },
+    RankCase {
+        label: "wrapper-cpu",
+        threshold: Some(usize::MAX),
+    },
+    RankCase {
+        label: "gated-wgpu",
+        threshold: Some(DEFAULT_MIN_RANK_BATCH),
+    },
+    RankCase {
+        label: "coarse-gate-4x",
+        threshold: Some(DEFAULT_MIN_RANK_BATCH * 4),
+    },
+    RankCase {
+        label: "forced-wgpu",
+        threshold: Some(1),
+    },
+];
+
+#[cfg(feature = "gpu")]
+const BALANCED_CASE_ORDERS: [[usize; 5]; 5] = [
+    [0, 1, 2, 3, 4],
+    [1, 2, 3, 4, 0],
+    [2, 3, 4, 0, 1],
+    [3, 4, 0, 1, 2],
+    [4, 0, 1, 2, 3],
+];
+
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy)]
+struct RankMeasurement {
+    elapsed_us: f64,
+    signature: (usize, u64),
+    stats: Option<WgpuQueryStats>,
+}
+
+#[cfg(feature = "gpu")]
+fn configure_rank_case(case: RankCase, gpu: &mut WgpuSuccinctArchive<OrderedUniverse>) {
+    if let Some(threshold) = case.threshold {
+        gpu.set_min_rank_batch(threshold);
+        gpu.reset_stats();
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn run_rank_case(
+    case: RankCase,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    gpu: &WgpuSuccinctArchive<OrderedUniverse>,
+    fixture: Fixture,
+    mode: Mode,
+    first: bool,
+) -> (usize, u64) {
+    if case.threshold.is_some() {
+        run(gpu, fixture, mode, first)
+    } else {
+        run(archive, fixture, mode, first)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn collect_rank_case(
+    case: RankCase,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    gpu: &WgpuSuccinctArchive<OrderedUniverse>,
+    fixture: Fixture,
+    mode: Mode,
+) -> Vec<ExactRow> {
+    if case.threshold.is_some() {
+        collect_exact(gpu, fixture, mode)
+    } else {
+        collect_exact(archive, fixture, mode)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn format_rank_stats(stats: Option<WgpuQueryStats>) -> String {
+    let Some(stats) = stats else {
+        return "rank=canonical CPU".to_owned();
+    };
+    let gpu_range = match (stats.min_gpu_batch, stats.max_gpu_batch) {
+        (Some(min), Some(max)) => format!("{min}/{max}"),
+        _ => "n/a".to_owned(),
+    };
+    format!(
+        "GPU dispatches/probes {}/{} (min/max {}); CPU batches/probes {}/{}",
+        stats.gpu_dispatches,
+        stats.gpu_probes,
+        gpu_range,
+        stats.cpu_fallback_batches,
+        stats.cpu_fallback_probes,
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn measure_rank_case(
+    case: RankCase,
+    archive: &SuccinctArchive<OrderedUniverse>,
+    gpu: &mut WgpuSuccinctArchive<OrderedUniverse>,
+    fixture: Fixture,
+    mode: Mode,
+    first: bool,
+) -> RankMeasurement {
+    configure_rank_case(case, gpu);
+    let started = Instant::now();
+    let signature = run_rank_case(case, archive, gpu, fixture, mode, first);
+    RankMeasurement {
+        elapsed_us: started.elapsed().as_secs_f64() * 1e6,
+        signature,
+        stats: case.threshold.map(|_| gpu.stats()),
+    }
+}
+
+/// Controlled comparison of the same resident rank backend used by the DAG
+/// accelerator probe. Candidate-page residual confirmation reaches this
+/// backend directly; the rank counters therefore expose exactly how paging
+/// changes accelerator admission and dispatch fragmentation.
+#[cfg(feature = "gpu")]
+fn bench_wgpu_backend(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    fixture: Fixture,
+    expected: usize,
+    reps: usize,
+) {
+    let prepared = Instant::now();
+    let mut gpu = WgpuSuccinctArchive::new(archive.clone())
+        .expect("failed to prepare SuccinctArchive ring columns for WGPU");
+    eprintln!(
+        "  WGPU adapter construction/device enqueue: {:?}",
+        prepared.elapsed()
+    );
+
+    // Synchronize deferred upload and compile the rank pipeline outside every
+    // timed sample. This uses the ordinary DAG, exactly as the established
+    // reconvergence benchmark does.
+    let canonical_ready = run(archive, fixture, Mode::Dag, false);
+    gpu.set_min_rank_batch(1);
+    gpu.reset_stats();
+    let ready_started = Instant::now();
+    let gpu_ready = run(&gpu, fixture, Mode::Dag, false);
+    let ready_elapsed = ready_started.elapsed();
+    let ready_stats = gpu.stats();
+    assert_eq!(gpu_ready, canonical_ready, "WGPU setup query parity");
+    eprintln!(
+        "  first forced-WGPU setup query: {ready_elapsed:?}; {}",
+        format_rank_stats(Some(ready_stats)),
+    );
+
+    let modes = [
+        ("dag", Mode::Dag),
+        ("res-atomic", Mode::ResidualAtomic),
+        ("res-paged", Mode::ResidualPaged),
+    ];
+    println!("  WGPU rank executor comparison (exact sorted bag parity):");
+
+    for (mode_index, &(mode_name, mode)) in modes.iter().enumerate() {
+        let canonical_rows = collect_exact(archive, fixture, mode);
+        assert_eq!(
+            canonical_rows.len(),
+            expected,
+            "canonical {mode_name} count"
+        );
+        let canonical_signature = run(archive, fixture, mode, false);
+        for &case in &RANK_CASES[1..] {
+            configure_rank_case(case, &mut gpu);
+            let rows = collect_rank_case(case, archive, &gpu, fixture, mode);
+            assert_eq!(
+                rows, canonical_rows,
+                "{} {mode_name} exact output bag differs from canonical CPU",
+                case.label,
+            );
+        }
+
+        // Equally warm each policy for both demand shapes before timing.
+        for case_index in BALANCED_CASE_ORDERS[mode_index] {
+            let case = RANK_CASES[case_index];
+            let first = measure_rank_case(case, archive, &mut gpu, fixture, mode, true);
+            let full = measure_rank_case(case, archive, &mut gpu, fixture, mode, false);
+            assert_eq!(
+                first.signature.0,
+                expected.min(1),
+                "{} {mode_name} warm TTFR",
+                case.label
+            );
+            assert_eq!(
+                full.signature, canonical_signature,
+                "{} {mode_name} warm drain",
+                case.label
+            );
+        }
+
+        let mut first_runs: [Vec<RankMeasurement>; 5] =
+            std::array::from_fn(|_| Vec::with_capacity(reps));
+        let mut full_runs: [Vec<RankMeasurement>; 5] =
+            std::array::from_fn(|_| Vec::with_capacity(reps));
+        for repetition in 0..reps {
+            let order = BALANCED_CASE_ORDERS[(repetition + mode_index) % RANK_CASES.len()];
+            for case_index in order {
+                let case = RANK_CASES[case_index];
+                let first = measure_rank_case(case, archive, &mut gpu, fixture, mode, true);
+                assert_eq!(
+                    first.signature.0,
+                    expected.min(1),
+                    "{} {mode_name} TTFR repetition {}",
+                    case.label,
+                    repetition + 1,
+                );
+                first_runs[case_index].push(first);
+
+                let full = measure_rank_case(case, archive, &mut gpu, fixture, mode, false);
+                assert_eq!(
+                    full.signature,
+                    canonical_signature,
+                    "{} {mode_name} drain repetition {}",
+                    case.label,
+                    repetition + 1,
+                );
+                full_runs[case_index].push(full);
+            }
+        }
+
+        println!("    scheduler: {mode_name}");
+        for (case_index, case) in RANK_CASES.iter().enumerate() {
+            let first_times: Vec<_> = first_runs[case_index]
+                .iter()
+                .map(|run| run.elapsed_us)
+                .collect();
+            let full_times: Vec<_> = full_runs[case_index]
+                .iter()
+                .map(|run| run.elapsed_us)
+                .collect();
+            println!(
+                "      {:<14} first med/p95 {:>10.1}/{:>10.1} us  full med/p95 {:>10.1}/{:>10.1} us",
+                case.label,
+                percentile(&first_times, 0.5),
+                percentile(&first_times, 0.95),
+                percentile(&full_times, 0.5),
+                percentile(&full_times, 0.95),
+            );
+            println!(
+                "        first: {}",
+                format_rank_stats(first_runs[case_index][0].stats),
+            );
+            println!(
+                "        full:  {}",
+                format_rank_stats(full_runs[case_index][0].stats),
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let fanout = args
@@ -300,14 +606,20 @@ fn main() {
         .and_then(|arg| arg.parse().ok())
         .unwrap_or(16_384);
     let reps = args.get(2).and_then(|arg| arg.parse().ok()).unwrap_or(21);
+    let case_filter = args.get(3).map(String::as_str).unwrap_or("all");
     assert!(fanout > 1);
     assert!(reps > 0);
 
     for (label, common) in [
-        ("common-low", Some(0)),
-        ("common-high", Some(fanout - 1)),
+        ("common-high-first-page", Some(fanout - 1)),
+        ("common-second-page", Some(fanout - 2)),
+        ("common-midpoint", Some(fanout / 2)),
+        ("common-low-last-page", Some(0)),
         ("absent", None),
     ] {
+        if case_filter != "all" && case_filter != label {
+            continue;
+        }
         let (set, fixture) = build(fanout, common);
         assert_eq!(fixture.person, id(1, 0));
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
@@ -326,5 +638,7 @@ fn main() {
             usize::from(common.is_some()),
             reps,
         );
+        #[cfg(feature = "gpu")]
+        bench_wgpu_backend(&archive, fixture, usize::from(common.is_some()), reps);
     }
 }

@@ -137,6 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Residual candidate paging gains real-WGPU and position-sensitive probes.**
+  The high-fanout benchmark now checks exact sorted bags across canonical CPU,
+  wrapper CPU, default/coarse accelerator admission, and forced WGPU rank
+  execution while reporting first-result/full-drain timing and rank dispatch
+  sizes. First-page, second-page, midpoint, last-page, and absent placements
+  expose scheduler-order effects. An ignored zero-column regression gate
+  captures the probe's known multi-seed reconvergence panic, while its
+  nonzero-column sibling verifies exact parent-tag preservation.
 - **Piles use one authoritative PATCH replay path.** The unpublished alternate
   locator-sidecar API, overlays, and CLI were removed before release. Refresh
   retains the useful one-observed-length optimization: each pass decodes one
