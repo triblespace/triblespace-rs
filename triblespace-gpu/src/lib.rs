@@ -4,6 +4,8 @@ use std::fmt;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
+#[cfg(all(test, feature = "wgpu"))]
+mod resident_ordered_oracle;
 #[cfg(feature = "wgpu")]
 mod resident_program;
 #[cfg(feature = "wgpu")]
