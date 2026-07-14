@@ -136,7 +136,7 @@ fn assert_matches_witnessed(
         assert_eq!(
             relevant.len(),
             1,
-            "exact pre-confirmation parity requires one relevant arm"
+            "this confirmation-free oracle helper requires one relevant arm"
         );
         assert_eq!(
             &inspection.proposer_arms[start..end],
@@ -625,6 +625,22 @@ fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_
     );
     assert_eq!(provisional.segments[0].count, 1);
 
+    let confirmed_arena = wired.enqueue(&resident, 4).unwrap();
+    assert_eq!(confirmed_arena.read_confirmation_keep_for_test()[0], 0);
+    let confirmed_inspection = confirmed_arena.inspect();
+    assert_success(&confirmed_inspection, 0);
+    assert!(confirmed_inspection
+        .segments
+        .iter()
+        .all(|segment| segment.base == 0 && segment.count == 0));
+    assert!(confirmed_inspection
+        .candidate_codes
+        .iter()
+        .chain(&confirmed_inspection.candidate_owners)
+        .chain(&confirmed_inspection.proposer_arms)
+        .chain(&confirmed_inspection.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
     let relevant = round.metadata().relevant_arm_ids(variables[0]).unwrap();
     assert_eq!(relevant.len(), 3);
     let mut descriptors = lower_present_admission(round).unwrap().arm_descriptors;
@@ -641,7 +657,7 @@ fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_
     let later_sibling = relevant[2] as usize * ARM_DESCRIPTOR_WORDS;
     descriptors[later_sibling + 1] = 3;
     let poisoned = round
-        .enqueue_present_proposals_with_trusted_descriptors_for_test(
+        .enqueue_confirmed_present_proposals_with_trusted_descriptors_for_test(
             &resident,
             &choices,
             4,
@@ -652,7 +668,158 @@ fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_
         poisoned.read_confirmation_keep_for_test()[0],
         RESIDENT_U32_SENTINEL
     );
-    assert_success(&poisoned.inspect(), 1);
+    let poisoned = poisoned.inspect();
+    assert_eq!(poisoned.status, STATUS_DEVICE_INVARIANT);
+    assert_eq!(poisoned.required, RESIDENT_U32_SENTINEL);
+    assert_eq!(poisoned.logical_len, 0);
+    assert_eq!((poisoned.dispatch_x, poisoned.dispatch_y), (0, 1));
+    assert!(poisoned.segments.iter().all(|segment| {
+        segment.base == RESIDENT_U32_SENTINEL
+            && segment.count == RESIDENT_U32_SENTINEL
+            && segment.variable == RESIDENT_U32_SENTINEL
+            && segment.insertion == RESIDENT_U32_SENTINEL
+    }));
+    assert!(poisoned
+        .candidate_codes
+        .iter()
+        .chain(&poisoned.candidate_owners)
+        .chain(&poisoned.proposer_arms)
+        .chain(&poisoned.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn confirmed_publication_stably_scatter_holes_and_preserves_owner_and_proposer() {
+    let entities = [ordered_id(0, 1), ordered_id(0, 2), ordered_id(0, 3)];
+    let extra = ordered_id(2, 4);
+    let attributes = [ordered_id(1, 10), ordered_id(1, 11), ordered_id(1, 12)];
+    let mut set = TribleSet::new();
+    insert(&mut set, entities[0], attributes[0], entities[0]);
+    insert(&mut set, entities[1], attributes[1], extra);
+    insert(&mut set, entities[2], attributes[2], entities[2]);
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = (0..5).map(ProgramVariable::new).collect::<Vec<_>>();
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        5,
+        [
+            QueryPattern::new(variables[0], variables[1], variables[2]),
+            QueryPattern::new(variables[3], variables[4], variables[0]),
+        ],
+    )
+    .unwrap();
+    let wired = WgpuResidentWiredRound::new(&gpu, &program, &[]).unwrap();
+    let seed = ProgramFrontier::seed();
+    let resident = wired.upload_frontier(&seed).unwrap();
+    let round = wired.staged_round();
+    let inputs = round.initialize_inputs(&resident).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let provisional_arena = round
+        .enqueue_present_proposals(&resident, &choices, 4)
+        .unwrap();
+    let keep = provisional_arena.read_confirmation_keep_for_test();
+    assert_eq!(keep, [1, 0, 1, 0]);
+    let provisional = provisional_arena.inspect();
+    assert_success(&provisional, 3);
+
+    let entity_codes = entities.map(|entity| program.encode(&raw(entity)).unwrap().get());
+    let relevant = round.metadata().relevant_arm_ids(variables[0]).unwrap();
+    assert_eq!(relevant.len(), 2);
+    assert_eq!(&provisional.candidate_codes[..3], &entity_codes);
+    assert_eq!(&provisional.candidate_owners[..3], &[0, 0, 0]);
+    assert_eq!(&provisional.proposer_arms[..3], &[relevant[0]; 3]);
+
+    let confirmed = wired.enqueue(&resident, 4).unwrap().inspect();
+    assert_success(&confirmed, 2);
+    let record = confirmed
+        .segments
+        .iter()
+        .find(|segment| segment.variable == variables[0].index() as u32)
+        .unwrap();
+    assert_eq!((record.base, record.count), (0, 2));
+    assert_eq!(
+        &confirmed.candidate_codes[..2],
+        &[entity_codes[0], entity_codes[2]]
+    );
+    assert_eq!(&confirmed.candidate_owners[..2], &[0, 0]);
+    assert_eq!(&confirmed.proposer_arms[..2], &[relevant[0], relevant[0]]);
+    assert_eq!(
+        &confirmed.child_body[..2],
+        &[entity_codes[0], entity_codes[2]]
+    );
+    assert!(confirmed
+        .candidate_codes
+        .iter()
+        .skip(2)
+        .chain(confirmed.candidate_owners.iter().skip(2))
+        .chain(confirmed.proposer_arms.iter().skip(2))
+        .chain(confirmed.child_body.iter().skip(2))
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn confirmed_publication_uses_provisional_dispatch_at_exact_block_capacity() {
+    let entities = (0..64u16)
+        .map(|ordinal| ordered_id(0, ordinal + 1))
+        .collect::<Vec<_>>();
+    let attributes = (0..64u16)
+        .map(|ordinal| ordered_id(1, ordinal + 100))
+        .collect::<Vec<_>>();
+    let mut set = TribleSet::new();
+    for index in 0..64usize {
+        let value = if index == 63 {
+            entities[63]
+        } else {
+            ordered_id(2, index as u16 + 1000)
+        };
+        insert(&mut set, entities[index], attributes[index], value);
+    }
+    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = (0..5).map(ProgramVariable::new).collect::<Vec<_>>();
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        5,
+        [
+            QueryPattern::new(variables[0], variables[1], variables[2]),
+            QueryPattern::new(variables[3], variables[4], variables[0]),
+        ],
+    )
+    .unwrap();
+    let wired = WgpuResidentWiredRound::new(&gpu, &program, &[]).unwrap();
+    let seed = ProgramFrontier::seed();
+    let resident = wired.upload_frontier(&seed).unwrap();
+    let round = wired.staged_round();
+    let inputs = round.initialize_inputs(&resident).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let provisional = round
+        .enqueue_present_proposals(&resident, &choices, 64)
+        .unwrap();
+    let keep = provisional.read_confirmation_keep_for_test();
+    assert!(keep[..63].iter().all(|&word| word == 0));
+    assert_eq!(keep[63], 1);
+    assert_success(&provisional.inspect(), 64);
+
+    // Survivor dispatch has one lane, which cannot reach source 63. This only
+    // succeeds when both scatters consume the provisional T=64 dispatch; the
+    // same T==capacity boundary also forbids reading prefix storage at index 64.
+    let confirmed = wired.enqueue(&resident, 64).unwrap().inspect();
+    assert_success(&confirmed, 1);
+    let last_code = program.encode(&raw(entities[63])).unwrap().get();
+    let proposer = round.metadata().relevant_arm_ids(variables[0]).unwrap()[0];
+    assert_eq!(confirmed.candidate_codes[0], last_code);
+    assert_eq!(confirmed.candidate_owners[0], 0);
+    assert_eq!(confirmed.proposer_arms[0], proposer);
+    assert_eq!(confirmed.child_body[0], last_code);
+    assert!(confirmed
+        .candidate_codes
+        .iter()
+        .skip(1)
+        .chain(confirmed.candidate_owners.iter().skip(1))
+        .chain(confirmed.proposer_arms.iter().skip(1))
+        .chain(confirmed.child_body.iter().skip(1))
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 fn extension_set(include_second_entity: bool) -> (TribleSet, Id, Id) {

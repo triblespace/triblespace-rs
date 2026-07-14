@@ -1,4 +1,4 @@
-//! Private provisional proposal arena for one archive-resident affine round.
+//! Private confirmed proposal arena for one archive-resident affine round.
 //!
 //! This first slice admits only zero-peer [`ArmSpec::Present`] proposers. It
 //! classifies packed row choices into a variable-major `S * R` width vector,
@@ -7,15 +7,13 @@
 //! the grouping operation: no sort, cutoff, deduplication, or cross-row choice
 //! exists anywhere in the pipeline.
 //!
-//! The arena is deliberately crate-private and provisional. A candidate-major
-//! kernel computes exact tri-state confirmation for the currently admitted
-//! all-Present domain, but stable survivor compaction is deferred, so the
-//! published arena remains the pre-confirmation superset rather than a public
-//! query transition. Every semantic buffer starts poisoned; one sticky
-//! finalizer records either a complete provisional batch or an error, candidate
-//! generation runs only for the former, and Jerky's logical length remains zero
-//! until the indirect child materializer finishes. Insufficient capacity and
-//! malformed device choices can therefore never expose a partial prefix.
+//! The low-level arena primitive remains explicitly provisional for focused
+//! staging tests. The wired capability confirms every candidate, scans its
+//! tri-state keep vector, and stably scatters survivors into distinct final
+//! candidate and child buffers. Every semantic buffer starts poisoned; sticky
+//! finalizers record either a complete batch or an error, and Jerky's logical
+//! length remains zero until the last scatter finishes. Insufficient capacity
+//! and malformed device choices can therefore never expose a partial prefix.
 //!
 //! Scratch and immutable plan regions are physically packed. The largest
 //! shader has seven user storage arrays, reserving baseline WGPU's eighth slot
@@ -29,13 +27,12 @@
 //! seed-frontier width parallel without changing the stable ordering law. The
 //! same exact indirect rectangle drives child materialization.
 //!
-//! The poison-filled canonical child body is likewise a reference artifact in
-//! this slice: it proves insertion and ordered parity. Confirmation resolves
-//! every relevant Present descriptor from the candidate code, owner, proposer,
-//! and immutable per-variable CSR; its private keep vector will drive a later
-//! stable compaction into distinct final buffers.
+//! Confirmation resolves every relevant Present descriptor from the candidate
+//! code, owner, proposer, and immutable per-variable CSR. Its private backing
+//! remains alive beneath confirmed wired publication, so compaction is never
+//! performed in place.
 
-#![allow(dead_code)] // The following resident confirmation slice consumes this arena.
+#![allow(dead_code)] // The following resident scheduler slice consumes this arena.
 
 use std::error::Error;
 use std::fmt;
@@ -148,17 +145,18 @@ impl From<jerky::Error> for ResidentProposalError {
     }
 }
 
-/// Opaque pre-confirmation children grouped by ascending unbound variable.
+/// Opaque proposal children grouped by ascending unbound variable.
 ///
 /// `segment_records` stores `[body_base, count, variable, insertion]`. The
 /// body base is measured in child rows, not words. Candidate codes and owners
-/// share that same logical row index. All three semantic allocations retain
-/// their poison tail through the capacity boundary.
+/// share that same logical row index. Wired construction exposes confirmed
+/// survivors; explicit low-level staging seams expose the provisional backing.
+/// All semantic allocations retain their poison tail through capacity.
 pub(crate) struct WgpuResidentProposals {
     context: GpuContext<WgpuRuntime>,
     round_owner: Arc<()>,
     frontier_lineage: Arc<()>,
-    /// Unique lineage for this exact provisional arena allocation.
+    /// Unique lineage for this exact published arena allocation.
     arena_lineage: Arc<()>,
     rows: usize,
     parent_stride: usize,
@@ -171,11 +169,29 @@ pub(crate) struct WgpuResidentProposals {
     segment_records: DeviceU32Buffer<WgpuRuntime>,
     candidate_records: DeviceU32Buffer<WgpuRuntime>,
     child_body: DeviceU32Buffer<WgpuRuntime>,
-    /// Tri-state Present-sibling result for every provisional destination.
-    /// This remains private until the following stable-compaction slice.
-    confirmation_keep: DeviceU32Buffer<WgpuRuntime>,
+    /// Packed tri-state confirmation scan and sticky publication state.
+    confirmation_workspace: DeviceU32Buffer<WgpuRuntime>,
+    confirmation_layout: ConfirmationWorkspaceLayout,
+    /// Confirmed publication retains every provisional source allocation on
+    /// which its already-enqueued stable scatters depend.
+    provisional_backing: Option<Box<ProvisionalBacking>>,
     #[cfg(test)]
     stage_profiles: Option<ProposalStageProfiles>,
+}
+
+struct ProvisionalBacking {
+    _control: DeviceU32Buffer<WgpuRuntime>,
+    _meta: DeviceBatchMeta<WgpuRuntime>,
+    _dispatch: DeviceDispatch<WgpuRuntime>,
+    _segment_records: DeviceU32Buffer<WgpuRuntime>,
+    _candidate_records: DeviceU32Buffer<WgpuRuntime>,
+    _child_body: DeviceU32Buffer<WgpuRuntime>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PresentPublication {
+    Provisional,
+    Confirmed,
 }
 
 #[cfg(test)]
@@ -219,6 +235,7 @@ struct PresentGeometry {
     candidate_record_words: usize,
     child_words: usize,
     workspace_layout: WorkspaceLayout,
+    confirmation_layout: ConfirmationWorkspaceLayout,
 }
 
 /// One opaque pairing of the exact semantic admission and its host geometry.
@@ -247,6 +264,20 @@ struct WorkspaceLayout {
     words: usize,
 }
 
+/// Physical regions in the one confirmation/publication workspace.
+#[derive(Clone, Copy)]
+struct ConfirmationWorkspaceLayout {
+    keep: usize,
+    local_offsets: usize,
+    block_sums: usize,
+    block_errors: usize,
+    block_offsets: usize,
+    final_status: usize,
+    final_total: usize,
+    block_count: usize,
+    words: usize,
+}
+
 #[derive(Clone, Copy)]
 struct PlanLayout {
     arm_descriptors: usize,
@@ -256,15 +287,14 @@ struct PlanLayout {
     variable_to_segment: usize,
 }
 
-/// Schema-specialized capability for one provisional Present-only round.
+/// Schema-specialized capability for one confirmed Present-only round.
 ///
 /// This private object is reusable across affine frontiers with the same
 /// `(program, bound-variable mask)`. It lowers Present admission once, rejects
 /// terminal and unsupported schemas before any producer kernel can launch,
 /// then wires support, tri-state planning, destination-parallel proposals and
-/// reference child materialization into one device command chain. Its output
-/// is explicitly pre-confirmation: a shared variable with multiple source
-/// arms may still contain candidates which sibling confirmation will remove.
+/// reference child materialization, exact confirmation, and stable survivor
+/// publication into one device command chain.
 struct WgpuResidentWiredRound<'a, U: Universe> {
     round: WgpuResidentRound<'a, U>,
     admission: PresentAdmission,
@@ -295,7 +325,7 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
         self.round.upload_frontier(frontier).map_err(Into::into)
     }
 
-    /// Enqueues one whole provisional nonterminal round without synchronizing.
+    /// Enqueues one whole confirmed nonterminal round without synchronizing.
     fn enqueue(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -314,6 +344,7 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
                 admission: &self.admission,
                 geometry,
             },
+            PresentPublication::Confirmed,
         )
     }
 
@@ -331,7 +362,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         choices: &ResidentRowChoices<WgpuRuntime>,
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
-        self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None, false)
+        self.enqueue_present_proposals_inner(
+            frontier,
+            choices,
+            capacity,
+            None,
+            None,
+            false,
+            PresentPublication::Provisional,
+        )
     }
 
     /// Enqueues one pre-admitted, preflighted provisional arena.
@@ -345,9 +384,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         frontier: &WgpuResidentFrontier<'_, U>,
         choices: &ResidentRowChoices<WgpuRuntime>,
         preflight: PresentPreflight<'_>,
+        publication: PresentPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        self.enqueue_present_proposals_with_inputs(inputs, preflight, None, None, false)
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            preflight,
+            None,
+            None,
+            false,
+            publication,
+        )
     }
 
     #[cfg(test)]
@@ -365,6 +412,26 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             Some(arm_descriptors),
             None,
             false,
+            PresentPublication::Provisional,
+        )
+    }
+
+    #[cfg(test)]
+    fn enqueue_confirmed_present_proposals_with_trusted_descriptors_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+        arm_descriptors: &[u32],
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        self.enqueue_present_proposals_inner(
+            frontier,
+            choices,
+            capacity,
+            Some(arm_descriptors),
+            None,
+            false,
+            PresentPublication::Confirmed,
         )
     }
 
@@ -386,6 +453,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None,
             Some((max_groups_x, max_groups_y)),
             false,
+            PresentPublication::Provisional,
         )
     }
 
@@ -400,9 +468,18 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         choices: &ResidentRowChoices<WgpuRuntime>,
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
-        self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None, true)
+        self.enqueue_present_proposals_inner(
+            frontier,
+            choices,
+            capacity,
+            None,
+            None,
+            true,
+            PresentPublication::Provisional,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_present_proposals_inner(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -411,6 +488,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
         _profile_stages: bool,
+        publication: PresentPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_present_admission(self)?;
@@ -424,6 +502,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             descriptor_override,
             dispatch_limits,
             _profile_stages,
+            publication,
         )
     }
 
@@ -435,6 +514,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
         _profile_stages: bool,
+        publication: PresentPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let context = self.archive().context();
         let admission = preflight.admission;
@@ -451,6 +531,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             candidate_record_words,
             child_words,
             workspace_layout,
+            confirmation_layout,
         } = preflight.geometry;
         if inputs.rows != rows || inputs.parent_stride != parent_stride {
             return Err(ResidentProposalError::MalformedPlan);
@@ -580,9 +661,12 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let mut segment_records = context.empty_u32(segment_record_words)?;
         let mut candidate_records = context.empty_u32(candidate_record_words)?;
         let mut child_body = context.empty_u32(child_words)?;
-        let mut confirmation_keep = context.empty_u32(capacity)?;
+        let mut confirmation_workspace = context.empty_u32(confirmation_layout.words)?;
 
-        let poison_len = segment_record_words.max(capacity).max(child_words);
+        let poison_len = segment_record_words
+            .max(capacity)
+            .max(child_words)
+            .max(confirmation_layout.words);
         if poison_len != 0 {
             let dispatch =
                 context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?;
@@ -594,10 +678,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     segment_records.output_arg(),
                     candidate_records.output_arg(),
                     child_body.output_arg(),
-                    confirmation_keep.output_arg(),
+                    confirmation_workspace.output_arg(),
                     segment_record_words as u32,
                     capacity as u32,
                     child_words as u32,
+                    confirmation_layout.words as u32,
                     RESIDENT_U32_SENTINEL,
                 );
             }
@@ -711,8 +796,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // One invocation confirms one provisional destination against every
         // stable relevant Present arm. The exact proposer arm is structurally
         // validated but skipped semantically, matching QueryProgram's
-        // propose-then-confirm contract. This tri-state vector is deliberately
-        // not yet published: the next slice performs its stable compaction.
+        // propose-then-confirm contract. Wired publication scans and compacts
+        // this private tri-state vector; low-level staging returns before that
+        // publication boundary.
         unsafe {
             confirm_present_candidates::launch_unchecked::<WgpuRuntime>(
                 context.client(),
@@ -724,7 +810,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 self.archive().present_entity_codes().input_arg(),
                 self.archive().present_attribute_codes().input_arg(),
                 self.archive().present_value_codes().input_arg(),
-                confirmation_keep.output_arg(),
+                confirmation_workspace.output_arg(),
                 inputs.rows as u32,
                 admission.segment_count as u32,
                 capacity as u32,
@@ -735,6 +821,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 plan_layout.variable_offsets as u32,
                 plan_layout.variable_arms as u32,
                 plan_layout.variable_to_segment as u32,
+                confirmation_layout.keep as u32,
                 RESIDENT_U32_SENTINEL,
             );
         }
@@ -793,6 +880,194 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         }
 
+        if publication == PresentPublication::Confirmed {
+            // Scan the whole capacity, not merely provisional T. The poison
+            // initializer made the tail canonical zero, and the finalizer
+            // explicitly proves that no survivor leaked into that tail.
+            if confirmation_layout.block_count != 0 {
+                let dispatch = context.static_batch_dispatch(
+                    confirmation_layout.block_count,
+                    confirmation_layout.block_count,
+                    CubeDim::new_1d(1),
+                )?;
+                unsafe {
+                    scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        confirmation_workspace.output_arg(),
+                        capacity as u32,
+                        confirmation_layout.block_count as u32,
+                        confirmation_layout.keep as u32,
+                        confirmation_layout.local_offsets as u32,
+                        confirmation_layout.block_sums as u32,
+                        confirmation_layout.block_errors as u32,
+                        BLOCK_ITEMS,
+                        RESIDENT_U32_SENTINEL,
+                        STATUS_DEVICE_INVARIANT,
+                    );
+                }
+            }
+
+            let mut final_control =
+                context.upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])?;
+            let mut final_meta = context.batch_meta(0, capacity)?;
+            let mut final_dispatch =
+                context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
+            let mut final_segments = context.empty_u32(segment_record_words)?;
+            let mut final_candidates = context.empty_u32(candidate_record_words)?;
+            let mut final_child_body = context.empty_u32(child_words)?;
+            let final_poison_len = segment_record_words.max(capacity).max(child_words);
+            if final_poison_len != 0 {
+                let dispatch = context.static_batch_dispatch(
+                    final_poison_len,
+                    final_poison_len,
+                    CubeDim::new_1d(THREADS),
+                )?;
+                unsafe {
+                    poison_confirmed_outputs::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        final_segments.output_arg(),
+                        final_candidates.output_arg(),
+                        final_child_body.output_arg(),
+                        segment_record_words as u32,
+                        capacity as u32,
+                        child_words as u32,
+                        RESIDENT_U32_SENTINEL,
+                    );
+                }
+            }
+
+            unsafe {
+                finalize_confirmed_publication::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    confirmation_workspace.output_arg(),
+                    control.input_arg(),
+                    segment_records.input_arg(),
+                    final_control.output_arg(),
+                    final_segments.output_arg(),
+                    capacity as u32,
+                    confirmation_layout.block_count as u32,
+                    admission.segment_count as u32,
+                    inputs.parent_stride as u32,
+                    self.metadata().variable_count() as u32,
+                    final_dispatch.max_groups_x(),
+                    final_dispatch.max_groups_y(),
+                    THREADS,
+                    confirmation_layout.local_offsets as u32,
+                    confirmation_layout.block_sums as u32,
+                    confirmation_layout.block_errors as u32,
+                    confirmation_layout.block_offsets as u32,
+                    confirmation_layout.final_status as u32,
+                    confirmation_layout.final_total as u32,
+                    BLOCK_ITEMS,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                    STATUS_CAPACITY,
+                    STATUS_DEVICE_INVARIANT,
+                    STATUS_GEOMETRY,
+                );
+                publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    final_control.input_arg(),
+                    final_dispatch.output_arg(),
+                    STATUS_OK,
+                );
+
+                // Both stable scatters use the already-published provisional
+                // T rectangle. A keep=1 lane owns exactly prefix[source].
+                scatter_confirmed_candidates::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dynamic_dispatch.cube_count(),
+                    dynamic_dispatch.cube_dim(),
+                    confirmation_workspace.input_arg(),
+                    control.input_arg(),
+                    candidate_records.input_arg(),
+                    final_candidates.output_arg(),
+                    capacity as u32,
+                    confirmation_layout.keep as u32,
+                    confirmation_layout.local_offsets as u32,
+                    confirmation_layout.block_offsets as u32,
+                    confirmation_layout.final_status as u32,
+                    confirmation_layout.final_total as u32,
+                    BLOCK_ITEMS,
+                    STATUS_OK,
+                );
+                scatter_confirmed_children::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dynamic_dispatch.cube_count(),
+                    dynamic_dispatch.cube_dim(),
+                    confirmation_workspace.input_arg(),
+                    control.input_arg(),
+                    child_body.input_arg(),
+                    final_child_body.output_arg(),
+                    capacity as u32,
+                    child_stride as u32,
+                    confirmation_layout.keep as u32,
+                    confirmation_layout.local_offsets as u32,
+                    confirmation_layout.block_offsets as u32,
+                    confirmation_layout.final_status as u32,
+                    confirmation_layout.final_total as u32,
+                    BLOCK_ITEMS,
+                    STATUS_OK,
+                );
+
+                // Metadata is the sole completion publication and is written
+                // only after both distinct semantic scatters are enqueued.
+                publish_present_meta::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    final_control.input_arg(),
+                    final_meta.output_arg(),
+                    capacity as u32,
+                    STATUS_OK,
+                );
+            }
+
+            return Ok(WgpuResidentProposals {
+                context: context.clone(),
+                round_owner: inputs.round_owner,
+                frontier_lineage: inputs.frontier_lineage,
+                arena_lineage: Arc::new(()),
+                rows: inputs.rows,
+                parent_stride: inputs.parent_stride,
+                child_stride,
+                segment_count: admission.segment_count,
+                capacity,
+                control: final_control,
+                meta: final_meta,
+                dispatch: final_dispatch,
+                segment_records: final_segments,
+                candidate_records: final_candidates,
+                child_body: final_child_body,
+                confirmation_workspace,
+                confirmation_layout,
+                provisional_backing: Some(Box::new(ProvisionalBacking {
+                    _control: control,
+                    _meta: meta,
+                    _dispatch: dynamic_dispatch,
+                    _segment_records: segment_records,
+                    _candidate_records: candidate_records,
+                    _child_body: child_body,
+                })),
+                #[cfg(test)]
+                stage_profiles: match (candidate_profile, child_body_profile) {
+                    (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
+                        candidates,
+                        child_body,
+                    }),
+                    _ => None,
+                },
+            });
+        }
+
         Ok(WgpuResidentProposals {
             context: context.clone(),
             round_owner: inputs.round_owner,
@@ -809,7 +1084,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             segment_records,
             candidate_records,
             child_body,
-            confirmation_keep,
+            confirmation_workspace,
+            confirmation_layout,
+            provisional_backing: None,
             #[cfg(test)]
             stage_profiles: match (candidate_profile, child_body_profile) {
                 (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
@@ -945,6 +1222,7 @@ fn present_geometry(
     )?;
     let child_words = checked_device_product(capacity, child_stride, "provisional child body")?;
     let workspace_layout = workspace_layout(cells, rows, choice_error_blocks, block_count)?;
+    let confirmation_layout = confirmation_workspace_layout(capacity)?;
     Ok(PresentGeometry {
         rows,
         parent_stride,
@@ -958,6 +1236,33 @@ fn present_geometry(
         candidate_record_words,
         child_words,
         workspace_layout,
+        confirmation_layout,
+    })
+}
+
+fn confirmation_workspace_layout(
+    capacity: usize,
+) -> Result<ConfirmationWorkspaceLayout, ResidentProposalError> {
+    let block_count = capacity.div_ceil(BLOCK_ITEMS as usize);
+    ensure_below_sentinel(block_count, "confirmation scan blocks")?;
+    let mut words = 0usize;
+    let keep = reserve_words(&mut words, capacity, "confirmation workspace")?;
+    let local_offsets = reserve_words(&mut words, capacity, "confirmation workspace")?;
+    let block_sums = reserve_words(&mut words, block_count, "confirmation workspace")?;
+    let block_errors = reserve_words(&mut words, block_count, "confirmation workspace")?;
+    let block_offsets = reserve_words(&mut words, block_count, "confirmation workspace")?;
+    let final_status = reserve_words(&mut words, 1, "confirmation workspace")?;
+    let final_total = reserve_words(&mut words, 1, "confirmation workspace")?;
+    Ok(ConfirmationWorkspaceLayout {
+        keep,
+        local_offsets,
+        block_sums,
+        block_errors,
+        block_offsets,
+        final_status,
+        final_total,
+        block_count,
+        words,
     })
 }
 
@@ -1423,10 +1728,11 @@ fn poison_proposal_outputs(
     segment_records: &mut Array<u32>,
     candidate_records: &mut Array<u32>,
     child_body: &mut Array<u32>,
-    confirmation_keep: &mut Array<u32>,
+    confirmation_workspace: &mut Array<u32>,
     segment_words: u32,
     capacity: u32,
     child_words: u32,
+    confirmation_words: u32,
     dead: u32,
 ) {
     let position = ABSOLUTE_POS;
@@ -1437,12 +1743,14 @@ fn poison_proposal_outputs(
         candidate_records[position] = dead;
         candidate_records[capacity as usize + position] = dead;
         candidate_records[capacity as usize * 2usize + position] = dead;
-        // The confirmation scan's eventual tail contribution is canonical
-        // zero. Active indirect lanes overwrite this with tri-state output.
-        confirmation_keep[position] = 0u32;
     }
     if position < child_words as usize {
         child_body[position] = dead;
+    }
+    if position < confirmation_words as usize {
+        // The keep tail and every scan workspace word begin at the canonical
+        // additive identity. Active stages overwrite their exact regions.
+        confirmation_workspace[position] = 0u32;
     }
 }
 
@@ -1609,7 +1917,9 @@ fn generate_present_candidates_by_destination(
 }
 
 #[cube(launch_unchecked)]
-#[allow(clippy::too_many_arguments)]
+// CubeCL cannot currently infer the expanded native type for `+=` here, so
+// keep the explicit addition form until its assignment expansion catches up.
+#[allow(clippy::assign_op_pattern, clippy::too_many_arguments)]
 fn confirm_present_candidates(
     plan: &Array<u32>,
     segment_records: &Array<u32>,
@@ -1628,10 +1938,12 @@ fn confirm_present_candidates(
     variable_offsets_base: u32,
     variable_arms_base: u32,
     variable_to_segment_base: u32,
+    keep_base: u32,
     dead: u32,
 ) {
     let source = ABSOLUTE_POS;
-    if source < capacity as usize && source < keep.len() {
+    let keep_word = keep_base as usize + source;
+    if source < capacity as usize && keep_word < keep.len() {
         // The static initializer gives every capacity-tail lane semantic zero.
         // An indirectly dispatched active lane first becomes poison and only a
         // complete validation below may publish zero or one.
@@ -1648,9 +1960,9 @@ fn confirm_present_candidates(
         }
 
         if total == dead {
-            keep[source] = dead;
+            keep[keep_word] = dead;
         } else if source < total as usize {
-            keep[source] = dead;
+            keep[keep_word] = dead;
             let mut invariant = false;
             let mut supported = true;
 
@@ -1865,11 +2177,426 @@ fn confirm_present_candidates(
             }
 
             if invariant {
-                keep[source] = dead;
+                keep[keep_word] = dead;
             } else if supported {
-                keep[source] = 1u32;
+                keep[keep_word] = 1u32;
             } else {
-                keep[source] = 0u32;
+                keep[keep_word] = 0u32;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn scan_confirmation_blocks(
+    workspace: &mut Array<u32>,
+    capacity: u32,
+    block_count: u32,
+    keep_base: u32,
+    local_offsets_base: u32,
+    block_sums_base: u32,
+    block_errors_base: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    invariant_status: u32,
+) {
+    let block = ABSOLUTE_POS;
+    if block < block_count as usize {
+        let start = block * block_items as usize;
+        let remaining = capacity as usize - start;
+        let mut end = capacity as usize;
+        if (block_items as usize) < remaining {
+            end = start + block_items as usize;
+        }
+        let mut total = 0u32;
+        let mut error = 0u32;
+        let mut source = start;
+        while source < end {
+            workspace[local_offsets_base as usize + source] = total;
+            let next = workspace[keep_base as usize + source];
+            if next > 1u32 || next >= dead - total {
+                error = invariant_status;
+            } else {
+                total += next;
+            }
+            source += 1usize;
+        }
+        workspace[block_sums_base as usize + block] = total;
+        workspace[block_errors_base as usize + block] = error;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finalize_confirmed_publication(
+    workspace: &mut Array<u32>,
+    provisional_control: &Array<u32>,
+    provisional_segments: &Array<u32>,
+    final_control: &mut Array<u32>,
+    final_segments: &mut Array<u32>,
+    capacity: u32,
+    block_count: u32,
+    segment_count: u32,
+    parent_stride: u32,
+    variable_count: u32,
+    max_groups_x: u32,
+    max_groups_y: u32,
+    threads: u32,
+    local_offsets_base: u32,
+    block_sums_base: u32,
+    block_errors_base: u32,
+    block_offsets_base: u32,
+    final_status_word: u32,
+    final_total_word: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    ok: u32,
+    capacity_status: u32,
+    invariant_status: u32,
+    geometry_status: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let upstream_status = provisional_control[CONTROL_STATUS];
+        let mut status = upstream_status;
+        let mut required = dead;
+        let mut total = 0u32;
+
+        if upstream_status == capacity_status {
+            // The provisional planner has already computed the exact required
+            // T. Confirmation cannot run without the complete provisional
+            // materialization, so preserve that upstream result verbatim.
+            required = provisional_control[CONTROL_REQUIRED];
+            if required == dead || required <= capacity {
+                status = invariant_status;
+                required = dead;
+            }
+        } else if upstream_status == ok {
+            let provisional_total = provisional_control[CONTROL_REQUIRED];
+            status = ok;
+            if provisional_total > capacity {
+                status = invariant_status;
+            }
+
+            let mut block = 0usize;
+            while block < block_count as usize {
+                workspace[block_offsets_base as usize + block] = total;
+                let block_error = workspace[block_errors_base as usize + block];
+                if block_error != ok {
+                    status = invariant_status;
+                }
+                let next = workspace[block_sums_base as usize + block];
+                if next == dead || next >= dead - total {
+                    status = invariant_status;
+                } else {
+                    total += next;
+                }
+                block += 1usize;
+            }
+
+            // A valid static capacity scan must have an all-zero tail beyond
+            // the provisional T: prefix(capacity) == prefix(T).
+            let mut prefix_t = total;
+            if provisional_total == 0u32 {
+                prefix_t = 0u32;
+            } else if provisional_total < capacity {
+                let boundary = provisional_total as usize;
+                let boundary_block = boundary / block_items as usize;
+                if boundary_block >= block_count as usize
+                    || local_offsets_base as usize + boundary >= workspace.len()
+                    || block_offsets_base as usize + boundary_block >= workspace.len()
+                {
+                    status = invariant_status;
+                } else {
+                    let block_base = workspace[block_offsets_base as usize + boundary_block];
+                    let local = workspace[local_offsets_base as usize + boundary];
+                    if block_base == dead || local == dead || local >= dead - block_base {
+                        status = invariant_status;
+                    } else {
+                        prefix_t = block_base + local;
+                    }
+                }
+            }
+            if prefix_t != total || total > capacity {
+                status = invariant_status;
+            }
+
+            // First pass validates the complete provisional segment cover and
+            // every derived survivor boundary without writing final semantics.
+            let mut cursor = 0u32;
+            let mut segment = 0usize;
+            let mut previous_variable = 0u32;
+            let mut have_previous_variable = false;
+            while segment < segment_count as usize {
+                let record = segment * SEGMENT_RECORD_WORDS;
+                if record + 3usize >= provisional_segments.len()
+                    || record + 3usize >= final_segments.len()
+                {
+                    status = invariant_status;
+                } else {
+                    let base = provisional_segments[record];
+                    let count = provisional_segments[record + 1usize];
+                    let variable = provisional_segments[record + 2usize];
+                    let insertion = provisional_segments[record + 3usize];
+                    let mut end = dead;
+                    if base != dead && count != dead && count < dead - base {
+                        end = base + count;
+                    }
+                    if base != cursor
+                        || end > provisional_total
+                        || variable >= variable_count
+                        || insertion > parent_stride
+                        || (have_previous_variable && variable <= previous_variable)
+                    {
+                        status = invariant_status;
+                    }
+                    previous_variable = variable;
+                    have_previous_variable = true;
+
+                    let mut survivor_base = 0u32;
+                    if base == provisional_total {
+                        survivor_base = prefix_t;
+                    } else if base != 0u32 && base < provisional_total && base < capacity {
+                        let boundary = base as usize;
+                        let boundary_block = boundary / block_items as usize;
+                        if boundary_block >= block_count as usize
+                            || local_offsets_base as usize + boundary >= workspace.len()
+                            || block_offsets_base as usize + boundary_block >= workspace.len()
+                        {
+                            status = invariant_status;
+                        } else {
+                            let block_base =
+                                workspace[block_offsets_base as usize + boundary_block];
+                            let local = workspace[local_offsets_base as usize + boundary];
+                            if block_base == dead || local == dead || local >= dead - block_base {
+                                status = invariant_status;
+                            } else {
+                                survivor_base = block_base + local;
+                            }
+                        }
+                    } else if base != 0u32 {
+                        status = invariant_status;
+                    }
+
+                    let mut survivor_end = 0u32;
+                    if end == provisional_total {
+                        survivor_end = prefix_t;
+                    } else if end != 0u32 && end < provisional_total && end < capacity {
+                        let boundary = end as usize;
+                        let boundary_block = boundary / block_items as usize;
+                        if boundary_block >= block_count as usize
+                            || local_offsets_base as usize + boundary >= workspace.len()
+                            || block_offsets_base as usize + boundary_block >= workspace.len()
+                        {
+                            status = invariant_status;
+                        } else {
+                            let block_base =
+                                workspace[block_offsets_base as usize + boundary_block];
+                            let local = workspace[local_offsets_base as usize + boundary];
+                            if block_base == dead || local == dead || local >= dead - block_base {
+                                status = invariant_status;
+                            } else {
+                                survivor_end = block_base + local;
+                            }
+                        }
+                    } else if end != 0u32 {
+                        status = invariant_status;
+                    }
+                    if survivor_base > survivor_end || survivor_end > total {
+                        status = invariant_status;
+                    }
+                    cursor = end;
+                }
+                segment += 1usize;
+            }
+            if cursor != provisional_total {
+                status = invariant_status;
+            }
+
+            let mut x = 0u32;
+            let mut y = 1u32;
+            if status == ok && total != 0u32 {
+                if threads == 0u32 || max_groups_x == 0u32 || max_groups_y == 0u32 {
+                    status = geometry_status;
+                } else {
+                    let groups = 1u32 + (total - 1u32) / threads;
+                    y = 1u32 + (groups - 1u32) / max_groups_x;
+                    if y == 0u32 || y > max_groups_y {
+                        status = geometry_status;
+                    } else {
+                        x = 1u32 + (groups - 1u32) / y;
+                        if x == 0u32 || x > max_groups_x {
+                            status = geometry_status;
+                        }
+                    }
+                }
+            }
+
+            if status == ok {
+                required = total;
+                final_control[CONTROL_DISPATCH_X] = x;
+                final_control[CONTROL_DISPATCH_Y] = y;
+
+                // Only a fully validated plan may publish semantic records.
+                let mut segment = 0usize;
+                while segment < segment_count as usize {
+                    let record = segment * SEGMENT_RECORD_WORDS;
+                    let base = provisional_segments[record];
+                    let count = provisional_segments[record + 1usize];
+                    let end = base + count;
+
+                    let mut survivor_base = 0u32;
+                    if base == provisional_total {
+                        survivor_base = total;
+                    } else if base != 0u32 {
+                        let boundary = base as usize;
+                        let boundary_block = boundary / block_items as usize;
+                        survivor_base = workspace[block_offsets_base as usize + boundary_block]
+                            + workspace[local_offsets_base as usize + boundary];
+                    }
+                    let mut survivor_end = 0u32;
+                    if end == provisional_total {
+                        survivor_end = total;
+                    } else if end != 0u32 {
+                        let boundary = end as usize;
+                        let boundary_block = boundary / block_items as usize;
+                        survivor_end = workspace[block_offsets_base as usize + boundary_block]
+                            + workspace[local_offsets_base as usize + boundary];
+                    }
+                    final_segments[record] = survivor_base;
+                    final_segments[record + 1usize] = survivor_end - survivor_base;
+                    final_segments[record + 2usize] = provisional_segments[record + 2usize];
+                    final_segments[record + 3usize] = provisional_segments[record + 3usize];
+                    segment += 1usize;
+                }
+            }
+        } else if upstream_status == invariant_status {
+            // Canonical invariant failures carry no meaningful total. A bad
+            // pairing remains the same sticky failure rather than becoming a
+            // weaker status.
+            status = invariant_status;
+            required = dead;
+        } else if upstream_status == geometry_status {
+            // Geometry is already the dominant known failure. Preserve it even
+            // if an untrusted upstream required word is non-canonical.
+            status = geometry_status;
+            required = dead;
+        } else {
+            // Unknown statuses are not part of the closed publication lattice.
+            status = invariant_status;
+            required = dead;
+        }
+
+        if status != ok {
+            final_control[CONTROL_DISPATCH_X] = 0u32;
+            final_control[CONTROL_DISPATCH_Y] = 1u32;
+        }
+        final_control[CONTROL_STATUS] = status;
+        final_control[CONTROL_REQUIRED] = required;
+        workspace[final_status_word as usize] = status;
+        workspace[final_total_word as usize] = required;
+    }
+}
+
+#[cube(launch_unchecked)]
+fn poison_confirmed_outputs(
+    segment_records: &mut Array<u32>,
+    candidate_records: &mut Array<u32>,
+    child_body: &mut Array<u32>,
+    segment_words: u32,
+    capacity: u32,
+    child_words: u32,
+    dead: u32,
+) {
+    let position = ABSOLUTE_POS;
+    if position < segment_words as usize {
+        segment_records[position] = dead;
+    }
+    if position < capacity as usize {
+        candidate_records[position] = dead;
+        candidate_records[capacity as usize + position] = dead;
+        candidate_records[capacity as usize * 2usize + position] = dead;
+    }
+    if position < child_words as usize {
+        child_body[position] = dead;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn scatter_confirmed_candidates(
+    workspace: &Array<u32>,
+    provisional_control: &Array<u32>,
+    provisional_candidates: &Array<u32>,
+    final_candidates: &mut Array<u32>,
+    capacity: u32,
+    keep_base: u32,
+    local_offsets_base: u32,
+    block_offsets_base: u32,
+    final_status_word: u32,
+    final_total_word: u32,
+    #[comptime] block_items: u32,
+    ok: u32,
+) {
+    let source = ABSOLUTE_POS;
+    if workspace[final_status_word as usize] == ok
+        && source < provisional_control[CONTROL_REQUIRED] as usize
+        && source < capacity as usize
+        && workspace[keep_base as usize + source] == 1u32
+        && capacity as usize * CANDIDATE_RECORD_FIELDS <= provisional_candidates.len()
+        && capacity as usize * CANDIDATE_RECORD_FIELDS <= final_candidates.len()
+    {
+        let block = source / block_items as usize;
+        let destination = workspace[block_offsets_base as usize + block]
+            + workspace[local_offsets_base as usize + source];
+        if destination < workspace[final_total_word as usize] && destination < capacity {
+            let destination = destination as usize;
+            final_candidates[destination] = provisional_candidates[source];
+            final_candidates[capacity as usize + destination] =
+                provisional_candidates[capacity as usize + source];
+            final_candidates[capacity as usize * 2usize + destination] =
+                provisional_candidates[capacity as usize * 2usize + source];
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn scatter_confirmed_children(
+    workspace: &Array<u32>,
+    provisional_control: &Array<u32>,
+    provisional_body: &Array<u32>,
+    final_body: &mut Array<u32>,
+    capacity: u32,
+    child_stride: u32,
+    keep_base: u32,
+    local_offsets_base: u32,
+    block_offsets_base: u32,
+    final_status_word: u32,
+    final_total_word: u32,
+    #[comptime] block_items: u32,
+    ok: u32,
+) {
+    let source = ABSOLUTE_POS;
+    if workspace[final_status_word as usize] == ok
+        && source < provisional_control[CONTROL_REQUIRED] as usize
+        && source < capacity as usize
+        && workspace[keep_base as usize + source] == 1u32
+    {
+        let block = source / block_items as usize;
+        let destination = workspace[block_offsets_base as usize + block]
+            + workspace[local_offsets_base as usize + source];
+        if destination < workspace[final_total_word as usize] && destination < capacity {
+            let source_base = source * child_stride as usize;
+            let destination_base = destination as usize * child_stride as usize;
+            if source_base + child_stride as usize <= provisional_body.len()
+                && destination_base + child_stride as usize <= final_body.len()
+            {
+                let mut column = 0usize;
+                while column < child_stride as usize {
+                    final_body[destination_base + column] = provisional_body[source_base + column];
+                    column += 1usize;
+                }
             }
         }
     }
@@ -2012,11 +2739,13 @@ struct ResolvedProposalStageProfiles {
 
 #[cfg(test)]
 impl WgpuResidentProposals {
-    /// Reads the private tri-state confirmation workspace for focused semantic
-    /// tests. Ordinary inspection intentionally continues to expose the
-    /// provisional arena until stable survivor compaction is implemented.
+    /// Reads the private tri-state confirmation vector for focused semantic
+    /// tests, independent of whether this arena publishes provisional or
+    /// confirmed semantic buffers.
     fn read_confirmation_keep_for_test(&self) -> Vec<u32> {
-        self.confirmation_keep.read()
+        let workspace = self.confirmation_workspace.read();
+        workspace[self.confirmation_layout.keep..self.confirmation_layout.keep + self.capacity]
+            .to_vec()
     }
 
     fn resolve_stage_profiles(&mut self) -> ResolvedProposalStageProfiles {

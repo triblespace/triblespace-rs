@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The private wired Present round now publishes confirmed children through a
+  distinct stable survivor arena.** A capacity-wide tri-state scan validates
+  every keep word, proves the zero tail beyond provisional `T`, and derives
+  confirmed segment boundaries from exact prefix values. Two source-parallel
+  scatters consume the original `T` dispatch and copy surviving candidate and
+  child records into separately poisoned buffers; final metadata is published
+  only after both complete. Upstream capacity totals remain exact, invariant
+  poison dominates semantic rejection, and malformed segment covers fail
+  closed without exposing semantic words. The low-level staging primitive
+  remains explicitly provisional for kernel tests; only the schema-specialized
+  wired path crosses the confirmed publication boundary.
 - **The private resident Present arena now computes an exact tri-state sibling
   confirmation mask without readback.** Stable per-variable arm CSR keeps
   duplicate source patterns distinct and identifies the exact proposer to skip;
@@ -17,17 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached Entity/Attribute/Value membership to `keep`, semantic `drop`, or
   invariant poison. Capacity-tail words remain the canonical zero scan identity,
   while malformed later siblings still poison candidates already rejected by an
-  earlier valid sibling. The mask stays private and provisional until stable
-  survivor compaction publishes confirmed children.
+  earlier valid sibling. The mask remains private backing state consumed by
+  wired stable publication without host readback.
 - **A private schema-specialized resident round now wires exact support through
-  provisional Present children without an intermediate readback.** One cached
+  confirmed Present children without an intermediate readback.** One cached
   admission rejects terminal and non-Present schemas before producer kernels;
   each execution then freezes capacity geometry, evaluates tri-state support
   and exact estimates, plans every row, and feeds the existing stable
   destination-parallel arena plus indirect reference child materializer. The
-  output remains explicitly pre-confirmation, preserves frontier and arena
-  lineage, reports capacity misses atomically through the sticky arena status,
-  and keeps every production kernel within seven user storage arrays.
+  low-level staging output remains explicitly pre-confirmation, while wired
+  output preserves frontier and arena lineage, reports capacity misses
+  atomically through the sticky arena status, and keeps every production kernel
+  within seven user storage arrays.
 - **Resident affine rounds gain a private, exact Present proposal arena.**
   Packed planner choices are classified into one variable-major width vector;
   a single stable device scan turns that layout directly into ascending

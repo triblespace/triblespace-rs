@@ -1533,6 +1533,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         );
     }
     let poison = [RESIDENT_U32_SENTINEL];
+    let confirmation_layout = confirmation_workspace_layout(1).unwrap();
     let arena = WgpuResidentProposals {
         context: context.clone(),
         round_owner: Arc::new(()),
@@ -1551,7 +1552,11 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             .upload_u32(&[RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS])
             .unwrap(),
         child_body: context.upload_u32(&poison).unwrap(),
-        confirmation_keep: context.upload_u32(&[0]).unwrap(),
+        confirmation_workspace: context
+            .upload_u32(&vec![0; confirmation_layout.words])
+            .unwrap(),
+        confirmation_layout,
+        provisional_backing: None,
         stage_profiles: None,
     };
     let inspection = arena.inspect();
@@ -1564,6 +1569,86 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             && segment.variable == RESIDENT_U32_SENTINEL
             && segment.insertion == RESIDENT_U32_SENTINEL
     }));
+}
+
+#[test]
+fn confirmed_finalizer_closes_the_upstream_status_required_lattice() {
+    let context = crate::WgpuContext::on_wgpu();
+    let capacity = 1usize;
+    let layout = confirmation_workspace_layout(capacity).unwrap();
+    let dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let run = |upstream_status: u32, upstream_required: u32| {
+        let mut workspace = context.upload_u32(&vec![0; layout.words]).unwrap();
+        let provisional_control = context
+            .upload_u32(&[upstream_status, upstream_required, 0, 1])
+            .unwrap();
+        let provisional_segments = context.upload_u32(&[0, 0, 0, 0]).unwrap();
+        let mut final_control = context
+            .upload_u32(&[STATUS_OK, RESIDENT_U32_SENTINEL, 0, 1])
+            .unwrap();
+        let mut final_segments = context
+            .upload_u32(&[RESIDENT_U32_SENTINEL; SEGMENT_RECORD_WORDS])
+            .unwrap();
+        unsafe {
+            finalize_confirmed_publication::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                workspace.output_arg(),
+                provisional_control.input_arg(),
+                provisional_segments.input_arg(),
+                final_control.output_arg(),
+                final_segments.output_arg(),
+                capacity as u32,
+                layout.block_count as u32,
+                1,
+                0,
+                1,
+                dispatch.max_groups_x(),
+                dispatch.max_groups_y(),
+                THREADS,
+                layout.local_offsets as u32,
+                layout.block_sums as u32,
+                layout.block_errors as u32,
+                layout.block_offsets as u32,
+                layout.final_status as u32,
+                layout.final_total as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+                STATUS_CAPACITY,
+                STATUS_DEVICE_INVARIANT,
+                STATUS_GEOMETRY,
+            );
+        }
+        final_control.read()
+    };
+
+    assert_eq!(&run(STATUS_CAPACITY, 2)[..2], &[STATUS_CAPACITY, 2]);
+    for required in [1, RESIDENT_U32_SENTINEL] {
+        assert_eq!(
+            &run(STATUS_CAPACITY, required)[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+    assert_eq!(
+        &run(STATUS_OK, 2)[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(
+        &run(STATUS_DEVICE_INVARIANT, 0)[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(
+        &run(STATUS_GEOMETRY, 0)[..2],
+        &[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(
+        &run(99, RESIDENT_U32_SENTINEL)[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
 }
 
 #[test]
