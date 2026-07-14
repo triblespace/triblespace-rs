@@ -1,9 +1,7 @@
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ProgramFrontier, ProgramVariable, QueryPattern, QueryProgram, QueryTerm,
 };
-use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, SuccinctArchive, SuccinctRotation,
-};
+use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
@@ -106,7 +104,7 @@ fn facade_rejects_foreign_archive_and_cross_round_inputs() {
 }
 
 #[test]
-fn pair_is_supported_while_restricted_and_support_fail_before_inputs() {
+fn pair_and_restricted_are_supported_while_support_fails_before_inputs() {
     let source = fixture();
     let archive = WgpuSuccinctArchive::new(source.archive).unwrap();
     let program =
@@ -120,13 +118,7 @@ fn pair_is_supported_while_restricted_and_support_fail_before_inputs() {
     let restricted = WgpuResidentRound::new(&archive, &program, &[v(0), v(1)]).unwrap();
     let restricted_host = ProgramFrontier::new(vec![v(0), v(1)], Vec::new(), 0).unwrap();
     let restricted_frontier = restricted.upload_frontier(&restricted_host).unwrap();
-    assert!(matches!(
-        restricted.initialize_inputs(&restricted_frontier),
-        Err(ResidentSupportError::UnsupportedRestrictedEstimate {
-            arm: 0,
-            rotation: SuccinctRotation::Eva,
-        })
-    ));
+    assert!(restricted.initialize_inputs(&restricted_frontier).is_ok());
 
     let support = WgpuResidentRound::new(&archive, &program, &[v(0), v(1), v(2)]).unwrap();
     let support_host = ProgramFrontier::new(vec![v(0), v(1), v(2)], Vec::new(), 0).unwrap();

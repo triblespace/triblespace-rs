@@ -7,10 +7,10 @@
 //!
 //! [`WgpuResidentRound`] initializes every estimate to its exact zero-peer
 //! count or the reserved dead sentinel, then overwrites one-peer
-//! `PairDistinct` arms through resident prefix-select and pair-boundary-rank
-//! pipelines. The affine frontier, descriptors, scratch, estimate matrix, and
-//! planner choices remain in one compatibility domain without a readback.
-//! Two-peer and fully-bound support primitives still fail explicitly.
+//! `PairDistinct` and two-peer `Restricted` arms through resident
+//! prefix-select and rank pipelines. The affine frontier, descriptors,
+//! scratch, estimate matrix, and planner choices remain in one compatibility
+//! domain without a readback. Fully-bound support still fails explicitly.
 
 use std::error::Error;
 use std::fmt;
@@ -33,6 +33,7 @@ use crate::succinct_query::{WgpuBitVector, WgpuSuccinctArchive};
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
 const PAIR_DESCRIPTOR_WORDS: usize = 3;
+const RESTRICTED_DESCRIPTOR_WORDS: usize = 5;
 const CONSTANT_SOURCE: u32 = 0;
 const COLUMN_SOURCE: u32 = 1;
 
@@ -43,13 +44,6 @@ pub enum ResidentSupportError {
     Round(ResidentRoundError),
     /// The compiled program belongs to another immutable archive snapshot.
     ArchiveOwnership,
-    /// This first producer slice cannot yet evaluate a two-peer estimate.
-    UnsupportedRestrictedEstimate {
-        /// Stable arm ID which requires the unavailable probe.
-        arm: u32,
-        /// Ring rotation required by the probe.
-        rotation: SuccinctRotation,
-    },
     /// This first producer slice cannot yet evaluate fully-bound support.
     UnsupportedFullyBoundSupport {
         /// Stable source-pattern position requiring a support probe.
@@ -77,10 +71,6 @@ impl fmt::Display for ResidentSupportError {
             Self::ArchiveOwnership => {
                 f.write_str("resident round program belongs to another archive snapshot")
             }
-            Self::UnsupportedRestrictedEstimate { arm, rotation } => write!(
-                f,
-                "resident estimate arm {arm} requires an unsupported {rotation:?} restricted probe"
-            ),
             Self::UnsupportedFullyBoundSupport {
                 source_pattern_index,
             } => write!(
@@ -109,7 +99,6 @@ impl Error for ResidentSupportError {
         match self {
             Self::Round(error) => Some(error),
             Self::ArchiveOwnership
-            | Self::UnsupportedRestrictedEstimate { .. }
             | Self::UnsupportedFullyBoundSupport { .. }
             | Self::FrontierOwnership
             | Self::MalformedFrontier
@@ -402,6 +391,14 @@ struct WgpuPairGroup {
     descriptors: DeviceU32Buffer<WgpuRuntime>,
 }
 
+/// One persistent two-peer dispatch group in a fixed canonical rotation.
+struct WgpuRestrictedGroup {
+    rotation: SuccinctRotation,
+    arm_count: usize,
+    /// Five words per local arm: global arm, then kind/payload for first/last.
+    descriptors: DeviceU32Buffer<WgpuRuntime>,
+}
+
 /// WGPU facade binding one plan and planner to one exact resident archive.
 pub struct WgpuResidentRound<'a, U: Universe> {
     archive: &'a WgpuSuccinctArchive<U>,
@@ -410,6 +407,7 @@ pub struct WgpuResidentRound<'a, U: Universe> {
     frontier_owner: Arc<()>,
     initial_estimates: DeviceU32Buffer<WgpuRuntime>,
     pair_groups: Box<[WgpuPairGroup]>,
+    restricted_groups: Box<[WgpuRestrictedGroup]>,
 }
 
 impl<'a, U: Universe> WgpuResidentRound<'a, U> {
@@ -432,6 +430,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             ResidentRowPlanner::from_metadata(plan.metadata().clone(), archive.context().clone())?;
         let initial_estimates = archive.context().upload_u32(&initial_estimates(&plan))?;
         let pair_groups = build_pair_groups(archive, &plan)?;
+        let restricted_groups = build_restricted_groups(archive, &plan)?;
         Ok(Self {
             archive,
             plan,
@@ -439,6 +438,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             frontier_owner: Arc::new(()),
             initial_estimates,
             pair_groups,
+            restricted_groups,
         })
     }
 
@@ -493,12 +493,12 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         })
     }
 
-    /// Allocates planner-owned inputs and enqueues exact zero/one-peer estimates.
+    /// Allocates planner-owned inputs and enqueues exact zero/one/two-peer estimates.
     ///
     /// The common launch initializes viability plus every arm-major cell.
-    /// Each nonempty pair rotation then performs prepare, prefix select,
-    /// normalization, pair-change rank, and scatter without a device read.
-    /// Unsupported restricted/support specs fail before allocation or launch.
+    /// Each nonempty pair or restricted rotation then performs prepare, prefix
+    /// select, normalization, rank, and scatter without a device read.
+    /// Unsupported fully-bound support fails before allocation or launch.
     pub fn initialize_inputs(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -533,6 +533,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         for group in &self.pair_groups {
             self.enqueue_pair_group(group, frontier, &mut inputs)?;
         }
+        for group in &self.restricted_groups {
+            self.enqueue_restricted_group(group, frontier, &mut inputs)?;
+        }
         Ok(inputs)
     }
 
@@ -547,17 +550,6 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     fn require_supported_slice(&self) -> Result<(), ResidentSupportError> {
         if self.plan.is_global_dead() {
             return Ok(());
-        }
-        for &spec in self.plan.arm_specs() {
-            match spec {
-                ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => {}
-                ArmSpec::Restricted { arm, rotation, .. } => {
-                    return Err(ResidentSupportError::UnsupportedRestrictedEstimate {
-                        arm,
-                        rotation,
-                    });
-                }
-            }
         }
         if let Some(support) = self.plan.fully_bound_supports().first() {
             return Err(ResidentSupportError::UnsupportedFullyBoundSupport {
@@ -654,6 +646,75 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 group.arm_count as u32,
                 self.plan.metadata().arms().len() as u32,
                 changes.num_ones() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+        Ok(())
+    }
+
+    fn enqueue_restricted_group(
+        &self,
+        group: &WgpuRestrictedGroup,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        inputs: &mut ResidentRoundInputs<WgpuRuntime>,
+    ) -> Result<(), ResidentSupportError> {
+        let (probes, endpoints) = restricted_group_geometry(group.arm_count, frontier.rows)?;
+        if probes == 0 {
+            return Ok(());
+        }
+
+        let context = self.planner.context();
+        let dispatch = context.static_batch_dispatch(probes, probes, CubeDim::new_1d(THREADS))?;
+        let mut positions = context.empty_u32(endpoints)?;
+        let mut values = context.empty_u32(endpoints)?;
+        let mut results = context.empty_u32(endpoints)?;
+        unsafe {
+            prepare_restricted::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                group.descriptors.input_arg(),
+                frontier.values.input_arg(),
+                positions.output_arg(),
+                values.output_arg(),
+                frontier.rows as u32,
+                frontier.stride as u32,
+                group.arm_count as u32,
+                self.archive.archive().domain.len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let prefix = first_axis_prefix(self.archive, group.rotation);
+        prefix.select1_batch_into(&positions, &mut results)?;
+        unsafe {
+            normalize_pair_range::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                results.input_arg(),
+                positions.output_arg(),
+                probes as u32,
+                self.archive.ring_col(group.rotation).len() as u32,
+                DEAD_ROW_SENTINEL,
+            );
+        }
+
+        let ring = self.archive.ring_col(group.rotation);
+        ring.rank_batch_into(&positions, &values, &mut results)?;
+        let estimates = inputs.estimates_output_arg();
+        unsafe {
+            scatter_restricted::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                group.descriptors.input_arg(),
+                results.input_arg(),
+                estimates,
+                frontier.rows as u32,
+                group.arm_count as u32,
+                self.plan.metadata().arms().len() as u32,
+                ring.len() as u32,
                 DEAD_ROW_SENTINEL,
             );
         }
@@ -867,6 +928,15 @@ fn pair_group_geometry(
     Ok((probes, endpoints))
 }
 
+fn restricted_group_geometry(
+    arm_count: usize,
+    rows: usize,
+) -> Result<(usize, usize), ResidentRoundError> {
+    let probes = checked_device_product(arm_count, rows, "resident restricted probes")?;
+    let endpoints = checked_device_product(probes, 2, "resident restricted endpoints")?;
+    Ok((probes, endpoints))
+}
+
 fn build_pair_groups<U: Universe>(
     archive: &WgpuSuccinctArchive<U>,
     plan: &ResidentRoundPlan,
@@ -907,6 +977,54 @@ fn build_pair_groups<U: Universe>(
         });
     }
     Ok(groups.into_boxed_slice())
+}
+
+fn build_restricted_groups<U: Universe>(
+    archive: &WgpuSuccinctArchive<U>,
+    plan: &ResidentRoundPlan,
+) -> Result<Box<[WgpuRestrictedGroup]>, ResidentSupportError> {
+    let mut groups = Vec::new();
+    for group in plan.arm_groups.iter() {
+        let ArmGroupKind::Restricted(rotation) = group.kind else {
+            continue;
+        };
+        checked_device_product(
+            group.arm_ids.len(),
+            RESTRICTED_DESCRIPTOR_WORDS,
+            "resident restricted descriptor table",
+        )?;
+        let mut descriptors = Vec::with_capacity(group.arm_ids.len() * RESTRICTED_DESCRIPTOR_WORDS);
+        for &arm in group.arm_ids.iter() {
+            let Some(ArmSpec::Restricted {
+                rotation: spec_rotation,
+                first,
+                last,
+                ..
+            }) = plan.arm_specs().get(arm as usize).copied()
+            else {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            };
+            if spec_rotation != rotation {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            }
+            let (first_kind, first_payload) = encode_source(first);
+            let (last_kind, last_payload) = encode_source(last);
+            descriptors.extend([arm, first_kind, first_payload, last_kind, last_payload]);
+        }
+        groups.push(WgpuRestrictedGroup {
+            rotation,
+            arm_count: group.arm_ids.len(),
+            descriptors: archive.context().upload_u32(&descriptors)?,
+        });
+    }
+    Ok(groups.into_boxed_slice())
+}
+
+fn encode_source(source: CodeSource) -> (u32, u32) {
+    match source {
+        CodeSource::Constant(code) => (CONSTANT_SOURCE, code),
+        CodeSource::Column(column) => (COLUMN_SOURCE, u32::from(column)),
+    }
 }
 
 fn first_axis_prefix<U: Universe>(
@@ -978,6 +1096,69 @@ fn prepare_pair_distinct(
                 let next = peer + 1u32;
                 queries[pair] = peer;
                 queries[pair + 1usize] = next;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_restricted(
+    descriptors: &Array<u32>,
+    frontier: &Array<u32>,
+    positions: &mut Array<u32>,
+    values: &mut Array<u32>,
+    rows: u32,
+    stride: u32,
+    arm_count: u32,
+    domain: u32,
+    dead: u32,
+) {
+    let probe = ABSOLUTE_POS;
+    let probes = rows as usize * arm_count as usize;
+    if probe < probes {
+        let pair = probe * 2usize;
+        positions[pair] = dead;
+        positions[pair + 1usize] = dead;
+        values[pair] = dead;
+        values[pair + 1usize] = dead;
+
+        let local_arm = probe / rows as usize;
+        let row = probe % rows as usize;
+        let descriptor = local_arm * RESTRICTED_DESCRIPTOR_WORDS;
+        if descriptor + 4usize < descriptors.len() {
+            let first_kind = descriptors[descriptor + 1usize];
+            let first_payload = descriptors[descriptor + 2usize];
+            let last_kind = descriptors[descriptor + 3usize];
+            let last_payload = descriptors[descriptor + 4usize];
+            let mut first = dead;
+            let mut last = dead;
+
+            if first_kind == CONSTANT_SOURCE {
+                first = first_payload;
+            } else if first_kind == COLUMN_SOURCE && first_payload < stride {
+                let offset = row * stride as usize + first_payload as usize;
+                if offset < frontier.len() {
+                    first = frontier[offset];
+                }
+            }
+            if last_kind == CONSTANT_SOURCE {
+                last = last_payload;
+            } else if last_kind == COLUMN_SOURCE && last_payload < stride {
+                let offset = row * stride as usize + last_payload as usize;
+                if offset < frontier.len() {
+                    last = frontier[offset];
+                }
+            }
+
+            // Both codes are proven in-range before either is allowed to reach
+            // a Jerky kernel. Wavelet rank validates positions, but an
+            // out-of-alphabet value could otherwise alias a high symbol.
+            if first < domain && first < dead - 1u32 && last < domain && last != dead {
+                positions[pair] = first;
+                positions[pair + 1usize] = first + 1u32;
+                values[pair] = last;
+                values[pair + 1usize] = last;
             }
         }
     }
@@ -1056,6 +1237,43 @@ fn scatter_pair_distinct(
     }
 }
 
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn scatter_restricted(
+    descriptors: &Array<u32>,
+    ranks: &Array<u32>,
+    estimates: &mut Array<u32>,
+    rows: u32,
+    local_arm_count: u32,
+    global_arm_count: u32,
+    ring_len: u32,
+    dead: u32,
+) {
+    let probe = ABSOLUTE_POS;
+    let probes = rows as usize * local_arm_count as usize;
+    if probe < probes {
+        let local_arm = probe / rows as usize;
+        let row = probe % rows as usize;
+        let descriptor = local_arm * RESTRICTED_DESCRIPTOR_WORDS;
+        if descriptor + 4usize < descriptors.len() {
+            let global_arm = descriptors[descriptor];
+            if global_arm < global_arm_count {
+                let destination = global_arm as usize * rows as usize + row;
+                let pair = probe * 2usize;
+                if destination < estimates.len() && pair + 1usize < ranks.len() {
+                    let lo = ranks[pair];
+                    let hi = ranks[pair + 1usize];
+                    let mut count = dead;
+                    if lo != dead && hi != dead && lo <= hi && hi <= ring_len {
+                        count = hi - lo;
+                    }
+                    estimates[destination] = count;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "resident_support_lowering_tests.rs"]
 mod lowering_tests;
@@ -1063,3 +1281,7 @@ mod lowering_tests;
 #[cfg(test)]
 #[path = "resident_pair_distinct_tests.rs"]
 mod pair_distinct_tests;
+
+#[cfg(test)]
+#[path = "resident_restricted_tests.rs"]
+mod restricted_tests;

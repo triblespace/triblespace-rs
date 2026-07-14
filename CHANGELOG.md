@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds now produce exact two-peer restricted estimates
+  entirely on WGPU.** Private five-word descriptors resolve Constant/Column
+  sources for both bound peers, poison both prefix queries and both wavelet
+  symbols unless both archive-local codes are in range, and execute the same
+  five-launch prepare/select/normalize/rank/scatter shape for all six Ring
+  rotations. Rank scatter independently rejects sentinels, reversed or
+  out-of-range ranks, and subtraction underflow while preserving exact zero as
+  a viable estimate. Native gates cover canonical CPU parity, every physical
+  rotation and source pairing, heterogeneous arm-major rows at block/split
+  boundaries, invalid high-symbol aliases, and monotonic snapshot extension;
+  fully-bound support remains an explicit later slice.
 - **Resident affine rounds now produce exact one-peer estimates entirely on
   WGPU.** `WgpuResidentRound` retains private per-rotation arm descriptors and
   accepts an opaque archive-branded affine frontier, initializes every
@@ -18,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five-launch group pipeline has no per-execution transfer or intermediate
   readback, preserves valid zero estimates, and fails closed on foreign
   frontiers, schema/geometry mismatches, invalid codes, and sentinel results;
-  restricted estimates and fully-bound support remain explicit later slices.
+  fully-bound support remains an explicit later slice.
 - **Resident affine rounds gain their first exact estimate/support lowering and
   zero-peer producer.** A pure host IR maps every target and zero/one/two-peer
   state to canonical `Present`, pair-distinct, or restricted Ring primitives,
@@ -26,8 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fully-bound support separately, and makes any missing constant globally
   dead. `WgpuResidentRound` pointer-binds that plan to one resident archive and
   its private context, then initializes exact axis-cardinality estimates and
-  viability directly into opaque planner inputs without readback. Unsupported
-  one-peer, two-peer, and support probes fail explicitly pending later slices.
+  viability directly into opaque planner inputs without readback. The later
+  one-peer and two-peer entries above consume this plan; fully-bound support
+  still fails explicitly pending its own slice.
 - **Resident affine rounds gain an exact runtime-generic row planner.** A
   stable variable-to-arm CSR lowering derives arm identities and full influence
   unions from public `QueryProgram` patterns. Its CubeCL kernel consumes the
