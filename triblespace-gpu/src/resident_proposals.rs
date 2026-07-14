@@ -41,14 +41,17 @@ use std::sync::Arc;
 
 use cubecl::prelude::*;
 use jerky::gpu::{DeviceBatchMeta, DeviceDispatch, DeviceU32Buffer, GpuContext};
-use triblespace_core::blob::encodings::succinctarchive::query_program::ProgramVariable;
+use triblespace_core::blob::encodings::succinctarchive::query_program::{
+    ProgramFrontier, ProgramVariable, QueryProgram,
+};
 use triblespace_core::blob::encodings::succinctarchive::Universe;
 
 use crate::resident_round::{
     checked_device_product, ResidentRoundError, ResidentRowChoices, RESIDENT_U32_SENTINEL,
 };
 use crate::resident_support::{
-    ArmSpec, ResidentAxis, ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound,
+    ArmSpec, ResidentAxis, ResidentProposalInputs, ResidentSupportError, WgpuResidentFrontier,
+    WgpuResidentRound,
 };
 
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
@@ -81,6 +84,8 @@ pub(crate) enum ResidentProposalError {
         /// Stable global arm ID.
         arm: usize,
     },
+    /// A nonterminal expansion was requested for an already complete schema.
+    TerminalSchema,
     /// Stable semantic arms and physical proposal metadata disagree.
     MalformedPlan,
     /// A host-known arena quantity cannot be represented below the sentinel.
@@ -95,6 +100,9 @@ impl fmt::Display for ResidentProposalError {
             Self::Support(error) => error.fmt(f),
             Self::UnsupportedProposer { arm } => {
                 write!(f, "resident proposal arm {arm} is not a Present primitive")
+            }
+            Self::TerminalSchema => {
+                f.write_str("resident provisional expansion requires an unbound variable")
             }
             Self::MalformedPlan => {
                 f.write_str("resident Present proposal metadata is inconsistent")
@@ -112,9 +120,10 @@ impl Error for ResidentProposalError {
         match self {
             Self::Support(error) => Some(error),
             Self::Device(error) => Some(error),
-            Self::UnsupportedProposer { .. } | Self::MalformedPlan | Self::GeometryOverflow(_) => {
-                None
-            }
+            Self::UnsupportedProposer { .. }
+            | Self::TerminalSchema
+            | Self::MalformedPlan
+            | Self::GeometryOverflow(_) => None,
         }
     }
 }
@@ -177,6 +186,39 @@ struct PresentAdmission {
     segment_count: usize,
 }
 
+impl PresentAdmission {
+    /// A provisional expansion is terminal exactly when no child segment can
+    /// be named. The low-level zero-segment arena remains valid for focused
+    /// primitive tests, but the wired nonterminal wrapper rejects this state.
+    const fn is_terminal(&self) -> bool {
+        self.segment_count == 0
+    }
+}
+
+/// Host-known geometry frozen before a wired round launches support kernels.
+struct PresentGeometry {
+    rows: usize,
+    parent_stride: usize,
+    capacity: usize,
+    segment_count: usize,
+    child_stride: usize,
+    cells: usize,
+    block_count: usize,
+    choice_error_blocks: usize,
+    segment_record_words: usize,
+    candidate_record_words: usize,
+    child_words: usize,
+    workspace_layout: WorkspaceLayout,
+}
+
+/// One opaque pairing of the exact semantic admission and its host geometry.
+/// Keeping the pair module-private prevents a capacity or segment-count plan
+/// from being replayed under another admission.
+struct PresentPreflight<'admission> {
+    admission: &'admission PresentAdmission,
+    geometry: PresentGeometry,
+}
+
 /// Physical regions in the one scratch allocation shared by scan kernels.
 ///
 /// Packing keeps every shader at or below seven user storage bindings, leaving
@@ -202,6 +244,73 @@ struct PlanLayout {
     variable_to_segment: usize,
 }
 
+/// Schema-specialized capability for one provisional Present-only round.
+///
+/// This private object is reusable across affine frontiers with the same
+/// `(program, bound-variable mask)`. It lowers Present admission once, rejects
+/// terminal and unsupported schemas before any producer kernel can launch,
+/// then wires support, tri-state planning, destination-parallel proposals and
+/// reference child materialization into one device command chain. Its output
+/// is explicitly pre-confirmation: a shared variable with multiple source
+/// arms may still contain candidates which sibling confirmation will remove.
+struct WgpuResidentWiredRound<'a, U: Universe> {
+    round: WgpuResidentRound<'a, U>,
+    admission: PresentAdmission,
+}
+
+impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
+    /// Compiles one reusable Present-only nonterminal schema capability.
+    fn new(
+        archive: &'a crate::succinct_query::WgpuSuccinctArchive<U>,
+        program: &QueryProgram<'_, U>,
+        bound_variables: &[ProgramVariable],
+    ) -> Result<Self, ResidentProposalError> {
+        // Construction may upload immutable metadata, but it launches no
+        // kernels. Admission therefore still fails before resident execution.
+        let round = WgpuResidentRound::new(archive, program, bound_variables)?;
+        let admission = lower_present_admission(&round)?;
+        if admission.is_terminal() {
+            return Err(ResidentProposalError::TerminalSchema);
+        }
+        Ok(Self { round, admission })
+    }
+
+    /// Test/reference upload into this exact schema and archive capability.
+    fn upload_frontier(
+        &self,
+        frontier: &ProgramFrontier,
+    ) -> Result<WgpuResidentFrontier<'a, U>, ResidentProposalError> {
+        self.round.upload_frontier(frontier).map_err(Into::into)
+    }
+
+    /// Enqueues one whole provisional nonterminal round without synchronizing.
+    fn enqueue(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        capacity: usize,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        // Every host-known capacity quantity and the exact frontier capability
+        // are validated before the first support kernel is submitted.
+        let geometry =
+            preflight_present_geometry(&self.round, frontier, capacity, &self.admission)?;
+        let inputs = self.round.initialize_inputs(frontier)?;
+        let choices = self.round.enqueue(&inputs)?;
+        self.round.enqueue_admitted_present_proposals(
+            frontier,
+            &choices,
+            PresentPreflight {
+                admission: &self.admission,
+                geometry,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn staged_round(&self) -> &WgpuResidentRound<'a, U> {
+        &self.round
+    }
+}
+
 impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     /// Enqueues Present-only provisional generation without synchronizing.
     pub(crate) fn enqueue_present_proposals(
@@ -211,6 +320,22 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         self.enqueue_present_proposals_inner(frontier, choices, capacity, None, None, false)
+    }
+
+    /// Enqueues one pre-admitted, preflighted provisional arena.
+    ///
+    /// The wired wrapper computes `admission` once at construction and freezes
+    /// all capacity-dependent host geometry before it launches support. This
+    /// method revalidates the exact frontier/planner lineage, but performs no
+    /// semantic lowering and no host geometry recomputation.
+    fn enqueue_admitted_present_proposals(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        preflight: PresentPreflight<'_>,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let inputs = self.proposal_inputs(frontier, choices)?;
+        self.enqueue_present_proposals_with_inputs(inputs, preflight, None, None, false)
     }
 
     #[cfg(test)]
@@ -277,36 +402,50 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
         let admission = lower_present_admission(self)?;
-        let context = self.archive().context();
+        let geometry = present_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            PresentPreflight {
+                admission: &admission,
+                geometry,
+            },
+            descriptor_override,
+            dispatch_limits,
+            _profile_stages,
+        )
+    }
 
-        ensure_below_sentinel(capacity, "candidate capacity")?;
-        let child_stride = inputs
-            .parent_stride
-            .checked_add(1)
-            .ok_or(ResidentProposalError::GeometryOverflow("child stride"))?;
-        ensure_below_sentinel(child_stride, "child stride")?;
-        let cells = checked_device_product(
-            admission.segment_count,
-            inputs.rows,
-            "proposal count matrix",
-        )?;
-        let block_count = cells.div_ceil(BLOCK_ITEMS as usize);
-        ensure_below_sentinel(block_count, "proposal scan blocks")?;
-        let choice_error_blocks = inputs.rows.div_ceil(BLOCK_ITEMS as usize);
-        ensure_below_sentinel(choice_error_blocks, "choice validation blocks")?;
-        let segment_record_words = checked_device_product(
-            admission.segment_count,
-            SEGMENT_RECORD_WORDS,
-            "proposal segment records",
-        )?;
-        let candidate_record_words = checked_device_product(
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_present_proposals_with_inputs(
+        &self,
+        inputs: ResidentProposalInputs,
+        preflight: PresentPreflight<'_>,
+        descriptor_override: Option<&[u32]>,
+        dispatch_limits: Option<(u32, u32)>,
+        _profile_stages: bool,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let context = self.archive().context();
+        let admission = preflight.admission;
+        let PresentGeometry {
+            rows,
+            parent_stride,
             capacity,
-            CANDIDATE_RECORD_FIELDS,
-            "proposal candidate records",
-        )?;
-        let child_words = checked_device_product(capacity, child_stride, "provisional child body")?;
-        let workspace_layout =
-            workspace_layout(cells, inputs.rows, choice_error_blocks, block_count)?;
+            segment_count,
+            child_stride,
+            cells,
+            block_count,
+            choice_error_blocks,
+            segment_record_words,
+            candidate_record_words,
+            child_words,
+            workspace_layout,
+        } = preflight.geometry;
+        if inputs.rows != rows || inputs.parent_stride != parent_stride {
+            return Err(ResidentProposalError::MalformedPlan);
+        }
+        if admission.segment_count != segment_count {
+            return Err(ResidentProposalError::MalformedPlan);
+        }
 
         let descriptors = descriptor_override.unwrap_or(&admission.arm_descriptors);
         let expected_descriptors = checked_device_product(
@@ -322,7 +461,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // uploads `lower_present_admission` after its independent source-axis
         // check. Equal-cardinality wrong-axis words cannot be rediscovered from
         // the packed descriptor alone and are outside the device threat model.
-        let (plan_words, plan_layout) = packed_plan(&admission, descriptors)?;
+        let (plan_words, plan_layout) = packed_plan(admission, descriptors)?;
         let plan = context.upload_u32(&plan_words)?;
         let mut workspace = context.empty_u32(workspace_layout.words)?;
         if inputs.rows != 0 {
@@ -700,6 +839,63 @@ fn lower_present_admission<U: Universe>(
         segment_specs,
         variable_to_segment,
         segment_count,
+    })
+}
+
+/// Freezes every capacity-dependent host quantity before any wired producer
+/// kernel is launched. Ordinary one-short capacity remains a device-reported,
+/// sticky arena status; only unrepresentable host geometry fails here.
+fn preflight_present_geometry<U: Universe>(
+    round: &WgpuResidentRound<'_, U>,
+    frontier: &WgpuResidentFrontier<'_, U>,
+    capacity: usize,
+    admission: &PresentAdmission,
+) -> Result<PresentGeometry, ResidentProposalError> {
+    let (rows, parent_stride) = round.proposal_frontier_shape(frontier)?;
+    present_geometry(rows, parent_stride, capacity, admission)
+}
+
+fn present_geometry(
+    rows: usize,
+    parent_stride: usize,
+    capacity: usize,
+    admission: &PresentAdmission,
+) -> Result<PresentGeometry, ResidentProposalError> {
+    ensure_below_sentinel(capacity, "candidate capacity")?;
+    let child_stride = parent_stride
+        .checked_add(1)
+        .ok_or(ResidentProposalError::GeometryOverflow("child stride"))?;
+    ensure_below_sentinel(child_stride, "child stride")?;
+    let cells = checked_device_product(admission.segment_count, rows, "proposal count matrix")?;
+    let block_count = cells.div_ceil(BLOCK_ITEMS as usize);
+    ensure_below_sentinel(block_count, "proposal scan blocks")?;
+    let choice_error_blocks = rows.div_ceil(BLOCK_ITEMS as usize);
+    ensure_below_sentinel(choice_error_blocks, "choice validation blocks")?;
+    let segment_record_words = checked_device_product(
+        admission.segment_count,
+        SEGMENT_RECORD_WORDS,
+        "proposal segment records",
+    )?;
+    let candidate_record_words = checked_device_product(
+        capacity,
+        CANDIDATE_RECORD_FIELDS,
+        "proposal candidate records",
+    )?;
+    let child_words = checked_device_product(capacity, child_stride, "provisional child body")?;
+    let workspace_layout = workspace_layout(cells, rows, choice_error_blocks, block_count)?;
+    Ok(PresentGeometry {
+        rows,
+        parent_stride,
+        capacity,
+        segment_count: admission.segment_count,
+        child_stride,
+        cells,
+        block_count,
+        choice_error_blocks,
+        segment_record_words,
+        candidate_record_words,
+        child_words,
+        workspace_layout,
     })
 }
 
@@ -1652,3 +1848,6 @@ fn pack_proposal_inspection(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod wired_tests;

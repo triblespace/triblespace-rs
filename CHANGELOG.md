@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A private schema-specialized resident round now wires exact support through
+  provisional Present children without an intermediate readback.** One cached
+  admission rejects terminal and non-Present schemas before producer kernels;
+  each execution then freezes capacity geometry, evaluates tri-state support
+  and exact estimates, plans every row, and feeds the existing stable
+  destination-parallel arena plus indirect reference child materializer. The
+  output remains explicitly pre-confirmation, preserves frontier and arena
+  lineage, reports capacity misses atomically through the sticky arena status,
+  and keeps every production kernel within seven user storage arrays.
 - **Resident affine rounds gain a private, exact Present proposal arena.**
   Packed planner choices are classified into one variable-major width vector;
   a single stable device scan turns that layout directly into ascending

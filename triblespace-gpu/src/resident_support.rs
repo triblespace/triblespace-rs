@@ -682,6 +682,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.plan.is_global_dead()
     }
 
+    /// Pure host shape validation for a later capacity/admission preflight.
+    ///
+    /// No raw buffer argument escapes this method and no kernel is launched.
+    pub(crate) fn proposal_frontier_shape(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+    ) -> Result<(usize, usize), ResidentSupportError> {
+        self.validate_frontier(frontier)?;
+        Ok((frontier.rows, frontier.stride))
+    }
+
     /// Test-only construction of malformed but correctly branded choices.
     /// Device consumers must still reject their contents before publication.
     #[cfg(test)]
