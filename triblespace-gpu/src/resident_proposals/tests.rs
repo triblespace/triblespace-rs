@@ -383,12 +383,76 @@ fn pair_axes(rotation: SuccinctRotation) -> (ProgramVariable, ProgramVariable) {
     }
 }
 
+fn pair_cpu_pattern(
+    rotation: SuccinctRotation,
+    target: ProgramVariable,
+    other: ProgramVariable,
+    bound: ProgramVariable,
+) -> QueryPattern {
+    match rotation {
+        SuccinctRotation::Eav => QueryPattern::new(bound, target, other),
+        SuccinctRotation::Vea => QueryPattern::new(target, other, bound),
+        SuccinctRotation::Ave => QueryPattern::new(other, bound, target),
+        SuccinctRotation::Vae => QueryPattern::new(other, target, bound),
+        SuccinctRotation::Eva => QueryPattern::new(bound, other, target),
+        SuccinctRotation::Aev => QueryPattern::new(target, bound, other),
+    }
+}
+
+fn pair_cpu_peer_rows(fixture: &PairFixture, rotation: SuccinctRotation) -> [Id; 3] {
+    match rotation {
+        // Every selected target width is no larger than the remaining
+        // unbound width. With target v0, the CPU planner therefore chooses the
+        // same Pair arm on every row, including the repeated final parent.
+        SuccinctRotation::Eav => [
+            fixture.entities[0],
+            fixture.entities[2],
+            fixture.entities[0],
+        ],
+        SuccinctRotation::Eva => [
+            fixture.entities[0],
+            fixture.entities[1],
+            fixture.entities[0],
+        ],
+        SuccinctRotation::Vea | SuccinctRotation::Vae => {
+            [fixture.values[0], fixture.values[1], fixture.values[0]]
+        }
+        SuccinctRotation::Ave => [
+            fixture.attributes[1],
+            fixture.attributes[2],
+            fixture.attributes[1],
+        ],
+        SuccinctRotation::Aev => [
+            fixture.attributes[0],
+            fixture.attributes[1],
+            fixture.attributes[0],
+        ],
+    }
+}
+
+fn restricted_cpu_pattern(
+    rotation: SuccinctRotation,
+    target: ProgramVariable,
+    first: ProgramVariable,
+    last: ProgramVariable,
+) -> QueryPattern {
+    match rotation {
+        SuccinctRotation::Eav => QueryPattern::new(first, target, last),
+        SuccinctRotation::Vea => QueryPattern::new(target, last, first),
+        SuccinctRotation::Ave => QueryPattern::new(last, first, target),
+        SuccinctRotation::Vae => QueryPattern::new(last, target, first),
+        SuccinctRotation::Eva => QueryPattern::new(first, last, target),
+        SuccinctRotation::Aev => QueryPattern::new(target, first, last),
+    }
+}
+
 fn enqueue_pair_case<U: Universe>(
     gpu: &crate::WgpuSuccinctArchive<U>,
     program: &QueryProgram<'_, U>,
     rotation: SuccinctRotation,
     peer: Id,
     capacity: usize,
+    confirmed: bool,
 ) -> (ProposalInspection, u32, u32, u32) {
     let (bound, target) = pair_axes(rotation);
     let round = WgpuResidentRound::new(gpu, program, &[bound]).unwrap();
@@ -422,10 +486,13 @@ fn enqueue_pair_case<U: Universe>(
             &[target.index() as u32, arm as u32, count],
         )
         .unwrap();
-    let inspection = round
-        .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
-        .unwrap()
-        .inspect();
+    let arena = if confirmed {
+        round.enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, capacity)
+    } else {
+        round.enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
+    }
+    .unwrap();
+    let inspection = arena.inspect();
     (inspection, arm as u32, peer_code, target.index() as u32)
 }
 
@@ -482,6 +549,11 @@ fn generic_restricted_generation_matches_cpu_order_for_natural_rotation() {
         .enqueue_generic_proposals_for_test(&frontier, &choices, expected.len() + 3)
         .unwrap()
         .inspect();
+    let confirmed = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, expected.len() + 3)
+        .unwrap()
+        .inspect();
+    assert_eq!(confirmed, inspection);
     assert_success(&inspection, expected.len());
     assert_eq!(&inspection.candidate_codes[..expected.len()], expected);
     assert_eq!(
@@ -668,6 +740,25 @@ fn physical_restricted_generation_covers_all_six_rotations_and_capacity_edges() 
         .enqueue_physical_restricted_proposals_for_test(&frontier, &choices, required)
         .unwrap()
         .inspect();
+    let confirmed_arena = round
+        .enqueue_confirmed_physical_restricted_proposals_for_test(&frontier, &choices, required)
+        .unwrap();
+    let confirmation_trace = confirmed_arena.read_semantic_confirmation_work_for_test();
+    for arm in 0..rotations.len() {
+        let target_count = cases
+            .iter()
+            .filter(|case| case.arm == arm as u32)
+            .map(|case| case.expected.len() as u32)
+            .sum::<u32>();
+        assert_eq!(
+            confirmation_trace[arm],
+            [target_count * 2, cases.len() as u32],
+            "Restricted confirmation work for {:?}",
+            rotations[arm]
+        );
+    }
+    let confirmed = confirmed_arena.inspect();
+    assert_eq!(confirmed, exact);
     assert_success(&exact, required);
 
     let mut expected_codes = Vec::with_capacity(required);
@@ -728,6 +819,143 @@ fn physical_restricted_generation_covers_all_six_rotations_and_capacity_edges() 
             .chain(&failed.proposer_arms)
             .chain(&failed.child_body)
             .all(|&word| word == RESIDENT_U32_SENTINEL));
+    }
+}
+
+#[test]
+fn confirmed_physical_restricted_all_six_rotations_match_cpu_selected_rows() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let target = ProgramVariable::new(0);
+    let first_variable = ProgramVariable::new(1);
+    let last_variable = ProgramVariable::new(2);
+
+    for rotation in SuccinctRotation::ALL {
+        let program = QueryProgram::compile(
+            gpu.archive(),
+            3,
+            [restricted_cpu_pattern(
+                rotation,
+                target,
+                first_variable,
+                last_variable,
+            )],
+        )
+        .unwrap();
+        let mut round =
+            WgpuResidentRound::new(&gpu, &program, &[first_variable, last_variable]).unwrap();
+        let physical_specs = round
+            .proposal_arm_specs()
+            .iter()
+            .copied()
+            .map(|spec| {
+                let ArmSpec::Restricted {
+                    arm,
+                    rotation: canonical,
+                    first,
+                    last,
+                } = spec
+                else {
+                    panic!("two-bound single-pattern round must be Restricted")
+                };
+                if canonical == rotation {
+                    spec
+                } else {
+                    assert_eq!(rotation, inverse_restricted_rotation(canonical));
+                    ArmSpec::Restricted {
+                        arm,
+                        rotation,
+                        first: last,
+                        last: first,
+                    }
+                }
+            })
+            .collect();
+        round
+            .reconfigure_restricted_proposal_arms_for_test(physical_specs)
+            .unwrap();
+        let arm = round
+            .proposal_arm_specs()
+            .iter()
+            .position(|spec| {
+                matches!(
+                    spec,
+                    ArmSpec::Restricted {
+                        rotation: candidate,
+                        ..
+                    } if *candidate == rotation
+                )
+            })
+            .expect("physical Restricted rotation is installed");
+
+        let pairs = representative_restricted_pairs(&fixture, rotation);
+        let mut parent_values = Vec::with_capacity(pairs.len() * 2);
+        for &(first, last) in &pairs {
+            parent_values.extend([
+                program.encode(&raw(first)).unwrap().get(),
+                program.encode(&raw(last)).unwrap().get(),
+            ]);
+        }
+        let host = program
+            .frontier_from_indices(
+                vec![first_variable, last_variable],
+                parent_values,
+                pairs.len(),
+            )
+            .unwrap();
+        let cpu = program.transition(&host).unwrap();
+        assert_eq!(cpu.len(), 1, "CPU transition group for {rotation:?}");
+        assert_eq!(
+            cpu[0].variables(),
+            &[target, first_variable, last_variable],
+            "CPU transition variable for {rotation:?}"
+        );
+        let cpu_body = cpu[0]
+            .values()
+            .iter()
+            .map(|code| code.get())
+            .collect::<Vec<_>>();
+
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+        let mut choice_words = Vec::with_capacity(pairs.len() * CHOICE_WORDS);
+        let mut expected_owners = Vec::new();
+        for (row, &(first, last)) in pairs.iter().enumerate() {
+            let witness = (arm * pairs.len() + row) * PROPOSAL_WITNESS_WORDS;
+            let count = witnesses[witness + 3] - witnesses[witness + 2];
+            assert_eq!(
+                count as usize,
+                expected_restricted_ids(&fixture, rotation, first, last).len(),
+                "raw selected-row width for {rotation:?}, row {row}"
+            );
+            expected_owners.extend(std::iter::repeat_n(row as u32, count as usize));
+            choice_words.extend([target.index() as u32, arm as u32, count]);
+        }
+        let choices = round
+            .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+            .unwrap();
+        let expected = cpu[0].len();
+        assert_eq!(expected_owners.len(), expected);
+        let arena = round
+            .enqueue_confirmed_physical_restricted_proposals_for_test(&frontier, &choices, expected)
+            .unwrap();
+        let trace = arena.read_semantic_confirmation_work_for_test();
+        assert_eq!(trace[arm], [(expected * 2) as u32, pairs.len() as u32]);
+        let inspection = arena.inspect();
+        assert_success(&inspection, expected);
+        assert_eq!(inspection.child_body, cpu_body, "{rotation:?}");
+        assert_eq!(inspection.candidate_owners, expected_owners, "{rotation:?}");
+        assert!(inspection
+            .proposer_arms
+            .iter()
+            .all(|&proposer| proposer == arm as u32));
+        let cpu_candidates = cpu_body
+            .chunks_exact(inspection.child_stride as usize)
+            .map(|row| row[0])
+            .collect::<Vec<_>>();
+        assert_eq!(inspection.candidate_codes, cpu_candidates, "{rotation:?}");
     }
 }
 
@@ -805,6 +1033,16 @@ fn restricted_zero_width_accepts_successor_end_at_zero_capacity() {
         .enqueue_generic_proposals_for_test(&frontier, &choices, 0)
         .unwrap()
         .inspect();
+    let confirmed_arena = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, 0)
+        .unwrap();
+    assert_eq!(
+        confirmed_arena.read_semantic_confirmation_work_for_test(),
+        vec![[0, 1]],
+        "N..N performs one owner-row prefix translation and no rank probes"
+    );
+    let confirmed = confirmed_arena.inspect();
+    assert_eq!(confirmed, inspection);
     assert_success(&inspection, 0);
     assert_eq!(inspection.segments.len(), 1);
     assert_eq!(inspection.segments[0].variable, value.index() as u32);
@@ -1025,6 +1263,11 @@ fn restricted_source_shape_matrix_allows_only_canonical_or_exact_inverse() {
         .unwrap()
         .inspect();
     assert_success(&canonical, required);
+    let confirmed_canonical = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, required)
+        .unwrap()
+        .inspect();
+    assert_eq!(confirmed_canonical, canonical);
 
     let inverse_specs = canonical_specs
         .iter()
@@ -1098,7 +1341,7 @@ fn restricted_source_shape_matrix_allows_only_canonical_or_exact_inverse() {
 }
 
 #[test]
-fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
+fn confirmed_mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
     const ROWS: usize = 65;
     let fixture = restricted_fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
@@ -1192,7 +1435,13 @@ fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
     let mut row_candidates = Vec::with_capacity(ROWS);
     let mut choice_words = Vec::with_capacity(ROWS * CHOICE_WORDS);
     for row in 0..ROWS {
-        let arm = arm_cycle[row % arm_cycle.len()];
+        // Keep a live Restricted row in the second 64-lane block. This is the
+        // boundary where a source-index/dispatch-lane mix-up previously hid.
+        let arm = if row == 64 {
+            5
+        } else {
+            arm_cycle[row % arm_cycle.len()]
+        };
         let target = round.metadata().arms()[arm].target_variable();
         let candidates = codes(
             &program,
@@ -1202,6 +1451,11 @@ fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
         row_arms.push(arm);
         row_candidates.push(candidates);
     }
+    assert_eq!(row_arms[64], 5);
+    assert!(
+        !row_candidates[64].is_empty(),
+        "block-one Restricted row must exercise a nonzero interval"
+    );
     assert!(row_arms
         .windows(arm_cycle.len())
         .any(|window| window == arm_cycle));
@@ -1221,10 +1475,25 @@ fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
         let choices = round
             .force_choice_words_from_inputs_for_test(&frontier, &inputs, words)
             .unwrap();
-        let inspection = round
-            .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
-            .unwrap()
-            .inspect();
+        let arena = round
+            .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, capacity)
+            .unwrap();
+        let trace = arena.read_semantic_confirmation_work_for_test();
+        for (arm, spec) in round.proposal_arm_specs().iter().enumerate() {
+            let target = round.metadata().arms()[arm].target_variable();
+            let provisional_target = range
+                .clone()
+                .filter(|&row| round.metadata().arms()[row_arms[row]].target_variable() == target)
+                .map(|row| row_candidates[row].len() as u32)
+                .sum::<u32>();
+            let expected = match spec {
+                ArmSpec::Present { .. } => [0, 0],
+                ArmSpec::PairDistinct { .. } => [provisional_target * 2, 0],
+                ArmSpec::Restricted { .. } => [provisional_target * 2, range.len() as u32],
+            };
+            assert_eq!(trace[arm], expected, "arm {arm}, rows {range:?}");
+        }
+        let inspection = arena.inspect();
         assert_success(&inspection, capacity);
         inspection
     };
@@ -1265,6 +1534,32 @@ fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
     assert_eq!(whole.proposer_arms, expected_arms);
     assert_eq!(whole.child_body, expected_body);
 
+    let restricted_segment = whole
+        .segments
+        .iter()
+        .find(|segment| segment.variable == targets[5].index() as u32)
+        .unwrap();
+    let start = restricted_segment.base as usize;
+    let end = start + restricted_segment.count as usize;
+    let lane_64_destinations = (start..end)
+        .filter(|&destination| whole.candidate_owners[destination] == 64)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lane_64_destinations
+            .iter()
+            .map(|&destination| whole.candidate_codes[destination])
+            .collect::<Vec<_>>(),
+        row_candidates[64],
+        "block-one Restricted destinations must match the raw triple oracle"
+    );
+    assert!(lane_64_destinations.iter().all(|&destination| {
+        whole.proposer_arms[destination] == 5
+            && whole.child_body[destination * whole.child_stride as usize
+                ..(destination + 1) * whole.child_stride as usize]
+                == expected_body[destination * whole.child_stride as usize
+                    ..(destination + 1) * whole.child_stride as usize]
+    }));
+
     let expected_segments = live_segments(&whole);
     for split in 0..=ROWS {
         let left = inspect_range(0..split);
@@ -1274,6 +1569,824 @@ fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
             expected_segments,
             "Present+Pair+Restricted row homomorphism split {split}"
         );
+    }
+}
+
+#[test]
+fn confirmed_shared_target_filters_cross_family_sibling_misses_stably() {
+    const ROWS: usize = 3;
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let target = ProgramVariable::new(0);
+    let open_attribute = ProgramVariable::new(1);
+    let open_value = ProgramVariable::new(2);
+    let bound_pair_attribute = ProgramVariable::new(3);
+    let open_pair_value = ProgramVariable::new(4);
+    let bound_restricted_attribute = ProgramVariable::new(5);
+    let bound_value = ProgramVariable::new(6);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        7,
+        [
+            QueryPattern::new(target, open_attribute, open_value),
+            QueryPattern::new(target, bound_pair_attribute, open_pair_value),
+            QueryPattern::new(target, bound_restricted_attribute, bound_value),
+        ],
+    )
+    .unwrap();
+    let bound = [
+        bound_pair_attribute,
+        bound_restricted_attribute,
+        bound_value,
+    ];
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let find_target_arm = |predicate: fn(ArmSpec) -> bool| {
+        round
+            .proposal_arm_specs()
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(arm, spec)| {
+                round.metadata().arms()[*arm].target_variable() == target && predicate(*spec)
+            })
+            .map(|(arm, _)| arm)
+            .unwrap()
+    };
+    let present_arm = find_target_arm(|spec| {
+        matches!(
+            spec,
+            ArmSpec::Present {
+                axis: ResidentAxis::Entity,
+                ..
+            }
+        )
+    });
+    let pair_arm = find_target_arm(|spec| {
+        matches!(
+            spec,
+            ArmSpec::PairDistinct {
+                rotation: SuccinctRotation::Aev,
+                ..
+            }
+        )
+    });
+    let restricted_arm = find_target_arm(|spec| {
+        matches!(
+            spec,
+            ArmSpec::Restricted {
+                rotation: SuccinctRotation::Aev,
+                ..
+            }
+        )
+    });
+    let proposer_arms = [present_arm, pair_arm, restricted_arm];
+    let pair_attributes = [
+        fixture.attributes[2],
+        fixture.attributes[0],
+        fixture.attributes[2],
+    ];
+    let restricted_attributes = [fixture.attributes[0]; ROWS];
+    let values = [fixture.values[0]; ROWS];
+    let parent_ids = (0..ROWS)
+        .flat_map(|row| {
+            [
+                pair_attributes[row],
+                restricted_attributes[row],
+                values[row],
+            ]
+        })
+        .collect::<Vec<_>>();
+    let parent_codes = parent_ids
+        .iter()
+        .map(|&id| program.encode(&raw(id)).unwrap().get())
+        .collect::<Vec<_>>();
+    let host = program
+        .frontier_from_indices(bound.to_vec(), parent_codes.clone(), ROWS)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+
+    let pair_ids =
+        |row: usize| expected_pair_ids(&fixture, SuccinctRotation::Aev, pair_attributes[row]);
+    let restricted_ids = |row: usize| {
+        expected_restricted_ids(
+            &fixture,
+            SuccinctRotation::Aev,
+            restricted_attributes[row],
+            values[row],
+        )
+    };
+    let confirmed_ids = |row: usize| {
+        let pair = pair_ids(row);
+        let restricted = restricted_ids(row);
+        fixture
+            .entities
+            .iter()
+            .copied()
+            .filter(|entity| pair.contains(entity) && restricted.contains(entity))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(confirmed_ids(0), vec![fixture.entities[0]]);
+    assert_eq!(
+        confirmed_ids(1),
+        vec![fixture.entities[0], fixture.entities[1]]
+    );
+    assert_eq!(confirmed_ids(2), vec![fixture.entities[0]]);
+
+    let provisional_ids = (0..ROWS)
+        .map(|row| match proposer_arms[row] {
+            arm if arm == present_arm => fixture.entities.to_vec(),
+            arm if arm == pair_arm => pair_ids(row),
+            arm if arm == restricted_arm => restricted_ids(row),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    let mut choice_words = Vec::with_capacity(ROWS * CHOICE_WORDS);
+    for row in 0..ROWS {
+        let arm = proposer_arms[row];
+        let witness = (arm * ROWS + row) * PROPOSAL_WITNESS_WORDS;
+        let count = witnesses[witness + 3] - witnesses[witness + 2];
+        assert_eq!(count as usize, provisional_ids[row].len());
+        choice_words.extend([target.index() as u32, arm as u32, count]);
+    }
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+        .unwrap();
+    let provisional_count = provisional_ids.iter().map(Vec::len).sum::<usize>();
+    let capacity = provisional_count + 5;
+    let provisional = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap()
+        .inspect();
+    assert_success(&provisional, provisional_count);
+
+    let confirmed_arena = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap();
+    let trace = confirmed_arena.read_semantic_confirmation_work_for_test();
+    for (arm, spec) in round.proposal_arm_specs().iter().enumerate() {
+        let target_count = if round.metadata().arms()[arm].target_variable() == target {
+            provisional_count as u32
+        } else {
+            0
+        };
+        let expected = match spec {
+            ArmSpec::Present { .. } => [0, 0],
+            ArmSpec::PairDistinct { .. } => [target_count * 2, 0],
+            ArmSpec::Restricted { .. } => [target_count * 2, ROWS as u32],
+        };
+        assert_eq!(trace[arm], expected, "arm {arm}");
+    }
+    let confirmed = confirmed_arena.inspect();
+    let expected_count = (0..ROWS).map(|row| confirmed_ids(row).len()).sum::<usize>();
+    assert_success(&confirmed, expected_count);
+    assert!(
+        expected_count < provisional_count,
+        "fixture must leave stable holes"
+    );
+
+    let mut expected_codes = Vec::new();
+    let mut expected_owners = Vec::new();
+    let mut expected_proposers = Vec::new();
+    let mut expected_body = Vec::new();
+    for row in 0..ROWS {
+        for candidate in codes(&program, &confirmed_ids(row)) {
+            expected_codes.push(candidate);
+            expected_owners.push(row as u32);
+            expected_proposers.push(proposer_arms[row] as u32);
+            expected_body.extend([
+                candidate,
+                parent_codes[row * 3],
+                parent_codes[row * 3 + 1],
+                parent_codes[row * 3 + 2],
+            ]);
+        }
+    }
+    assert_eq!(&confirmed.candidate_codes[..expected_count], expected_codes);
+    assert_eq!(
+        &confirmed.candidate_owners[..expected_count],
+        expected_owners
+    );
+    assert_eq!(
+        &confirmed.proposer_arms[..expected_count],
+        expected_proposers
+    );
+    assert_eq!(&confirmed.child_body[..expected_body.len()], expected_body);
+    assert!(confirmed.candidate_codes[expected_count..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+    assert!(confirmed.child_body[expected_body.len()..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn confirmed_restricted_anchor_at_source_lane_64_survives_dropped_capabilities() {
+    const ROWS: usize = 65;
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let target = ProgramVariable::new(0);
+    let bound_attribute = ProgramVariable::new(1);
+    let open_value = ProgramVariable::new(2);
+    let bound_value = ProgramVariable::new(3);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        4,
+        [
+            QueryPattern::new(target, bound_attribute, open_value),
+            QueryPattern::new(target, bound_attribute, bound_value),
+        ],
+    )
+    .unwrap();
+    let bound = [bound_attribute, bound_value];
+    let round = WgpuResidentRound::new(&gpu, &program, &bound).unwrap();
+    let pair_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(arm, spec)| {
+            round.metadata().arms()[*arm].target_variable() == target
+                && matches!(
+                    spec,
+                    ArmSpec::PairDistinct {
+                        rotation: SuccinctRotation::Aev,
+                        ..
+                    }
+                )
+        })
+        .map(|(arm, _)| arm)
+        .unwrap();
+    let restricted_arm = round
+        .proposal_arm_specs()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(arm, spec)| {
+            round.metadata().arms()[*arm].target_variable() == target
+                && matches!(
+                    spec,
+                    ArmSpec::Restricted {
+                        rotation: SuccinctRotation::Aev,
+                        ..
+                    }
+                )
+        })
+        .map(|(arm, _)| arm)
+        .unwrap();
+    let singleton = representative_restricted_pairs(&fixture, SuccinctRotation::Aev)[1];
+    assert_eq!(
+        expected_restricted_ids(&fixture, SuccinctRotation::Aev, singleton.0, singleton.1).len(),
+        1
+    );
+    let anchor = restricted_anchor_pair(&fixture, &program, SuccinctRotation::Aev);
+    let anchor_restricted =
+        expected_restricted_ids(&fixture, SuccinctRotation::Aev, anchor.0, anchor.1);
+    let anchor_pair = expected_pair_ids(&fixture, SuccinctRotation::Aev, anchor.0);
+    assert!(!anchor_restricted.is_empty());
+    assert!(anchor_restricted
+        .iter()
+        .all(|entity| anchor_pair.contains(entity)));
+
+    let row_pairs = (0..ROWS)
+        .map(|row| if row == 64 { anchor } else { singleton })
+        .collect::<Vec<_>>();
+    let parent_codes = row_pairs
+        .iter()
+        .flat_map(|&(attribute, value)| {
+            [
+                program.encode(&raw(attribute)).unwrap().get(),
+                program.encode(&raw(value)).unwrap().get(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let host = program
+        .frontier_from_indices(bound.to_vec(), parent_codes.clone(), ROWS)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let restricted_witness = (restricted_arm * ROWS + 64) * PROPOSAL_WITNESS_WORDS;
+    let (anchor_witness, anchor_base) = restricted_geometry(
+        program.archive(),
+        SuccinctRotation::Aev,
+        program.encode(&raw(anchor.0)).unwrap().get() as usize,
+        program.encode(&raw(anchor.1)).unwrap().get() as usize,
+    );
+    assert!(anchor_base > 0);
+    assert!(anchor_witness[2] > 0);
+    assert!(anchor_witness[3] > anchor_witness[2]);
+    assert_eq!(
+        &witnesses[restricted_witness..restricted_witness + PROPOSAL_WITNESS_WORDS],
+        &anchor_witness.map(|word| word as u32)
+    );
+
+    let mut choice_words = Vec::with_capacity(ROWS * CHOICE_WORDS);
+    for row in 0..ROWS {
+        let arm = if row == 64 { pair_arm } else { restricted_arm };
+        let witness = (arm * ROWS + row) * PROPOSAL_WITNESS_WORDS;
+        let count = witnesses[witness + 3] - witnesses[witness + 2];
+        let expected = if row == 64 { anchor_pair.len() } else { 1 };
+        assert_eq!(count as usize, expected, "row {row}");
+        choice_words.extend([target.index() as u32, arm as u32, count]);
+    }
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+        .unwrap();
+    let provisional_count = 64 + anchor_pair.len();
+    let capacity = provisional_count + 4;
+    let provisional = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap()
+        .inspect();
+    assert_success(&provisional, provisional_count);
+    assert_eq!(provisional.candidate_owners[64], 64);
+    assert_eq!(provisional.proposer_arms[64], pair_arm as u32);
+    assert_eq!(
+        &provisional.candidate_codes[64..64 + anchor_pair.len()],
+        codes(&program, &anchor_pair)
+    );
+
+    let confirmed_arena = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap();
+    let short_arena = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, provisional_count - 1)
+        .unwrap();
+    let expected_trace = round
+        .proposal_arm_specs()
+        .iter()
+        .enumerate()
+        .map(|(arm, spec)| {
+            let target_count = if round.metadata().arms()[arm].target_variable() == target {
+                provisional_count as u32
+            } else {
+                0
+            };
+            match spec {
+                ArmSpec::Present { .. } => [0, 0],
+                ArmSpec::PairDistinct { .. } => [target_count * 2, 0],
+                ArmSpec::Restricted { .. } => [target_count * 2, ROWS as u32],
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // The arena owns every queued source. No round/frontier/input/choice
+    // capability remains when either trace or semantic publication is read.
+    drop(choices);
+    drop(inputs);
+    drop(frontier);
+    drop(round);
+
+    assert_eq!(
+        confirmed_arena.read_semantic_confirmation_work_for_test(),
+        expected_trace
+    );
+    let confirmed = confirmed_arena.inspect();
+    let expected_count = 64 + anchor_restricted.len();
+    assert_success(&confirmed, expected_count);
+    assert_eq!(
+        &confirmed.candidate_codes[64..64 + anchor_restricted.len()],
+        codes(&program, &anchor_restricted)
+    );
+    assert!(confirmed.candidate_owners[64..64 + anchor_restricted.len()]
+        .iter()
+        .all(|&owner| owner == 64));
+    assert!(confirmed.proposer_arms[64..64 + anchor_restricted.len()]
+        .iter()
+        .all(|&arm| arm == pair_arm as u32));
+    for (ordinal, &candidate) in codes(&program, &anchor_restricted).iter().enumerate() {
+        let destination = 64 + ordinal;
+        assert_eq!(
+            &confirmed.child_body[destination * confirmed.child_stride as usize
+                ..(destination + 1) * confirmed.child_stride as usize],
+            &[candidate, parent_codes[128], parent_codes[129]]
+        );
+    }
+    assert!(confirmed.candidate_codes[expected_count..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
+    let short = short_arena.inspect();
+    assert_eq!(short.status, STATUS_CAPACITY);
+    assert_eq!(short.required, provisional_count as u32);
+    assert_eq!(short.logical_len, 0);
+    assert_eq!((short.dispatch_x, short.dispatch_y), (0, 1));
+    assert!(short
+        .candidate_codes
+        .iter()
+        .chain(&short.candidate_owners)
+        .chain(&short.proposer_arms)
+        .chain(&short.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+}
+
+#[test]
+fn semantic_fold_distinguishes_proposer_and_sibling_misses_and_pending_faults() {
+    let context = crate::WgpuContext::on_wgpu();
+    let layout = confirmation_workspace_layout(1).unwrap();
+    let run_fold = |proposer: u32,
+                    restricted: u32,
+                    lo: u32,
+                    hi: u32,
+                    rank_lo: u32,
+                    rank_hi: u32,
+                    keep: u32,
+                    pending: u32,
+                    passes: usize| {
+        let candidates = context.upload_u32(&[0, 0, proposer]).unwrap();
+        let control = context.upload_u32(&[STATUS_OK, 1, 1, 1, 0]).unwrap();
+        let lo_positions = context.upload_u32(&[lo]).unwrap();
+        let hi_positions = context.upload_u32(&[hi]).unwrap();
+        let lo_ranks = context.upload_u32(&[rank_lo]).unwrap();
+        let hi_ranks = context.upload_u32(&[rank_hi]).unwrap();
+        let mut words = vec![0; layout.words];
+        words[layout.keep] = keep;
+        words[layout.pending] = pending;
+        let mut workspace = context.upload_u32(&words).unwrap();
+        for _ in 0..passes {
+            unsafe {
+                fold_semantic_confirmation_arm::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    candidates.input_arg(),
+                    control.input_arg(),
+                    lo_positions.input_arg(),
+                    hi_positions.input_arg(),
+                    lo_ranks.input_arg(),
+                    hi_ranks.input_arg(),
+                    workspace.output_arg(),
+                    1,
+                    2,
+                    2,
+                    2,
+                    0,
+                    restricted,
+                    layout.keep as u32,
+                    layout.pending as u32,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+        }
+        workspace.read()
+    };
+
+    let proposer_miss = run_fold(0, 0, 0, 0, 0, 0, 1, 1, 1);
+    assert_eq!(proposer_miss[layout.keep], RESIDENT_U32_SENTINEL);
+    assert_eq!(proposer_miss[layout.pending], 0);
+
+    let sibling_miss = run_fold(1, 0, 0, 0, 0, 0, 1, 1, 1);
+    assert_eq!(sibling_miss[layout.keep], 0);
+    assert_eq!(sibling_miss[layout.pending], 0);
+
+    let restricted_multi_hit = run_fold(1, 1, 0, 2, 0, 2, 1, 1, 1);
+    assert_eq!(
+        restricted_multi_hit[layout.keep], RESIDENT_U32_SENTINEL,
+        "a Restricted rank difference greater than one is poison, not a miss"
+    );
+    assert_eq!(restricted_multi_hit[layout.pending], 0);
+
+    let reversed_interval = run_fold(1, 0, 1, 0, 0, 0, 1, 1, 1);
+    assert_eq!(reversed_interval[layout.keep], RESIDENT_U32_SENTINEL);
+    let out_of_range_rank = run_fold(1, 0, 0, 1, 0, 2, 1, 1, 1);
+    assert_eq!(out_of_range_rank[layout.keep], RESIDENT_U32_SENTINEL);
+    let sticky_poison = run_fold(1, 0, 0, 1, 0, 1, RESIDENT_U32_SENTINEL, 1, 1);
+    assert_eq!(sticky_poison[layout.keep], RESIDENT_U32_SENTINEL);
+
+    let duplicate = run_fold(1, 0, 0, 1, 0, 1, 1, 1, 2);
+    assert_eq!(duplicate[layout.keep], RESIDENT_U32_SENTINEL);
+    assert_eq!(duplicate[layout.pending], 0);
+
+    let leftover = run_fold(1, 0, 0, 1, 0, 1, 1, 2, 1);
+    assert_eq!(leftover[layout.keep], 1);
+    assert_eq!(leftover[layout.pending], 1);
+
+    let scan = |words: Vec<u32>| {
+        let mut workspace = context.upload_u32(&words).unwrap();
+        unsafe {
+            scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                workspace.output_arg(),
+                1,
+                layout.block_count as u32,
+                layout.keep as u32,
+                layout.pending as u32,
+                layout.semantic_status as u32,
+                layout.local_offsets as u32,
+                layout.block_sums as u32,
+                layout.block_errors as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_DEVICE_INVARIANT,
+            );
+        }
+        workspace.read()
+    };
+    assert_eq!(
+        scan(leftover)[layout.block_errors],
+        STATUS_DEVICE_INVARIANT,
+        "a skipped deferred pass must be detected by pending"
+    );
+    let mut never_folded = vec![0; layout.words];
+    never_folded[layout.keep] = 1;
+    never_folded[layout.pending] = 1;
+    assert_eq!(
+        scan(never_folded)[layout.block_errors],
+        STATUS_DEVICE_INVARIANT
+    );
+}
+
+#[test]
+fn semantic_arm_publisher_rechecks_retained_lengths_and_segment_range() {
+    let context = crate::WgpuContext::on_wgpu();
+    let layout = confirmation_workspace_layout(1).unwrap();
+    let rotation = SuccinctRotation::Aev.index() as u32;
+    let enum_limit = 8u32;
+    let canonical_plan = vec![0, FAMILY_RESTRICTED, rotation, enum_limit, 0];
+    let canonical_segments = vec![0, 1, 0, 0];
+    let run = |plan_words: &[u32], segment_words: &[u32]| {
+        let plan = context.upload_u32(plan_words).unwrap();
+        let segments = context.upload_u32(segment_words).unwrap();
+        let provisional = context.upload_u32(&[STATUS_OK, 1, 1, 1]).unwrap();
+        let mut workspace = context.upload_u32(&vec![0; layout.words]).unwrap();
+        let mut arm_control = context
+            .upload_u32(&[
+                STATUS_DEVICE_INVARIANT,
+                RESIDENT_U32_SENTINEL,
+                0,
+                1,
+                RESIDENT_U32_SENTINEL,
+            ])
+            .unwrap();
+        unsafe {
+            publish_semantic_confirmation_arm_work::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                plan.input_arg(),
+                segments.input_arg(),
+                provisional.input_arg(),
+                workspace.output_arg(),
+                arm_control.output_arg(),
+                0,
+                0,
+                FAMILY_RESTRICTED,
+                rotation,
+                enum_limit,
+                1,
+                1,
+                1,
+                1,
+                1,
+                THREADS,
+                0,
+                ARM_DESCRIPTOR_WORDS as u32,
+                layout.semantic_status as u32,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+                STATUS_DEVICE_INVARIANT,
+            );
+        }
+        (arm_control.read(), workspace.read())
+    };
+
+    let (control, workspace) = run(&canonical_plan, &canonical_segments);
+    assert_eq!(&control[..5], &[STATUS_OK, 1, 1, 1, 0]);
+    assert_eq!(workspace[layout.semantic_status], STATUS_OK);
+
+    let mut out_of_range_segment = canonical_plan.clone();
+    out_of_range_segment[ARM_DESCRIPTOR_WORDS] = 1;
+    let mut faults = vec![
+        (
+            "out-of-range segment",
+            out_of_range_segment,
+            canonical_segments.clone(),
+        ),
+        (
+            "truncated plan",
+            canonical_plan[..4].to_vec(),
+            canonical_segments.clone(),
+        ),
+        (
+            "truncated segment records",
+            canonical_plan.clone(),
+            canonical_segments[..3].to_vec(),
+        ),
+    ];
+    let mut oversized_segment = canonical_segments.clone();
+    oversized_segment[1] = 2;
+    faults.push((
+        "segment exceeds retained total",
+        canonical_plan,
+        oversized_segment,
+    ));
+    for (name, plan, segments) in faults {
+        let (control, workspace) = run(&plan, &segments);
+        assert_eq!(
+            &control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "{name}"
+        );
+        assert_eq!(
+            control[CONTROL_SEGMENT_BASE], RESIDENT_U32_SENTINEL,
+            "{name}"
+        );
+        assert_eq!(
+            workspace[layout.semantic_status], STATUS_DEVICE_INVARIANT,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn restricted_confirmation_normalization_rejects_bad_select_results() {
+    let context = crate::WgpuContext::on_wgpu();
+    let run = |source: [u32; 4], query: u32, selected: u32| {
+        let plan = context.upload_u32(&source).unwrap();
+        let frontier = context.upload_u32(&[2]).unwrap();
+        let queries = context.upload_u32(&[query]).unwrap();
+        let mut bases = context.upload_u32(&[selected]).unwrap();
+        let control = context.upload_u32(&[STATUS_OK, 1, 1, 1, 0]).unwrap();
+        unsafe {
+            normalize_restricted_confirmation_bases::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                plan.input_arg(),
+                frontier.input_arg(),
+                queries.input_arg(),
+                bases.output_arg(),
+                control.input_arg(),
+                1,
+                1,
+                4,
+                0,
+                5,
+                0,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+            );
+        }
+        bases.read()[0]
+    };
+
+    let constant = [0, 0, CONSTANT_SOURCE, 2];
+    assert_eq!(run(constant, 2, 4), 2);
+    for selected in [1, 8, RESIDENT_U32_SENTINEL] {
+        assert_eq!(run(constant, 2, selected), RESIDENT_U32_SENTINEL);
+    }
+    assert_eq!(
+        run([0, 0, COLUMN_SOURCE, 0], 2, 4),
+        2,
+        "Column and Constant last sources normalize identically"
+    );
+    assert_eq!(
+        run([0, 0, CONSTANT_SOURCE, 4], 0, 0),
+        RESIDENT_U32_SENTINEL,
+        "an out-of-domain source cannot borrow the safe query zero"
+    );
+}
+
+#[test]
+fn semantic_initializer_rejects_csr_proposer_descriptor_and_pending_corruption() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let target = ProgramVariable::new(0);
+    let open_attribute = ProgramVariable::new(1);
+    let open_value = ProgramVariable::new(2);
+    let bound_pair_attribute = ProgramVariable::new(3);
+    let open_pair_value = ProgramVariable::new(4);
+    let bound_restricted_attribute = ProgramVariable::new(5);
+    let bound_value = ProgramVariable::new(6);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        7,
+        [
+            QueryPattern::new(target, open_attribute, open_value),
+            QueryPattern::new(target, bound_pair_attribute, open_pair_value),
+            QueryPattern::new(target, bound_restricted_attribute, bound_value),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(
+        &gpu,
+        &program,
+        &[
+            bound_pair_attribute,
+            bound_restricted_attribute,
+            bound_value,
+        ],
+    )
+    .unwrap();
+    let admission = lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural).unwrap();
+    let (canonical_plan, plan_layout) =
+        packed_plan(&admission, &admission.arm_descriptors).unwrap();
+    let relevant = round.metadata().relevant_arm_ids(target).unwrap();
+    assert_eq!(relevant.len(), 3);
+    let proposer = relevant
+        .iter()
+        .copied()
+        .find(|&arm| {
+            matches!(
+                round.proposal_arm_specs()[arm as usize],
+                ArmSpec::Present {
+                    axis: ResidentAxis::Entity,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let candidate = program.encode(&raw(fixture.entities[0])).unwrap().get();
+    let mut segment_records = Vec::with_capacity(admission.segment_count * SEGMENT_RECORD_WORDS);
+    let mut cursor = 0u32;
+    for spec in admission.segment_specs.chunks_exact(SEGMENT_SPEC_WORDS) {
+        let count = u32::from(spec[0] == target.index() as u32);
+        segment_records.extend([cursor, count, spec[0], spec[1]]);
+        cursor += count;
+    }
+    assert_eq!(cursor, 1);
+    let candidate_records = [candidate, 0, proposer];
+    let confirmation = confirmation_workspace_layout(1).unwrap();
+    let (ring_len, pair_counts) = checked_proposal_physical_limits(&round).unwrap();
+    let context = round.archive().context();
+    let run = |plan_words: &[u32]| {
+        let plan = context.upload_u32(plan_words).unwrap();
+        let segments = context.upload_u32(&segment_records).unwrap();
+        let candidates = context.upload_u32(&candidate_records).unwrap();
+        let mut workspace = context.upload_u32(&vec![0; confirmation.words]).unwrap();
+        unsafe {
+            initialize_semantic_confirmation::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                plan.input_arg(),
+                segments.input_arg(),
+                candidates.input_arg(),
+                round.archive().present_entity_codes().input_arg(),
+                round.archive().present_attribute_codes().input_arg(),
+                round.archive().present_value_codes().input_arg(),
+                workspace.output_arg(),
+                1,
+                admission.segment_count as u32,
+                1,
+                program.archive().domain.len() as u32,
+                ring_len,
+                pair_counts[0],
+                pair_counts[1],
+                pair_counts[2],
+                pair_counts[3],
+                pair_counts[4],
+                pair_counts[5],
+                round.metadata().variable_count() as u32,
+                round.metadata().arms().len() as u32,
+                plan_layout.arm_descriptors as u32,
+                plan_layout.variable_offsets as u32,
+                plan_layout.variable_arms as u32,
+                plan_layout.deferred_arm_counts as u32,
+                plan_layout.variable_to_segment as u32,
+                confirmation.keep as u32,
+                confirmation.pending as u32,
+                RESIDENT_U32_SENTINEL,
+            );
+        }
+        let words = workspace.read();
+        [words[confirmation.keep], words[confirmation.pending]]
+    };
+    assert_eq!(run(&canonical_plan), [1, 2]);
+
+    let start = admission.variable_offsets[target.index()] as usize;
+    let end = admission.variable_offsets[target.index() + 1] as usize;
+    assert_eq!(end - start, 3);
+    let arms_base = plan_layout.variable_arms + start;
+    let mut faults = Vec::new();
+    let mut duplicate = canonical_plan.clone();
+    duplicate[arms_base + 1] = duplicate[arms_base];
+    faults.push(("duplicate/missing proposer", duplicate));
+    let mut out_of_order = canonical_plan.clone();
+    out_of_order.swap(arms_base, arms_base + 1);
+    faults.push(("out-of-order CSR", out_of_order));
+    let mut empty_range = canonical_plan.clone();
+    empty_range[plan_layout.variable_offsets + target.index() + 1] = start as u32;
+    faults.push(("empty relevant range", empty_range));
+    let mut bad_descriptor = canonical_plan.clone();
+    bad_descriptor[plan_layout.arm_descriptors + proposer as usize * ARM_DESCRIPTOR_WORDS + 3] += 1;
+    faults.push(("malformed proposer descriptor", bad_descriptor));
+    let mut bad_pending = canonical_plan.clone();
+    bad_pending[plan_layout.deferred_arm_counts + target.index()] = 1;
+    faults.push(("wrong deferred count", bad_pending));
+
+    for (name, plan) in faults {
+        let result = run(&plan);
+        assert_eq!(result[0], RESIDENT_U32_SENTINEL, "{name}");
+        assert_ne!(result[1], RESIDENT_U32_SENTINEL, "{name}");
     }
 }
 
@@ -1375,6 +2488,7 @@ fn restricted_faults_fail_closed_and_outrank_capacity() {
             variable_arms: admission.variable_arms.clone(),
             segment_specs: admission.segment_specs.clone(),
             variable_to_segment: admission.variable_to_segment.clone(),
+            deferred_arm_counts: admission.deferred_arm_counts.clone(),
             segment_count: admission.segment_count,
         };
         let proposal_inputs = round.proposal_inputs(&frontier, &choices).unwrap();
@@ -1395,7 +2509,7 @@ fn restricted_faults_fail_closed_and_outrank_capacity() {
                 None,
                 None,
                 false,
-                PresentPublication::Provisional,
+                PresentPublication::Confirmed,
             )
             .unwrap()
             .inspect();
@@ -1477,7 +2591,7 @@ fn restricted_arena_retains_inputs_after_round_capabilities_drop() {
 }
 
 #[test]
-fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
+fn pair_and_restricted_confirmation_is_monotone_after_decoding_rebuilt_archive_codes() {
     let entity_id = ordered_id(1);
     let inserted_attribute = ordered_id(4);
     let existing_attribute = ordered_id(8);
@@ -1487,7 +2601,7 @@ fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
     let mut after = before.clone();
     insert(&mut after, entity_id, inserted_attribute, value_id);
 
-    let run = |set: &TribleSet| {
+    let run = |set: &TribleSet, restricted: bool| {
         let archive: SuccinctArchive<OrderedUniverse> = set.into();
         let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
         let entity = ProgramVariable::new(0);
@@ -1499,37 +2613,64 @@ fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
             [QueryPattern::new(entity, attribute, value)],
         )
         .unwrap();
-        let round = WgpuResidentRound::new(&gpu, &program, &[entity, value]).unwrap();
-        assert!(matches!(
-            round.proposal_arm_specs(),
-            [ArmSpec::Restricted {
-                rotation: SuccinctRotation::Eav,
-                ..
-            }]
-        ));
+        let bound_variables = if restricted {
+            vec![entity, value]
+        } else {
+            vec![entity]
+        };
+        let round = WgpuResidentRound::new(&gpu, &program, &bound_variables).unwrap();
+        let arm = round
+            .proposal_arm_specs()
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(arm, spec)| {
+                round.metadata().arms()[*arm].target_variable() == attribute
+                    && if restricted {
+                        matches!(
+                            spec,
+                            ArmSpec::Restricted {
+                                rotation: SuccinctRotation::Eav,
+                                ..
+                            }
+                        )
+                    } else {
+                        matches!(
+                            spec,
+                            ArmSpec::PairDistinct {
+                                rotation: SuccinctRotation::Eav,
+                                ..
+                            }
+                        )
+                    }
+            })
+            .map(|(arm, _)| arm)
+            .unwrap();
+        let bound_codes = if restricted {
+            vec![
+                program.encode(&raw(entity_id)).unwrap().get(),
+                program.encode(&raw(value_id)).unwrap().get(),
+            ]
+        } else {
+            vec![program.encode(&raw(entity_id)).unwrap().get()]
+        };
         let host = program
-            .frontier_from_indices(
-                vec![entity, value],
-                vec![
-                    program.encode(&raw(entity_id)).unwrap().get(),
-                    program.encode(&raw(value_id)).unwrap().get(),
-                ],
-                1,
-            )
+            .frontier_from_indices(bound_variables, bound_codes, 1)
             .unwrap();
         let frontier = round.upload_frontier(&host).unwrap();
         let inputs = round.initialize_inputs(&frontier).unwrap();
         let witnesses = inputs.read_proposal_witnesses_for_test();
-        let count = witnesses[3] - witnesses[2];
+        let witness = arm * PROPOSAL_WITNESS_WORDS;
+        let count = witnesses[witness + 3] - witnesses[witness + 2];
         let choices = round
             .force_choice_words_from_inputs_for_test(
                 &frontier,
                 &inputs,
-                &[attribute.index() as u32, 0, count],
+                &[attribute.index() as u32, arm as u32, count],
             )
             .unwrap();
         let inspection = round
-            .enqueue_generic_proposals_for_test(&frontier, &choices, count as usize)
+            .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, count as usize)
             .unwrap()
             .inspect();
         assert_success(&inspection, count as usize);
@@ -1546,8 +2687,8 @@ fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
         (encoded, decoded)
     };
 
-    let (before_codes, before_decoded) = run(&before);
-    let (after_codes, after_decoded) = run(&after);
+    let (before_codes, before_decoded) = run(&before, false);
+    let (after_codes, after_decoded) = run(&after, false);
     assert_eq!(before_decoded, vec![raw(existing_attribute)]);
     assert_eq!(
         after_decoded,
@@ -1562,6 +2703,24 @@ fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
         before_codes[0], after_codes[1],
         "new ordered-universe member must shift the old snapshot-local code"
     );
+
+    let (restricted_before_codes, restricted_before_decoded) = run(&before, true);
+    let (restricted_after_codes, restricted_after_decoded) = run(&after, true);
+    assert_eq!(restricted_before_decoded, before_decoded);
+    assert_eq!(restricted_after_decoded, after_decoded);
+    assert_ne!(
+        restricted_before_codes[0], restricted_after_codes[1],
+        "Restricted survivors must be compared after decoding shifted codes"
+    );
+    let restricted_before = restricted_before_decoded
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let restricted_after = restricted_after_decoded
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert!(restricted_before.is_subset(&restricted_after));
 }
 
 #[test]
@@ -1909,6 +3068,8 @@ fn gate_direct(
                 capacity as u32,
                 confirmation_layout.block_count as u32,
                 confirmation_layout.keep as u32,
+                confirmation_layout.pending as u32,
+                confirmation_layout.semantic_status as u32,
                 confirmation_layout.local_offsets as u32,
                 confirmation_layout.block_sums as u32,
                 confirmation_layout.block_errors as u32,
@@ -4035,6 +5196,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             .unwrap(),
         _workspace: workspace,
         _plan: context.upload_u32(&[]).unwrap(),
+        _semantic_confirmation: None,
         _generation_dispatch: context
             .batch_dispatch(0, 1, CubeDim::new_1d(THREADS))
             .unwrap(),
@@ -4117,6 +5279,7 @@ fn confirmed_finalizer_closes_the_upstream_status_required_lattice() {
                 layout.block_sums as u32,
                 layout.block_errors as u32,
                 layout.block_offsets as u32,
+                layout.semantic_status as u32,
                 layout.final_status as u32,
                 layout.final_total as u32,
                 BLOCK_ITEMS,
@@ -4151,6 +5314,61 @@ fn confirmed_finalizer_closes_the_upstream_status_required_lattice() {
     );
     assert_eq!(
         &run(99, RESIDENT_U32_SENTINEL)[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+
+    // No block scan launches at capacity zero, so the scalar finalizer must
+    // still consume the sticky semantic status directly.
+    let zero = confirmation_workspace_layout(0).unwrap();
+    let mut zero_words = vec![0; zero.words];
+    zero_words[zero.semantic_status] = STATUS_DEVICE_INVARIANT;
+    let mut workspace = context.upload_u32(&zero_words).unwrap();
+    let provisional_control = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
+    let provisional_segments = context.upload_u32(&[0, 0, 0, 0]).unwrap();
+    let mut final_control = context
+        .upload_u32(&[STATUS_OK, RESIDENT_U32_SENTINEL, 0, 1])
+        .unwrap();
+    let mut final_segments = context
+        .upload_u32(&[RESIDENT_U32_SENTINEL; SEGMENT_RECORD_WORDS])
+        .unwrap();
+    let zero_dispatch = context
+        .batch_dispatch(0, 0, CubeDim::new_1d(THREADS))
+        .unwrap();
+    unsafe {
+        finalize_confirmed_publication::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            workspace.output_arg(),
+            provisional_control.input_arg(),
+            provisional_segments.input_arg(),
+            final_control.output_arg(),
+            final_segments.output_arg(),
+            0,
+            0,
+            1,
+            0,
+            1,
+            zero_dispatch.max_groups_x(),
+            zero_dispatch.max_groups_y(),
+            THREADS,
+            zero.local_offsets as u32,
+            zero.block_sums as u32,
+            zero.block_errors as u32,
+            zero.block_offsets as u32,
+            zero.semantic_status as u32,
+            zero.final_status as u32,
+            zero.final_total as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+            STATUS_CAPACITY,
+            STATUS_DEVICE_INVARIANT,
+            STATUS_GEOMETRY,
+        );
+    }
+    assert_eq!(
+        &final_control.read()[..2],
         &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
     );
 }
@@ -4284,6 +5502,30 @@ fn global_dead_all_dead_all_zero_and_empty_frontiers_are_successful_empty_arenas
         .chain(&dead.candidate_owners)
         .chain(&dead.proposer_arms)
         .chain(&dead.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
+    // Confirmed generic publication must preserve global semantic death as a
+    // successful empty arena. Its intentionally sentinel descriptors name no
+    // work, and every retained per-arm work counter therefore stays zero.
+    let confirmed_dead_arena = dead_round
+        .enqueue_confirmed_generic_proposals_for_test(&dead_frontier, &dead_choices, 7)
+        .unwrap();
+    assert!(confirmed_dead_arena
+        .read_semantic_confirmation_work_for_test()
+        .iter()
+        .all(|&entry| entry == [0, 0]));
+    let confirmed_dead = confirmed_dead_arena.inspect();
+    assert_success(&confirmed_dead, 0);
+    assert!(confirmed_dead
+        .segments
+        .iter()
+        .all(|segment| segment.base == 0 && segment.count == 0));
+    assert!(confirmed_dead
+        .candidate_codes
+        .iter()
+        .chain(&confirmed_dead.candidate_owners)
+        .chain(&confirmed_dead.proposer_arms)
+        .chain(&confirmed_dead.child_body)
         .all(|&word| word == RESIDENT_U32_SENTINEL));
 
     // Fully-bound support rejects the row, so ordinary (non-global) planning
@@ -4490,7 +5732,13 @@ fn pair_lf_all_six_rotations_match_independent_ordered_id_oracle() {
         let expected_codes = codes(&program, &expected_ids);
         let capacity = expected_codes.len() + 3;
         let (inspection, arm, peer_code, target) =
-            enqueue_pair_case(&gpu, &program, rotation, peer, capacity);
+            enqueue_pair_case(&gpu, &program, rotation, peer, capacity, false);
+        let (confirmed, confirmed_arm, confirmed_peer, confirmed_target) =
+            enqueue_pair_case(&gpu, &program, rotation, peer, capacity, true);
+        assert_eq!(confirmed_arm, arm);
+        assert_eq!(confirmed_peer, peer_code);
+        assert_eq!(confirmed_target, target);
+        assert_eq!(confirmed, inspection, "confirmed {rotation:?}");
         assert_success(&inspection, expected_codes.len());
         seen[rotation.index()] = true;
 
@@ -4548,6 +5796,97 @@ fn pair_lf_all_six_rotations_match_independent_ordered_id_oracle() {
 }
 
 #[test]
+fn confirmed_pair_all_six_rotations_match_cpu_order_and_parent_multiplicity() {
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let target = ProgramVariable::new(0);
+    let other = ProgramVariable::new(1);
+    let bound = ProgramVariable::new(2);
+
+    for rotation in SuccinctRotation::ALL {
+        let program = QueryProgram::compile(
+            gpu.archive(),
+            3,
+            [pair_cpu_pattern(rotation, target, other, bound)],
+        )
+        .unwrap();
+        let round = WgpuResidentRound::new(&gpu, &program, &[bound]).unwrap();
+        let arm = round
+            .proposal_arm_specs()
+            .iter()
+            .position(|spec| {
+                matches!(
+                    spec,
+                    ArmSpec::PairDistinct {
+                        rotation: candidate,
+                        ..
+                    } if *candidate == rotation
+                )
+            })
+            .expect("requested Pair rotation is admitted");
+        let peers = pair_cpu_peer_rows(&fixture, rotation);
+        let peer_codes = peers
+            .iter()
+            .map(|&peer| program.encode(&raw(peer)).unwrap().get())
+            .collect::<Vec<_>>();
+        let host = program
+            .frontier_from_indices(vec![bound], peer_codes, peers.len())
+            .unwrap();
+        let cpu = program.transition(&host).unwrap();
+        assert_eq!(cpu.len(), 1, "CPU transition group for {rotation:?}");
+        assert_eq!(
+            cpu[0].variables(),
+            &[target, bound],
+            "CPU transition variable for {rotation:?}"
+        );
+        let cpu_body = cpu[0]
+            .values()
+            .iter()
+            .map(|code| code.get())
+            .collect::<Vec<_>>();
+
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+        let mut choice_words = Vec::with_capacity(peers.len() * CHOICE_WORDS);
+        let mut expected_owners = Vec::new();
+        for (row, &peer) in peers.iter().enumerate() {
+            let witness = (arm * peers.len() + row) * PROPOSAL_WITNESS_WORDS;
+            let count = witnesses[witness + 3] - witnesses[witness + 2];
+            assert_eq!(
+                count as usize,
+                expected_pair_ids(&fixture, rotation, peer).len(),
+                "raw selected-row width for {rotation:?}, row {row}"
+            );
+            expected_owners.extend(std::iter::repeat_n(row as u32, count as usize));
+            choice_words.extend([target.index() as u32, arm as u32, count]);
+        }
+        let choices = round
+            .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+            .unwrap();
+        let expected = cpu[0].len();
+        assert_eq!(expected_owners.len(), expected);
+        let inspection = round
+            .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, expected)
+            .unwrap()
+            .inspect();
+        assert_success(&inspection, expected);
+        assert_eq!(inspection.child_body, cpu_body, "{rotation:?}");
+        assert_eq!(inspection.candidate_owners, expected_owners, "{rotation:?}");
+        assert!(inspection
+            .proposer_arms
+            .iter()
+            .all(|&proposer| proposer == arm as u32));
+        let cpu_candidates = cpu_body
+            .chunks_exact(inspection.child_stride as usize)
+            .map(|row| row[0])
+            .collect::<Vec<_>>();
+        assert_eq!(inspection.candidate_codes, cpu_candidates, "{rotation:?}");
+    }
+}
+
+#[test]
 fn pair_lf_zero_width_and_capacity_failure_are_atomic() {
     let fixture = pair_fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
@@ -4572,7 +5911,17 @@ fn pair_lf_zero_width_and_capacity_failure_are_atomic() {
         SuccinctRotation::Eav,
         fixture.attributes[2],
         4,
+        false,
     );
+    let (confirmed_zero, _, _, _) = enqueue_pair_case(
+        &gpu,
+        &program,
+        SuccinctRotation::Eav,
+        fixture.attributes[2],
+        4,
+        true,
+    );
+    assert_eq!(confirmed_zero, zero);
     assert_success(&zero, 0);
     assert!(zero.segments.iter().all(|segment| segment.count == 0));
     assert!(zero
@@ -4591,7 +5940,17 @@ fn pair_lf_zero_width_and_capacity_failure_are_atomic() {
         SuccinctRotation::Eav,
         fixture.entities[0],
         expected.len() - 1,
+        false,
     );
+    let (confirmed_short, _, _, _) = enqueue_pair_case(
+        &gpu,
+        &program,
+        SuccinctRotation::Eav,
+        fixture.entities[0],
+        expected.len() - 1,
+        true,
+    );
+    assert_eq!(confirmed_short, short);
     assert_eq!(short.status, STATUS_CAPACITY);
     assert_eq!(short.required, expected.len() as u32);
     assert_eq!(short.logical_len, 0);
@@ -4837,10 +6196,6 @@ fn pair_lf_reuses_rotation_scratch_across_sixty_five_sparse_rows() {
     let choices = round
         .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
         .unwrap();
-    assert!(matches!(
-        round.enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, 256),
-        Err(ResidentProposalError::MalformedPlan)
-    ));
 
     let mut expected_codes = Vec::new();
     let mut expected_owners = Vec::new();
@@ -4875,6 +6230,34 @@ fn pair_lf_reuses_rotation_scratch_across_sixty_five_sparse_rows() {
         }
     }
     let capacity = expected_codes.len() + 7;
+    let confirmed = round
+        .enqueue_confirmed_generic_proposals_for_test(&frontier, &choices, capacity)
+        .unwrap()
+        .inspect();
+    assert_success(&confirmed, expected_codes.len());
+    assert_eq!(
+        &confirmed.candidate_codes[..expected_codes.len()],
+        expected_codes
+    );
+    assert_eq!(
+        &confirmed.candidate_owners[..expected_owners.len()],
+        expected_owners
+    );
+    assert_eq!(
+        &confirmed.proposer_arms[..expected_arms.len()],
+        expected_arms
+    );
+    assert_eq!(
+        &confirmed.child_body[..expected_children.len()],
+        expected_children
+    );
+    assert!(confirmed.candidate_codes[expected_codes.len()..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+    assert!(confirmed.child_body[expected_children.len()..]
+        .iter()
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
+
     let max_groups_y = capacity.div_ceil(THREADS as usize) as u32;
     let first = round
         .enqueue_generic_proposals_with_dispatch_limits_for_test(
@@ -5891,6 +7274,8 @@ fn destination_finalizer_rejects_equal_total_with_a_hole_and_live_tail() {
             capacity as u32,
             layout.block_count as u32,
             layout.keep as u32,
+            layout.pending as u32,
+            layout.semantic_status as u32,
             layout.local_offsets as u32,
             layout.block_sums as u32,
             layout.block_errors as u32,
@@ -5946,6 +7331,8 @@ fn destination_finalizer_rejects_equal_total_with_a_hole_and_live_tail() {
             capacity as u32,
             layout.block_count as u32,
             layout.keep as u32,
+            layout.pending as u32,
+            layout.semantic_status as u32,
             layout.local_offsets as u32,
             layout.block_sums as u32,
             layout.block_errors as u32,
