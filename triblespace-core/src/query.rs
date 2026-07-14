@@ -357,8 +357,11 @@ impl Default for Binding {
 /// solver canonical ascending order — so constraints locate their columns
 /// with [`col`](Self::col) and never assume a layout.
 ///
-/// A view with **no columns is the seed block: a single zero-width row**
-/// (the empty binding). This is what makes level 0 an ordinary block
+/// A view constructed publicly with **no columns is the seed block: a single
+/// zero-width row** (the empty binding). Blocked engines may internally carry
+/// several occurrences of that empty binding after splitting and remerging;
+/// their explicit row count preserves that multiplicity even though `rows`
+/// itself is necessarily empty. This is what makes level 0 an ordinary block
 /// instead of a special case in every engine.
 ///
 /// The view is `Copy` and borrows the engine's row storage directly. A
@@ -412,6 +415,34 @@ impl<'v> RowsView<'v> {
         }
     }
 
+    /// Creates an engine-internal view with an explicit row count.
+    ///
+    /// Unlike [`new`](Self::new), this can represent zero, one, or several
+    /// zero-width rows. That distinction cannot be inferred from `rows.len()`
+    /// when `vars` is empty, but it matters when equivalent empty bindings
+    /// reconverge in a blocked worklist.
+    pub(crate) fn new_with_row_count(
+        vars: &'v [VariableId],
+        rows: &'v [RawInline],
+        n_rows: usize,
+    ) -> Self {
+        let expected = vars
+            .len()
+            .checked_mul(n_rows)
+            .expect("RowsView dimensions overflow");
+        assert_eq!(
+            rows.len(),
+            expected,
+            "RowsView storage disagrees with its explicit dimensions"
+        );
+        RowsView {
+            vars,
+            rows,
+            cols: None,
+            n_rows,
+        }
+    }
+
     /// Creates a view with a caller-maintained variable→column index
     /// (`cols[v]` = column of `v`, [`COL_UNBOUND`] otherwise), making
     /// [`col`](Self::col) O(1). The single-row cursor engine uses this.
@@ -436,13 +467,14 @@ impl<'v> RowsView<'v> {
         self.vars.len()
     }
 
-    /// Number of rows. A zero-column view has exactly one (virtual) row.
+    /// Number of rows. Public zero-column views have one virtual seed row;
+    /// internal blocked views can preserve multiple empty-row occurrences.
     #[inline]
     pub fn len(&self) -> usize {
         self.n_rows
     }
 
-    /// `true` when the view holds no rows (only possible with columns).
+    /// `true` when the view holds no rows.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -480,7 +512,7 @@ impl<'v> RowsView<'v> {
         }
     }
 
-    /// Iterates the rows as value slices (one empty slice for the seed).
+    /// Iterates the rows as value slices (empty slices for zero-width rows).
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &'v [RawInline]> + use<'v> {
         let stride = self.vars.len();
@@ -959,6 +991,13 @@ pub trait Constraint<'a> {
     /// Pointwise `CandidateSink::retain` filters have this property. A
     /// group-global operation such as sorting, deduplication, top-k, or
     /// selecting one representative does not.
+    ///
+    /// An opted-in confirmer may receive several tagged parent rows whose
+    /// `RowsView` has zero columns. They are distinct affine occurrences even
+    /// though every row slice is empty: candidate tags still identify the
+    /// parent group, and reconvergence must preserve their multiplicity. In
+    /// particular, page-local implementations must not infer
+    /// `view.len() == 1` from `view.vars.is_empty()`.
     ///
     /// The conservative default keeps the complete parent group atomic.
     /// Residual execution consults this only after any unchecked atomic
@@ -3759,6 +3798,24 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn rows_view_preserves_explicit_zero_width_row_multiplicity() {
+        assert_eq!(RowsView::EMPTY.len(), 1);
+        assert_eq!(RowsView::new(&[], &[]).len(), 1);
+
+        let three = RowsView::new_with_row_count(&[], &[], 3);
+        assert_eq!(three.len(), 3);
+        assert!(!three.is_empty());
+        let empty: &[RawInline] = &[];
+        assert_eq!(three.iter().collect::<Vec<_>>(), vec![empty; 3]);
+        assert_eq!(three.row(2), empty);
+        assert_eq!(three.row_view(2).len(), 1);
+
+        let zero = RowsView::new_with_row_count(&[], &[], 0);
+        assert!(zero.is_empty());
+        assert_eq!(zero.iter().count(), 0);
+    }
 
     pub mod knights {
         use crate::prelude::*;

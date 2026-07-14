@@ -788,18 +788,7 @@ impl StateBucket {
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
 
 fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize) -> RowsView<'v> {
-    assert_eq!(
-        rows.len(),
-        vars.len().saturating_mul(row_count),
-        "residual bucket row shape disagrees with its canonical state"
-    );
-    if vars.is_empty() {
-        assert_eq!(
-            row_count, 1,
-            "the empty binding has exactly one canonical seed row"
-        );
-    }
-    RowsView::new(vars, rows)
+    RowsView::new_with_row_count(vars, rows, row_count)
 }
 
 fn file(
@@ -2112,6 +2101,57 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ParityFilterLeaf {
+        variable: VariableId,
+        estimate: usize,
+        parity: u8,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Constraint<'static> for ParityFilterLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.calls.lock().unwrap().push(candidates.len());
+            let parity = self.parity;
+            candidates.retain(|_, value| value[0] & 1 == parity);
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
     struct WholeGroupMinimumLeaf {
         variable: VariableId,
         estimate: usize,
@@ -2760,6 +2800,113 @@ mod tests {
     }
 
     #[test]
+    fn candidate_page_split_and_remerge_preserves_randomized_affine_multiplicity() {
+        fn next(seed: &mut u64) -> usize {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*seed >> 32) as usize
+        }
+
+        fn expanded(batch: &CandidateBatch, stride: usize) -> Vec<(Vec<RawInline>, RawInline)> {
+            batch
+                .candidates
+                .iter()
+                .map(|&(parent, candidate)| {
+                    let parent = parent as usize;
+                    let start = parent * stride;
+                    (
+                        batch.parents.rows[start..start + stride].to_vec(),
+                        candidate,
+                    )
+                })
+                .collect()
+        }
+
+        fn assert_dense(batch: &CandidateBatch) {
+            assert!(!batch.candidates.is_empty());
+            assert!(batch
+                .candidates
+                .iter()
+                .all(|(row, _)| (*row as usize) < batch.parents.row_count));
+            assert!(batch
+                .candidates
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0));
+            let mut seen = vec![false; batch.parents.row_count];
+            for &(row, _) in &batch.candidates {
+                seen[row as usize] = true;
+            }
+            assert!(seen.into_iter().all(|live| live));
+        }
+
+        let mut seed = 0xC0FF_EE12_3456_789Au64;
+        for stride in [0, 1, 3] {
+            for case in 0..128usize {
+                let parent_count = 1 + next(&mut seed) % 7;
+                let mut parent_rows = Vec::with_capacity(parent_count * stride);
+                let mut candidates = Vec::new();
+                for parent in 0..parent_count {
+                    for column in 0..stride {
+                        let mut value = raw(parent as u8);
+                        value[1] = column as u8;
+                        value[2] = case as u8;
+                        parent_rows.push(value);
+                    }
+                    let candidate_count = 1 + next(&mut seed) % 7;
+                    for occurrence in 0..candidate_count {
+                        let mut value = raw(parent as u8);
+                        value[1] = occurrence as u8;
+                        value[2] = case as u8;
+                        candidates.push((parent as u32, value));
+                    }
+                }
+
+                let original = CandidateBatch {
+                    parents: RowBatch {
+                        rows: parent_rows,
+                        row_count: parent_count,
+                    },
+                    candidates,
+                };
+                let mut expected = expanded(&original, stride);
+                let mut remainder = original;
+                let mut pages = Vec::new();
+                while !remainder.candidates.is_empty() {
+                    let width = 1 + next(&mut seed) % 9;
+                    let page = remainder.take_candidate_tail(stride, width);
+                    assert_dense(&page);
+                    pages.push(page);
+                }
+                assert_eq!(remainder.parents.row_count, 0);
+                assert!(remainder.parents.rows.is_empty());
+
+                for i in (1..pages.len()).rev() {
+                    let j = next(&mut seed) % (i + 1);
+                    pages.swap(i, j);
+                }
+                let expected_parent_occurrences: usize =
+                    pages.iter().map(|page| page.parents.row_count).sum();
+                let mut merged = pages.pop().expect("the original batch was nonempty");
+                for page in pages {
+                    merged.append(page);
+                }
+                assert_dense(&merged);
+                assert_eq!(merged.parents.row_count, expected_parent_occurrences);
+
+                let vars: Vec<VariableId> = (0..stride).collect();
+                let view = rows_view(&vars, &merged.parents.rows, merged.parents.row_count);
+                assert_eq!(view.len(), expected_parent_occurrences);
+
+                let mut actual = expanded(&merged, stride);
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "stride={stride}, case={case}");
+            }
+        }
+    }
+
+    #[test]
     fn paging_begins_only_after_atomic_remaining_confirms_are_checked() {
         let root = IntersectionConstraint::new(vec![
             CapabilityLeaf {
@@ -2975,6 +3122,55 @@ mod tests {
         assert_eq!(sequential, values);
         assert_eq!(cap_one, sequential);
         assert_eq!(geometric, sequential);
+    }
+
+    #[test]
+    fn page_reconvergence_preserves_multiple_zero_width_parent_rows() {
+        let make = |calls: Arc<Mutex<Vec<usize>>>| {
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new((0..8).map(raw).collect()),
+                }) as ShapeConstraint,
+                Box::new(ParityFilterLeaf {
+                    variable: 0,
+                    estimate: 9,
+                    parity: 0,
+                    calls,
+                }) as ShapeConstraint,
+            ])
+        };
+
+        // Width one rejects candidate 7. Width two then leaves 6 from page
+        // [5, 6] and 4 from page [3, 4]. Those pages reconverge in the same
+        // checked Candidate state as two parent occurrences with no committed
+        // columns: rows=[], row_count=2. Draining through a projection that
+        // rejects every terminal row forces that merged bucket to execute.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let profiled = Query::new(make(Arc::clone(&calls)), |_| None::<()>)
+            .solve_residual_state_lazy()
+            .cap(8)
+            .start_width(1)
+            .growth(2)
+            .collect_profiled();
+        assert!(profiled.results.is_empty());
+        assert!(profiled.stats.bucket_merges > 0);
+        assert_eq!(&calls.lock().unwrap()[..3], [1, 2, 2]);
+
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut residual: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .solve_residual_state_lazy()
+            .cap(8)
+            .start_width(1)
+            .growth(2)
+            .collect();
+        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
+            .sequential()
+            .collect();
+        residual.sort_unstable();
+        sequential.sort_unstable();
+        assert_eq!(residual, (0..8).step_by(2).map(raw).collect::<Vec<_>>());
+        assert_eq!(residual, sequential);
     }
 
     #[test]
