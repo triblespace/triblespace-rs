@@ -495,7 +495,9 @@ fn build_ladder(n: usize) -> (TribleSet, ExclusiveId) {
         let child = deterministic_id(0xD46A_1003, index as u64 + 1);
         kb += entity! { &root @ world::p1: &parent };
         kb += entity! { &parent @ world::p2: &child };
-        if index == 0 {
+        // The query cursors consume the ordered candidate tail first, so the
+        // greatest deterministic parent is the scheduler's first branch.
+        if index + 1 == n {
             first_child = Some(child.clone());
         }
         if index == n / 2 {
