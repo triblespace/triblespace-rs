@@ -69,6 +69,19 @@ where
     }
 }
 
+impl<'a, C> ConstraintChildren<'a> for UnionConstraint<C>
+where
+    C: Constraint<'a> + 'a,
+{
+    fn len(&self) -> usize {
+        self.constraints.len()
+    }
+
+    fn child(&self, index: usize) -> &dyn Constraint<'a> {
+        &self.constraints[index]
+    }
+}
+
 impl<'a, C> Constraint<'a> for UnionConstraint<C>
 where
     C: Constraint<'a> + 'a,
@@ -222,6 +235,10 @@ where
             .fold(VariableSet::new_empty(), |acc, c| {
                 acc.union(c.influence(variable))
             })
+    }
+
+    fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
+        ConstraintShape::Union(self)
     }
 }
 

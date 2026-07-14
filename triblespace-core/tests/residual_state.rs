@@ -444,6 +444,124 @@ impl Constraint<'_> for FiniteDomain {
     }
 }
 
+#[derive(Default)]
+struct UnionArmTrace {
+    gated_parents: Vec<usize>,
+    proposed_parents: Vec<usize>,
+    confirmed_parents: Vec<usize>,
+    confirm_frontiers: Vec<usize>,
+}
+
+/// A union arm whose liveness and estimate order depend on a bound parent.
+/// It deliberately declares `P` while remaining irrelevant for proposing or
+/// confirming it: `P` is context, and only `X` is the arm's active value.
+#[derive(Clone)]
+struct ParentAwareArm {
+    live_parity: Option<u8>,
+    preferred_parity: u8,
+    preferred_estimate: usize,
+    other_estimate: usize,
+    output: u8,
+    trace: Arc<Mutex<UnionArmTrace>>,
+}
+
+impl ParentAwareArm {
+    fn parent(&self, view: &RowsView<'_>, row: &[RawInline]) -> usize {
+        let column = view.col(P).expect("parent-aware arm requires bound P");
+        decode(&row[column], P_MARKER).expect("parent-aware fixture encoding")
+    }
+
+    fn value(&self, parent: usize) -> RawInline {
+        encoded(X_MARKER, parent * 4 + usize::from(self.output))
+    }
+}
+
+impl Constraint<'_> for ParentAwareArm {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(P).union(VariableSet::new_singleton(X))
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        if variable != X {
+            return false;
+        }
+        if view.col(P).is_none() {
+            out.fill(1_024, view.len());
+        } else {
+            out.extend(view.iter().map(|row| {
+                if self.parent(view, row) % 2 == usize::from(self.preferred_parity) {
+                    self.preferred_estimate
+                } else {
+                    self.other_estimate
+                }
+            }));
+        }
+        true
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, X);
+        assert!(candidates.is_empty(), "each union arm needs a fresh sink");
+        let parents: Vec<_> = view.iter().map(|row| self.parent(view, row)).collect();
+        self.trace
+            .lock()
+            .unwrap()
+            .proposed_parents
+            .extend(parents.iter().copied());
+        for (row, parent) in parents.into_iter().enumerate() {
+            candidates.push(row as u32, self.value(parent));
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        assert_eq!(variable, X);
+        let parents: Vec<_> = view.iter().map(|row| self.parent(view, row)).collect();
+        {
+            let mut trace = self.trace.lock().unwrap();
+            trace.confirmed_parents.extend(parents.iter().copied());
+            trace.confirm_frontiers.push(candidates.len());
+        }
+        candidates.retain(|row, candidate| {
+            let parent = parents[row as usize];
+            *candidate == self.value(parent)
+        });
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        let Some(column) = view.col(P) else {
+            return true;
+        };
+        let parents: Vec<_> = view
+            .iter()
+            .map(|row| decode(&row[column], P_MARKER).expect("parent-aware fixture encoding"))
+            .collect();
+        self.trace
+            .lock()
+            .unwrap()
+            .gated_parents
+            .extend(parents.iter().copied());
+        parents.into_iter().all(|parent| {
+            self.live_parity
+                .is_none_or(|parity| parent % 2 == usize::from(parity))
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct BorrowedDomain<'v> {
     variable: VariableId,
@@ -499,6 +617,27 @@ impl<'v> Constraint<'v> for BorrowedDomain<'v> {
 }
 
 type OwnedConstraint = Box<dyn Constraint<'static> + Send + Sync>;
+
+fn parent_arm(
+    live_parity: Option<u8>,
+    preferred_parity: u8,
+    preferred_estimate: usize,
+    other_estimate: usize,
+    output: u8,
+) -> (OwnedConstraint, Arc<Mutex<UnionArmTrace>>) {
+    let trace = Arc::new(Mutex::new(UnionArmTrace::default()));
+    (
+        Box::new(ParentAwareArm {
+            live_parity,
+            preferred_parity,
+            preferred_estimate,
+            other_estimate,
+            output,
+            trace: Arc::clone(&trace),
+        }),
+        trace,
+    )
+}
 
 fn finite_domain(
     variable: VariableId,
@@ -801,7 +940,7 @@ fn nested_and_width_one_yields_before_draining_sibling_parents() {
 }
 
 #[test]
-fn union_with_and_arms_stays_opaque_inside_a_nested_and_and_skips_dead_arms() {
+fn lowered_union_keeps_and_arms_opaque_and_skips_dead_arms() {
     let expected = vec![(encoded(b'u', 0), encoded(b'v', 0))];
     let eager = Query::new(nested_dead_union_fixture(), project_pair).solve_residual_state();
     let lazy: Vec<_> = Query::new(nested_dead_union_fixture(), project_pair)
@@ -1601,11 +1740,37 @@ fn union_fixture(
     )
 }
 
+fn parent_union_fixture(
+    parents: Vec<RawInline>,
+    live: [Option<u8>; 2],
+    outputs: [u8; 2],
+    reverse: bool,
+) -> (
+    IntersectionConstraint<OwnedConstraint>,
+    [Arc<Mutex<UnionArmTrace>>; 2],
+) {
+    let (even, even_trace) = parent_arm(live[0], 0, 1, 8, outputs[0]);
+    let (odd, odd_trace) = parent_arm(live[1], 1, 1, 8, outputs[1]);
+    let arms = if reverse {
+        vec![odd, even]
+    } else {
+        vec![even, odd]
+    };
+    let (parents, _) = finite_domain(P, parents, 0);
+    (
+        IntersectionConstraint::new(vec![
+            Box::new(parents) as OwnedConstraint,
+            Box::new(UnionConstraint::new(arms)) as OwnedConstraint,
+        ]),
+        [even_trace, odd_trace],
+    )
+}
+
 #[test]
-fn opaque_union_deduplicates_identical_arms_when_proposing_and_confirming() {
+fn lowered_union_deduplicates_identical_arms_when_proposing_and_confirming() {
     for role in [UnionRole::Proposer, UnionRole::Confirmer] {
         let (root, arm_calls, value) = union_fixture(role);
-        let residual = Query::new(root, project_parent).solve_residual_state();
+        let residual = Query::new(root, project_parent).solve_residual_state_profiled();
         let (lazy_root, _, _) = union_fixture(role);
         let lazy: Vec<_> = Query::new(lazy_root, project_parent)
             .solve_residual_state_lazy()
@@ -1618,10 +1783,31 @@ fn opaque_union_deduplicates_identical_arms_when_proposing_and_confirming() {
             .sequential()
             .collect();
 
-        assert_eq!(residual, [value], "union must preserve set semantics");
+        assert_eq!(
+            residual.results,
+            [value],
+            "union must preserve set semantics"
+        );
         assert_eq!(lazy, [value], "lazy union must preserve set semantics");
-        assert_eq!(residual, sequential, "residual vs scalar DFS");
+        assert_eq!(residual.results, sequential, "residual vs scalar DFS");
         assert_eq!(lazy, sequential, "lazy residual vs scalar DFS");
+        assert_eq!(residual.stats.union_parent_atoms, 1);
+        match role {
+            UnionRole::Proposer => assert_eq!(
+                (
+                    residual.stats.union_propose_calls,
+                    residual.stats.union_confirm_calls,
+                ),
+                (2, 0)
+            ),
+            UnionRole::Confirmer => assert_eq!(
+                (
+                    residual.stats.union_propose_calls,
+                    residual.stats.union_confirm_calls,
+                ),
+                (0, 2)
+            ),
+        }
         for calls in arm_calls {
             let calls = calls.lock().unwrap();
             match role {
@@ -1630,4 +1816,195 @@ fn opaque_union_deduplicates_identical_arms_when_proposing_and_confirming() {
             }
         }
     }
+}
+
+#[test]
+fn lowered_union_gates_dead_arms_per_parent_without_cross_contamination() {
+    let parents = vec![encoded(P_MARKER, 0), encoded(P_MARKER, 1)];
+    let (root, [even, odd]) =
+        parent_union_fixture(parents.clone(), [Some(0), Some(1)], [0, 0], false);
+    let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
+    let mut expected = vec![
+        (parents[0], encoded(X_MARKER, 0)),
+        (parents[1], encoded(X_MARKER, 4)),
+    ];
+    residual.results.sort_unstable();
+    expected.sort_unstable();
+
+    assert_eq!(residual.results, expected);
+    assert_eq!(residual.stats.union_parent_atoms, 2);
+    assert_eq!(residual.stats.union_propose_calls, 2);
+    assert!(
+        residual.stats.bucket_merges > 0,
+        "full done sets should reconverge"
+    );
+    {
+        let even = even.lock().unwrap();
+        assert_eq!(even.gated_parents, [0, 1]);
+        assert_eq!(even.proposed_parents, [0]);
+    }
+    {
+        let odd = odd.lock().unwrap();
+        assert_eq!(odd.gated_parents, [0, 1]);
+        assert_eq!(odd.proposed_parents, [1]);
+    }
+
+    let (sequential_root, _) = parent_union_fixture(parents, [Some(0), Some(1)], [0, 0], false);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    sequential.sort_unstable();
+    assert_eq!(residual.results, sequential);
+}
+
+#[test]
+fn row_local_arm_orders_remerge_and_arm_order_does_not_change_the_bag() {
+    let parents = vec![encoded(P_MARKER, 0), encoded(P_MARKER, 1)];
+    let run = |reverse| {
+        let (root, traces) = parent_union_fixture(parents.clone(), [None, None], [0, 1], reverse);
+        let mut solved = Query::new(root, project_pair).solve_residual_state_profiled();
+        solved.results.sort_unstable();
+        (solved, traces)
+    };
+    let (forward, forward_traces) = run(false);
+    let (reverse, _) = run(true);
+
+    assert_eq!(forward.results, reverse.results);
+    assert_eq!(forward.results.len(), 4);
+    assert_eq!(forward.stats.union_parent_atoms, 2);
+    assert_eq!(forward.stats.union_propose_calls, 4);
+    assert!(forward.stats.bucket_merges > 0);
+    assert!(forward.stats.rows_merged > 0);
+    for trace in forward_traces {
+        let mut seen = trace.lock().unwrap().proposed_parents.clone();
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1]);
+    }
+
+    let (sequential_root, _) = parent_union_fixture(parents, [None, None], [0, 1], false);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    sequential.sort_unstable();
+    assert_eq!(forward.results, sequential);
+}
+
+#[test]
+fn union_set_semantics_are_per_parent_not_per_equal_outer_row() {
+    let parent = encoded(P_MARKER, 0);
+    let (root, _) = parent_union_fixture(vec![parent, parent], [None, None], [0, 0], false);
+    let solved = Query::new(root, project_pair).solve_residual_state_profiled();
+
+    assert_eq!(
+        solved.results,
+        vec![
+            (parent, encoded(X_MARKER, 0)),
+            (parent, encoded(X_MARKER, 0))
+        ]
+    );
+    assert_eq!(solved.stats.union_parent_atoms, 2);
+    assert_eq!(solved.stats.union_propose_calls, 2);
+}
+
+#[test]
+fn confirming_arms_each_receive_the_original_duplicate_frontier() {
+    let parent = encoded(P_MARKER, 0);
+    let x0 = encoded(X_MARKER, 0);
+    let x1 = encoded(X_MARKER, 1);
+    let (parents, _) = finite_domain(P, vec![parent], 0);
+    let (peer, _) = finite_domain(X, vec![x0, x0, x1], 1);
+    let (left, left_trace) = parent_arm(None, 0, 32, 64, 0);
+    let (right, right_trace) = parent_arm(None, 1, 32, 64, 1);
+    let root = IntersectionConstraint::new(vec![
+        Box::new(parents) as OwnedConstraint,
+        Box::new(peer) as OwnedConstraint,
+        Box::new(UnionConstraint::new(vec![left, right])) as OwnedConstraint,
+    ]);
+    let mut solved = Query::new(root, project_pair).solve_residual_state_profiled();
+    solved.results.sort_unstable();
+
+    assert_eq!(solved.results, vec![(parent, x0), (parent, x1)]);
+    assert_eq!(solved.stats.union_confirm_calls, 2);
+    assert_eq!(left_trace.lock().unwrap().confirm_frontiers, [3]);
+    assert_eq!(right_trace.lock().unwrap().confirm_frontiers, [3]);
+}
+
+#[test]
+fn only_the_first_union_occurrence_is_lowered() {
+    let value = encoded(b'2', 0);
+    let fixture = || {
+        let (first_left, first_left_calls) = finite_domain(P, vec![value], 1);
+        let (first_right, first_right_calls) = finite_domain(P, vec![value], 1);
+        let (later_left, later_left_calls) = finite_domain(P, vec![value], 8);
+        let (later_right, later_right_calls) = finite_domain(P, vec![value], 8);
+        (
+            IntersectionConstraint::new(vec![
+                Box::new(UnionConstraint::new(vec![first_left, first_right])) as OwnedConstraint,
+                Box::new(UnionConstraint::new(vec![later_left, later_right])) as OwnedConstraint,
+            ]),
+            [first_left_calls, first_right_calls],
+            [later_left_calls, later_right_calls],
+        )
+    };
+    let (root, first_calls, later_calls) = fixture();
+    let solved = Query::new(root, project_parent).solve_residual_state_profiled();
+
+    assert_eq!(solved.results, [value]);
+    assert_eq!(
+        (
+            solved.stats.union_propose_calls,
+            solved.stats.union_confirm_calls,
+        ),
+        (2, 0)
+    );
+    for calls in first_calls {
+        let calls = calls.lock().unwrap();
+        assert_eq!((calls.propose, calls.confirm), (1, 0));
+    }
+    for calls in later_calls {
+        let calls = calls.lock().unwrap();
+        assert_eq!((calls.propose, calls.confirm), (0, 1));
+    }
+    let (sequential_root, _, _) = fixture();
+    let sequential: Vec<_> = Query::new(sequential_root, project_parent)
+        .sequential()
+        .collect();
+    assert_eq!(solved.results, sequential);
+}
+
+#[test]
+fn lazy_union_stops_at_one_parent_and_cap_one_matches_full_execution() {
+    let parents: Vec<_> = (0..12).map(|parent| encoded(P_MARKER, parent)).collect();
+    let (lazy_root, lazy_traces) =
+        parent_union_fixture(parents.clone(), [None, None], [0, 1], false);
+    let mut lazy = Query::new(lazy_root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1)
+        .growth(1);
+    assert!(lazy.next().is_some());
+    assert_eq!(lazy.stats().union_parent_atoms, 1);
+    for trace in lazy_traces {
+        assert_eq!(trace.lock().unwrap().proposed_parents.len(), 1);
+    }
+    drop(lazy);
+
+    let (cap_one_root, _) = parent_union_fixture(parents.clone(), [None, None], [0, 1], false);
+    let mut cap_one: Vec<_> = Query::new(cap_one_root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .start_width(1)
+        .growth(1)
+        .collect();
+    let (default_root, _) = parent_union_fixture(parents.clone(), [None, None], [0, 1], false);
+    let mut default = Query::new(default_root, project_pair).solve_residual_state();
+    let (sequential_root, _) = parent_union_fixture(parents, [None, None], [0, 1], false);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    cap_one.sort_unstable();
+    default.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(cap_one, default);
+    assert_eq!(cap_one, sequential);
 }

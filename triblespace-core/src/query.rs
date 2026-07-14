@@ -692,9 +692,10 @@ pub fn confirm_per_row(
 /// Structural shape exposed to query-engine lowering probes.
 ///
 /// This is deliberately not part of the ordinary constraint protocol. It lets
-/// opt-in engines flatten associative conjunctions without teaching them the
-/// concrete Rust type of every constraint. Semantic wrappers and custom
-/// constraints remain opaque unless they explicitly expose a shape.
+/// opt-in engines flatten associative conjunctions or step through finite
+/// disjunctions without teaching them the concrete Rust type of every
+/// constraint. Semantic wrappers and custom constraints remain opaque unless
+/// they explicitly expose a shape.
 #[doc(hidden)]
 #[non_exhaustive]
 #[derive(Clone, Copy)]
@@ -703,6 +704,13 @@ pub enum ConstraintShape<'s, 'a> {
     Opaque,
     /// An associative logical conjunction whose children may be inspected.
     And(&'s dyn ConstraintChildren<'a>),
+    /// A finite logical disjunction whose arms may be inspected.
+    ///
+    /// Unlike [`And`](Self::And), this is not permission to flatten the arms
+    /// into the surrounding conjunction. A lowering engine must preserve
+    /// per-parent set union: every proposing arm owns an empty sink and every
+    /// confirming arm sees the same original candidate set.
+    Union(&'s dyn ConstraintChildren<'a>),
 }
 
 /// Object-safe child access for a structural constraint shape.
@@ -928,17 +936,20 @@ pub trait Constraint<'a> {
         }
     }
 
-    /// Exposes associative structure to opt-in residual lowering engines.
+    /// Exposes finite logical structure to opt-in residual lowering engines.
     ///
     /// The default keeps the constraint opaque. Implementations must expose
-    /// only structure whose flattening preserves the ordinary protocol's
+    /// only structure whose lowering preserves the ordinary protocol's
     /// semantics; wrappers that change scope, multiplicity, or evaluation
-    /// meaning should retain the default. The exposed shape must be a finite,
+    /// meaning should retain the default. Exposing a union does not permit its
+    /// arms to be treated as conjunctive leaves: the engine remains responsible
+    /// for independent proposal sinks, original-input confirmation, dead-arm
+    /// gating, and per-parent deduplication. The exposed shape must be a finite,
     /// acyclic tree. Its variants, child counts, and child order are structural
-    /// facts and MUST remain stable for the entire query execution. A
-    /// path-based engine may resolve the plan repeatedly, so changing shape
-    /// through interior mutability can silently select a different constraint
-    /// occurrence even when every individual borrow is memory-safe.
+    /// facts and MUST remain stable for the entire query execution. A path-based
+    /// engine may resolve the plan repeatedly, so changing shape through
+    /// interior mutability can silently select a different constraint occurrence
+    /// even when every individual borrow is memory-safe.
     #[doc(hidden)]
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::Opaque

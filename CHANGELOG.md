@@ -18,11 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history-independent rank gate lets variable-order, proposal, confirmation,
   and independently planned action histories reconverge before shared work
   runs, while row payloads retain multiplicity. The maximal nested AND region
-  is flattened into deterministic preorder leaf occurrences; unions and
-  ignore/path wrappers remain opaque semantic boundaries; custom constraints
-  do too unless they explicitly expose an associative AND shape. A profiled
-  entry point reports planning/action pops, interner and bucket merges, and
-  leaf-call batch measurements.
+  is flattened into deterministic preorder leaf occurrences. The first finite
+  union occurrence can now be lowered into opaque arm actions: exact per-row
+  liveness gates dead arms, proposing arms own fresh sinks, confirming arms
+  each replay the original candidate frontier, and stable parent atoms
+  accumulate an idempotent set union without collapsing equal outer
+  derivations. Canonical done-arm sets let row-local arm orders split and
+  reconverge; later unions and every arm stay opaque to prevent recursive OR
+  expansion. Ignore/path wrappers remain opaque semantic boundaries; custom
+  constraints do too unless they explicitly expose a supported finite shape.
+  A profiled entry point reports planning/action pops, interner and bucket
+  merges, leaf-call batch measurements, and lowered-union activity.
 - **Canonical residual states gain a demand-driven batch-fill iterator.**
   `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
   descendants can yield before sibling rows are evaluated. Filing a nonempty

@@ -4,10 +4,12 @@
 //! identified by its remaining computation rather than its history. It
 //! lowers the maximal associative AND region rooted at an
 //! [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint).
-//! Nested intersections become deterministic preorder leaf occurrences;
-//! union, ignore, and regular-path constraints remain opaque ordinary
-//! [`Constraint`] leaves; custom constraints do too unless they explicitly
-//! expose an associative AND shape.
+//! Nested intersections become deterministic preorder leaf occurrences. The
+//! first finite [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+//! occurrence in that preorder may additionally be stepped arm by arm while
+//! every arm remains opaque; later unions, ignore, and regular-path constraints
+//! remain ordinary [`Constraint`] leaves. Custom constraints do too unless they
+//! explicitly expose a supported finite shape.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
@@ -34,7 +36,7 @@
 //! canonical descriptor and its stored paths a total description of the future
 //! computation while row values remain payload.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -45,6 +47,13 @@ use super::*;
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
 
+/// The one finite union occurrence lowered by this prototype.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnionOccurrence {
+    leaf: usize,
+    arm_count: usize,
+}
+
 /// Borrow-free lowering plan safe to store beside an owned `Arc` root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
@@ -53,6 +62,10 @@ struct ConstraintPath(Box<[usize]>);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
     leaves: Vec<ConstraintPath>,
+    /// Exactly the first preorder union occurrence is lowered. Keeping the
+    /// choice in the immutable plan makes later union occurrences opaque and
+    /// prevents recursive OR expansion through an arm.
+    union: Option<UnionOccurrence>,
 }
 
 impl ResidualPlan {
@@ -61,13 +74,24 @@ impl ResidualPlan {
             constraint: &dyn Constraint<'a>,
             path: &mut Vec<usize>,
             leaves: &mut Vec<ConstraintPath>,
+            union: &mut Option<UnionOccurrence>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
                     for child in 0..children.len() {
                         path.push(child);
-                        visit(children.child(child), path, leaves);
+                        visit(children.child(child), path, leaves, union);
                         path.pop();
+                    }
+                }
+                ConstraintShape::Union(children) => {
+                    let leaf = leaves.len();
+                    leaves.push(ConstraintPath(path.clone().into_boxed_slice()));
+                    if union.is_none() {
+                        *union = Some(UnionOccurrence {
+                            leaf,
+                            arm_count: children.len(),
+                        });
                     }
                 }
                 ConstraintShape::Opaque => {
@@ -77,8 +101,9 @@ impl ResidualPlan {
         }
 
         let mut leaves = Vec::new();
-        visit(root, &mut Vec::new(), &mut leaves);
-        Self { leaves }
+        let mut union = None;
+        visit(root, &mut Vec::new(), &mut leaves, &mut union);
+        Self { leaves, union }
     }
 
     fn len(&self) -> usize {
@@ -90,6 +115,20 @@ impl ResidualPlan {
         (path.len() == 1).then(|| path[0])
     }
 
+    fn geometry(&self) -> ResidualGeometry {
+        ResidualGeometry {
+            leaf_count: self.leaves.len(),
+            union_leaf: self.union.as_ref().map(|union| union.leaf),
+            union_arm_count: self.union.as_ref().map_or(0, |union| union.arm_count),
+        }
+    }
+
+    fn is_lowered_union(&self, occurrence: usize) -> bool {
+        self.union
+            .as_ref()
+            .is_some_and(|union| union.leaf == occurrence)
+    }
+
     fn resolve<'r, 'a>(
         &self,
         root: &'r dyn Constraint<'a>,
@@ -99,12 +138,68 @@ impl ResidualPlan {
         for &child in self.leaves[occurrence].0.iter() {
             constraint = match constraint.residual_shape() {
                 ConstraintShape::And(children) => children.child(child),
-                ConstraintShape::Opaque => {
+                ConstraintShape::Opaque | ConstraintShape::Union(_) => {
                     panic!("residual AND shape changed during query execution")
                 }
             };
         }
         constraint
+    }
+
+    fn resolve_union_arm<'r, 'a>(
+        &self,
+        root: &'r dyn Constraint<'a>,
+        occurrence: usize,
+        arm: usize,
+    ) -> &'r dyn Constraint<'a> {
+        assert!(
+            self.is_lowered_union(occurrence),
+            "attempted to lower an opaque union occurrence"
+        );
+        match self.resolve(root, occurrence).residual_shape() {
+            ConstraintShape::Union(children) => {
+                assert_eq!(
+                    children.len(),
+                    self.union.as_ref().expect("lowered union exists").arm_count,
+                    "residual union shape changed during query execution"
+                );
+                children.child(arm)
+            }
+            ConstraintShape::Opaque | ConstraintShape::And(_) => {
+                panic!("residual union shape changed during query execution")
+            }
+        }
+    }
+}
+
+/// Rank geometry shared by descriptors and the worklist.
+///
+/// One checked outer leaf owns a micro-stride large enough for every union arm
+/// to alternate plan/action states. With no lowered union this reduces exactly
+/// to the historical two-rank stride.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResidualGeometry {
+    leaf_count: usize,
+    union_leaf: Option<usize>,
+    union_arm_count: usize,
+}
+
+impl ResidualGeometry {
+    fn action_stride(self) -> usize {
+        self.union_arm_count
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(2))
+            .expect("residual-state action stride overflow")
+    }
+}
+
+impl From<usize> for ResidualGeometry {
+    fn from(leaf_count: usize) -> Self {
+        Self {
+            leaf_count,
+            union_leaf: None,
+            union_arm_count: 0,
+        }
     }
 }
 
@@ -133,6 +228,20 @@ pub struct ResidualStateStats {
     pub propose_action_pops: usize,
     /// Explicit confirmation-action chunks that invoked one flattened leaf.
     pub confirm_action_pops: usize,
+    /// Union planner chunks that gated dead arms, selected one remaining arm
+    /// per parent, or completed the per-parent set union.
+    pub union_plan_pops: usize,
+    /// Explicit union proposal-arm chunks. Every call owns a fresh empty sink.
+    pub union_propose_action_pops: usize,
+    /// Explicit union confirmation-arm chunks. Every call receives the
+    /// immutable original candidate group for each parent.
+    pub union_confirm_action_pops: usize,
+    /// Opaque union-arm proposal calls.
+    pub union_propose_calls: usize,
+    /// Opaque union-arm confirmation calls.
+    pub union_confirm_calls: usize,
+    /// Stable parent atoms minted on entry to a lowered union occurrence.
+    pub union_parent_atoms: usize,
     /// Proposal or confirmation action pops whose candidates compacted to no
     /// successor rows.
     pub dead_action_pops: usize,
@@ -229,6 +338,46 @@ impl ChildSet {
     }
 }
 
+/// Canonical progress through the one lowered finite union.
+///
+/// The set records semantic completion, not history: an arm is present after
+/// it ran or after exact `satisfied` gating proved it dead for every parent in
+/// the bucket. Different arm orders therefore meet at the same descriptor.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ArmSet(Vec<u64>);
+
+impl ArmSet {
+    fn empty(arm_count: usize) -> Self {
+        Self(vec![0; arm_count.div_ceil(64)])
+    }
+
+    fn contains(&self, arm: usize) -> bool {
+        self.0[arm / 64] & (1 << (arm % 64)) != 0
+    }
+
+    fn insert(&mut self, arm: usize) {
+        self.0[arm / 64] |= 1 << (arm % 64);
+    }
+
+    fn with_inserted(&self, arm: usize) -> Self {
+        let mut next = self.clone();
+        next.insert(arm);
+        next
+    }
+
+    fn count(&self) -> usize {
+        self.0.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    fn is_valid_for(&self, arm_count: usize) -> bool {
+        if self.0.len() != arm_count.div_ceil(64) {
+            return false;
+        }
+        let remainder = arm_count % 64;
+        remainder == 0 || self.0.last().is_none_or(|word| word >> remainder == 0)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ResidualPhase {
     /// Plan one joint `(variable, proposing child)` action per row.
@@ -238,6 +387,22 @@ enum ResidualPhase {
         variable: VariableId,
         relevant: ChildSet,
         proposer: usize,
+    },
+    /// Gate dead arms and choose the next opaque proposer. `done` is the
+    /// canonical set of arms already evaluated or proven dead.
+    UnionProposePlan {
+        variable: VariableId,
+        relevant: ChildSet,
+        union: usize,
+        done: ArmSet,
+    },
+    /// Invoke one union arm with a fresh empty proposal sink.
+    UnionPropose {
+        variable: VariableId,
+        relevant: ChildSet,
+        union: usize,
+        done: ArmSet,
+        arm: usize,
     },
     /// A variable has speculative candidates and some leaf occurrences have
     /// already accepted them. Plan the next confirmer per parent row.
@@ -253,6 +418,25 @@ enum ResidualPhase {
         relevant: ChildSet,
         checked: ChildSet,
         confirmer: usize,
+    },
+    /// Gate dead arms and choose the next opaque confirmer. The outer
+    /// `checked` set is the continuation to resume after the union completes.
+    UnionConfirmPlan {
+        variable: VariableId,
+        relevant: ChildSet,
+        checked: ChildSet,
+        union: usize,
+        done: ArmSet,
+    },
+    /// Invoke one union arm over a fresh copy of every parent's original
+    /// candidate set.
+    UnionConfirm {
+        variable: VariableId,
+        relevant: ChildSet,
+        checked: ChildSet,
+        union: usize,
+        done: ArmSet,
+        arm: usize,
     },
 }
 
@@ -276,7 +460,8 @@ impl Hash for StateDesc {
 }
 
 impl StateDesc {
-    fn validate(&self, leaf_count: usize) {
+    fn validate(&self, geometry: ResidualGeometry) {
+        let leaf_count = geometry.leaf_count;
         let validate_variable = |variable: VariableId| {
             assert!(
                 !self.bound.is_set(variable),
@@ -299,6 +484,27 @@ impl StateDesc {
                 "residual checked set is not a subset of the relevant set"
             );
         };
+        let validate_union = |union: usize, done: &ArmSet, arm: Option<usize>| {
+            assert_eq!(
+                geometry.union_leaf,
+                Some(union),
+                "residual union state names an opaque occurrence"
+            );
+            assert!(
+                geometry.union_arm_count > 0,
+                "residual union state has no finite arms"
+            );
+            assert!(
+                done.is_valid_for(geometry.union_arm_count),
+                "residual done-arm set contains a non-arm occurrence"
+            );
+            if let Some(arm) = arm {
+                assert!(
+                    arm < geometry.union_arm_count && !done.contains(arm),
+                    "residual union action names an already-done arm"
+                );
+            }
+        };
 
         match &self.phase {
             ResidualPhase::Ready => {}
@@ -317,6 +523,33 @@ impl StateDesc {
                     *proposer < leaf_count && relevant.contains(*proposer),
                     "residual proposer is not relevant"
                 );
+            }
+            ResidualPhase::UnionProposePlan {
+                variable,
+                relevant,
+                union,
+                done,
+            } => {
+                validate_variable(*variable);
+                assert!(
+                    relevant.is_valid_for(leaf_count) && relevant.contains(*union),
+                    "residual union proposer is not relevant"
+                );
+                validate_union(*union, done, None);
+            }
+            ResidualPhase::UnionPropose {
+                variable,
+                relevant,
+                union,
+                done,
+                arm,
+            } => {
+                validate_variable(*variable);
+                assert!(
+                    relevant.is_valid_for(leaf_count) && relevant.contains(*union),
+                    "residual union proposer is not relevant"
+                );
+                validate_union(*union, done, Some(*arm));
             }
             ResidualPhase::Candidate {
                 variable,
@@ -341,17 +574,51 @@ impl StateDesc {
                     "residual confirmer is not an unchecked relevant leaf"
                 );
             }
+            ResidualPhase::UnionConfirmPlan {
+                variable,
+                relevant,
+                checked,
+                union,
+                done,
+            } => {
+                validate_variable(*variable);
+                validate_sets(relevant, checked);
+                assert!(
+                    relevant.contains(*union) && !checked.contains(*union),
+                    "residual union confirmer is not unchecked and relevant"
+                );
+                validate_union(*union, done, None);
+            }
+            ResidualPhase::UnionConfirm {
+                variable,
+                relevant,
+                checked,
+                union,
+                done,
+                arm,
+            } => {
+                validate_variable(*variable);
+                validate_sets(relevant, checked);
+                assert!(
+                    relevant.contains(*union) && !checked.contains(*union),
+                    "residual union confirmer is not unchecked and relevant"
+                );
+                validate_union(*union, done, Some(*arm));
+            }
         }
     }
 
     /// History-independent grade. Every transition strictly raises it, so
     /// draining the minimum grade is an exact readiness gate: once a state is
     /// popped, no unprocessed predecessor can still file into it.
-    fn rank(&self, leaf_count: usize) -> usize {
-        self.validate(leaf_count);
-        let stride = leaf_count
+    fn rank(&self, geometry: impl Into<ResidualGeometry>) -> usize {
+        let geometry = geometry.into();
+        self.validate(geometry);
+        let action_stride = geometry.action_stride();
+        let stride = geometry
+            .leaf_count
             .checked_add(1)
-            .and_then(|value| value.checked_mul(2))
+            .and_then(|value| value.checked_mul(action_stride))
             .expect("residual-state rank stride overflow");
         let base = self
             .bound
@@ -363,15 +630,49 @@ impl StateDesc {
             ResidualPhase::Propose { .. } => {
                 base.checked_add(1).expect("residual-state rank overflow")
             }
-            ResidualPhase::Candidate { checked, .. } => checked
+            ResidualPhase::UnionProposePlan { done, .. } => done
                 .count()
                 .checked_mul(2)
+                .and_then(|grade| grade.checked_add(1))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionPropose { done, .. } => done
+                .count()
+                .checked_mul(2)
+                .and_then(|grade| grade.checked_add(2))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::Candidate { checked, .. } => checked
+                .count()
+                .checked_mul(action_stride)
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
             ResidualPhase::Confirm { checked, .. } => checked
                 .count()
-                .checked_mul(2)
+                .checked_mul(action_stride)
                 .and_then(|grade| grade.checked_add(1))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionConfirmPlan { checked, done, .. } => checked
+                .count()
+                .checked_mul(action_stride)
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(2)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(1))
+                .and_then(|grade| base.checked_add(grade))
+                .expect("residual-state rank overflow"),
+            ResidualPhase::UnionConfirm { checked, done, .. } => checked
+                .count()
+                .checked_mul(action_stride)
+                .and_then(|grade| {
+                    done.count()
+                        .checked_mul(2)
+                        .and_then(|done| grade.checked_add(done))
+                })
+                .and_then(|grade| grade.checked_add(2))
                 .and_then(|grade| base.checked_add(grade))
                 .expect("residual-state rank overflow"),
         }
@@ -602,10 +903,196 @@ impl CandidateBatch {
     }
 }
 
+/// Stable identity for one outer parent derivation while it traverses a
+/// lowered union. Equal row values intentionally receive different IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct UnionParentId(u64);
+
+#[derive(Debug)]
+struct UnionParent {
+    id: UnionParentId,
+    /// One committed outer row in the canonical `StateDesc::bound` schema.
+    row: Box<[RawInline]>,
+    /// Confirmation replays this exact original candidate multiset to every
+    /// arm. Proposal parents carry `None` because every arm starts empty.
+    original: Option<Box<[RawInline]>>,
+    /// Idempotent per-parent union of values emitted or retained so far.
+    accepted: BTreeSet<RawInline>,
+}
+
+/// Whole-parent payload for a union plan or arm action.
+#[derive(Debug)]
+struct UnionBatch {
+    parents: Vec<UnionParent>,
+}
+
+impl UnionBatch {
+    fn mint_id(stats: &mut ResidualStateStats) -> UnionParentId {
+        let id = UnionParentId(
+            u64::try_from(stats.union_parent_atoms).expect("too many residual union parents"),
+        );
+        stats.union_parent_atoms = stats
+            .union_parent_atoms
+            .checked_add(1)
+            .expect("too many residual union parents");
+        id
+    }
+
+    fn from_rows(rows: RowBatch, stride: usize, stats: &mut ResidualStateStats) -> Self {
+        assert_eq!(rows.rows.len(), rows.row_count.saturating_mul(stride));
+        let parents = (0..rows.row_count)
+            .map(|parent| {
+                let start = parent * stride;
+                UnionParent {
+                    id: Self::mint_id(stats),
+                    row: rows.rows[start..start + stride].to_vec().into_boxed_slice(),
+                    original: None,
+                    accepted: BTreeSet::new(),
+                }
+            })
+            .collect();
+        Self { parents }
+    }
+
+    fn from_candidates(
+        batch: CandidateBatch,
+        stride: usize,
+        stats: &mut ResidualStateStats,
+    ) -> Self {
+        assert_eq!(
+            batch.parents.rows.len(),
+            batch.parents.row_count.saturating_mul(stride)
+        );
+        let mut originals = vec![Vec::new(); batch.parents.row_count];
+        for (parent, value) in batch.candidates {
+            let parent = parent as usize;
+            assert!(
+                parent < originals.len(),
+                "constraint emitted an invalid candidate row tag"
+            );
+            originals[parent].push(value);
+        }
+        for original in &mut originals {
+            // This matches UnionConstraint::confirm: every arm receives the
+            // original values sorted, including any duplicates.
+            original.sort_unstable();
+        }
+
+        let parents = originals
+            .into_iter()
+            .enumerate()
+            .map(|(parent, original)| {
+                let start = parent * stride;
+                UnionParent {
+                    id: Self::mint_id(stats),
+                    row: batch.parents.rows[start..start + stride]
+                        .to_vec()
+                        .into_boxed_slice(),
+                    original: Some(original.into_boxed_slice()),
+                    accepted: BTreeSet::new(),
+                }
+            })
+            .collect();
+        Self { parents }
+    }
+
+    fn row_count(&self) -> usize {
+        self.parents.len()
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.parents.append(&mut other.parents);
+    }
+
+    fn take_tail(&mut self, width: usize) -> Self {
+        let take = self.parents.len().min(width.max(1));
+        debug_assert!(take > 0);
+        let first = self.parents.len() - take;
+        Self {
+            parents: self.parents.split_off(first),
+        }
+    }
+
+    fn rows(&self, stride: usize) -> Vec<RawInline> {
+        let mut rows = Vec::with_capacity(stride.saturating_mul(self.parents.len()));
+        for parent in &self.parents {
+            assert_eq!(
+                parent.row.len(),
+                stride,
+                "union parent row disagrees with its canonical state"
+            );
+            rows.extend_from_slice(&parent.row);
+        }
+        rows
+    }
+
+    fn original_candidates(&self) -> Candidates {
+        let mut candidates = Vec::new();
+        for (parent, atom) in self.parents.iter().enumerate() {
+            let original = atom
+                .original
+                .as_deref()
+                .expect("proposal union has no original candidate frontier");
+            let parent = u32::try_from(parent).expect("too many union parents");
+            candidates.extend(original.iter().copied().map(|value| (parent, value)));
+        }
+        candidates
+    }
+
+    fn accumulate(&mut self, candidates: Candidates) {
+        for (parent, value) in candidates {
+            let parent = parent as usize;
+            assert!(
+                parent < self.parents.len(),
+                "union arm emitted an invalid candidate row tag"
+            );
+            self.parents[parent].accepted.insert(value);
+        }
+    }
+
+    fn partition<K: Ord>(self, assignments: Vec<K>) -> BTreeMap<K, Self> {
+        assert_eq!(assignments.len(), self.parents.len());
+        let mut groups = BTreeMap::new();
+        for (assignment, parent) in assignments.into_iter().zip(self.parents) {
+            groups
+                .entry(assignment)
+                .or_insert_with(|| Self {
+                    parents: Vec::new(),
+                })
+                .parents
+                .push(parent);
+        }
+        groups
+    }
+
+    fn into_candidates(self, stride: usize) -> CandidateBatch {
+        let mut parents = RowBatch {
+            rows: Vec::with_capacity(stride.saturating_mul(self.parents.len())),
+            row_count: self.parents.len(),
+        };
+        let mut candidates = Vec::new();
+        for (parent, atom) in self.parents.into_iter().enumerate() {
+            assert_eq!(
+                atom.row.len(),
+                stride,
+                "union parent row disagrees with its canonical state"
+            );
+            parents.rows.extend_from_slice(&atom.row);
+            let parent = u32::try_from(parent).expect("too many union parents");
+            candidates.extend(atom.accepted.into_iter().map(|value| (parent, value)));
+        }
+        CandidateBatch {
+            parents,
+            candidates,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum StateBucket {
     Rows(RowBatch),
     Candidates(CandidateBatch),
+    Union(UnionBatch),
 }
 
 impl StateBucket {
@@ -613,6 +1100,7 @@ impl StateBucket {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
             StateBucket::Candidates(batch) => batch.parents.row_count,
+            StateBucket::Union(batch) => batch.row_count(),
         }
     }
 
@@ -620,6 +1108,7 @@ impl StateBucket {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
+            (StateBucket::Union(left), StateBucket::Union(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
         }
     }
@@ -650,6 +1139,7 @@ impl StateBucket {
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
             }
+            StateBucket::Union(batch) => StateBucket::Union(batch.take_tail(width)),
         }
     }
 }
@@ -674,7 +1164,7 @@ fn rows_view<'v>(vars: &'v [VariableId], rows: &'v [RawInline], row_count: usize
 fn file(
     worklist: &mut Worklist,
     interner: &mut StateInterner,
-    leaf_count: usize,
+    geometry: impl Into<ResidualGeometry>,
     desc: StateDesc,
     bucket: StateBucket,
     stats: &mut ResidualStateStats,
@@ -682,7 +1172,8 @@ fn file(
     if bucket.row_count() == 0 {
         return false;
     }
-    let rank = desc.rank(leaf_count);
+    let geometry = geometry.into();
+    let rank = desc.rank(geometry);
     let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
@@ -737,6 +1228,10 @@ fn propose_leaf<'a, C: Constraint<'a> + 'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
+    assert!(
+        !plan.is_lowered_union(leaf),
+        "a lowered union proposer must execute one opaque arm at a time"
+    );
     if let Some(child) = plan.direct_child(leaf) {
         root.children()[child].propose(variable, view, candidates);
     } else {
@@ -752,6 +1247,10 @@ fn confirm_leaf<'a, C: Constraint<'a> + 'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
+    assert!(
+        !plan.is_lowered_union(leaf),
+        "a lowered union confirmer must execute one opaque arm at a time"
+    );
     if let Some(child) = plan.direct_child(leaf) {
         root.children()[child].confirm(variable, view, candidates);
     } else {
@@ -772,6 +1271,7 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
     stats: &mut ResidualStateStats,
 ) -> bool {
     let leaf_count = plan.len();
+    let geometry = plan.geometry();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
@@ -851,21 +1351,41 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
-        file(
-            worklist,
-            interner,
-            leaf_count,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Propose {
-                    variable: variable_plan.variable,
-                    relevant: variable_plan.relevant.clone(),
-                    proposer: action.leaf,
+        if plan.is_lowered_union(action.leaf) {
+            let batch = UnionBatch::from_rows(selected, vars.len(), stats);
+            file(
+                worklist,
+                interner,
+                geometry,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::UnionProposePlan {
+                        variable: variable_plan.variable,
+                        relevant: variable_plan.relevant.clone(),
+                        union: action.leaf,
+                        done: ArmSet::empty(geometry.union_arm_count),
+                    },
                 },
-            },
-            StateBucket::Rows(selected),
-            stats,
-        )
+                StateBucket::Union(batch),
+                stats,
+            )
+        } else {
+            file(
+                worklist,
+                interner,
+                geometry,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::Propose {
+                        variable: variable_plan.variable,
+                        relevant: variable_plan.relevant.clone(),
+                        proposer: action.leaf,
+                    },
+                },
+                StateBucket::Rows(selected),
+                stats,
+            )
+        }
     };
 
     if groups.len() == 1 {
@@ -897,6 +1417,7 @@ fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
     stats: &mut ResidualStateStats,
 ) -> bool {
     let leaf_count = plan.len();
+    let geometry = plan.geometry();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let mut candidates = Vec::new();
@@ -922,7 +1443,7 @@ fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
         file(
             worklist,
             interner,
-            leaf_count,
+            geometry,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -943,7 +1464,7 @@ fn commit_candidates(
     desc: &StateDesc,
     variable: VariableId,
     batch: CandidateBatch,
-    leaf_count: usize,
+    geometry: ResidualGeometry,
     worklist: &mut Worklist,
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
@@ -977,7 +1498,7 @@ fn commit_candidates(
     file(
         worklist,
         interner,
-        leaf_count,
+        geometry,
         StateDesc {
             bound: next_bound,
             phase: ResidualPhase::Ready,
@@ -1003,8 +1524,9 @@ fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
     stats: &mut ResidualStateStats,
 ) -> bool {
     let leaf_count = plan.len();
+    let geometry = plan.geometry();
     if relevant == checked {
-        return commit_candidates(desc, variable, batch, leaf_count, worklist, interner, stats);
+        return commit_candidates(desc, variable, batch, geometry, worklist, interner, stats);
     }
 
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -1047,22 +1569,43 @@ fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
     );
 
     let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
-        file(
-            worklist,
-            interner,
-            leaf_count,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Confirm {
-                    variable,
-                    relevant: relevant.clone(),
-                    checked: checked.clone(),
-                    confirmer,
+        if plan.is_lowered_union(confirmer) {
+            let batch = UnionBatch::from_candidates(selected, vars.len(), stats);
+            file(
+                worklist,
+                interner,
+                geometry,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::UnionConfirmPlan {
+                        variable,
+                        relevant: relevant.clone(),
+                        checked: checked.clone(),
+                        union: confirmer,
+                        done: ArmSet::empty(geometry.union_arm_count),
+                    },
                 },
-            },
-            StateBucket::Candidates(selected),
-            stats,
-        )
+                StateBucket::Union(batch),
+                stats,
+            )
+        } else {
+            file(
+                worklist,
+                interner,
+                geometry,
+                StateDesc {
+                    bound: desc.bound,
+                    phase: ResidualPhase::Confirm {
+                        variable,
+                        relevant: relevant.clone(),
+                        checked: checked.clone(),
+                        confirmer,
+                    },
+                },
+                StateBucket::Candidates(selected),
+                stats,
+            )
+        }
     };
 
     let first = confirmers[0];
@@ -1092,7 +1635,7 @@ fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> bool {
-    let leaf_count = plan.len();
+    let geometry = plan.geometry();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
     confirm_leaf(
@@ -1111,7 +1654,7 @@ fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
         file(
             worklist,
             interner,
-            leaf_count,
+            geometry,
             StateDesc {
                 bound: desc.bound,
                 phase: ResidualPhase::Candidate {
@@ -1126,6 +1669,317 @@ fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
     } else {
         false
     }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum UnionDecision {
+    Finish,
+    Action { done: ArmSet, arm: usize },
+}
+
+/// Gates dead arms independently for every parent and chooses one remaining
+/// arm by its row-local estimate. Only the semantic done set survives into the
+/// descriptor; the order that produced it does not.
+fn union_decisions<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    union: usize,
+    variable: VariableId,
+    vars: &[VariableId],
+    done: &ArmSet,
+    batch: &UnionBatch,
+) -> Vec<UnionDecision> {
+    let arm_count = plan.geometry().union_arm_count;
+    let mut observed_ids = BTreeSet::new();
+    batch
+        .parents
+        .iter()
+        .map(|parent| {
+            assert!(
+                observed_ids.insert(parent.id),
+                "one union bucket contains the same stable parent twice"
+            );
+            let row_view = rows_view(vars, &parent.row, 1);
+            let mut next_done = done.clone();
+            if done.count() == 0 {
+                // Constraint shape and behavior are immutable for the solve,
+                // and this parent's row/schema do not change inside the union.
+                // Therefore the entry planner can gate every arm exactly once;
+                // after the first action, every unfinished arm is known live.
+                for arm in 0..arm_count {
+                    if !plan
+                        .resolve_union_arm(root, union, arm)
+                        .satisfied(&row_view)
+                    {
+                        next_done.insert(arm);
+                    }
+                }
+            }
+            if next_done.count() == arm_count {
+                return UnionDecision::Finish;
+            }
+
+            let arm = (0..arm_count)
+                .filter(|&arm| !next_done.contains(arm))
+                .min_by_key(|&arm| {
+                    let mut estimate = usize::MAX;
+                    let relevant = plan.resolve_union_arm(root, union, arm).estimate(
+                        variable,
+                        &row_view,
+                        &mut EstimateSink::Scalar(&mut estimate),
+                    );
+                    (!relevant, estimate, arm)
+                })
+                .expect("unfinished union has one enabled arm");
+            UnionDecision::Action {
+                done: next_done,
+                arm,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_union(
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    checked: ChildSet,
+    batch: UnionBatch,
+    geometry: ResidualGeometry,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> bool {
+    let stride = desc.bound.count();
+    let batch = batch.into_candidates(stride);
+    if let Some(batch) = batch.compact(stride) {
+        file(
+            worklist,
+            interner,
+            geometry,
+            StateDesc {
+                bound: desc.bound,
+                phase: ResidualPhase::Candidate {
+                    variable,
+                    relevant: relevant.clone(),
+                    checked,
+                },
+            },
+            StateBucket::Candidates(batch),
+            stats,
+        )
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_propose_plan_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    union: usize,
+    done: &ArmSet,
+    batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> bool {
+    let geometry = plan.geometry();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let decisions = union_decisions(root, plan, union, variable, &vars, done, &batch);
+    let mut advanced = false;
+    for (decision, selected) in batch.partition(decisions) {
+        match decision {
+            UnionDecision::Finish => {
+                let mut checked = ChildSet::empty(geometry.leaf_count);
+                checked.insert(union);
+                advanced |= finish_union(
+                    desc, variable, relevant, checked, selected, geometry, worklist, interner,
+                    stats,
+                );
+            }
+            UnionDecision::Action { done, arm } => {
+                advanced |= file(
+                    worklist,
+                    interner,
+                    geometry,
+                    StateDesc {
+                        bound: desc.bound,
+                        phase: ResidualPhase::UnionPropose {
+                            variable,
+                            relevant: relevant.clone(),
+                            union,
+                            done,
+                            arm,
+                        },
+                    },
+                    StateBucket::Union(selected),
+                    stats,
+                );
+            }
+        }
+    }
+    advanced
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_propose_action_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    union: usize,
+    done: &ArmSet,
+    arm: usize,
+    mut batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> bool {
+    let geometry = plan.geometry();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let rows = batch.rows(vars.len());
+    let view = rows_view(&vars, &rows, batch.row_count());
+    let mut candidates = Vec::new();
+    // Load-bearing: every arm receives ownership of a fresh empty sink.
+    plan.resolve_union_arm(root, union, arm).propose(
+        variable,
+        &view,
+        &mut CandidateSink::Tagged(&mut candidates),
+    );
+    stats.union_propose_calls += 1;
+    batch.accumulate(candidates);
+
+    file(
+        worklist,
+        interner,
+        geometry,
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::UnionProposePlan {
+                variable,
+                relevant: relevant.clone(),
+                union,
+                done: done.with_inserted(arm),
+            },
+        },
+        StateBucket::Union(batch),
+        stats,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_confirm_plan_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    checked: &ChildSet,
+    union: usize,
+    done: &ArmSet,
+    batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> bool {
+    let geometry = plan.geometry();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let decisions = union_decisions(root, plan, union, variable, &vars, done, &batch);
+    let mut advanced = false;
+    for (decision, selected) in batch.partition(decisions) {
+        match decision {
+            UnionDecision::Finish => {
+                advanced |= finish_union(
+                    desc,
+                    variable,
+                    relevant,
+                    checked.with_inserted(union),
+                    selected,
+                    geometry,
+                    worklist,
+                    interner,
+                    stats,
+                );
+            }
+            UnionDecision::Action { done, arm } => {
+                advanced |= file(
+                    worklist,
+                    interner,
+                    geometry,
+                    StateDesc {
+                        bound: desc.bound,
+                        phase: ResidualPhase::UnionConfirm {
+                            variable,
+                            relevant: relevant.clone(),
+                            checked: checked.clone(),
+                            union,
+                            done,
+                            arm,
+                        },
+                    },
+                    StateBucket::Union(selected),
+                    stats,
+                );
+            }
+        }
+    }
+    advanced
+}
+
+#[allow(clippy::too_many_arguments)]
+fn union_confirm_action_transition<'a, C: Constraint<'a> + 'a>(
+    root: &IntersectionConstraint<C>,
+    plan: &ResidualPlan,
+    desc: &StateDesc,
+    variable: VariableId,
+    relevant: &ChildSet,
+    checked: &ChildSet,
+    union: usize,
+    done: &ArmSet,
+    arm: usize,
+    mut batch: UnionBatch,
+    worklist: &mut Worklist,
+    interner: &mut StateInterner,
+    stats: &mut ResidualStateStats,
+) -> bool {
+    let geometry = plan.geometry();
+    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
+    let rows = batch.rows(vars.len());
+    let view = rows_view(&vars, &rows, batch.row_count());
+    // Load-bearing: every arm filters a fresh copy of the original frontier,
+    // never another arm's survivors or the accumulated union.
+    let mut candidates = batch.original_candidates();
+    plan.resolve_union_arm(root, union, arm).confirm(
+        variable,
+        &view,
+        &mut CandidateSink::Tagged(&mut candidates),
+    );
+    stats.union_confirm_calls += 1;
+    batch.accumulate(candidates);
+
+    file(
+        worklist,
+        interner,
+        geometry,
+        StateDesc {
+            bound: desc.bound,
+            phase: ResidualPhase::UnionConfirmPlan {
+                variable,
+                relevant: relevant.clone(),
+                checked: checked.clone(),
+                union,
+                done: done.with_inserted(arm),
+            },
+        },
+        StateBucket::Union(batch),
+        stats,
+    )
 }
 
 /// Semantic result of executing one selected residual-state chunk.
@@ -1179,6 +2033,47 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
             StepOutcome::Advanced
         }
         (
+            ResidualPhase::UnionProposePlan {
+                variable,
+                relevant,
+                union,
+                done,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            stats.union_plan_pops += 1;
+            let advanced = union_propose_plan_transition(
+                root, plan, desc, *variable, relevant, *union, done, batch, worklist, interner,
+                stats,
+            );
+            if advanced {
+                StepOutcome::Advanced
+            } else {
+                StepOutcome::Dead
+            }
+        }
+        (
+            ResidualPhase::UnionPropose {
+                variable,
+                relevant,
+                union,
+                done,
+                arm,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            stats.union_propose_action_pops += 1;
+            let advanced = union_propose_action_transition(
+                root, plan, desc, *variable, relevant, *union, done, *arm, batch, worklist,
+                interner, stats,
+            );
+            assert!(
+                advanced,
+                "a union proposal action must file its parent atoms"
+            );
+            StepOutcome::Advanced
+        }
+        (
             ResidualPhase::Propose {
                 variable,
                 relevant,
@@ -1213,6 +2108,49 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
             StepOutcome::Advanced
         }
         (
+            ResidualPhase::UnionConfirmPlan {
+                variable,
+                relevant,
+                checked,
+                union,
+                done,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            stats.union_plan_pops += 1;
+            let advanced = union_confirm_plan_transition(
+                root, plan, desc, *variable, relevant, checked, *union, done, batch, worklist,
+                interner, stats,
+            );
+            if advanced {
+                StepOutcome::Advanced
+            } else {
+                StepOutcome::Dead
+            }
+        }
+        (
+            ResidualPhase::UnionConfirm {
+                variable,
+                relevant,
+                checked,
+                union,
+                done,
+                arm,
+            },
+            StateBucket::Union(batch),
+        ) => {
+            stats.union_confirm_action_pops += 1;
+            let advanced = union_confirm_action_transition(
+                root, plan, desc, *variable, relevant, checked, *union, done, *arm, batch,
+                worklist, interner, stats,
+            );
+            assert!(
+                advanced,
+                "a union confirmation action must file its parent atoms"
+            );
+            StepOutcome::Advanced
+        }
+        (
             ResidualPhase::Confirm {
                 variable,
                 relevant,
@@ -1244,7 +2182,9 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
 /// a later filing simply reopens the same interned descriptor.
 struct ResidualStateMachine {
     full: VariableSet,
+    #[cfg(test)]
     leaf_count: usize,
+    geometry: ResidualGeometry,
     interner: StateInterner,
     worklist: Worklist,
     stats: ResidualStateStats,
@@ -1259,11 +2199,30 @@ struct ResidualStateMachine {
 }
 
 impl ResidualStateMachine {
+    #[cfg(test)]
     fn new(full: VariableSet, leaf_count: usize, mode: Search) -> Self {
+        Self::new_with_geometry(
+            full,
+            ResidualGeometry {
+                leaf_count,
+                union_leaf: None,
+                union_arm_count: 0,
+            },
+            mode,
+        )
+    }
+
+    fn for_plan(full: VariableSet, plan: &ResidualPlan, mode: Search) -> Self {
+        Self::new_with_geometry(full, plan.geometry(), mode)
+    }
+
+    fn new_with_geometry(full: VariableSet, geometry: ResidualGeometry, mode: Search) -> Self {
         let cap = block_row_cap();
         let mut state = Self {
             full,
-            leaf_count,
+            #[cfg(test)]
+            leaf_count: geometry.leaf_count,
+            geometry,
             interner: StateInterner::default(),
             worklist: Worklist::new(),
             stats: ResidualStateStats::default(),
@@ -1280,7 +2239,7 @@ impl ResidualStateMachine {
             file(
                 &mut state.worklist,
                 &mut state.interner,
-                leaf_count,
+                geometry,
                 StateDesc {
                     bound: VariableSet::new_empty(),
                     phase: ResidualPhase::Ready,
@@ -1336,7 +2295,7 @@ impl ResidualStateMachine {
         }
 
         let desc = self.interner.get(id).clone();
-        debug_assert_eq!(desc.rank(self.leaf_count), rank);
+        debug_assert_eq!(desc.rank(self.geometry), rank);
         let before = bucket.row_count();
         let chunk = bucket.take_tail(desc.bound.count(), width);
         let remainder = bucket.row_count();
@@ -1563,7 +2522,7 @@ where
 {
     let full = root.variables();
     let plan = ResidualPlan::compile(root);
-    let leaf_count = plan.len();
+    let geometry = plan.geometry();
     let mut stats = ResidualStateStats::default();
     let mut interner = StateInterner::default();
     let mut worklist = Worklist::new();
@@ -1571,7 +2530,7 @@ where
         file(
             &mut worklist,
             &mut interner,
-            leaf_count,
+            geometry,
             StateDesc {
                 bound: VariableSet::new_empty(),
                 phase: ResidualPhase::Ready,
@@ -1589,7 +2548,7 @@ where
             .expect("observed worklist level exists");
         for (id, bucket) in level {
             let desc = interner.get(id).clone();
-            debug_assert_eq!(desc.rank(leaf_count), rank);
+            debug_assert_eq!(desc.rank(geometry), rank);
             stats.state_pops += 1;
             stats.readiness_pops += 1;
             match execute_state(
@@ -1666,14 +2625,14 @@ where
         } = self;
         let full = constraint.variables();
         let plan = ResidualPlan::compile(constraint.as_ref());
-        let leaf_count = plan.len();
+        let state = ResidualStateMachine::for_plan(full, &plan, mode);
         ResidualStateIter {
             root: constraint,
             plan,
             postprocessing,
             influences,
             base_estimates,
-            state: ResidualStateMachine::new(full, leaf_count, mode),
+            state,
         }
     }
 
@@ -1685,11 +2644,12 @@ where
     /// interned states. Planning states only estimate and partition; explicit
     /// action states invoke one flattened leaf over their assembled row or
     /// whole-parent candidate bucket. Histories with identical future work
-    /// append into one bucket before that state runs. Union, ignore, and
-    /// regular-path constraints remain opaque semantic boundaries; custom
-    /// constraints do too unless they explicitly expose an associative AND
-    /// shape. Opaque leaves continue through the ordinary [`Constraint`]
-    /// protocol.
+    /// append into one bucket before that state runs. The first finite union
+    /// occurrence is stepped arm by arm with canonical done-arm sets; its
+    /// arms and every later union remain opaque. Ignore and regular-path
+    /// constraints are opaque semantic boundaries, as are custom constraints
+    /// unless they explicitly expose a supported shape. Opaque leaves continue
+    /// through the ordinary [`Constraint`] protocol.
     ///
     /// Result order may differ from the ordinary iterator; the result
     /// multiset is the same. Use
@@ -1757,14 +2717,14 @@ where
         let full = constraint.variables();
         let root = Arc::new(constraint);
         let plan = ResidualPlan::compile(root.as_ref());
-        let leaf_count = plan.len();
+        let state = ResidualStateMachine::for_plan(full, &plan, mode);
         ResidualStateIter {
             root,
             plan,
             postprocessing,
             influences,
             base_estimates,
-            state: ResidualStateMachine::new(full, leaf_count, mode),
+            state,
         }
     }
 
@@ -2062,7 +3022,9 @@ mod tests {
             Box::new(IntersectionConstraint::new(vec![ShapeLeaf(0)]));
         let boxed_children = match boxed.residual_shape() {
             ConstraintShape::And(children) => children,
-            ConstraintShape::Opaque => panic!("boxed intersection stayed opaque"),
+            ConstraintShape::Opaque | ConstraintShape::Union(_) => {
+                panic!("boxed intersection did not expose AND children")
+            }
         };
         assert_eq!(boxed_children.len(), 1);
         assert_eq!(
@@ -2074,7 +3036,9 @@ mod tests {
             Arc::new(IntersectionConstraint::new(vec![ShapeLeaf(1)]));
         let arc_children = match arc.residual_shape() {
             ConstraintShape::And(children) => children,
-            ConstraintShape::Opaque => panic!("Arc intersection stayed opaque"),
+            ConstraintShape::Opaque | ConstraintShape::Union(_) => {
+                panic!("Arc intersection did not expose AND children")
+            }
         };
         assert_eq!(arc_children.len(), 1);
         assert_eq!(
@@ -2185,11 +3149,52 @@ mod tests {
         ]);
         let root =
             IntersectionConstraint::new(vec![shape_and(vec![Box::new(union) as ShapeConstraint])]);
+        let plan = ResidualPlan::compile(&root);
         assert_eq!(
-            ResidualPlan::compile(&root).leaves,
+            plan.leaves,
             vec![ConstraintPath(vec![0, 0].into_boxed_slice())],
             "an AND may contain a union, but lowering must not enter its AND arms"
         );
+        assert_eq!(
+            plan.union,
+            Some(UnionOccurrence {
+                leaf: 0,
+                arm_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn only_the_first_preorder_union_occurrence_is_lowered() {
+        let union = |variable| {
+            Box::new(UnionConstraint::new(vec![
+                shape_leaf(variable),
+                shape_and(vec![shape_leaf(variable)]),
+            ])) as ShapeConstraint
+        };
+        let root = IntersectionConstraint::new(vec![union(4), union(5)]);
+        let plan = ResidualPlan::compile(&root);
+
+        assert_eq!(
+            plan.leaves,
+            vec![
+                ConstraintPath(vec![0].into_boxed_slice()),
+                ConstraintPath(vec![1].into_boxed_slice()),
+            ]
+        );
+        assert_eq!(
+            plan.union,
+            Some(UnionOccurrence {
+                leaf: 0,
+                arm_count: 2,
+            })
+        );
+        assert!(plan.is_lowered_union(0));
+        assert!(!plan.is_lowered_union(1));
+        assert!(matches!(
+            plan.resolve(&root, 1).residual_shape(),
+            ConstraintShape::Union(_)
+        ));
     }
 
     #[test]
@@ -2387,7 +3392,9 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 64);
                 assert!(batch.candidates.iter().all(|(parent, _)| *parent == 0));
             }
-            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+            StateBucket::Rows(_) | StateBucket::Union(_) => {
+                panic!("confirmation returned a non-candidate payload")
+            }
         }
 
         let mut full = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
@@ -2413,7 +3420,9 @@ mod tests {
                 assert_eq!(batch.candidates.len(), 65);
                 assert_eq!(batch.candidates.last().map(|(parent, _)| *parent), Some(1));
             }
-            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+            StateBucket::Rows(_) | StateBucket::Union(_) => {
+                panic!("confirmation returned a non-candidate payload")
+            }
         }
     }
 
@@ -3190,6 +4199,62 @@ mod tests {
         };
         assert_eq!(next_ready.rank(leaf_count), 20);
         assert!(full_candidate.rank(leaf_count) < next_ready.rank(leaf_count));
+    }
+
+    #[test]
+    fn union_done_sets_have_canonical_strictly_increasing_ranks() {
+        let geometry = ResidualGeometry {
+            leaf_count: 3,
+            union_leaf: Some(1),
+            union_arm_count: 3,
+        };
+        let bound = VariableSet::new_singleton(0);
+        let mut relevant = ChildSet::empty(geometry.leaf_count);
+        relevant.insert(1);
+        relevant.insert(2);
+        let empty = ArmSet::empty(geometry.union_arm_count);
+        let done_zero = empty.with_inserted(0);
+        let done_zero_two = done_zero.with_inserted(2);
+        let done_two_zero = empty.with_inserted(2).with_inserted(0);
+        assert_eq!(done_zero_two, done_two_zero);
+
+        let plan = |done| StateDesc {
+            bound,
+            phase: ResidualPhase::UnionProposePlan {
+                variable: 1,
+                relevant: relevant.clone(),
+                union: 1,
+                done,
+            },
+        };
+        let action = |done, arm| StateDesc {
+            bound,
+            phase: ResidualPhase::UnionPropose {
+                variable: 1,
+                relevant: relevant.clone(),
+                union: 1,
+                done,
+                arm,
+            },
+        };
+        let mut checked = ChildSet::empty(geometry.leaf_count);
+        checked.insert(1);
+        let candidate = StateDesc {
+            bound,
+            phase: ResidualPhase::Candidate {
+                variable: 1,
+                relevant: relevant.clone(),
+                checked,
+            },
+        };
+
+        assert_eq!(plan(empty.clone()).rank(geometry), 33);
+        assert_eq!(action(empty, 0).rank(geometry), 34);
+        assert_eq!(plan(done_zero.clone()).rank(geometry), 35);
+        assert_eq!(action(done_zero, 2).rank(geometry), 36);
+        assert_eq!(plan(done_zero_two.clone()).rank(geometry), 37);
+        assert_eq!(plan(done_two_zero).rank(geometry), 37);
+        assert_eq!(candidate.rank(geometry), 40);
     }
 
     #[test]
