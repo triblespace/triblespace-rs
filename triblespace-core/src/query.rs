@@ -33,7 +33,7 @@ pub mod patchconstraint;
 pub mod rangeconstraint;
 /// [`RegularPathConstraint`] — regular path expressions over graphs.
 pub mod regularpathconstraint;
-/// Experimental canonical residual-state execution for root intersections.
+/// Experimental canonical residual-state execution for arbitrary constraints.
 pub mod residual;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;

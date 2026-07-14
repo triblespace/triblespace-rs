@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Root intersections gain an opt-in canonical residual-state solver.**
+- **Constraints gain an opt-in canonical residual-state solver.** Any root
+  `Constraint` can use the residual APIs: roots that expose associative AND
+  structure are recursively flattened, while an opaque root is represented by
+  one empty-path leaf and retains its own union, ignore, path, constant, range,
+  or custom semantics.
   `solve_residual_state` jointly chooses each row's next variable and proposing
   leaf occurrence, then interns both planning states and uniform
   `Propose`/`Confirm` protocol actions as exact control-state descriptors.

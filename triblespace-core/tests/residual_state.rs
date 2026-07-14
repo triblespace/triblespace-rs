@@ -1,14 +1,20 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
+use triblespace_core::id::{rngid, Id};
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::inline::Inline;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::equalityconstraint::EqualityConstraint;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
+use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, Query, RowsView,
-    VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, IgnoreConstraint, PathOp, Query,
+    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
 };
+use triblespace_core::trible::{Trible, TribleSet};
 
 // Deliberately put x before p. The residual solver first binds p, then has to
 // insert x before the existing p column when it commits x's candidates.
@@ -319,6 +325,12 @@ fn encoded(marker: u8, index: usize) -> RawInline {
     value
 }
 
+fn genid_inline(id: &Id) -> Inline<GenId> {
+    let mut value = [0; 32];
+    value[16..].copy_from_slice(&id[..]);
+    Inline::new(value)
+}
+
 fn decode(value: &RawInline, marker: u8) -> Option<usize> {
     (value[0] == marker)
         .then(|| u64::from_be_bytes(value[24..].try_into().expect("eight-byte suffix")) as usize)
@@ -448,6 +460,52 @@ impl Constraint<'_> for FiniteDomain {
 struct BorrowedDomain<'v> {
     variable: VariableId,
     values: &'v [RawInline],
+}
+
+/// Hides an ordinary constraint's optional lowering shape while preserving
+/// every semantic protocol operation. This models custom semantic wrappers:
+/// the residual engine must treat the whole value as one opaque root leaf.
+struct Opaque<C>(C);
+
+impl<'a, C: Constraint<'a>> Constraint<'a> for Opaque<C> {
+    fn variables(&self) -> VariableSet {
+        self.0.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.0.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.propose(variable, view, candidates)
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.0.confirm(variable, view, candidates)
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.0.satisfied(view)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.0.influence(variable)
+    }
 }
 
 impl<'v> Constraint<'v> for BorrowedDomain<'v> {
@@ -626,6 +684,180 @@ fn project_parent(binding: &Binding) -> Option<RawInline> {
 
 fn project_same(_: &Binding) -> Option<()> {
     Some(())
+}
+
+fn assert_arbitrary_root_equivalent<'a, C, F, Pj, R>(make: F, project: Pj, mut expected: Vec<R>)
+where
+    C: Constraint<'a> + 'a,
+    F: Fn() -> C,
+    Pj: Fn(&Binding) -> Option<R> + Copy,
+    R: Ord + std::fmt::Debug,
+{
+    let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+    let mut eager = Query::new(make(), project).solve_residual_state();
+    let mut lazy_default: Vec<_> = Query::new(make(), project)
+        .solve_residual_state_lazy()
+        .collect();
+    let mut lazy_cap_one: Vec<_> = Query::new(make(), project)
+        .solve_residual_state_lazy()
+        .cap(1)
+        .collect();
+
+    expected.sort_unstable();
+    sequential.sort_unstable();
+    eager.sort_unstable();
+    lazy_default.sort_unstable();
+    lazy_cap_one.sort_unstable();
+    assert_eq!(sequential, expected, "scalar result bag vs fixture oracle");
+    assert_eq!(eager, expected, "eager residual result bag");
+    assert_eq!(lazy_default, expected, "default lazy residual result bag");
+    assert_eq!(lazy_cap_one, expected, "cap=1 lazy residual result bag");
+}
+
+#[test]
+fn top_level_union_root_preserves_set_semantics() {
+    let left = vec![encoded(b'u', 0), encoded(b'u', 1)];
+    let right = vec![encoded(b'u', 1), encoded(b'u', 2)];
+    let expected = vec![encoded(b'u', 0), encoded(b'u', 1), encoded(b'u', 2)];
+
+    assert_arbitrary_root_equivalent(
+        || {
+            let (left, _) = finite_domain(P, left.clone(), 2);
+            let (right, _) = finite_domain(P, right.clone(), 2);
+            UnionConstraint::new(vec![left, right])
+        },
+        project_parent,
+        expected,
+    );
+}
+
+#[test]
+fn top_level_ignore_root_preserves_wildcard_scope() {
+    let expected: Vec<_> = (0..4).map(|parent| encoded(P_MARKER, parent)).collect();
+
+    assert_arbitrary_root_equivalent(
+        || {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            IgnoreConstraint::new(
+                VariableSet::new_singleton(X),
+                Box::new(TableChild::relation(Child::A, 4, trace)),
+            )
+        },
+        project_parent,
+        expected,
+    );
+}
+
+#[test]
+fn top_level_regular_path_root_preserves_graph_semantics() {
+    let a = rngid();
+    let b = rngid();
+    let c = rngid();
+    let attribute = Id::new([0x52; 16]).expect("non-zero test attribute");
+    let a_value = genid_inline(&a);
+    let b_value = genid_inline(&b);
+    let c_value = genid_inline(&c);
+    let mut set = TribleSet::new();
+    set.insert(&Trible::new(&a, &attribute, &b_value));
+    set.insert(&Trible::new(&a, &attribute, &c_value));
+    set.insert(&Trible::new(&b, &attribute, &c_value));
+    let expected = vec![
+        (a_value.raw, b_value.raw),
+        (a_value.raw, c_value.raw),
+        (b_value.raw, c_value.raw),
+    ];
+
+    assert_arbitrary_root_equivalent(
+        || {
+            RegularPathConstraint::new(
+                set.clone(),
+                Variable::<GenId>::new(P),
+                Variable::<GenId>::new(X),
+                &[PathOp::Attr(attribute.raw())],
+            )
+        },
+        project_pair,
+        expected,
+    );
+}
+
+#[test]
+fn top_level_constant_root_and_confirm_only_range_api_are_supported() {
+    let constant = Inline::<UnknownInline>::new(encoded(b'k', 7));
+    assert_arbitrary_root_equivalent(
+        || Variable::<UnknownInline>::new(P).is(constant),
+        project_parent,
+        vec![constant.raw],
+    );
+
+    let min = Inline::<UnknownInline>::new(encoded(b'r', 1));
+    let max = Inline::<UnknownInline>::new(encoded(b'r', 3));
+    // InlineRange deliberately cannot propose, so by itself it is not a
+    // complete executable query. It can nevertheless be the API's concrete
+    // root type; the following test exercises its semantics when paired with
+    // a proposer behind one opaque root boundary.
+    let range = InlineRange::new(Variable::<UnknownInline>::new(P), min, max);
+    drop(Query::new(range, project_parent).solve_residual_state_lazy());
+}
+
+#[test]
+fn opaque_root_preserves_internal_equality_and_range_semantics() {
+    let equality_values: Vec<_> = (0..4).map(|i| encoded(b'=', i)).collect();
+    let equality_expected: Vec<_> = equality_values
+        .iter()
+        .copied()
+        .map(|value| (value, value))
+        .collect();
+    assert_arbitrary_root_equivalent(
+        || Opaque(equality_fixture().0),
+        project_pair,
+        equality_expected,
+    );
+
+    let range_values: Vec<_> = (0..5).map(|i| encoded(b'r', i)).collect();
+    let min = Inline::<UnknownInline>::new(encoded(b'r', 1));
+    let max = Inline::<UnknownInline>::new(encoded(b'r', 3));
+    assert_arbitrary_root_equivalent(
+        || {
+            let (domain, _) = finite_domain(P, range_values.clone(), 5);
+            Opaque(IntersectionConstraint::new(vec![
+                Box::new(domain) as OwnedConstraint,
+                Box::new(InlineRange::new(
+                    Variable::<UnknownInline>::new(P),
+                    min,
+                    max,
+                )),
+            ]))
+        },
+        project_parent,
+        range_values[1..=3].to_vec(),
+    );
+}
+
+#[test]
+fn top_level_custom_and_borrowed_roots_need_no_wrapper() {
+    let owned_values: Vec<_> = (0..3).map(|i| encoded(b'c', i)).collect();
+    assert_arbitrary_root_equivalent(
+        || finite_domain(P, owned_values.clone(), 3).0,
+        project_parent,
+        owned_values.clone(),
+    );
+
+    let borrowed_values: Vec<_> = (0..3).map(|i| encoded(b'b', i)).collect();
+    assert_arbitrary_root_equivalent(
+        || BorrowedDomain {
+            variable: P,
+            values: &borrowed_values,
+        },
+        project_parent,
+        borrowed_values.clone(),
+    );
+}
+
+#[test]
+fn top_level_zero_variable_roots_settle_before_planning() {
+    assert_arbitrary_root_equivalent(|| Truth(true), project_same, vec![()]);
+    assert_arbitrary_root_equivalent(|| Truth(false), project_same, Vec::new());
 }
 
 fn matching_calls(trace: &Trace, child: Child, verb: Verb, variable: VariableId) -> Vec<Call> {

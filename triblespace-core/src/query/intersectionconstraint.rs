@@ -30,11 +30,6 @@ where
     pub fn new(constraints: Vec<C>) -> Self {
         IntersectionConstraint { constraints }
     }
-
-    /// Direct children for the residual plan's one-edge static-dispatch path.
-    pub(crate) fn children(&self) -> &[C] {
-        &self.constraints
-    }
 }
 
 impl<'a, C> ConstraintChildren<'a> for IntersectionConstraint<C>

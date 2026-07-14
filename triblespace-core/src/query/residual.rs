@@ -2,11 +2,10 @@
 //!
 //! This is the smallest executable slice of a scheduler where a bucket is
 //! identified by its remaining computation rather than its history. It
-//! lowers the maximal associative AND region rooted at an
-//! [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint).
-//! Nested intersections become deterministic preorder leaf occurrences;
-//! union, ignore, and regular-path constraints remain opaque ordinary
-//! [`Constraint`] leaves; custom constraints do too unless they explicitly
+//! lowers any root [`Constraint`]. An exposed associative AND region becomes
+//! deterministic preorder leaf occurrences; an opaque root is one leaf at the
+//! empty path. Union, ignore, and regular-path constraints therefore remain
+//! ordinary indivisible leaves, as do custom constraints unless they explicitly
 //! expose an associative AND shape.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
@@ -36,16 +35,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+#[cfg(test)]
 use std::sync::Arc;
 
-use super::intersectionconstraint::IntersectionConstraint;
 use super::*;
 
 /// One deterministic route from the owned root to an opaque residual leaf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ConstraintPath(Box<[usize]>);
 
-/// Borrow-free lowering plan safe to store beside an owned `Arc` root.
+/// Borrow-free lowering plan safe to store beside its owned root.
 ///
 /// Occurrence identity is the path's preorder position, not the address or
 /// concrete type of the resolved constraint. Thus repeating the same `Arc`
@@ -83,11 +82,6 @@ impl ResidualPlan {
 
     fn len(&self) -> usize {
         self.leaves.len()
-    }
-
-    fn direct_child(&self, occurrence: usize) -> Option<usize> {
-        let path = &self.leaves[occurrence].0;
-        (path.len() == 1).then(|| path[0])
     }
 
     fn resolve<'r, 'a>(
@@ -714,53 +708,41 @@ struct VariablePlan {
     estimates: Vec<usize>,
 }
 
-fn estimate_leaf<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn estimate_leaf<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     leaf: usize,
     variable: VariableId,
     view: &RowsView<'_>,
     out: &mut EstimateSink<'_>,
 ) -> bool {
-    if let Some(child) = plan.direct_child(leaf) {
-        root.children()[child].estimate(variable, view, out)
-    } else {
-        plan.resolve(root, leaf).estimate(variable, view, out)
-    }
+    plan.resolve(root, leaf).estimate(variable, view, out)
 }
 
-fn propose_leaf<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn propose_leaf<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     leaf: usize,
     variable: VariableId,
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    if let Some(child) = plan.direct_child(leaf) {
-        root.children()[child].propose(variable, view, candidates);
-    } else {
-        plan.resolve(root, leaf).propose(variable, view, candidates);
-    }
+    plan.resolve(root, leaf).propose(variable, view, candidates);
 }
 
-fn confirm_leaf<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn confirm_leaf<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     leaf: usize,
     variable: VariableId,
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    if let Some(child) = plan.direct_child(leaf) {
-        root.children()[child].confirm(variable, view, candidates);
-    } else {
-        plan.resolve(root, leaf).confirm(variable, view, candidates);
-    }
+    plan.resolve(root, leaf).confirm(variable, view, candidates);
 }
 
-fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn ready_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     rows: RowBatch,
@@ -884,8 +866,8 @@ fn ready_plan_transition<'a, C: Constraint<'a> + 'a>(
     }
 }
 
-fn propose_action_transition<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn propose_action_transition<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     variable: VariableId,
@@ -990,8 +972,8 @@ fn commit_candidates(
     )
 }
 
-fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn candidate_plan_transition<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     variable: VariableId,
@@ -1079,8 +1061,8 @@ fn candidate_plan_transition<'a, C: Constraint<'a> + 'a>(
     }
 }
 
-fn confirm_action_transition<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn confirm_action_transition<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     variable: VariableId,
@@ -1144,8 +1126,8 @@ enum StepOutcome {
 /// affine payload chunk. The explicit outcome lets eager and lazy callers
 /// distinguish semantic progress, branch death, and terminal projection
 /// without inferring any of them from worklist size.
-fn execute_state<'a, C: Constraint<'a> + 'a>(
-    root: &IntersectionConstraint<C>,
+fn execute_state<'a>(
+    root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
     desc: &StateDesc,
     bucket: StateBucket,
@@ -1369,9 +1351,9 @@ impl ResidualStateMachine {
         Some((desc, chunk))
     }
 
-    fn pop_once<'a, C: Constraint<'a> + 'a>(
+    fn pop_once<'a>(
         &mut self,
-        root: &IntersectionConstraint<C>,
+        root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
@@ -1414,16 +1396,15 @@ impl ResidualStateMachine {
         self.emit_count = rows.row_count;
     }
 
-    fn pull<'a, C, P, R>(
+    fn pull<'a, P, R>(
         &mut self,
-        root: &IntersectionConstraint<C>,
+        root: &dyn Constraint<'a>,
         plan: &ResidualPlan,
         postprocessing: &P,
         influences: &[VariableSet; 128],
         base_estimates: &[usize; 128],
     ) -> Option<R>
     where
-        C: Constraint<'a> + 'a,
         P: Fn(&Binding) -> Option<R>,
     {
         loop {
@@ -1458,7 +1439,7 @@ impl ResidualStateMachine {
     }
 }
 
-/// Demand-driven canonical residual-state execution for a root intersection.
+/// Demand-driven canonical residual-state execution for any root constraint.
 ///
 /// The iterator begins with a narrow desired parent-atom width, so full
 /// descendant buckets can produce a result before sibling rows are evaluated.
@@ -1473,7 +1454,7 @@ impl ResidualStateMachine {
 /// it produces the same result multiset as [`Query::solve_residual_state`].
 #[must_use]
 pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
-    root: Arc<IntersectionConstraint<C>>,
+    root: C,
     plan: ResidualPlan,
     postprocessing: P,
     influences: [VariableSet; 128],
@@ -1541,7 +1522,7 @@ where
 
     fn next(&mut self) -> Option<Self::Item> {
         self.state.pull(
-            self.root.as_ref(),
+            &self.root,
             &self.plan,
             &self.postprocessing,
             &self.influences,
@@ -1550,15 +1531,14 @@ where
     }
 }
 
-fn solve<'a, C, P, R>(
-    root: &IntersectionConstraint<C>,
+fn solve<'a, P, R>(
+    root: &dyn Constraint<'a>,
     postprocessing: P,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     mode: Search,
 ) -> ResidualStateSolve<R>
 where
-    C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
     let full = root.variables();
@@ -1636,12 +1616,12 @@ fn assert_fresh<C, P: Fn(&Binding) -> Option<R>, R>(query: &Query<C, P, R>) {
     );
 }
 
-impl<'a, C, P, R> Query<Arc<IntersectionConstraint<C>>, P, R>
+impl<'a, C, P, R> Query<C, P, R>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
-    /// Lazily executes a root intersection through canonical residual states.
+    /// Lazily executes any root constraint through canonical residual states.
     ///
     /// The first pull uses a one-parent depth-first batch by default. Filing a
     /// nonempty successor preserves that width; an action with no successor or
@@ -1665,7 +1645,7 @@ where
             ..
         } = self;
         let full = constraint.variables();
-        let plan = ResidualPlan::compile(constraint.as_ref());
+        let plan = ResidualPlan::compile(&constraint);
         let leaf_count = plan.len();
         ResidualStateIter {
             root: constraint,
@@ -1677,7 +1657,7 @@ where
         }
     }
 
-    /// Eagerly solves a root intersection through canonical residual states.
+    /// Eagerly solves any root constraint through canonical residual states.
     ///
     /// This experimental path recursively flattens the maximal nested AND
     /// region, jointly chooses the next variable and proposing leaf occurrence,
@@ -1724,81 +1704,6 @@ where
             ..
         } = self;
         solve(
-            constraint.as_ref(),
-            postprocessing,
-            influences,
-            base_estimates,
-            mode,
-        )
-    }
-}
-
-impl<'a, C, P, R> Query<IntersectionConstraint<C>, P, R>
-where
-    C: Constraint<'a> + 'a,
-    P: Fn(&Binding) -> Option<R>,
-{
-    /// Lazily executes a direct root intersection through canonical residual
-    /// states with geometric batch-fill scheduling.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started on this query.
-    pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
-        assert_fresh(&self);
-        let Query {
-            constraint,
-            postprocessing,
-            influences,
-            base_estimates,
-            mode,
-            ..
-        } = self;
-        let full = constraint.variables();
-        let root = Arc::new(constraint);
-        let plan = ResidualPlan::compile(root.as_ref());
-        let leaf_count = plan.len();
-        ResidualStateIter {
-            root,
-            plan,
-            postprocessing,
-            influences,
-            base_estimates,
-            state: ResidualStateMachine::new(full, leaf_count, mode),
-        }
-    }
-
-    /// Eagerly solves a direct root intersection through canonical residual
-    /// states, preserving the ordinary solver's result multiset while
-    /// allowing result order to differ.
-    ///
-    /// Flattened leaves must obey [`Constraint::estimate`]'s structural,
-    /// block-uniform relevance law and remain semantically immutable during
-    /// the solve.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started on this query.
-    pub fn solve_residual_state(self) -> Vec<R> {
-        self.solve_residual_state_profiled().results
-    }
-
-    /// Direct-root residual solve with scheduler measurements.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started on this query.
-    pub fn solve_residual_state_profiled(self) -> ResidualStateSolve<R> {
-        assert_fresh(&self);
-        let Query {
-            constraint,
-            postprocessing,
-            influences,
-            base_estimates,
-            mode,
-            ..
-        } = self;
-        solve(
             &constraint,
             postprocessing,
             influences,
@@ -1811,6 +1716,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::unionconstraint::UnionConstraint;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2126,6 +2032,20 @@ mod tests {
                 vec![0, 1, 1, 0],
                 vec![0, 1, 1, 1]
             ]
+        );
+    }
+
+    #[test]
+    fn opaque_root_is_one_empty_path_occurrence() {
+        let root = ShapeLeaf(9);
+        let plan = ResidualPlan::compile(&root);
+        assert_eq!(
+            plan.leaves,
+            vec![ConstraintPath(Vec::new().into_boxed_slice())]
+        );
+        assert_eq!(
+            plan.resolve(&root, 0).variables(),
+            VariableSet::new_singleton(9)
         );
     }
 
