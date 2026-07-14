@@ -252,6 +252,10 @@ pub enum ResidentRoundError {
     },
     /// Inputs were prepared by another planner compatibility capability.
     InputOwnership,
+    /// Packed choices were produced by another exact planner capability.
+    ChoiceOwnership,
+    /// Packed choice metadata or storage does not match the exact planner.
+    MalformedChoiceBuffer,
     /// The device returned a malformed choice triple.
     MalformedDeviceChoice {
         /// Row containing the malformed triple.
@@ -289,6 +293,10 @@ impl fmt::Display for ResidentRoundError {
             Self::InputOwnership => {
                 f.write_str("resident row-planner input belongs to another planner")
             }
+            Self::ChoiceOwnership => f.write_str("resident row choices belong to another planner"),
+            Self::MalformedChoiceBuffer => {
+                f.write_str("resident row-choice metadata or storage is malformed")
+            }
             Self::MalformedDeviceChoice { row } => {
                 write!(
                     f,
@@ -309,6 +317,8 @@ impl Error for ResidentRoundError {
             | Self::GeometryOverflow(_)
             | Self::EstimateMatrixShape { .. }
             | Self::InputOwnership
+            | Self::ChoiceOwnership
+            | Self::MalformedChoiceBuffer
             | Self::MalformedDeviceChoice { .. } => None,
         }
     }
@@ -327,6 +337,7 @@ impl From<jerky::Error> for ResidentRoundError {
 /// allocation created by this planner without any intermediate readback.
 pub struct ResidentRoundInputs<R: Runtime> {
     owner: Arc<()>,
+    frontier_lineage: Option<Arc<()>>,
     viable: DeviceU32Buffer<R>,
     estimates: DeviceU32Buffer<R>,
     rows: usize,
@@ -345,6 +356,27 @@ impl<R: Runtime> ResidentRoundInputs<R> {
 
     pub(crate) fn estimates_output_arg(&mut self) -> ArrayArg<R> {
         self.estimates.output_arg()
+    }
+
+    /// Brands freshly allocated inputs with one exact frontier allocation.
+    ///
+    /// Low-level planner inputs intentionally remain unbranded. Only the
+    /// archive-bound resident round may attach this private lineage before its
+    /// producer kernels launch, and an input cannot be relabelled afterward.
+    pub(crate) fn bind_frontier_lineage(
+        &mut self,
+        lineage: Arc<()>,
+    ) -> Result<(), ResidentRoundError> {
+        match &self.frontier_lineage {
+            Some(current) if !Arc::ptr_eq(current, &lineage) => {
+                Err(ResidentRoundError::InputOwnership)
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.frontier_lineage = Some(lineage);
+                Ok(())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -437,6 +469,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         let estimate_count = self.metadata.expected_estimates(rows)?;
         Ok(ResidentRoundInputs {
             owner: self.owner.clone(),
+            frontier_lineage: None,
             viable: self.context.empty_u32(rows)?,
             estimates: self.context.empty_u32(estimate_count)?,
             rows,
@@ -467,6 +500,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
             .collect::<Vec<_>>();
         Ok(ResidentRoundInputs {
             owner: self.owner.clone(),
+            frontier_lineage: None,
             viable: self.context.upload_u32(&viability)?,
             estimates: self.context.upload_u32(estimates)?,
             rows: viable.len(),
@@ -518,11 +552,37 @@ impl<R: Runtime> ResidentRowPlanner<R> {
             }
         }
         Ok(ResidentRowChoices {
+            owner: self.owner.clone(),
+            frontier_lineage: inputs.frontier_lineage.clone(),
             words,
             rows: inputs.rows,
             variable_count: self.metadata.variable_count,
             arm_targets: self.arm_targets.clone(),
         })
+    }
+
+    /// Returns the packed choice input for a downstream resident kernel only
+    /// after revalidating its exact planner capability and storage geometry.
+    ///
+    /// Keeping this seam crate-private prevents downstream code from obtaining
+    /// a raw device handle and relabelling choices from another context,
+    /// archive, schema, or planner round.
+    #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
+    pub(crate) fn choice_input_arg(
+        &self,
+        choices: &ResidentRowChoices<R>,
+    ) -> Result<ArrayArg<R>, ResidentRoundError> {
+        if !Arc::ptr_eq(&self.owner, &choices.owner)
+            || !Arc::ptr_eq(&self.arm_targets, &choices.arm_targets)
+        {
+            return Err(ResidentRoundError::ChoiceOwnership);
+        }
+        let expected = checked_device_product(choices.rows, CHOICE_WORDS, "packed row choices")?;
+        if choices.variable_count != self.metadata.variable_count || choices.words.len() != expected
+        {
+            return Err(ResidentRoundError::MalformedChoiceBuffer);
+        }
+        Ok(choices.words.input_arg())
     }
 }
 
@@ -531,6 +591,10 @@ impl<R: Runtime> ResidentRowPlanner<R> {
 /// Each row is `[variable, proposer_arm, exact_count]`; dead rows use
 /// [`DEAD_ROW_SENTINEL`] in the first two words and zero in the third.
 pub struct ResidentRowChoices<R: Runtime> {
+    #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
+    owner: Arc<()>,
+    #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
+    frontier_lineage: Option<Arc<()>>,
     words: DeviceU32Buffer<R>,
     rows: usize,
     variable_count: usize,
@@ -548,9 +612,12 @@ impl<R: Runtime> ResidentRowChoices<R> {
         self.rows == 0
     }
 
-    /// Device-resident packed words for a later resident round stage.
-    pub fn device_words(&self) -> &DeviceU32Buffer<R> {
-        &self.words
+    /// Whether these choices descend from this exact resident frontier.
+    #[allow(dead_code)] // Consumed by the immediately following resident proposal slice.
+    pub(crate) fn has_frontier_lineage(&self, lineage: &Arc<()>) -> bool {
+        self.frontier_lineage
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, lineage))
     }
 
     /// Test/public boundary synchronization: performs exactly one packed
@@ -636,9 +703,15 @@ pub(crate) fn checked_device_product(
 mod tests {
     use super::{
         checked_device_product, decode_choices, validate_rows, ResidentRoundError,
-        ResidentRowChoice, CHOICE_WORDS, DEAD_ROW_SENTINEL,
+        ResidentRowChoice, ResidentRowPlanner, CHOICE_WORDS, DEAD_ROW_SENTINEL,
     };
-    use triblespace_core::blob::encodings::succinctarchive::query_program::ProgramVariable;
+    use crate::succinct_query::WgpuContext;
+    use std::sync::Arc;
+    use triblespace_core::blob::encodings::succinctarchive::query_program::{
+        ProgramVariable, QueryPattern, QueryProgram,
+    };
+    use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+    use triblespace_core::trible::TribleSet;
 
     #[test]
     fn device_geometries_exclude_the_reserved_u32_sentinel() {
@@ -696,6 +769,39 @@ mod tests {
                 proposal_count: 7,
             }]
         );
+    }
+
+    #[test]
+    fn private_choice_seam_rejects_tampered_shape_and_metadata_identity() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let v2 = ProgramVariable::new(2);
+        let program = QueryProgram::compile(&archive, 3, [QueryPattern::new(v0, v1, v2)]).unwrap();
+        let planner =
+            ResidentRowPlanner::with_context(&program, &[], WgpuContext::on_wgpu()).unwrap();
+        let inputs = planner.upload_inputs(&[true], &[0, 0, 0]).unwrap();
+
+        let mut wrong_rows = planner.enqueue(&inputs).unwrap();
+        wrong_rows.rows += 1;
+        assert!(matches!(
+            planner.choice_input_arg(&wrong_rows),
+            Err(ResidentRoundError::MalformedChoiceBuffer)
+        ));
+
+        let mut wrong_variable_count = planner.enqueue(&inputs).unwrap();
+        wrong_variable_count.variable_count += 1;
+        assert!(matches!(
+            planner.choice_input_arg(&wrong_variable_count),
+            Err(ResidentRoundError::MalformedChoiceBuffer)
+        ));
+
+        let mut relabelled_targets = planner.enqueue(&inputs).unwrap();
+        relabelled_targets.arm_targets = Arc::from(relabelled_targets.arm_targets.to_vec());
+        assert!(matches!(
+            planner.choice_input_arg(&relabelled_targets),
+            Err(ResidentRoundError::ChoiceOwnership)
+        ));
     }
 }
 

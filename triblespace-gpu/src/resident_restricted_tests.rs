@@ -630,6 +630,7 @@ fn invalid_last_aliases_fail_closed_in_the_complete_restricted_pipeline() {
     let frontier = WgpuResidentFrontier {
         archive: &resident,
         owner: round.frontier_owner.clone(),
+        lineage: Arc::new(()),
         values: resident
             .context()
             .upload_u32(&[

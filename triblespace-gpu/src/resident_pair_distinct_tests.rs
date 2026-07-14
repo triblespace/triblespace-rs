@@ -418,6 +418,7 @@ fn opaque_frontiers_reject_wrong_schema_archive_and_shape() {
     let wrong_schema = WgpuResidentFrontier {
         archive: &first,
         owner: first_round.frontier_owner.clone(),
+        lineage: Arc::new(()),
         values: first
             .context()
             .upload_u32(&[code(&first_program, ids.attributes[0])])
@@ -434,6 +435,7 @@ fn opaque_frontiers_reject_wrong_schema_archive_and_shape() {
     let malformed_shape = WgpuResidentFrontier {
         archive: &first,
         owner: first_round.frontier_owner.clone(),
+        lineage: Arc::new(()),
         values: first.context().upload_u32(&[]).unwrap(),
         variables: vec![v(0)].into_boxed_slice(),
         rows: 1,
@@ -460,6 +462,7 @@ fn malformed_device_codes_poison_estimates_but_valid_zero_stays_viable() {
     let frontier = WgpuResidentFrontier {
         archive: &resident,
         owner: round.frontier_owner.clone(),
+        lineage: Arc::new(()),
         values: resident
             .context()
             .upload_u32(&[highest, domain, u32::MAX - 1, u32::MAX])

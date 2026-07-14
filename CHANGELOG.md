@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident row choices now preserve exact planner and frontier lineage.**
+  Packed choices retain the private planner capability plus a unique lineage
+  propagated from the precise affine frontier through its estimate inputs.
+  Downstream resident kernels can obtain a choice input only through a
+  crate-private seam which first validates the archive/context, round owner,
+  canonical schema and geometry, exact frontier allocation, and planner
+  identity. The former public raw device-buffer accessor is removed; low-level
+  planner choices remain readable but fail closed when presented as
+  archive-bound proposal inputs.
 - **Resident affine rounds now produce exact two-peer restricted estimates
   entirely on WGPU.** Private five-word descriptors resolve Constant/Column
   sources for both bound peers, poison both prefix queries and both wavelet
