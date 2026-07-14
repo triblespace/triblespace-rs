@@ -25,6 +25,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -117,6 +119,204 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for EstimateOverride<C> {
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.inner.influence(variable)
     }
+}
+
+/// Leaf-level query-protocol instrumentation. Wrapping the pattern backend
+/// rather than the root intersection makes DAG and residual counts directly
+/// comparable: both totals describe the same estimate/propose/confirm calls
+/// into storage leaves (plus explicitly wrapped synthetic leaves).
+#[derive(Default)]
+struct ProtocolCounts {
+    estimate_calls: AtomicU64,
+    estimate_rows: AtomicU64,
+    propose_calls: AtomicU64,
+    propose_rows: AtomicU64,
+    confirm_calls: AtomicU64,
+    confirm_rows: AtomicU64,
+    satisfied_calls: AtomicU64,
+    satisfied_rows: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProtocolSnapshot {
+    estimate_calls: u64,
+    estimate_rows: u64,
+    propose_calls: u64,
+    propose_rows: u64,
+    confirm_calls: u64,
+    confirm_rows: u64,
+    satisfied_calls: u64,
+    satisfied_rows: u64,
+}
+
+impl ProtocolSnapshot {
+    fn action_calls(self) -> u64 {
+        self.propose_calls + self.confirm_calls
+    }
+}
+
+impl ProtocolCounts {
+    fn snapshot(&self) -> ProtocolSnapshot {
+        ProtocolSnapshot {
+            estimate_calls: self.estimate_calls.load(AtomicOrdering::Relaxed),
+            estimate_rows: self.estimate_rows.load(AtomicOrdering::Relaxed),
+            propose_calls: self.propose_calls.load(AtomicOrdering::Relaxed),
+            propose_rows: self.propose_rows.load(AtomicOrdering::Relaxed),
+            confirm_calls: self.confirm_calls.load(AtomicOrdering::Relaxed),
+            confirm_rows: self.confirm_rows.load(AtomicOrdering::Relaxed),
+            satisfied_calls: self.satisfied_calls.load(AtomicOrdering::Relaxed),
+            satisfied_rows: self.satisfied_rows.load(AtomicOrdering::Relaxed),
+        }
+    }
+}
+
+struct CountedConstraint<C> {
+    inner: C,
+    counts: Arc<ProtocolCounts>,
+}
+
+impl<C> CountedConstraint<C> {
+    fn new(inner: C, counts: Arc<ProtocolCounts>) -> Self {
+        Self { inner, counts }
+    }
+}
+
+impl<'a, C: Constraint<'a>> Constraint<'a> for CountedConstraint<C> {
+    fn variables(&self) -> VariableSet {
+        self.inner.variables()
+    }
+
+    fn estimate(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        out: &mut EstimateSink<'_>,
+    ) -> bool {
+        self.counts
+            .estimate_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.counts
+            .estimate_rows
+            .fetch_add(view.len() as u64, AtomicOrdering::Relaxed);
+        self.inner.estimate(variable, view, out)
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.counts
+            .propose_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.counts
+            .propose_rows
+            .fetch_add(view.len() as u64, AtomicOrdering::Relaxed);
+        self.inner.propose(variable, view, candidates);
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        view: &RowsView<'_>,
+        candidates: &mut CandidateSink<'_>,
+    ) {
+        self.counts
+            .confirm_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.counts
+            .confirm_rows
+            .fetch_add(view.len() as u64, AtomicOrdering::Relaxed);
+        self.inner.confirm(variable, view, candidates);
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        self.counts
+            .satisfied_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.counts
+            .satisfied_rows
+            .fetch_add(view.len() as u64, AtomicOrdering::Relaxed);
+        self.inner.satisfied(view)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.inner.influence(variable)
+    }
+}
+
+struct CountingPattern<'a, S> {
+    inner: &'a S,
+    counts: Arc<ProtocolCounts>,
+}
+
+impl<'a, S> CountingPattern<'a, S> {
+    fn new(inner: &'a S, counts: Arc<ProtocolCounts>) -> Self {
+        Self { inner, counts }
+    }
+}
+
+impl<S: TriblePattern> TriblePattern for CountingPattern<'_, S> {
+    type PatternConstraint<'a>
+        = CountedConstraint<S::PatternConstraint<'a>>
+    where
+        Self: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<inlineencodings::GenId>>,
+        a: impl Into<Term<inlineencodings::GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        CountedConstraint::new(self.inner.pattern(e, a, v), Arc::clone(&self.counts))
+    }
+}
+
+fn print_protocol_comparison(
+    label: &str,
+    dag_geo: ProtocolSnapshot,
+    residual_geo: ProtocolSnapshot,
+    dag_saturated: ProtocolSnapshot,
+    residual_saturated: ProtocolSnapshot,
+) {
+    fn row(name: &str, snapshot: ProtocolSnapshot) {
+        println!(
+            "    {name:<8} estimate {}/{}r; propose {}/{}r; confirm {}/{}r; satisfied {}/{}r; p+c {}",
+            snapshot.estimate_calls,
+            snapshot.estimate_rows,
+            snapshot.propose_calls,
+            snapshot.propose_rows,
+            snapshot.confirm_calls,
+            snapshot.confirm_rows,
+            snapshot.satisfied_calls,
+            snapshot.satisfied_rows,
+            snapshot.action_calls(),
+        );
+    }
+
+    println!("  {label} leaf-protocol calls:");
+    row("dag-geo", dag_geo);
+    row("res-geo", residual_geo);
+    row("dag-sat", dag_saturated);
+    row("res-sat", residual_saturated);
+    println!(
+        "  {label} p+c nonincrease gate: geometric {} ({} <= {}), saturated {} ({} <= {})",
+        if residual_geo.action_calls() <= dag_geo.action_calls() {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        residual_geo.action_calls(),
+        dag_geo.action_calls(),
+        if residual_saturated.action_calls() <= dag_saturated.action_calls() {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        residual_saturated.action_calls(),
+        dag_saturated.action_calls(),
+    );
 }
 
 /// Keeps exactly the first fanout value for each bound parent while reporting
@@ -478,6 +678,31 @@ macro_rules! measure_query {
     }};
 }
 
+macro_rules! collect_protocol_engine {
+    ($query:expr, dag_geo) => {
+        ($query).solve_dag_lazy().collect::<Vec<_>>()
+    };
+    ($query:expr, residual_geo) => {
+        ($query).solve_residual_state_lazy().collect::<Vec<_>>()
+    };
+    ($query:expr, dag_saturated) => {
+        ($query)
+            .solve_dag_lazy()
+            .cap(SATURATED_WIDTH)
+            .start_width(SATURATED_WIDTH)
+            .growth(1)
+            .collect::<Vec<_>>()
+    };
+    ($query:expr, residual_saturated) => {
+        ($query)
+            .solve_residual_state_lazy()
+            .cap(SATURATED_WIDTH)
+            .start_width(SATURATED_WIDTH)
+            .growth(1)
+            .collect::<Vec<_>>()
+    };
+}
+
 fn deterministic_id(namespace: u32, counter: u64) -> ExclusiveId {
     let mut raw = [0u8; 16];
     raw[..4].copy_from_slice(&namespace.to_be_bytes());
@@ -703,6 +928,57 @@ fn bench_ragged<S: TriblePattern>(
         "  ragged fixture truth: {candidate_pairs} storage-proposed (parent,value) pairs -> 100 live rows; parent occupancy alone hides {:.2} candidates/parent",
         candidate_pairs as f64 / 100.0,
     );
+
+    macro_rules! counted_run {
+        ($mode:ident) => {{
+            let counts = Arc::new(ProtocolCounts::default());
+            let counted = CountingPattern::new(kb, Arc::clone(&counts));
+            let bag = collect_protocol_engine!(
+                find!(
+                    (
+                        p: Inline<inlineencodings::GenId>,
+                        x: Inline<inlineencodings::GenId>
+                    ),
+                    and!(
+                        pattern!(&counted, [{ root @ world::p1: ?p }]),
+                        pattern!(&counted, [{ ?p @ world::p2: ?x }]),
+                        CountedConstraint::new(
+                            FirstPerParent::new(p.index, x.index, first.to_vec()),
+                            Arc::clone(&counts),
+                        ),
+                    )
+                ),
+                $mode
+            );
+            (bag, counts.snapshot())
+        }};
+    }
+
+    let (mut dag_geo_bag, dag_geo) = counted_run!(dag_geo);
+    let (mut residual_geo_bag, residual_geo) = counted_run!(residual_geo);
+    let (mut dag_saturated_bag, dag_saturated) = counted_run!(dag_saturated);
+    let (mut residual_saturated_bag, residual_saturated) = counted_run!(residual_saturated);
+    for bag in [
+        &mut dag_geo_bag,
+        &mut residual_geo_bag,
+        &mut dag_saturated_bag,
+        &mut residual_saturated_bag,
+    ] {
+        bag.sort_unstable();
+    }
+    assert_eq!(residual_geo_bag, dag_geo_bag, "ragged counted geo bag");
+    assert_eq!(dag_saturated_bag, dag_geo_bag, "ragged counted DAG bag");
+    assert_eq!(
+        residual_saturated_bag, dag_geo_bag,
+        "ragged counted saturated bag"
+    );
+    print_protocol_comparison(
+        &format!("ragged {label}"),
+        dag_geo,
+        residual_geo,
+        dag_saturated,
+        residual_saturated,
+    );
 }
 
 fn build_union() -> (TribleSet, ExclusiveId) {
@@ -868,6 +1144,63 @@ fn bench_routes<S: TriblePattern>(
         )
     );
     println!("  route fixture truth: 120 distinct order routes, {expected} result rows");
+
+    macro_rules! counted_run {
+        ($mode:ident) => {{
+            let counts = Arc::new(ProtocolCounts::default());
+            let counted = CountingPattern::new(kb, Arc::clone(&counts));
+            let bag = collect_protocol_engine!(
+                find!(
+                    (
+                        e: Inline<inlineencodings::GenId>,
+                        x1: Inline<inlineencodings::GenId>,
+                        x2: Inline<inlineencodings::GenId>,
+                        x3: Inline<inlineencodings::GenId>,
+                        x4: Inline<inlineencodings::GenId>,
+                        x5: Inline<inlineencodings::GenId>,
+                        z: Inline<inlineencodings::GenId>
+                    ),
+                    pattern!(&counted, [
+                        { ?e @ world::p1: ?x1, world::p2: ?x2, world::p3: ?x3, world::p4: ?x4, world::p5: ?x5, world::z: ?z },
+                        { ?x1 @ world::t1: k1 },
+                        { ?x2 @ world::t2: k2 },
+                        { ?x3 @ world::t3: k3 },
+                        { ?x4 @ world::t4: k4 },
+                        { ?x5 @ world::t5: k5 },
+                        { ?z @ world::tz: kz },
+                    ])
+                ),
+                $mode
+            );
+            (bag, counts.snapshot())
+        }};
+    }
+
+    let (mut dag_geo_bag, dag_geo) = counted_run!(dag_geo);
+    let (mut residual_geo_bag, residual_geo) = counted_run!(residual_geo);
+    let (mut dag_saturated_bag, dag_saturated) = counted_run!(dag_saturated);
+    let (mut residual_saturated_bag, residual_saturated) = counted_run!(residual_saturated);
+    for bag in [
+        &mut dag_geo_bag,
+        &mut residual_geo_bag,
+        &mut dag_saturated_bag,
+        &mut residual_saturated_bag,
+    ] {
+        bag.sort_unstable();
+    }
+    assert_eq!(residual_geo_bag, dag_geo_bag, "route counted geo bag");
+    assert_eq!(dag_saturated_bag, dag_geo_bag, "route counted DAG bag");
+    assert_eq!(
+        residual_saturated_bag, dag_geo_bag,
+        "route counted saturated bag"
+    );
+    print_protocol_comparison(
+        &format!("route {label}"),
+        dag_geo,
+        residual_geo,
+        dag_saturated,
+        residual_saturated,
+    );
 }
 
 fn build_rpq(
