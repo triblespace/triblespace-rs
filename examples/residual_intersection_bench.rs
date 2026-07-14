@@ -119,6 +119,7 @@ enum Mode {
     Sequential,
     Dag,
     Residual,
+    ResidualLazy,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
@@ -130,6 +131,7 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
         Mode::Sequential => tally(query.sequential()),
         Mode::Dag => tally(query.solve_dag()),
         Mode::Residual => tally(query.solve_residual_state()),
+        Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
     }
 }
 
@@ -140,6 +142,37 @@ fn run_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualSta
     )
     .solve_residual_state_profiled();
     (tally(solve.results), solve.stats)
+}
+
+fn run_lazy_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualStateStats) {
+    let solve = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    )
+    .solve_residual_state_lazy()
+    .collect_profiled();
+    (tally(solve.results), solve.stats)
+}
+
+#[derive(Clone, Copy)]
+enum FirstMode {
+    Sequential,
+    DagLazy,
+    ResidualEager,
+    ResidualLazy,
+}
+
+fn run_first<S: TriblePattern>(kb: &S, mode: FirstMode) -> (usize, u64) {
+    let query = find!(
+        (p: Inline<_>, x: Inline<_>),
+        pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
+    );
+    match mode {
+        FirstMode::Sequential => tally(query.sequential().take(1)),
+        FirstMode::DagLazy => tally(query.solve_dag_lazy().take(1)),
+        FirstMode::ResidualEager => tally(query.solve_residual_state().into_iter().take(1)),
+        FirstMode::ResidualLazy => tally(query.solve_residual_state_lazy().take(1)),
+    }
 }
 
 fn median(samples: &[f64]) -> f64 {
@@ -153,11 +186,47 @@ fn median(samples: &[f64]) -> f64 {
     }
 }
 
+fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
+    let modes = [
+        ("seq", FirstMode::Sequential),
+        ("dag-lazy", FirstMode::DagLazy),
+        ("res-eager", FirstMode::ResidualEager),
+        ("res-lazy", FirstMode::ResidualLazy),
+    ];
+    for &(_, mode) in &modes {
+        std::hint::black_box(run_first(kb, mode));
+    }
+
+    let mut samples = vec![Vec::with_capacity(reps); modes.len()];
+    let mut signatures = vec![(0, 0); modes.len()];
+    for repetition in 0..reps {
+        for offset in 0..modes.len() {
+            let mode_index = (repetition + offset) % modes.len();
+            let start = Instant::now();
+            signatures[mode_index] = run_first(kb, modes[mode_index].1);
+            samples[mode_index].push(start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+
+    println!("  first result ({label}):");
+    for (mode_index, &(name, _)) in modes.iter().enumerate() {
+        // Search order is intentionally scheduler-dependent, so only the
+        // existence of one prefix row is shared here. Full-drain signatures
+        // below remain the exact semantic parity gate.
+        assert_eq!(
+            signatures[mode_index].0, 1,
+            "{label} {name} must produce one first result"
+        );
+        println!("    {name:<11} {:>9.3} ms", median(&samples[mode_index]));
+    }
+}
+
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
     let modes = [
         ("seq", Mode::Sequential),
         ("dag", Mode::Dag),
         ("residual", Mode::Residual),
+        ("res-lazy", Mode::ResidualLazy),
     ];
 
     // Untimed full drains pay any one-time setup before the measurements.
@@ -166,6 +235,8 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
     }
 
     println!("\n== {label} ==");
+    bench_first_result(label, kb, reps);
+    println!("  full drain:");
     let mut samples = vec![Vec::with_capacity(reps); modes.len()];
     let mut signatures = vec![(0, 0); modes.len()];
     for repetition in 0..reps {
@@ -217,6 +288,33 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
         stats.confirm_calls,
         stats.confirm_rows,
         stats.max_confirm_rows,
+    );
+
+    let (lazy_signature, lazy_stats) = run_lazy_residual_profiled(kb);
+    assert_eq!(
+        lazy_signature, reference,
+        "profiled lazy residual result signature mismatch"
+    );
+    println!(
+        "  lazy profile: states {} + hits {}, pops {} (sprint {} / harvest {} / partial {}), \
+         live merges {} ({} rows), reentries {} ({} rows); propose {} calls/{} rows/max {}, \
+         confirm {} calls/{} rows/max {}",
+        lazy_stats.states_interned,
+        lazy_stats.interner_hits,
+        lazy_stats.state_pops,
+        lazy_stats.sprint_pops,
+        lazy_stats.harvest_pops,
+        lazy_stats.partial_pops,
+        lazy_stats.bucket_merges,
+        lazy_stats.rows_merged,
+        lazy_stats.state_reentries,
+        lazy_stats.rows_reentered,
+        lazy_stats.propose_calls,
+        lazy_stats.propose_rows,
+        lazy_stats.max_propose_rows,
+        lazy_stats.confirm_calls,
+        lazy_stats.confirm_rows,
+        lazy_stats.max_confirm_rows,
     );
 }
 

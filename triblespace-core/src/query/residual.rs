@@ -33,8 +33,22 @@ pub struct ResidualStateStats {
     pub bucket_merges: usize,
     /// Parent rows appended by those merge filings.
     pub rows_merged: usize,
-    /// Number of canonical buckets processed.
+    /// Number of canonical bucket chunks processed.
     pub state_pops: usize,
+    /// Bucket chunks processed while the geometric scheduler was below its
+    /// saturation cap and therefore diving by maximum rank.
+    pub sprint_pops: usize,
+    /// Bucket chunks processed at the saturation cap and therefore drained
+    /// through the minimum-rank readiness gate. The eager solver counts every
+    /// one of its saturated pops here.
+    pub harvest_pops: usize,
+    /// Pops that left unprocessed parent rows live under the same state.
+    pub partial_pops: usize,
+    /// Filings that reopened an interned state after its live bucket had
+    /// already been consumed.
+    pub state_reentries: usize,
+    /// Parent rows carried by [`state_reentries`](Self::state_reentries).
+    pub rows_reentered: usize,
     /// Direct-child proposal calls.
     pub propose_calls: usize,
     /// Direct-child confirmation calls.
@@ -153,17 +167,22 @@ struct StateInterner {
 }
 
 impl StateInterner {
-    fn intern(&mut self, desc: StateDesc, stats: &mut ResidualStateStats) -> StateId {
+    /// Returns the exact ID and whether the descriptor was already interned.
+    fn intern_with_status(
+        &mut self,
+        desc: StateDesc,
+        stats: &mut ResidualStateStats,
+    ) -> (StateId, bool) {
         if let Some(&id) = self.by_desc.get(&desc) {
             stats.interner_hits += 1;
-            return id;
+            return (id, true);
         }
         let raw = u32::try_from(self.descs.len()).expect("too many residual states");
         let id = StateId(raw);
         self.descs.push(desc.clone());
         self.by_desc.insert(desc, id);
         stats.states_interned += 1;
-        id
+        (id, false)
     }
 
     fn get(&self, id: StateId) -> &StateDesc {
@@ -223,6 +242,54 @@ impl CandidateBatch {
                     value,
                 )
             }));
+    }
+
+    /// Takes at most `width` complete parent atoms from the tail.
+    ///
+    /// A candidate-state atom is a parent row *and its entire ragged
+    /// candidate group*. Confirmers such as `UnionConstraint` may sort and
+    /// deduplicate within that group, so splitting the candidate vector at an
+    /// arbitrary element would change semantics. Candidate tags are grouped
+    /// by ascending parent throughout the protocol; the tail can therefore be
+    /// cut once and remapped densely.
+    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
+        let take = self.parents.row_count.min(width.max(1));
+        debug_assert!(take > 0);
+        if take == self.parents.row_count {
+            return Self {
+                parents: std::mem::replace(
+                    &mut self.parents,
+                    RowBatch {
+                        rows: Vec::new(),
+                        row_count: 0,
+                    },
+                ),
+                candidates: std::mem::take(&mut self.candidates),
+            };
+        }
+
+        let first = self.parents.row_count - take;
+        let tail_rows = self.parents.rows.split_off(first * stride);
+        self.parents.row_count = first;
+
+        let candidate_cut = self
+            .candidates
+            .partition_point(|(row, _)| (*row as usize) < first);
+        let mut candidates = self.candidates.split_off(candidate_cut);
+        let first = u32::try_from(first).expect("too many candidate parents");
+        for (row, _) in &mut candidates {
+            *row = row
+                .checked_sub(first)
+                .expect("candidate tail contained a prefix row");
+        }
+
+        Self {
+            parents: RowBatch {
+                rows: tail_rows,
+                row_count: take,
+            },
+            candidates,
+        }
     }
 
     /// Stable-partitions parents and their ragged candidate groups in one
@@ -335,6 +402,33 @@ impl StateBucket {
             _ => panic!("one canonical residual state received incompatible payloads"),
         }
     }
+
+    /// Removes a tail chunk without bisecting a candidate parent group.
+    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
+        match self {
+            StateBucket::Ready(batch) => {
+                let take = batch.row_count.min(width.max(1));
+                debug_assert!(take > 0);
+                if take == batch.row_count {
+                    return StateBucket::Ready(std::mem::replace(
+                        batch,
+                        RowBatch {
+                            rows: Vec::new(),
+                            row_count: 0,
+                        },
+                    ));
+                }
+                let first = batch.row_count - take;
+                let rows = batch.rows.split_off(first * stride);
+                batch.row_count = first;
+                StateBucket::Ready(RowBatch {
+                    rows,
+                    row_count: take,
+                })
+            }
+            StateBucket::Candidate(batch) => StateBucket::Candidate(batch.take_tail(stride, width)),
+        }
+    }
 }
 
 type Worklist = BTreeMap<usize, BTreeMap<StateId, StateBucket>>;
@@ -366,13 +460,17 @@ fn file(
         return;
     }
     let rank = desc.rank(child_count);
-    let id = interner.intern(desc, stats);
+    let (id, known) = interner.intern_with_status(desc, stats);
     let level = worklist.entry(rank).or_default();
     if let Some(existing) = level.get_mut(&id) {
         stats.bucket_merges += 1;
         stats.rows_merged += bucket.row_count();
         existing.append(bucket);
     } else {
+        if known {
+            stats.state_reentries += 1;
+            stats.rows_reentered += bucket.row_count();
+        }
         level.insert(id, bucket);
     }
 }
@@ -676,6 +774,306 @@ fn candidate_transition<'a, C: Constraint<'a> + 'a>(
     }
 }
 
+/// Resumable execution state for [`ResidualStateIter`].
+///
+/// The exact interner deliberately outlives live buckets. Sprint scheduling
+/// may process a state before all of its lower-rank feeders, after which a
+/// later filing simply reopens the same interned descriptor.
+struct ResidualStateMachine {
+    full: VariableSet,
+    child_count: usize,
+    interner: StateInterner,
+    worklist: Worklist,
+    stats: ResidualStateStats,
+    binding: Binding,
+    emit_vars: Vec<VariableId>,
+    emit_rows: Vec<RawInline>,
+    emit_next: usize,
+    emit_count: usize,
+    width: usize,
+    growth: usize,
+    cap: usize,
+}
+
+impl ResidualStateMachine {
+    fn new(full: VariableSet, child_count: usize, mode: Search) -> Self {
+        let cap = block_row_cap();
+        let mut state = Self {
+            full,
+            child_count,
+            interner: StateInterner::default(),
+            worklist: Worklist::new(),
+            stats: ResidualStateStats::default(),
+            binding: Binding::default(),
+            emit_vars: Vec::new(),
+            emit_rows: Vec::new(),
+            emit_next: 0,
+            emit_count: 0,
+            width: lazy_start_width().clamp(1, cap),
+            growth: lazy_growth(),
+            cap,
+        };
+        if matches!(mode, Search::NextVariable) {
+            file(
+                &mut state.worklist,
+                &mut state.interner,
+                child_count,
+                StateDesc {
+                    bound: VariableSet::new_empty(),
+                    phase: ResidualPhase::Ready,
+                },
+                StateBucket::Ready(RowBatch::seed()),
+                &mut state.stats,
+            );
+        }
+        state
+    }
+
+    /// Removes one width-bounded chunk from the next state.
+    ///
+    /// Below the cap, maximum rank gives the depth-first sprint: every child
+    /// outranks its parent's live remainder. At the cap, minimum rank is the
+    /// readiness gate: strict rank growth means no drained state can receive a
+    /// future filing. Partial remainders are reinserted directly and are not
+    /// counted as canonical merges or reentries.
+    fn take_next(&mut self, width: usize) -> Option<(StateDesc, StateBucket)> {
+        let sprint = width < self.cap;
+        let rank = if sprint {
+            *self.worklist.last_key_value()?.0
+        } else {
+            *self.worklist.first_key_value()?.0
+        };
+
+        let (id, mut bucket, remove_level) = {
+            let level = self
+                .worklist
+                .get_mut(&rank)
+                .expect("selected residual rank exists");
+            let id = if sprint {
+                *level
+                    .last_key_value()
+                    .expect("residual rank has a live state")
+                    .0
+            } else {
+                *level
+                    .first_key_value()
+                    .expect("residual rank has a live state")
+                    .0
+            };
+            let bucket = level.remove(&id).expect("selected residual state exists");
+            (id, bucket, level.is_empty())
+        };
+        if remove_level {
+            self.worklist.remove(&rank);
+        }
+
+        let desc = self.interner.get(id).clone();
+        debug_assert_eq!(desc.rank(self.child_count), rank);
+        let before = bucket.row_count();
+        let chunk = bucket.take_tail(desc.bound.count(), width);
+        if bucket.row_count() != 0 {
+            self.stats.partial_pops += 1;
+            assert!(
+                self.worklist
+                    .entry(rank)
+                    .or_default()
+                    .insert(id, bucket)
+                    .is_none(),
+                "a residual-state remainder collided with another live bucket"
+            );
+        }
+        debug_assert_eq!(chunk.row_count(), before.min(width.max(1)));
+
+        self.stats.state_pops += 1;
+        if sprint {
+            self.stats.sprint_pops += 1;
+        } else {
+            self.stats.harvest_pops += 1;
+        }
+        Some((desc, chunk))
+    }
+
+    fn pop_once<'a, C: Constraint<'a> + 'a>(
+        &mut self,
+        root: &IntersectionConstraint<C>,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+        width: usize,
+    ) {
+        let (desc, bucket) = self
+            .take_next(width)
+            .expect("pop_once requires a non-empty residual worklist");
+        match (&desc.phase, bucket) {
+            (ResidualPhase::Ready, StateBucket::Ready(rows)) if desc.bound == self.full => {
+                debug_assert!(self.emit_next >= self.emit_count);
+                self.emit_vars.clear();
+                self.emit_vars.extend(desc.bound);
+                self.emit_rows = rows.rows;
+                self.emit_next = 0;
+                self.emit_count = rows.row_count;
+            }
+            (ResidualPhase::Ready, StateBucket::Ready(rows)) => ready_transition(
+                root,
+                &desc,
+                rows,
+                self.full,
+                influences,
+                base_estimates,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            ),
+            (
+                ResidualPhase::Candidate {
+                    variable,
+                    relevant,
+                    checked,
+                },
+                StateBucket::Candidate(batch),
+            ) => candidate_transition(
+                root,
+                &desc,
+                *variable,
+                relevant,
+                checked,
+                batch,
+                &mut self.worklist,
+                &mut self.interner,
+                &mut self.stats,
+            ),
+            _ => panic!("canonical residual state received the wrong bucket shape"),
+        }
+    }
+
+    fn pull<'a, C, P, R>(
+        &mut self,
+        root: &IntersectionConstraint<C>,
+        postprocessing: &P,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<R>
+    where
+        C: Constraint<'a> + 'a,
+        P: Fn(&Binding) -> Option<R>,
+    {
+        loop {
+            while self.emit_next < self.emit_count {
+                let row = self.emit_next;
+                // Consume before invoking user code. If it panics and the
+                // unwind is caught, a later pull must not repeat its effects.
+                self.emit_next += 1;
+                let stride = self.emit_vars.len();
+                let start = row * stride;
+                for (column, &variable) in self.emit_vars.iter().enumerate() {
+                    self.binding.set(variable, &self.emit_rows[start + column]);
+                }
+                if let Some(result) = postprocessing(&self.binding) {
+                    return Some(result);
+                }
+            }
+            if self.worklist.is_empty() {
+                return None;
+            }
+
+            let width = self.width;
+            while self.emit_next >= self.emit_count && !self.worklist.is_empty() {
+                self.pop_once(root, influences, base_estimates, width);
+            }
+            self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
+        }
+    }
+}
+
+/// Demand-driven canonical residual-state execution for a root intersection.
+///
+/// The iterator begins with narrow maximum-rank sprint chunks, so a descendant
+/// can produce a result before sibling rows are evaluated. With a growth
+/// factor above one, each engine resumption widens the chunk geometrically.
+/// Once the configured cap is reached, minimum-rank scheduling restores the
+/// eager solver's readiness gate and holds later states until all possible
+/// lower-rank feeders have drained. A growth factor of one deliberately stays
+/// in sprint mode unless its starting width is already at the cap.
+///
+/// Dropping the iterator discards its remaining affine frontier. Fully drained,
+/// it produces the same result multiset as [`Query::solve_residual_state`].
+#[must_use]
+pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
+    root: Arc<IntersectionConstraint<C>>,
+    postprocessing: P,
+    influences: [VariableSet; 128],
+    base_estimates: [usize; 128],
+    state: ResidualStateMachine,
+}
+
+impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
+    /// Overrides the initial chunk width, clamped to `1..=cap`.
+    pub fn start_width(mut self, width: usize) -> Self {
+        self.state.width = width.clamp(1, self.state.cap);
+        self
+    }
+
+    /// Overrides the geometric growth factor (`1` keeps a fixed width).
+    pub fn growth(mut self, growth: usize) -> Self {
+        self.state.growth = growth.max(1);
+        self
+    }
+
+    /// Overrides the saturation cap. At the cap the scheduler switches from
+    /// maximum-rank sprinting to minimum-rank harvest readiness.
+    ///
+    /// Like [`DagIter::cap`](super::DagIter::cap), this never raises the
+    /// current width. To start above the default cap, set the new cap first:
+    /// `.cap(new_cap).start_width(new_cap)`.
+    pub fn cap(mut self, cap: usize) -> Self {
+        self.state.cap = cap.max(1);
+        self.state.width = self.state.width.min(self.state.cap);
+        self
+    }
+
+    /// Width the next engine resumption will use.
+    pub fn current_width(&self) -> usize {
+        self.state.width
+    }
+
+    /// Measurements accumulated by pulls performed so far.
+    pub fn stats(&self) -> &ResidualStateStats {
+        &self.state.stats
+    }
+}
+
+impl<'a, C, P, R> ResidualStateIter<C, P, R>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    /// Fully drains the iterator and returns its results and final profile.
+    pub fn collect_profiled(mut self) -> ResidualStateSolve<R> {
+        let mut results = Vec::new();
+        results.extend(self.by_ref());
+        ResidualStateSolve {
+            results,
+            stats: self.state.stats,
+        }
+    }
+}
+
+impl<'a, C, P, R> Iterator for ResidualStateIter<C, P, R>
+where
+    C: Constraint<'a> + 'a,
+    P: Fn(&Binding) -> Option<R>,
+{
+    type Item = R;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.state.pull(
+            self.root.as_ref(),
+            &self.postprocessing,
+            &self.influences,
+            &self.base_estimates,
+        )
+    }
+}
+
 fn solve<'a, C, P, R>(
     root: &IntersectionConstraint<C>,
     postprocessing: P,
@@ -716,6 +1114,7 @@ where
             let desc = interner.get(id).clone();
             debug_assert_eq!(desc.rank(child_count), rank);
             stats.state_pops += 1;
+            stats.harvest_pops += 1;
             match (&desc.phase, bucket) {
                 (ResidualPhase::Ready, StateBucket::Ready(rows)) if desc.bound == full => {
                     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
@@ -783,6 +1182,37 @@ where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    /// Lazily executes a root intersection through canonical residual states.
+    ///
+    /// The first pull uses a one-parent sprint by default. Continued pulling
+    /// geometrically widens batches and eventually restores minimum-rank
+    /// harvest readiness. Result order may differ from the ordinary iterator;
+    /// a full drain preserves its result multiset.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started on this query.
+    pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
+        assert_fresh(&self);
+        let Query {
+            constraint,
+            postprocessing,
+            influences,
+            base_estimates,
+            mode,
+            ..
+        } = self;
+        let full = constraint.variables();
+        let child_count = constraint.children().len();
+        ResidualStateIter {
+            root: constraint,
+            postprocessing,
+            influences,
+            base_estimates,
+            state: ResidualStateMachine::new(full, child_count, mode),
+        }
+    }
+
     /// Eagerly solves a root intersection through canonical residual states.
     ///
     /// This experimental path jointly chooses the next variable and direct
@@ -838,6 +1268,33 @@ where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    /// Lazily executes a direct root intersection through canonical residual
+    /// states with geometric sprint-to-harvest scheduling.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started on this query.
+    pub fn solve_residual_state_lazy(self) -> ResidualStateIter<C, P, R> {
+        assert_fresh(&self);
+        let Query {
+            constraint,
+            postprocessing,
+            influences,
+            base_estimates,
+            mode,
+            ..
+        } = self;
+        let full = constraint.variables();
+        let child_count = constraint.children().len();
+        ResidualStateIter {
+            root: Arc::new(constraint),
+            postprocessing,
+            influences,
+            base_estimates,
+            state: ResidualStateMachine::new(full, child_count, mode),
+        }
+    }
+
     /// Eagerly solves a direct root intersection through canonical residual
     /// states, preserving the ordinary solver's result multiset while
     /// allowing result order to differ.
@@ -882,6 +1339,40 @@ where
 mod tests {
     use super::*;
 
+    fn raw(byte: u8) -> RawInline {
+        let mut value = [0; 32];
+        value[0] = byte;
+        value
+    }
+
+    #[test]
+    fn candidate_tail_chunks_keep_parent_groups_whole_and_remap_tags() {
+        let mut original_candidates = vec![(0, raw(10)), (0, raw(10)), (1, raw(11))];
+        original_candidates.extend((12..44).map(|byte| (2, raw(byte))));
+        let mut prefix = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(0), raw(1), raw(2)],
+                row_count: 3,
+            },
+            candidates: original_candidates.clone(),
+        };
+
+        let tail = prefix.take_tail(1, 2);
+        assert_eq!(prefix.parents.rows, [raw(0)]);
+        assert_eq!(prefix.parents.row_count, 1);
+        assert_eq!(prefix.candidates, [(0, raw(10)), (0, raw(10))]);
+        assert_eq!(tail.parents.rows, [raw(1), raw(2)]);
+        assert_eq!(tail.parents.row_count, 2);
+        let mut expected_tail = vec![(0, raw(11))];
+        expected_tail.extend((12..44).map(|byte| (1, raw(byte))));
+        assert_eq!(tail.candidates, expected_tail);
+
+        prefix.append(tail);
+        assert_eq!(prefix.parents.rows, [raw(0), raw(1), raw(2)]);
+        assert_eq!(prefix.parents.row_count, 3);
+        assert_eq!(prefix.candidates, original_candidates);
+    }
+
     #[test]
     fn child_sets_do_not_alias_across_the_u128_boundary() {
         let mut set = ChildSet::empty(129);
@@ -917,8 +1408,12 @@ mod tests {
         };
         let mut stats = ResidualStateStats::default();
         let mut interner = StateInterner::default();
-        let left = interner.intern(desc(left_checked), &mut stats);
-        let right = interner.intern(desc(right_checked), &mut stats);
+        let left = interner
+            .intern_with_status(desc(left_checked), &mut stats)
+            .0;
+        let right = interner
+            .intern_with_status(desc(right_checked), &mut stats)
+            .0;
         assert_eq!(left, right);
         assert_eq!(stats.states_interned, 1);
         assert_eq!(stats.interner_hits, 1);
@@ -984,9 +1479,9 @@ mod tests {
 
         let mut stats = ResidualStateStats::default();
         let mut interner = StateInterner::default();
-        let original = interner.intern(candidate, &mut stats);
+        let original = interner.intern_with_status(candidate, &mut stats).0;
         for variant in variants {
-            assert_ne!(original, interner.intern(variant, &mut stats));
+            assert_ne!(original, interner.intern_with_status(variant, &mut stats).0);
         }
         assert_eq!(stats.states_interned, 6);
         assert_eq!(stats.interner_hits, 0);

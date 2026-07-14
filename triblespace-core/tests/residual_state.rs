@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 use triblespace_core::inline::RawInline;
@@ -560,6 +561,210 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
     assert_eq!(residual.stats.rows_merged, N / 2);
     assert!(residual.stats.interner_hits >= 1);
     assert_eq!(residual.stats.max_confirm_rows, N);
+    assert_eq!(residual.stats.sprint_pops, 0);
+    assert_eq!(residual.stats.harvest_pops, residual.stats.state_pops);
+    assert_eq!(
+        residual.stats.interner_hits,
+        residual.stats.bucket_merges + residual.stats.state_reentries
+    );
+}
+
+#[test]
+fn lazy_width_one_reaches_a_result_before_draining_sibling_parents() {
+    const N: usize = 12;
+    let (root, trace) = fixture(N);
+    let mut lazy = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(2);
+
+    assert_eq!(lazy.current_width(), 1);
+    let first = lazy.next().expect("fixture has a first result");
+    assert_eq!(decode(&first.0, P_MARKER), decode(&first.1, X_MARKER));
+    assert_eq!(
+        lazy.current_width(),
+        2,
+        "the first resumption must prepare a geometrically wider next chunk"
+    );
+    assert_eq!(lazy.stats().harvest_pops, 0);
+    assert!(lazy.stats().sprint_pops > 0);
+    assert!(lazy.stats().partial_pops > 0);
+    assert_eq!(lazy.stats().max_propose_rows, 1);
+    assert_eq!(lazy.stats().max_confirm_rows, 1);
+
+    let trace = trace.lock().unwrap();
+    let x_calls: Vec<_> = trace
+        .calls
+        .iter()
+        .filter(|call| call.variable == X)
+        .collect();
+    assert!(!x_calls.is_empty());
+    assert!(
+        x_calls.iter().all(|call| call.rows == 1),
+        "the first result must not evaluate x for sibling parent rows: {x_calls:?}"
+    );
+    drop(trace);
+
+    // Dropping here must discard the unconsumed affine frontier without
+    // evaluating the remaining parents.
+    drop(lazy);
+}
+
+#[test]
+fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
+    const N: usize = 12;
+    let (root, _) = fixture(N);
+    let mut lazy = Query::new(Arc::new(root), project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect_profiled();
+
+    let (eager_root, _) = fixture(N);
+    let mut eager = Query::new(eager_root, project_pair).solve_residual_state();
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    lazy.results.sort_unstable();
+    eager.sort_unstable();
+    sequential.sort_unstable();
+
+    assert_eq!(lazy.results, eager);
+    assert_eq!(lazy.results, sequential);
+    assert_eq!(lazy.stats.harvest_pops, 0);
+    assert!(lazy.stats.sprint_pops > 0);
+    assert!(lazy.stats.state_reentries > 0);
+    assert!(lazy.stats.rows_reentered > 0);
+    assert_eq!(
+        lazy.stats.state_pops,
+        lazy.stats.sprint_pops + lazy.stats.harvest_pops
+    );
+    assert_eq!(
+        lazy.stats.interner_hits,
+        lazy.stats.bucket_merges + lazy.stats.state_reentries
+    );
+}
+
+#[test]
+fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
+    const N: usize = 12;
+    let (root, _) = fixture(N);
+    let mut crossed = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(4)
+        .start_width(1)
+        .growth(2)
+        .collect_profiled();
+
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    crossed.results.sort_unstable();
+    sequential.sort_unstable();
+
+    assert_eq!(crossed.results, sequential);
+    assert!(crossed.stats.sprint_pops > 0);
+    assert!(crossed.stats.harvest_pops > 0);
+    assert_eq!(
+        crossed.stats.state_pops,
+        crossed.stats.sprint_pops + crossed.stats.harvest_pops
+    );
+    assert_eq!(
+        crossed.stats.interner_hits,
+        crossed.stats.bucket_merges + crossed.stats.state_reentries
+    );
+}
+
+#[test]
+fn lazy_forced_harvest_reconverges_before_states_are_popped() {
+    const N: usize = 12;
+    let (root, _) = fixture(N);
+    let mut harvested = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(2)
+        .start_width(2)
+        .growth(1)
+        .collect_profiled();
+
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    harvested.results.sort_unstable();
+    sequential.sort_unstable();
+
+    assert_eq!(harvested.results, sequential);
+    assert_eq!(harvested.stats.sprint_pops, 0);
+    assert!(harvested.stats.harvest_pops > 0);
+    assert!(harvested.stats.partial_pops > 0);
+    assert_eq!(
+        harvested.stats.state_reentries, 0,
+        "minimum-rank harvest must drain every feeder before popping its target"
+    );
+    assert!(harvested.stats.bucket_merges > 0);
+    assert!(harvested.stats.rows_merged > 0);
+    assert!(harvested.stats.max_confirm_rows <= 2);
+    assert_eq!(
+        harvested.stats.state_pops,
+        harvested.stats.sprint_pops + harvested.stats.harvest_pops
+    );
+    assert_eq!(
+        harvested.stats.interner_hits,
+        harvested.stats.bucket_merges + harvested.stats.state_reentries
+    );
+}
+
+#[test]
+fn lazy_projection_panic_consumes_the_row_before_resume() {
+    const N: usize = 4;
+    let (root, _) = fixture(N);
+    let seen = RefCell::new(Vec::new());
+    let project = |binding: &Binding| {
+        let parent = *binding.get(P)?;
+        let seen_count = {
+            let mut seen = seen.borrow_mut();
+            seen.push(parent);
+            seen.len()
+        };
+        assert_ne!(seen_count, 1, "first projected row panics");
+        Some(parent)
+    };
+    let mut lazy = Query::new(root, project)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1);
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lazy.next()));
+    assert!(panic.is_err());
+    let resumed = lazy.next().expect("a later row remains after the panic");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 2);
+    assert_ne!(seen[0], seen[1], "the panicking row was projected twice");
+    assert_eq!(resumed, seen[1]);
+}
+
+#[test]
+fn lazy_cap_builder_does_not_raise_an_already_clamped_start_width() {
+    let (root, _) = fixture(1);
+    let start_then_cap = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(2)
+        .start_width(8)
+        .cap(8);
+    assert_eq!(start_then_cap.current_width(), 2);
+
+    let (root, _) = fixture(1);
+    let cap_then_start = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(2)
+        .cap(8)
+        .start_width(8);
+    assert_eq!(cap_then_start.current_width(), 8);
 }
 
 #[test]
@@ -567,13 +772,22 @@ fn reconvergence_preserves_duplicate_projection_multiplicity() {
     const N: usize = 12;
     let (root, _) = fixture(N);
     let residual = Query::new(root, project_same).solve_residual_state_profiled();
+    let (lazy_root, _) = fixture(N);
+    let lazy: Vec<_> = Query::new(lazy_root, project_same)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect();
     let (sequential_root, _) = fixture(N);
     let sequential: Vec<_> = Query::new(sequential_root, project_same)
         .sequential()
         .collect();
 
     assert_eq!(residual.results, vec![(); N]);
+    assert_eq!(lazy, vec![(); N]);
     assert_eq!(residual.results, sequential);
+    assert_eq!(lazy, sequential);
     assert_eq!(residual.stats.bucket_merges, 1);
     assert_eq!(residual.stats.rows_merged, N / 2);
 }
@@ -612,8 +826,12 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
         Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
             .sequential()
             .collect();
+    let lazy_true: Vec<_> = Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
+        .solve_residual_state_lazy()
+        .collect();
     assert_eq!(residual_true.results, ["empty binding"]);
     assert_eq!(residual_true.results, sequential_true);
+    assert_eq!(residual_true.results, lazy_true);
     assert_eq!(residual_true.stats.state_pops, 1);
 
     let residual_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
@@ -625,6 +843,11 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert!(residual_false.results.is_empty());
     assert_eq!(residual_false.results, sequential_false);
     assert_eq!(residual_false.stats.state_pops, 0);
+
+    let mut lazy_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
+        .solve_residual_state_lazy();
+    assert!(lazy_false.next().is_none());
+    assert!(lazy_false.next().is_none());
 }
 
 fn equality_fixture() -> (
@@ -652,16 +875,25 @@ fn equality_fixture() -> (
 fn equality_becomes_relevant_after_its_peer_is_bound() {
     let (root, parent_calls, x_calls, values) = equality_fixture();
     let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
+    let (lazy_root, _, _, _) = equality_fixture();
+    let mut lazy: Vec<_> = Query::new(lazy_root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(1)
+        .growth(1)
+        .collect();
     let (sequential_root, _, _, _) = equality_fixture();
     let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
         .sequential()
         .collect();
     let mut oracle: Vec<_> = values.iter().copied().map(|value| (value, value)).collect();
     residual.results.sort_unstable();
+    lazy.sort_unstable();
     sequential.sort_unstable();
     oracle.sort_unstable();
     assert_eq!(residual.results, oracle);
     assert_eq!(residual.results, sequential);
+    assert_eq!(lazy, sequential);
 
     let parent_calls = parent_calls.lock().unwrap();
     let x_calls = x_calls.lock().unwrap();
@@ -725,13 +957,22 @@ fn opaque_union_deduplicates_identical_arms_when_proposing_and_confirming() {
     for role in [UnionRole::Proposer, UnionRole::Confirmer] {
         let (root, arm_calls, value) = union_fixture(role);
         let residual = Query::new(root, project_parent).solve_residual_state();
+        let (lazy_root, _, _) = union_fixture(role);
+        let lazy: Vec<_> = Query::new(lazy_root, project_parent)
+            .solve_residual_state_lazy()
+            .cap(usize::MAX)
+            .start_width(1)
+            .growth(1)
+            .collect();
         let (sequential_root, _, _) = union_fixture(role);
         let sequential: Vec<_> = Query::new(sequential_root, project_parent)
             .sequential()
             .collect();
 
         assert_eq!(residual, [value], "union must preserve set semantics");
+        assert_eq!(lazy, [value], "lazy union must preserve set semantics");
         assert_eq!(residual, sequential, "residual vs scalar DFS");
+        assert_eq!(lazy, sequential, "lazy residual vs scalar DFS");
         for calls in arm_calls {
             let calls = calls.lock().unwrap();
             match role {

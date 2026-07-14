@@ -25,7 +25,8 @@
 //!         2048 16 8
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
-//! blocked-v1 / grouped / dag / residual-state / agglomerative / dag-unmerged on both backends
+//! blocked-v1 / grouped / dag / eager residual-state / lazy residual-state /
+//! agglomerative / dag-unmerged on both backends
 //! and prints per mode: min/median/max wall time, parity signature, and for the
 //! frontier engines the group/batch structure, materialized rows, peak live
 //! row-store cells, and the DAG's bucket/merge census.
@@ -220,6 +221,7 @@ enum Mode {
     Grp,
     Dag,
     Residual,
+    ResidualLazy,
     Agglomerative,
     DagU,
 }
@@ -247,6 +249,7 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
         Mode::Residual => tally(q.solve_residual_state()),
+        Mode::ResidualLazy => tally(q.solve_residual_state_lazy()),
         Mode::Agglomerative => tally(
             q.solve_dag_lazy()
                 .start_width(1)
@@ -274,6 +277,27 @@ fn run_residual_profiled<S: TriblePattern>(
         ])
     )
     .solve_residual_state_profiled();
+    (tally(solve.results), solve.stats)
+}
+
+fn run_lazy_residual_profiled<S: TriblePattern>(
+    kb: &S,
+    markers: (Id, Id, Id, Id, Id),
+) -> ((usize, u64), ResidualStateStats) {
+    let (k1, k2, k3, k4, kz) = markers;
+    let solve = find!(
+        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
+        pattern!(kb, [
+            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
+            { ?x1 @ world::rt1: k1 },
+            { ?x2 @ world::rt2: k2 },
+            { ?x3 @ world::rt3: k3 },
+            { ?x4 @ world::rt4: k4 },
+            { ?z @ world::rtz: kz }
+        ])
+    )
+    .solve_residual_state_lazy()
+    .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
@@ -305,6 +329,7 @@ fn bench_backend<S: TriblePattern>(
         ("grp", Mode::Grp),
         ("dag", Mode::Dag),
         ("residual", Mode::Residual),
+        ("res-lazy", Mode::ResidualLazy),
         ("agglomerative", Mode::Agglomerative),
         ("dagu", Mode::DagU),
     ]);
@@ -368,6 +393,25 @@ fn bench_backend<S: TriblePattern>(
                 stats.interner_hits,
                 stats.bucket_merges,
                 stats.rows_merged,
+                stats.propose_calls,
+                stats.max_propose_rows,
+                stats.confirm_calls,
+                stats.max_confirm_rows,
+            );
+            continue;
+        }
+        if mode == Mode::ResidualLazy {
+            let (_, stats) = run_lazy_residual_profiled(kb, markers);
+            println!(
+                "  residual lazy states: {} interned / {} hits / {} reentries ({} rows); pops {} ({} sprint / {} harvest / {} partial); calls propose {} (max {} rows), confirm {} (max {} rows)",
+                stats.states_interned,
+                stats.interner_hits,
+                stats.state_reentries,
+                stats.rows_reentered,
+                stats.state_pops,
+                stats.sprint_pops,
+                stats.harvest_pops,
+                stats.partial_pops,
                 stats.propose_calls,
                 stats.max_propose_rows,
                 stats.confirm_calls,
