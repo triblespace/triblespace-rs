@@ -702,16 +702,21 @@ where
         .solve_residual_state_lazy()
         .cap(1)
         .collect();
+    let mut ordinary: Vec<_> = Query::new(make(), project)
+        .residual_state_scheduler()
+        .collect();
 
     expected.sort_unstable();
     sequential.sort_unstable();
     eager.sort_unstable();
     lazy_default.sort_unstable();
     lazy_cap_one.sort_unstable();
+    ordinary.sort_unstable();
     assert_eq!(sequential, expected, "scalar result bag vs fixture oracle");
     assert_eq!(eager, expected, "eager residual result bag");
     assert_eq!(lazy_default, expected, "default lazy residual result bag");
     assert_eq!(lazy_cap_one, expected, "cap=1 lazy residual result bag");
+    assert_eq!(ordinary, expected, "ordinary Query residual result bag");
 }
 
 #[test]
@@ -858,6 +863,17 @@ fn top_level_custom_and_borrowed_roots_need_no_wrapper() {
 fn top_level_zero_variable_roots_settle_before_planning() {
     assert_arbitrary_root_equivalent(|| Truth(true), project_same, vec![()]);
     assert_arbitrary_root_equivalent(|| Truth(false), project_same, Vec::new());
+}
+
+#[test]
+fn failed_ordinary_residual_pull_is_not_fresh_for_probe_restart() {
+    let mut query = Query::new(Truth(false), project_same).residual_state_scheduler();
+    assert_eq!(query.next(), None);
+
+    let restart = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(query.solve_residual_state_lazy());
+    }));
+    assert!(restart.is_err());
 }
 
 fn matching_calls(trace: &Trace, child: Child, verb: Verb, variable: VariableId) -> Vec<Call> {

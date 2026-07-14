@@ -133,6 +133,12 @@ macro_rules! assert_all_engines_match {
             "{}: lazy dag forced harvest",
             $label
         );
+        prop_assert_eq!(
+            multiset(($query).residual_state_scheduler()),
+            expected.clone(),
+            "{}: ordinary Query residual state",
+            $label
+        );
         #[cfg(feature = "parallel")]
         for threads in [1usize, 4] {
             let scalar = parallel_pool(threads)

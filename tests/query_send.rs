@@ -32,6 +32,15 @@ fn ordinary_query_with_non_send_output_is_send() {
     let mut started = Query::new(constraint, |_| Some(Rc::new(())));
     assert!(started.next().is_some());
     assert_send(started);
+
+    // The owned residual runtime likewise stores only raw rows and planning
+    // state, never a projected `R`.
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let constraint = variable.is(U256BE::inline_from(1u64));
+    let mut residual = Query::new(constraint, |_| Some(Rc::new(()))).residual_state_scheduler();
+    assert!(residual.next().is_some());
+    assert_send(residual);
 }
 
 #[test]
@@ -106,6 +115,82 @@ fn clone_after_iteration_does_not_require_clone_output() {
     assert_eq!(query.count(), cloned.count());
 }
 
+/// The same manual `Query::clone` bound must stay independent of `R: Clone`
+/// when the owned cursor is the residual state machine.
+#[cfg(feature = "parallel")]
+#[test]
+fn residual_clone_after_iteration_does_not_require_clone_output() {
+    struct NonClone;
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut query = Query::new(constraint, |_| Some(NonClone)).residual_state_scheduler();
+
+    assert!(query.next().is_some());
+    assert!(query.next().is_some());
+    let cloned = query.clone();
+    assert_eq!(query.count(), cloned.count());
+}
+
+#[test]
+fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
+    use std::sync::Arc;
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut filtered = Query::new(constraint, move |binding| {
+        let value = *binding.get(variable.index)?;
+        (value[31] % 2 == 0).then_some(value)
+    })
+    .residual_state_scheduler()
+    .collect::<Vec<_>>();
+    filtered.sort_unstable();
+    assert_eq!(filtered, vec![values[1].raw, values[3].raw]);
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let projected = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&projected);
+    let mut panicking = Query::new(constraint, move |binding| {
+        let value = *binding.get(variable.index)?;
+        let mut projected = record.lock().unwrap_or_else(|poison| poison.into_inner());
+        projected.push(value);
+        assert_ne!(projected.len(), 1, "first projection panics");
+        Some(value)
+    })
+    .residual_state_scheduler();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panicking.next()));
+    assert!(panic.is_err());
+    let resumed = panicking.next().expect("a later raw row remains");
+    let projected = projected
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    assert_eq!(projected.len(), 2);
+    assert_ne!(projected[0], projected[1], "panicking row was repeated");
+    assert_eq!(resumed, projected[1]);
+}
+
 /// A partially consumed ordinary query owns a DAG worklist while its legacy
 /// DFS cursor is untouched. Converting it to rayon must drain that remaining
 /// worklist as one leaf, not split and restart the DFS cursor from the seed.
@@ -145,6 +230,75 @@ fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
     assert!(message.contains("cannot initialize parallel DAG iteration"));
 }
 
+/// A started residual cursor has no scalar cursor position to split. Ordinary
+/// Rayon conversion therefore drains it as one exact leaf.
+#[cfg(feature = "parallel")]
+#[test]
+fn partially_consumed_residual_query_into_par_iter_keeps_exact_remainder() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut query = Query::new(constraint, move |binding| {
+        binding.get(variable.index).copied()
+    })
+    .residual_state_scheduler();
+
+    assert!(query.next().is_some());
+    let expected = query.clone().collect::<Vec<_>>();
+    let actual = query.into_par_iter().collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn pulled_query_rejects_every_seed_restarting_selector() {
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut query = Query::new(constraint, move |binding| {
+        binding.get(variable.index).copied()
+    })
+    .residual_state_scheduler();
+    assert!(query.next().is_some());
+
+    let panics = [
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let query = query.clone();
+            move || drop(query.sequential())
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let query = query.clone();
+            move || drop(query.residual_state_scheduler())
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let query = query.clone();
+            move || drop(query.solve_dag_lazy())
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let query = query.clone();
+            move || drop(query.solve_residual_state_lazy())
+        })),
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            drop(query.into_par_dag_iter())
+        })),
+    ];
+    assert!(panics.into_iter().all(|result| result.is_err()));
+}
+
 #[cfg(feature = "parallel")]
 #[test]
 fn fresh_query_into_par_iter_matches_scalar_scheduler() {
@@ -168,6 +322,25 @@ fn fresh_query_into_par_iter_matches_scalar_scheduler() {
     expected.sort_unstable();
     actual.sort_unstable();
     assert_eq!(actual, expected);
+
+    // Ordinary Rayon conversion remains the scalar splitter even when the
+    // unstarted query had selected residual execution.
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut selected = Query::new(constraint, move |binding| {
+        binding.get(variable.index).copied()
+    })
+    .residual_state_scheduler()
+    .into_par_iter()
+    .collect::<Vec<_>>();
+    selected.sort_unstable();
+    assert_eq!(selected, expected);
 }
 
 /// The explicit parallel-DAG path must descend through an initially
