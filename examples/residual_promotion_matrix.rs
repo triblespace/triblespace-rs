@@ -488,15 +488,23 @@ fn deterministic_id(namespace: u32, counter: u64) -> ExclusiveId {
 fn build_ladder(n: usize) -> (TribleSet, ExclusiveId) {
     let root = deterministic_id(0xD46A_1001, 1);
     let mut kb = TribleSet::new();
-    let values: Vec<_> = (0..n)
-        .map(|index| deterministic_id(0xD46A_1002, index as u64 + 1))
-        .collect();
-    for value in &values {
-        kb += entity! { &root @ world::p1: value };
+    let mut first_child = None;
+    let mut middle_child = None;
+    for index in 0..n {
+        let parent = deterministic_id(0xD46A_1002, index as u64 + 1);
+        let child = deterministic_id(0xD46A_1003, index as u64 + 1);
+        kb += entity! { &root @ world::p1: &parent };
+        kb += entity! { &parent @ world::p2: &child };
+        if index == 0 {
+            first_child = Some(child.clone());
+        }
+        if index == n / 2 {
+            middle_child = Some(child);
+        }
     }
-    kb += entity! { &root @ world::p2: &values[0] };
-    kb += entity! { &root @ world::p3: &values[n / 2] };
-    // p4 intentionally has no fact: it is the absent rung.
+    kb += entity! { &root @ world::p3: &first_child.expect("nonempty ladder") };
+    kb += entity! { &root @ world::p4: &middle_child.expect("nonempty ladder") };
+    // p5 intentionally has no fact: it is the absent rung.
     (kb, root)
 }
 
@@ -507,18 +515,22 @@ fn bench_ladder<S: TriblePattern>(label: &str, kb: &S, root: &ExclusiveId, n: us
                 &format!("late-hit {label} {} (N={n})", $name),
                 reps,
                 find!(
-                    x: Inline<inlineencodings::GenId>,
+                    (
+                        p: Inline<inlineencodings::GenId>,
+                        x: Inline<inlineencodings::GenId>
+                    ),
                     and!(
-                        EstimateOverride::new(pattern!(kb, [{ root @ world::p1: ?x }]), 0),
-                        EstimateOverride::new(pattern!(kb, [{ root @ $attribute: ?x }]), n + 1),
+                        EstimateOverride::new(pattern!(kb, [{ root @ world::p1: ?p }]), 0),
+                        pattern!(kb, [{ ?p @ world::p2: ?x }]),
+                        EstimateOverride::new(pattern!(kb, [{ root @ $attribute: ?x }]), 16),
                     )
                 )
             );
         };
     }
-    rung!("first", world::p2);
-    rung!("middle", world::p3);
-    rung!("absent", world::p4);
+    rung!("first", world::p3);
+    rung!("middle", world::p4);
+    rung!("absent", world::p5);
 }
 
 fn build_negative_ladder(n: usize) -> (TribleSet, ExclusiveId) {
