@@ -485,32 +485,63 @@ fn deterministic_id(namespace: u32, counter: u64) -> ExclusiveId {
     ExclusiveId::force(Id::new(raw).expect("nonzero namespace yields a valid deterministic ID"))
 }
 
-fn build_ladder(n: usize) -> (TribleSet, ExclusiveId) {
+fn build_ladder_base(n: usize) -> (TribleSet, ExclusiveId) {
     let root = deterministic_id(0xD46A_1001, 1);
     let mut kb = TribleSet::new();
-    let mut first_child = None;
-    let mut middle_child = None;
     for index in 0..n {
         let parent = deterministic_id(0xD46A_1002, index as u64 + 1);
         let child = deterministic_id(0xD46A_1003, index as u64 + 1);
         kb += entity! { &root @ world::p1: &parent };
         kb += entity! { &parent @ world::p2: &child };
-        // The query cursors consume the ordered candidate tail first, so the
-        // greatest deterministic parent is the scheduler's first branch.
-        if index + 1 == n {
-            first_child = Some(child.clone());
-        }
-        if index == n / 2 {
-            middle_child = Some(child);
-        }
     }
-    kb += entity! { &root @ world::p3: &first_child.expect("nonempty ladder") };
-    kb += entity! { &root @ world::p4: &middle_child.expect("nonempty ladder") };
-    // p5 intentionally has no fact: it is the absent rung.
     (kb, root)
 }
 
-fn bench_ladder<S: TriblePattern>(label: &str, kb: &S, root: &ExclusiveId, n: usize, reps: usize) {
+/// Incumbent lazy-DAG enumeration order for the unfiltered ladder. Defining
+/// first/middle against this order makes the latency comparison independent of
+/// a backend's physical cursor direction.
+fn ladder_dag_order<S: TriblePattern>(
+    kb: &S,
+    root: &ExclusiveId,
+) -> Vec<Inline<inlineencodings::GenId>> {
+    find!(
+        (
+            p: Inline<inlineencodings::GenId>,
+            x: Inline<inlineencodings::GenId>
+        ),
+        and!(
+            EstimateOverride::new(pattern!(kb, [{ root @ world::p1: ?p }]), 0),
+            pattern!(kb, [{ ?p @ world::p2: ?x }]),
+        )
+    )
+    .solve_dag_lazy()
+    .map(|(_, x)| x)
+    .collect()
+}
+
+fn add_ladder_markers(
+    kb: &mut TribleSet,
+    root: &ExclusiveId,
+    first_attribute: Attribute<inlineencodings::GenId>,
+    middle_attribute: Attribute<inlineencodings::GenId>,
+    order: &[Inline<inlineencodings::GenId>],
+) {
+    assert!(!order.is_empty());
+    *kb += entity! { root @ first_attribute: order[0] };
+    *kb += entity! { root @ middle_attribute: order[order.len() / 2] };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench_ladder<S: TriblePattern>(
+    label: &str,
+    kb: &S,
+    root: &ExclusiveId,
+    first_attribute: Attribute<inlineencodings::GenId>,
+    middle_attribute: Attribute<inlineencodings::GenId>,
+    absent_attribute: Attribute<inlineencodings::GenId>,
+    n: usize,
+    reps: usize,
+) {
     macro_rules! rung {
         ($name:literal, $attribute:expr) => {
             measure_query!(
@@ -530,9 +561,9 @@ fn bench_ladder<S: TriblePattern>(label: &str, kb: &S, root: &ExclusiveId, n: us
             );
         };
     }
-    rung!("first", world::p3);
-    rung!("middle", world::p4);
-    rung!("absent", world::p5);
+    rung!("first", first_attribute);
+    rung!("middle", middle_attribute);
+    rung!("absent", absent_attribute);
 }
 
 fn build_negative_ladder(n: usize) -> (TribleSet, ExclusiveId) {
@@ -902,10 +933,45 @@ fn main() {
         "residual promotion matrix: exact candidate 9d74fbdab3717ffb6a0ec5acc80b77e26c55bb3e; reps {reps}; saturated width {SATURATED_WIDTH}"
     );
 
-    let (ladder, ladder_root) = build_ladder(4096);
+    let (mut ladder, ladder_root) = build_ladder_base(4096);
+    let tribleset_order = ladder_dag_order(&ladder, &ladder_root);
+    let preliminary_archive: SuccinctArchive<OrderedUniverse> = (&ladder).into();
+    let archive_order = ladder_dag_order(&preliminary_archive, &ladder_root);
+    add_ladder_markers(
+        &mut ladder,
+        &ladder_root,
+        world::p3.clone(),
+        world::p4.clone(),
+        &tribleset_order,
+    );
+    add_ladder_markers(
+        &mut ladder,
+        &ladder_root,
+        world::t1.clone(),
+        world::t2.clone(),
+        &archive_order,
+    );
     let ladder_archive: SuccinctArchive<OrderedUniverse> = (&ladder).into();
-    bench_ladder("TribleSet", &ladder, &ladder_root, 4096, reps);
-    bench_ladder("SuccinctArchive", &ladder_archive, &ladder_root, 4096, reps);
+    bench_ladder(
+        "TribleSet",
+        &ladder,
+        &ladder_root,
+        world::p3.clone(),
+        world::p4.clone(),
+        world::p5.clone(),
+        4096,
+        reps,
+    );
+    bench_ladder(
+        "SuccinctArchive",
+        &ladder_archive,
+        &ladder_root,
+        world::t1.clone(),
+        world::t2.clone(),
+        world::t3.clone(),
+        4096,
+        reps,
+    );
 
     let (negative, negative_root) = build_negative_ladder(16_384);
     let negative_archive: SuccinctArchive<OrderedUniverse> = (&negative).into();
