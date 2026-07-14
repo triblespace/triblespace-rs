@@ -1389,8 +1389,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Unlike [`Query::solve_residual_state_lazy`], this keeps the runtime
     /// cursor behind `Query::next`, so cloning a started query snapshots its
     /// exact raw remainder and ordinary parallel conversion can drain that
-    /// remainder without restarting from the seed. The ordinary default
-    /// remains the lazy DAG scheduler while this API is evaluated.
+    /// remainder without restarting from the seed. Converting an unstarted
+    /// selected query through ordinary Rayon iteration still uses the stable
+    /// scalar splitter; it does not initialize a residual cursor implicitly.
+    /// The ordinary default remains the lazy DAG scheduler while this API is
+    /// evaluated.
     ///
     /// # Panics
     ///
