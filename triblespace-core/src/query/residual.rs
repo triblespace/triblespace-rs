@@ -11,13 +11,17 @@
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
 //! Confirm descriptors without invoking either protocol verb. The action state
-//! is what calls one flattened leaf. Occupancy scheduling chooses the deepest
-//! live bucket able to fill the desired parent-atom width; if none can, it
-//! drains the minimum-rank bucket through the strict readiness gate. Separately
-//! planned groups can therefore assemble in one canonical action bucket
-//! without sacrificing width-one depth-first latency. Parent atoms are a
-//! semantics-safe chunking unit, not a total-work estimate: ragged candidate
-//! fanout can make equally wide Confirm buckets cost different amounts.
+//! is what calls one flattened leaf. Exact row-local variable choices are the
+//! leaves of the same topology-scaled agglomerative merge hierarchy used by the
+//! DAG engine; after a compatible group is reassigned, each row still chooses
+//! its tightest proposer for that scheduled variable. Occupancy scheduling
+//! chooses the deepest live bucket able to fill the desired parent-atom width;
+//! if none can, it drains the minimum-rank bucket through the strict readiness
+//! gate. Separately planned groups can therefore assemble in one canonical
+//! action bucket without sacrificing width-one depth-first latency. Parent
+//! atoms are a semantics-safe chunking unit, not a total-work estimate: ragged
+//! candidate fanout can make equally wide Confirm buckets cost different
+//! amounts.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance—even when they
 //! merge into an already-live bucket—and grows geometrically after an action
@@ -119,10 +123,25 @@ pub struct ResidualStateStats {
     /// Ready-state chunks that planned row-local proposal actions without
     /// invoking the constraint protocol.
     pub ready_plan_pops: usize,
+    /// Exact row-local preferred-variable groups observed by Ready planning,
+    /// summed across pops before topology-scaled agglomeration.
+    pub ready_preferred_variable_groups: usize,
+    /// Variable groups retained by Ready planning after topology-scaled
+    /// agglomeration, summed across pops.
+    pub ready_scheduled_variable_groups: usize,
+    /// Concrete `(scheduled variable, exact proposer occurrence)` groups filed
+    /// by Ready planning, summed across pops.
+    pub ready_proposal_groups: usize,
+    /// Ready pops where agglomeration reduced the preferred-variable group
+    /// count.
+    pub agglomerated_ready_pops: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
     pub candidate_plan_pops: usize,
+    /// Concrete confirmer-occurrence groups filed by Candidate planning,
+    /// summed across pops that still had an unchecked relevant occurrence.
+    pub candidate_confirmation_groups: usize,
     /// Explicit proposal-action chunks that invoked one flattened leaf.
     pub propose_action_pops: usize,
     /// Explicit confirmation-action chunks that invoked one flattened leaf.
@@ -704,8 +723,6 @@ struct VariablePlan {
     relevant: ChildSet,
     /// Tightest flattened leaf occurrence per row.
     proposers: Vec<usize>,
-    /// Elementwise minimum leaf estimate per row.
-    estimates: Vec<usize>,
 }
 
 fn estimate_leaf<'a>(
@@ -758,11 +775,14 @@ fn ready_plan_transition<'a>(
     let view = rows_view(&vars, &rows.rows, rows.row_count);
     let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
     let mut plans = Vec::with_capacity(unbound.len());
+    let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
 
-    for variable in unbound {
+    for &variable in &unbound {
         let mut relevant = ChildSet::empty(leaf_count);
         let mut proposers = vec![usize::MAX; rows.row_count];
-        let mut estimates = vec![usize::MAX; rows.row_count];
+        let estimate_start = estimate_matrix.len();
+        estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
+        let estimates = &mut estimate_matrix[estimate_start..];
         let mut column = Vec::with_capacity(rows.row_count);
         for leaf in 0..leaf_count {
             column.clear();
@@ -803,33 +823,71 @@ fn ready_plan_transition<'a>(
             variable,
             relevant,
             proposers,
-            estimates,
         });
     }
 
-    let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
+    let mut preferred = Vec::with_capacity(rows.row_count);
+    let mut preferred_counts = vec![0; plans.len()];
     for row in 0..rows.row_count {
-        let mut best: Option<(ProposeAction, (u64, u64, u64))> = None;
+        let mut best: Option<(usize, (u64, u64, u64))> = None;
         for (pi, plan) in plans.iter().enumerate() {
-            let estimate = plan.estimates[row];
+            let estimate = estimate_matrix[pi * rows.row_count + row];
             let key = variable_order_key(
                 estimate,
                 base_estimates[plan.variable],
                 influences[plan.variable].count(),
             );
-            let action = ProposeAction {
-                variable_plan: pi,
-                leaf: plan.proposers[row],
-            };
             if best.is_none_or(|(_, best_key)| key > best_key) {
-                best = Some((action, key));
+                best = Some((pi, key));
             }
         }
-        let action = best
+        let variable_plan = best
             .expect("a non-full ready state has an enabled proposal")
             .0;
+        preferred.push(variable_plan as u32);
+        preferred_counts[variable_plan] += 1;
+    }
+
+    let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
+    let mut scheduled = preferred.clone();
+    let mut scheduled_groups = preferred_groups;
+    if preferred_groups > 1 {
+        let mut owners = Vec::new();
+        let mut group_sums = Vec::new();
+        let mut compatible = Vec::new();
+        let mut active = Vec::new();
+        let plan = plan_agglomerative_partition(
+            &estimate_matrix,
+            rows.row_count,
+            &unbound,
+            influences,
+            &preferred,
+            &preferred_counts,
+            &mut owners,
+            &mut scheduled,
+            &mut group_sums,
+            &mut compatible,
+            &mut active,
+        );
+        debug_assert_eq!(plan.preferred_groups, preferred_groups);
+        scheduled_groups = plan.scheduled_groups;
+        if scheduled_groups < preferred_groups {
+            stats.agglomerated_ready_pops += 1;
+        }
+    }
+    stats.ready_preferred_variable_groups += preferred_groups;
+    stats.ready_scheduled_variable_groups += scheduled_groups;
+
+    let mut groups: BTreeMap<ProposeAction, Vec<usize>> = BTreeMap::new();
+    for (row, &variable_plan) in scheduled.iter().enumerate() {
+        let variable_plan = variable_plan as usize;
+        let action = ProposeAction {
+            variable_plan,
+            leaf: plans[variable_plan].proposers[row],
+        };
         groups.entry(action).or_default().push(row);
     }
+    stats.ready_proposal_groups += groups.len();
 
     let mut file_propose_group = |action: ProposeAction, selected: RowBatch| {
         let variable_plan = &plans[action.variable_plan];
@@ -1027,6 +1085,11 @@ fn candidate_plan_transition<'a>(
         confirmers.iter().all(|&child| child != usize::MAX),
         "candidate state has no enabled transition"
     );
+    let mut confirmer_groups = ChildSet::empty(leaf_count);
+    for &confirmer in &confirmers {
+        confirmer_groups.insert(confirmer);
+    }
+    stats.candidate_confirmation_groups += confirmer_groups.count();
 
     let mut file_confirm_group = |confirmer: usize, selected: CandidateBatch| {
         file(
@@ -1913,6 +1976,54 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct RowEstimateLeaf {
+        parent: VariableId,
+        variable: VariableId,
+        estimates: [usize; 2],
+    }
+
+    impl Constraint<'static> for RowEstimateLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            let parent = view
+                .col(self.parent)
+                .expect("row-dependent estimate requires its parent binding");
+            out.extend(
+                view.iter()
+                    .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
+            );
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
     type ShapeConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 
     fn shape_leaf(variable: VariableId) -> ShapeConstraint {
@@ -1960,6 +2071,135 @@ mod tests {
             );
         }
         machine
+    }
+
+    fn ready_action_fixture(
+        leaves: Vec<RowEstimateLeaf>,
+    ) -> (Vec<(VariableId, usize, usize)>, ResidualStateStats) {
+        const PARENT: VariableId = 0;
+        let root = IntersectionConstraint::new(leaves);
+        let plan = ResidualPlan::compile(&root);
+        let desc = StateDesc {
+            bound: VariableSet::new_singleton(PARENT),
+            phase: ResidualPhase::Ready,
+        };
+        let rows = RowBatch {
+            rows: vec![raw(0), raw(1)],
+            row_count: 2,
+        };
+        let influences = [VariableSet::new_empty(); 128];
+        let base_estimates = [1; 128];
+        let mut worklist = Worklist::new();
+        let mut interner = StateInterner::default();
+        let mut stats = ResidualStateStats::default();
+
+        assert!(ready_plan_transition(
+            &root,
+            &plan,
+            &desc,
+            rows,
+            root.variables(),
+            &influences,
+            &base_estimates,
+            &mut worklist,
+            &mut interner,
+            &mut stats,
+        ));
+
+        let mut actions = Vec::new();
+        for level in worklist.values() {
+            for (&id, bucket) in level {
+                let ResidualPhase::Propose {
+                    variable, proposer, ..
+                } = interner.get(id).phase
+                else {
+                    panic!("Ready planning filed a non-proposal state")
+                };
+                actions.push((variable, proposer, bucket.row_count()));
+            }
+        }
+        actions.sort_unstable();
+        (actions, stats)
+    }
+
+    #[test]
+    fn ready_agglomeration_coalesces_near_variable_choices() {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let (actions, stats) = ready_action_fixture(vec![
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: LEFT,
+                estimates: [1, 2],
+            },
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: RIGHT,
+                estimates: [2, 1],
+            },
+        ]);
+
+        assert_eq!(actions, [(LEFT, 0, 2)]);
+        assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.ready_scheduled_variable_groups, 1);
+        assert_eq!(stats.ready_proposal_groups, 1);
+        assert_eq!(stats.agglomerated_ready_pops, 1);
+    }
+
+    #[test]
+    fn ready_agglomeration_selects_each_scheduled_rows_exact_proposer() {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let (actions, stats) = ready_action_fixture(vec![
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: LEFT,
+                estimates: [1, 4],
+            },
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: LEFT,
+                estimates: [4, 2],
+            },
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: RIGHT,
+                estimates: [2, 1],
+            },
+        ]);
+
+        assert_eq!(actions, [(LEFT, 0, 1), (LEFT, 1, 1)]);
+        assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.ready_scheduled_variable_groups, 1);
+        assert_eq!(stats.ready_proposal_groups, 2);
+        assert_eq!(stats.agglomerated_ready_pops, 1);
+    }
+
+    #[test]
+    fn ready_agglomeration_keeps_incompatible_exact_choices() {
+        const PARENT: VariableId = 0;
+        const LEFT: VariableId = 1;
+        const RIGHT: VariableId = 2;
+        let (actions, stats) = ready_action_fixture(vec![
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: LEFT,
+                estimates: [1, 64],
+            },
+            RowEstimateLeaf {
+                parent: PARENT,
+                variable: RIGHT,
+                estimates: [64, 1],
+            },
+        ]);
+
+        assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 1, 1)]);
+        assert_eq!(stats.ready_preferred_variable_groups, 2);
+        assert_eq!(stats.ready_scheduled_variable_groups, 2);
+        assert_eq!(stats.ready_proposal_groups, 2);
+        assert_eq!(stats.agglomerated_ready_pops, 0);
     }
 
     #[test]
@@ -2360,6 +2600,10 @@ mod tests {
             StepOutcome::Advanced
         ));
         assert_eq!(machine.stats.ready_plan_pops, 1);
+        assert_eq!(machine.stats.ready_preferred_variable_groups, 1);
+        assert_eq!(machine.stats.ready_scheduled_variable_groups, 1);
+        assert_eq!(machine.stats.ready_proposal_groups, 1);
+        assert_eq!(machine.stats.agglomerated_ready_pops, 0);
         assert_eq!(machine.stats.propose_action_pops, 0);
         assert_eq!(machine.stats.propose_calls, 0);
         assert_eq!(proposes.load(Ordering::Relaxed), 0);
@@ -2841,6 +3085,7 @@ mod tests {
             ));
         }
         assert_eq!(stats.candidate_plan_pops, 2);
+        assert_eq!(stats.candidate_confirmation_groups, 4);
         assert_eq!(stats.confirm_calls, 0);
         assert_eq!(even_calls.load(Ordering::Relaxed), 0);
         assert_eq!(odd_calls.load(Ordering::Relaxed), 0);
