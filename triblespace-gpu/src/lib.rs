@@ -9,6 +9,8 @@ mod resident_program;
 #[cfg(feature = "wgpu")]
 mod resident_round;
 #[cfg(feature = "wgpu")]
+mod resident_support;
+#[cfg(feature = "wgpu")]
 mod succinct_query;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
@@ -25,6 +27,8 @@ pub use resident_round::{
     ResidentRowChoice, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
     DEAD_ROW_SENTINEL,
 };
+#[cfg(feature = "wgpu")]
+pub use resident_support::{ResidentSupportError, WgpuResidentRound};
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
     WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,

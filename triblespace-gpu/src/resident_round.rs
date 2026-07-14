@@ -338,16 +338,9 @@ impl<R: Runtime> ResidentRoundInputs<R> {
         self.rows
     }
 
-    // These narrow write capabilities are consumed by the following resident
-    // estimate/support microprogram once that stage lands.
-    #[allow(dead_code)]
-    pub(crate) fn viable_output_arg(&mut self) -> ArrayArg<R> {
-        self.viable.output_arg()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn estimates_output_arg(&mut self) -> ArrayArg<R> {
-        self.estimates.output_arg()
+    /// Borrows the two distinct allocations as one producer-stage capability.
+    pub(crate) fn producer_output_args(&mut self) -> (ArrayArg<R>, ArrayArg<R>) {
+        (self.viable.output_arg(), self.estimates.output_arg())
     }
 }
 
@@ -379,6 +372,14 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         context: GpuContext<R>,
     ) -> Result<Self, ResidentRoundError> {
         let metadata = ResidentRoundMetadata::lower(program, bound_variables)?;
+        Self::from_metadata(metadata, context)
+    }
+
+    /// Uploads one already-lowered immutable metadata capability.
+    pub(crate) fn from_metadata(
+        metadata: ResidentRoundMetadata,
+        context: GpuContext<R>,
+    ) -> Result<Self, ResidentRoundError> {
         let variable_offsets = context.upload_u32(&metadata.variable_offsets)?;
         let variable_arms = context.upload_u32(&metadata.variable_arms)?;
         let arm_patterns = context.upload_u32(

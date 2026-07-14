@@ -67,3 +67,7 @@ required-features = ["wgpu"]
 [[test]]
 name = "resident_row_planner"
 required-features = ["wgpu"]
+
+[[test]]
+name = "resident_support_estimates"
+required-features = ["wgpu"]

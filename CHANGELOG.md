@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds gain their first exact estimate/support lowering and
+  zero-peer producer.** A pure host IR maps every target and zero/one/two-peer
+  state to canonical `Present`, pair-distinct, or restricted Ring primitives,
+  retains stable semantic arm IDs and physical rotation groups, records
+  fully-bound support separately, and makes any missing constant globally
+  dead. `WgpuResidentRound` pointer-binds that plan to one resident archive and
+  its private context, then initializes exact axis-cardinality estimates and
+  viability directly into opaque planner inputs without readback. Unsupported
+  one-peer, two-peer, and support probes fail explicitly pending later slices.
 - **Resident affine rounds gain an exact runtime-generic row planner.** A
   stable variable-to-arm CSR lowering derives arm identities and full influence
   unions from public `QueryProgram` patterns. Its CubeCL kernel consumes the
