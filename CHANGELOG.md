@@ -42,7 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a total-work estimate. Exact descriptors remain interned so early states
   can safely reopen when later histories reach them. Full drains preserve the
   eager solver's result bag; partial consumers may drop the remaining affine
-  frontier after the first useful result.
+  frontier after the first useful result. Ready planning now passes its exact
+  row-local variable preferences through the DAG engine's topology-scaled
+  agglomerative planner before selecting each scheduled row's exact proposing
+  leaf. This coalesces compatible variable routes without weakening constraint
+  semantics or introducing another cutoff policy.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM

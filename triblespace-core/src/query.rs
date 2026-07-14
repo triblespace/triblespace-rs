@@ -46,7 +46,9 @@ use std::fmt;
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 
-use agglomerative::{plan_agglomerative_partition, AgglomerativePlan};
+use agglomerative::plan_agglomerative_partition;
+#[cfg(test)]
+use agglomerative::AgglomerativePlan;
 use arrayvec::ArrayVec;
 use constantconstraint::*;
 /// Re-export of [`IgnoreConstraint`].

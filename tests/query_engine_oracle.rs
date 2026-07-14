@@ -157,6 +157,145 @@ macro_rules! assert_all_engines_match {
     }};
 }
 
+macro_rules! assert_residual_engines_match {
+    ($label:expr, $expected:expr, $query:expr) => {{
+        let expected = multiset($expected);
+        prop_assert_eq!(
+            multiset(($query).solve_residual_state()),
+            expected.clone(),
+            "{}: eager residual state",
+            $label
+        );
+        prop_assert_eq!(
+            multiset(($query).solve_residual_state_lazy()),
+            expected.clone(),
+            "{}: lazy residual state",
+            $label
+        );
+        prop_assert_eq!(
+            multiset(
+                ($query)
+                    .solve_residual_state_lazy()
+                    .cap(1)
+                    .start_width(1)
+                    .growth(1)
+            ),
+            expected.clone(),
+            "{}: residual fixed-width sprint",
+            $label
+        );
+        prop_assert_eq!(
+            multiset(($query).solve_residual_state_lazy().cap(2)),
+            expected.clone(),
+            "{}: residual forced harvest",
+            $label
+        );
+    }};
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    /// Independently checks residual eager, geometric, fixed-width, and
+    /// forced-harvest schedules over random joins and overlapping unions on
+    /// both storage backends. Keeping this in a separate property test also
+    /// keeps the generated query temporaries below the test thread's stack
+    /// budget.
+    #[test]
+    fn residual_schedules_match_relational_oracles(
+        p_masks in prop::array::uniform4(0u8..16),
+        r_masks in prop::array::uniform4(0u8..16),
+        q_target_mask in 0u8..16,
+    ) {
+        const N: usize = 4;
+        let xs: Vec<Id> = (1..=N).map(|i| fixture_id(i as u8)).collect();
+        let hs: Vec<Id> = (11..11 + N).map(|i| fixture_id(i as u8)).collect();
+        let target = fixture_id(23);
+        let mut kb = TribleSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if has_bit(p_masks[i], j) {
+                    insert_edge(&mut kb, &xs[i], &oracle::p, &hs[j]);
+                }
+                if has_bit(r_masks[i], j) {
+                    insert_edge(&mut kb, &xs[i], &oracle::r, &hs[j]);
+                }
+            }
+        }
+        for j in 0..N {
+            if has_bit(q_target_mask, j) {
+                insert_edge(&mut kb, &hs[j], &oracle::q, &target);
+            }
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
+
+        let mut join_oracle = HashSet::new();
+        let mut union_oracle = HashSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if has_bit(q_target_mask, j) {
+                    if has_bit(p_masks[i], j) {
+                        join_oracle.insert((xs[i].to_inline(), hs[j].to_inline()));
+                    }
+                    if has_bit(p_masks[i], j) || has_bit(r_masks[i], j) {
+                        union_oracle.insert((xs[i].to_inline(), hs[j].to_inline()));
+                    }
+                }
+            }
+        }
+
+        macro_rules! join_query {
+            ($store:expr) => {
+                find!(
+                    (x: Inline<GenId>, h: Inline<GenId>),
+                    and!(
+                        pattern!($store, [{ ?x @ oracle::p: ?h }]),
+                        pattern!($store, [{ ?h @ oracle::q: (&target) }]),
+                    )
+                )
+            };
+        }
+        macro_rules! union_query {
+            ($store:expr) => {
+                find!(
+                    (x: Inline<GenId>, h: Inline<GenId>),
+                    or!(
+                        and!(
+                            pattern!($store, [{ ?x @ oracle::p: ?h }]),
+                            pattern!($store, [{ ?h @ oracle::q: (&target) }]),
+                        ),
+                        and!(
+                            pattern!($store, [{ ?x @ oracle::r: ?h }]),
+                            pattern!($store, [{ ?h @ oracle::q: (&target) }]),
+                        ),
+                    )
+                )
+            };
+        }
+
+        assert_residual_engines_match!(
+            "residual-join/tribleset",
+            join_oracle.clone(),
+            join_query!(&kb)
+        );
+        assert_residual_engines_match!(
+            "residual-join/archive",
+            join_oracle,
+            join_query!(&archive)
+        );
+        assert_residual_engines_match!(
+            "residual-union/tribleset",
+            union_oracle.clone(),
+            union_query!(&kb)
+        );
+        assert_residual_engines_match!(
+            "residual-union/archive",
+            union_oracle,
+            union_query!(&archive)
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
