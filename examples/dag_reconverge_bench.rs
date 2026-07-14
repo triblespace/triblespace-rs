@@ -23,8 +23,12 @@
 //!     # Fat-shard GPU comparison (~1.77M tribles):
 //!     cargo run --release --features gpu --example dag_reconverge_bench -- \
 //!         2048 16 8
+//!     # Repeat only the controlled GPU matrix after the archive is built:
+//!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
+//!         --example dag_reconverge_bench -- 2048 16 8
 //!
 //! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
+//! explicit parallel residual-state /
 //! blocked-v1 / grouped / dag / eager residual-state / lazy residual-state /
 //! agglomerative / dag-unmerged on both backends
 //! and prints per mode: min/median/max wall time, parity signature, and for the
@@ -217,6 +221,8 @@ enum Mode {
     ParScalar,
     #[cfg(feature = "parallel")]
     ParDag,
+    #[cfg(feature = "parallel")]
+    ParResidual,
     Blk,
     Grp,
     Dag,
@@ -245,6 +251,8 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         Mode::ParScalar => tally_par(q.into_par_iter()),
         #[cfg(feature = "parallel")]
         Mode::ParDag => tally_par(q.into_par_dag_iter()),
+        #[cfg(feature = "parallel")]
+        Mode::ParResidual => tally_par(q.into_par_residual_state_iter()),
         Mode::Blk => tally(q.solve_blocked()),
         Mode::Grp => tally(q.solve_blocked_grouped()),
         Mode::Dag => tally(q.solve_dag()),
@@ -323,7 +331,11 @@ fn bench_backend<S: TriblePattern>(
 ) {
     let mut modes = vec![("seq", Mode::Seq)];
     #[cfg(feature = "parallel")]
-    modes.extend([("par-scalar", Mode::ParScalar), ("par-dag", Mode::ParDag)]);
+    modes.extend([
+        ("par-scalar", Mode::ParScalar),
+        ("par-dag", Mode::ParDag),
+        ("par-residual", Mode::ParResidual),
+    ]);
     modes.extend([
         ("blk", Mode::Blk),
         ("grp", Mode::Grp),
@@ -375,9 +387,14 @@ fn bench_backend<S: TriblePattern>(
             .iter()
             .position(|(name, _)| *name == "par-dag")
             .unwrap()];
+        let par_residual = meds[modes
+            .iter()
+            .position(|(name, _)| *name == "par-residual")
+            .unwrap()];
         println!(
-            "  scheduler ratio  dag/scalar {:>7.3}x",
+            "  scheduler ratio  dag/scalar {:>7.3}x  residual/scalar {:>7.3}x",
             par_scalar / par_dag,
+            par_scalar / par_residual,
         );
     }
     // Instrumented single passes: group/batch structure, intermediates,
@@ -452,9 +469,10 @@ type QueryRow = (
     Inline<inlineencodings::GenId>,
 );
 
-/// Collects a full result multiset for the two DAG scheduler shapes used by
-/// the controlled GPU comparison. Callers sort the result before comparison,
-/// because Rayon deliberately does not promise encounter order here.
+/// Collects a full result multiset for the global DAG, saturated serial
+/// residual, and two affine Rayon scheduler shapes used by the controlled GPU
+/// comparison. Callers sort the result before comparison, because Rayon
+/// deliberately does not promise encounter order here.
 #[cfg(feature = "gpu")]
 fn collect_query<S: TriblePattern>(
     kb: &S,
@@ -475,8 +493,10 @@ fn collect_query<S: TriblePattern>(
     );
     match mode {
         Mode::Dag => q.solve_dag(),
+        Mode::Residual => q.solve_residual_state(),
         Mode::ParDag => q.into_par_dag_iter().collect(),
-        _ => unreachable!("controlled WGPU comparison only uses DAG schedulers"),
+        Mode::ParResidual => q.into_par_residual_state_iter().collect(),
+        _ => unreachable!("controlled WGPU comparison only uses affine schedulers"),
     }
 }
 
@@ -583,8 +603,9 @@ fn case_threshold(case: RankCase) -> String {
     }
 }
 
-/// Measures the global and Rayon-sharded DAG schedulers with a controlled,
-/// interleaved rank-executor comparison.
+/// Measures the global DAG, saturated serial residual, and Rayon-sharded
+/// DAG/residual schedulers with a controlled, interleaved rank-executor
+/// comparison.
 ///
 /// Construction only measures host preparation and device enqueue. A separate
 /// first forced query accounts for any deferred synchronization and pipeline
@@ -625,7 +646,12 @@ fn bench_wgpu_backend(
         ready_stats.gpu_probes,
     );
 
-    let modes = [("dag", Mode::Dag), ("par-dag", Mode::ParDag)];
+    let modes = [
+        ("dag", Mode::Dag),
+        ("residual", Mode::Residual),
+        ("par-dag", Mode::ParDag),
+        ("par-residual", Mode::ParResidual),
+    ];
     println!(
         "\n== Controlled SuccinctArchive rank executors ({} Rayon threads) ==",
         rayon::current_num_threads(),
@@ -762,6 +788,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     assert!(reps > 0, "reps must be at least one");
+    #[cfg(feature = "gpu")]
+    let controlled_gpu_only = std::env::var_os("TRIBLES_WGPU_ONLY").is_some();
+    #[cfg(not(feature = "gpu"))]
+    let controlled_gpu_only = false;
 
     eprintln!(
         "block row cap: {}",
@@ -779,15 +809,19 @@ fn main() {
         t0.elapsed()
     );
 
-    println!("\n== TribleSet backend (default blocked delegation) ==");
-    bench_backend("reconverge 24-route", &kb, markers, expected, reps);
+    if !controlled_gpu_only {
+        println!("\n== TribleSet backend (default blocked delegation) ==");
+        bench_backend("reconverge 24-route", &kb, markers, expected, reps);
+    }
 
     let t0 = Instant::now();
     let archive: SuccinctArchive<OrderedUniverse> = (&kb).into();
     eprintln!("\narchive built in {:?}", t0.elapsed());
 
-    println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
-    bench_backend("reconverge 24-route", &archive, markers, expected, reps);
+    if !controlled_gpu_only {
+        println!("\n== SuccinctArchive backend (batched blocked overrides) ==");
+        bench_backend("reconverge 24-route", &archive, markers, expected, reps);
+    }
 
     #[cfg(feature = "gpu")]
     {

@@ -440,7 +440,7 @@ impl StateDesc {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct StateId(u32);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StateInterner {
     by_desc: HashMap<StateDesc, StateId>,
     descs: Vec<StateDesc>,
@@ -749,6 +749,32 @@ impl StateBucket {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
+        }
+    }
+
+    /// Bisects one affine payload into two independently executable shards.
+    ///
+    /// Row phases split on row boundaries. Candidate phases split either on
+    /// complete parent groups or, once the exact residual continuation is
+    /// page-local, on candidate-occurrence boundaries. The latter may copy
+    /// one parent binding into both shards, but every speculative candidate
+    /// remains owned by exactly one side.
+    #[cfg(feature = "parallel")]
+    fn split_for_parallel(&mut self, stride: usize, candidate_pages: bool) -> Option<Self> {
+        match self {
+            StateBucket::Rows(batch) if batch.row_count >= 2 => {
+                let right_rows = batch.row_count / 2;
+                Some(self.take_tail(stride, right_rows, false))
+            }
+            StateBucket::Candidates(batch) if candidate_pages && batch.candidate_count() >= 2 => {
+                let right_candidates = batch.candidate_count() / 2;
+                Some(self.take_tail(stride, right_candidates, true))
+            }
+            StateBucket::Candidates(batch) if !candidate_pages && batch.parents.row_count >= 2 => {
+                let right_parents = batch.parents.row_count / 2;
+                Some(self.take_tail(stride, right_parents, false))
+            }
+            StateBucket::Rows(_) | StateBucket::Candidates(_) => None,
         }
     }
 
@@ -1637,6 +1663,164 @@ impl ResidualStateMachine {
     }
 }
 
+#[cfg(feature = "parallel")]
+impl ResidualStateMachine {
+    /// Construct an empty sibling with the same exact-state vocabulary and
+    /// scheduler policy. Affine payload is moved into it by
+    /// [`split_for_parallel`](Self::split_for_parallel).
+    fn parallel_sibling(&self) -> Self {
+        Self {
+            full: self.full,
+            leaf_count: self.leaf_count,
+            interner: self.interner.clone(),
+            worklist: Worklist::new(),
+            stats: ResidualStateStats::default(),
+            binding: Binding::default(),
+            emit_vars: Vec::new(),
+            emit_rows: Vec::new(),
+            emit_next: 0,
+            emit_count: 0,
+            width: self.width,
+            growth: self.growth,
+            cap: self.cap,
+        }
+    }
+
+    /// Partition the current affine remainder into two independent residual
+    /// worklists without restarting from the seed.
+    ///
+    /// A fresh one-row prefix is advanced through the ordinary state-machine
+    /// transitions until it branches. Fully-bound staged rows split directly;
+    /// worklist rows split on row boundaries; candidate payloads preserve
+    /// whole-parent atomicity unless the plan proves the remaining confirmers
+    /// page-local. If two unsplittable buckets already exist, one whole bucket
+    /// moves to the sibling. Cross-shard reconvergence is deliberately traded
+    /// for parallelism, just as in the affine DAG splitter.
+    fn split_for_parallel<'a>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        plan: &ResidualPlan,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<Self> {
+        loop {
+            debug_assert_eq!(
+                self.emit_next, 0,
+                "parallel residual splits before fold consumption"
+            );
+
+            if self.emit_count >= 2 {
+                let right_count = self.emit_count / 2;
+                let left_count = self.emit_count - right_count;
+                let stride = self.emit_vars.len();
+                debug_assert!(stride > 0, "a zero-variable query has one result");
+
+                let mut right = self.parallel_sibling();
+                right.emit_vars = self.emit_vars.clone();
+                right.emit_rows = self.emit_rows.split_off(left_count * stride);
+                right.emit_count = right_count;
+                self.emit_count = left_count;
+                return Some(right);
+            }
+
+            // A staged singleton is already an exact affine component. Keep
+            // it intact while the other shard owns the remaining worklist.
+            if self.emit_count == 1 && !self.worklist.is_empty() {
+                let mut right = self.parallel_sibling();
+                right.emit_vars = std::mem::take(&mut self.emit_vars);
+                right.emit_rows = std::mem::take(&mut self.emit_rows);
+                right.emit_count = 1;
+                self.emit_count = 0;
+                return Some(right);
+            }
+
+            // Prefer splitting inside one exact state so both workers retain
+            // similarly shaped block-native continuations.
+            let splittable = self.worklist.iter().rev().find_map(|(&rank, level)| {
+                level.iter().rev().find_map(|(&id, bucket)| {
+                    let desc = self.interner.get(id);
+                    let candidate_pages = desc.uses_candidate_pages(plan);
+                    let can_split = match bucket {
+                        StateBucket::Rows(batch) => batch.row_count >= 2,
+                        StateBucket::Candidates(batch) if candidate_pages => {
+                            batch.candidate_count() >= 2
+                        }
+                        StateBucket::Candidates(batch) => batch.parents.row_count >= 2,
+                    };
+                    can_split.then_some((rank, id, candidate_pages))
+                })
+            });
+            if let Some((rank, id, candidate_pages)) = splittable {
+                let desc = self.interner.get(id);
+                let stride = desc.bound.count();
+                let right_bucket = self
+                    .worklist
+                    .get_mut(&rank)
+                    .and_then(|level| level.get_mut(&id))
+                    .and_then(|bucket| bucket.split_for_parallel(stride, candidate_pages))
+                    .expect("selected residual payload is splittable");
+
+                let mut right = self.parallel_sibling();
+                assert!(
+                    right
+                        .worklist
+                        .entry(rank)
+                        .or_default()
+                        .insert(id, right_bucket)
+                        .is_none(),
+                    "fresh residual sibling unexpectedly contained work"
+                );
+                return Some(right);
+            }
+
+            // Distinct state buckets are disjoint affine components even when
+            // neither currently contains two scheduling atoms.
+            let bucket_count: usize = self.worklist.values().map(BTreeMap::len).sum();
+            if bucket_count >= 2 {
+                let (&rank, level) = self
+                    .worklist
+                    .last_key_value()
+                    .expect("two buckets imply a nonempty worklist");
+                let id = *level
+                    .last_key_value()
+                    .expect("live residual rank has a bucket")
+                    .0;
+                let (bucket, remove_level) = {
+                    let level = self
+                        .worklist
+                        .get_mut(&rank)
+                        .expect("selected residual rank exists");
+                    let bucket = level.remove(&id).expect("selected residual state exists");
+                    (bucket, level.is_empty())
+                };
+                if remove_level {
+                    self.worklist.remove(&rank);
+                }
+
+                let mut right = self.parallel_sibling();
+                right.worklist.entry(rank).or_default().insert(id, bucket);
+                return Some(right);
+            }
+
+            if self.worklist.is_empty() {
+                return None;
+            }
+
+            // One unsplittable affine atom remains. Advance the exact machine
+            // rather than manufacturing a second query from the seed.
+            let width = self.width.max(1);
+            match self.pop_once(root, plan, influences, base_estimates, width) {
+                StepOutcome::Advanced => {}
+                StepOutcome::Dead => self.increase_width(),
+                StepOutcome::Emit(rows) => {
+                    self.stage_emit(rows);
+                    self.increase_width();
+                }
+            }
+        }
+    }
+}
+
 /// Demand-driven canonical residual-state execution for any root constraint.
 ///
 /// The iterator begins with a narrow desired actionable width, so full
@@ -1659,6 +1843,10 @@ pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
     state: ResidualStateMachine,
+    /// Whether the serial iterator has been pulled. A started exact remainder
+    /// may still be drained in parallel, but is conservatively kept as one
+    /// Rayon leaf rather than split or restarted.
+    iteration_started: bool,
 }
 
 impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
@@ -1720,6 +1908,7 @@ where
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.iteration_started = true;
         self.state.pull(
             &self.root,
             &self.plan,
@@ -1853,6 +2042,7 @@ where
             influences,
             base_estimates,
             state: ResidualStateMachine::new(full, leaf_count, mode),
+            iteration_started: false,
         }
     }
 
@@ -1912,11 +2102,182 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// Explicit parallel residual execution via Rayon.
+//
+// A fresh residual iterator owns one affine state-machine frontier. Rayon
+// requests at most `workers - 1` splits; each split moves disjoint rows,
+// complete candidate-parent groups, or plan-proven page-local candidate
+// occurrences into a sibling state machine. Constraint and postprocessor
+// clones are created only for an actual sibling, and projected `R` values are
+// never stored in either machine. A serially started iterator is still
+// parallel-consumable, but its exact remainder stays one leaf.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "parallel")]
+pub use parallel::ResidualStateParIter;
+
+#[cfg(feature = "parallel")]
+mod parallel {
+    use super::*;
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    /// Parallel iterator over one affine residual-state frontier.
+    ///
+    /// Construct it explicitly with
+    /// [`Query::into_par_residual_state_iter`] for saturated block-native
+    /// throughput, or convert a configured [`ResidualStateIter`] through
+    /// [`IntoParallelIterator`] to preserve its selected width policy.
+    pub struct ResidualStateParIter<C, P: Fn(&Binding) -> Option<R>, R> {
+        inner: Box<ResidualStateIter<C, P, R>>,
+        split_budget: usize,
+    }
+
+    impl<'a, C, P, R> Query<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        /// Consume a fresh query as a block-native parallel residual iterator.
+        ///
+        /// The exact state machine starts at saturated width because this
+        /// entry point is an explicit full-enumeration throughput request.
+        /// Seed negotiation advances in place until an affine frontier can be
+        /// split; it is never restarted. At most one residual shard per Rayon
+        /// worker is created, and fully drained output preserves the serial
+        /// query's result multiset rather than its order.
+        ///
+        /// Candidate payloads stay parent-atomic across whole-group
+        /// confirmers. Once the compiled continuation proves every remaining
+        /// confirmer page-local, candidate occurrences themselves become
+        /// independent shard atoms.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the query has already been pulled, like the serial
+        /// residual entry points.
+        pub fn into_par_residual_state_iter(self) -> ResidualStateParIter<C, P, R> {
+            let mut residual = self.solve_residual_state_lazy();
+            residual.state.width = residual.state.cap;
+            residual.into_par_iter()
+        }
+    }
+
+    impl<'a, C, P, R> IntoParallelIterator for ResidualStateIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+        type Iter = ResidualStateParIter<C, P, R>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            ResidualStateParIter {
+                inner: Box::new(self),
+                // Derived inside the pool that consumes this iterator.
+                split_budget: 0,
+            }
+        }
+    }
+
+    impl<'a, C, P, R> UnindexedProducer for ResidualStateParIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        fn split(mut self) -> (Self, Option<Self>) {
+            if self.inner.iteration_started || self.split_budget == 0 {
+                self.split_budget = 0;
+                return (self, None);
+            }
+            self.split_budget -= 1;
+
+            let right_state = {
+                let iter = &mut *self.inner;
+                iter.state.split_for_parallel(
+                    &iter.root,
+                    &iter.plan,
+                    &iter.influences,
+                    &iter.base_estimates,
+                )
+            };
+            let Some(right_state) = right_state else {
+                self.split_budget = 0;
+                return (self, None);
+            };
+
+            // Only an actual shard pays for cloning user-owned execution
+            // machinery. The affine state itself is moved, never cloned.
+            let right = ResidualStateIter {
+                root: self.inner.root.clone(),
+                plan: self.inner.plan.clone(),
+                postprocessing: self.inner.postprocessing.clone(),
+                influences: self.inner.influences,
+                base_estimates: self.inner.base_estimates,
+                state: right_state,
+                iteration_started: false,
+            };
+            let left_budget = self.split_budget / 2;
+            let right_budget = self.split_budget - left_budget;
+            self.split_budget = left_budget;
+            (
+                self,
+                Some(ResidualStateParIter {
+                    inner: Box::new(right),
+                    split_budget: right_budget,
+                }),
+            )
+        }
+
+        fn fold_with<F: Folder<R>>(self, mut folder: F) -> F {
+            let ResidualStateParIter {
+                inner: mut iter, ..
+            } = self;
+            while !folder.full() {
+                match iter.next() {
+                    Some(item) => folder = folder.consume(item),
+                    None => break,
+                }
+            }
+            folder
+        }
+    }
+
+    impl<'a, C, P, R> ParallelIterator for ResidualStateParIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        fn drive_unindexed<Con>(mut self, consumer: Con) -> Con::Result
+        where
+            Con: UnindexedConsumer<Self::Item>,
+        {
+            self.split_budget = if self.inner.iteration_started {
+                0
+            } else {
+                rayon::current_num_threads().saturating_sub(1)
+            };
+            bridge_unindexed(self, consumer)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::unionconstraint::UnionConstraint;
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -2199,6 +2560,110 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "parallel")]
+    #[derive(Clone, Copy)]
+    struct ZeroVariableTruth(bool);
+
+    #[cfg(feature = "parallel")]
+    impl Constraint<'static> for ZeroVariableTruth {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_empty()
+        }
+
+        fn estimate(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _out: &mut EstimateSink<'_>,
+        ) -> bool {
+            false
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn satisfied(&self, _view: &RowsView<'_>) -> bool {
+            self.0
+        }
+    }
+
+    /// A concrete root whose manual `Clone` records only the copies paid for
+    /// by actual Rayon siblings.
+    #[cfg(feature = "parallel")]
+    struct CloneCountingFanout {
+        variable: VariableId,
+        values: Arc<Vec<RawInline>>,
+        clones: Arc<AtomicUsize>,
+        proposes: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl Clone for CloneCountingFanout {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                variable: self.variable,
+                values: Arc::clone(&self.values),
+                clones: Arc::clone(&self.clones),
+                proposes: Arc::clone(&self.proposes),
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    impl Constraint<'static> for CloneCountingFanout {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.values.len(), view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.proposes.fetch_add(1, Ordering::Relaxed);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
     #[derive(Clone)]
     struct VerbLeaf {
         variable: VariableId,
@@ -2403,6 +2868,52 @@ mod tests {
     }
 
     type ShapeConstraint = Box<dyn Constraint<'static> + Send + Sync>;
+
+    #[cfg(feature = "parallel")]
+    type ParallelShapeConstraint = Arc<dyn Constraint<'static> + Send + Sync>;
+
+    #[cfg(feature = "parallel")]
+    fn parallel_shape<C>(constraint: C) -> ParallelShapeConstraint
+    where
+        C: Constraint<'static> + Send + Sync + 'static,
+    {
+        Arc::new(constraint)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn with_parallel_workers<R: Send>(threads: usize, operation: impl FnOnce() -> R + Send) -> R {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(operation)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn parallel_paged_filter_fixture(
+        values: Vec<RawInline>,
+        accepted: RawInline,
+    ) -> Arc<IntersectionConstraint<ParallelShapeConstraint>> {
+        let estimate = values.len();
+        Arc::new(IntersectionConstraint::new(vec![
+            parallel_shape(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(values),
+            }),
+            parallel_shape(PageFilterLeaf {
+                variable: 0,
+                estimate: estimate + 1,
+                accepted: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            parallel_shape(PageFilterLeaf {
+                variable: 0,
+                estimate: estimate + 2,
+                accepted: Some(accepted),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ]))
+    }
 
     fn shape_leaf(variable: VariableId) -> ShapeConstraint {
         Box::new(ShapeLeaf(variable))
@@ -3257,6 +3768,317 @@ mod tests {
         assert_eq!(*left_calls.lock().unwrap(), [5, 5]);
         assert_eq!(*right_calls.lock().unwrap(), [5, 5]);
         assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_page_local_sharding_bisects_one_parent_duplicate_run() {
+        let values = vec![
+            raw(0),
+            raw(0),
+            raw(0),
+            raw(1),
+            raw(1),
+            raw(2),
+            raw(2),
+            raw(3),
+            raw(3),
+            raw(4),
+            raw(4),
+            raw(5),
+        ];
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let make = || {
+            Arc::new(IntersectionConstraint::new(vec![
+                parallel_shape(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(values.clone()),
+                }),
+                parallel_shape(PageFilterLeaf {
+                    variable: 0,
+                    estimate: values.len() + 1,
+                    accepted: None,
+                    calls: Arc::clone(&calls),
+                }),
+            ]))
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+
+        let mut one_worker = with_parallel_workers(1, || {
+            Query::new(make(), project)
+                .into_par_residual_state_iter()
+                .collect::<Vec<_>>()
+        });
+        one_worker.sort_unstable();
+        assert_eq!(one_worker, values);
+        assert_eq!(*calls.lock().unwrap(), [values.len()]);
+
+        calls.lock().unwrap().clear();
+        let mut four_workers = with_parallel_workers(4, || {
+            Query::new(make(), project)
+                .into_par_residual_state_iter()
+                .collect::<Vec<_>>()
+        });
+        four_workers.sort_unstable();
+        assert_eq!(four_workers, values);
+
+        let page_sizes = calls.lock().unwrap();
+        assert_eq!(page_sizes.iter().sum::<usize>(), values.len());
+        assert!(page_sizes.len() > 1, "one parent must span several shards");
+        assert!(
+            page_sizes.iter().all(|&size| size < values.len()),
+            "no worker may receive the original complete parent run"
+        );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_staged_emit_split_moves_each_raw_row_once() {
+        let root = FanoutLeaf {
+            variable: 0,
+            values: Arc::new(Vec::new()),
+        };
+        let plan = ResidualPlan::compile(&root);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        machine.emit_vars = vec![0];
+        machine.emit_rows = (0..7).map(raw).collect();
+        machine.emit_count = 7;
+
+        let right = machine
+            .split_for_parallel(
+                &root,
+                &plan,
+                &[VariableSet::new_empty(); 128],
+                &[usize::MAX; 128],
+            )
+            .expect("seven staged rows are splittable");
+
+        assert_eq!(machine.emit_count, 4);
+        assert_eq!(machine.emit_rows, (0..4).map(raw).collect::<Vec<_>>());
+        assert_eq!(right.emit_count, 3);
+        assert_eq!(right.emit_rows, (4..7).map(raw).collect::<Vec<_>>());
+        assert!(machine.worklist.is_empty());
+        assert!(right.worklist.is_empty());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_atomic_custom_and_union_keep_parent_run_whole() {
+        let whole_calls = Arc::new(Mutex::new(Vec::new()));
+        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let custom_root = Arc::new(IntersectionConstraint::new(vec![
+            parallel_shape(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
+            }),
+            parallel_shape(WholeGroupMinimumLeaf {
+                variable: 0,
+                estimate: 5,
+                calls: Arc::clone(&whole_calls),
+            }),
+            parallel_shape(PageFilterLeaf {
+                variable: 0,
+                estimate: 6,
+                accepted: None,
+                calls: Arc::clone(&suffix_calls),
+            }),
+        ]));
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut custom = with_parallel_workers(4, || {
+            Query::new(custom_root, project)
+                .into_par_residual_state_iter()
+                .collect::<Vec<_>>()
+        });
+        custom.sort_unstable();
+        assert_eq!(custom, [raw(1), raw(1)]);
+        assert_eq!(*whole_calls.lock().unwrap(), [4]);
+        let mut custom_suffix = suffix_calls.lock().unwrap().clone();
+        custom_suffix.sort_unstable();
+        assert_eq!(custom_suffix, [1, 1]);
+
+        let left_calls = Arc::new(Mutex::new(Vec::new()));
+        let right_calls = Arc::new(Mutex::new(Vec::new()));
+        let union_suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let union = UnionConstraint::new(vec![
+            PageFilterLeaf {
+                variable: 0,
+                estimate: 10,
+                accepted: Some(raw(0)),
+                calls: Arc::clone(&left_calls),
+            },
+            PageFilterLeaf {
+                variable: 0,
+                estimate: 10,
+                accepted: Some(raw(1)),
+                calls: Arc::clone(&right_calls),
+            },
+        ]);
+        let union_root = Arc::new(IntersectionConstraint::new(vec![
+            parallel_shape(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(vec![raw(0), raw(0), raw(1), raw(1), raw(2)]),
+            }),
+            parallel_shape(union),
+            parallel_shape(PageFilterLeaf {
+                variable: 0,
+                estimate: 30,
+                accepted: None,
+                calls: Arc::clone(&union_suffix_calls),
+            }),
+        ]));
+        let mut union_results = with_parallel_workers(4, || {
+            Query::new(union_root, project)
+                .into_par_residual_state_iter()
+                .collect::<Vec<_>>()
+        });
+        union_results.sort_unstable();
+        assert_eq!(union_results, [raw(0), raw(1)]);
+        assert_eq!(*left_calls.lock().unwrap(), [5]);
+        assert_eq!(*right_calls.lock().unwrap(), [5]);
+        let mut union_suffix = union_suffix_calls.lock().unwrap().clone();
+        union_suffix.sort_unstable();
+        assert_eq!(union_suffix, [1, 1]);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn started_residual_parallel_conversion_drains_exact_remainder_once() {
+        let values: Vec<_> = (0..9).map(raw).collect();
+        let make = || {
+            Arc::new(IntersectionConstraint::new(vec![
+                parallel_shape(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(values.clone()),
+                }),
+                parallel_shape(PageFilterLeaf {
+                    variable: 0,
+                    estimate: values.len() + 1,
+                    accepted: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }),
+            ]))
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+
+        let mut serial = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(64);
+        let first = serial.next();
+        let serial_remainder: Vec<_> = serial.collect();
+
+        let mut started = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(64);
+        assert_eq!(started.next(), first);
+        let parallel_remainder =
+            with_parallel_workers(4, move || started.into_par_iter().collect::<Vec<_>>());
+        assert_eq!(parallel_remainder, serial_remainder);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_residual_matches_early_late_absent_and_zero_column_oracles() {
+        let project = |binding: &Binding| binding.get(0).copied();
+        let values: Vec<_> = (0..64).map(raw).collect();
+        for accepted in [raw(0), raw(63), raw(255)] {
+            let make = || parallel_paged_filter_fixture(values.clone(), accepted);
+            let mut expected: Vec<_> = values
+                .iter()
+                .copied()
+                .filter(|value| *value == accepted)
+                .collect();
+            let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+            let mut dag: Vec<_> = Query::new(make(), project).solve_dag_lazy().collect();
+            let mut residual: Vec<_> = Query::new(make(), project)
+                .solve_residual_state_lazy()
+                .collect();
+            expected.sort_unstable();
+            sequential.sort_unstable();
+            dag.sort_unstable();
+            residual.sort_unstable();
+            assert_eq!(sequential, expected);
+            assert_eq!(dag, expected);
+            assert_eq!(residual, expected);
+            for workers in [1, 4] {
+                let mut parallel = with_parallel_workers(workers, || {
+                    Query::new(make(), project)
+                        .into_par_residual_state_iter()
+                        .collect::<Vec<_>>()
+                });
+                parallel.sort_unstable();
+                assert_eq!(parallel, expected, "workers={workers}");
+            }
+        }
+
+        for truth in [false, true] {
+            let expected = if truth { vec![()] } else { Vec::new() };
+            assert_eq!(
+                Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                    .sequential()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                    .solve_dag_lazy()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                    .solve_residual_state_lazy()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for workers in [1, 4] {
+                let parallel = with_parallel_workers(workers, || {
+                    Query::new(ZeroVariableTruth(truth), |_| Some(()))
+                        .into_par_residual_state_iter()
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(parallel, expected, "truth={truth}, workers={workers}");
+            }
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_residual_clones_only_for_siblings_and_not_projected_rows() {
+        struct NonCloneResult(RawInline);
+
+        let values: Vec<_> = (0..16).map(raw).collect();
+        for workers in [1, 4] {
+            let clones = Arc::new(AtomicUsize::new(0));
+            let proposes = Arc::new(AtomicUsize::new(0));
+            let root = CloneCountingFanout {
+                variable: 0,
+                values: Arc::new(values.clone()),
+                clones: Arc::clone(&clones),
+                proposes: Arc::clone(&proposes),
+            };
+            let results = with_parallel_workers(workers, || {
+                Query::new(root, |binding: &Binding| {
+                    Some(NonCloneResult(*binding.get(0).unwrap()))
+                })
+                .into_par_residual_state_iter()
+                .collect::<Vec<_>>()
+            });
+            let mut raw_results: Vec<_> = results.into_iter().map(|result| result.0).collect();
+            raw_results.sort_unstable();
+            assert_eq!(raw_results, values);
+            assert_eq!(
+                proposes.load(Ordering::Relaxed),
+                1,
+                "parallel negotiation must advance one seed, not restart shards"
+            );
+
+            let clone_count = clones.load(Ordering::Relaxed);
+            if workers == 1 {
+                assert_eq!(clone_count, 0);
+            } else {
+                assert!((1..=workers - 1).contains(&clone_count));
+            }
+        }
     }
 
     #[test]
