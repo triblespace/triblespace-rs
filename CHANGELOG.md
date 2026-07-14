@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The private resident Present arena now computes an exact tri-state sibling
+  confirmation mask without readback.** Stable per-variable arm CSR keeps
+  duplicate source patterns distinct and identifies the exact proposer to skip;
+  one candidate-major seven-array kernel validates code, owner, segment,
+  proposer, every relevant descriptor, and proposer membership, then reduces
+  cached Entity/Attribute/Value membership to `keep`, semantic `drop`, or
+  invariant poison. Capacity-tail words remain the canonical zero scan identity,
+  while malformed later siblings still poison candidates already rejected by an
+  earlier valid sibling. The mask stays private and provisional until stable
+  survivor compaction publishes confirmed children.
 - **A private schema-specialized resident round now wires exact support through
   provisional Present children without an intermediate readback.** One cached
   admission rejects terminal and non-Present schemas before producer kernels;

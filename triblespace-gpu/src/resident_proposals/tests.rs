@@ -1551,6 +1551,7 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             .upload_u32(&[RESIDENT_U32_SENTINEL; CANDIDATE_RECORD_FIELDS])
             .unwrap(),
         child_body: context.upload_u32(&poison).unwrap(),
+        confirmation_keep: context.upload_u32(&[0]).unwrap(),
         stage_profiles: None,
     };
     let inspection = arena.inspect();

@@ -552,7 +552,7 @@ fn wired_capabilities_reject_foreign_frontiers_and_reuse_one_schema_safely() {
 }
 
 #[test]
-fn shared_variable_present_arms_are_explicitly_a_preconfirmation_superset() {
+fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_dominates() {
     let entity = ordered_id(0, 1);
     let value = ordered_id(2, 1);
     let attributes = [ordered_id(1, 1), ordered_id(1, 2)];
@@ -561,20 +561,60 @@ fn shared_variable_present_arms_are_explicitly_a_preconfirmation_superset() {
     insert(&mut set, entity, attributes[1], value);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
-    let variables = (0..5).map(ProgramVariable::new).collect::<Vec<_>>();
+    let seed = ProgramFrontier::seed();
+
+    // One pattern gives every candidate exactly one relevant Present arm. Its
+    // live confirmation words are one, while the full capacity tail stays at
+    // the canonical scan identity zero.
+    {
+        let live_variables = (0..3).map(ProgramVariable::new).collect::<Vec<_>>();
+        let live_program = QueryProgram::compile(
+            gpu.archive(),
+            3,
+            [QueryPattern::new(
+                live_variables[0],
+                live_variables[1],
+                live_variables[2],
+            )],
+        )
+        .unwrap();
+        let live_wired = WgpuResidentWiredRound::new(&gpu, &live_program, &[]).unwrap();
+        let live_resident = live_wired.upload_frontier(&seed).unwrap();
+        let live_round = live_wired.staged_round();
+        let live_inputs = live_round.initialize_inputs(&live_resident).unwrap();
+        let live_choices = live_round.enqueue(&live_inputs).unwrap();
+        let live_arena = live_round
+            .enqueue_present_proposals(&live_resident, &live_choices, 4)
+            .unwrap();
+        let live_inspection = live_arena.inspect();
+        let live_len = live_inspection.logical_len as usize;
+        assert!(live_len > 0 && live_len < 4);
+        let live_keep = live_arena.read_confirmation_keep_for_test();
+        assert!(live_keep[..live_len].iter().all(|&word| word == 1));
+        assert!(live_keep[live_len..].iter().all(|&word| word == 0));
+    }
+
+    let variables = (0..7).map(ProgramVariable::new).collect::<Vec<_>>();
     let program = QueryProgram::compile(
         gpu.archive(),
-        5,
+        7,
         [
             QueryPattern::new(variables[0], variables[1], variables[2]),
             QueryPattern::new(variables[3], variables[4], variables[0]),
+            QueryPattern::new(variables[5], variables[0], variables[6]),
         ],
     )
     .unwrap();
     let wired = WgpuResidentWiredRound::new(&gpu, &program, &[]).unwrap();
-    let seed = ProgramFrontier::seed();
     let resident = wired.upload_frontier(&seed).unwrap();
-    let provisional = wired.enqueue(&resident, 4).unwrap().inspect();
+    let round = wired.staged_round();
+    let inputs = round.initialize_inputs(&resident).unwrap();
+    let choices = round.enqueue(&inputs).unwrap();
+    let arena = round
+        .enqueue_present_proposals(&resident, &choices, 4)
+        .unwrap();
+    assert_eq!(arena.read_confirmation_keep_for_test()[0], 0);
+    let provisional = arena.inspect();
     assert_success(&provisional, 1);
 
     let confirmed = program.transition(&seed).unwrap();
@@ -584,6 +624,35 @@ fn shared_variable_present_arms_are_explicitly_a_preconfirmation_superset() {
         variables[0].index() as u32
     );
     assert_eq!(provisional.segments[0].count, 1);
+
+    let relevant = round.metadata().relevant_arm_ids(variables[0]).unwrap();
+    assert_eq!(relevant.len(), 3);
+    let mut descriptors = lower_present_admission(round).unwrap().arm_descriptors;
+    let relevant_axes = relevant
+        .iter()
+        .map(|&arm| descriptors[arm as usize * ARM_DESCRIPTOR_WORDS + 1])
+        .collect::<Vec<_>>();
+    assert_eq!(relevant_axes, [0, 2, 1]);
+    assert_eq!(provisional.proposer_arms[0], relevant[0]);
+
+    // The Value sibling has already rejected this candidate. Corrupt only the
+    // later Attribute sibling: confirmation must still validate it and report
+    // poison rather than allowing the earlier semantic rejection to mask it.
+    let later_sibling = relevant[2] as usize * ARM_DESCRIPTOR_WORDS;
+    descriptors[later_sibling + 1] = 3;
+    let poisoned = round
+        .enqueue_present_proposals_with_trusted_descriptors_for_test(
+            &resident,
+            &choices,
+            4,
+            &descriptors,
+        )
+        .unwrap();
+    assert_eq!(
+        poisoned.read_confirmation_keep_for_test()[0],
+        RESIDENT_U32_SENTINEL
+    );
+    assert_success(&poisoned.inspect(), 1);
 }
 
 fn extension_set(include_second_entity: bool) -> (TribleSet, Id, Id) {

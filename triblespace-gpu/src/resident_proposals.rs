@@ -7,13 +7,15 @@
 //! the grouping operation: no sort, cutoff, deduplication, or cross-row choice
 //! exists anywhere in the pipeline.
 //!
-//! The arena is deliberately crate-private and provisional. It contains no
-//! sibling confirmation and is not a public query transition. Every semantic
-//! buffer starts poisoned; one sticky finalizer records either a complete
-//! provisional batch or an error, candidate generation runs only for the
-//! former, and Jerky's logical length remains zero until the indirect child
-//! materializer finishes. Insufficient capacity and malformed device choices
-//! can therefore never expose a partial prefix.
+//! The arena is deliberately crate-private and provisional. A candidate-major
+//! kernel computes exact tri-state confirmation for the currently admitted
+//! all-Present domain, but stable survivor compaction is deferred, so the
+//! published arena remains the pre-confirmation superset rather than a public
+//! query transition. Every semantic buffer starts poisoned; one sticky
+//! finalizer records either a complete provisional batch or an error, candidate
+//! generation runs only for the former, and Jerky's logical length remains zero
+//! until the indirect child materializer finishes. Insufficient capacity and
+//! malformed device choices can therefore never expose a partial prefix.
 //!
 //! Scratch and immutable plan regions are physically packed. The largest
 //! shader has seven user storage arrays, reserving baseline WGPU's eighth slot
@@ -28,10 +30,10 @@
 //! same exact indirect rectangle drives child materialization.
 //!
 //! The poison-filled canonical child body is likewise a reference artifact in
-//! this slice: it proves insertion and ordered parity. Sibling confirmation can
-//! resolve sources from candidate code + owner + the exact parent frontier, so
-//! a production successor may defer body materialization until after survivor
-//! compaction instead of copying candidates that will be rejected.
+//! this slice: it proves insertion and ordered parity. Confirmation resolves
+//! every relevant Present descriptor from the candidate code, owner, proposer,
+//! and immutable per-variable CSR; its private keep vector will drive a later
+//! stable compaction into distinct final buffers.
 
 #![allow(dead_code)] // The following resident confirmation slice consumes this arena.
 
@@ -169,6 +171,9 @@ pub(crate) struct WgpuResidentProposals {
     segment_records: DeviceU32Buffer<WgpuRuntime>,
     candidate_records: DeviceU32Buffer<WgpuRuntime>,
     child_body: DeviceU32Buffer<WgpuRuntime>,
+    /// Tri-state Present-sibling result for every provisional destination.
+    /// This remains private until the following stable-compaction slice.
+    confirmation_keep: DeviceU32Buffer<WgpuRuntime>,
     #[cfg(test)]
     stage_profiles: Option<ProposalStageProfiles>,
 }
@@ -181,6 +186,11 @@ struct ProposalStageProfiles {
 
 struct PresentAdmission {
     arm_descriptors: Vec<u32>,
+    /// CSR offsets for stable relevant-arm slices, one entry per variable plus
+    /// the terminal arm count.
+    variable_offsets: Vec<u32>,
+    /// Stable global arm IDs concatenated in variable order.
+    variable_arms: Vec<u32>,
     segment_specs: Vec<u32>,
     variable_to_segment: Vec<u32>,
     segment_count: usize,
@@ -240,6 +250,8 @@ struct WorkspaceLayout {
 #[derive(Clone, Copy)]
 struct PlanLayout {
     arm_descriptors: usize,
+    variable_offsets: usize,
+    variable_arms: usize,
     segment_specs: usize,
     variable_to_segment: usize,
 }
@@ -568,6 +580,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let mut segment_records = context.empty_u32(segment_record_words)?;
         let mut candidate_records = context.empty_u32(candidate_record_words)?;
         let mut child_body = context.empty_u32(child_words)?;
+        let mut confirmation_keep = context.empty_u32(capacity)?;
 
         let poison_len = segment_record_words.max(capacity).max(child_words);
         if poison_len != 0 {
@@ -581,6 +594,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     segment_records.output_arg(),
                     candidate_records.output_arg(),
                     child_body.output_arg(),
+                    confirmation_keep.output_arg(),
                     segment_record_words as u32,
                     capacity as u32,
                     child_words as u32,
@@ -694,6 +708,37 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         #[cfg(not(test))]
         launch_candidates();
 
+        // One invocation confirms one provisional destination against every
+        // stable relevant Present arm. The exact proposer arm is structurally
+        // validated but skipped semantically, matching QueryProgram's
+        // propose-then-confirm contract. This tri-state vector is deliberately
+        // not yet published: the next slice performs its stable compaction.
+        unsafe {
+            confirm_present_candidates::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dynamic_dispatch.cube_count(),
+                dynamic_dispatch.cube_dim(),
+                plan.input_arg(),
+                segment_records.input_arg(),
+                candidate_records.input_arg(),
+                self.archive().present_entity_codes().input_arg(),
+                self.archive().present_attribute_codes().input_arg(),
+                self.archive().present_value_codes().input_arg(),
+                confirmation_keep.output_arg(),
+                inputs.rows as u32,
+                admission.segment_count as u32,
+                capacity as u32,
+                domain,
+                self.metadata().variable_count() as u32,
+                self.metadata().arms().len() as u32,
+                plan_layout.arm_descriptors as u32,
+                plan_layout.variable_offsets as u32,
+                plan_layout.variable_arms as u32,
+                plan_layout.variable_to_segment as u32,
+                RESIDENT_U32_SENTINEL,
+            );
+        }
+
         // The child materializer consumes the same published indirect record;
         // neither indirect consumer binds that exclusive buffer as storage.
         let arm_count = self.metadata().arms().len() as u32;
@@ -764,6 +809,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             segment_records,
             candidate_records,
             child_body,
+            confirmation_keep,
             #[cfg(test)]
             stage_profiles: match (candidate_profile, child_body_profile) {
                 (Some(candidates), Some(child_body)) => Some(ProposalStageProfiles {
@@ -817,6 +863,20 @@ fn lower_present_admission<U: Universe>(
         }
     }
 
+    let mut variable_offsets = Vec::with_capacity(metadata.variable_count() + 1);
+    let mut variable_arms = Vec::with_capacity(arm_count);
+    variable_offsets.push(0);
+    for variable in 0..metadata.variable_count() {
+        let variable = ProgramVariable::new(variable as u8);
+        let relevant = metadata.relevant_arm_ids(variable)?;
+        variable_arms.extend_from_slice(relevant);
+        ensure_below_sentinel(variable_arms.len(), "Present relevant-arm CSR")?;
+        variable_offsets.push(variable_arms.len() as u32);
+    }
+    if variable_arms.len() != arm_count {
+        return Err(ResidentProposalError::MalformedPlan);
+    }
+
     let bound = metadata.bound_variables();
     let mut segment_specs = Vec::new();
     let mut variable_to_segment = vec![RESIDENT_U32_SENTINEL; metadata.variable_count()];
@@ -836,6 +896,8 @@ fn lower_present_admission<U: Universe>(
 
     Ok(PresentAdmission {
         arm_descriptors,
+        variable_offsets,
+        variable_arms,
         segment_specs,
         variable_to_segment,
         segment_count,
@@ -937,6 +999,14 @@ fn packed_plan(
     let mut words = 0usize;
     let arm_descriptors = reserve_words(&mut words, descriptors.len(), "proposal plan")?;
     plan.extend_from_slice(descriptors);
+    let variable_offsets = reserve_words(
+        &mut words,
+        admission.variable_offsets.len(),
+        "proposal plan",
+    )?;
+    plan.extend_from_slice(&admission.variable_offsets);
+    let variable_arms = reserve_words(&mut words, admission.variable_arms.len(), "proposal plan")?;
+    plan.extend_from_slice(&admission.variable_arms);
     let segment_specs = reserve_words(&mut words, admission.segment_specs.len(), "proposal plan")?;
     plan.extend_from_slice(&admission.segment_specs);
     let variable_to_segment = reserve_words(
@@ -950,6 +1020,8 @@ fn packed_plan(
         plan,
         PlanLayout {
             arm_descriptors,
+            variable_offsets,
+            variable_arms,
             segment_specs,
             variable_to_segment,
         },
@@ -1351,6 +1423,7 @@ fn poison_proposal_outputs(
     segment_records: &mut Array<u32>,
     candidate_records: &mut Array<u32>,
     child_body: &mut Array<u32>,
+    confirmation_keep: &mut Array<u32>,
     segment_words: u32,
     capacity: u32,
     child_words: u32,
@@ -1364,6 +1437,9 @@ fn poison_proposal_outputs(
         candidate_records[position] = dead;
         candidate_records[capacity as usize + position] = dead;
         candidate_records[capacity as usize * 2usize + position] = dead;
+        // The confirmation scan's eventual tail contribution is canonical
+        // zero. Active indirect lanes overwrite this with tri-state output.
+        confirmation_keep[position] = 0u32;
     }
     if position < child_words as usize {
         child_body[position] = dead;
@@ -1533,6 +1609,273 @@ fn generate_present_candidates_by_destination(
 }
 
 #[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn confirm_present_candidates(
+    plan: &Array<u32>,
+    segment_records: &Array<u32>,
+    candidate_records: &Array<u32>,
+    present_entities: &Array<u32>,
+    present_attributes: &Array<u32>,
+    present_values: &Array<u32>,
+    keep: &mut Array<u32>,
+    rows: u32,
+    segment_count: u32,
+    capacity: u32,
+    domain: u32,
+    variable_count: u32,
+    arm_count: u32,
+    arm_descriptors_base: u32,
+    variable_offsets_base: u32,
+    variable_arms_base: u32,
+    variable_to_segment_base: u32,
+    dead: u32,
+) {
+    let source = ABSOLUTE_POS;
+    if source < capacity as usize && source < keep.len() {
+        // The static initializer gives every capacity-tail lane semantic zero.
+        // An indirectly dispatched active lane first becomes poison and only a
+        // complete validation below may publish zero or one.
+        let mut total = dead;
+        if segment_count != 0u32
+            && segment_count as usize <= segment_records.len() / SEGMENT_RECORD_WORDS
+        {
+            let last_record = (segment_count as usize - 1usize) * SEGMENT_RECORD_WORDS;
+            let base = segment_records[last_record];
+            let count = segment_records[last_record + 1usize];
+            if base != dead && count != dead && count < dead - base {
+                total = base + count;
+            }
+        }
+
+        if total == dead {
+            keep[source] = dead;
+        } else if source < total as usize {
+            keep[source] = dead;
+            let mut invariant = false;
+            let mut supported = true;
+
+            if capacity as usize * CANDIDATE_RECORD_FIELDS > candidate_records.len() {
+                invariant = true;
+            }
+
+            // Locate the unique provisional segment containing this source.
+            let source_u32 = source as u32;
+            let mut segment_lo = 0u32;
+            let mut segment_hi = segment_count;
+            while segment_lo < segment_hi {
+                let segment_mid = segment_lo + (segment_hi - segment_lo) / 2u32;
+                let record = segment_mid as usize * SEGMENT_RECORD_WORDS;
+                let mut segment_end = dead;
+                if record + 1usize < segment_records.len() {
+                    let base = segment_records[record];
+                    let count = segment_records[record + 1usize];
+                    if base != dead && count != dead && count < dead - base {
+                        segment_end = base + count;
+                    }
+                }
+                if segment_end <= source_u32 {
+                    segment_lo = segment_mid + 1u32;
+                } else {
+                    segment_hi = segment_mid;
+                }
+            }
+
+            let mut variable = dead;
+            if segment_lo < segment_count {
+                let record = segment_lo as usize * SEGMENT_RECORD_WORDS;
+                if record + 3usize < segment_records.len() {
+                    let base = segment_records[record];
+                    let count = segment_records[record + 1usize];
+                    if base != dead && count != dead && count < dead - base {
+                        let end = base + count;
+                        if source_u32 >= base && source_u32 < end {
+                            variable = segment_records[record + 2usize];
+                        }
+                    }
+                }
+            }
+            if variable >= variable_count {
+                invariant = true;
+            }
+
+            let mut candidate = dead;
+            let mut owner = dead;
+            let mut proposer = dead;
+            if source < capacity as usize
+                && capacity as usize * CANDIDATE_RECORD_FIELDS <= candidate_records.len()
+            {
+                candidate = candidate_records[source];
+                owner = candidate_records[capacity as usize + source];
+                proposer = candidate_records[capacity as usize * 2usize + source];
+            }
+            if candidate >= domain || owner >= rows || proposer >= arm_count {
+                invariant = true;
+            }
+
+            // The segment selected by the candidate's variable must agree with
+            // both the immutable variable map and the proposer's descriptor.
+            if variable < variable_count
+                && variable_to_segment_base as usize + (variable as usize) < plan.len()
+            {
+                if plan[variable_to_segment_base as usize + variable as usize] != segment_lo {
+                    invariant = true;
+                }
+            } else {
+                invariant = true;
+            }
+
+            if proposer < arm_count {
+                let descriptor =
+                    arm_descriptors_base as usize + proposer as usize * ARM_DESCRIPTOR_WORDS;
+                if descriptor + 2usize >= plan.len() || plan[descriptor] != variable {
+                    invariant = true;
+                }
+            }
+
+            let mut start = dead;
+            let mut end = dead;
+            if variable < variable_count {
+                let offset = variable_offsets_base as usize + variable as usize;
+                if offset + 1usize < plan.len() {
+                    start = plan[offset];
+                    end = plan[offset + 1usize];
+                }
+            }
+            if start == dead || end == dead || start >= end || end > arm_count {
+                invariant = true;
+            }
+
+            // The three resident present lists are sorted. Cache membership
+            // once per candidate so every relevant descriptor selects from
+            // the same result rather than repeating a binary search.
+            let mut entity_lo = 0usize;
+            let mut entity_hi = present_entities.len();
+            while entity_lo < entity_hi {
+                let mid = entity_lo + (entity_hi - entity_lo) / 2usize;
+                if present_entities[mid] < candidate {
+                    entity_lo = mid + 1usize;
+                } else {
+                    entity_hi = mid;
+                }
+            }
+            let entity_member =
+                entity_lo < present_entities.len() && present_entities[entity_lo] == candidate;
+
+            let mut attribute_lo = 0usize;
+            let mut attribute_hi = present_attributes.len();
+            while attribute_lo < attribute_hi {
+                let mid = attribute_lo + (attribute_hi - attribute_lo) / 2usize;
+                if present_attributes[mid] < candidate {
+                    attribute_lo = mid + 1usize;
+                } else {
+                    attribute_hi = mid;
+                }
+            }
+            let attribute_member = attribute_lo < present_attributes.len()
+                && present_attributes[attribute_lo] == candidate;
+
+            let mut value_lo = 0usize;
+            let mut value_hi = present_values.len();
+            while value_lo < value_hi {
+                let mid = value_lo + (value_hi - value_lo) / 2usize;
+                if present_values[mid] < candidate {
+                    value_lo = mid + 1usize;
+                } else {
+                    value_hi = mid;
+                }
+            }
+            let value_member =
+                value_lo < present_values.len() && present_values[value_lo] == candidate;
+
+            let mut proposer_occurrences: u32 = 0u32;
+            let mut previous_arm = 0u32;
+            let mut have_previous_arm = false;
+            if start != dead && end != dead && start <= end && end <= arm_count {
+                let mut cursor = start;
+                while cursor < end {
+                    let arm_word = variable_arms_base as usize + cursor as usize;
+                    let mut arm = dead;
+                    if arm_word < plan.len() {
+                        arm = plan[arm_word];
+                    }
+                    if arm >= arm_count || (have_previous_arm && arm <= previous_arm) {
+                        invariant = true;
+                    }
+                    previous_arm = arm;
+                    have_previous_arm = true;
+
+                    if arm == proposer {
+                        proposer_occurrences = proposer_occurrences + 1u32;
+                    }
+
+                    if arm < arm_count {
+                        let descriptor =
+                            arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
+                        if descriptor + 2usize < plan.len() {
+                            let target = plan[descriptor];
+                            let axis = plan[descriptor + 1usize];
+                            let expected = plan[descriptor + 2usize];
+                            let mut descriptor_valid = target == variable;
+                            if axis == 0u32 {
+                                descriptor_valid =
+                                    descriptor_valid && expected as usize == present_entities.len();
+                            } else if axis == 1u32 {
+                                descriptor_valid = descriptor_valid
+                                    && expected as usize == present_attributes.len();
+                            } else if axis == 2u32 {
+                                descriptor_valid =
+                                    descriptor_valid && expected as usize == present_values.len();
+                            } else {
+                                descriptor_valid = false;
+                            }
+                            if !descriptor_valid {
+                                invariant = true;
+                            }
+
+                            let mut member = false;
+                            if axis == 0u32 {
+                                member = entity_member;
+                            } else if axis == 1u32 {
+                                member = attribute_member;
+                            } else if axis == 2u32 {
+                                member = value_member;
+                            }
+
+                            // QueryProgram skips exactly the proposer arm. Every
+                            // sibling descriptor is still visited after a miss,
+                            // allowing later invariant poison to dominate.
+                            if descriptor_valid && candidate < domain {
+                                if arm == proposer {
+                                    if !member {
+                                        invariant = true;
+                                    }
+                                } else {
+                                    supported = supported && member;
+                                }
+                            }
+                        } else {
+                            invariant = true;
+                        }
+                    }
+                    cursor += 1u32;
+                }
+            }
+            if proposer_occurrences != 1u32 {
+                invariant = true;
+            }
+
+            if invariant {
+                keep[source] = dead;
+            } else if supported {
+                keep[source] = 1u32;
+            } else {
+                keep[source] = 0u32;
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
 fn publish_present_dispatch(control: &Array<u32>, dispatch: &mut Array<u32>, ok: u32) {
     if ABSOLUTE_POS == 0 {
         if control[CONTROL_STATUS] == ok {
@@ -1669,6 +2012,13 @@ struct ResolvedProposalStageProfiles {
 
 #[cfg(test)]
 impl WgpuResidentProposals {
+    /// Reads the private tri-state confirmation workspace for focused semantic
+    /// tests. Ordinary inspection intentionally continues to expose the
+    /// provisional arena until stable survivor compaction is implemented.
+    fn read_confirmation_keep_for_test(&self) -> Vec<u32> {
+        self.confirmation_keep.read()
+    }
+
     fn resolve_stage_profiles(&mut self) -> ResolvedProposalStageProfiles {
         let profiles = self
             .stage_profiles
