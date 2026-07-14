@@ -12,10 +12,13 @@
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by a uniform semantic action, and file explicit Propose or
 //! Confirm descriptors without invoking either protocol verb. The action state
-//! is what calls one flattened leaf. Under minimum-rank harvest scheduling,
-//! separately planned groups can therefore assemble in one canonical action
-//! bucket before the protocol call; maximum-rank sprinting deliberately keeps
-//! its low-latency execute-before-remainder behavior.
+//! is what calls one flattened leaf. Occupancy scheduling chooses the deepest
+//! live bucket able to fill the desired parent-atom width; if none can, it
+//! drains the minimum-rank bucket through the strict readiness gate. Separately
+//! planned groups can therefore assemble in one canonical action bucket
+//! without sacrificing width-one depth-first latency. Parent atoms are a
+//! semantics-safe chunking unit, not a total-work estimate: ragged candidate
+//! fanout can make equally wide Confirm buckets cost different amounts.
 //!
 //! As with the other batched engines, flattened leaves must obey the
 //! [`Constraint::estimate`] protocol: relevance is a structural answer,
@@ -124,13 +127,16 @@ pub struct ResidualStateStats {
     pub propose_action_pops: usize,
     /// Explicit confirmation-action chunks that invoked one flattened leaf.
     pub confirm_action_pops: usize,
-    /// Bucket chunks processed while the geometric scheduler was below its
-    /// saturation cap and therefore diving by maximum rank.
-    pub sprint_pops: usize,
-    /// Bucket chunks processed at the saturation cap and therefore drained
-    /// through the minimum-rank readiness gate. The eager solver counts every
-    /// one of its saturated pops here.
-    pub harvest_pops: usize,
+    /// Terminal Ready-state chunks emitted for projection.
+    pub emit_pops: usize,
+    /// Full parent-atom-width chunks selected from the maximum eligible rank.
+    /// This is occupancy, not total Confirm work when candidate fanout is
+    /// ragged.
+    pub full_pops: usize,
+    /// Underfilled buckets drained through the minimum-rank readiness gate
+    /// because no live state could fill the desired width. The eager solver
+    /// counts every one of its readiness-gated pops here.
+    pub readiness_pops: usize,
     /// Pops that left unprocessed parent rows live under the same state.
     pub partial_pops: usize,
     /// Filings that reopened an interned state after its live bucket had
@@ -1118,7 +1124,10 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
     stats: &mut ResidualStateStats,
 ) -> Option<RowBatch> {
     match (&desc.phase, bucket) {
-        (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => Some(rows),
+        (ResidualPhase::Ready, StateBucket::Rows(rows)) if desc.bound == full => {
+            stats.emit_pops += 1;
+            Some(rows)
+        }
         (ResidualPhase::Ready, StateBucket::Rows(rows)) => {
             stats.ready_plan_pops += 1;
             ready_plan_transition(
@@ -1185,9 +1194,9 @@ fn execute_state<'a, C: Constraint<'a> + 'a>(
 
 /// Resumable execution state for [`ResidualStateIter`].
 ///
-/// The exact interner deliberately outlives live buckets. Sprint scheduling
-/// may process a state before all of its lower-rank feeders, after which a
-/// later filing simply reopens the same interned descriptor.
+/// The exact interner deliberately outlives live buckets. Occupancy scheduling
+/// may process a full state before all of its lower-rank feeders, after which
+/// a later filing simply reopens the same interned descriptor.
 struct ResidualStateMachine {
     full: VariableSet,
     leaf_count: usize,
@@ -1238,39 +1247,44 @@ impl ResidualStateMachine {
         state
     }
 
-    /// Removes one width-bounded chunk from the next state.
+    /// Removes one batch-filling chunk from the next state.
     ///
-    /// Below the cap, maximum rank gives the depth-first sprint: every child
-    /// outranks its parent's live remainder. At the cap, minimum rank is the
-    /// readiness gate: strict rank growth means no drained state can receive a
-    /// future filing. Partial remainders are reinserted directly and are not
+    /// The deepest bucket that can supply the complete desired parent-atom
+    /// width wins. If no bucket is large enough, the minimum-rank bucket is
+    /// drained instead; strict rank growth makes that underfilled pop
+    /// readiness-safe. Thus width one preserves maximum-rank, highest-ID
+    /// traversal, while a width above every live bucket is exact minimum-rank
+    /// scheduling. Partial remainders are reinserted directly and are not
     /// counted as canonical merges or reentries.
     fn take_next(&mut self, width: usize) -> Option<(StateDesc, StateBucket)> {
-        let sprint = width < self.cap;
-        let rank = if sprint {
-            *self.worklist.last_key_value()?.0
+        let width = width.max(1);
+        let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
+            level
+                .iter()
+                .rev()
+                .find_map(|(&id, bucket)| (bucket.row_count() >= width).then_some((rank, id)))
+        });
+        let (rank, id, is_full) = if let Some((rank, id)) = full_state {
+            (rank, id, true)
         } else {
-            *self.worklist.first_key_value()?.0
+            let (&rank, level) = self.worklist.first_key_value()?;
+            let (&id, bucket) = level
+                .last_key_value()
+                .expect("residual rank has a live state");
+            assert!(
+                bucket.row_count() < width,
+                "readiness selected while a full residual bucket existed"
+            );
+            (rank, id, false)
         };
 
-        let (id, mut bucket, remove_level) = {
+        let (mut bucket, remove_level) = {
             let level = self
                 .worklist
                 .get_mut(&rank)
                 .expect("selected residual rank exists");
-            let id = if sprint {
-                *level
-                    .last_key_value()
-                    .expect("residual rank has a live state")
-                    .0
-            } else {
-                *level
-                    .first_key_value()
-                    .expect("residual rank has a live state")
-                    .0
-            };
             let bucket = level.remove(&id).expect("selected residual state exists");
-            (id, bucket, level.is_empty())
+            (bucket, level.is_empty())
         };
         if remove_level {
             self.worklist.remove(&rank);
@@ -1280,7 +1294,9 @@ impl ResidualStateMachine {
         debug_assert_eq!(desc.rank(self.leaf_count), rank);
         let before = bucket.row_count();
         let chunk = bucket.take_tail(desc.bound.count(), width);
-        if bucket.row_count() != 0 {
+        let remainder = bucket.row_count();
+        if remainder != 0 {
+            assert!(is_full, "only a full pop may leave a remainder");
             self.stats.partial_pops += 1;
             assert!(
                 self.worklist
@@ -1291,13 +1307,19 @@ impl ResidualStateMachine {
                 "a residual-state remainder collided with another live bucket"
             );
         }
-        debug_assert_eq!(chunk.row_count(), before.min(width.max(1)));
+        debug_assert_eq!(chunk.row_count(), before.min(width));
+        if is_full {
+            assert!(before >= width, "full residual pop was underfilled");
+        } else {
+            assert!(before < width, "readiness residual pop was full");
+            assert_eq!(remainder, 0, "a readiness pop must drain its bucket");
+        }
 
         self.stats.state_pops += 1;
-        if sprint {
-            self.stats.sprint_pops += 1;
+        if is_full {
+            self.stats.full_pops += 1;
         } else {
-            self.stats.harvest_pops += 1;
+            self.stats.readiness_pops += 1;
         }
         Some((desc, chunk))
     }
@@ -1376,13 +1398,13 @@ impl ResidualStateMachine {
 
 /// Demand-driven canonical residual-state execution for a root intersection.
 ///
-/// The iterator begins with narrow maximum-rank sprint chunks, so a descendant
-/// can produce a result before sibling rows are evaluated. With a growth
-/// factor above one, each engine resumption widens the chunk geometrically.
-/// Once the configured cap is reached, minimum-rank scheduling restores the
-/// eager solver's readiness gate and holds later states until all possible
-/// lower-rank feeders have drained. A growth factor of one deliberately stays
-/// in sprint mode unless its starting width is already at the cap.
+/// The iterator begins with a narrow desired parent-atom width, so full
+/// descendant buckets can produce a result before sibling rows are evaluated.
+/// With a growth factor above one, each output-producing engine resumption
+/// prepares a geometrically wider width for later frontier work. The deepest
+/// live bucket able to fill it wins; if none can, the minimum-rank bucket drains
+/// through the strict readiness gate. The cap only bounds geometric width
+/// growth and does not select a scheduling mode.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
 /// it produces the same result multiset as [`Query::solve_residual_state`].
@@ -1409,8 +1431,7 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
         self
     }
 
-    /// Overrides the saturation cap. At the cap the scheduler switches from
-    /// maximum-rank sprinting to minimum-rank harvest readiness.
+    /// Overrides the geometric width-growth cap.
     ///
     /// Like [`DagIter::cap`](super::DagIter::cap), this never raises the
     /// current width. To start above the default cap, set the new cap first:
@@ -1507,7 +1528,7 @@ where
             let desc = interner.get(id).clone();
             debug_assert_eq!(desc.rank(leaf_count), rank);
             stats.state_pops += 1;
-            stats.harvest_pops += 1;
+            stats.readiness_pops += 1;
             if let Some(rows) = execute_state(
                 root,
                 &plan,
@@ -1556,10 +1577,11 @@ where
 {
     /// Lazily executes a root intersection through canonical residual states.
     ///
-    /// The first pull uses a one-parent sprint by default. Continued pulling
-    /// geometrically widens batches and eventually restores minimum-rank
-    /// harvest readiness. Result order may differ from the ordinary iterator;
-    /// a full drain preserves its result multiset.
+    /// The first pull uses a one-parent depth-first batch by default. Once a
+    /// pull stages output, later engine resumptions geometrically widen the
+    /// desired batch; whenever no live state can fill it, the minimum-rank state
+    /// drains readiness-safely. Result order may differ from the ordinary
+    /// iterator; a full drain preserves its result multiset.
     ///
     /// # Panics
     ///
@@ -1649,7 +1671,7 @@ where
     P: Fn(&Binding) -> Option<R>,
 {
     /// Lazily executes a direct root intersection through canonical residual
-    /// states with geometric sprint-to-harvest scheduling.
+    /// states with geometric batch-fill scheduling.
     ///
     /// # Panics
     ///
@@ -1888,6 +1910,39 @@ mod tests {
         value
     }
 
+    fn ready_desc(bound_count: usize) -> StateDesc {
+        let mut bound = VariableSet::new_empty();
+        for variable in 0..bound_count {
+            bound.set(variable);
+        }
+        StateDesc {
+            bound,
+            phase: ResidualPhase::Ready,
+        }
+    }
+
+    fn ready_bucket(bound_count: usize, row_count: usize, marker: u8) -> StateBucket {
+        StateBucket::Rows(RowBatch {
+            rows: vec![raw(marker); bound_count * row_count],
+            row_count,
+        })
+    }
+
+    fn scheduler_fixture(entries: &[(usize, usize, u8)]) -> ResidualStateMachine {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        for &(bound_count, row_count, marker) in entries {
+            file(
+                &mut machine.worklist,
+                &mut machine.interner,
+                machine.leaf_count,
+                ready_desc(bound_count),
+                ready_bucket(bound_count, row_count, marker),
+                &mut machine.stats,
+            );
+        }
+        machine
+    }
+
     #[test]
     fn box_and_arc_forward_object_safe_residual_shapes() {
         let boxed: Box<dyn Constraint<'static> + Send + Sync> =
@@ -2050,6 +2105,203 @@ mod tests {
         assert_eq!(prefix.parents.rows, [raw(0), raw(1), raw(2)]);
         assert_eq!(prefix.parents.row_count, 3);
         assert_eq!(prefix.candidates, original_candidates);
+    }
+
+    #[test]
+    fn width_one_selects_the_deepest_live_state() {
+        let mut machine = scheduler_fixture(&[(1, 4, 1), (2, 3, 2), (3, 1, 3)]);
+
+        let (desc, chunk) = machine.take_next(1).expect("fixture has live work");
+
+        assert_eq!(desc, ready_desc(3));
+        assert_eq!(chunk.row_count(), 1);
+        assert_eq!(machine.stats.full_pops, 1);
+        assert_eq!(machine.stats.readiness_pops, 0);
+    }
+
+    #[test]
+    fn no_full_bucket_drains_the_minimum_rank_even_if_a_deeper_bucket_is_larger() {
+        let mut machine = scheduler_fixture(&[(1, 2, 1), (2, 7, 2), (3, 5, 3)]);
+
+        let (desc, chunk) = machine.take_next(8).expect("fixture has live work");
+
+        assert_eq!(desc, ready_desc(1));
+        assert_eq!(chunk.row_count(), 2);
+        assert_eq!(machine.stats.full_pops, 0);
+        assert_eq!(machine.stats.readiness_pops, 1);
+        assert_eq!(machine.stats.partial_pops, 0);
+    }
+
+    #[test]
+    fn deepest_full_bucket_wins_over_deeper_underfill_and_shallower_surplus() {
+        let mut machine = scheduler_fixture(&[(1, 16, 1), (2, 9, 2), (3, 8, 3), (4, 7, 4)]);
+
+        let (desc, chunk) = machine.take_next(8).expect("fixture has live work");
+
+        assert_eq!(desc, ready_desc(3));
+        assert_eq!(chunk.row_count(), 8);
+        assert_eq!(machine.stats.full_pops, 1);
+        assert_eq!(machine.stats.readiness_pops, 0);
+        assert_eq!(machine.stats.partial_pops, 0);
+    }
+
+    #[test]
+    fn full_planner_remainder_runs_before_a_deeper_underfilled_action() {
+        let mut machine = scheduler_fixture(&[(1, 4, 1)]);
+        let mut relevant = ChildSet::empty(machine.leaf_count);
+        relevant.insert(0);
+        let propose = StateDesc {
+            bound: ready_desc(1).bound,
+            phase: ResidualPhase::Propose {
+                variable: 127,
+                relevant,
+                proposer: 0,
+            },
+        };
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            machine.leaf_count,
+            propose.clone(),
+            ready_bucket(1, 1, 2),
+            &mut machine.stats,
+        );
+
+        for _ in 0..2 {
+            let (desc, chunk) = machine.take_next(2).expect("fixture has live work");
+            assert_eq!(desc, ready_desc(1));
+            assert_eq!(chunk.row_count(), 2);
+        }
+        let (desc, chunk) = machine.take_next(2).expect("action remains live");
+        assert_eq!(desc, propose);
+        assert_eq!(chunk.row_count(), 1);
+        assert_eq!(machine.stats.full_pops, 2);
+        assert_eq!(machine.stats.readiness_pops, 1);
+        assert_eq!(machine.stats.partial_pops, 1);
+    }
+
+    #[test]
+    fn readiness_ties_use_the_same_highest_state_id_rule_as_full_ties() {
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut first_bound = VariableSet::new_empty();
+        first_bound.set(0);
+        let first = StateDesc {
+            bound: first_bound,
+            phase: ResidualPhase::Ready,
+        };
+        let mut second_bound = VariableSet::new_empty();
+        second_bound.set(1);
+        let second = StateDesc {
+            bound: second_bound,
+            phase: ResidualPhase::Ready,
+        };
+        for (desc, marker) in [(first, 1), (second.clone(), 2)] {
+            file(
+                &mut machine.worklist,
+                &mut machine.interner,
+                machine.leaf_count,
+                desc,
+                ready_bucket(1, 1, marker),
+                &mut machine.stats,
+            );
+        }
+
+        let (desc, chunk) = machine.take_next(2).expect("fixture has live work");
+
+        assert_eq!(desc, second);
+        assert_eq!(chunk.row_count(), 1);
+        assert_eq!(machine.stats.readiness_pops, 1);
+    }
+
+    #[test]
+    fn confirm_occupancy_counts_whole_parents_not_ragged_candidates() {
+        fn confirm_desc() -> StateDesc {
+            let mut relevant = ChildSet::empty(2);
+            relevant.insert(0);
+            relevant.insert(1);
+            let mut checked = ChildSet::empty(2);
+            checked.insert(0);
+            StateDesc {
+                bound: ready_desc(1).bound,
+                phase: ResidualPhase::Confirm {
+                    variable: 127,
+                    relevant,
+                    checked,
+                    confirmer: 1,
+                },
+            }
+        }
+
+        fn candidate_bucket(parent_count: usize) -> StateBucket {
+            let mut candidates = vec![(0, raw(9)); 64];
+            if parent_count == 2 {
+                candidates.push((1, raw(10)));
+            }
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch {
+                    rows: vec![raw(3); parent_count],
+                    row_count: parent_count,
+                },
+                candidates,
+            })
+        }
+
+        let mut underfilled = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
+        for (desc, bucket) in [
+            (ready_desc(1), ready_bucket(1, 2, 1)),
+            (confirm_desc(), candidate_bucket(1)),
+        ] {
+            file(
+                &mut underfilled.worklist,
+                &mut underfilled.interner,
+                underfilled.leaf_count,
+                desc,
+                bucket,
+                &mut underfilled.stats,
+            );
+        }
+
+        let (desc, chunk) = underfilled.take_next(2).expect("ready bucket is full");
+        assert_eq!(desc, ready_desc(1));
+        assert_eq!(chunk.row_count(), 2);
+        let (desc, chunk) = underfilled
+            .take_next(2)
+            .expect("underfilled confirmation remains live");
+        assert_eq!(desc, confirm_desc());
+        match chunk {
+            StateBucket::Candidates(batch) => {
+                assert_eq!(batch.parents.row_count, 1);
+                assert_eq!(batch.candidates.len(), 64);
+                assert!(batch.candidates.iter().all(|(parent, _)| *parent == 0));
+            }
+            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+        }
+
+        let mut full = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
+        for (desc, bucket) in [
+            (ready_desc(1), ready_bucket(1, 2, 1)),
+            (confirm_desc(), candidate_bucket(2)),
+        ] {
+            file(
+                &mut full.worklist,
+                &mut full.interner,
+                full.leaf_count,
+                desc,
+                bucket,
+                &mut full.stats,
+            );
+        }
+
+        let (desc, chunk) = full.take_next(2).expect("confirmation bucket is full");
+        assert_eq!(desc, confirm_desc());
+        match chunk {
+            StateBucket::Candidates(batch) => {
+                assert_eq!(batch.parents.row_count, 2);
+                assert_eq!(batch.candidates.len(), 65);
+                assert_eq!(batch.candidates.last().map(|(parent, _)| *parent), Some(1));
+            }
+            StateBucket::Rows(_) => panic!("confirmation returned a row payload"),
+        }
     }
 
     #[test]

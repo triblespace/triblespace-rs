@@ -403,14 +403,14 @@ fn bench_backend<S: TriblePattern>(
         if mode == Mode::ResidualLazy {
             let (_, stats) = run_lazy_residual_profiled(kb, markers);
             println!(
-                "  residual lazy states: {} interned / {} hits / {} reentries ({} rows); pops {} ({} sprint / {} harvest / {} partial); calls propose {} (max {} rows), confirm {} (max {} rows)",
+                "  residual lazy states: {} interned / {} hits / {} reentries ({} rows); pops {} ({} full / {} readiness / {} partial); calls propose {} (max {} rows), confirm {} (max {} rows)",
                 stats.states_interned,
                 stats.interner_hits,
                 stats.state_reentries,
                 stats.rows_reentered,
                 stats.state_pops,
-                stats.sprint_pops,
-                stats.harvest_pops,
+                stats.full_pops,
+                stats.readiness_pops,
                 stats.partial_pops,
                 stats.propose_calls,
                 stats.max_propose_rows,

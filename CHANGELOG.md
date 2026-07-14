@@ -23,15 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do too unless they explicitly expose an associative AND shape. A profiled
   entry point reports planning/action pops, interner and bucket merges, and
   leaf-call batch measurements.
-- **Canonical residual states gain a demand-driven sprint-to-harvest
-  iterator.** `solve_residual_state_lazy` starts with narrow maximum-rank
-  chunks so descendants can yield before sibling rows are evaluated, widens
-  geometrically on continued demand, then switches to minimum-rank readiness
-  at its saturation cap. Candidate chunks keep each parent and its complete
-  ragged candidate group together, while exact descriptors remain interned so
-  early states can safely reopen when later histories reach them. Full drains
-  preserve the eager solver's result bag; partial consumers may drop the
-  remaining affine frontier after the first useful result.
+- **Canonical residual states gain a demand-driven batch-fill iterator.**
+  `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
+  descendants can yield before sibling rows are evaluated, then widens between
+  output-producing resumptions on continued demand. The deepest live state able
+  to fill that width wins; when none can, minimum-rank readiness drains the
+  remaining feeder frontier. The saturation cap only bounds width growth.
+  Candidate chunks keep each parent and its complete ragged candidate group
+  together; this makes a parent a semantics-safe occupancy unit, though
+  candidate fanout means it is not a total-work estimate. Exact descriptors
+  remain interned so early states can safely reopen when later histories reach
+  them. Full drains preserve the eager solver's result bag; partial consumers
+  may drop the remaining affine frontier after the first useful result.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM

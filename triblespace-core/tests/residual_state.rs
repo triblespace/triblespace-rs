@@ -691,8 +691,8 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
     assert_eq!(residual.stats.rows_merged, N / 2);
     assert!(residual.stats.interner_hits >= 1);
     assert_eq!(residual.stats.max_confirm_rows, N);
-    assert_eq!(residual.stats.sprint_pops, 0);
-    assert_eq!(residual.stats.harvest_pops, residual.stats.state_pops);
+    assert_eq!(residual.stats.full_pops, 0);
+    assert_eq!(residual.stats.readiness_pops, residual.stats.state_pops);
     assert_eq!(
         residual.stats.interner_hits,
         residual.stats.bucket_merges + residual.stats.state_reentries
@@ -769,7 +769,8 @@ fn nested_and_width_one_yields_before_draining_sibling_parents() {
         .growth(1);
     let first = lazy.next().expect("nested fixture has a first result");
     assert_eq!(decode(&first.0, P_MARKER), decode(&first.1, X_MARKER));
-    assert_eq!(lazy.stats().harvest_pops, 0);
+    assert_eq!(lazy.stats().readiness_pops, 0);
+    assert!(lazy.stats().full_pops > 0);
     assert!(lazy.stats().partial_pops > 0);
     assert_eq!(lazy.stats().max_propose_rows, 1);
     assert_eq!(lazy.stats().max_confirm_rows, 1);
@@ -932,8 +933,8 @@ fn lazy_width_one_reaches_a_result_before_draining_sibling_parents() {
         2,
         "the first resumption must prepare a geometrically wider next chunk"
     );
-    assert_eq!(lazy.stats().harvest_pops, 0);
-    assert!(lazy.stats().sprint_pops > 0);
+    assert_eq!(lazy.stats().readiness_pops, 0);
+    assert!(lazy.stats().full_pops > 0);
     assert!(lazy.stats().partial_pops > 0);
     assert_eq!(lazy.stats().max_propose_rows, 1);
     assert_eq!(lazy.stats().max_confirm_rows, 1);
@@ -979,13 +980,13 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
 
     assert_eq!(lazy.results, eager);
     assert_eq!(lazy.results, sequential);
-    assert_eq!(lazy.stats.harvest_pops, 0);
-    assert!(lazy.stats.sprint_pops > 0);
+    assert_eq!(lazy.stats.readiness_pops, 0);
+    assert!(lazy.stats.full_pops > 0);
     assert!(lazy.stats.state_reentries > 0);
     assert!(lazy.stats.rows_reentered > 0);
     assert_eq!(
         lazy.stats.state_pops,
-        lazy.stats.sprint_pops + lazy.stats.harvest_pops
+        lazy.stats.full_pops + lazy.stats.readiness_pops
     );
     assert_eq!(
         lazy.stats.interner_hits,
@@ -994,7 +995,7 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_bag() {
 }
 
 #[test]
-fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
+fn lazy_geometric_width_uses_both_full_and_underfilled_choices() {
     const N: usize = 12;
     let (root, _) = fixture(N);
     let mut crossed = Query::new(root, project_pair)
@@ -1012,11 +1013,11 @@ fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
     sequential.sort_unstable();
 
     assert_eq!(crossed.results, sequential);
-    assert!(crossed.stats.sprint_pops > 0);
-    assert!(crossed.stats.harvest_pops > 0);
+    assert!(crossed.stats.full_pops > 0);
+    assert!(crossed.stats.readiness_pops > 0);
     assert_eq!(
         crossed.stats.state_pops,
-        crossed.stats.sprint_pops + crossed.stats.harvest_pops
+        crossed.stats.full_pops + crossed.stats.readiness_pops
     );
     assert_eq!(
         crossed.stats.interner_hits,
@@ -1025,13 +1026,13 @@ fn lazy_geometric_width_crosses_from_sprint_into_harvest() {
 }
 
 #[test]
-fn lazy_forced_harvest_reconverges_before_states_are_popped() {
+fn lazy_width_above_the_frontier_reconverges_before_states_are_popped() {
     const N: usize = 12;
     let (root, _) = fixture(N);
-    let mut harvested = Query::new(root, project_pair)
+    let mut readiness = Query::new(root, project_pair)
         .solve_residual_state_lazy()
-        .cap(2)
-        .start_width(2)
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
 
@@ -1039,86 +1040,36 @@ fn lazy_forced_harvest_reconverges_before_states_are_popped() {
     let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
         .sequential()
         .collect();
-    harvested.results.sort_unstable();
+    readiness.results.sort_unstable();
     sequential.sort_unstable();
 
-    assert_eq!(harvested.results, sequential);
-    assert_eq!(harvested.stats.sprint_pops, 0);
-    assert!(harvested.stats.harvest_pops > 0);
-    assert!(harvested.stats.partial_pops > 0);
+    assert_eq!(readiness.results, sequential);
+    assert_eq!(readiness.stats.full_pops, 0);
+    assert!(readiness.stats.readiness_pops > 0);
+    assert_eq!(readiness.stats.partial_pops, 0);
     assert_eq!(
-        harvested.stats.state_reentries, 0,
-        "minimum-rank harvest must drain every feeder before popping its target"
+        readiness.stats.state_reentries, 0,
+        "an underfilled minimum-rank drain must consume every feeder before its target"
     );
-    assert!(harvested.stats.bucket_merges > 0);
-    assert!(harvested.stats.rows_merged > 0);
-    assert!(harvested.stats.max_confirm_rows <= 2);
+    assert!(readiness.stats.bucket_merges > 0);
+    assert!(readiness.stats.rows_merged > 0);
+    assert_eq!(readiness.stats.max_confirm_rows, N);
     assert_eq!(
-        harvested.stats.state_pops,
-        harvested.stats.sprint_pops + harvested.stats.harvest_pops
+        readiness.stats.state_pops,
+        readiness.stats.full_pops + readiness.stats.readiness_pops
     );
     assert_eq!(
-        harvested.stats.interner_hits,
-        harvested.stats.bucket_merges + harvested.stats.state_reentries
+        readiness.stats.interner_hits,
+        readiness.stats.bucket_merges + readiness.stats.state_reentries
     );
 }
 
 #[test]
-fn harvest_plans_striped_ready_chunks_before_invoking_uniform_actions() {
+fn occupancy_plans_striped_ready_chunks_before_invoking_uniform_actions() {
     const N: usize = 4;
     const W: usize = 2;
     let (root, trace) = fixture(N);
-    let mut harvested = Query::new(root, project_pair)
-        .solve_residual_state_lazy()
-        .cap(W)
-        .start_width(W)
-        .growth(1)
-        .collect_profiled();
-    let (sequential_root, _) = fixture(N);
-    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
-        .sequential()
-        .collect();
-    harvested.results.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(harvested.results, sequential);
-
-    // Each Ready(P) chunk is striped: [2, 3] and [0, 1] independently
-    // choose one A and one B row. Since harvest drains the even-rank Ready
-    // planner before either odd-rank Propose action, the two one-row filings
-    // for each leaf merge into one width-W protocol call.
-    let trace = trace.lock().unwrap();
-    for child in [Child::A, Child::B] {
-        let calls = matching_calls(&trace, child, Verb::Propose, X);
-        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
-        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
-    }
-
-    let stats = harvested.stats;
-    assert_eq!(stats.sprint_pops, 0);
-    assert_eq!(stats.harvest_pops, stats.state_pops);
-    assert_eq!(stats.propose_action_pops, stats.propose_calls);
-    assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
-    assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
-    assert_eq!(stats.max_propose_rows, W);
-    assert!(stats.max_confirm_rows <= W);
-    assert_eq!(stats.state_reentries, 0);
-    assert_eq!(
-        stats.state_pops,
-        stats.ready_plan_pops
-            + stats.candidate_plan_pops
-            + stats.propose_action_pops
-            + stats.confirm_action_pops
-            + 2,
-        "the remaining two pops emit the four full rows in width-W chunks"
-    );
-}
-
-#[test]
-fn sprint_executes_striped_actions_before_later_planner_chunks_reopen_them() {
-    const N: usize = 4;
-    const W: usize = 2;
-    let (root, trace) = fixture(N);
-    let mut sprinted = Query::new(root, project_pair)
+    let mut filled = Query::new(root, project_pair)
         .solve_residual_state_lazy()
         .cap(usize::MAX)
         .start_width(W)
@@ -1128,26 +1079,87 @@ fn sprint_executes_striped_actions_before_later_planner_chunks_reopen_them() {
     let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
         .sequential()
         .collect();
-    sprinted.results.sort_unstable();
+    filled.results.sort_unstable();
     sequential.sort_unstable();
-    assert_eq!(sprinted.results, sequential);
+    assert_eq!(filled.results, sequential);
 
-    // Phase one intentionally retains the binary scheduler: maximum-rank
-    // sprinting executes each newly planned action before the Ready remainder.
-    // The same descriptor is therefore reopened by the later planner chunk
-    // instead of assembling cross-chunk batches. Occupancy scheduling is the
-    // follow-on that can generalize the harvest gain to sprint mode.
+    // Each Ready(P) chunk is striped: [2, 3] and [0, 1] independently
+    // choose one A and one B row. Each one-row Propose action is underfilled,
+    // while the Ready remainder can still fill W. The scheduler therefore
+    // plans the remainder first and merges both filings into one width-W call.
     let trace = trace.lock().unwrap();
     for child in [Child::A, Child::B] {
         let calls = matching_calls(&trace, child, Verb::Propose, X);
-        assert_eq!(calls.len(), 2, "{child:?} sprint proposal calls");
-        assert!(calls.iter().all(|call| call.rows == 1));
+        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
+        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
     }
-    assert!(sprinted.stats.sprint_pops > 0);
-    assert_eq!(sprinted.stats.harvest_pops, 0);
-    assert_eq!(sprinted.stats.propose_calls, 5);
-    assert_eq!(sprinted.stats.max_propose_rows, 1);
-    assert!(sprinted.stats.state_reentries > 0);
+
+    let stats = filled.stats;
+    assert_eq!(stats.state_pops, stats.full_pops + stats.readiness_pops);
+    assert_eq!(stats.propose_action_pops, stats.propose_calls);
+    assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
+    assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
+    assert_eq!(stats.max_propose_rows, W);
+    assert!(stats.max_confirm_rows <= W);
+    assert_eq!(
+        stats.state_pops,
+        stats.ready_plan_pops
+            + stats.candidate_plan_pops
+            + stats.propose_action_pops
+            + stats.confirm_action_pops
+            + stats.emit_pops,
+        "every pop must have one explicit planning, action, or emission phase"
+    );
+}
+
+#[test]
+fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
+    const N: usize = 4;
+    const W: usize = 2;
+    let run = |cap| {
+        let (root, trace) = fixture(N);
+        let solved = Query::new(root, project_pair)
+            .solve_residual_state_lazy()
+            .cap(cap)
+            .start_width(W)
+            .growth(1)
+            .collect_profiled();
+        let calls = trace.lock().unwrap().calls.clone();
+        (solved, calls)
+    };
+    let (capped, capped_calls) = run(W);
+    let (uncapped, uncapped_calls) = run(usize::MAX);
+
+    assert_eq!(capped.results, uncapped.results);
+    assert_eq!(capped.stats, uncapped.stats);
+    assert_eq!(capped_calls, uncapped_calls);
+
+    let (sequential_root, _) = fixture(N);
+    let mut sequential: Vec<_> = Query::new(sequential_root, project_pair)
+        .sequential()
+        .collect();
+    let mut capped_results = capped.results.clone();
+    capped_results.sort_unstable();
+    sequential.sort_unstable();
+    assert_eq!(capped_results, sequential);
+
+    // The cap only bounds width growth. It cannot switch scheduling policy:
+    // the width-W action shape must match the cap-above-width case.
+    let trace = Trace {
+        calls: capped_calls,
+    };
+    for child in [Child::A, Child::B] {
+        let calls = matching_calls(&trace, child, Verb::Propose, X);
+        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
+        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
+    }
+    assert_eq!(capped.stats.propose_calls, 3);
+    assert_eq!(capped.stats.propose_rows, 5);
+    assert_eq!(capped.stats.max_propose_rows, W);
+    assert_eq!(
+        capped.stats.state_pops,
+        capped.stats.full_pops + capped.stats.readiness_pops
+    );
 }
 
 #[test]
