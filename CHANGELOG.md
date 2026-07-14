@@ -16,8 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   microprogram, selects proposers by `(estimate, source pattern)`, and applies
   the CPU interpreter's exact cardinality-magnitude/influence/variable-ID key
   independently to every row. The first WGPU wrapper keeps metadata, inputs,
-  and packed choices resident, fails closed on malformed dimensions or planner
-  ownership, and performs no read until the explicit final test boundary.
+  and packed choices resident, fails closed on malformed dimensions, planner
+  ownership, reserved estimates, or inconsistent choice identities, and
+  performs no read until the explicit final test boundary.
 - **One all-variable `QueryProgram` pattern can run as a forced resident
   E→A→V chain.** `WgpuQueryProgram::execute_eav` accepts every permutation of
   three variable IDs across the axes, keeps private physical E and E/A

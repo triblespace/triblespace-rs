@@ -230,6 +230,24 @@ fn native_kernel_matches_oracle_for_mixed_choices_flips_ties_and_boundaries() {
 }
 
 #[test]
+fn reserved_estimate_in_a_proposer_or_non_proposer_arm_kills_the_row() {
+    let planner = planner(&[variables()[4]]);
+    let rows = 3;
+    let mut estimates = vec![8; planner.metadata().arms().len() * rows];
+
+    // Arm 2 is v2's sole arm, hence necessarily that variable's proposer.
+    set_estimate(&mut estimates, rows, 2, 0, u32::MAX);
+    // For v0, arm 0 remains the proposer while the looser arm 3 is poisoned.
+    set_estimate(&mut estimates, rows, 0, 1, 1);
+    set_estimate(&mut estimates, rows, 3, 1, u32::MAX);
+
+    let choices = run(&planner, &[true, true, true], &estimates);
+    assert_eq!(choices[0], ResidentRowChoice::dead());
+    assert_eq!(choices[1], ResidentRowChoice::dead());
+    assert_ne!(choices[2], ResidentRowChoice::dead());
+}
+
+#[test]
 fn native_block_edges_and_every_split_are_row_homomorphic() {
     let planner = planner(&[variables()[4]]);
     let arms = planner.metadata().arms().len();

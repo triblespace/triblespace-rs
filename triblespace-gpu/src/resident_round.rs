@@ -356,6 +356,7 @@ pub struct ResidentRowPlanner<R: Runtime> {
     metadata: ResidentRoundMetadata,
     context: GpuContext<R>,
     owner: Arc<()>,
+    arm_targets: Arc<[ProgramVariable]>,
     variable_offsets: DeviceU32Buffer<R>,
     variable_arms: DeviceU32Buffer<R>,
     arm_patterns: DeviceU32Buffer<R>,
@@ -388,10 +389,17 @@ impl<R: Runtime> ResidentRowPlanner<R> {
                 .collect::<Vec<_>>(),
         )?;
         let influence_counts = context.upload_u32(&metadata.influence_counts)?;
+        let arm_targets = metadata
+            .arms
+            .iter()
+            .map(|arm| arm.target_variable)
+            .collect::<Vec<_>>()
+            .into();
         Ok(Self {
             metadata,
             context,
             owner: Arc::new(()),
+            arm_targets,
             variable_offsets,
             variable_arms,
             arm_patterns,
@@ -503,7 +511,7 @@ impl<R: Runtime> ResidentRowPlanner<R> {
             words,
             rows: inputs.rows,
             variable_count: self.metadata.variable_count,
-            arm_count: self.metadata.arms.len(),
+            arm_targets: self.arm_targets.clone(),
         })
     }
 }
@@ -516,7 +524,7 @@ pub struct ResidentRowChoices<R: Runtime> {
     words: DeviceU32Buffer<R>,
     rows: usize,
     variable_count: usize,
-    arm_count: usize,
+    arm_targets: Arc<[ProgramVariable]>,
 }
 
 impl<R: Runtime> ResidentRowChoices<R> {
@@ -539,32 +547,46 @@ impl<R: Runtime> ResidentRowChoices<R> {
     /// device read and validates every decoded choice.
     pub fn read(&self) -> Result<Vec<ResidentRowChoice>, ResidentRoundError> {
         let words = self.words.read();
-        if words.len() != self.rows * CHOICE_WORDS {
-            return Err(ResidentRoundError::GeometryOverflow(
-                "device choice readback",
-            ));
-        }
-        words
-            .chunks_exact(CHOICE_WORDS)
-            .enumerate()
-            .map(|(row, choice)| {
-                let variable = choice[0];
-                let arm = choice[1];
-                let count = choice[2];
-                if variable == DEAD_ROW_SENTINEL && arm == DEAD_ROW_SENTINEL && count == 0 {
-                    return Ok(ResidentRowChoice::dead());
-                }
-                if variable as usize >= self.variable_count || arm as usize >= self.arm_count {
-                    return Err(ResidentRoundError::MalformedDeviceChoice { row });
-                }
-                Ok(ResidentRowChoice {
-                    variable: Some(ProgramVariable::new(variable as u8)),
-                    proposer_arm: Some(arm as usize),
-                    proposal_count: count,
-                })
-            })
-            .collect()
+        decode_choices(&words, self.rows, self.variable_count, &self.arm_targets)
     }
+}
+
+fn decode_choices(
+    words: &[u32],
+    rows: usize,
+    variable_count: usize,
+    arm_targets: &[ProgramVariable],
+) -> Result<Vec<ResidentRowChoice>, ResidentRoundError> {
+    let expected = checked_device_product(rows, CHOICE_WORDS, "device choice readback")?;
+    if words.len() != expected {
+        return Err(ResidentRoundError::GeometryOverflow(
+            "device choice readback",
+        ));
+    }
+    words
+        .chunks_exact(CHOICE_WORDS)
+        .enumerate()
+        .map(|(row, choice)| {
+            let variable = choice[0];
+            let arm = choice[1];
+            let count = choice[2];
+            if variable == DEAD_ROW_SENTINEL && arm == DEAD_ROW_SENTINEL && count == 0 {
+                return Ok(ResidentRowChoice::dead());
+            }
+            let target = arm_targets.get(arm as usize);
+            if variable as usize >= variable_count
+                || count == DEAD_ROW_SENTINEL
+                || target.is_none_or(|target| target.index() != variable as usize)
+            {
+                return Err(ResidentRoundError::MalformedDeviceChoice { row });
+            }
+            Ok(ResidentRowChoice {
+                variable: Some(ProgramVariable::new(variable as u8)),
+                proposer_arm: Some(arm as usize),
+                proposal_count: count,
+            })
+        })
+        .collect()
 }
 
 fn pattern_variables(pattern: ProgramPattern) -> Vec<ProgramVariable> {
@@ -603,8 +625,10 @@ fn checked_device_product(
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_device_product, validate_rows, ResidentRoundError, CHOICE_WORDS, DEAD_ROW_SENTINEL,
+        checked_device_product, decode_choices, validate_rows, ResidentRoundError,
+        ResidentRowChoice, CHOICE_WORDS, DEAD_ROW_SENTINEL,
     };
+    use triblespace_core::blob::encodings::succinctarchive::query_program::ProgramVariable;
 
     #[test]
     fn device_geometries_exclude_the_reserved_u32_sentinel() {
@@ -639,6 +663,30 @@ mod tests {
             Err(ResidentRoundError::GeometryOverflow("packed"))
         ));
     }
+
+    #[test]
+    fn decoded_choices_reject_in_range_wrong_target_and_reserved_count() {
+        let v0 = ProgramVariable::new(0);
+        let v1 = ProgramVariable::new(1);
+        let targets = [v0, v1];
+
+        assert!(matches!(
+            decode_choices(&[0, 1, 7], 1, 2, &targets),
+            Err(ResidentRoundError::MalformedDeviceChoice { row: 0 })
+        ));
+        assert!(matches!(
+            decode_choices(&[0, 0, DEAD_ROW_SENTINEL], 1, 2, &targets),
+            Err(ResidentRoundError::MalformedDeviceChoice { row: 0 })
+        ));
+        assert_eq!(
+            decode_choices(&[0, 0, 7], 1, 2, &targets).unwrap(),
+            vec![ResidentRowChoice {
+                variable: Some(v0),
+                proposer_arm: Some(0),
+                proposal_count: 7,
+            }]
+        );
+    }
 }
 
 #[cube(launch_unchecked)]
@@ -663,11 +711,13 @@ fn exact_row_planner(
         output[output_base + 1usize] = dead;
         output[output_base + 2usize] = 0u32;
 
-        // Treat every non-canonical viability value as dead. The typed host
-        // path only emits 0/1; a future device producer therefore fails closed
-        // if it violates that contract.
+        // Treat every non-canonical viability value or reserved estimate as
+        // dead. The typed host path only emits 0/1 and exact counts strictly
+        // below `dead`; a future device producer therefore fails closed if it
+        // violates either contract.
         if viable[row] == 1u32 {
             let mut have_variable = false;
+            let mut valid_estimates = true;
             let mut best_variable = 0u32;
             let mut best_arm = 0u32;
             let mut best_count = 0u32;
@@ -683,10 +733,16 @@ fn exact_row_planner(
                     let mut proposer = variable_arms[cursor as usize];
                     let mut proposer_pattern = arm_patterns[proposer as usize];
                     let mut proposal_count = estimates[proposer as usize * rows as usize + row];
+                    if proposal_count == dead {
+                        valid_estimates = false;
+                    }
                     cursor += 1u32;
                     while cursor < end {
                         let arm = variable_arms[cursor as usize];
                         let count = estimates[arm as usize * rows as usize + row];
+                        if count == dead {
+                            valid_estimates = false;
+                        }
                         let source_pattern = arm_patterns[arm as usize];
                         if count < proposal_count
                             || (count == proposal_count && source_pattern < proposer_pattern)
@@ -719,7 +775,7 @@ fn exact_row_planner(
                 variable += 1u32;
             }
 
-            if have_variable {
+            if have_variable && valid_estimates {
                 output[output_base] = best_variable;
                 output[output_base + 1usize] = best_arm;
                 output[output_base + 2usize] = best_count;
