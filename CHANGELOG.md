@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Residual-state promotion has a deterministic adversarial benchmark matrix.**
+  The plain executable checks exact result bags and measures first-result plus
+  full-drain latency for sequential, lazy DAG, and lazy residual schedules on
+  late/absent hits, semantic branch death, ragged fanout, 120 reconvergent
+  routes, opaque unions, and a real regular-path leaf. TribleSet and
+  SuccinctArchive run wherever their protocols apply, with an opt-in WGPU
+  route fixture; saturated-width work reports accompany geometric timings.
+
 - **Constraints gain an opt-in canonical residual-state solver.** Any root
   `Constraint` can use the residual APIs: roots that expose associative AND
   structure are recursively flattened, while an opaque root is represented by
