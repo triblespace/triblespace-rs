@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds gain an exact runtime-generic row planner.** A
+  stable variable-to-arm CSR lowering derives arm identities and full influence
+  unions from public `QueryProgram` patterns. Its CubeCL kernel consumes the
+  exact arm-major estimates and row support produced by the next resident
+  microprogram, selects proposers by `(estimate, source pattern)`, and applies
+  the CPU interpreter's exact cardinality-magnitude/influence/variable-ID key
+  independently to every row. The first WGPU wrapper keeps metadata, inputs,
+  and packed choices resident, fails closed on malformed dimensions, planner
+  ownership, reserved estimates, or inconsistent choice identities, and
+  performs no read until the explicit final test boundary.
 - **One all-variable `QueryProgram` pattern can run as a forced resident
   E→A→V chain.** `WgpuQueryProgram::execute_eav` accepts every permutation of
   three variable IDs across the axes, keeps private physical E and E/A

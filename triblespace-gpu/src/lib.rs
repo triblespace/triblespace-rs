@@ -7,6 +7,8 @@ mod cubecl_backend;
 #[cfg(feature = "wgpu")]
 mod resident_program;
 #[cfg(feature = "wgpu")]
+mod resident_round;
+#[cfg(feature = "wgpu")]
 mod succinct_query;
 
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
@@ -17,6 +19,12 @@ pub use cubecl_backend::CudaWaveletFreeze;
 pub use cubecl_backend::WgpuWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use resident_program::{ResidentTransitionError, WgpuQueryProgram};
+#[cfg(feature = "wgpu")]
+pub use resident_round::{
+    ResidentRoundArm, ResidentRoundError, ResidentRoundInputs, ResidentRoundMetadata,
+    ResidentRowChoice, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
+    DEAD_ROW_SENTINEL,
+};
 #[cfg(feature = "wgpu")]
 pub use succinct_query::{
     WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,
