@@ -165,4 +165,14 @@ attributes! {
     "9B06AA4060EF9928A923FC7E6A6B6438" as finished_at: inlineencodings::NsTAIInterval;
     /// When an entity expires or becomes invalid.
     "89FEC3B560336BA88B10759DECD3155F" as expires_at: inlineencodings::NsTAIInterval;
+    /// A version that this entity supersedes (predecessor edge, repeated).
+    ///
+    /// Canonical versioning edge for snapshot histories: an entity's current
+    /// head is the version that nothing supersedes. Append-only and
+    /// merge-safe — concurrent edits produce sibling heads (an honest fork),
+    /// never a clock-driven silent clobber, so "current" is a query over the
+    /// supersedes DAG rather than a mutable pointer. General-purpose across
+    /// domains (wiki fragments, compass reviews, relations groups, memory
+    /// chunks); a merge that reconciles two heads may supersede both.
+    "EA5308C6296520A185DE4E5019F779FB" as supersedes: inlineencodings::GenId;
 }
