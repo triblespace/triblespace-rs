@@ -100,15 +100,18 @@ non-default even though its warm row-kernel performance is promising.
 ## Resident query batches
 
 With the `wgpu` feature, `WgpuSuccinctArchive` creates resident mirrors of the
-three axis-prefix bit vectors and six Ring wavelet matrices in one Jerky
+three axis-prefix bit vectors, three derived present-code lists, all six
+ordered-pair change vectors, and six Ring wavelet matrices in one Jerky
 compatibility domain, and implements the same `TriblePattern` interface as the
 wrapped CPU archive. Construction prepares the host data and enqueues the
 device transfers; the first observed query provides the synchronization
-boundary. For the ordinary constraint wrapper, the canonical archive, query
-planner, domain searches, prefix navigation, proposals, estimates, and
-satisfaction checks remain on the CPU. Only whole-frontier `confirm` rank
-streams use Jerky's resident
-`GpuWaveletMatrix::rank_batch`; scalar queries retain the ordinary CPU path.
+boundary. `pair_changes(rotation)` selects the `(first, middle)` boundary
+vector using the same `SuccinctRotation` that selects a Ring column. For the
+ordinary constraint wrapper, the canonical archive, query planner, domain
+searches, prefix navigation, proposals, estimates, and satisfaction checks
+remain on the CPU. Only whole-frontier `confirm` rank streams use Jerky's
+resident `GpuWaveletMatrix::rank_batch`; scalar queries retain the ordinary CPU
+path.
 
 ```rust,no_run
 # use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -122,6 +125,15 @@ let gpu = WgpuSuccinctArchive::new(archive).expect("prepare succinct archive on 
 # let _ = gpu;
 # }
 ```
+
+The pair vectors remain allocated for the wrapper's lifetime because generic
+one-peer resident rounds need any of the six rotations. For `T` tribles, let
+`W = 16 * ceil((ceil(T/32) + 1) / 16)`. At Jerky's current 512-bit rank-block
+layout each vector uploads `4W` bytes of padded bits plus `4(W/16)` bytes of
+rank counts. All six therefore carry `24 * (W + W/16)` bytes of logical device
+payload (408 bytes for an empty archive); mirroring the five vectors beyond the
+former EAV-only path adds `20 * (W + W/16)` bytes, asymptotically about 0.664
+bytes per trible. A backend may reserve more due to its allocation granularity.
 
 The default admission threshold is 8,192 rank probes (two probes per
 candidate), preserving the historical 4,096-candidate crossover. Smaller

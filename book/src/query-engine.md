@@ -256,8 +256,10 @@ The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
 putting a device dependency in core. It wraps the canonical archive, keeps its
 six Jerky wavelet matrices resident, and routes tagged `confirm` rank streams
 through a device-neutral `RingBatchQuery`; estimates, proposals, prefix walks,
-domain lookups, satisfaction checks, and scalar sinks remain on CPU. GPU
-admission is per batch (8,192 rank probes by default), so affine sharding may
+domain lookups, satisfaction checks, and scalar sinks remain on CPU. The same
+wrapper also retains all six `(first, middle)` pair-change vectors for resident
+programs, selected through the same `SuccinctRotation` as their Ring columns.
+GPU admission is per batch (8,192 rank probes by default), so affine sharding may
 still create CPU fallbacks. This is intentional: forcing every Rayon shard to
 emit synchronizing device work for every tiny rank batch is much slower than
 either executor, while fat batches amortize fixed dispatch/readback costs and

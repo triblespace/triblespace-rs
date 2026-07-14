@@ -19,11 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scan; exact prefix/cardinality validation, changed-E/A LF navigation, stable
   exact-capacity scans, checked geometry, and sticky device invariants preserve
   the forced CPU interpreter's seed-major order and multiplicity.
-- **WGPU succinct archives keep E/A pair-change boundaries resident.**
-  `WgpuSuccinctArchive` now mirrors `changed_e_a` in the same private Jerky
-  compatibility domain as its prefix vectors and Ring columns, exposes the
-  documented `entity_attribute_changes` accessor, and checks native parity and
-  fail-closed rejection of buffers from a separately constructed wrapper.
+- **WGPU succinct archives keep every ordered-pair boundary resident.**
+  `WgpuSuccinctArchive::pair_changes(rotation)` mirrors all six canonical
+  `(first, middle)` first-occurrence vectors in the same private Jerky
+  compatibility domain as the prefix vectors and Ring columns. Construction
+  validates every vector against the Ring length before uploading any of them;
+  native tests cover exact rank/select parity and fail-closed foreign buffers
+  independently for all six rotations. Relative to the former EAV-only mirror,
+  this adds five persistent padded bit-vector/rank-directory payloads: for `T`
+  tribles the current Jerky layout adds `20 * (W + W/16)` bytes, where
+  `W = 16 * ceil((ceil(T/32) + 1) / 16)`, before backend allocation rounding.
 - **An opt-in CubeCL CPU-runtime probe compares one rank-style kernel across
   MLIR/LLVM CPU and WGPU.** The `triblespace-gpu` `cpu` feature remains outside
   production defaults and exists to run `cpu_runtime_probe`, which checks exact

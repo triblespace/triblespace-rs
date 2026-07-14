@@ -67,6 +67,40 @@ fn indexed_bits(bits: Vec<bool>) -> BitVector<Rank9SelIndex> {
     BitVector::new(data, index)
 }
 
+fn pair_change_fixture() -> SuccinctArchive<OrderedUniverse> {
+    let entities = [ordered_id(1), ordered_id(4), ordered_id(7)];
+    let attributes = [ordered_id(2), ordered_id(5), ordered_id(8)];
+    let values = [ordered_id(3), ordered_id(6)];
+    let mut set = TribleSet::new();
+    for (entity, attribute, value) in [
+        (entities[0], attributes[1], values[0]),
+        (entities[1], attributes[0], values[0]),
+        (entities[1], attributes[0], values[1]),
+        (entities[1], attributes[2], values[0]),
+        (entities[2], attributes[0], values[0]),
+        (entities[2], attributes[1], values[0]),
+        (entities[2], attributes[2], values[0]),
+    ] {
+        set.insert(&role_trible(entity, attribute, value));
+    }
+    (&set).into()
+}
+
+fn replace_pair_changes(
+    archive: &mut SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    changes: BitVector<Rank9SelIndex>,
+) {
+    match rotation {
+        SuccinctRotation::Eav => archive.changed_e_a = changes,
+        SuccinctRotation::Vea => archive.changed_v_e = changes,
+        SuccinctRotation::Ave => archive.changed_a_v = changes,
+        SuccinctRotation::Vae => archive.changed_v_a = changes,
+        SuccinctRotation::Eva => archive.changed_e_v = changes,
+        SuccinctRotation::Aev => archive.changed_a_e = changes,
+    }
+}
+
 #[test]
 #[ignore = "requires a native WGPU adapter"]
 fn wgpu_merge_is_byte_identical_to_canonical_cpu_merge() {
@@ -209,18 +243,11 @@ fn wgpu_archive_components_share_one_resident_context() {
         .upload_u32(&[0, 1])
         .unwrap();
     let mut output = gpu
-        .entity_attribute_changes()
+        .pair_changes(SuccinctRotation::Eav)
         .context()
         .empty_u32(2)
         .unwrap();
-    for rotation in [
-        SuccinctRotation::Eav,
-        SuccinctRotation::Vea,
-        SuccinctRotation::Ave,
-        SuccinctRotation::Vae,
-        SuccinctRotation::Eva,
-        SuccinctRotation::Aev,
-    ] {
+    for rotation in SuccinctRotation::ALL {
         gpu.ring_col(rotation)
             .rank_batch_into(&positions, &values, &mut output)
             .unwrap();
@@ -235,7 +262,7 @@ fn wgpu_archive_components_share_one_resident_context() {
         prefix.select1_batch_into(&values, &mut output).unwrap();
     }
 
-    let changes = gpu.entity_attribute_changes();
+    let changes = gpu.pair_changes(SuccinctRotation::Eav);
     assert_eq!(changes.len(), archive.changed_e_a.len());
     assert_eq!(changes.num_ones(), archive.changed_e_a.num_ones());
     changes.rank1_batch_into(&positions, &mut output).unwrap();
@@ -269,9 +296,118 @@ fn wgpu_archive_components_share_one_resident_context() {
         .rank1_batch_into(&positions, &mut foreign_output)
         .is_err());
     assert!(gpu
-        .entity_attribute_changes()
+        .pair_changes(SuccinctRotation::Eav)
         .rank1_batch_into(&positions, &mut foreign_output)
         .is_err());
+}
+
+#[test]
+#[ignore = "requires a native WGPU adapter"]
+fn wgpu_pair_changes_match_every_cpu_rotation_and_reject_foreign_contexts() {
+    let archive = pair_change_fixture();
+    let distinct_pair_vectors: HashSet<_> = SuccinctRotation::ALL
+        .map(|rotation| archive.pair_changes(rotation).to_vec())
+        .into_iter()
+        .collect();
+    assert_eq!(
+        distinct_pair_vectors.len(),
+        SuccinctRotation::ALL.len(),
+        "fixture must distinguish every canonical array slot"
+    );
+    let gpu = WgpuSuccinctArchive::new(archive.clone()).unwrap();
+    let foreign = WgpuSuccinctArchive::new(archive.clone()).unwrap();
+
+    for rotation in SuccinctRotation::ALL {
+        let cpu = archive.pair_changes(rotation);
+        let resident = gpu.pair_changes(rotation);
+        assert_eq!(resident.len(), cpu.len(), "{rotation:?} bit length");
+        assert_eq!(
+            resident.num_ones(),
+            cpu.num_ones(),
+            "{rotation:?} pair count"
+        );
+
+        let rank_positions: Vec<u32> = (0..=cpu.len() as u32).collect();
+        let positions = gpu.context().upload_u32(&rank_positions).unwrap();
+        let mut rank_output = gpu.context().empty_u32(rank_positions.len()).unwrap();
+        resident
+            .rank1_batch_into(&positions, &mut rank_output)
+            .unwrap();
+        assert_eq!(
+            rank_output.read(),
+            (0..=cpu.len())
+                .map(|position| cpu.rank1(position).unwrap() as u32)
+                .collect::<Vec<_>>(),
+            "{rotation:?} rank1 parity"
+        );
+
+        let select_ranks: Vec<u32> = (0..cpu.num_ones() as u32).collect();
+        let ranks = gpu.context().upload_u32(&select_ranks).unwrap();
+        let mut select_output = gpu.context().empty_u32(select_ranks.len()).unwrap();
+        resident
+            .select1_batch_into(&ranks, &mut select_output)
+            .unwrap();
+        assert_eq!(
+            select_output.read(),
+            (0..cpu.num_ones())
+                .map(|rank| cpu.select1(rank).unwrap() as u32)
+                .collect::<Vec<_>>(),
+            "{rotation:?} select1 parity"
+        );
+
+        let foreign_positions = foreign.context().upload_u32(&rank_positions).unwrap();
+        let mut foreign_rank_output = foreign.context().empty_u32(rank_positions.len()).unwrap();
+        let mut local_rank_output = gpu.context().empty_u32(rank_positions.len()).unwrap();
+        assert!(
+            resident
+                .rank1_batch_into(&positions, &mut foreign_rank_output)
+                .is_err(),
+            "{rotation:?} must reject a foreign output"
+        );
+        assert!(
+            resident
+                .rank1_batch_into(&foreign_positions, &mut local_rank_output)
+                .is_err(),
+            "{rotation:?} must reject foreign positions"
+        );
+
+        let foreign_ranks = foreign.context().upload_u32(&select_ranks).unwrap();
+        let mut foreign_select_output = foreign.context().empty_u32(select_ranks.len()).unwrap();
+        let mut local_select_output = gpu.context().empty_u32(select_ranks.len()).unwrap();
+        assert!(
+            resident
+                .select1_batch_into(&ranks, &mut foreign_select_output)
+                .is_err(),
+            "{rotation:?} must reject a foreign select output"
+        );
+        assert!(
+            resident
+                .select1_batch_into(&foreign_ranks, &mut local_select_output)
+                .is_err(),
+            "{rotation:?} must reject foreign ranks"
+        );
+    }
+
+    let empty: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
+    let empty_changes = empty.changed_e_a.clone();
+    for rotation in SuccinctRotation::ALL {
+        let mut malformed = archive.clone();
+        replace_pair_changes(&mut malformed, rotation, empty_changes.clone());
+        assert!(
+            WgpuSuccinctArchive::new(malformed).is_err(),
+            "{rotation:?} length mismatch must fail before upload"
+        );
+
+        let mut malformed = archive.clone();
+        let mut bits = archive.pair_changes(rotation).to_vec();
+        assert!(bits[0]);
+        bits[0] = false;
+        replace_pair_changes(&mut malformed, rotation, indexed_bits(bits));
+        assert!(
+            WgpuSuccinctArchive::new(malformed).is_err(),
+            "{rotation:?} missing initial marker must fail before upload"
+        );
+    }
 }
 
 #[test]

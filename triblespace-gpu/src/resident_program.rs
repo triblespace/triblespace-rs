@@ -670,7 +670,7 @@ where
                 geometry.triples as u32,
             );
         }
-        let changed = self.resident.entity_attribute_changes();
+        let changed = self.resident.pair_changes(SuccinctRotation::Eav);
         let mut pair_boundaries = context.empty_u32(double_rows)?;
         changed.rank1_batch_into(&changed_rank_positions, &mut pair_boundaries)?;
 

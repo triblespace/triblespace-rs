@@ -109,7 +109,7 @@ impl QueryStats {
 }
 
 /// A [`SuccinctArchive`] with its three axis prefixes and present-code lists,
-/// entity/attribute change boundaries, and all six ring columns resident on
+/// all six ordered-pair change vectors, and all six ring columns resident on
 /// WGPU in one compatibility domain.
 ///
 /// Query planning, prefix navigation, proposals, and satisfaction checks use
@@ -130,8 +130,9 @@ where
     a_a: WgpuBitVector,
     /// Resident mirror of [`SuccinctArchive::v_a`].
     v_a: WgpuBitVector,
-    /// Resident mirror of [`SuccinctArchive::changed_e_a`].
-    changed_e_a: WgpuBitVector,
+    /// Resident `(first, middle)` pair boundaries in canonical
+    /// [`SuccinctRotation`] order.
+    pair_changes: [WgpuBitVector; SuccinctRotation::ALL.len()],
     /// Ascending compact codes that occur in the entity axis.
     present_entities: DeviceU32Buffer<cubecl::wgpu::WgpuRuntime>,
     /// Ascending compact codes that occur in the attribute axis.
@@ -159,12 +160,18 @@ where
     U: Universe,
 {
     /// Prepares and enqueues the three canonical prefix vectors, derived
-    /// present-code lists, the E/A pair change vector, and all six Ring wavelet
-    /// matrices on the default WGPU device.
+    /// present-code lists, all six ordered-pair change vectors, and all six
+    /// Ring wavelet matrices on the default WGPU device.
     ///
     /// CubeCL's buffer writes are asynchronous; the first rank query provides
     /// the synchronization boundary. Existing query operations other than
     /// accelerated confirmation ranks still use the canonical CPU archive.
+    ///
+    /// For `T` Ring rows, each pair vector's current Jerky payload is
+    /// `4 * (W + W / 16)` bytes, where
+    /// `W = 16 * ceil((ceil(T / 32) + 1) / 16)`. All six allocations persist
+    /// for this wrapper's lifetime; backend allocation granularity may add
+    /// further padding.
     pub fn new(archive: SuccinctArchive<U>) -> jerky::Result<Self> {
         let domain_len = archive.domain.len();
         let triple_count = archive.eav_c.len();
@@ -189,6 +196,7 @@ where
             archive.value_count,
             "value",
         )?;
+        validate_pair_changes(&archive, triple_count)?;
         let context = WgpuContext::on_wgpu();
         let present_entities = context.upload_u32(&present_entities)?;
         let present_attributes = context.upload_u32(&present_attributes)?;
@@ -196,7 +204,32 @@ where
         let e_a = WgpuBitVector::with_context(context.clone(), &archive.e_a.data)?;
         let a_a = WgpuBitVector::with_context(context.clone(), &archive.a_a.data)?;
         let v_a = WgpuBitVector::with_context(context.clone(), &archive.v_a.data)?;
-        let changed_e_a = WgpuBitVector::with_context(context.clone(), &archive.changed_e_a.data)?;
+        let pair_changes = [
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Eav).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Vea).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Ave).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Vae).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Eva).data,
+            )?,
+            WgpuBitVector::with_context(
+                context.clone(),
+                &archive.pair_changes(SuccinctRotation::Aev).data,
+            )?,
+        ];
         let eav_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.eav_c)?;
         let vea_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.vea_c)?;
         let ave_c = WgpuWaveletMatrix::with_context(context.clone(), &archive.ave_c)?;
@@ -209,7 +242,7 @@ where
             e_a,
             a_a,
             v_a,
-            changed_e_a,
+            pair_changes,
             present_entities,
             present_attributes,
             present_values,
@@ -284,14 +317,15 @@ where
         &self.v_a
     }
 
-    /// Returns the resident EAV entity/attribute pair-change bit vector.
+    /// Returns the resident first-occurrence markers for `(first, middle)`
+    /// pairs in `rotation`.
     ///
-    /// This mirrors [`SuccinctArchive::changed_e_a`] in the same compatibility
+    /// This mirrors [`SuccinctArchive::pair_changes`] in the same compatibility
     /// domain as the prefix vectors and Ring columns. Jerky reserves
-    /// `u32::MAX` as its device miss sentinel, so resident construction keeps
-    /// the bit-vector geometry strictly below that length.
-    pub fn entity_attribute_changes(&self) -> &WgpuBitVector {
-        &self.changed_e_a
+    /// `u32::MAX` as its device miss sentinel, so construction validates every
+    /// vector before uploading any of them.
+    pub fn pair_changes(&self, rotation: SuccinctRotation) -> &WgpuBitVector {
+        &self.pair_changes[rotation.index()]
     }
 
     /// Returns the resident ascending compact codes present in the entity axis.
@@ -332,6 +366,27 @@ where
             SuccinctRotation::Aev => &self.aev_c,
         }
     }
+}
+
+fn validate_pair_changes<U>(archive: &SuccinctArchive<U>, triple_count: usize) -> jerky::Result<()>
+where
+    U: Universe,
+{
+    for rotation in SuccinctRotation::ALL {
+        let changes = archive.pair_changes(rotation);
+        if changes.len() != triple_count {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} pair-change length {} does not match the Ring length {triple_count}",
+                changes.len()
+            )));
+        }
+        if triple_count != 0 && changes.select1(0) != Some(0) {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} pair changes do not mark the first Ring row"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn collect_present_codes(
