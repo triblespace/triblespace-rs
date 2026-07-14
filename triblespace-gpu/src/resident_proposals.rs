@@ -1,6 +1,9 @@
 //! Private confirmed proposal arena for one archive-resident affine round.
 //!
-//! This first slice admits only zero-peer [`ArmSpec::Present`] proposers. It
+//! Published execution still admits only zero-peer [`ArmSpec::Present`]
+//! proposers. Its internal plan and classifier use explicit Present/PairDistinct
+//! family tags and exact retained interval witnesses, preparing the shared
+//! arena for Pair generation without exposing an incomplete Pair capability. It
 //! classifies packed row choices into a variable-major `S * R` width vector,
 //! performs one exact stable scan over that flat order, and writes candidates
 //! directly into ascending-variable segments. The layout itself is therefore
@@ -20,12 +23,15 @@
 //! for CubeCL's generated information buffer rather than depending on a
 //! high-binding desktop adapter.
 //!
-//! Generation assigns one invocation to each exact output destination. After
-//! finalization publishes the `T`-sized indirect rectangle, each invocation
-//! performs strict-end lower bounds over segment records and scanned row cells,
-//! then copies one candidate from the retained validated row axis. This makes
-//! seed-frontier width parallel without changing the stable ordering law. The
-//! same exact indirect rectangle drives child materialization.
+//! Generation assigns one invocation to each exact output destination. The
+//! planning finalizer publishes a private `T`-sized generation dispatch; each
+//! invocation performs strict-end lower bounds over segment records and scanned
+//! row cells, then copies one candidate from the retained validated row axis.
+//! A static capacity-wide gate subsequently proves structural route identity
+//! and the poison tail, independently derives the public dispatch rectangle
+//! from `T`, and publishes it for confirmation and child materialization. The
+//! two dispatch records carry the same logical total but are distinct physical
+//! publication boundaries.
 //!
 //! Confirmation resolves every relevant Present descriptor from the candidate
 //! code, owner, proposer, and immutable per-variable CSR. Its private backing
@@ -43,10 +49,11 @@ use jerky::gpu::{DeviceBatchMeta, DeviceDispatch, DeviceU32Buffer, GpuContext};
 use triblespace_core::blob::encodings::succinctarchive::query_program::{
     ProgramFrontier, ProgramVariable, QueryProgram,
 };
-use triblespace_core::blob::encodings::succinctarchive::Universe;
+use triblespace_core::blob::encodings::succinctarchive::{SuccinctRotation, Universe};
 
 use crate::resident_round::{
-    checked_device_product, ResidentRoundError, ResidentRowChoices, RESIDENT_U32_SENTINEL,
+    checked_device_product, ResidentRoundError, ResidentRowChoices, PROPOSAL_WITNESS_WORDS,
+    RESIDENT_U32_SENTINEL,
 };
 use crate::resident_support::{
     ArmSpec, ResidentAxis, ResidentProposalInputs, ResidentSupportError, WgpuResidentFrontier,
@@ -58,10 +65,13 @@ type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
 const THREADS: u32 = 64;
 const BLOCK_ITEMS: u32 = 64;
 const CHOICE_WORDS: usize = 3;
-const ARM_DESCRIPTOR_WORDS: usize = 3;
+const ARM_DESCRIPTOR_WORDS: usize = 4;
 const SEGMENT_SPEC_WORDS: usize = 2;
 const SEGMENT_RECORD_WORDS: usize = 4;
 const CANDIDATE_RECORD_FIELDS: usize = 3;
+
+const FAMILY_PRESENT: u32 = 0;
+const FAMILY_PAIR_DISTINCT: u32 = 1;
 
 const CONTROL_STATUS: usize = 0;
 const CONTROL_REQUIRED: usize = 1;
@@ -98,14 +108,12 @@ impl fmt::Display for ResidentProposalError {
         match self {
             Self::Support(error) => error.fmt(f),
             Self::UnsupportedProposer { arm } => {
-                write!(f, "resident proposal arm {arm} is not a Present primitive")
+                write!(f, "resident proposal policy does not admit arm {arm}")
             }
             Self::TerminalSchema => {
                 f.write_str("resident provisional expansion requires an unbound variable")
             }
-            Self::MalformedPlan => {
-                f.write_str("resident Present proposal metadata is inconsistent")
-            }
+            Self::MalformedPlan => f.write_str("resident proposal metadata is inconsistent"),
             Self::GeometryOverflow(quantity) => {
                 write!(f, "resident proposal arena overflows {quantity}")
             }
@@ -163,6 +171,10 @@ pub(crate) struct WgpuResidentProposals {
     child_stride: usize,
     segment_count: usize,
     capacity: usize,
+    /// Private pre-validation planning state retained beneath publication.
+    _planning_control: DeviceU32Buffer<WgpuRuntime>,
+    /// Private indirect rectangle consumed only by family generators.
+    _generation_dispatch: DeviceDispatch<WgpuRuntime>,
     control: DeviceU32Buffer<WgpuRuntime>,
     meta: DeviceBatchMeta<WgpuRuntime>,
     dispatch: DeviceDispatch<WgpuRuntime>,
@@ -200,7 +212,7 @@ struct ProposalStageProfiles {
     child_body: cubecl::profile::ProfileDuration,
 }
 
-struct PresentAdmission {
+struct ProposalAdmission {
     arm_descriptors: Vec<u32>,
     /// CSR offsets for stable relevant-arm slices, one entry per variable plus
     /// the terminal arm count.
@@ -212,7 +224,7 @@ struct PresentAdmission {
     segment_count: usize,
 }
 
-impl PresentAdmission {
+impl ProposalAdmission {
     /// A provisional expansion is terminal exactly when no child segment can
     /// be named. The low-level zero-segment arena remains valid for focused
     /// primitive tests, but the wired nonterminal wrapper rejects this state.
@@ -222,7 +234,7 @@ impl PresentAdmission {
 }
 
 /// Host-known geometry frozen before a wired round launches support kernels.
-struct PresentGeometry {
+struct ProposalGeometry {
     rows: usize,
     parent_stride: usize,
     capacity: usize,
@@ -241,9 +253,15 @@ struct PresentGeometry {
 /// One opaque pairing of the exact semantic admission and its host geometry.
 /// Keeping the pair module-private prevents a capacity or segment-count plan
 /// from being replayed under another admission.
-struct PresentPreflight<'admission> {
-    admission: &'admission PresentAdmission,
-    geometry: PresentGeometry,
+struct ProposalPreflight<'admission> {
+    admission: &'admission ProposalAdmission,
+    geometry: ProposalGeometry,
+}
+
+#[derive(Clone, Copy)]
+enum ProposerPolicy {
+    PresentOnly,
+    PresentAndPair,
 }
 
 /// Physical regions in the one scratch allocation shared by scan kernels.
@@ -254,7 +272,11 @@ struct PresentPreflight<'admission> {
 struct WorkspaceLayout {
     counts: usize,
     row_arms: usize,
-    row_axes: usize,
+    row_families: usize,
+    row_physicals: usize,
+    row_segments: usize,
+    row_counts: usize,
+    row_enum_los: usize,
     choice_errors: usize,
     validation_errors: usize,
     local_offsets: usize,
@@ -297,7 +319,7 @@ struct PlanLayout {
 /// publication into one device command chain.
 struct WgpuResidentWiredRound<'a, U: Universe> {
     round: WgpuResidentRound<'a, U>,
-    admission: PresentAdmission,
+    admission: ProposalAdmission,
 }
 
 impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
@@ -310,7 +332,7 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
         // Construction may upload immutable metadata, but it launches no
         // kernels. Admission therefore still fails before resident execution.
         let round = WgpuResidentRound::new(archive, program, bound_variables)?;
-        let admission = lower_present_admission(&round)?;
+        let admission = lower_proposal_admission(&round, ProposerPolicy::PresentOnly)?;
         if admission.is_terminal() {
             return Err(ResidentProposalError::TerminalSchema);
         }
@@ -340,7 +362,7 @@ impl<'a, U: Universe> WgpuResidentWiredRound<'a, U> {
         self.round.enqueue_admitted_present_proposals(
             frontier,
             &choices,
-            PresentPreflight {
+            ProposalPreflight {
                 admission: &self.admission,
                 geometry,
             },
@@ -383,7 +405,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
         choices: &ResidentRowChoices<WgpuRuntime>,
-        preflight: PresentPreflight<'_>,
+        preflight: ProposalPreflight<'_>,
         publication: PresentPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
@@ -491,11 +513,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         publication: PresentPublication,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        let admission = lower_present_admission(self)?;
-        let geometry = present_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::PresentOnly)?;
+        let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
         self.enqueue_present_proposals_with_inputs(
             inputs,
-            PresentPreflight {
+            ProposalPreflight {
                 admission: &admission,
                 geometry,
             },
@@ -510,7 +532,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     fn enqueue_present_proposals_with_inputs(
         &self,
         inputs: ResidentProposalInputs,
-        preflight: PresentPreflight<'_>,
+        preflight: ProposalPreflight<'_>,
         descriptor_override: Option<&[u32]>,
         dispatch_limits: Option<(u32, u32)>,
         _profile_stages: bool,
@@ -518,7 +540,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let context = self.archive().context();
         let admission = preflight.admission;
-        let PresentGeometry {
+        let ProposalGeometry {
             rows,
             parent_stride,
             capacity,
@@ -544,19 +566,20 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let expected_descriptors = checked_device_product(
             self.metadata().arms().len(),
             ARM_DESCRIPTOR_WORDS,
-            "Present arm descriptors",
+            "proposal arm descriptors",
         )?;
         if descriptors.len() != expected_descriptors {
             return Err(ResidentProposalError::MalformedPlan);
         }
 
         // The override is deliberately a trusted test seam: production always
-        // uploads `lower_present_admission` after its independent source-axis
+        // uploads strict Present-only lowering after its independent source-axis
         // check. Equal-cardinality wrong-axis words cannot be rediscovered from
         // the packed descriptor alone and are outside the device threat model.
         let (plan_words, plan_layout) = packed_plan(admission, descriptors)?;
         let plan = context.upload_u32(&plan_words)?;
         let mut workspace = context.empty_u32(workspace_layout.words)?;
+        let (ring_len, pair_counts) = checked_proposal_physical_limits(self)?;
         if inputs.rows != 0 {
             let dispatch = context.static_batch_dispatch(
                 inputs.rows,
@@ -564,25 +587,38 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 CubeDim::new_1d(THREADS),
             )?;
             unsafe {
-                classify_present_choices::launch_unchecked::<WgpuRuntime>(
+                classify_proposal_choices::launch_unchecked::<WgpuRuntime>(
                     context.client(),
                     dispatch.cube_count(),
                     dispatch.cube_dim(),
                     inputs.choices,
+                    inputs.proposal_witness,
                     plan.input_arg(),
                     workspace.output_arg(),
                     inputs.rows as u32,
                     admission.segment_count as u32,
                     self.metadata().variable_count() as u32,
                     self.metadata().arms().len() as u32,
+                    u32::from(self.proposal_global_dead()),
                     self.archive().present_entity_codes().len() as u32,
                     self.archive().present_attribute_codes().len() as u32,
                     self.archive().present_value_codes().len() as u32,
+                    ring_len,
+                    pair_counts[0],
+                    pair_counts[1],
+                    pair_counts[2],
+                    pair_counts[3],
+                    pair_counts[4],
+                    pair_counts[5],
                     plan_layout.arm_descriptors as u32,
                     plan_layout.variable_to_segment as u32,
                     workspace_layout.counts as u32,
                     workspace_layout.row_arms as u32,
-                    workspace_layout.row_axes as u32,
+                    workspace_layout.row_families as u32,
+                    workspace_layout.row_physicals as u32,
+                    workspace_layout.row_segments as u32,
+                    workspace_layout.row_counts as u32,
+                    workspace_layout.row_enum_los as u32,
                     workspace_layout.choice_errors as u32,
                     RESIDENT_U32_SENTINEL,
                 );
@@ -631,33 +667,43 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             }
         }
 
-        let mut control = context.upload_u32(&[STATUS_OK, 0, 0, 1])?;
+        let mut planning_control = context.upload_u32(&[STATUS_OK, 0, 0, 1])?;
+        let mut control =
+            context.upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])?;
         let mut meta = context.batch_meta(0, capacity)?;
+        let mut generation_dispatch =
+            context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
         let mut dynamic_dispatch = context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
-        let (planning_max_x, planning_max_y) = if let Some((x, y)) = dispatch_limits {
-            // Jerky's capacity rectangle prefers 1-D whenever it fits. The
-            // test seam may rotate the same exact workgroup budget into 2-D,
-            // but only after proving the alternate rectangle is hardware-legal
-            // and covers no more groups than the real capacity envelope.
-            let hardware = &context.client().properties().hardware;
-            let capacity_groups = capacity.div_ceil(THREADS as usize);
-            if x == 0
-                || y == 0
-                || x > hardware.max_cube_count.0
-                || y > hardware.max_cube_count.1
-                || x as u64 * y as u64 != capacity_groups as u64
-            {
-                return Err(ResidentProposalError::GeometryOverflow(
-                    "test dispatch rectangle",
-                ));
-            }
-            (x, y)
-        } else {
-            (
-                dynamic_dispatch.max_groups_x(),
-                dynamic_dispatch.max_groups_y(),
-            )
-        };
+        let (generation_max_x, generation_max_y, publication_max_x, publication_max_y) =
+            if let Some((x, y)) = dispatch_limits {
+                // Jerky's capacity rectangle prefers 1-D whenever it fits. The
+                // test seam may rotate the same exact workgroup budget into 2-D,
+                // but only after proving the alternate rectangle is hardware-legal
+                // and covers no more groups than the real capacity envelope.
+                let hardware = &context.client().properties().hardware;
+                let capacity_groups = capacity.div_ceil(THREADS as usize);
+                if x == 0
+                    || y == 0
+                    || x > hardware.max_cube_count.0
+                    || y > hardware.max_cube_count.1
+                    || x as u64 * y as u64 != capacity_groups as u64
+                {
+                    return Err(ResidentProposalError::GeometryOverflow(
+                        "test dispatch rectangle",
+                    ));
+                }
+                // The seam supplies the same independently validated hardware
+                // envelope to both records; it does not couple either record's
+                // device-side contents to the other.
+                (x, y, x, y)
+            } else {
+                (
+                    generation_dispatch.max_groups_x(),
+                    generation_dispatch.max_groups_y(),
+                    dynamic_dispatch.max_groups_x(),
+                    dynamic_dispatch.max_groups_y(),
+                )
+            };
         let mut segment_records = context.empty_u32(segment_record_words)?;
         let mut candidate_records = context.empty_u32(candidate_record_words)?;
         let mut child_body = context.empty_u32(child_words)?;
@@ -696,7 +742,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 workspace.output_arg(),
                 plan.input_arg(),
                 segment_records.output_arg(),
-                control.output_arg(),
+                planning_control.output_arg(),
                 inputs.rows as u32,
                 cells as u32,
                 block_count as u32,
@@ -705,8 +751,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 inputs.parent_stride as u32,
                 self.metadata().variable_count() as u32,
                 capacity as u32,
-                planning_max_x,
-                planning_max_y,
+                generation_max_x,
+                generation_max_y,
                 THREADS,
                 workspace_layout.counts as u32,
                 workspace_layout.validation_errors as u32,
@@ -723,16 +769,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         }
 
-        // The finalizer has proved an exact successful total and legal folded
-        // dispatch rectangle (or a zero-work failure record), so the exclusive
-        // indirect record can now be published once for both consumers.
+        // The planner publishes only the private family-generation rectangle.
+        // The arena dispatch remains zero until the shared destination gate.
         unsafe {
             publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 CubeCount::new_single(),
                 CubeDim::new_single(),
-                control.input_arg(),
-                dynamic_dispatch.output_arg(),
+                planning_control.input_arg(),
+                generation_dispatch.output_arg(),
                 STATUS_OK,
             );
         }
@@ -741,8 +786,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // the capability seam proves choice/frontier shapes and lineage;
         // classification proves canonical dead triples or live
         // variable/arm/axis/count/segment cells and retains each validated arm
-        // and axis by row; the flat scan proves every cell prefix and total
-        // below the sentinel; the finalizer proves segment boundaries,
+        // and tagged physical witness by row; the flat scan proves every cell
+        // prefix and total below the sentinel; the finalizer proves segment boundaries,
         // insertion/schema, capacity, and provisional control geometry;
         // archive construction proves each present list's exact length,
         // ascending order and in-domain codes; and the checked host products
@@ -756,21 +801,25 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         let launch_candidates = || unsafe {
             generate_present_candidates_by_destination::launch_unchecked::<WgpuRuntime>(
                 context.client(),
-                dynamic_dispatch.cube_count(),
-                dynamic_dispatch.cube_dim(),
+                generation_dispatch.cube_count(),
+                generation_dispatch.cube_dim(),
                 workspace.input_arg(),
                 segment_records.input_arg(),
                 entity_present_codes,
                 attribute_present_codes,
                 value_present_codes,
-                control.input_arg(),
+                planning_control.input_arg(),
                 candidate_records.output_arg(),
                 inputs.rows as u32,
                 admission.segment_count as u32,
                 capacity as u32,
                 domain,
                 workspace_layout.row_arms as u32,
-                workspace_layout.row_axes as u32,
+                workspace_layout.row_families as u32,
+                workspace_layout.row_physicals as u32,
+                workspace_layout.row_segments as u32,
+                workspace_layout.row_counts as u32,
+                workspace_layout.row_enum_los as u32,
                 workspace_layout.counts as u32,
                 workspace_layout.local_offsets as u32,
                 workspace_layout.block_offsets as u32,
@@ -792,6 +841,117 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         };
         #[cfg(not(test))]
         launch_candidates();
+
+        // Family generation is still private. Invert the canonical scan for
+        // every active destination and prove that the whole capacity tail is
+        // poison before publishing the arena's independent indirect record.
+        if capacity != 0 {
+            let dispatch =
+                context.static_batch_dispatch(capacity, capacity, CubeDim::new_1d(THREADS))?;
+            unsafe {
+                validate_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dispatch.cube_count(),
+                    dispatch.cube_dim(),
+                    workspace.input_arg(),
+                    segment_records.input_arg(),
+                    candidate_records.input_arg(),
+                    planning_control.input_arg(),
+                    confirmation_workspace.output_arg(),
+                    inputs.rows as u32,
+                    admission.segment_count as u32,
+                    capacity as u32,
+                    domain,
+                    workspace_layout.row_arms as u32,
+                    workspace_layout.row_segments as u32,
+                    workspace_layout.row_counts as u32,
+                    workspace_layout.counts as u32,
+                    workspace_layout.local_offsets as u32,
+                    workspace_layout.block_offsets as u32,
+                    confirmation_layout.keep as u32,
+                    BLOCK_ITEMS,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+        }
+        if confirmation_layout.block_count != 0 {
+            let dispatch = context.static_batch_dispatch(
+                confirmation_layout.block_count,
+                confirmation_layout.block_count,
+                CubeDim::new_1d(1),
+            )?;
+            unsafe {
+                scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dispatch.cube_count(),
+                    dispatch.cube_dim(),
+                    confirmation_workspace.output_arg(),
+                    capacity as u32,
+                    confirmation_layout.block_count as u32,
+                    confirmation_layout.keep as u32,
+                    confirmation_layout.local_offsets as u32,
+                    confirmation_layout.block_sums as u32,
+                    confirmation_layout.block_errors as u32,
+                    BLOCK_ITEMS,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_DEVICE_INVARIANT,
+                );
+            }
+        }
+        unsafe {
+            finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                confirmation_workspace.output_arg(),
+                planning_control.input_arg(),
+                control.output_arg(),
+                capacity as u32,
+                confirmation_layout.block_count as u32,
+                publication_max_x,
+                publication_max_y,
+                THREADS,
+                confirmation_layout.local_offsets as u32,
+                confirmation_layout.block_sums as u32,
+                confirmation_layout.block_errors as u32,
+                confirmation_layout.block_offsets as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+                STATUS_CAPACITY,
+                STATUS_DEVICE_INVARIANT,
+                STATUS_GEOMETRY,
+            );
+            publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                control.input_arg(),
+                dynamic_dispatch.output_arg(),
+                STATUS_OK,
+            );
+        }
+        if poison_len != 0 {
+            let dispatch =
+                context.static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))?;
+            unsafe {
+                poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    dispatch.cube_count(),
+                    dispatch.cube_dim(),
+                    control.input_arg(),
+                    segment_records.output_arg(),
+                    candidate_records.output_arg(),
+                    child_body.output_arg(),
+                    segment_record_words as u32,
+                    capacity as u32,
+                    child_words as u32,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+        }
 
         // One invocation confirms one provisional destination against every
         // stable relevant Present arm. The exact proposer arm is structurally
@@ -1041,6 +1201,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 child_stride,
                 segment_count: admission.segment_count,
                 capacity,
+                _planning_control: planning_control,
+                _generation_dispatch: generation_dispatch,
                 control: final_control,
                 meta: final_meta,
                 dispatch: final_dispatch,
@@ -1078,6 +1240,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             child_stride,
             segment_count: admission.segment_count,
             capacity,
+            _planning_control: planning_control,
+            _generation_dispatch: generation_dispatch,
             control,
             meta,
             dispatch: dynamic_dispatch,
@@ -1099,13 +1263,15 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     }
 }
 
-fn lower_present_admission<U: Universe>(
+fn lower_proposal_admission<U: Universe>(
     round: &WgpuResidentRound<'_, U>,
-) -> Result<PresentAdmission, ResidentProposalError> {
+    policy: ProposerPolicy,
+) -> Result<ProposalAdmission, ResidentProposalError> {
     let metadata = round.metadata();
+    let (_, pair_counts) = checked_proposal_physical_limits(round)?;
     let arm_count = metadata.arms().len();
     let descriptor_words =
-        checked_device_product(arm_count, ARM_DESCRIPTOR_WORDS, "Present arm descriptors")?;
+        checked_device_product(arm_count, ARM_DESCRIPTOR_WORDS, "proposal arm descriptors")?;
     let mut arm_descriptors = vec![RESIDENT_U32_SENTINEL; descriptor_words];
 
     if !round.proposal_global_dead() {
@@ -1113,30 +1279,10 @@ fn lower_present_admission<U: Universe>(
         if specs.len() != arm_count {
             return Err(ResidentProposalError::MalformedPlan);
         }
-        for (arm, (&identity, &spec)) in metadata.arms().iter().zip(specs).enumerate() {
-            let ArmSpec::Present {
-                arm: spec_arm,
-                axis,
-                count,
-            } = spec
-            else {
-                return Err(ResidentProposalError::UnsupportedProposer { arm });
-            };
-            if spec_arm as usize != arm || round.proposal_arm_axis(arm) != Some(axis) {
-                return Err(ResidentProposalError::MalformedPlan);
-            }
-            let present_len = match axis {
-                ResidentAxis::Entity => round.archive().present_entity_codes().len(),
-                ResidentAxis::Attribute => round.archive().present_attribute_codes().len(),
-                ResidentAxis::Value => round.archive().present_value_codes().len(),
-            };
-            if count as usize != present_len || count == RESIDENT_U32_SENTINEL {
-                return Err(ResidentProposalError::MalformedPlan);
-            }
+        for (arm, &spec) in specs.iter().enumerate() {
+            let descriptor = lower_proposal_arm_descriptor(round, arm, spec, policy, pair_counts)?;
             let base = arm * ARM_DESCRIPTOR_WORDS;
-            arm_descriptors[base] = identity.target_variable().index() as u32;
-            arm_descriptors[base + 1] = axis.code();
-            arm_descriptors[base + 2] = count;
+            arm_descriptors[base..base + ARM_DESCRIPTOR_WORDS].copy_from_slice(&descriptor);
         }
     }
 
@@ -1147,7 +1293,7 @@ fn lower_present_admission<U: Universe>(
         let variable = ProgramVariable::new(variable as u8);
         let relevant = metadata.relevant_arm_ids(variable)?;
         variable_arms.extend_from_slice(relevant);
-        ensure_below_sentinel(variable_arms.len(), "Present relevant-arm CSR")?;
+        ensure_below_sentinel(variable_arms.len(), "proposal relevant-arm CSR")?;
         variable_offsets.push(variable_arms.len() as u32);
     }
     if variable_arms.len() != arm_count {
@@ -1171,7 +1317,7 @@ fn lower_present_admission<U: Universe>(
     let segment_count = segment_specs.len() / SEGMENT_SPEC_WORDS;
     checked_device_product(segment_count, SEGMENT_SPEC_WORDS, "proposal segment specs")?;
 
-    Ok(PresentAdmission {
+    Ok(ProposalAdmission {
         arm_descriptors,
         variable_offsets,
         variable_arms,
@@ -1181,6 +1327,98 @@ fn lower_present_admission<U: Universe>(
     })
 }
 
+fn lower_proposal_arm_descriptor<U: Universe>(
+    round: &WgpuResidentRound<'_, U>,
+    arm: usize,
+    spec: ArmSpec,
+    policy: ProposerPolicy,
+    pair_counts: [u32; 6],
+) -> Result<[u32; ARM_DESCRIPTOR_WORDS], ResidentProposalError> {
+    let identity = round
+        .metadata()
+        .arms()
+        .get(arm)
+        .ok_or(ResidentProposalError::MalformedPlan)?;
+    let (family, physical, enum_limit) = match spec {
+        ArmSpec::Present {
+            arm: spec_arm,
+            axis,
+            count,
+        } => {
+            if spec_arm as usize != arm || round.proposal_arm_axis(arm) != Some(axis) {
+                return Err(ResidentProposalError::MalformedPlan);
+            }
+            let present_len = match axis {
+                ResidentAxis::Entity => round.archive().present_entity_codes().len(),
+                ResidentAxis::Attribute => round.archive().present_attribute_codes().len(),
+                ResidentAxis::Value => round.archive().present_value_codes().len(),
+            };
+            if count as usize != present_len || count == RESIDENT_U32_SENTINEL {
+                return Err(ResidentProposalError::MalformedPlan);
+            }
+            (FAMILY_PRESENT, axis.code(), count)
+        }
+        ArmSpec::PairDistinct {
+            arm: spec_arm,
+            rotation,
+            ..
+        } if matches!(policy, ProposerPolicy::PresentAndPair) => {
+            if spec_arm as usize != arm
+                || round.proposal_arm_axis(arm) != Some(rotation_target_axis(rotation))
+                || round.proposal_arm_pair_rotation(arm) != Some(rotation)
+            {
+                return Err(ResidentProposalError::MalformedPlan);
+            }
+            (
+                FAMILY_PAIR_DISTINCT,
+                rotation.index() as u32,
+                pair_counts[rotation.index()],
+            )
+        }
+        ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => {
+            return Err(ResidentProposalError::UnsupportedProposer { arm });
+        }
+    };
+    Ok([
+        identity.target_variable().index() as u32,
+        family,
+        physical,
+        enum_limit,
+    ])
+}
+
+fn lower_present_admission<U: Universe>(
+    round: &WgpuResidentRound<'_, U>,
+) -> Result<ProposalAdmission, ResidentProposalError> {
+    lower_proposal_admission(round, ProposerPolicy::PresentOnly)
+}
+
+fn checked_proposal_physical_limits<U: Universe>(
+    round: &WgpuResidentRound<'_, U>,
+) -> Result<(u32, [u32; 6]), ResidentProposalError> {
+    let ring_len = round.archive().ring_col(SuccinctRotation::Eav).len();
+    ensure_below_sentinel(ring_len, "proposal Ring length")?;
+    let mut pair_counts = [0u32; 6];
+    for rotation in SuccinctRotation::ALL {
+        let rotation_len = round.archive().ring_col(rotation).len();
+        let changes = round.archive().pair_changes(rotation);
+        if rotation_len != ring_len || changes.len() != ring_len {
+            return Err(ResidentProposalError::MalformedPlan);
+        }
+        ensure_below_sentinel(changes.num_ones(), "PairDistinct pair count")?;
+        pair_counts[rotation.index()] = changes.num_ones() as u32;
+    }
+    Ok((ring_len as u32, pair_counts))
+}
+
+const fn rotation_target_axis(rotation: SuccinctRotation) -> ResidentAxis {
+    match rotation {
+        SuccinctRotation::Eav | SuccinctRotation::Vae => ResidentAxis::Attribute,
+        SuccinctRotation::Vea | SuccinctRotation::Aev => ResidentAxis::Entity,
+        SuccinctRotation::Ave | SuccinctRotation::Eva => ResidentAxis::Value,
+    }
+}
+
 /// Freezes every capacity-dependent host quantity before any wired producer
 /// kernel is launched. Ordinary one-short capacity remains a device-reported,
 /// sticky arena status; only unrepresentable host geometry fails here.
@@ -1188,18 +1426,18 @@ fn preflight_present_geometry<U: Universe>(
     round: &WgpuResidentRound<'_, U>,
     frontier: &WgpuResidentFrontier<'_, U>,
     capacity: usize,
-    admission: &PresentAdmission,
-) -> Result<PresentGeometry, ResidentProposalError> {
+    admission: &ProposalAdmission,
+) -> Result<ProposalGeometry, ResidentProposalError> {
     let (rows, parent_stride) = round.proposal_frontier_shape(frontier)?;
-    present_geometry(rows, parent_stride, capacity, admission)
+    proposal_geometry(rows, parent_stride, capacity, admission)
 }
 
-fn present_geometry(
+fn proposal_geometry(
     rows: usize,
     parent_stride: usize,
     capacity: usize,
-    admission: &PresentAdmission,
-) -> Result<PresentGeometry, ResidentProposalError> {
+    admission: &ProposalAdmission,
+) -> Result<ProposalGeometry, ResidentProposalError> {
     ensure_below_sentinel(capacity, "candidate capacity")?;
     let child_stride = parent_stride
         .checked_add(1)
@@ -1223,7 +1461,7 @@ fn present_geometry(
     let child_words = checked_device_product(capacity, child_stride, "provisional child body")?;
     let workspace_layout = workspace_layout(cells, rows, choice_error_blocks, block_count)?;
     let confirmation_layout = confirmation_workspace_layout(capacity)?;
-    Ok(PresentGeometry {
+    Ok(ProposalGeometry {
         rows,
         parent_stride,
         capacity,
@@ -1275,7 +1513,11 @@ fn workspace_layout(
     let mut words = 0usize;
     let counts = reserve_words(&mut words, cells, "proposal workspace")?;
     let row_arms = reserve_words(&mut words, rows, "proposal workspace")?;
-    let row_axes = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_families = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_physicals = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_segments = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_counts = reserve_words(&mut words, rows, "proposal workspace")?;
+    let row_enum_los = reserve_words(&mut words, rows, "proposal workspace")?;
     let choice_errors = reserve_words(&mut words, rows, "proposal workspace")?;
     let validation_errors = reserve_words(&mut words, validation_blocks, "proposal workspace")?;
     let local_offsets = reserve_words(&mut words, cells, "proposal workspace")?;
@@ -1285,7 +1527,11 @@ fn workspace_layout(
     Ok(WorkspaceLayout {
         counts,
         row_arms,
-        row_axes,
+        row_families,
+        row_physicals,
+        row_segments,
+        row_counts,
+        row_enum_los,
         choice_errors,
         validation_errors,
         local_offsets,
@@ -1297,7 +1543,7 @@ fn workspace_layout(
 }
 
 fn packed_plan(
-    admission: &PresentAdmission,
+    admission: &ProposalAdmission,
     descriptors: &[u32],
 ) -> Result<(Vec<u32>, PlanLayout), ResidentProposalError> {
     let mut plan = Vec::new();
@@ -1359,22 +1605,35 @@ fn ensure_below_sentinel(
 
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn classify_present_choices(
+fn classify_proposal_choices(
     choices: &Array<u32>,
+    proposal_witness: &Array<u32>,
     plan: &Array<u32>,
     workspace: &mut Array<u32>,
     rows: u32,
     segment_count: u32,
     variable_count: u32,
     arm_count: u32,
+    global_dead: u32,
     entity_count: u32,
     attribute_count: u32,
     value_count: u32,
+    ring_len: u32,
+    pair_count_eav: u32,
+    pair_count_vea: u32,
+    pair_count_ave: u32,
+    pair_count_vae: u32,
+    pair_count_eva: u32,
+    pair_count_aev: u32,
     arm_descriptors_base: u32,
     variable_to_segment_base: u32,
     counts_base: u32,
     row_arms_base: u32,
-    row_axes_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_segments_base: u32,
+    row_counts_base: u32,
+    row_enum_los_base: u32,
     choice_errors_base: u32,
     dead: u32,
 ) {
@@ -1393,51 +1652,234 @@ fn classify_present_choices(
         if row_arms_base as usize + row < workspace.len() {
             workspace[row_arms_base as usize + row] = dead;
         }
-        if row_axes_base as usize + row < workspace.len() {
-            workspace[row_axes_base as usize + row] = dead;
+        if row_families_base as usize + row < workspace.len() {
+            workspace[row_families_base as usize + row] = dead;
+        }
+        if row_physicals_base as usize + row < workspace.len() {
+            workspace[row_physicals_base as usize + row] = dead;
+        }
+        if row_segments_base as usize + row < workspace.len() {
+            workspace[row_segments_base as usize + row] = dead;
+        }
+        if row_counts_base as usize + row < workspace.len() {
+            workspace[row_counts_base as usize + row] = dead;
+        }
+        if row_enum_los_base as usize + row < workspace.len() {
+            workspace[row_enum_los_base as usize + row] = dead;
+        }
+
+        // The exact planner already proves the generic interval lattice for
+        // every arm. This family boundary additionally authenticates every
+        // retained witness against its physical descriptor before allowing a
+        // selected or semantic-dead row to reach capacity planning.
+        let mut physical_witnesses_valid = true;
+        if global_dead == 1u32 {
+            let mut witness_arm = 0u32;
+            while witness_arm < arm_count {
+                let descriptor =
+                    arm_descriptors_base as usize + witness_arm as usize * ARM_DESCRIPTOR_WORDS;
+                let witness = (witness_arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                if descriptor + 3usize >= plan.len()
+                    || witness + 3usize >= proposal_witness.len()
+                    || plan[descriptor] != dead
+                    || plan[descriptor + 1usize] != dead
+                    || plan[descriptor + 2usize] != dead
+                    || plan[descriptor + 3usize] != dead
+                    || proposal_witness[witness] != 0u32
+                    || proposal_witness[witness + 1usize] != 0u32
+                    || proposal_witness[witness + 2usize] != 0u32
+                    || proposal_witness[witness + 3usize] != 0u32
+                {
+                    physical_witnesses_valid = false;
+                }
+                witness_arm += 1u32;
+            }
+        } else {
+            let mut witness_arm = 0u32;
+            while witness_arm < arm_count {
+                let descriptor =
+                    arm_descriptors_base as usize + witness_arm as usize * ARM_DESCRIPTOR_WORDS;
+                let witness = (witness_arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                let mut valid = false;
+                if descriptor + 3usize < plan.len() && witness + 3usize < proposal_witness.len() {
+                    let target = plan[descriptor];
+                    let family = plan[descriptor + 1usize];
+                    let physical = plan[descriptor + 2usize];
+                    let enum_limit = plan[descriptor + 3usize];
+                    let base_lo = proposal_witness[witness];
+                    let base_hi = proposal_witness[witness + 1usize];
+                    let enum_lo = proposal_witness[witness + 2usize];
+                    let enum_hi = proposal_witness[witness + 3usize];
+                    if target < variable_count
+                        && base_lo != dead
+                        && base_hi != dead
+                        && enum_lo != dead
+                        && enum_hi != dead
+                        && base_lo <= base_hi
+                        && enum_lo <= enum_hi
+                        && enum_hi - enum_lo <= base_hi - base_lo
+                    {
+                        if family == FAMILY_PRESENT {
+                            let mut resident_count = dead;
+                            if physical == 0u32 {
+                                resident_count = entity_count;
+                            } else if physical == 1u32 {
+                                resident_count = attribute_count;
+                            } else if physical == 2u32 {
+                                resident_count = value_count;
+                            }
+                            valid = enum_limit == resident_count
+                                && base_lo == 0u32
+                                && base_hi == resident_count
+                                && enum_lo == 0u32
+                                && enum_hi == resident_count;
+                        } else if family == FAMILY_PAIR_DISTINCT {
+                            let mut pair_count = dead;
+                            let mut known_physical = false;
+                            if physical == 0u32 {
+                                pair_count = pair_count_eav;
+                                known_physical = true;
+                            } else if physical == 1u32 {
+                                pair_count = pair_count_vea;
+                                known_physical = true;
+                            } else if physical == 2u32 {
+                                pair_count = pair_count_ave;
+                                known_physical = true;
+                            } else if physical == 3u32 {
+                                pair_count = pair_count_vae;
+                                known_physical = true;
+                            } else if physical == 4u32 {
+                                pair_count = pair_count_eva;
+                                known_physical = true;
+                            } else if physical == 5u32 {
+                                pair_count = pair_count_aev;
+                                known_physical = true;
+                            }
+                            valid = known_physical
+                                && enum_limit != dead
+                                && enum_limit == pair_count
+                                && base_hi <= ring_len
+                                && enum_hi <= pair_count
+                                && enum_lo <= base_lo
+                                && enum_hi <= base_hi;
+                        }
+                    }
+                }
+                if !valid {
+                    physical_witnesses_valid = false;
+                }
+                witness_arm += 1u32;
+            }
         }
         let choice_base = row * CHOICE_WORDS;
         if choice_base + 2usize < choices.len() {
             let variable = choices[choice_base];
             let arm = choices[choice_base + 1usize];
             let count = choices[choice_base + 2usize];
-            if variable == dead && arm == dead && count == 0u32 {
+            if variable == dead && arm == dead && count == 0u32 && physical_witnesses_valid {
+                if row_counts_base as usize + row < workspace.len() {
+                    workspace[row_counts_base as usize + row] = 0u32;
+                }
                 error = 0u32;
             } else if variable < variable_count
                 && arm < arm_count
                 && count != dead
+                && physical_witnesses_valid
                 && variable_to_segment_base as usize + (variable as usize) < plan.len()
             {
                 let descriptor =
                     arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
-                if descriptor + 2usize < plan.len() {
+                let witness = (arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                if descriptor + 3usize < plan.len() && witness + 3usize < proposal_witness.len() {
                     let target = plan[descriptor];
-                    let axis = plan[descriptor + 1usize];
-                    let expected = plan[descriptor + 2usize];
-                    let mut resident_count = dead;
-                    if axis == 0u32 {
-                        resident_count = entity_count;
-                    } else if axis == 1u32 {
-                        resident_count = attribute_count;
-                    } else if axis == 2u32 {
-                        resident_count = value_count;
-                    }
+                    let family = plan[descriptor + 1usize];
+                    let physical = plan[descriptor + 2usize];
+                    let enum_limit = plan[descriptor + 3usize];
+                    let base_lo = proposal_witness[witness];
+                    let base_hi = proposal_witness[witness + 1usize];
+                    let enum_lo = proposal_witness[witness + 2usize];
+                    let enum_hi = proposal_witness[witness + 3usize];
                     let selected_segment =
                         plan[variable_to_segment_base as usize + variable as usize];
-                    if target == variable
-                        && selected_segment < segment_count
-                        && expected == resident_count
-                        && count == expected
+                    let mut exact_witness = false;
+                    if base_lo != dead
+                        && base_hi != dead
+                        && enum_lo != dead
+                        && enum_hi != dead
+                        && base_lo <= base_hi
+                        && enum_lo <= enum_hi
+                        && count == enum_hi - enum_lo
+                        && enum_hi - enum_lo <= base_hi - base_lo
                     {
+                        if family == FAMILY_PRESENT {
+                            let mut resident_count = dead;
+                            if physical == 0u32 {
+                                resident_count = entity_count;
+                            } else if physical == 1u32 {
+                                resident_count = attribute_count;
+                            } else if physical == 2u32 {
+                                resident_count = value_count;
+                            }
+                            exact_witness = enum_limit == resident_count
+                                && base_lo == 0u32
+                                && base_hi == resident_count
+                                && enum_lo == 0u32
+                                && enum_hi == resident_count;
+                        } else if family == FAMILY_PAIR_DISTINCT {
+                            let mut pair_count = dead;
+                            let mut known_physical = false;
+                            if physical == 0u32 {
+                                pair_count = pair_count_eav;
+                                known_physical = true;
+                            } else if physical == 1u32 {
+                                pair_count = pair_count_vea;
+                                known_physical = true;
+                            } else if physical == 2u32 {
+                                pair_count = pair_count_ave;
+                                known_physical = true;
+                            } else if physical == 3u32 {
+                                pair_count = pair_count_vae;
+                                known_physical = true;
+                            } else if physical == 4u32 {
+                                pair_count = pair_count_eva;
+                                known_physical = true;
+                            } else if physical == 5u32 {
+                                pair_count = pair_count_aev;
+                                known_physical = true;
+                            }
+                            exact_witness = known_physical
+                                && enum_limit != dead
+                                && enum_limit == pair_count
+                                && base_hi <= ring_len
+                                && enum_hi <= pair_count
+                                && enum_lo <= base_lo
+                                && enum_hi <= base_hi;
+                        }
+                    }
+                    if target == variable && selected_segment < segment_count && exact_witness {
                         let cell =
                             counts_base as usize + selected_segment as usize * rows as usize + row;
                         if cell < workspace.len() {
                             workspace[cell] = count;
                             let arm_word = row_arms_base as usize + row;
-                            let axis_word = row_axes_base as usize + row;
-                            if arm_word < workspace.len() && axis_word < workspace.len() {
+                            let family_word = row_families_base as usize + row;
+                            let physical_word = row_physicals_base as usize + row;
+                            let segment_word = row_segments_base as usize + row;
+                            let count_word = row_counts_base as usize + row;
+                            let enum_lo_word = row_enum_los_base as usize + row;
+                            if arm_word < workspace.len()
+                                && family_word < workspace.len()
+                                && physical_word < workspace.len()
+                                && segment_word < workspace.len()
+                                && count_word < workspace.len()
+                                && enum_lo_word < workspace.len()
+                            {
                                 workspace[arm_word] = arm;
-                                workspace[axis_word] = axis;
+                                workspace[family_word] = family;
+                                workspace[physical_word] = physical;
+                                workspace[segment_word] = selected_segment;
+                                workspace[count_word] = count;
+                                workspace[enum_lo_word] = enum_lo;
                                 error = 0u32;
                             }
                         }
@@ -1771,7 +2213,11 @@ fn generate_present_candidates_by_destination(
     capacity: u32,
     domain: u32,
     row_arms_base: u32,
-    row_axes_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_segments_base: u32,
+    row_counts_base: u32,
+    row_enum_los_base: u32,
     counts_base: u32,
     local_offsets_base: u32,
     block_offsets_base: u32,
@@ -1864,6 +2310,7 @@ fn generate_present_candidates_by_destination(
                     let block = cell / block_items as usize;
                     let mut cell_start = dead;
                     let mut cell_end = dead;
+                    let mut cell_count = dead;
                     if counts_base as usize + cell < workspace.len()
                         && local_offsets_base as usize + cell < workspace.len()
                         && block_offsets_base as usize + block < workspace.len()
@@ -1877,6 +2324,7 @@ fn generate_present_candidates_by_destination(
                                 if count < dead - start {
                                     cell_start = start;
                                     cell_end = start + count;
+                                    cell_count = count;
                                 }
                             }
                         }
@@ -1884,26 +2332,47 @@ fn generate_present_candidates_by_destination(
 
                     if destination_u32 >= cell_start && destination_u32 < cell_end {
                         let arm_word = row_arms_base as usize + row as usize;
-                        let axis_word = row_axes_base as usize + row as usize;
-                        if arm_word < workspace.len() && axis_word < workspace.len() {
+                        let family_word = row_families_base as usize + row as usize;
+                        let physical_word = row_physicals_base as usize + row as usize;
+                        let segment_word = row_segments_base as usize + row as usize;
+                        let count_word = row_counts_base as usize + row as usize;
+                        let enum_lo_word = row_enum_los_base as usize + row as usize;
+                        if arm_word < workspace.len()
+                            && family_word < workspace.len()
+                            && physical_word < workspace.len()
+                            && segment_word < workspace.len()
+                            && count_word < workspace.len()
+                            && enum_lo_word < workspace.len()
+                        {
                             let arm = workspace[arm_word];
-                            let axis = workspace[axis_word];
+                            let family = workspace[family_word];
+                            let physical = workspace[physical_word];
+                            let retained_segment = workspace[segment_word];
+                            let retained_count = workspace[count_word];
+                            let enum_lo = workspace[enum_lo_word];
                             let ordinal = (destination_u32 - cell_start) as usize;
                             let mut candidate = dead;
-                            if axis == 0u32 {
+                            if physical == 0u32 {
                                 if ordinal < present_entities.len() {
                                     candidate = present_entities[ordinal];
                                 }
-                            } else if axis == 1u32 {
+                            } else if physical == 1u32 {
                                 if ordinal < present_attributes.len() {
                                     candidate = present_attributes[ordinal];
                                 }
-                            } else if axis == 2u32 {
+                            } else if physical == 2u32 {
                                 if ordinal < present_values.len() {
                                     candidate = present_values[ordinal];
                                 }
                             }
-                            if arm != dead && candidate != dead && candidate < domain {
+                            if arm != dead
+                                && family == FAMILY_PRESENT
+                                && retained_segment == segment
+                                && retained_count == cell_count
+                                && enum_lo == 0u32
+                                && candidate != dead
+                                && candidate < domain
+                            {
                                 candidate_records[destination] = candidate;
                                 candidate_records[capacity as usize + destination] = row;
                                 candidate_records[capacity as usize * 2usize + destination] = arm;
@@ -1912,6 +2381,328 @@ fn generate_present_candidates_by_destination(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+// Keep overflow guards nested so sentinel rejection structurally precedes
+// every `dead - base` expression in the generated device program.
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
+fn validate_proposal_destinations(
+    workspace: &Array<u32>,
+    segment_records: &Array<u32>,
+    candidate_records: &Array<u32>,
+    planning_control: &Array<u32>,
+    verdict_workspace: &mut Array<u32>,
+    rows: u32,
+    segment_count: u32,
+    capacity: u32,
+    domain: u32,
+    row_arms_base: u32,
+    row_segments_base: u32,
+    row_counts_base: u32,
+    counts_base: u32,
+    local_offsets_base: u32,
+    block_offsets_base: u32,
+    verdict_base: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let destination = ABSOLUTE_POS;
+    let verdict_word = verdict_base as usize + destination;
+    if destination < capacity as usize && verdict_word < verdict_workspace.len() {
+        let records_valid = capacity as usize * CANDIDATE_RECORD_FIELDS <= candidate_records.len();
+        let mut candidate = dead;
+        let mut owner = dead;
+        let mut proposer = dead;
+        if records_valid {
+            candidate = candidate_records[destination];
+            owner = candidate_records[capacity as usize + destination];
+            proposer = candidate_records[capacity as usize * 2usize + destination];
+        }
+
+        let mut verdict = dead;
+        if planning_control[CONTROL_STATUS] != ok {
+            if records_valid && candidate == dead && owner == dead && proposer == dead {
+                verdict = 0u32;
+            }
+        } else {
+            let total = planning_control[CONTROL_REQUIRED];
+            if destination >= total as usize {
+                if records_valid && candidate == dead && owner == dead && proposer == dead {
+                    verdict = 0u32;
+                }
+            } else if rows != 0u32
+                && segment_count as usize <= segment_records.len() / SEGMENT_RECORD_WORDS
+            {
+                let destination_u32 = destination as u32;
+                let mut segment_lo = 0u32;
+                let mut segment_hi = segment_count;
+                while segment_lo < segment_hi {
+                    let segment_mid = segment_lo + (segment_hi - segment_lo) / 2u32;
+                    let record = segment_mid as usize * SEGMENT_RECORD_WORDS;
+                    let mut segment_end = dead;
+                    if record + 1usize < segment_records.len() {
+                        let base = segment_records[record];
+                        let count = segment_records[record + 1usize];
+                        if base != dead && count != dead && count < dead - base {
+                            segment_end = base + count;
+                        }
+                    }
+                    if segment_end <= destination_u32 {
+                        segment_lo = segment_mid + 1u32;
+                    } else {
+                        segment_hi = segment_mid;
+                    }
+                }
+
+                if segment_lo < segment_count {
+                    let segment = segment_lo;
+                    let record = segment as usize * SEGMENT_RECORD_WORDS;
+                    let segment_base = segment_records[record];
+                    let segment_width = segment_records[record + 1usize];
+                    let mut segment_end = dead;
+                    if segment_base != dead && segment_width != dead {
+                        if segment_width < dead - segment_base {
+                            segment_end = segment_base + segment_width;
+                        }
+                    }
+                    if destination_u32 >= segment_base && destination_u32 < segment_end {
+                        let mut row_lo = 0u32;
+                        let mut row_hi = rows;
+                        while row_lo < row_hi {
+                            let row_mid = row_lo + (row_hi - row_lo) / 2u32;
+                            let cell = segment as usize * rows as usize + row_mid as usize;
+                            let block = cell / block_items as usize;
+                            let mut cell_end = dead;
+                            if counts_base as usize + cell < workspace.len()
+                                && local_offsets_base as usize + cell < workspace.len()
+                                && block_offsets_base as usize + block < workspace.len()
+                            {
+                                let block_base = workspace[block_offsets_base as usize + block];
+                                let local = workspace[local_offsets_base as usize + cell];
+                                let count = workspace[counts_base as usize + cell];
+                                if block_base != dead && local != dead && count != dead {
+                                    if local < dead - block_base {
+                                        let start = block_base + local;
+                                        if count < dead - start {
+                                            cell_end = start + count;
+                                        }
+                                    }
+                                }
+                            }
+                            if cell_end <= destination_u32 {
+                                row_lo = row_mid + 1u32;
+                            } else {
+                                row_hi = row_mid;
+                            }
+                        }
+
+                        if row_lo < rows {
+                            let row = row_lo;
+                            let cell = segment as usize * rows as usize + row as usize;
+                            let block = cell / block_items as usize;
+                            let mut cell_start = dead;
+                            let mut cell_end = dead;
+                            let mut cell_count = dead;
+                            if counts_base as usize + cell < workspace.len()
+                                && local_offsets_base as usize + cell < workspace.len()
+                                && block_offsets_base as usize + block < workspace.len()
+                            {
+                                let block_base = workspace[block_offsets_base as usize + block];
+                                let local = workspace[local_offsets_base as usize + cell];
+                                let count = workspace[counts_base as usize + cell];
+                                if block_base != dead && local != dead && count != dead {
+                                    if local < dead - block_base {
+                                        let start = block_base + local;
+                                        if count < dead - start {
+                                            cell_start = start;
+                                            cell_end = start + count;
+                                            cell_count = count;
+                                        }
+                                    }
+                                }
+                            }
+
+                            let arm_word = row_arms_base as usize + row as usize;
+                            let segment_word = row_segments_base as usize + row as usize;
+                            let count_word = row_counts_base as usize + row as usize;
+                            if destination_u32 >= cell_start
+                                && destination_u32 < cell_end
+                                && arm_word < workspace.len()
+                                && segment_word < workspace.len()
+                                && count_word < workspace.len()
+                                && candidate < domain
+                                && owner == row
+                                && proposer == workspace[arm_word]
+                                && workspace[segment_word] == segment
+                                && workspace[count_word] == cell_count
+                            {
+                                verdict = 1u32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        verdict_workspace[verdict_word] = verdict;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finalize_proposal_destinations(
+    workspace: &mut Array<u32>,
+    planning_control: &Array<u32>,
+    control: &mut Array<u32>,
+    capacity: u32,
+    block_count: u32,
+    max_groups_x: u32,
+    max_groups_y: u32,
+    threads: u32,
+    local_offsets_base: u32,
+    block_sums_base: u32,
+    block_errors_base: u32,
+    block_offsets_base: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    ok: u32,
+    capacity_status: u32,
+    invariant_status: u32,
+    geometry_status: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let upstream_status = planning_control[CONTROL_STATUS];
+        let upstream_required = planning_control[CONTROL_REQUIRED];
+        let mut expected_blocks = 0u32;
+        if capacity != 0u32 && block_items != 0u32 {
+            expected_blocks = 1u32 + (capacity - 1u32) / block_items;
+        }
+        let mut scan_valid = block_items != 0u32 && block_count == expected_blocks;
+        let mut total = 0u32;
+        let mut block = 0usize;
+        while block < block_count as usize {
+            workspace[block_offsets_base as usize + block] = total;
+            if workspace[block_errors_base as usize + block] != ok {
+                scan_valid = false;
+            }
+            let next = workspace[block_sums_base as usize + block];
+            if next == dead || next >= dead - total {
+                scan_valid = false;
+            } else {
+                total += next;
+            }
+            block += 1usize;
+        }
+
+        let mut status = upstream_status;
+        let mut required = upstream_required;
+        let mut dispatch_x = 0u32;
+        let mut dispatch_y = 1u32;
+
+        if upstream_status == geometry_status {
+            required = dead;
+        } else if !scan_valid {
+            status = invariant_status;
+            required = dead;
+        } else if upstream_status == ok {
+            let mut prefix_required = total;
+            if upstream_required == 0u32 {
+                prefix_required = 0u32;
+            } else if upstream_required < capacity {
+                let boundary = upstream_required as usize;
+                let boundary_block = boundary / block_items as usize;
+                if boundary_block >= block_count as usize
+                    || local_offsets_base as usize + boundary >= workspace.len()
+                    || block_offsets_base as usize + boundary_block >= workspace.len()
+                {
+                    status = invariant_status;
+                } else {
+                    let block_base = workspace[block_offsets_base as usize + boundary_block];
+                    let local = workspace[local_offsets_base as usize + boundary];
+                    if block_base == dead || local == dead || local >= dead - block_base {
+                        status = invariant_status;
+                    } else {
+                        prefix_required = block_base + local;
+                    }
+                }
+            }
+            if upstream_required == dead
+                || upstream_required > capacity
+                || total != upstream_required
+                || prefix_required != total
+            {
+                status = invariant_status;
+            }
+            if status == ok && required != 0u32 {
+                if threads == 0u32 || max_groups_x == 0u32 || max_groups_y == 0u32 {
+                    status = geometry_status;
+                } else {
+                    let groups = 1u32 + (required - 1u32) / threads;
+                    dispatch_y = 1u32 + (groups - 1u32) / max_groups_x;
+                    if dispatch_y == 0u32 || dispatch_y > max_groups_y {
+                        status = geometry_status;
+                    } else {
+                        dispatch_x = 1u32 + (groups - 1u32) / dispatch_y;
+                        if dispatch_x == 0u32 || dispatch_x > max_groups_x {
+                            status = geometry_status;
+                        }
+                    }
+                }
+            }
+            if status != ok {
+                required = dead;
+            }
+        } else if upstream_status == capacity_status {
+            if upstream_required == dead || upstream_required <= capacity || total != 0u32 {
+                status = invariant_status;
+                required = dead;
+            }
+        } else if upstream_status == invariant_status {
+            required = dead;
+        } else {
+            status = invariant_status;
+            required = dead;
+        }
+
+        if status != ok {
+            dispatch_x = 0u32;
+            dispatch_y = 1u32;
+        }
+        control[CONTROL_STATUS] = status;
+        control[CONTROL_REQUIRED] = required;
+        control[CONTROL_DISPATCH_X] = dispatch_x;
+        control[CONTROL_DISPATCH_Y] = dispatch_y;
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn poison_failed_proposal_outputs(
+    control: &Array<u32>,
+    segment_records: &mut Array<u32>,
+    candidate_records: &mut Array<u32>,
+    child_body: &mut Array<u32>,
+    segment_words: u32,
+    capacity: u32,
+    child_words: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let position = ABSOLUTE_POS;
+    if control[CONTROL_STATUS] != ok {
+        if position < segment_words as usize {
+            segment_records[position] = dead;
+        }
+        if position < capacity as usize {
+            candidate_records[position] = dead;
+            candidate_records[capacity as usize + position] = dead;
+            candidate_records[capacity as usize * 2usize + position] = dead;
+        }
+        if position < child_words as usize {
+            child_body[position] = dead;
         }
     }
 }
@@ -2039,7 +2830,10 @@ fn confirm_present_candidates(
             if proposer < arm_count {
                 let descriptor =
                     arm_descriptors_base as usize + proposer as usize * ARM_DESCRIPTOR_WORDS;
-                if descriptor + 2usize >= plan.len() || plan[descriptor] != variable {
+                if descriptor + 3usize >= plan.len()
+                    || plan[descriptor] != variable
+                    || plan[descriptor + 1usize] != FAMILY_PRESENT
+                {
                     invariant = true;
                 }
             }
@@ -2123,11 +2917,13 @@ fn confirm_present_candidates(
                     if arm < arm_count {
                         let descriptor =
                             arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
-                        if descriptor + 2usize < plan.len() {
+                        if descriptor + 3usize < plan.len() {
                             let target = plan[descriptor];
-                            let axis = plan[descriptor + 1usize];
-                            let expected = plan[descriptor + 2usize];
-                            let mut descriptor_valid = target == variable;
+                            let family = plan[descriptor + 1usize];
+                            let axis = plan[descriptor + 2usize];
+                            let expected = plan[descriptor + 3usize];
+                            let mut descriptor_valid =
+                                target == variable && family == FAMILY_PRESENT;
                             if axis == 0u32 {
                                 descriptor_valid =
                                     descriptor_valid && expected as usize == present_entities.len();
@@ -2648,7 +3444,7 @@ fn materialize_present_children(
         let arm = candidate_records[capacity as usize * 2usize + destination];
         if candidate != dead && owner < rows && arm < arm_count {
             let descriptor = arm_descriptors_base as usize + arm as usize * ARM_DESCRIPTOR_WORDS;
-            if descriptor + 2usize < plan.len() {
+            if descriptor + 3usize < plan.len() && plan[descriptor + 1usize] == FAMILY_PRESENT {
                 let variable = plan[descriptor];
                 if variable_to_segment_base as usize + (variable as usize) < plan.len() {
                     let segment = plan[variable_to_segment_base as usize + variable as usize];
@@ -2859,6 +3655,14 @@ impl WgpuResidentProposals {
 fn pack_proposal_completion(meta: &Array<u32>, marker: &mut Array<u32>) {
     if ABSOLUTE_POS == 0 {
         marker[0] = meta[0];
+    }
+}
+
+#[cfg(test)]
+#[cube(launch_unchecked)]
+fn mark_indirect_dispatch(marker: &mut Array<u32>) {
+    if ABSOLUTE_POS == 0 {
+        marker[0] = 1u32;
     }
 }
 

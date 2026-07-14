@@ -381,6 +381,45 @@ impl ResidentRoundPlan {
         pattern_axis(pattern, identity.target_variable())
     }
 
+    /// Independently re-lowers one arm's one-peer physical rotation from the
+    /// retained source pattern and canonical bound schema.
+    pub(crate) fn arm_pair_rotation(&self, arm: usize) -> Option<SuccinctRotation> {
+        let identity = *self.metadata.arms().get(arm)?;
+        let pattern = *self.patterns.get(identity.source_pattern_index())?;
+        let target = identity.target_variable();
+        let bound = self.metadata.bound_variables();
+        if pattern.entity == ProgramTerm::Variable(target) {
+            match (
+                term_is_bound(pattern.attribute, bound)?,
+                term_is_bound(pattern.value, bound)?,
+            ) {
+                (true, false) => Some(SuccinctRotation::Aev),
+                (false, true) => Some(SuccinctRotation::Vea),
+                (false, false) | (true, true) => None,
+            }
+        } else if pattern.attribute == ProgramTerm::Variable(target) {
+            match (
+                term_is_bound(pattern.entity, bound)?,
+                term_is_bound(pattern.value, bound)?,
+            ) {
+                (true, false) => Some(SuccinctRotation::Eav),
+                (false, true) => Some(SuccinctRotation::Vae),
+                (false, false) | (true, true) => None,
+            }
+        } else if pattern.value == ProgramTerm::Variable(target) {
+            match (
+                term_is_bound(pattern.entity, bound)?,
+                term_is_bound(pattern.attribute, bound)?,
+            ) {
+                (true, false) => Some(SuccinctRotation::Eva),
+                (false, true) => Some(SuccinctRotation::Ave),
+                (false, false) | (true, true) => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Nonempty physical groups in `Present`, pair-rotation, restricted-rotation order.
     #[cfg(test)]
     pub fn arm_groups(&self) -> &[ArmGroup] {
@@ -576,7 +615,10 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     /// Each nonempty pair or restricted rotation performs prepare, prefix
     /// select, normalization, rank, and scatter without a device read. Every
     /// fully-bound source then follows one canonical E-A-V membership pipeline;
-    /// its final launch has exactly one invocation and writer per row.
+    /// its final launch has exactly one invocation and writer per row. Each
+    /// witness writer argument is acquired only for its immediately following
+    /// launch on this ordered queue; choice sealing later prevents acquisition
+    /// of new writers rather than attempting to revoke an existing argument.
     pub fn initialize_inputs(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -688,6 +730,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         self.plan.arm_axis(arm)
     }
 
+    /// Independently re-derived one-peer rotation for host admission.
+    pub(crate) fn proposal_arm_pair_rotation(&self, arm: usize) -> Option<SuccinctRotation> {
+        self.plan.arm_pair_rotation(arm)
+    }
+
     /// Whether a missing constant killed the complete positive conjunction.
     pub(crate) const fn proposal_global_dead(&self) -> bool {
         self.plan.is_global_dead()
@@ -704,11 +751,10 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         Ok((frontier.rows, frontier.stride))
     }
 
-    /// Test-only construction of malformed but correctly branded Present
-    /// choices with synthetic zero-peer witnesses. Device consumers must still
-    /// reject their contents before publication. Pair/Restricted tests must use
-    /// [`Self::force_choice_words_from_inputs_for_test`] so they retain real
-    /// producer intervals.
+    /// Test-only construction of malformed but correctly branded choices over
+    /// the exact witness allocation produced for this frontier. Device
+    /// consumers must still reject malformed choice words before publication;
+    /// no test may fabricate or relabel the retained interval bytes.
     #[cfg(test)]
     pub(crate) fn upload_choice_words_for_test(
         &self,
@@ -716,8 +762,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         words: &[u32],
     ) -> Result<ResidentRowChoices<WgpuRuntime>, ResidentSupportError> {
         self.validate_frontier(frontier)?;
+        let inputs = self.initialize_inputs(frontier)?;
         self.planner
-            .upload_choice_words_for_test(words, frontier.rows, frontier.lineage.clone())
+            .force_choice_words_from_inputs_for_test(&inputs, words)
             .map_err(Into::into)
     }
 
@@ -1050,6 +1097,14 @@ fn pattern_has_missing(pattern: ProgramPattern) -> bool {
     pattern_terms(pattern)
         .into_iter()
         .any(|term| term == ProgramTerm::MissingConstant)
+}
+
+fn term_is_bound(term: ProgramTerm, bound: &[ProgramVariable]) -> Option<bool> {
+    match term {
+        ProgramTerm::Constant(_) => Some(true),
+        ProgramTerm::Variable(variable) => Some(bound.binary_search(&variable).is_ok()),
+        ProgramTerm::MissingConstant => None,
+    }
 }
 
 fn resolve_bound(term: ProgramTerm, columns: &[Option<u8>]) -> Option<CodeSource> {

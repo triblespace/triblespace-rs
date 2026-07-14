@@ -370,8 +370,12 @@ impl From<jerky::Error> for ResidentRoundError {
 /// The fields remain opaque so arbitrary buffers cannot be relabelled as
 /// planner-owned. The next resident support microprogram can fill an allocation
 /// created by this planner without any intermediate readback. Once planning
-/// clones the exact witness allocation into a choice capability, every writer
-/// seam fails closed because the private [`Arc`] is no longer unique.
+/// clones the exact witness allocation into a choice capability, the private
+/// [`Arc`] is no longer unique and no new writer argument can be acquired.
+/// This does not revoke an argument which was already acquired: the resident
+/// facade therefore obtains each producer argument immediately before its
+/// launch, enqueues it on the same ordered queue, and drops it before the
+/// planner is enqueued and sealing occurs.
 pub struct ResidentRoundInputs<R: Runtime> {
     owner: Arc<()>,
     frontier_lineage: Option<Arc<()>>,
@@ -727,50 +731,6 @@ impl<R: Runtime> ResidentRowPlanner<R> {
             return Err(ResidentRoundError::MalformedProposalWitness);
         }
         Ok(())
-    }
-
-    /// Constructs a planner- and frontier-branded packed choice allocation
-    /// without running the planner.
-    ///
-    /// This exists only for adversarial device-boundary tests of the next
-    /// resident Present stage. Its synthetic `[0, count, 0, count]` witnesses
-    /// are intentionally valid only for that zero-peer test surface. Future
-    /// Pair/Restricted tests must force words from real inputs through
-    /// [`Self::force_choice_words_from_inputs_for_test`] instead of fabricating
-    /// interval bytes. Production code can mint choices only through
-    /// [`Self::enqueue`].
-    #[cfg(test)]
-    pub(crate) fn upload_choice_words_for_test(
-        &self,
-        words: &[u32],
-        rows: usize,
-        frontier_lineage: Arc<()>,
-    ) -> Result<ResidentRowChoices<R>, ResidentRoundError> {
-        validate_rows(rows)?;
-        let expected = checked_device_product(rows, CHOICE_WORDS, "packed row choices")?;
-        if words.len() != expected {
-            return Err(ResidentRoundError::MalformedChoiceBuffer);
-        }
-        let witness_words = self.metadata.expected_witness_words(rows)?;
-        let mut witnesses = vec![0; witness_words];
-        for (row, choice) in words.chunks_exact(CHOICE_WORDS).enumerate() {
-            let arm = choice[1];
-            let count = choice[2];
-            if arm < self.metadata.arms.len() as u32 && count != RESIDENT_U32_SENTINEL {
-                let base = (arm as usize * rows + row) * PROPOSAL_WITNESS_WORDS;
-                witnesses[base..base + PROPOSAL_WITNESS_WORDS]
-                    .copy_from_slice(&[0, count, 0, count]);
-            }
-        }
-        Ok(ResidentRowChoices {
-            owner: self.owner.clone(),
-            frontier_lineage: Some(frontier_lineage),
-            proposal_witness: Arc::new(self.context.upload_u32(&witnesses)?),
-            words: self.context.upload_u32(words)?,
-            rows,
-            variable_count: self.metadata.variable_count,
-            arm_targets: self.arm_targets.clone(),
-        })
     }
 
     /// Forces choice words while retaining the exact producer witness Arc.

@@ -646,16 +646,17 @@ fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_
     let mut descriptors = lower_present_admission(round).unwrap().arm_descriptors;
     let relevant_axes = relevant
         .iter()
-        .map(|&arm| descriptors[arm as usize * ARM_DESCRIPTOR_WORDS + 1])
+        .map(|&arm| descriptors[arm as usize * ARM_DESCRIPTOR_WORDS + 2])
         .collect::<Vec<_>>();
     assert_eq!(relevant_axes, [0, 2, 1]);
     assert_eq!(provisional.proposer_arms[0], relevant[0]);
 
-    // The Value sibling has already rejected this candidate. Corrupt only the
-    // later Attribute sibling: confirmation must still validate it and report
-    // poison rather than allowing the earlier semantic rejection to mask it.
+    // The Value sibling would reject this candidate semantically. Corrupt only
+    // the later Attribute sibling: all-arm descriptor authentication must
+    // report invariant poison before capacity, rather than allowing that
+    // semantic rejection to mask the malformed physical descriptor.
     let later_sibling = relevant[2] as usize * ARM_DESCRIPTOR_WORDS;
-    descriptors[later_sibling + 1] = 3;
+    descriptors[later_sibling + 2] = 3;
     let poisoned = round
         .enqueue_confirmed_present_proposals_with_trusted_descriptors_for_test(
             &resident,
@@ -664,10 +665,9 @@ fn shared_variable_present_confirmation_rejects_cross_axis_candidate_and_poison_
             &descriptors,
         )
         .unwrap();
-    assert_eq!(
-        poisoned.read_confirmation_keep_for_test()[0],
-        RESIDENT_U32_SENTINEL
-    );
+    // An upstream classifier failure reaches the capacity-wide destination
+    // gate as canonical poison and therefore contributes no live keep lane.
+    assert_eq!(poisoned.read_confirmation_keep_for_test()[0], 0);
     let poisoned = poisoned.inspect();
     assert_eq!(poisoned.status, STATUS_DEVICE_INVARIANT);
     assert_eq!(poisoned.required, RESIDENT_U32_SENTINEL);

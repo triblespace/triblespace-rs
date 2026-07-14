@@ -109,6 +109,385 @@ fn assert_success(inspection: &ProposalInspection, expected: usize) {
     );
 }
 
+struct DirectClassification {
+    control: Vec<u32>,
+    workspace: Vec<u32>,
+    segments: Vec<u32>,
+    layout: WorkspaceLayout,
+}
+
+fn classify_direct<U: Universe>(
+    round: &WgpuResidentRound<'_, U>,
+    admission: &ProposalAdmission,
+    descriptors: &[u32],
+    parent_stride: usize,
+    choices: &[u32],
+    witnesses: &[u32],
+    capacity: usize,
+) -> DirectClassification {
+    let rows = choices.len() / CHOICE_WORDS;
+    assert_eq!(choices.len(), rows * CHOICE_WORDS);
+    assert_eq!(
+        witnesses.len(),
+        rows * round.metadata().arms().len() * PROPOSAL_WITNESS_WORDS
+    );
+    let geometry = proposal_geometry(rows, parent_stride, capacity, admission).unwrap();
+    let (plan_words, plan_layout) = packed_plan(admission, descriptors).unwrap();
+    let context = round.archive().context();
+    let choices = context.upload_u32(choices).unwrap();
+    let witnesses = context.upload_u32(witnesses).unwrap();
+    let plan = context.upload_u32(&plan_words).unwrap();
+    let mut workspace = context.empty_u32(geometry.workspace_layout.words).unwrap();
+    let (ring_len, pair_counts) = checked_proposal_physical_limits(round).unwrap();
+    if rows != 0 {
+        let dispatch = context
+            .static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))
+            .unwrap();
+        unsafe {
+            classify_proposal_choices::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                choices.input_arg(),
+                witnesses.input_arg(),
+                plan.input_arg(),
+                workspace.output_arg(),
+                rows as u32,
+                admission.segment_count as u32,
+                round.metadata().variable_count() as u32,
+                round.metadata().arms().len() as u32,
+                u32::from(round.proposal_global_dead()),
+                round.archive().present_entity_codes().len() as u32,
+                round.archive().present_attribute_codes().len() as u32,
+                round.archive().present_value_codes().len() as u32,
+                ring_len,
+                pair_counts[0],
+                pair_counts[1],
+                pair_counts[2],
+                pair_counts[3],
+                pair_counts[4],
+                pair_counts[5],
+                plan_layout.arm_descriptors as u32,
+                plan_layout.variable_to_segment as u32,
+                geometry.workspace_layout.counts as u32,
+                geometry.workspace_layout.row_arms as u32,
+                geometry.workspace_layout.row_families as u32,
+                geometry.workspace_layout.row_physicals as u32,
+                geometry.workspace_layout.row_segments as u32,
+                geometry.workspace_layout.row_counts as u32,
+                geometry.workspace_layout.row_enum_los as u32,
+                geometry.workspace_layout.choice_errors as u32,
+                RESIDENT_U32_SENTINEL,
+            );
+        }
+    }
+    if geometry.choice_error_blocks != 0 {
+        let dispatch = context
+            .static_batch_dispatch(
+                geometry.choice_error_blocks,
+                geometry.choice_error_blocks,
+                CubeDim::new_1d(1),
+            )
+            .unwrap();
+        unsafe {
+            reduce_validation_errors::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                workspace.output_arg(),
+                rows as u32,
+                geometry.choice_error_blocks as u32,
+                geometry.workspace_layout.choice_errors as u32,
+                geometry.workspace_layout.validation_errors as u32,
+                BLOCK_ITEMS,
+            );
+        }
+    }
+    if geometry.block_count != 0 {
+        let dispatch = context
+            .static_batch_dispatch(
+                geometry.block_count,
+                geometry.block_count,
+                CubeDim::new_1d(1),
+            )
+            .unwrap();
+        unsafe {
+            scan_present_blocks::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                dispatch.cube_count(),
+                dispatch.cube_dim(),
+                workspace.output_arg(),
+                geometry.cells as u32,
+                geometry.block_count as u32,
+                geometry.workspace_layout.counts as u32,
+                geometry.workspace_layout.local_offsets as u32,
+                geometry.workspace_layout.block_sums as u32,
+                geometry.workspace_layout.block_errors as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+            );
+        }
+    }
+    let mut segments = context
+        .upload_u32(&vec![RESIDENT_U32_SENTINEL; geometry.segment_record_words])
+        .unwrap();
+    let mut control = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
+    let dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    unsafe {
+        finalize_present_scan::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            workspace.output_arg(),
+            plan.input_arg(),
+            segments.output_arg(),
+            control.output_arg(),
+            rows as u32,
+            geometry.cells as u32,
+            geometry.block_count as u32,
+            geometry.choice_error_blocks as u32,
+            admission.segment_count as u32,
+            parent_stride as u32,
+            round.metadata().variable_count() as u32,
+            capacity as u32,
+            dispatch.max_groups_x(),
+            dispatch.max_groups_y(),
+            THREADS,
+            geometry.workspace_layout.counts as u32,
+            geometry.workspace_layout.validation_errors as u32,
+            geometry.workspace_layout.local_offsets as u32,
+            geometry.workspace_layout.block_sums as u32,
+            geometry.workspace_layout.block_errors as u32,
+            geometry.workspace_layout.block_offsets as u32,
+            plan_layout.segment_specs as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_CAPACITY,
+            STATUS_DEVICE_INVARIANT,
+            STATUS_GEOMETRY,
+        );
+    }
+    DirectClassification {
+        control: control.read(),
+        workspace: workspace.read(),
+        segments: segments.read(),
+        layout: geometry.workspace_layout,
+    }
+}
+
+struct DirectGate {
+    control: Vec<u32>,
+    logical_len: u32,
+    segments: Vec<u32>,
+    candidates: Vec<u32>,
+    child: Vec<u32>,
+    verdicts: Vec<u32>,
+    indirect_marker: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gate_direct(
+    planning_words: [u32; 4],
+    workspace_words: &[u32],
+    workspace_layout: WorkspaceLayout,
+    rows: usize,
+    segment_count: usize,
+    capacity: usize,
+    domain: u32,
+    segment_words: &[u32],
+    candidate_words: &[u32],
+    child_words: &[u32],
+) -> DirectGate {
+    let context = crate::WgpuContext::on_wgpu();
+    let workspace = context.upload_u32(workspace_words).unwrap();
+    let mut segments = context.upload_u32(segment_words).unwrap();
+    let mut candidates = context.upload_u32(candidate_words).unwrap();
+    let mut child = context.upload_u32(child_words).unwrap();
+    let planning = context.upload_u32(&planning_words).unwrap();
+    let mut control = context
+        .upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])
+        .unwrap();
+    let mut meta = context.batch_meta(0, capacity).unwrap();
+    let mut dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    let confirmation_layout = confirmation_workspace_layout(capacity).unwrap();
+    let mut confirmation = context
+        .upload_u32(&vec![0; confirmation_layout.words])
+        .unwrap();
+
+    if capacity != 0 {
+        let launch = context
+            .static_batch_dispatch(capacity, capacity, CubeDim::new_1d(THREADS))
+            .unwrap();
+        unsafe {
+            validate_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                launch.cube_count(),
+                launch.cube_dim(),
+                workspace.input_arg(),
+                segments.input_arg(),
+                candidates.input_arg(),
+                planning.input_arg(),
+                confirmation.output_arg(),
+                rows as u32,
+                segment_count as u32,
+                capacity as u32,
+                domain,
+                workspace_layout.row_arms as u32,
+                workspace_layout.row_segments as u32,
+                workspace_layout.row_counts as u32,
+                workspace_layout.counts as u32,
+                workspace_layout.local_offsets as u32,
+                workspace_layout.block_offsets as u32,
+                confirmation_layout.keep as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+            );
+        }
+    }
+    if confirmation_layout.block_count != 0 {
+        let launch = context
+            .static_batch_dispatch(
+                confirmation_layout.block_count,
+                confirmation_layout.block_count,
+                CubeDim::new_1d(1),
+            )
+            .unwrap();
+        unsafe {
+            scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                launch.cube_count(),
+                launch.cube_dim(),
+                confirmation.output_arg(),
+                capacity as u32,
+                confirmation_layout.block_count as u32,
+                confirmation_layout.keep as u32,
+                confirmation_layout.local_offsets as u32,
+                confirmation_layout.block_sums as u32,
+                confirmation_layout.block_errors as u32,
+                BLOCK_ITEMS,
+                RESIDENT_U32_SENTINEL,
+                STATUS_DEVICE_INVARIANT,
+            );
+        }
+    }
+    unsafe {
+        finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            confirmation.output_arg(),
+            planning.input_arg(),
+            control.output_arg(),
+            capacity as u32,
+            confirmation_layout.block_count as u32,
+            dispatch.max_groups_x(),
+            dispatch.max_groups_y(),
+            THREADS,
+            confirmation_layout.local_offsets as u32,
+            confirmation_layout.block_sums as u32,
+            confirmation_layout.block_errors as u32,
+            confirmation_layout.block_offsets as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+            STATUS_CAPACITY,
+            STATUS_DEVICE_INVARIANT,
+            STATUS_GEOMETRY,
+        );
+        publish_present_dispatch::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            control.input_arg(),
+            dispatch.output_arg(),
+            STATUS_OK,
+        );
+    }
+    let poison_len = segment_words.len().max(capacity).max(child_words.len());
+    if poison_len != 0 {
+        let launch = context
+            .static_batch_dispatch(poison_len, poison_len, CubeDim::new_1d(THREADS))
+            .unwrap();
+        unsafe {
+            poison_failed_proposal_outputs::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                launch.cube_count(),
+                launch.cube_dim(),
+                control.input_arg(),
+                segments.output_arg(),
+                candidates.output_arg(),
+                child.output_arg(),
+                segment_words.len() as u32,
+                capacity as u32,
+                child_words.len() as u32,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+            );
+        }
+    }
+    unsafe {
+        publish_present_meta::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            control.input_arg(),
+            meta.output_arg(),
+            capacity as u32,
+            STATUS_OK,
+        );
+    }
+    let mut indirect_marker = context.upload_u32(&[0]).unwrap();
+    unsafe {
+        mark_indirect_dispatch::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            dispatch.cube_count(),
+            dispatch.cube_dim(),
+            indirect_marker.output_arg(),
+        );
+    }
+    let mut meta_marker = context.empty_u32(1).unwrap();
+    unsafe {
+        pack_proposal_completion::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            meta.input_arg(),
+            meta_marker.output_arg(),
+        );
+    }
+    let confirmation = confirmation.read();
+    DirectGate {
+        control: control.read(),
+        logical_len: meta_marker.read()[0],
+        segments: segments.read(),
+        candidates: candidates.read(),
+        child: child.read(),
+        verdicts: confirmation[confirmation_layout.keep..confirmation_layout.keep + capacity]
+            .to_vec(),
+        indirect_marker: indirect_marker.read()[0],
+    }
+}
+
+fn canonical_gate_fixture() -> (WorkspaceLayout, Vec<u32>, Vec<u32>, Vec<u32>) {
+    let layout = workspace_layout(3, 3, 0, 1).unwrap();
+    let mut workspace = vec![0; layout.words];
+    workspace[layout.counts..layout.counts + 3].copy_from_slice(&[1, 1, 1]);
+    workspace[layout.row_arms..layout.row_arms + 3].copy_from_slice(&[7, 8, 9]);
+    workspace[layout.row_segments..layout.row_segments + 3].copy_from_slice(&[0, 0, 0]);
+    workspace[layout.row_counts..layout.row_counts + 3].copy_from_slice(&[1, 1, 1]);
+    workspace[layout.local_offsets..layout.local_offsets + 3].copy_from_slice(&[0, 1, 2]);
+    workspace[layout.block_offsets] = 0;
+    let segments = vec![0, 3, 0, 0];
+    let dead = RESIDENT_U32_SENTINEL;
+    let candidates = vec![0, 1, 2, dead, 0, 1, 2, dead, 7, 8, 9, dead];
+    (layout, workspace, segments, candidates)
+}
+
 #[test]
 fn indirect_child_materialization_covers_zero_one_block_edge_and_forced_2d_fold() {
     for (entities, expected_dispatch) in [(0usize, (0, 1)), (1, (1, 1)), (64, (1, 1)), (65, (1, 2))]
@@ -1339,7 +1718,7 @@ fn malformed_private_choices_and_axis_descriptors_fail_before_capacity() {
         .upload_choice_words_for_test(&frontier, &valid)
         .unwrap();
     let mut descriptors = lower_present_admission(&round).unwrap().arm_descriptors;
-    descriptors[1] = ResidentAxis::Attribute.code();
+    descriptors[2] = ResidentAxis::Attribute.code();
     let inspection = round
         .enqueue_present_proposals_with_trusted_descriptors_for_test(
             &frontier,
@@ -1398,7 +1777,7 @@ fn trusted_descriptor_override_is_not_a_device_axis_authenticator() {
     );
 
     let mut trusted = lower_present_admission(&round).unwrap().arm_descriptors;
-    trusted[entity_arm * ARM_DESCRIPTOR_WORDS + 1] = ResidentAxis::Value.code();
+    trusted[entity_arm * ARM_DESCRIPTOR_WORDS + 2] = ResidentAxis::Value.code();
     let overridden = round
         .enqueue_present_proposals_with_trusted_descriptors_for_test(
             &frontier,
@@ -1544,6 +1923,12 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         child_stride: 1,
         segment_count: 1,
         capacity: 1,
+        _planning_control: context
+            .upload_u32(&[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL, 0, 1])
+            .unwrap(),
+        _generation_dispatch: context
+            .batch_dispatch(0, 1, CubeDim::new_1d(THREADS))
+            .unwrap(),
         control,
         meta,
         dispatch,
@@ -1953,6 +2338,756 @@ fn non_present_arms_fail_host_admission_without_a_device_launch() {
         round.enqueue_present_proposals(&frontier, &choices, 8),
         Err(ResidentProposalError::UnsupportedProposer { .. })
     ));
+}
+
+#[test]
+fn generic_pair_descriptors_cover_all_six_rotations_and_classify_exact_witnesses() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let bound_codes = [
+        program.encode(&raw(fixture.entities[0])).unwrap().get(),
+        program.encode(&raw(fixture.attributes[0])).unwrap().get(),
+        program.encode(&raw(fixture.values[0])).unwrap().get(),
+    ];
+    let expected = [
+        [(1usize, SuccinctRotation::Eav), (2, SuccinctRotation::Eva)],
+        [(0usize, SuccinctRotation::Aev), (2, SuccinctRotation::Ave)],
+        [(0usize, SuccinctRotation::Vea), (1, SuccinctRotation::Vae)],
+    ];
+    let mut seen = [false; 6];
+
+    for bound_index in 0..3 {
+        let round = WgpuResidentRound::new(&gpu, &program, &[variables[bound_index]]).unwrap();
+        let admission = lower_proposal_admission(&round, ProposerPolicy::PresentAndPair).unwrap();
+        let host = program
+            .frontier_from_indices(
+                vec![variables[bound_index]],
+                vec![bound_codes[bound_index]],
+                1,
+            )
+            .unwrap();
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+
+        for &(target_index, rotation) in &expected[bound_index] {
+            let arm = round
+                .metadata()
+                .arms()
+                .iter()
+                .position(|identity| identity.target_variable() == variables[target_index])
+                .unwrap();
+            let descriptor = arm * ARM_DESCRIPTOR_WORDS;
+            assert_eq!(admission.arm_descriptors[descriptor], target_index as u32);
+            assert_eq!(
+                admission.arm_descriptors[descriptor + 1],
+                FAMILY_PAIR_DISTINCT
+            );
+            assert_eq!(
+                admission.arm_descriptors[descriptor + 2],
+                rotation.index() as u32
+            );
+            assert_eq!(round.proposal_arm_pair_rotation(arm), Some(rotation));
+            seen[rotation.index()] = true;
+
+            let witness = arm * PROPOSAL_WITNESS_WORDS;
+            let count = witnesses[witness + 3] - witnesses[witness + 2];
+            let choice = [target_index as u32, arm as u32, count];
+            let classified = classify_direct(
+                &round,
+                &admission,
+                &admission.arm_descriptors,
+                1,
+                &choice,
+                &witnesses,
+                count as usize,
+            );
+            assert_eq!(&classified.control[..2], &[STATUS_OK, count]);
+            assert_eq!(classified.workspace[classified.layout.row_arms], arm as u32);
+            assert_eq!(
+                classified.workspace[classified.layout.row_families],
+                FAMILY_PAIR_DISTINCT
+            );
+            assert_eq!(
+                classified.workspace[classified.layout.row_physicals],
+                rotation.index() as u32
+            );
+            let segment = admission.variable_to_segment[target_index];
+            assert_eq!(
+                classified.workspace[classified.layout.row_segments],
+                segment
+            );
+            assert_eq!(classified.workspace[classified.layout.row_counts], count);
+            assert_eq!(
+                classified.workspace[classified.layout.row_enum_los],
+                witnesses[witness + 2]
+            );
+            assert_eq!(
+                classified.workspace[classified.layout.counts + segment as usize],
+                count
+            );
+            let record = segment as usize * SEGMENT_RECORD_WORDS;
+            assert_eq!(classified.segments[record + 1], count);
+            assert_eq!(classified.segments[record + 2], target_index as u32);
+        }
+    }
+    assert!(seen.into_iter().all(|seen| seen));
+}
+
+#[test]
+fn pair_classifier_rejects_bad_tags_limits_and_interval_shapes_before_capacity() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[variables[0]]).unwrap();
+    let admission = lower_proposal_admission(&round, ProposerPolicy::PresentAndPair).unwrap();
+    let arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == variables[1])
+        .unwrap();
+    let descriptor = arm * ARM_DESCRIPTOR_WORDS;
+    let host = program
+        .frontier_from_indices(
+            vec![variables[0]],
+            vec![program.encode(&raw(fixture.entities[0])).unwrap().get()],
+            1,
+        )
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let witness = arm * PROPOSAL_WITNESS_WORDS;
+    let count = witnesses[witness + 3] - witnesses[witness + 2];
+    let choice = [variables[1].index() as u32, arm as u32, count];
+
+    let mut bad_descriptors = Vec::new();
+    for (word, value) in [
+        (0usize, variables[2].index() as u32),
+        (1, 9),
+        (2, SuccinctRotation::ALL.len() as u32),
+        (3, admission.arm_descriptors[descriptor + 3] + 1),
+    ] {
+        let mut descriptors = admission.arm_descriptors.clone();
+        descriptors[descriptor + word] = value;
+        bad_descriptors.push(descriptors);
+    }
+    let mut coherent_unknown_physical = admission.arm_descriptors.clone();
+    coherent_unknown_physical[descriptor + 2] = SuccinctRotation::ALL.len() as u32;
+    coherent_unknown_physical[descriptor + 3] = RESIDENT_U32_SENTINEL;
+    bad_descriptors.push(coherent_unknown_physical);
+    for descriptors in bad_descriptors {
+        let classified =
+            classify_direct(&round, &admission, &descriptors, 1, &choice, &witnesses, 0);
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+
+    let (ring_len, pair_counts) = checked_proposal_physical_limits(&round).unwrap();
+    let pair_limit = pair_counts[SuccinctRotation::Eav.index()];
+    let mut bad_witnesses = Vec::new();
+    for replacement in [
+        [0, ring_len + 1, 0, count],
+        [0, ring_len, 0, pair_limit + 1],
+        [1, 2, 2, 2],
+        [0, 1, 0, 2],
+        [RESIDENT_U32_SENTINEL; PROPOSAL_WITNESS_WORDS],
+    ] {
+        let mut malformed = witnesses.clone();
+        malformed[witness..witness + PROPOSAL_WITNESS_WORDS].copy_from_slice(&replacement);
+        bad_witnesses.push(malformed);
+    }
+    for malformed in bad_witnesses {
+        let classified = classify_direct(
+            &round,
+            &admission,
+            &admission.arm_descriptors,
+            1,
+            &choice,
+            &malformed,
+            0,
+        );
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+
+    let other_arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == variables[2])
+        .unwrap();
+    let other_witness = other_arm * PROPOSAL_WITNESS_WORDS;
+    let mut impossible_unchosen = witnesses.clone();
+    impossible_unchosen[other_witness..other_witness + PROPOSAL_WITNESS_WORDS].copy_from_slice(&[
+        0,
+        ring_len + 1,
+        0,
+        0,
+    ]);
+    for selected in [choice, [RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 0]] {
+        let classified = classify_direct(
+            &round,
+            &admission,
+            &admission.arm_descriptors,
+            1,
+            &selected,
+            &impossible_unchosen,
+            0,
+        );
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+    let other_descriptor = other_arm * ARM_DESCRIPTOR_WORDS;
+    let mut impossible_unchosen_descriptor = admission.arm_descriptors.clone();
+    impossible_unchosen_descriptor[other_descriptor + 2] = SuccinctRotation::ALL.len() as u32;
+    impossible_unchosen_descriptor[other_descriptor + 3] = RESIDENT_U32_SENTINEL;
+    for selected in [choice, [RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 0]] {
+        let classified = classify_direct(
+            &round,
+            &admission,
+            &impossible_unchosen_descriptor,
+            1,
+            &selected,
+            &witnesses,
+            0,
+        );
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+
+    let mut zero_witnesses = witnesses.clone();
+    zero_witnesses[witness..witness + PROPOSAL_WITNESS_WORDS].copy_from_slice(&[0, 0, 0, 0]);
+    let zero = classify_direct(
+        &round,
+        &admission,
+        &admission.arm_descriptors,
+        1,
+        &[variables[1].index() as u32, arm as u32, 0],
+        &zero_witnesses,
+        0,
+    );
+    assert_eq!(&zero.control[..2], &[STATUS_OK, 0]);
+    assert_eq!(zero.workspace[zero.layout.row_arms], arm as u32);
+    assert_eq!(zero.workspace[zero.layout.row_counts], 0);
+    let dead = classify_direct(
+        &round,
+        &admission,
+        &admission.arm_descriptors,
+        1,
+        &[RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 0],
+        &zero_witnesses,
+        0,
+    );
+    assert_eq!(&dead.control[..2], &[STATUS_OK, 0]);
+    assert_eq!(dead.workspace[dead.layout.row_arms], RESIDENT_U32_SENTINEL);
+    assert_eq!(dead.workspace[dead.layout.row_counts], 0);
+}
+
+#[test]
+fn present_classifier_authenticates_unchosen_physical_witnesses_before_semantics() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[]).unwrap();
+    let admission = lower_present_admission(&round).unwrap();
+    let frontier = round.upload_frontier(&ProgramFrontier::seed()).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let selected_arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == variables[0])
+        .unwrap();
+    let unchosen_arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == variables[1])
+        .unwrap();
+    let selected_witness = selected_arm * PROPOSAL_WITNESS_WORDS;
+    let count = witnesses[selected_witness + 3] - witnesses[selected_witness + 2];
+    let mut impossible_unchosen = witnesses.clone();
+    let unchosen_witness = unchosen_arm * PROPOSAL_WITNESS_WORDS;
+    impossible_unchosen[unchosen_witness..unchosen_witness + PROPOSAL_WITNESS_WORDS]
+        .copy_from_slice(&[1, 1, 0, 0]);
+    for choice in [
+        [variables[0].index() as u32, selected_arm as u32, count],
+        [RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL, 0],
+    ] {
+        let classified = classify_direct(
+            &round,
+            &admission,
+            &admission.arm_descriptors,
+            0,
+            &choice,
+            &impossible_unchosen,
+            0,
+        );
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+        );
+    }
+}
+
+#[test]
+fn generic_admission_still_rejects_restricted_arms() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &variables[..2]).unwrap();
+    assert!(matches!(
+        lower_proposal_admission(&round, ProposerPolicy::PresentAndPair),
+        Err(ResidentProposalError::UnsupportedProposer { .. })
+    ));
+}
+
+#[test]
+fn generic_admission_authenticates_same_target_pair_rotation_independently() {
+    let fixture = fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let variables = [
+        ProgramVariable::new(0),
+        ProgramVariable::new(1),
+        ProgramVariable::new(2),
+    ];
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(variables[0], variables[1], variables[2])],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[variables[2]]).unwrap();
+    let arm = round
+        .metadata()
+        .arms()
+        .iter()
+        .position(|identity| identity.target_variable() == variables[1])
+        .unwrap();
+    let ArmSpec::PairDistinct { peer, .. } = round.proposal_arm_specs()[arm] else {
+        panic!("attribute arm with bound value must be PairDistinct");
+    };
+    assert_eq!(
+        round.proposal_arm_pair_rotation(arm),
+        Some(SuccinctRotation::Vae)
+    );
+    let (_, pair_counts) = checked_proposal_physical_limits(&round).unwrap();
+    assert!(matches!(
+        lower_proposal_arm_descriptor(
+            &round,
+            arm,
+            ArmSpec::PairDistinct {
+                arm: arm as u32,
+                rotation: SuccinctRotation::Eav,
+                peer,
+            },
+            ProposerPolicy::PresentAndPair,
+            pair_counts,
+        ),
+        Err(ResidentProposalError::MalformedPlan)
+    ));
+}
+
+#[test]
+fn shared_destination_gate_rejects_every_identity_and_completeness_fault() {
+    let (layout, workspace, segments, canonical) = canonical_gate_fixture();
+    let valid = gate_direct(
+        [STATUS_OK, 3, 1, 1],
+        &workspace,
+        layout,
+        3,
+        1,
+        4,
+        3,
+        &segments,
+        &canonical,
+        &[55; 4],
+    );
+    assert_eq!(&valid.control[..2], &[STATUS_OK, 3]);
+    assert_eq!(valid.logical_len, 3);
+    assert_eq!(valid.verdicts, [1, 1, 1, 0]);
+    assert_eq!(valid.indirect_marker, 1);
+
+    let mut faults = Vec::new();
+    let mut middle_hole = canonical.clone();
+    middle_hole[1] = RESIDENT_U32_SENTINEL;
+    faults.push(("middle hole", middle_hole));
+    let mut wrong_owner = canonical.clone();
+    wrong_owner[4 + 1] = 0;
+    faults.push(("wrong owner", wrong_owner));
+    let mut wrong_proposer = canonical.clone();
+    wrong_proposer[8 + 1] = 7;
+    faults.push(("wrong proposer", wrong_proposer));
+    let mut out_of_domain = canonical.clone();
+    out_of_domain[1] = 3;
+    faults.push(("out of domain", out_of_domain));
+    let mut live_tail = canonical.clone();
+    live_tail[3] = 0;
+    faults.push(("non-poison code tail", live_tail));
+    let mut live_owner_tail = canonical.clone();
+    live_owner_tail[4 + 3] = 0;
+    faults.push(("non-poison owner tail", live_owner_tail));
+    let mut live_proposer_tail = canonical.clone();
+    live_proposer_tail[8 + 3] = 7;
+    faults.push(("non-poison proposer tail", live_proposer_tail));
+    let mut duplicate_route = canonical.clone();
+    duplicate_route[1] = duplicate_route[0];
+    duplicate_route[4 + 1] = duplicate_route[4];
+    duplicate_route[8 + 1] = duplicate_route[8];
+    faults.push(("duplicate route leaves canonical hole", duplicate_route));
+
+    for (name, candidates) in faults {
+        let failed = gate_direct(
+            [STATUS_OK, 3, 1, 1],
+            &workspace,
+            layout,
+            3,
+            1,
+            4,
+            3,
+            &segments,
+            &candidates,
+            &[55; 4],
+        );
+        assert_eq!(
+            &failed.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "{name}"
+        );
+        assert_eq!((failed.control[2], failed.control[3]), (0, 1), "{name}");
+        assert_eq!(failed.logical_len, 0, "{name}");
+        assert_eq!(failed.indirect_marker, 0, "{name}");
+        assert!(
+            failed
+                .segments
+                .iter()
+                .chain(&failed.candidates)
+                .chain(&failed.child)
+                .all(|&word| word == RESIDENT_U32_SENTINEL),
+            "{name}"
+        );
+    }
+
+    let mut wrong_segment = workspace.clone();
+    wrong_segment[layout.row_segments + 1] = 1;
+    let mut wrong_row_count = workspace.clone();
+    wrong_row_count[layout.row_counts + 1] = 2;
+    let mut wrong_canonical_count = workspace.clone();
+    wrong_canonical_count[layout.counts + 1] = 2;
+    for (name, malformed_workspace) in [
+        ("wrong retained segment", wrong_segment),
+        ("wrong retained row count", wrong_row_count),
+        ("wrong canonical cell count", wrong_canonical_count),
+    ] {
+        let failed = gate_direct(
+            [STATUS_OK, 3, 1, 1],
+            &malformed_workspace,
+            layout,
+            3,
+            1,
+            4,
+            3,
+            &segments,
+            &canonical,
+            &[55; 4],
+        );
+        assert_eq!(
+            &failed.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "{name}"
+        );
+        assert_eq!(failed.indirect_marker, 0, "{name}");
+    }
+
+    let exact_capacity_candidates = [0, 1, 2, 0, 1, 2, 7, 8, 9];
+    let exact_capacity = gate_direct(
+        [STATUS_OK, 3, 1, 1],
+        &workspace,
+        layout,
+        3,
+        1,
+        3,
+        3,
+        &segments,
+        &exact_capacity_candidates,
+        &[55; 3],
+    );
+    assert_eq!(&exact_capacity.control[..2], &[STATUS_OK, 3]);
+    assert_eq!(exact_capacity.verdicts, [1, 1, 1]);
+    assert_eq!(exact_capacity.indirect_marker, 1);
+}
+
+#[test]
+fn destination_gate_preserves_the_closed_upstream_error_lattice() {
+    let (layout, workspace, _, _) = canonical_gate_fixture();
+    let dead = RESIDENT_U32_SENTINEL;
+    let poison_segments = vec![dead; SEGMENT_RECORD_WORDS];
+    let poison_candidates = vec![dead; 4 * CANDIDATE_RECORD_FIELDS];
+    let run = |planning, candidates: &[u32]| {
+        gate_direct(
+            planning,
+            &workspace,
+            layout,
+            3,
+            1,
+            4,
+            3,
+            &poison_segments,
+            candidates,
+            &[55; 4],
+        )
+    };
+
+    let capacity = run([STATUS_CAPACITY, 5, 0, 1], &poison_candidates);
+    assert_eq!(&capacity.control[..2], &[STATUS_CAPACITY, 5]);
+    assert_eq!(capacity.logical_len, 0);
+    assert_eq!(capacity.indirect_marker, 0);
+    assert!(capacity
+        .segments
+        .iter()
+        .chain(&capacity.candidates)
+        .chain(&capacity.child)
+        .all(|&word| word == dead));
+
+    let mut polluted = poison_candidates.clone();
+    polluted[0] = 0;
+    let capacity_pollution = run([STATUS_CAPACITY, 5, 0, 1], &polluted);
+    assert_eq!(
+        &capacity_pollution.control[..2],
+        &[STATUS_DEVICE_INVARIANT, dead]
+    );
+    let invariant = run([STATUS_DEVICE_INVARIANT, 0, 0, 1], &poison_candidates);
+    assert_eq!(&invariant.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
+    let unknown = run([99, dead, 0, 1], &poison_candidates);
+    assert_eq!(&unknown.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
+    let geometry = run([STATUS_GEOMETRY, dead, 0, 1], &polluted);
+    assert_eq!(&geometry.control[..2], &[STATUS_GEOMETRY, dead]);
+    for malformed in [[STATUS_CAPACITY, dead, 0, 1], [STATUS_CAPACITY, 4, 0, 1]] {
+        let result = run(malformed, &poison_candidates);
+        assert_eq!(&result.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
+    }
+
+    let zero = run([STATUS_OK, 0, 0, 1], &poison_candidates);
+    assert_eq!(&zero.control[..2], &[STATUS_OK, 0]);
+    let zero_pollution = run([STATUS_OK, 0, 0, 1], &polluted);
+    assert_eq!(
+        &zero_pollution.control[..2],
+        &[STATUS_DEVICE_INVARIANT, dead]
+    );
+    let ignored_zero_planning_dispatch = run([STATUS_OK, 0, 1, 99], &poison_candidates);
+    assert_eq!(
+        &ignored_zero_planning_dispatch.control[..2],
+        &[STATUS_OK, 0]
+    );
+    assert_eq!(
+        (
+            ignored_zero_planning_dispatch.control[2],
+            ignored_zero_planning_dispatch.control[3],
+        ),
+        (0, 1)
+    );
+    for malformed in [[STATUS_OK, 5, 1, 1], [STATUS_OK, dead, 1, 1]] {
+        let result = run(malformed, &poison_candidates);
+        assert_eq!(&result.control[..2], &[STATUS_DEVICE_INVARIANT, dead]);
+    }
+
+    let (_, _, segments, candidates) = canonical_gate_fixture();
+    let ignored_live_planning_dispatch = gate_direct(
+        [STATUS_OK, 3, RESIDENT_U32_SENTINEL, RESIDENT_U32_SENTINEL],
+        &workspace,
+        layout,
+        3,
+        1,
+        4,
+        3,
+        &segments,
+        &candidates,
+        &[55; 4],
+    );
+    assert_eq!(
+        &ignored_live_planning_dispatch.control[..2],
+        &[STATUS_OK, 3]
+    );
+    assert_eq!(
+        (
+            ignored_live_planning_dispatch.control[2],
+            ignored_live_planning_dispatch.control[3],
+        ),
+        (1, 1)
+    );
+    assert_eq!(ignored_live_planning_dispatch.indirect_marker, 1);
+}
+
+#[test]
+fn destination_finalizer_rejects_equal_total_with_a_hole_and_live_tail() {
+    let context = crate::WgpuContext::on_wgpu();
+    let capacity = 4usize;
+    let layout = confirmation_workspace_layout(capacity).unwrap();
+    let mut words = vec![0; layout.words];
+    words[layout.keep..layout.keep + capacity].copy_from_slice(&[1, 0, 1, 1]);
+    let mut workspace = context.upload_u32(&words).unwrap();
+    let scan = context
+        .static_batch_dispatch(layout.block_count, layout.block_count, CubeDim::new_1d(1))
+        .unwrap();
+    unsafe {
+        scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            scan.cube_count(),
+            scan.cube_dim(),
+            workspace.output_arg(),
+            capacity as u32,
+            layout.block_count as u32,
+            layout.keep as u32,
+            layout.local_offsets as u32,
+            layout.block_sums as u32,
+            layout.block_errors as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_DEVICE_INVARIANT,
+        );
+    }
+    let planning = context.upload_u32(&[STATUS_OK, 3, 1, 1]).unwrap();
+    let mut control = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
+    let dispatch = context
+        .batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))
+        .unwrap();
+    unsafe {
+        finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            workspace.output_arg(),
+            planning.input_arg(),
+            control.output_arg(),
+            capacity as u32,
+            layout.block_count as u32,
+            dispatch.max_groups_x(),
+            dispatch.max_groups_y(),
+            THREADS,
+            layout.local_offsets as u32,
+            layout.block_sums as u32,
+            layout.block_errors as u32,
+            layout.block_offsets as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+            STATUS_CAPACITY,
+            STATUS_DEVICE_INVARIANT,
+            STATUS_GEOMETRY,
+        );
+    }
+    assert_eq!(
+        &control.read()[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+
+    let mut valid_words = vec![0; layout.words];
+    valid_words[layout.keep..layout.keep + capacity].copy_from_slice(&[1, 1, 1, 0]);
+    let mut valid_workspace = context.upload_u32(&valid_words).unwrap();
+    unsafe {
+        scan_confirmation_blocks::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            scan.cube_count(),
+            scan.cube_dim(),
+            valid_workspace.output_arg(),
+            capacity as u32,
+            layout.block_count as u32,
+            layout.keep as u32,
+            layout.local_offsets as u32,
+            layout.block_sums as u32,
+            layout.block_errors as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_DEVICE_INVARIANT,
+        );
+    }
+    let mut malformed_envelope = context.upload_u32(&[STATUS_OK, 0, 0, 1]).unwrap();
+    unsafe {
+        finalize_proposal_destinations::launch_unchecked::<WgpuRuntime>(
+            context.client(),
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            valid_workspace.output_arg(),
+            planning.input_arg(),
+            malformed_envelope.output_arg(),
+            capacity as u32,
+            layout.block_count as u32,
+            0,
+            dispatch.max_groups_y(),
+            THREADS,
+            layout.local_offsets as u32,
+            layout.block_sums as u32,
+            layout.block_errors as u32,
+            layout.block_offsets as u32,
+            BLOCK_ITEMS,
+            RESIDENT_U32_SENTINEL,
+            STATUS_OK,
+            STATUS_CAPACITY,
+            STATUS_DEVICE_INVARIANT,
+            STATUS_GEOMETRY,
+        );
+    }
+    assert_eq!(
+        &malformed_envelope.read()[..2],
+        &[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL]
+    );
 }
 
 struct ProposalBenchmarkSample {

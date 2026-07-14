@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident proposal planning now carries explicit family-tagged physical
+  descriptors and validates every generated destination route before
+  publication.**
+  The exact classifier accepts Present and PairDistinct witness shapes while
+  the low-level and wired execution policies remain strictly Present-only.
+  A family-neutral capacity-wide gate proves canonical segment, row, proposer,
+  in-domain code, and poison-tail identity before publishing a distinct arena
+  dispatch; late faults atomically re-poison all semantic outputs and leave
+  metadata at zero.
 - **Resident support now retains one exact proof-carrying interval witness per
   arm and row.** Present, PairDistinct, and Restricted producers write
   `[base_lo, base_hi, enum_lo, enum_hi]`; the planner derives counts only from
