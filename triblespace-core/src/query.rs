@@ -1126,6 +1126,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryScheduler {
     LazyDag,
+    ResidualState,
     Sequential,
 }
 
@@ -1194,6 +1195,10 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// box avoids growing the already-large sequential cursor copied by
     /// rayon's DFS splitter.
     dag: Option<Box<DagState>>,
+    /// Lazily initialized canonical residual-state cursor. The box owns only
+    /// a borrow-free lowering plan plus raw machine state; `constraint` and
+    /// `postprocessing` remain owned by this `Query`.
+    residual: Option<Box<residual::ResidualQueryState>>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -1226,6 +1231,7 @@ where
             values: self.values.clone(),
             binding: self.binding.clone(),
             dag: self.dag.clone(),
+            residual: self.residual.clone(),
         }
     }
 }
@@ -1370,10 +1376,32 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// made before the first call to [`Iterator::next`].
     pub fn sequential(mut self) -> Self {
         assert!(
-            !self.iteration_started && self.dag.is_none(),
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
             "cannot select the sequential query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::Sequential;
+        self
+    }
+
+    /// Use the experimental canonical residual-state scheduler through the
+    /// ordinary resumable [`Query`] iterator.
+    ///
+    /// Unlike [`Query::solve_residual_state_lazy`], this keeps the runtime
+    /// cursor behind `Query::next`, so cloning a started query snapshots its
+    /// exact raw remainder and ordinary parallel conversion can drain that
+    /// remainder without restarting from the seed. The ordinary default
+    /// remains the lazy DAG scheduler while this API is evaluated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if iteration has already started. Scheduler selection must be
+    /// made before the first call to [`Iterator::next`].
+    pub fn residual_state_scheduler(mut self) -> Self {
+        assert!(
+            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            "cannot select the residual-state query scheduler after iteration has started"
+        );
+        self.scheduler = QueryScheduler::ResidualState;
         self
     }
 
@@ -1452,6 +1480,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             values: ArrayVec::from([const { None }; 128]),
             binding: Binding::default(),
             dag: None,
+            residual: None,
         }
     }
 }
@@ -3213,6 +3242,36 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             );
         }
 
+        if let Some(state) = &mut self.residual {
+            return state.pull(
+                &self.constraint,
+                &self.postprocessing,
+                &self.influences,
+                &self.base_estimates,
+            );
+        }
+
+        if self.scheduler == QueryScheduler::ResidualState
+            && fresh
+            && matches!(self.mode, Search::NextVariable | Search::Done)
+            && self.stack.is_empty()
+            && self.bound.is_empty()
+            && self.touched_variables.is_empty()
+        {
+            let state = self
+                .residual
+                .insert(Box::new(residual::ResidualQueryState::new(
+                    &self.constraint,
+                    self.mode,
+                )));
+            return state.pull(
+                &self.constraint,
+                &self.postprocessing,
+                &self.influences,
+                &self.base_estimates,
+            );
+        }
+
         // The ordinary iterator defaults to the lazy DAG. Rayon partitions a
         // fresh query by advancing the scalar cursor before its leaves call
         // `next`; those partial cursors deliberately stay on the sequential
@@ -3306,6 +3365,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
             .field("mode", &self.mode)
             .field("iteration_started", &self.iteration_started)
             .field("dag_started", &self.dag.is_some())
+            .field("residual_started", &self.residual.is_some())
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
             .finish()
@@ -3329,8 +3389,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 // multiple rows, then Rayon bisects those affine rows into independent
 // worklists. Each DAG fold leaf therefore keeps batching, per-row variable
 // selection, and local route reconvergence. A partially consumed ordinary DAG
-// query remains one exact-remainder leaf when converted through the ordinary
-// `IntoParallelIterator` path.
+// or explicitly selected residual query remains one exact-remainder leaf when
+// converted through the ordinary `IntoParallelIterator` path.
 //
 // `fold_with` is the terminal leaf: it drives the ordinary `Iterator::next()`
 // on whichever scheduler state the producer owns. No duplicated execution
@@ -3355,9 +3415,10 @@ mod parallel {
     /// impl on the underlying query state. Ordinary parallel iteration uses
     /// the established scalar cursor splitter. The explicit DAG entry point
     /// partitions the lazy DAG's affine row frontier, so each fold leaf
-    /// continues through the block-native scheduler. `Query::next` is reused
-    /// as the fold leaf in both cases — parallel execution adds no duplicate
-    /// engine loop.
+    /// continues through the block-native scheduler. A started residual-state
+    /// cursor is likewise preserved as one unsplittable exact-remainder leaf.
+    /// `Query::next` is reused as the fold leaf in every case — parallel
+    /// execution adds no duplicate engine loop.
     ///
     /// The inner query is stored in a [`Box`] so rayon's work-stealing
     /// `split` (which clones the producer) doesn't memcpy ~15 KB of query
@@ -3414,6 +3475,7 @@ mod parallel {
             assert!(
                 !self.iteration_started
                     && self.dag.is_none()
+                    && self.residual.is_none()
                     && self.stack.is_empty()
                     && self.bound.is_empty()
                     && self.touched_variables.is_empty()
@@ -3455,7 +3517,7 @@ mod parallel {
             // scalar DFS path. Marking the scheduler explicitly prevents an
             // unsplittable zero-/one-row leaf from lazily creating a DAG when
             // `fold_with` first calls `Query::next`.
-            if !self.iteration_started && self.dag.is_none() {
+            if !self.iteration_started && self.dag.is_none() && self.residual.is_none() {
                 self.scheduler = QueryScheduler::Sequential;
             }
 
@@ -3482,10 +3544,13 @@ mod parallel {
         /// `fold_with`. See the module comment for both non-re-enumeration
         /// arguments.
         fn split(mut self) -> (Self, Option<Self>) {
-            // A query converted after an ordinary `next()` already owns a
-            // resumable DAG worklist with projected progress. Keep it as one
-            // leaf so the exact remainder is neither restarted nor reordered.
-            if self.inner.dag.is_some() && self.inner.iteration_started {
+            // A query converted after an ordinary `next()` may own a resumable
+            // DAG or residual worklist with projected progress. Keep it as
+            // one leaf so the exact remainder is neither restarted nor
+            // reordered.
+            if (self.inner.dag.is_some() || self.inner.residual.is_some())
+                && self.inner.iteration_started
+            {
                 self.split_budget = 0;
                 return (self, None);
             }
@@ -3640,13 +3705,21 @@ mod parallel {
             Con: UnindexedConsumer<Self::Item>,
         {
             let workers = rayon::current_num_threads();
-            self.split_budget = match (&self.inner.dag, self.inner.iteration_started) {
+            self.split_budget = match (
+                &self.inner.dag,
+                &self.inner.residual,
+                self.inner.iteration_started,
+            ) {
                 // Explicit fresh DAG: at most one affine shard per worker.
-                (Some(_), false) => workers.saturating_sub(1),
-                // Partially consumed ordinary DAG: exact remainder, one leaf.
-                (Some(_), true) => 0,
+                (Some(_), None, false) => workers.saturating_sub(1),
+                // Partially consumed block-native scheduler: exact remainder,
+                // one leaf. Residual sharding is deliberately out of scope.
+                (Some(_), _, true) | (_, Some(_), true) => 0,
                 // Scalar cursor: retain the established spare work chunks.
-                (None, _) => workers.saturating_mul(workers).max(2),
+                (None, None, _) => workers.saturating_mul(workers).max(2),
+                // No public path installs an unstarted residual runtime, but
+                // fail closed if an internal caller ever does.
+                (None, Some(_), false) | (Some(_), Some(_), false) => 0,
             };
             bridge_unindexed(self, consumer)
         }

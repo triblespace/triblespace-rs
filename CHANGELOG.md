@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ordinary `Query` can explicitly own a residual-state cursor.** The
+  temporary `residual_state_scheduler` selector keeps the default lazy-DAG and
+  scalar controls unchanged while placing a borrow-free plan-and-machine box
+  behind `Query::next`. Mid-iteration clones snapshot candidate remainders and
+  staged raw rows without requiring `R: Clone`; a partially consumed residual
+  query converts to Rayon as one exact unsplittable remainder leaf.
 - **Constraints gain an opt-in canonical residual-state solver.** Any root
   `Constraint` can use the residual APIs: roots that expose associative AND
   structure are recursively flattened, while an opaque root is represented by

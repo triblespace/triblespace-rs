@@ -451,7 +451,7 @@ impl StateDesc {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct StateId(u32);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct StateInterner {
     by_desc: HashMap<StateDesc, StateId>,
     descs: Vec<StateDesc>,
@@ -481,7 +481,7 @@ impl StateInterner {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RowBatch {
     rows: Vec<RawInline>,
     row_count: usize,
@@ -513,7 +513,7 @@ impl RowBatch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CandidateBatch {
     /// Committed parent bindings. The speculative variable is deliberately
     /// absent from this block and travels only in `candidates`.
@@ -731,7 +731,7 @@ impl CandidateBatch {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
     Candidates(CandidateBatch),
@@ -1467,6 +1467,7 @@ fn execute_state<'a>(
 /// The exact interner deliberately outlives live buckets. Occupancy scheduling
 /// may process a full state before all of its lower-rank feeders, after which
 /// a later filing simply reopens the same interned descriptor.
+#[derive(Clone)]
 struct ResidualStateMachine {
     full: VariableSet,
     leaf_count: usize,
@@ -1488,6 +1489,40 @@ struct ResidualStateMachine {
     width: usize,
     growth: usize,
     cap: usize,
+}
+
+/// Borrow-free residual cursor stored by the ordinary [`Query`].
+///
+/// The query continues to own the root constraint and postprocessor. This
+/// box contains only the lowering plan and exact raw scheduler remainder, so
+/// cloning it never needs to clone a projected `R` and no field borrows the
+/// surrounding `Query`.
+#[derive(Clone)]
+pub(super) struct ResidualQueryState {
+    plan: ResidualPlan,
+    machine: ResidualStateMachine,
+}
+
+impl ResidualQueryState {
+    pub(super) fn new<'a>(root: &dyn Constraint<'a>, mode: Search) -> Self {
+        let plan = ResidualPlan::compile(root);
+        let machine = ResidualStateMachine::new(root.variables(), plan.len(), mode);
+        Self { plan, machine }
+    }
+
+    pub(super) fn pull<'a, P, R>(
+        &mut self,
+        root: &dyn Constraint<'a>,
+        postprocessing: &P,
+        influences: &[VariableSet; 128],
+        base_estimates: &[usize; 128],
+    ) -> Option<R>
+    where
+        P: Fn(&Binding) -> Option<R>,
+    {
+        self.machine
+            .pull(root, &self.plan, postprocessing, influences, base_estimates)
+    }
 }
 
 impl ResidualStateMachine {
@@ -3288,6 +3323,61 @@ mod tests {
         assert_eq!(lazy.stats().candidates_confirmed, 2);
         assert_eq!(lazy.stats().max_confirm_candidates, 1);
         assert_eq!(lazy.stats().partial_pops, 1);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn ordinary_query_clone_snapshots_parked_candidate_remainder() {
+        let values: Vec<_> = (0..64).map(raw).collect();
+        let root = Arc::new(IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(values.clone()),
+            }) as ShapeConstraint,
+            Box::new(PageFilterLeaf {
+                variable: 0,
+                estimate: values.len() + 1,
+                accepted: None,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }) as ShapeConstraint,
+        ]));
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .residual_state_scheduler();
+
+        assert_eq!(query.next(), Some(raw(63)));
+        let runtime = query.residual.as_deref().expect("residual cursor started");
+        assert!(runtime.machine.worklist.values().any(|level| {
+            level
+                .values()
+                .any(|bucket| matches!(bucket, StateBucket::Candidates(_)))
+        }));
+        assert!(runtime.machine.stats.partial_pops > 0);
+
+        let cloned = query.clone();
+        assert_eq!(query.collect::<Vec<_>>(), cloned.collect::<Vec<_>>());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn ordinary_query_clone_snapshots_unconsumed_staged_output() {
+        let values: Vec<_> = (0..8).map(raw).collect();
+        let root = Arc::new(FanoutLeaf {
+            variable: 0,
+            values: Arc::new(values),
+        });
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .residual_state_scheduler();
+
+        assert!(query.next().is_some());
+        assert!(query.next().is_some());
+        let runtime = query.residual.as_deref().expect("residual cursor started");
+        assert!(
+            runtime.machine.emit_next < runtime.machine.emit_count,
+            "the second geometric pull must leave one raw row staged"
+        );
+
+        let cloned = query.clone();
+        assert_eq!(query.collect::<Vec<_>>(), cloned.collect::<Vec<_>>());
     }
 
     #[test]
