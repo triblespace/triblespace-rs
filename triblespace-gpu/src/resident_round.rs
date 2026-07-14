@@ -593,6 +593,35 @@ impl<R: Runtime> ResidentRowPlanner<R> {
         }
         Ok(choices.words.input_arg())
     }
+
+    /// Constructs a planner- and frontier-branded packed choice allocation
+    /// without running the planner.
+    ///
+    /// This exists only for adversarial device-boundary tests of the next
+    /// resident stage. Production code can mint choices only through
+    /// [`Self::enqueue`]. The ordinary private seam still validates the shape
+    /// and exact planner identities before exposing an input argument.
+    #[cfg(test)]
+    pub(crate) fn upload_choice_words_for_test(
+        &self,
+        words: &[u32],
+        rows: usize,
+        frontier_lineage: Arc<()>,
+    ) -> Result<ResidentRowChoices<R>, ResidentRoundError> {
+        validate_rows(rows)?;
+        let expected = checked_device_product(rows, CHOICE_WORDS, "packed row choices")?;
+        if words.len() != expected {
+            return Err(ResidentRoundError::MalformedChoiceBuffer);
+        }
+        Ok(ResidentRowChoices {
+            owner: self.owner.clone(),
+            frontier_lineage: Some(frontier_lineage),
+            words: self.context.upload_u32(words)?,
+            rows,
+            variable_count: self.metadata.variable_count,
+            arm_targets: self.arm_targets.clone(),
+        })
+    }
 }
 
 /// Packed resident choices produced by [`ResidentRowPlanner::enqueue`].

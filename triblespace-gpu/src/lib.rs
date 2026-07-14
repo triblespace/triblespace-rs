@@ -7,6 +7,8 @@ mod cubecl_backend;
 #[cfg(feature = "wgpu")]
 mod resident_program;
 #[cfg(feature = "wgpu")]
+mod resident_proposals;
+#[cfg(feature = "wgpu")]
 mod resident_round;
 #[cfg(feature = "wgpu")]
 mod resident_support;

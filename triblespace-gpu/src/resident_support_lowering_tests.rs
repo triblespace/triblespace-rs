@@ -77,14 +77,17 @@ fn all_twelve_target_peer_states_lower_exactly() {
         &[
             ArmSpec::Present {
                 arm: 0,
+                axis: ResidentAxis::Entity,
                 count: fixture.archive.entity_count as u32,
             },
             ArmSpec::Present {
                 arm: 1,
+                axis: ResidentAxis::Attribute,
                 count: fixture.archive.attribute_count as u32,
             },
             ArmSpec::Present {
                 arm: 2,
+                axis: ResidentAxis::Value,
                 count: fixture.archive.value_count as u32,
             },
         ]

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Resident affine rounds gain a private, exact Present proposal arena.**
+  Packed planner choices are classified into one variable-major width vector;
+  a single stable device scan turns that layout directly into ascending
+  variable segments without sorting. One sticky finalizer records either a
+  complete exact provisional batch or an error, retaining the representable
+  required total on capacity misses while leaving every semantic segment and
+  candidate/body word poisoned on failure. Present generation copies the
+  archive's resident ascending axis lists (never `0..domain`), preserves parent
+  order and duplicates, records owner plus exact proposer arm, and inserts each
+  candidate into a canonical child row through the real exclusive indirect
+  dispatch;
+  Jerky's logical metadata remains zero until that materialization completes.
+  Packed scratch and plan allocations keep every kernel within seven user
+  storage bindings for baseline WGPU portability. The provisional arena
+  remains crate-private, carries distinct round, parent-frontier, and fresh
+  arena lineages, performs no readback, and deliberately exposes no public
+  transition before sibling confirmation and survivor compaction exist. This
+  correctness slice assigns
+  one invocation per parent row and loops its Present width; a later
+  candidate-parallel indirect generator should replace that seed-frontier
+  bottleneck without changing the scan or arena semantics. The canonical child
+  body is also a parity artifact for now: confirmation can use code, owner, and
+  the exact parent frontier, allowing production materialization to move after
+  survivor compaction.
 - **Resident row choices now preserve exact planner and frontier lineage.**
   Packed choices retain the private planner capability plus a unique lineage
   propagated from the precise affine frontier through its estimate inputs.

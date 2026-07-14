@@ -40,6 +40,31 @@ const SUPPORT_DESCRIPTOR_WORDS: usize = 6;
 const CONSTANT_SOURCE: u32 = 0;
 const COLUMN_SOURCE: u32 = 1;
 
+/// Canonical archive axis selected by a resident proposal arm.
+///
+/// Proposal generation must retain this identity explicitly: equal entity,
+/// attribute, and value cardinalities do not make their resident present-code
+/// lists interchangeable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResidentAxis {
+    /// Entity position of a trible pattern.
+    Entity,
+    /// Attribute position of a trible pattern.
+    Attribute,
+    /// Value position of a trible pattern.
+    Value,
+}
+
+impl ResidentAxis {
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Entity => 0,
+            Self::Attribute => 1,
+            Self::Value => 2,
+        }
+    }
+}
+
 /// Failure to bind or execute the bounded resident producer stage.
 #[derive(Debug)]
 pub enum ResidentSupportError {
@@ -139,6 +164,8 @@ pub enum ArmSpec {
     Present {
         /// Stable index into [`ResidentRoundMetadata::arms`].
         arm: u32,
+        /// Exact archive axis whose resident present-code list is proposed.
+        axis: ResidentAxis,
         /// Exact number of distinct codes present on the target axis.
         count: u32,
     },
@@ -246,6 +273,7 @@ impl ArmGroup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResidentRoundPlan {
     metadata: ResidentRoundMetadata,
+    patterns: Box<[ProgramPattern]>,
     arm_specs: Box<[ArmSpec]>,
     arm_groups: Box<[ArmGroup]>,
     fully_bound_supports: Box<[FullyBoundSupport]>,
@@ -268,6 +296,7 @@ impl ResidentRoundPlan {
         if global_dead {
             return Ok(Self {
                 metadata,
+                patterns: program.patterns().to_vec().into_boxed_slice(),
                 arm_specs: Box::new([]),
                 arm_groups: Box::new([]),
                 fully_bound_supports: Box::new([]),
@@ -322,6 +351,7 @@ impl ResidentRoundPlan {
 
         Ok(Self {
             metadata,
+            patterns: program.patterns().to_vec().into_boxed_slice(),
             arm_specs: arm_specs.into_boxed_slice(),
             arm_groups,
             fully_bound_supports,
@@ -337,6 +367,16 @@ impl ResidentRoundPlan {
     /// Physical estimate instructions in stable arm-ID order.
     pub fn arm_specs(&self) -> &[ArmSpec] {
         &self.arm_specs
+    }
+
+    /// Re-derives one stable arm's target axis from its source pattern.
+    ///
+    /// The proposal stage uses this independently of the physical arm spec so
+    /// a descriptor cannot silently select the wrong resident present list.
+    pub(crate) fn arm_axis(&self, arm: usize) -> Option<ResidentAxis> {
+        let identity = *self.metadata.arms().get(arm)?;
+        let pattern = *self.patterns.get(identity.source_pattern_index())?;
+        pattern_axis(pattern, identity.target_variable())
     }
 
     /// Nonempty physical groups in `Present`, pair-rotation, restricted-rotation order.
@@ -388,6 +428,20 @@ impl<U: Universe> WgpuResidentFrontier<'_, U> {
     pub const fn stride(&self) -> usize {
         self.stride
     }
+}
+
+/// Narrow, already-validated device input seam for a resident proposal stage.
+///
+/// The raw array arguments never cross the crate boundary. Construction proves
+/// exact archive/context ownership, the compiled round, canonical schema and
+/// geometry, planner ownership, and the unique frontier allocation lineage.
+pub(crate) struct ResidentProposalInputs {
+    pub(crate) frontier: ArrayArg<WgpuRuntime>,
+    pub(crate) choices: ArrayArg<WgpuRuntime>,
+    pub(crate) rows: usize,
+    pub(crate) parent_stride: usize,
+    pub(crate) round_owner: Arc<()>,
+    pub(crate) frontier_lineage: Arc<()>,
 }
 
 /// One persistent one-peer dispatch group in a fixed canonical rotation.
@@ -591,6 +645,55 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         }
         self.planner.choice_input_arg(choices).map_err(Into::into)
     }
+
+    /// Returns both proposal inputs only after validating their complete shared
+    /// capability. Later stages retain the two private tokens rather than
+    /// weakening provenance to archive equality.
+    pub(crate) fn proposal_inputs(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+    ) -> Result<ResidentProposalInputs, ResidentSupportError> {
+        let choices = self.choice_input_arg(frontier, choices)?;
+        Ok(ResidentProposalInputs {
+            frontier: frontier.values.input_arg(),
+            choices,
+            rows: frontier.rows,
+            parent_stride: frontier.stride,
+            round_owner: frontier.owner.clone(),
+            frontier_lineage: frontier.lineage.clone(),
+        })
+    }
+
+    /// Physical arm table retained by the exact compiled round.
+    pub(crate) fn proposal_arm_specs(&self) -> &[ArmSpec] {
+        self.plan.arm_specs()
+    }
+
+    /// Independently re-derived axis for one stable semantic arm.
+    pub(crate) fn proposal_arm_axis(&self, arm: usize) -> Option<ResidentAxis> {
+        self.plan.arm_axis(arm)
+    }
+
+    /// Whether a missing constant killed the complete positive conjunction.
+    pub(crate) const fn proposal_global_dead(&self) -> bool {
+        self.plan.is_global_dead()
+    }
+
+    /// Test-only construction of malformed but correctly branded choices.
+    /// Device consumers must still reject their contents before publication.
+    #[cfg(test)]
+    pub(crate) fn upload_choice_words_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        words: &[u32],
+    ) -> Result<ResidentRowChoices<WgpuRuntime>, ResidentSupportError> {
+        self.validate_frontier(frontier)?;
+        self.planner
+            .upload_choice_words_for_test(words, frontier.rows, frontier.lineage.clone())
+            .map_err(Into::into)
+    }
+
     fn validate_frontier(
         &self,
         frontier: &WgpuResidentFrontier<'_, U>,
@@ -885,6 +988,18 @@ fn pattern_terms(pattern: ProgramPattern) -> [ProgramTerm; 3] {
     [pattern.entity, pattern.attribute, pattern.value]
 }
 
+fn pattern_axis(pattern: ProgramPattern, variable: ProgramVariable) -> Option<ResidentAxis> {
+    if pattern.entity == ProgramTerm::Variable(variable) {
+        Some(ResidentAxis::Entity)
+    } else if pattern.attribute == ProgramTerm::Variable(variable) {
+        Some(ResidentAxis::Attribute)
+    } else if pattern.value == ProgramTerm::Variable(variable) {
+        Some(ResidentAxis::Value)
+    } else {
+        None
+    }
+}
+
 fn pattern_has_missing(pattern: ProgramPattern) -> bool {
     pattern_terms(pattern)
         .into_iter()
@@ -941,7 +1056,11 @@ fn lower_entity_arm(
     count: u32,
 ) -> ArmSpec {
     match (attribute, value) {
-        (None, None) => ArmSpec::Present { arm, count },
+        (None, None) => ArmSpec::Present {
+            arm,
+            axis: ResidentAxis::Entity,
+            count,
+        },
         (Some(peer), None) => ArmSpec::PairDistinct {
             arm,
             rotation: SuccinctRotation::Aev,
@@ -968,7 +1087,11 @@ fn lower_attribute_arm(
     count: u32,
 ) -> ArmSpec {
     match (entity, value) {
-        (None, None) => ArmSpec::Present { arm, count },
+        (None, None) => ArmSpec::Present {
+            arm,
+            axis: ResidentAxis::Attribute,
+            count,
+        },
         (Some(peer), None) => ArmSpec::PairDistinct {
             arm,
             rotation: SuccinctRotation::Eav,
@@ -995,7 +1118,11 @@ fn lower_value_arm(
     count: u32,
 ) -> ArmSpec {
     match (entity, attribute) {
-        (None, None) => ArmSpec::Present { arm, count },
+        (None, None) => ArmSpec::Present {
+            arm,
+            axis: ResidentAxis::Value,
+            count,
+        },
         (Some(peer), None) => ArmSpec::PairDistinct {
             arm,
             rotation: SuccinctRotation::Eva,
