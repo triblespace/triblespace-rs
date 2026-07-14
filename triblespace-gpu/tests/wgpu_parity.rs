@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::{BitVector, BitVectorData, NumBits, Rank, Select};
+use jerky::char_sequences::WaveletMatrix;
 use rayon::prelude::*;
 use triblespace_core::and;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -98,6 +99,21 @@ fn replace_pair_changes(
         SuccinctRotation::Vae => archive.changed_v_a = changes,
         SuccinctRotation::Eva => archive.changed_e_v = changes,
         SuccinctRotation::Aev => archive.changed_a_e = changes,
+    }
+}
+
+fn replace_ring_col(
+    archive: &mut SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    ring: WaveletMatrix<Rank9SelIndex>,
+) {
+    match rotation {
+        SuccinctRotation::Eav => archive.eav_c = ring,
+        SuccinctRotation::Vea => archive.vea_c = ring,
+        SuccinctRotation::Ave => archive.ave_c = ring,
+        SuccinctRotation::Vae => archive.vae_c = ring,
+        SuccinctRotation::Eva => archive.eva_c = ring,
+        SuccinctRotation::Aev => archive.aev_c = ring,
     }
 }
 
@@ -389,13 +405,30 @@ fn wgpu_pair_changes_match_every_cpu_rotation_and_reject_foreign_contexts() {
     }
 
     let empty: SuccinctArchive<OrderedUniverse> = (&TribleSet::new()).into();
-    let empty_changes = empty.changed_e_a.clone();
     for rotation in SuccinctRotation::ALL {
+        let empty_changes = empty.pair_changes(rotation).clone();
+        let empty_ring = empty.ring_col(rotation).clone();
+
         let mut malformed = archive.clone();
         replace_pair_changes(&mut malformed, rotation, empty_changes.clone());
         assert!(
             WgpuSuccinctArchive::new(malformed).is_err(),
-            "{rotation:?} length mismatch must fail before upload"
+            "{rotation:?} pair-change length mismatch must fail before upload"
+        );
+
+        let mut malformed = archive.clone();
+        replace_ring_col(&mut malformed, rotation, empty_ring.clone());
+        assert!(
+            WgpuSuccinctArchive::new(malformed).is_err(),
+            "{rotation:?} Ring length mismatch must fail before upload"
+        );
+
+        let mut malformed = archive.clone();
+        replace_ring_col(&mut malformed, rotation, empty_ring);
+        replace_pair_changes(&mut malformed, rotation, empty_changes);
+        assert!(
+            WgpuSuccinctArchive::new(malformed).is_err(),
+            "{rotation:?} jointly shortened Ring and pair changes must fail before upload"
         );
 
         let mut malformed = archive.clone();

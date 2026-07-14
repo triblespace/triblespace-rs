@@ -373,14 +373,20 @@ where
     U: Universe,
 {
     for rotation in SuccinctRotation::ALL {
-        let changes = archive.pair_changes(rotation);
-        if changes.len() != triple_count {
+        let ring_len = archive.ring_col(rotation).len();
+        if ring_len != triple_count {
             return Err(jerky::Error::invalid_argument(format!(
-                "{rotation:?} pair-change length {} does not match the Ring length {triple_count}",
+                "{rotation:?} Ring length {ring_len} does not match the canonical EAV length {triple_count}"
+            )));
+        }
+        let changes = archive.pair_changes(rotation);
+        if changes.len() != ring_len {
+            return Err(jerky::Error::invalid_argument(format!(
+                "{rotation:?} pair-change length {} does not match its Ring length {ring_len}",
                 changes.len()
             )));
         }
-        if triple_count != 0 && changes.select1(0) != Some(0) {
+        if ring_len != 0 && changes.select1(0) != Some(0) {
             return Err(jerky::Error::invalid_argument(format!(
                 "{rotation:?} pair changes do not mark the first Ring row"
             )));
