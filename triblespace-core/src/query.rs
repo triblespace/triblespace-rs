@@ -947,6 +947,27 @@ pub trait Constraint<'a> {
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::Opaque
     }
+
+    /// Reports whether residual execution may partition one parent's ordered
+    /// candidate sequence into disjoint pages before calling `confirm`.
+    ///
+    /// This is an opt-in execution capability, not an additional obligation
+    /// of the ordinary constraint protocol. Returning `true` promises that,
+    /// for fixed row bindings, confirming consecutive candidate pages and
+    /// concatenating their survivors preserves exactly the values, order, and
+    /// multiplicity of one confirmation over the complete parent group.
+    /// Pointwise `CandidateSink::retain` filters have this property. A
+    /// group-global operation such as sorting, deduplication, top-k, or
+    /// selecting one representative does not.
+    ///
+    /// The conservative default keeps the complete parent group atomic.
+    /// Residual execution consults this only after any unchecked atomic
+    /// confirmer has run, so an atomic prefix may safely feed a page-local
+    /// suffix. The answer is structural and must remain stable for the solve.
+    #[doc(hidden)]
+    fn residual_confirm_is_page_local(&self) -> bool {
+        false
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
@@ -999,6 +1020,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         let inner: &T = self;
         inner.residual_shape()
     }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_confirm_is_page_local()
+    }
 }
 
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
@@ -1050,6 +1076,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         let inner: &T = self;
         inner.residual_shape()
+    }
+
+    fn residual_confirm_is_page_local(&self) -> bool {
+        let inner: &T = self;
+        inner.residual_confirm_is_page_local()
     }
 }
 

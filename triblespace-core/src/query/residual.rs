@@ -15,13 +15,16 @@
 //! leaves of the same topology-scaled agglomerative merge hierarchy used by the
 //! DAG engine; after a compatible group is reassigned, each row still chooses
 //! its tightest proposer for that scheduled variable. Occupancy scheduling
-//! chooses the deepest live bucket able to fill the desired parent-atom width;
+//! chooses the deepest live bucket able to fill the desired actionable width;
 //! if none can, it drains the minimum-rank bucket through the strict readiness
 //! gate. Separately planned groups can therefore assemble in one canonical
-//! action bucket without sacrificing width-one depth-first latency. Parent
-//! atoms are a semantics-safe chunking unit, not a total-work estimate: ragged
-//! candidate fanout can make equally wide Confirm buckets cost different
-//! amounts.
+//! action bucket without sacrificing width-one depth-first latency. Ready and
+//! Propose states measure parent rows. Candidate and Confirm states remain
+//! parent-atomic while any unchecked whole-group confirmer remains; once the
+//! residual continuation contains only page-local confirms, they measure and
+//! split candidate occurrences. Thus width one can confirm one value and
+//! descend while preserving group-global Union/custom semantics at their
+//! atomic boundary. Proposal remains eager for each selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance—even when they
 //! merge into an already-live bucket—and grows geometrically after an action
@@ -56,6 +59,9 @@ struct ConstraintPath(Box<[usize]>);
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
     leaves: Vec<ConstraintPath>,
+    /// Whether each opaque leaf's confirmation is homomorphic over ordered
+    /// pages of one parent's candidate sequence.
+    page_local_confirms: Vec<bool>,
 }
 
 impl ResidualPlan {
@@ -64,24 +70,30 @@ impl ResidualPlan {
             constraint: &dyn Constraint<'a>,
             path: &mut Vec<usize>,
             leaves: &mut Vec<ConstraintPath>,
+            page_local_confirms: &mut Vec<bool>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
                     for child in 0..children.len() {
                         path.push(child);
-                        visit(children.child(child), path, leaves);
+                        visit(children.child(child), path, leaves, page_local_confirms);
                         path.pop();
                     }
                 }
                 ConstraintShape::Opaque => {
                     leaves.push(ConstraintPath(path.clone().into_boxed_slice()));
+                    page_local_confirms.push(constraint.residual_confirm_is_page_local());
                 }
             }
         }
 
         let mut leaves = Vec::new();
-        visit(root, &mut Vec::new(), &mut leaves);
-        Self { leaves }
+        let mut page_local_confirms = Vec::new();
+        visit(root, &mut Vec::new(), &mut leaves, &mut page_local_confirms);
+        Self {
+            leaves,
+            page_local_confirms,
+        }
     }
 
     fn len(&self) -> usize {
@@ -103,6 +115,15 @@ impl ResidualPlan {
             };
         }
         constraint
+    }
+
+    /// True exactly when every unchecked relevant confirmer can process
+    /// ordered candidate pages independently. Whole-group confirmers may run
+    /// first; paging begins only once the remaining continuation is local.
+    fn remaining_confirms_are_page_local(&self, relevant: &ChildSet, checked: &ChildSet) -> bool {
+        (0..self.len()).all(|leaf| {
+            !relevant.contains(leaf) || checked.contains(leaf) || self.page_local_confirms[leaf]
+        })
     }
 }
 
@@ -151,15 +172,16 @@ pub struct ResidualStateStats {
     pub dead_action_pops: usize,
     /// Terminal Ready-state chunks emitted for projection.
     pub emit_pops: usize,
-    /// Full parent-atom-width chunks selected from the maximum eligible rank.
-    /// This is occupancy, not total Confirm work when candidate fanout is
-    /// ragged.
+    /// Full actionable-width chunks selected from the maximum eligible rank.
+    /// The unit is a parent row for Ready/Propose and atomic candidate states,
+    /// or a candidate occurrence for an entirely page-local continuation.
     pub full_pops: usize,
     /// Underfilled buckets drained through the minimum-rank readiness gate
     /// because no live state could fill the desired width. The eager solver
     /// counts every one of its readiness-gated pops here.
     pub readiness_pops: usize,
-    /// Pops that left unprocessed parent rows live under the same state.
+    /// Pops that left unprocessed parent rows or candidate occurrences live
+    /// under the same state.
     pub partial_pops: usize,
     /// Filings that reopened an interned state after its live bucket had
     /// already been consumed.
@@ -172,13 +194,23 @@ pub struct ResidualStateStats {
     pub confirm_calls: usize,
     /// Parent rows passed to proposal calls.
     pub propose_rows: usize,
+    /// Candidate occurrences materialized by proposal calls. Proposal remains
+    /// eager per selected parent block; candidate paging begins afterwards.
+    pub candidates_proposed: usize,
+    /// Largest candidate frontier materialized by one proposal call.
+    pub max_propose_candidates: usize,
     /// Parent rows passed to confirmation calls.
     pub confirm_rows: usize,
+    /// Candidate occurrences presented to confirmation calls, counting an
+    /// occurrence once per remaining confirmer it reaches.
+    pub candidates_confirmed: usize,
+    /// Largest candidate page presented to one confirmation call.
+    pub max_confirm_candidates: usize,
     /// Largest flattened-leaf proposal batch.
     pub max_propose_rows: usize,
     /// Largest flattened-leaf confirmation batch.
     pub max_confirm_rows: usize,
-    /// Numeric increases of the lazy scheduler's desired parent-atom width.
+    /// Numeric increases of the lazy scheduler's desired actionable width.
     /// Saturated or growth-one attempts do not increment this counter.
     pub width_increases: usize,
 }
@@ -389,6 +421,20 @@ impl StateDesc {
                 .expect("residual-state rank overflow"),
         }
     }
+
+    /// Candidate occurrences become independent scheduling atoms only after
+    /// every confirmer still named by the continuation is page-local.
+    fn uses_candidate_pages(&self, plan: &ResidualPlan) -> bool {
+        match &self.phase {
+            ResidualPhase::Candidate {
+                relevant, checked, ..
+            } => relevant != checked && plan.remaining_confirms_are_page_local(relevant, checked),
+            ResidualPhase::Confirm {
+                relevant, checked, ..
+            } => plan.remaining_confirms_are_page_local(relevant, checked),
+            ResidualPhase::Ready | ResidualPhase::Propose { .. } => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -466,6 +512,10 @@ struct CandidateBatch {
 }
 
 impl CandidateBatch {
+    fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
     fn append(&mut self, mut other: Self) {
         let offset = u32::try_from(self.parents.row_count).expect("too many candidate parents");
         self.parents.append(other.parents);
@@ -523,6 +573,61 @@ impl CandidateBatch {
                 row_count: take,
             },
             candidates,
+        }
+    }
+
+    /// Takes at most `width` candidate occurrences from the tail, allowing a
+    /// parent group to be bisected. Callers must establish that every
+    /// remaining confirmer is page-local before using this operation.
+    fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
+        let take = self.candidate_count().min(width.max(1));
+        debug_assert!(take > 0);
+        if take == self.candidate_count() {
+            return Self {
+                parents: std::mem::replace(
+                    &mut self.parents,
+                    RowBatch {
+                        rows: Vec::new(),
+                        row_count: 0,
+                    },
+                ),
+                candidates: std::mem::take(&mut self.candidates),
+            };
+        }
+
+        let cut = self.candidate_count() - take;
+        let mut tail_candidates = self.candidates.split_off(cut);
+        let first_tail_parent = tail_candidates[0].0 as usize;
+        let prefix_parent_count = self.candidates.last().unwrap().0 as usize + 1;
+        assert!(
+            first_tail_parent < self.parents.row_count,
+            "constraint emitted an invalid candidate row tag"
+        );
+        assert!(
+            prefix_parent_count <= first_tail_parent + 1,
+            "candidate tags must remain grouped by ascending parent"
+        );
+
+        // The prefix stays in place: no O(total-fanout) rescan or retag on a
+        // width-one split. The tail copies only its parent suffix, including
+        // the one binding duplicated when the cut bisects a parent group.
+        let tail_rows = self.parents.rows[first_tail_parent * stride..].to_vec();
+        let tail_parent_count = self.parents.row_count - first_tail_parent;
+        let first_tail_parent = u32::try_from(first_tail_parent).expect("too many parents");
+        for (parent, _) in &mut tail_candidates {
+            *parent = parent
+                .checked_sub(first_tail_parent)
+                .expect("candidate tail contained an earlier parent");
+        }
+        self.parents.rows.truncate(prefix_parent_count * stride);
+        self.parents.row_count = prefix_parent_count;
+
+        Self {
+            parents: RowBatch {
+                rows: tail_rows,
+                row_count: tail_parent_count,
+            },
+            candidates: tail_candidates,
         }
     }
 
@@ -629,6 +734,16 @@ impl StateBucket {
         }
     }
 
+    /// Scheduling occupancy. Row-bearing phases are measured in parent rows;
+    /// once a candidate continuation is entirely page-local, its actionable
+    /// atoms are candidate occurrences instead.
+    fn occupancy(&self, candidate_pages: bool) -> usize {
+        match self {
+            StateBucket::Candidates(batch) if candidate_pages => batch.candidate_count(),
+            _ => self.row_count(),
+        }
+    }
+
     fn append(&mut self, other: Self) {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
@@ -638,7 +753,7 @@ impl StateBucket {
     }
 
     /// Removes a tail chunk without bisecting a candidate parent group.
-    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
+    fn take_tail(&mut self, stride: usize, width: usize, candidate_pages: bool) -> Self {
         match self {
             StateBucket::Rows(batch) => {
                 let take = batch.row_count.min(width.max(1));
@@ -659,6 +774,9 @@ impl StateBucket {
                     rows,
                     row_count: take,
                 })
+            }
+            StateBucket::Candidates(batch) if candidate_pages => {
+                StateBucket::Candidates(batch.take_candidate_tail(stride, width))
             }
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
@@ -951,6 +1069,8 @@ fn propose_action_transition<'a>(
     stats.propose_calls += 1;
     stats.propose_rows += rows.row_count;
     stats.max_propose_rows = stats.max_propose_rows.max(rows.row_count);
+    stats.candidates_proposed += candidates.len();
+    stats.max_propose_candidates = stats.max_propose_candidates.max(candidates.len());
 
     let mut checked = ChildSet::empty(leaf_count);
     checked.insert(proposer);
@@ -1140,6 +1260,7 @@ fn confirm_action_transition<'a>(
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &batch.parents.rows, batch.parents.row_count);
+    let candidates_before = batch.candidates.len();
     confirm_leaf(
         root,
         plan,
@@ -1151,6 +1272,8 @@ fn confirm_action_transition<'a>(
     stats.confirm_calls += 1;
     stats.confirm_rows += batch.parents.row_count;
     stats.max_confirm_rows = stats.max_confirm_rows.max(batch.parents.row_count);
+    stats.candidates_confirmed += candidates_before;
+    stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
 
     if let Some(batch) = batch.compact(vars.len()) {
         file(
@@ -1339,20 +1462,40 @@ impl ResidualStateMachine {
 
     /// Removes one batch-filling chunk from the next state.
     ///
-    /// The deepest bucket that can supply the complete desired parent-atom
-    /// width wins. If no bucket is large enough, the minimum-rank bucket is
-    /// drained instead; strict rank growth makes that underfilled pop
-    /// readiness-safe. Thus width one preserves maximum-rank, highest-ID
-    /// traversal, while a width above every live bucket is exact minimum-rank
-    /// scheduling. Partial remainders are reinserted directly and are not
-    /// counted as canonical merges or reentries.
+    /// The deepest bucket that can supply the complete desired actionable
+    /// width wins. Rows are the unit until a candidate continuation contains
+    /// only page-local confirms, at which point candidate occurrences are the
+    /// unit. If no bucket is large enough, the minimum-rank bucket is drained;
+    /// strict rank growth makes that underfilled pop readiness-safe. Thus
+    /// width one preserves maximum-rank, highest-ID traversal, while a width
+    /// above every live bucket is exact minimum-rank scheduling. Partial
+    /// remainders are reinserted directly and are not counted as canonical
+    /// merges or reentries.
+    #[cfg(test)]
     fn take_next(&mut self, width: usize) -> Option<(StateDesc, StateBucket)> {
+        self.take_next_inner(None, width)
+    }
+
+    fn take_next_with_plan(
+        &mut self,
+        plan: &ResidualPlan,
+        width: usize,
+    ) -> Option<(StateDesc, StateBucket)> {
+        self.take_next_inner(Some(plan), width)
+    }
+
+    fn take_next_inner(
+        &mut self,
+        plan: Option<&ResidualPlan>,
+        width: usize,
+    ) -> Option<(StateDesc, StateBucket)> {
         let width = width.max(1);
         let full_state = self.worklist.iter().rev().find_map(|(&rank, level)| {
-            level
-                .iter()
-                .rev()
-                .find_map(|(&id, bucket)| (bucket.row_count() >= width).then_some((rank, id)))
+            level.iter().rev().find_map(|(&id, bucket)| {
+                let desc = self.interner.get(id);
+                let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+                (bucket.occupancy(candidate_pages) >= width).then_some((rank, id))
+            })
         });
         let (rank, id, is_full) = if let Some((rank, id)) = full_state {
             (rank, id, true)
@@ -1361,8 +1504,10 @@ impl ResidualStateMachine {
             let (&id, bucket) = level
                 .last_key_value()
                 .expect("residual rank has a live state");
+            let desc = self.interner.get(id);
+            let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
             assert!(
-                bucket.row_count() < width,
+                bucket.occupancy(candidate_pages) < width,
                 "readiness selected while a full residual bucket existed"
             );
             (rank, id, false)
@@ -1382,9 +1527,10 @@ impl ResidualStateMachine {
 
         let desc = self.interner.get(id).clone();
         debug_assert_eq!(desc.rank(self.leaf_count), rank);
-        let before = bucket.row_count();
-        let chunk = bucket.take_tail(desc.bound.count(), width);
-        let remainder = bucket.row_count();
+        let candidate_pages = plan.is_some_and(|plan| desc.uses_candidate_pages(plan));
+        let before = bucket.occupancy(candidate_pages);
+        let chunk = bucket.take_tail(desc.bound.count(), width, candidate_pages);
+        let remainder = bucket.occupancy(candidate_pages);
         if remainder != 0 {
             assert!(is_full, "only a full pop may leave a remainder");
             self.stats.partial_pops += 1;
@@ -1397,7 +1543,7 @@ impl ResidualStateMachine {
                 "a residual-state remainder collided with another live bucket"
             );
         }
-        debug_assert_eq!(chunk.row_count(), before.min(width));
+        debug_assert_eq!(chunk.occupancy(candidate_pages), before.min(width));
         if is_full {
             assert!(before >= width, "full residual pop was underfilled");
         } else {
@@ -1423,7 +1569,7 @@ impl ResidualStateMachine {
         width: usize,
     ) -> StepOutcome {
         let (desc, bucket) = self
-            .take_next(width)
+            .take_next_with_plan(plan, width)
             .expect("pop_once requires a non-empty residual worklist");
         let outcome = execute_state(
             root,
@@ -1504,8 +1650,9 @@ impl ResidualStateMachine {
 
 /// Demand-driven canonical residual-state execution for any root constraint.
 ///
-/// The iterator begins with a narrow desired parent-atom width, so full
-/// descendant buckets can produce a result before sibling rows are evaluated.
+/// The iterator begins with a narrow desired actionable width, so full
+/// descendant buckets can produce a result before sibling rows or candidate
+/// values are evaluated.
 /// With a growth factor above one, semantic branch death or raw terminal output
 /// immediately prepares a geometrically wider width for later frontier work;
 /// filing any nonempty successor leaves the width unchanged. The deepest live
@@ -1782,6 +1929,7 @@ mod tests {
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::unionconstraint::UnionConstraint;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Clone, Copy)]
     struct ShapeLeaf(VariableId);
@@ -1818,6 +1966,196 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct CapabilityLeaf {
+        variable: VariableId,
+        page_local: bool,
+    }
+
+    impl Constraint<'static> for CapabilityLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(1, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            self.page_local
+        }
+    }
+
+    #[derive(Clone)]
+    struct FanoutLeaf {
+        variable: VariableId,
+        values: Arc<Vec<RawInline>>,
+    }
+
+    impl Constraint<'static> for FanoutLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.values.len(), view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            for row in 0..view.len() {
+                candidates.extend_row(row as u32, self.values.iter().copied());
+            }
+        }
+
+        fn confirm(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+    }
+
+    #[derive(Clone)]
+    struct PageFilterLeaf {
+        variable: VariableId,
+        estimate: usize,
+        accepted: Option<RawInline>,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Constraint<'static> for PageFilterLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            _view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.calls.lock().unwrap().push(candidates.len());
+            if let Some(accepted) = self.accepted {
+                candidates.retain(|_, value| *value == accepted);
+            }
+        }
+
+        fn residual_confirm_is_page_local(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct WholeGroupMinimumLeaf {
+        variable: VariableId,
+        estimate: usize,
+        calls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Constraint<'static> for WholeGroupMinimumLeaf {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(self.variable)
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != self.variable {
+                return false;
+            }
+            out.fill(self.estimate, view.len());
+            true
+        }
+
+        fn propose(
+            &self,
+            _variable: VariableId,
+            _view: &RowsView<'_>,
+            _candidates: &mut CandidateSink<'_>,
+        ) {
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, self.variable);
+            self.calls.lock().unwrap().push(candidates.len());
+            confirm_per_row(view, candidates, |_, values| {
+                let minimum = values.iter().copied().min();
+                values.retain(|value| Some(*value) == minimum);
+            });
         }
     }
 
@@ -2378,6 +2716,351 @@ mod tests {
         assert_eq!(prefix.parents.rows, [raw(0), raw(1), raw(2)]);
         assert_eq!(prefix.parents.row_count, 3);
         assert_eq!(prefix.candidates, original_candidates);
+    }
+
+    #[test]
+    fn candidate_pages_may_bisect_one_parent_without_losing_occurrences() {
+        fn expanded(batch: &CandidateBatch) -> Vec<(RawInline, RawInline)> {
+            batch
+                .candidates
+                .iter()
+                .map(|&(parent, candidate)| (batch.parents.rows[parent as usize], candidate))
+                .collect()
+        }
+
+        let original = CandidateBatch {
+            parents: RowBatch {
+                rows: vec![raw(20), raw(21)],
+                row_count: 2,
+            },
+            candidates: vec![
+                (0, raw(1)),
+                (0, raw(1)),
+                (0, raw(2)),
+                (0, raw(3)),
+                (1, raw(4)),
+                (1, raw(5)),
+            ],
+        };
+        let expected = expanded(&original);
+        let mut prefix = original;
+        let page = prefix.take_candidate_tail(1, 3);
+
+        assert_eq!(prefix.parents.rows, [raw(20)]);
+        assert_eq!(prefix.candidates, [(0, raw(1)), (0, raw(1)), (0, raw(2))]);
+        assert_eq!(page.parents.rows, [raw(20), raw(21)]);
+        assert_eq!(page.candidates, [(0, raw(3)), (1, raw(4)), (1, raw(5))]);
+
+        let mut actual = expanded(&prefix);
+        actual.extend(expanded(&page));
+        assert_eq!(
+            actual, expected,
+            "every duplicate occurrence belongs to one page"
+        );
+    }
+
+    #[test]
+    fn paging_begins_only_after_atomic_remaining_confirms_are_checked() {
+        let root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        relevant.insert(2);
+        let mut proposer_checked = ChildSet::empty(plan.len());
+        proposer_checked.insert(0);
+        let before_atomic = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant: relevant.clone(),
+                checked: proposer_checked.clone(),
+            },
+        };
+        assert!(!before_atomic.uses_candidate_pages(&plan));
+
+        let after_atomic = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked: proposer_checked.with_inserted(1),
+            },
+        };
+        assert!(after_atomic.uses_candidate_pages(&plan));
+    }
+
+    #[test]
+    fn page_local_candidate_state_uses_candidate_occupancy_and_keeps_remainder_live() {
+        let root = IntersectionConstraint::new(vec![
+            CapabilityLeaf {
+                variable: 0,
+                page_local: false,
+            },
+            CapabilityLeaf {
+                variable: 0,
+                page_local: true,
+            },
+        ]);
+        let plan = ResidualPlan::compile(&root);
+        let mut relevant = ChildSet::empty(plan.len());
+        relevant.insert(0);
+        relevant.insert(1);
+        let mut checked = ChildSet::empty(plan.len());
+        checked.insert(0);
+        let desc = StateDesc {
+            bound: VariableSet::new_empty(),
+            phase: ResidualPhase::Candidate {
+                variable: 0,
+                relevant,
+                checked,
+            },
+        };
+        assert!(desc.uses_candidate_pages(&plan));
+
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        file(
+            &mut machine.worklist,
+            &mut machine.interner,
+            plan.len(),
+            desc.clone(),
+            StateBucket::Candidates(CandidateBatch {
+                parents: RowBatch::seed(),
+                candidates: (0..8).map(|value| (0, raw(value))).collect(),
+            }),
+            &mut machine.stats,
+        );
+
+        let (selected, page) = machine
+            .take_next_with_plan(&plan, 2)
+            .expect("page-local candidates are live");
+        assert_eq!(selected, desc);
+        let StateBucket::Candidates(page) = page else {
+            panic!("candidate state returned row payload")
+        };
+        assert_eq!(page.parents.row_count, 1);
+        assert_eq!(page.candidates, [(0, raw(6)), (0, raw(7))]);
+
+        let (_, level) = machine
+            .worklist
+            .first_key_value()
+            .expect("candidate remainder stays under the same rank");
+        let (&id, remainder) = level.first_key_value().unwrap();
+        assert_eq!(machine.interner.get(id), &desc);
+        assert_eq!(remainder.occupancy(true), 6);
+        assert_eq!(machine.stats.partial_pops, 1);
+    }
+
+    fn paged_filter_fixture(
+        values: Vec<RawInline>,
+        accepted: RawInline,
+        first_calls: Arc<Mutex<Vec<usize>>>,
+        second_calls: Arc<Mutex<Vec<usize>>>,
+    ) -> IntersectionConstraint<ShapeConstraint> {
+        let estimate = values.len();
+        IntersectionConstraint::new(vec![
+            Box::new(FanoutLeaf {
+                variable: 0,
+                values: Arc::new(values),
+            }) as ShapeConstraint,
+            Box::new(PageFilterLeaf {
+                variable: 0,
+                estimate: estimate + 1,
+                accepted: None,
+                calls: first_calls,
+            }) as ShapeConstraint,
+            Box::new(PageFilterLeaf {
+                variable: 0,
+                estimate: estimate + 2,
+                accepted: Some(accepted),
+                calls: second_calls,
+            }) as ShapeConstraint,
+        ])
+    }
+
+    #[test]
+    fn width_one_confirms_one_candidate_then_descends() {
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        let values: Vec<_> = (0..64).map(raw).collect();
+        let root = paged_filter_fixture(
+            values,
+            raw(63),
+            Arc::clone(&first_calls),
+            Arc::clone(&second_calls),
+        );
+        let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
+            .solve_residual_state_lazy()
+            .cap(64);
+
+        assert_eq!(lazy.next(), Some(raw(63)));
+        assert_eq!(*first_calls.lock().unwrap(), [1]);
+        assert_eq!(*second_calls.lock().unwrap(), [1]);
+        assert_eq!(lazy.stats().candidates_proposed, 64);
+        assert_eq!(lazy.stats().max_propose_candidates, 64);
+        assert_eq!(lazy.stats().confirm_calls, 2);
+        assert_eq!(lazy.stats().candidates_confirmed, 2);
+        assert_eq!(lazy.stats().max_confirm_candidates, 1);
+        assert_eq!(lazy.stats().partial_pops, 1);
+    }
+
+    #[test]
+    fn late_and_absent_hits_grow_candidate_pages_geometrically() {
+        for (accepted, expected) in [(raw(0), Some(raw(0))), (raw(255), None)] {
+            let first_calls = Arc::new(Mutex::new(Vec::new()));
+            let second_calls = Arc::new(Mutex::new(Vec::new()));
+            let root = paged_filter_fixture(
+                (0..64).map(raw).collect(),
+                accepted,
+                Arc::clone(&first_calls),
+                Arc::clone(&second_calls),
+            );
+            let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
+                .solve_residual_state_lazy()
+                .cap(64);
+
+            assert_eq!(lazy.next(), expected);
+            assert_eq!(*first_calls.lock().unwrap(), [1, 2, 4, 8, 16, 32, 1]);
+            assert_eq!(*second_calls.lock().unwrap(), [1, 2, 4, 8, 16, 32, 1]);
+            assert_eq!(lazy.stats().candidates_proposed, 64);
+            assert_eq!(lazy.stats().candidates_confirmed, 128);
+            assert_eq!(lazy.stats().max_confirm_candidates, 32);
+            assert_eq!(lazy.stats().width_increases, 6);
+        }
+    }
+
+    #[test]
+    fn duplicate_candidate_multiplicity_survives_page_splitting() {
+        let values = vec![raw(0), raw(0), raw(1), raw(1), raw(1), raw(2)];
+        let make = || {
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(values.clone()),
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 100,
+                    accepted: None,
+                    calls: Arc::new(Mutex::new(Vec::new())),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut cap_one: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(1)
+            .collect();
+        let mut geometric: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(64)
+            .collect();
+        sequential.sort_unstable();
+        cap_one.sort_unstable();
+        geometric.sort_unstable();
+        assert_eq!(sequential, values);
+        assert_eq!(cap_one, sequential);
+        assert_eq!(geometric, sequential);
+    }
+
+    #[test]
+    fn whole_group_confirmer_runs_atomically_before_page_local_suffix() {
+        let whole_calls = Arc::new(Mutex::new(Vec::new()));
+        let page_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = || {
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(WholeGroupMinimumLeaf {
+                    variable: 0,
+                    estimate: 5,
+                    calls: Arc::clone(&whole_calls),
+                }) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 6,
+                    accepted: None,
+                    calls: Arc::clone(&page_calls),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut residual: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(1)
+            .collect();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        residual.sort_unstable();
+        sequential.sort_unstable();
+        assert_eq!(residual, [raw(1), raw(1)]);
+        assert_eq!(residual, sequential);
+        assert_eq!(*whole_calls.lock().unwrap(), [4, 4]);
+        assert_eq!(*page_calls.lock().unwrap(), [1, 1, 2]);
+    }
+
+    #[test]
+    fn opaque_union_deduplicates_whole_group_before_page_local_suffix() {
+        let left_calls = Arc::new(Mutex::new(Vec::new()));
+        let right_calls = Arc::new(Mutex::new(Vec::new()));
+        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = || {
+            let union = UnionConstraint::new(vec![
+                PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(0)),
+                    calls: Arc::clone(&left_calls),
+                },
+                PageFilterLeaf {
+                    variable: 0,
+                    estimate: 10,
+                    accepted: Some(raw(1)),
+                    calls: Arc::clone(&right_calls),
+                },
+            ]);
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: 0,
+                    values: Arc::new(vec![raw(0), raw(0), raw(1), raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(union) as ShapeConstraint,
+                Box::new(PageFilterLeaf {
+                    variable: 0,
+                    estimate: 30,
+                    accepted: None,
+                    calls: Arc::clone(&suffix_calls),
+                }) as ShapeConstraint,
+            ])
+        };
+        let project = |binding: &Binding| binding.get(0).copied();
+        let mut residual: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy()
+            .cap(1)
+            .collect();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        residual.sort_unstable();
+        sequential.sort_unstable();
+        assert_eq!(residual, [raw(0), raw(1)]);
+        assert_eq!(residual, sequential);
+        assert_eq!(*left_calls.lock().unwrap(), [5, 5]);
+        assert_eq!(*right_calls.lock().unwrap(), [5, 5]);
+        assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2]);
     }
 
     #[test]

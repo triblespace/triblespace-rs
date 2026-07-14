@@ -1229,6 +1229,10 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         });
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Exact when both endpoints are bound: checks reachability from the
     /// bound start to the bound end (with the zero-length-path scope rule
     /// applied) for every row. Returns `true` optimistically while either

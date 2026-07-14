@@ -750,6 +750,10 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         });
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// When all three positions have values (bound or constant), checks
     /// whether each row's triple exists in the EAV index. Returns `true`
     /// optimistically when any position is still unbound.

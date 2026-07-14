@@ -665,6 +665,10 @@ where
         });
     }
 
+    fn residual_confirm_is_page_local(&self) -> bool {
+        true
+    }
+
     /// Exact when entity, attribute, and value all have values (bound or
     /// constant): checks whether the archive contains that exact triple
     /// (E→A→V range restriction, mirroring `TribleSetConstraint`'s
