@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 use jerky::bit_vector::{Rank, Select};
@@ -104,6 +104,26 @@ fn pair_fixture() -> PairFixture {
     }
 }
 
+fn restricted_fixture() -> PairFixture {
+    let mut fixture = pair_fixture();
+    for triple in [
+        (
+            fixture.entities[1],
+            fixture.attributes[1],
+            fixture.values[1],
+        ),
+        (
+            fixture.entities[2],
+            fixture.attributes[0],
+            fixture.values[2],
+        ),
+    ] {
+        insert(&mut fixture.set, triple.0, triple.1, triple.2);
+        fixture.triples.push(triple);
+    }
+    fixture
+}
+
 fn expected_pair_ids(fixture: &PairFixture, rotation: SuccinctRotation, peer: Id) -> Vec<Id> {
     let mut expected: Vec<_> = fixture
         .triples
@@ -121,6 +141,187 @@ fn expected_pair_ids(fixture: &PairFixture, rotation: SuccinctRotation, peer: Id
     expected.sort_unstable();
     expected.dedup();
     expected
+}
+
+fn expected_restricted_ids(
+    fixture: &PairFixture,
+    rotation: SuccinctRotation,
+    first: Id,
+    last: Id,
+) -> Vec<Id> {
+    let mut expected: Vec<_> = fixture
+        .triples
+        .iter()
+        .filter_map(|&(entity, attribute, value)| match rotation {
+            SuccinctRotation::Eav if entity == first && value == last => Some(attribute),
+            SuccinctRotation::Vea if value == first && attribute == last => Some(entity),
+            SuccinctRotation::Ave if attribute == first && entity == last => Some(value),
+            SuccinctRotation::Vae if value == first && entity == last => Some(attribute),
+            SuccinctRotation::Eva if entity == first && attribute == last => Some(value),
+            SuccinctRotation::Aev if attribute == first && value == last => Some(entity),
+            _ => None,
+        })
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    expected
+}
+
+fn restricted_source_ids(fixture: &PairFixture, rotation: SuccinctRotation) -> (&[Id], &[Id]) {
+    match rotation {
+        SuccinctRotation::Eav | SuccinctRotation::Eva => (
+            &fixture.entities,
+            match rotation {
+                SuccinctRotation::Eav => &fixture.values,
+                SuccinctRotation::Eva => &fixture.attributes,
+                _ => unreachable!(),
+            },
+        ),
+        SuccinctRotation::Vea | SuccinctRotation::Vae => (
+            &fixture.values,
+            match rotation {
+                SuccinctRotation::Vea => &fixture.attributes,
+                SuccinctRotation::Vae => &fixture.entities,
+                _ => unreachable!(),
+            },
+        ),
+        SuccinctRotation::Ave | SuccinctRotation::Aev => (
+            &fixture.attributes,
+            match rotation {
+                SuccinctRotation::Ave => &fixture.entities,
+                SuccinctRotation::Aev => &fixture.values,
+                _ => unreachable!(),
+            },
+        ),
+    }
+}
+
+fn representative_restricted_pairs(
+    fixture: &PairFixture,
+    rotation: SuccinctRotation,
+) -> [(Id, Id); 3] {
+    let (first_ids, last_ids) = restricted_source_ids(fixture, rotation);
+    let mut zero = None;
+    let mut one = None;
+    let mut many = None;
+    for &first in first_ids {
+        for &last in last_ids {
+            match expected_restricted_ids(fixture, rotation, first, last).len() {
+                0 => {
+                    zero.get_or_insert((first, last));
+                }
+                1 => {
+                    one.get_or_insert((first, last));
+                }
+                _ => {
+                    many.get_or_insert((first, last));
+                }
+            }
+        }
+    }
+    [
+        zero.expect("fixture has a zero-width Restricted row"),
+        one.expect("fixture has a singleton Restricted row"),
+        many.expect("fixture has a multi-value Restricted row"),
+    ]
+}
+
+fn prefix_select(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    code: usize,
+) -> usize {
+    match rotation {
+        SuccinctRotation::Eav | SuccinctRotation::Eva => archive.e_a.select1(code).unwrap(),
+        SuccinctRotation::Aev | SuccinctRotation::Ave => archive.a_a.select1(code).unwrap(),
+        SuccinctRotation::Vea | SuccinctRotation::Vae => archive.v_a.select1(code).unwrap(),
+    }
+}
+
+fn restricted_geometry(
+    archive: &SuccinctArchive<OrderedUniverse>,
+    rotation: SuccinctRotation,
+    first: usize,
+    last: usize,
+) -> ([usize; PROPOSAL_WITNESS_WORDS], usize) {
+    let lo = prefix_select(archive, rotation, first) - first;
+    let hi = prefix_select(archive, rotation, first + 1) - (first + 1);
+    let ring = archive.ring_col(rotation);
+    let r0 = ring.rank(lo, last).unwrap();
+    let r1 = ring.rank(hi, last).unwrap();
+    let successor = successor_rotation(rotation);
+    let base = prefix_select(archive, successor, last) - last;
+    ([lo, hi, r0, r1], base)
+}
+
+fn restricted_anchor_pair(
+    fixture: &PairFixture,
+    program: &QueryProgram<'_, OrderedUniverse>,
+    rotation: SuccinctRotation,
+) -> (Id, Id) {
+    let archive = program.archive();
+    let successor = archive.ring_col(successor_rotation(rotation));
+    let (first_ids, last_ids) = restricted_source_ids(fixture, rotation);
+    for &first in first_ids {
+        for &last in last_ids {
+            let first_code = program.encode(&raw(first)).unwrap().index();
+            let last_code = program.encode(&raw(last)).unwrap().index();
+            let ([_, _, r0, r1], base) =
+                restricted_geometry(archive, rotation, first_code, last_code);
+            let start = base + r0;
+            if base == 0 || r0 == 0 || r0 == r1 || start >= successor.len() {
+                continue;
+            }
+            let previous_differs = start > 0
+                && successor.access(start - 1).unwrap() != successor.access(start).unwrap();
+            let next_differs = start + 1 < successor.len()
+                && successor.access(start + 1).unwrap() != successor.access(start).unwrap();
+            if previous_differs || next_differs {
+                return (first, last);
+            }
+        }
+    }
+    panic!("fixture lacks a nonzero-base/nonzero-rank Restricted anchor for {rotation:?}")
+}
+
+fn restricted_bound_row(
+    fixture: &PairFixture,
+    rotation: SuccinctRotation,
+    first: Id,
+    last: Id,
+) -> [Id; 3] {
+    let mut row = [
+        fixture.entities[0],
+        fixture.attributes[0],
+        fixture.values[0],
+    ];
+    match rotation {
+        SuccinctRotation::Eav => {
+            row[0] = first;
+            row[2] = last;
+        }
+        SuccinctRotation::Vea => {
+            row[2] = first;
+            row[1] = last;
+        }
+        SuccinctRotation::Ave => {
+            row[1] = first;
+            row[0] = last;
+        }
+        SuccinctRotation::Vae => {
+            row[2] = first;
+            row[0] = last;
+        }
+        SuccinctRotation::Eva => {
+            row[0] = first;
+            row[1] = last;
+        }
+        SuccinctRotation::Aev => {
+            row[1] = first;
+            row[2] = last;
+        }
+    }
+    row
 }
 
 fn codes<U: Universe>(program: &QueryProgram<'_, U>, ids: &[Id]) -> Vec<u32> {
@@ -226,6 +427,1224 @@ fn enqueue_pair_case<U: Universe>(
         .unwrap()
         .inspect();
     (inspection, arm as u32, peer_code, target.index() as u32)
+}
+
+#[test]
+fn generic_restricted_generation_matches_cpu_order_for_natural_rotation() {
+    let fixture = pair_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(entity, attribute, value)],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity, attribute]).unwrap();
+    let (arm, rotation) = round
+        .proposal_arm_specs()
+        .iter()
+        .enumerate()
+        .find_map(|(arm, spec)| match spec {
+            ArmSpec::Restricted { rotation, .. } => Some((arm, *rotation)),
+            ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => None,
+        })
+        .unwrap();
+    assert_eq!(rotation, SuccinctRotation::Eva);
+    let first = fixture.entities[0];
+    let last = fixture.attributes[0];
+    let first_code = program.encode(&raw(first)).unwrap().get();
+    let last_code = program.encode(&raw(last)).unwrap().get();
+    let host = program
+        .frontier_from_indices(vec![entity, attribute], vec![first_code, last_code], 1)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let witness = arm * PROPOSAL_WITNESS_WORDS;
+    let count = witnesses[witness + 3] - witnesses[witness + 2];
+    let choices = round
+        .force_choice_words_from_inputs_for_test(
+            &frontier,
+            &inputs,
+            &[value.index() as u32, arm as u32, count],
+        )
+        .unwrap();
+    let expected = codes(
+        &program,
+        &expected_restricted_ids(&fixture, rotation, first, last),
+    );
+    assert_eq!(count as usize, expected.len());
+    let inspection = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, expected.len() + 3)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, expected.len());
+    assert_eq!(&inspection.candidate_codes[..expected.len()], expected);
+    assert_eq!(
+        &inspection.candidate_owners[..expected.len()],
+        vec![0; expected.len()]
+    );
+    assert_eq!(
+        &inspection.proposer_arms[..expected.len()],
+        vec![arm as u32; expected.len()]
+    );
+    let expected_body = expected
+        .iter()
+        .flat_map(|&candidate| [first_code, last_code, candidate])
+        .collect::<Vec<_>>();
+    // Canonical child columns are E,A,V; target V is inserted last.
+    assert_eq!(&inspection.child_body[..expected_body.len()], expected_body);
+}
+
+#[test]
+fn physical_restricted_generation_covers_all_six_rotations_and_capacity_edges() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let targets = std::array::from_fn::<_, 6, _>(|index| ProgramVariable::new(index as u8));
+    let entity_peer = ProgramVariable::new(6);
+    let attribute_peer = ProgramVariable::new(7);
+    let value_peer = ProgramVariable::new(8);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        9,
+        [
+            QueryPattern::new(entity_peer, targets[0], value_peer),
+            QueryPattern::new(targets[1], attribute_peer, value_peer),
+            QueryPattern::new(entity_peer, attribute_peer, targets[2]),
+            QueryPattern::new(entity_peer, targets[3], value_peer),
+            QueryPattern::new(entity_peer, attribute_peer, targets[4]),
+            QueryPattern::new(targets[5], attribute_peer, value_peer),
+        ],
+    )
+    .unwrap();
+    let mut round =
+        WgpuResidentRound::new(&gpu, &program, &[entity_peer, attribute_peer, value_peer]).unwrap();
+    let rotations = [
+        SuccinctRotation::Eav,
+        SuccinctRotation::Vea,
+        SuccinctRotation::Ave,
+        SuccinctRotation::Vae,
+        SuccinctRotation::Eva,
+        SuccinctRotation::Aev,
+    ];
+    let physical_specs = round
+        .proposal_arm_specs()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(arm, spec)| {
+            let ArmSpec::Restricted {
+                arm: spec_arm,
+                rotation,
+                first,
+                last,
+            } = spec
+            else {
+                panic!("all six fixture arms must lower as Restricted")
+            };
+            assert_eq!(spec_arm as usize, arm);
+            let desired = rotations[arm];
+            if desired == rotation {
+                spec
+            } else {
+                assert_eq!(desired, inverse_restricted_rotation(rotation));
+                ArmSpec::Restricted {
+                    arm: spec_arm,
+                    rotation: desired,
+                    first: last,
+                    last: first,
+                }
+            }
+        })
+        .collect();
+    round
+        .reconfigure_restricted_proposal_arms_for_test(physical_specs)
+        .unwrap();
+    assert_eq!(
+        round
+            .proposal_arm_specs()
+            .iter()
+            .map(|spec| match spec {
+                ArmSpec::Restricted { rotation, .. } => *rotation,
+                ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        rotations
+    );
+
+    struct Case {
+        target: ProgramVariable,
+        arm: u32,
+        rotation: SuccinctRotation,
+        first: u32,
+        last: u32,
+        parent: [u32; 3],
+        expected: Vec<u32>,
+    }
+
+    let source_pairs = rotations.map(|rotation| {
+        let [zero, one, many] = representative_restricted_pairs(&fixture, rotation);
+        [
+            zero,
+            one,
+            many,
+            restricted_anchor_pair(&fixture, &program, rotation),
+        ]
+    });
+    let mut cases = Vec::with_capacity(rotations.len() * 4);
+    // Interleave variables in the affine input. Publication must nevertheless
+    // be variable-major and stable by original row within each variable.
+    let category_pairs = std::array::from_fn::<_, 4, _>(|category| {
+        std::array::from_fn::<_, 6, _>(|arm| source_pairs[arm][category])
+    });
+    for pairs in category_pairs {
+        for (arm, (&rotation, (first, last))) in rotations.iter().zip(pairs).enumerate() {
+            let parent_ids = restricted_bound_row(&fixture, rotation, first, last);
+            let parent = parent_ids.map(|id| program.encode(&raw(id)).unwrap().get());
+            cases.push(Case {
+                target: targets[arm],
+                arm: arm as u32,
+                rotation,
+                first: program.encode(&raw(first)).unwrap().get(),
+                last: program.encode(&raw(last)).unwrap().get(),
+                parent,
+                expected: codes(
+                    &program,
+                    &expected_restricted_ids(&fixture, rotation, first, last),
+                ),
+            });
+        }
+    }
+    let parent_values = cases
+        .iter()
+        .flat_map(|case| case.parent)
+        .collect::<Vec<_>>();
+    let host = program
+        .frontier_from_indices(
+            vec![entity_peer, attribute_peer, value_peer],
+            parent_values,
+            cases.len(),
+        )
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let mut choice_words = Vec::with_capacity(cases.len() * CHOICE_WORDS);
+    for (row, case) in cases.iter().enumerate() {
+        let witness = (case.arm as usize * cases.len() + row) * PROPOSAL_WITNESS_WORDS;
+        let (expected_witness, _) = restricted_geometry(
+            program.archive(),
+            case.rotation,
+            case.first as usize,
+            case.last as usize,
+        );
+        assert_eq!(
+            &witnesses[witness..witness + PROPOSAL_WITNESS_WORDS],
+            &expected_witness.map(|word| word as u32),
+            "rotation {:?}, row {row}",
+            case.rotation
+        );
+        assert_eq!(
+            witnesses[witness + 3] - witnesses[witness + 2],
+            case.expected.len() as u32
+        );
+        choice_words.extend([
+            case.target.index() as u32,
+            case.arm,
+            case.expected.len() as u32,
+        ]);
+    }
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+        .unwrap();
+    let required = cases.iter().map(|case| case.expected.len()).sum::<usize>();
+    assert!(required > 1);
+    let exact = round
+        .enqueue_physical_restricted_proposals_for_test(&frontier, &choices, required)
+        .unwrap()
+        .inspect();
+    assert_success(&exact, required);
+
+    let mut expected_codes = Vec::with_capacity(required);
+    let mut expected_owners = Vec::with_capacity(required);
+    let mut expected_arms = Vec::with_capacity(required);
+    let mut expected_body = Vec::with_capacity(required * 4);
+    let mut expected_base = 0usize;
+    for &target in &targets {
+        let segment = &exact.segments[target.index()];
+        let segment_count = cases
+            .iter()
+            .filter(|case| case.target == target)
+            .map(|case| case.expected.len())
+            .sum::<usize>();
+        assert_eq!(segment.variable, target.index() as u32);
+        assert_eq!(segment.insertion, 0);
+        assert_eq!(segment.base, expected_base as u32);
+        assert_eq!(segment.count, segment_count as u32);
+        expected_base += segment_count;
+        for (row, case) in cases
+            .iter()
+            .enumerate()
+            .filter(|(_, case)| case.target == target)
+        {
+            for &candidate in &case.expected {
+                expected_codes.push(candidate);
+                expected_owners.push(row as u32);
+                expected_arms.push(case.arm);
+                expected_body.extend([candidate, case.parent[0], case.parent[1], case.parent[2]]);
+            }
+        }
+    }
+    assert_eq!(expected_base, required);
+    assert_eq!(exact.candidate_codes, expected_codes);
+    assert_eq!(exact.candidate_owners, expected_owners);
+    assert_eq!(exact.proposer_arms, expected_arms);
+    assert_eq!(exact.child_body, expected_body);
+
+    for capacity in [required - 1, 0] {
+        let failed = round
+            .enqueue_physical_restricted_proposals_for_test(&frontier, &choices, capacity)
+            .unwrap()
+            .inspect();
+        assert_eq!(failed.status, STATUS_CAPACITY);
+        assert_eq!(failed.required, required as u32);
+        assert_eq!(failed.logical_len, 0);
+        assert_eq!((failed.dispatch_x, failed.dispatch_y), (0, 1));
+        assert!(failed.segments.iter().all(|segment| {
+            segment.base == RESIDENT_U32_SENTINEL
+                && segment.count == RESIDENT_U32_SENTINEL
+                && segment.variable == RESIDENT_U32_SENTINEL
+                && segment.insertion == RESIDENT_U32_SENTINEL
+        }));
+        assert!(failed
+            .candidate_codes
+            .iter()
+            .chain(&failed.candidate_owners)
+            .chain(&failed.proposer_arms)
+            .chain(&failed.child_body)
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
+    }
+}
+
+#[test]
+fn restricted_zero_width_accepts_successor_end_at_zero_capacity() {
+    let mut fixture = restricted_fixture();
+    // This code belongs to the archive domain only as an entity and sorts
+    // after every attribute. Used as an attribute peer below, its successor
+    // prefix base is exactly N: the valid empty interval starts at the end.
+    let absent_attribute = ordered_id(11);
+    let domain_triple = (absent_attribute, fixture.attributes[2], fixture.values[2]);
+    insert(
+        &mut fixture.set,
+        domain_triple.0,
+        domain_triple.1,
+        domain_triple.2,
+    );
+    fixture.triples.push(domain_triple);
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(entity, attribute, value)],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity, attribute]).unwrap();
+    let ArmSpec::Restricted { arm, rotation, .. } = round.proposal_arm_specs()[0] else {
+        panic!("two-peer fixture must lower as Restricted")
+    };
+    assert_eq!(rotation, SuccinctRotation::Eva);
+    let first = fixture.entities[0];
+    assert!(expected_restricted_ids(&fixture, rotation, first, absent_attribute).is_empty());
+    let first_code = program.encode(&raw(first)).unwrap().get();
+    let last_code = program.encode(&raw(absent_attribute)).unwrap().get();
+    let (witness, base) = restricted_geometry(
+        program.archive(),
+        rotation,
+        first_code as usize,
+        last_code as usize,
+    );
+    assert_eq!(
+        base,
+        program
+            .archive()
+            .ring_col(successor_rotation(rotation))
+            .len()
+    );
+    assert_eq!(witness[2], witness[3]);
+    assert_eq!(
+        base + witness[2],
+        program.archive().ring_col(rotation).len()
+    );
+
+    let host = program
+        .frontier_from_indices(vec![entity, attribute], vec![first_code, last_code], 1)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    assert_eq!(
+        inputs.read_proposal_witnesses_for_test(),
+        witness.map(|word| word as u32)
+    );
+    let choices = round
+        .force_choice_words_from_inputs_for_test(
+            &frontier,
+            &inputs,
+            &[value.index() as u32, arm, 0],
+        )
+        .unwrap();
+    let inspection = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, 0)
+        .unwrap()
+        .inspect();
+    assert_success(&inspection, 0);
+    assert_eq!(inspection.segments.len(), 1);
+    assert_eq!(inspection.segments[0].variable, value.index() as u32);
+    assert_eq!(inspection.segments[0].base, 0);
+    assert_eq!(inspection.segments[0].count, 0);
+    assert_eq!(inspection.segments[0].insertion, 2);
+    assert!(inspection.candidate_codes.is_empty());
+    assert!(inspection.candidate_owners.is_empty());
+    assert!(inspection.proposer_arms.is_empty());
+    assert!(inspection.child_body.is_empty());
+}
+
+#[test]
+fn restricted_source_shape_matrix_allows_only_canonical_or_exact_inverse() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let targets = std::array::from_fn::<_, 12, _>(|index| ProgramVariable::new(index as u8));
+    let entity_peer = ProgramVariable::new(12);
+    let attribute_peer = ProgramVariable::new(13);
+    let value_peer = ProgramVariable::new(14);
+    let canonical_rotations = [
+        SuccinctRotation::Eav,
+        SuccinctRotation::Aev,
+        SuccinctRotation::Eva,
+    ];
+    let source_shapes = [(true, true), (true, false), (false, true), (false, false)];
+    let canonical_pairs =
+        canonical_rotations.map(|rotation| representative_restricted_pairs(&fixture, rotation)[2]);
+    assert_eq!(canonical_pairs[0], (fixture.entities[0], fixture.values[0]));
+    assert_eq!(
+        canonical_pairs[1],
+        (fixture.attributes[0], fixture.values[0])
+    );
+    assert_eq!(
+        canonical_pairs[2],
+        (fixture.entities[0], fixture.attributes[0])
+    );
+
+    let mut patterns = Vec::with_capacity(targets.len());
+    for (rotation_index, &rotation) in canonical_rotations.iter().enumerate() {
+        let (first_id, last_id) = canonical_pairs[rotation_index];
+        for (shape, &(constant_first, constant_last)) in source_shapes.iter().enumerate() {
+            let target = targets[rotation_index * source_shapes.len() + shape];
+            let first_variable = match rotation {
+                SuccinctRotation::Eav | SuccinctRotation::Eva => entity_peer,
+                SuccinctRotation::Aev => attribute_peer,
+                SuccinctRotation::Vea | SuccinctRotation::Ave | SuccinctRotation::Vae => {
+                    unreachable!()
+                }
+            };
+            let last_variable = match rotation {
+                SuccinctRotation::Eav | SuccinctRotation::Aev => value_peer,
+                SuccinctRotation::Eva => attribute_peer,
+                SuccinctRotation::Vea | SuccinctRotation::Ave | SuccinctRotation::Vae => {
+                    unreachable!()
+                }
+            };
+            let first = if constant_first {
+                QueryTerm::Constant(raw(first_id))
+            } else {
+                QueryTerm::Variable(first_variable)
+            };
+            let last = if constant_last {
+                QueryTerm::Constant(raw(last_id))
+            } else {
+                QueryTerm::Variable(last_variable)
+            };
+            patterns.push(match rotation {
+                SuccinctRotation::Eav => QueryPattern::new(first, target, last),
+                SuccinctRotation::Aev => QueryPattern::new(target, first, last),
+                SuccinctRotation::Eva => QueryPattern::new(first, last, target),
+                SuccinctRotation::Vea | SuccinctRotation::Ave | SuccinctRotation::Vae => {
+                    unreachable!()
+                }
+            });
+        }
+    }
+    let program = QueryProgram::compile(gpu.archive(), 15, patterns).unwrap();
+    let mut round =
+        WgpuResidentRound::new(&gpu, &program, &[entity_peer, attribute_peer, value_peer]).unwrap();
+    let canonical_specs = round.proposal_arm_specs().to_vec();
+    assert_eq!(canonical_specs.len(), targets.len());
+
+    let source_words = |source: CodeSource| match source {
+        CodeSource::Constant(code) => [CONSTANT_SOURCE, code],
+        CodeSource::Column(column) => [COLUMN_SOURCE, u32::from(column)],
+    };
+    let assert_source_table = |admission: &ProposalAdmission, specs: &[ArmSpec]| {
+        for (arm, &spec) in specs.iter().enumerate() {
+            let ArmSpec::Restricted { first, last, .. } = spec else {
+                panic!("source-shape fixture lowered a non-Restricted arm")
+            };
+            let mut expected = Vec::with_capacity(RESTRICTED_SOURCE_WORDS_PER_ARM);
+            expected.extend(source_words(first));
+            expected.extend(source_words(last));
+            let base = arm * RESTRICTED_SOURCE_WORDS_PER_ARM;
+            assert_eq!(
+                &admission.restricted_sources[base..base + RESTRICTED_SOURCE_WORDS_PER_ARM],
+                expected,
+                "arm {arm}"
+            );
+        }
+    };
+    let canonical_admission =
+        lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural).unwrap();
+    assert_source_table(&canonical_admission, &canonical_specs);
+    for (arm, &spec) in canonical_specs.iter().enumerate() {
+        let ArmSpec::Restricted {
+            rotation,
+            first,
+            last,
+            ..
+        } = spec
+        else {
+            unreachable!()
+        };
+        assert_eq!(rotation, canonical_rotations[arm / source_shapes.len()]);
+        let (constant_first, constant_last) = source_shapes[arm % source_shapes.len()];
+        assert_eq!(matches!(first, CodeSource::Constant(_)), constant_first);
+        assert_eq!(matches!(last, CodeSource::Constant(_)), constant_last);
+    }
+
+    let parent = [
+        fixture.entities[0],
+        fixture.attributes[0],
+        fixture.values[0],
+    ]
+    .map(|id| program.encode(&raw(id)).unwrap().get());
+    let parent_values = (0..targets.len()).flat_map(|_| parent).collect::<Vec<_>>();
+    let host = program
+        .frontier_from_indices(
+            vec![entity_peer, attribute_peer, value_peer],
+            parent_values,
+            targets.len(),
+        )
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let expected_by_arm = canonical_rotations
+        .iter()
+        .enumerate()
+        .flat_map(|(rotation_index, &rotation)| {
+            let (first, last) = canonical_pairs[rotation_index];
+            let expected = codes(
+                &program,
+                &expected_restricted_ids(&fixture, rotation, first, last),
+            );
+            (0..source_shapes.len()).map(move |_| expected.clone())
+        })
+        .collect::<Vec<_>>();
+    let choice_words = targets
+        .iter()
+        .enumerate()
+        .flat_map(|(arm, target)| {
+            [
+                target.index() as u32,
+                arm as u32,
+                expected_by_arm[arm].len() as u32,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice_words)
+        .unwrap();
+    let required = expected_by_arm.iter().map(Vec::len).sum::<usize>();
+
+    // A same-rotation source swap remains type/width coherent and would pass
+    // the old axis-only gate, but it is neither the semantic arm nor its
+    // physical inverse. Failed validation must leave the live round untouched.
+    let mut relabelled = canonical_specs.clone();
+    let ArmSpec::Restricted {
+        arm,
+        rotation,
+        first,
+        last,
+    } = relabelled[3]
+    else {
+        unreachable!()
+    };
+    relabelled[3] = ArmSpec::Restricted {
+        arm,
+        rotation,
+        first: last,
+        last: first,
+    };
+    assert!(matches!(
+        round.reconfigure_restricted_proposal_arms_for_test(relabelled),
+        Err(ResidentSupportError::MalformedResidentPlan)
+    ));
+    assert_eq!(round.proposal_arm_specs(), canonical_specs);
+    assert!(round.initialize_inputs(&frontier).is_ok());
+
+    let mut unswapped_inverse = canonical_specs.clone();
+    let ArmSpec::Restricted {
+        arm,
+        rotation,
+        first,
+        last,
+    } = unswapped_inverse[3]
+    else {
+        unreachable!()
+    };
+    unswapped_inverse[3] = ArmSpec::Restricted {
+        arm,
+        rotation: inverse_restricted_rotation(rotation),
+        first,
+        last,
+    };
+    assert!(matches!(
+        round.reconfigure_restricted_proposal_arms_for_test(unswapped_inverse),
+        Err(ResidentSupportError::MalformedResidentPlan)
+    ));
+    assert_eq!(round.proposal_arm_specs(), canonical_specs);
+
+    let canonical = round
+        .enqueue_generic_proposals_for_test(&frontier, &choices, required)
+        .unwrap()
+        .inspect();
+    assert_success(&canonical, required);
+
+    let inverse_specs = canonical_specs
+        .iter()
+        .copied()
+        .map(|spec| match spec {
+            ArmSpec::Restricted {
+                arm,
+                rotation,
+                first,
+                last,
+            } => ArmSpec::Restricted {
+                arm,
+                rotation: inverse_restricted_rotation(rotation),
+                first: last,
+                last: first,
+            },
+            ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    round
+        .reconfigure_restricted_proposal_arms_for_test(inverse_specs.clone())
+        .unwrap();
+    assert!(matches!(
+        round.initialize_inputs(&frontier),
+        Err(ResidentSupportError::FrontierOwnership)
+    ));
+    assert!(matches!(
+        round.enqueue(&inputs),
+        Err(ResidentRoundError::InputOwnership)
+    ));
+    assert!(matches!(
+        lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural),
+        Err(ResidentProposalError::MalformedPlan)
+    ));
+    let inverse_admission =
+        lower_proposal_admission(&round, ProposerPolicy::RestrictedPhysical).unwrap();
+    assert_source_table(&inverse_admission, &inverse_specs);
+    for (arm, &spec) in inverse_specs.iter().enumerate() {
+        let ArmSpec::Restricted {
+            rotation,
+            first,
+            last,
+            ..
+        } = spec
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            rotation,
+            inverse_restricted_rotation(canonical_rotations[arm / source_shapes.len()])
+        );
+        let (canonical_first, canonical_last) = source_shapes[arm % source_shapes.len()];
+        assert_eq!(matches!(first, CodeSource::Constant(_)), canonical_last);
+        assert_eq!(matches!(last, CodeSource::Constant(_)), canonical_first);
+    }
+
+    let inverse_frontier = round.upload_frontier(&host).unwrap();
+    let inverse_inputs = round.initialize_inputs(&inverse_frontier).unwrap();
+    let inverse_choices = round
+        .force_choice_words_from_inputs_for_test(&inverse_frontier, &inverse_inputs, &choice_words)
+        .unwrap();
+    let inverse = round
+        .enqueue_physical_restricted_proposals_for_test(
+            &inverse_frontier,
+            &inverse_choices,
+            required,
+        )
+        .unwrap()
+        .inspect();
+    assert_eq!(inverse, canonical);
+}
+
+#[test]
+fn mixed_present_pair_restricted_is_stable_and_row_homomorphic() {
+    const ROWS: usize = 65;
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let targets = std::array::from_fn::<_, 6, _>(|index| ProgramVariable::new(index as u8));
+    let entity_peer = ProgramVariable::new(6);
+    let attribute_peer = ProgramVariable::new(7);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        8,
+        [
+            QueryPattern::new(targets[0], targets[1], targets[2]),
+            QueryPattern::new(entity_peer, targets[3], targets[4]),
+            QueryPattern::new(entity_peer, attribute_peer, targets[5]),
+        ],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity_peer, attribute_peer]).unwrap();
+    assert_eq!(round.proposal_arm_specs().len(), targets.len());
+    assert!(matches!(
+        round.proposal_arm_specs()[0],
+        ArmSpec::Present { .. }
+    ));
+    assert!(matches!(
+        round.proposal_arm_specs()[1],
+        ArmSpec::Present { .. }
+    ));
+    assert!(matches!(
+        round.proposal_arm_specs()[2],
+        ArmSpec::Present { .. }
+    ));
+    assert!(matches!(
+        round.proposal_arm_specs()[3],
+        ArmSpec::PairDistinct { .. }
+    ));
+    assert!(matches!(
+        round.proposal_arm_specs()[4],
+        ArmSpec::PairDistinct { .. }
+    ));
+    assert!(matches!(
+        round.proposal_arm_specs()[5],
+        ArmSpec::Restricted { .. }
+    ));
+
+    let parent_cycle = [
+        [fixture.entities[0], fixture.attributes[0]],
+        [fixture.entities[0], fixture.attributes[1]],
+        [fixture.entities[2], fixture.attributes[0]],
+        [fixture.entities[1], fixture.attributes[2]],
+    ];
+    let arm_cycle = [0usize, 3, 5, 1, 4, 2, 5, 3, 0, 4, 5];
+    let parent_ids = (0..ROWS)
+        .map(|row| parent_cycle[row % parent_cycle.len()])
+        .collect::<Vec<_>>();
+    let parent_values = parent_ids
+        .iter()
+        .flat_map(|row| row.map(|id| program.encode(&raw(id)).unwrap().get()))
+        .collect::<Vec<_>>();
+    let host = program
+        .frontier_from_indices(vec![entity_peer, attribute_peer], parent_values, ROWS)
+        .unwrap();
+
+    let source_id = |source: CodeSource, parent: [Id; 2]| match source {
+        CodeSource::Column(column) => parent[usize::from(column)],
+        CodeSource::Constant(_) => panic!("mixed fixture has no constant source"),
+    };
+    let ids_for = |spec: ArmSpec, parent: [Id; 2]| -> Vec<Id> {
+        match spec {
+            ArmSpec::Present { axis, .. } => match axis {
+                ResidentAxis::Entity => fixture.entities.to_vec(),
+                ResidentAxis::Attribute => fixture.attributes.to_vec(),
+                ResidentAxis::Value => fixture.values.to_vec(),
+            },
+            ArmSpec::PairDistinct { rotation, peer, .. } => {
+                expected_pair_ids(&fixture, rotation, source_id(peer, parent))
+            }
+            ArmSpec::Restricted {
+                rotation,
+                first,
+                last,
+                ..
+            } => expected_restricted_ids(
+                &fixture,
+                rotation,
+                source_id(first, parent),
+                source_id(last, parent),
+            ),
+        }
+    };
+    let mut row_arms = Vec::with_capacity(ROWS);
+    let mut row_candidates = Vec::with_capacity(ROWS);
+    let mut choice_words = Vec::with_capacity(ROWS * CHOICE_WORDS);
+    for row in 0..ROWS {
+        let arm = arm_cycle[row % arm_cycle.len()];
+        let target = round.metadata().arms()[arm].target_variable();
+        let candidates = codes(
+            &program,
+            &ids_for(round.proposal_arm_specs()[arm], parent_ids[row]),
+        );
+        choice_words.extend([target.index() as u32, arm as u32, candidates.len() as u32]);
+        row_arms.push(arm);
+        row_candidates.push(candidates);
+    }
+    assert!(row_arms
+        .windows(arm_cycle.len())
+        .any(|window| window == arm_cycle));
+    assert!(parent_ids
+        .windows(parent_cycle.len())
+        .any(|window| window == parent_cycle));
+
+    let inspect_range = |range: std::ops::Range<usize>| {
+        let sliced = host.slice(range.clone()).unwrap();
+        let frontier = round.upload_frontier(&sliced).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let words = &choice_words[range.start * CHOICE_WORDS..range.end * CHOICE_WORDS];
+        let capacity = words
+            .chunks_exact(CHOICE_WORDS)
+            .map(|choice| choice[2] as usize)
+            .sum();
+        let choices = round
+            .force_choice_words_from_inputs_for_test(&frontier, &inputs, words)
+            .unwrap();
+        let inspection = round
+            .enqueue_generic_proposals_for_test(&frontier, &choices, capacity)
+            .unwrap()
+            .inspect();
+        assert_success(&inspection, capacity);
+        inspection
+    };
+
+    let whole = inspect_range(0..ROWS);
+    let repeated = inspect_range(0..ROWS);
+    assert_eq!(
+        repeated, whole,
+        "identical immutable inputs changed output bytes"
+    );
+
+    let required = row_candidates.iter().map(Vec::len).sum::<usize>();
+    assert_success(&whole, required);
+    let mut expected_codes = Vec::with_capacity(required);
+    let mut expected_owners = Vec::with_capacity(required);
+    let mut expected_arms = Vec::with_capacity(required);
+    let mut expected_body = Vec::with_capacity(required * 3);
+    for &target in &targets {
+        for row in 0..ROWS {
+            let arm = row_arms[row];
+            if round.metadata().arms()[arm].target_variable() != target {
+                continue;
+            }
+            for &candidate in &row_candidates[row] {
+                expected_codes.push(candidate);
+                expected_owners.push(row as u32);
+                expected_arms.push(arm as u32);
+                expected_body.extend([
+                    candidate,
+                    program.encode(&raw(parent_ids[row][0])).unwrap().get(),
+                    program.encode(&raw(parent_ids[row][1])).unwrap().get(),
+                ]);
+            }
+        }
+    }
+    assert_eq!(whole.candidate_codes, expected_codes);
+    assert_eq!(whole.candidate_owners, expected_owners);
+    assert_eq!(whole.proposer_arms, expected_arms);
+    assert_eq!(whole.child_body, expected_body);
+
+    let expected_segments = live_segments(&whole);
+    for split in 0..=ROWS {
+        let left = inspect_range(0..split);
+        let right = inspect_range(split..ROWS);
+        assert_eq!(
+            concatenate_segment_maps(&left, &right, split as u32),
+            expected_segments,
+            "Present+Pair+Restricted row homomorphism split {split}"
+        );
+    }
+}
+
+#[test]
+fn restricted_faults_fail_closed_and_outrank_capacity() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(entity, attribute, value)],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity, attribute]).unwrap();
+    let admission = lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural).unwrap();
+    let arm = 0usize;
+    let descriptor = arm * ARM_DESCRIPTOR_WORDS;
+    let first_code = program.encode(&raw(fixture.entities[0])).unwrap().get();
+    let last_code = program.encode(&raw(fixture.attributes[0])).unwrap().get();
+    let host = program
+        .frontier_from_indices(vec![entity, attribute], vec![first_code, last_code], 1)
+        .unwrap();
+    let frontier = round.upload_frontier(&host).unwrap();
+    let inputs = round.initialize_inputs(&frontier).unwrap();
+    let witnesses = inputs.read_proposal_witnesses_for_test();
+    let count = witnesses[3] - witnesses[2];
+    assert!(count > 1);
+    let choice = [value.index() as u32, arm as u32, count];
+    let choices = round
+        .force_choice_words_from_inputs_for_test(&frontier, &inputs, &choice)
+        .unwrap();
+    let ring_len = round.archive().ring_col(SuccinctRotation::Eav).len() as u32;
+
+    for (word, replacement) in [
+        (0usize, attribute.index() as u32),
+        (1, 99),
+        (2, SuccinctRotation::ALL.len() as u32),
+        (3, ring_len - 1),
+    ] {
+        let mut descriptors = admission.arm_descriptors.clone();
+        descriptors[descriptor + word] = replacement;
+        let classified =
+            classify_direct(&round, &admission, &descriptors, 2, &choice, &witnesses, 0);
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "descriptor word {word}"
+        );
+    }
+
+    for replacement in [
+        [0, ring_len + 1, 0, count],
+        [0, ring_len, 0, ring_len + 1],
+        [1, 2, 2, 2],
+        [0, 1, 0, 2],
+        [RESIDENT_U32_SENTINEL; PROPOSAL_WITNESS_WORDS],
+    ] {
+        let classified = classify_direct(
+            &round,
+            &admission,
+            &admission.arm_descriptors,
+            2,
+            &choice,
+            &replacement,
+            0,
+        );
+        assert_eq!(
+            &classified.control[..2],
+            &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL],
+            "witness {replacement:?}"
+        );
+    }
+
+    let source_base = arm * RESTRICTED_SOURCE_WORDS_PER_ARM;
+    let domain = program.archive().domain.len() as u32;
+    let mut source_faults = Vec::new();
+    let mut unknown_kind = admission.restricted_sources.clone();
+    unknown_kind[source_base] = 99;
+    source_faults.push(("unknown source kind", unknown_kind));
+    let mut coherent_wrong_range = admission.restricted_sources.clone();
+    coherent_wrong_range[source_base + 1] = 1;
+    source_faults.push(("coherent wrong source range", coherent_wrong_range));
+    let mut out_of_domain = admission.restricted_sources.clone();
+    out_of_domain[source_base + 2] = CONSTANT_SOURCE;
+    out_of_domain[source_base + 3] = domain;
+    source_faults.push(("out-of-domain source", out_of_domain));
+
+    for (name, sources) in source_faults {
+        let mut corrupted = ProposalAdmission {
+            pair_capable: admission.pair_capable,
+            restricted_capable: admission.restricted_capable,
+            arm_descriptors: admission.arm_descriptors.clone(),
+            restricted_sources: sources,
+            variable_offsets: admission.variable_offsets.clone(),
+            variable_arms: admission.variable_arms.clone(),
+            segment_specs: admission.segment_specs.clone(),
+            variable_to_segment: admission.variable_to_segment.clone(),
+            segment_count: admission.segment_count,
+        };
+        let proposal_inputs = round.proposal_inputs(&frontier, &choices).unwrap();
+        let geometry = proposal_geometry(
+            proposal_inputs.rows,
+            proposal_inputs.parent_stride,
+            count as usize - 1,
+            &corrupted,
+        )
+        .unwrap();
+        let failed = round
+            .enqueue_present_proposals_with_inputs(
+                proposal_inputs,
+                ProposalPreflight {
+                    admission: &corrupted,
+                    geometry,
+                },
+                None,
+                None,
+                false,
+                PresentPublication::Provisional,
+            )
+            .unwrap()
+            .inspect();
+        assert_eq!(failed.status, STATUS_DEVICE_INVARIANT, "{name}");
+        assert_eq!(failed.required, RESIDENT_U32_SENTINEL, "{name}");
+        assert_eq!(failed.logical_len, 0, "{name}");
+        assert_eq!((failed.dispatch_x, failed.dispatch_y), (0, 1), "{name}");
+        assert!(!failed.candidate_codes.is_empty(), "{name}");
+        assert!(failed.segments.iter().all(|segment| {
+            segment.base == RESIDENT_U32_SENTINEL
+                && segment.count == RESIDENT_U32_SENTINEL
+                && segment.variable == RESIDENT_U32_SENTINEL
+                && segment.insertion == RESIDENT_U32_SENTINEL
+        }));
+        assert!(failed
+            .candidate_codes
+            .iter()
+            .chain(&failed.candidate_owners)
+            .chain(&failed.proposer_arms)
+            .chain(&failed.child_body)
+            .all(|&word| word == RESIDENT_U32_SENTINEL));
+        // Keep the admission live across the complete enqueue above while
+        // making it clear no later iteration can accidentally reuse it.
+        corrupted.restricted_sources.clear();
+    }
+}
+
+#[test]
+fn restricted_arena_retains_inputs_after_round_capabilities_drop() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let entity = ProgramVariable::new(0);
+    let attribute = ProgramVariable::new(1);
+    let value = ProgramVariable::new(2);
+    let program = QueryProgram::compile(
+        gpu.archive(),
+        3,
+        [QueryPattern::new(entity, attribute, value)],
+    )
+    .unwrap();
+    let round = WgpuResidentRound::new(&gpu, &program, &[entity, attribute]).unwrap();
+    let expected = expected_restricted_ids(
+        &fixture,
+        SuccinctRotation::Eva,
+        fixture.entities[0],
+        fixture.attributes[0],
+    );
+    let arena = {
+        let host = program
+            .frontier_from_indices(
+                vec![entity, attribute],
+                vec![
+                    program.encode(&raw(fixture.entities[0])).unwrap().get(),
+                    program.encode(&raw(fixture.attributes[0])).unwrap().get(),
+                ],
+                1,
+            )
+            .unwrap();
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+        let count = witnesses[3] - witnesses[2];
+        let choices = round
+            .force_choice_words_from_inputs_for_test(
+                &frontier,
+                &inputs,
+                &[value.index() as u32, 0, count],
+            )
+            .unwrap();
+        round
+            .enqueue_generic_proposals_for_test(&frontier, &choices, expected.len())
+            .unwrap()
+    };
+    drop(round);
+    let inspection = arena.inspect();
+    assert_success(&inspection, expected.len());
+    assert_eq!(inspection.candidate_codes, codes(&program, &expected));
+}
+
+#[test]
+fn restricted_generation_is_monotone_after_decoding_rebuilt_archive_codes() {
+    let entity_id = ordered_id(1);
+    let inserted_attribute = ordered_id(4);
+    let existing_attribute = ordered_id(8);
+    let value_id = ordered_id(12);
+    let mut before = TribleSet::new();
+    insert(&mut before, entity_id, existing_attribute, value_id);
+    let mut after = before.clone();
+    insert(&mut after, entity_id, inserted_attribute, value_id);
+
+    let run = |set: &TribleSet| {
+        let archive: SuccinctArchive<OrderedUniverse> = set.into();
+        let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+        let entity = ProgramVariable::new(0);
+        let attribute = ProgramVariable::new(1);
+        let value = ProgramVariable::new(2);
+        let program = QueryProgram::compile(
+            gpu.archive(),
+            3,
+            [QueryPattern::new(entity, attribute, value)],
+        )
+        .unwrap();
+        let round = WgpuResidentRound::new(&gpu, &program, &[entity, value]).unwrap();
+        assert!(matches!(
+            round.proposal_arm_specs(),
+            [ArmSpec::Restricted {
+                rotation: SuccinctRotation::Eav,
+                ..
+            }]
+        ));
+        let host = program
+            .frontier_from_indices(
+                vec![entity, value],
+                vec![
+                    program.encode(&raw(entity_id)).unwrap().get(),
+                    program.encode(&raw(value_id)).unwrap().get(),
+                ],
+                1,
+            )
+            .unwrap();
+        let frontier = round.upload_frontier(&host).unwrap();
+        let inputs = round.initialize_inputs(&frontier).unwrap();
+        let witnesses = inputs.read_proposal_witnesses_for_test();
+        let count = witnesses[3] - witnesses[2];
+        let choices = round
+            .force_choice_words_from_inputs_for_test(
+                &frontier,
+                &inputs,
+                &[attribute.index() as u32, 0, count],
+            )
+            .unwrap();
+        let inspection = round
+            .enqueue_generic_proposals_for_test(&frontier, &choices, count as usize)
+            .unwrap()
+            .inspect();
+        assert_success(&inspection, count as usize);
+        let encoded = inspection.candidate_codes;
+        let candidate_frontier = program
+            .frontier_from_indices(vec![attribute], encoded.clone(), encoded.len())
+            .unwrap();
+        let decoded = program
+            .decode_frontier(&candidate_frontier)
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0])
+            .collect::<Vec<_>>();
+        (encoded, decoded)
+    };
+
+    let (before_codes, before_decoded) = run(&before);
+    let (after_codes, after_decoded) = run(&after);
+    assert_eq!(before_decoded, vec![raw(existing_attribute)]);
+    assert_eq!(
+        after_decoded,
+        vec![raw(inserted_attribute), raw(existing_attribute)]
+    );
+    let before_set = before_decoded.iter().copied().collect::<BTreeSet<_>>();
+    let after_set = after_decoded.iter().copied().collect::<BTreeSet<_>>();
+    assert!(before_set.is_subset(&after_set));
+    assert_eq!(before_codes.len(), 1);
+    assert_eq!(after_codes.len(), 2);
+    assert_ne!(
+        before_codes[0], after_codes[1],
+        "new ordered-universe member must shift the old snapshot-local code"
+    );
+}
+
+#[test]
+fn restricted_group_finalizer_preserves_the_closed_status_lattice() {
+    let fixture = restricted_fixture();
+    let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
+    let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
+    let context = gpu.context();
+    let layout = restricted_workspace_layout(1).unwrap();
+    assert_eq!(layout.max_block_count, 1);
+
+    let run = |upstream_status: u32, validation_error: u32, scan_error: u32| {
+        let mut words = vec![0; layout.words];
+        words[layout.block_sums] = 1;
+        words[layout.validation_errors] = validation_error;
+        words[layout.block_errors] = scan_error;
+        let mut workspace = context.upload_u32(&words).unwrap();
+        let mut planning = context.upload_u32(&[upstream_status, 5, 0, 1]).unwrap();
+        let mut group = context
+            .upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])
+            .unwrap();
+        unsafe {
+            finalize_restricted_group_scan::launch_unchecked::<WgpuRuntime>(
+                context.client(),
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                workspace.output_arg(),
+                planning.output_arg(),
+                group.output_arg(),
+                1,
+                1,
+                8,
+                8,
+                8,
+                THREADS,
+                layout.validation_errors as u32,
+                layout.block_sums as u32,
+                layout.block_errors as u32,
+                layout.block_offsets as u32,
+                RESIDENT_U32_SENTINEL,
+                STATUS_OK,
+                STATUS_CAPACITY,
+                STATUS_DEVICE_INVARIANT,
+                STATUS_GEOMETRY,
+            );
+        }
+        (planning.read(), group.read())
+    };
+
+    let (planning, group) = run(STATUS_CAPACITY, STATUS_DEVICE_INVARIANT, 0);
+    assert_eq!(
+        &planning[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(&group[..4], &[STATUS_DEVICE_INVARIANT, 0, 0, 1]);
+
+    let (planning, group) = run(STATUS_DEVICE_INVARIANT, 0, 0);
+    assert_eq!(
+        &planning[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(&group[..4], &[STATUS_DEVICE_INVARIANT, 0, 0, 1]);
+
+    let (planning, group) = run(STATUS_GEOMETRY, STATUS_DEVICE_INVARIANT, 0);
+    assert_eq!(&planning[..2], &[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL]);
+    assert_eq!(&group[..4], &[STATUS_GEOMETRY, 0, 0, 1]);
+
+    let (planning, group) = run(99, 0, 0);
+    assert_eq!(
+        &planning[..2],
+        &[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL]
+    );
+    assert_eq!(&group[..4], &[STATUS_DEVICE_INVARIANT, 0, 0, 1]);
+
+    let (planning, group) = run(STATUS_CAPACITY, 0, 0);
+    assert_eq!(&planning[..2], &[STATUS_CAPACITY, 5]);
+    assert_eq!(&group[..4], &[STATUS_CAPACITY, 0, 0, 1]);
+
+    for upstream in [STATUS_OK, STATUS_CAPACITY] {
+        let (planning, group) = run(upstream, 0, STATUS_GEOMETRY);
+        assert_eq!(&planning[..2], &[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL]);
+        assert_eq!(&group[..4], &[STATUS_GEOMETRY, 0, 0, 1]);
+    }
 }
 
 struct DirectClassification {
@@ -2603,6 +4022,8 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         context: context.clone(),
         round_owner: Arc::new(()),
         frontier_lineage: Arc::new(()),
+        _frontier_values: Arc::new(context.upload_u32(&[]).unwrap()),
+        _proposal_witness: Arc::new(context.upload_u32(&[]).unwrap()),
         arena_lineage: Arc::new(()),
         rows: 1,
         parent_stride: 0,
@@ -2612,10 +4033,13 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
         _planning_control: context
             .upload_u32(&[STATUS_GEOMETRY, RESIDENT_U32_SENTINEL, 0, 1])
             .unwrap(),
+        _workspace: workspace,
+        _plan: context.upload_u32(&[]).unwrap(),
         _generation_dispatch: context
             .batch_dispatch(0, 1, CubeDim::new_1d(THREADS))
             .unwrap(),
         _pair_generation: None,
+        _restricted_generation: None,
         control,
         meta,
         dispatch,
@@ -2642,6 +4066,13 @@ fn unrepresentable_scan_total_has_a_distinct_geometry_status() {
             && segment.variable == RESIDENT_U32_SENTINEL
             && segment.insertion == RESIDENT_U32_SENTINEL
     }));
+    assert!(inspection
+        .candidate_codes
+        .iter()
+        .chain(&inspection.candidate_owners)
+        .chain(&inspection.proposer_arms)
+        .chain(&inspection.child_body)
+        .all(|&word| word == RESIDENT_U32_SENTINEL));
 }
 
 #[test]
@@ -3580,7 +5011,7 @@ fn generic_pair_descriptors_cover_all_six_rotations_and_classify_exact_witnesses
 
     for bound_index in 0..3 {
         let round = WgpuResidentRound::new(&gpu, &program, &[variables[bound_index]]).unwrap();
-        let admission = lower_proposal_admission(&round, ProposerPolicy::PresentAndPair).unwrap();
+        let admission = lower_proposal_admission(&round, ProposerPolicy::PairGeneric).unwrap();
         let host = program
             .frontier_from_indices(
                 vec![variables[bound_index]],
@@ -3673,7 +5104,7 @@ fn pair_classifier_rejects_bad_tags_limits_and_interval_shapes_before_capacity()
     )
     .unwrap();
     let round = WgpuResidentRound::new(&gpu, &program, &[variables[0]]).unwrap();
-    let admission = lower_proposal_admission(&round, ProposerPolicy::PresentAndPair).unwrap();
+    let admission = lower_proposal_admission(&round, ProposerPolicy::PairGeneric).unwrap();
     let arm = round
         .metadata()
         .arms()
@@ -3886,7 +5317,7 @@ fn present_classifier_authenticates_unchosen_physical_witnesses_before_semantics
 }
 
 #[test]
-fn generic_admission_still_rejects_restricted_arms() {
+fn restricted_admission_is_test_only_and_pair_policy_still_rejects_it() {
     let fixture = fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&fixture.set).into();
     let gpu = crate::WgpuSuccinctArchive::new(archive).unwrap();
@@ -3903,9 +5334,15 @@ fn generic_admission_still_rejects_restricted_arms() {
     .unwrap();
     let round = WgpuResidentRound::new(&gpu, &program, &variables[..2]).unwrap();
     assert!(matches!(
-        lower_proposal_admission(&round, ProposerPolicy::PresentAndPair),
+        lower_proposal_admission(&round, ProposerPolicy::PairGeneric),
         Err(ResidentProposalError::UnsupportedProposer { .. })
     ));
+    let admission = lower_proposal_admission(&round, ProposerPolicy::RestrictedNatural).unwrap();
+    assert!(admission.admits_restricted());
+    assert_eq!(
+        admission.restricted_sources,
+        [COLUMN_SOURCE, 0, COLUMN_SOURCE, 1]
+    );
 }
 
 #[test]
@@ -3938,7 +5375,7 @@ fn generic_admission_authenticates_same_target_pair_rotation_independently() {
         round.proposal_arm_pair_rotation(arm),
         Some(SuccinctRotation::Vae)
     );
-    let (_, pair_counts) = checked_proposal_physical_limits(&round).unwrap();
+    let (ring_len, pair_counts) = checked_proposal_physical_limits(&round).unwrap();
     assert!(matches!(
         lower_proposal_arm_descriptor(
             &round,
@@ -3948,7 +5385,8 @@ fn generic_admission_authenticates_same_target_pair_rotation_independently() {
                 rotation: SuccinctRotation::Eav,
                 peer,
             },
-            ProposerPolicy::PresentAndPair,
+            ProposerPolicy::PairGeneric,
+            ring_len,
             pair_counts,
         ),
         Err(ResidentProposalError::MalformedPlan)
@@ -4363,8 +5801,18 @@ fn destination_gate_preserves_the_closed_upstream_error_lattice() {
         ("unknown status", &unknown),
         ("geometry", &geometry),
     ] {
+        assert_eq!(failed.logical_len, 0, "{name}");
         assert_eq!(failed.indirect_marker, 0, "{name}");
         assert_eq!(failed.failure_indirect_marker, 1, "{name}");
+        assert!(
+            failed
+                .segments
+                .iter()
+                .chain(&failed.candidates)
+                .chain(&failed.child)
+                .all(|&word| word == dead),
+            "{name} leaked semantic bytes"
+        );
     }
     for malformed in [[STATUS_CAPACITY, dead, 0, 1], [STATUS_CAPACITY, 4, 0, 1]] {
         let result = run(malformed, &poison_candidates);

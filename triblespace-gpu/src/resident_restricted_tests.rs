@@ -684,7 +684,8 @@ fn invalid_last_aliases_fail_closed_in_the_complete_restricted_pipeline() {
                 domain,
                 valid_last,
             ])
-            .unwrap(),
+            .unwrap()
+            .into(),
         variables: vec![v(0), v(1)].into_boxed_slice(),
         rows: 5,
         stride: 2,
@@ -709,7 +710,8 @@ fn invalid_last_aliases_fail_closed_in_the_complete_restricted_pipeline() {
         values: resident
             .context()
             .upload_u32(&[valid_first, valid_last])
-            .unwrap(),
+            .unwrap()
+            .into(),
         variables: vec![v(0), v(1)].into_boxed_slice(),
         rows: 1,
         stride: 2,

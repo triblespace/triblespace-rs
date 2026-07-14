@@ -1,9 +1,9 @@
 //! Private confirmed proposal arena for one archive-resident affine round.
 //!
 //! Published execution still admits only zero-peer [`ArmSpec::Present`]
-//! proposers. Its internal plan and classifier use explicit Present/PairDistinct
-//! family tags and exact retained interval witnesses, preparing the shared
-//! arena for Pair generation without exposing an incomplete Pair capability. It
+//! proposers. The internal provisional harness uses explicit Present,
+//! PairDistinct, and Restricted family tags plus exact retained interval
+//! witnesses without exposing an incomplete generic-family capability. It
 //! classifies packed row choices into a variable-major `S * R` width vector,
 //! performs one exact stable scan over that flat order, and writes candidates
 //! directly into ascending-variable segments. The layout itself is therefore
@@ -23,15 +23,15 @@
 //! for CubeCL's generated information buffer rather than depending on a
 //! high-binding desktop adapter.
 //!
-//! Generation assigns one invocation to each exact output destination. The
-//! planning finalizer publishes a private `T`-sized generation dispatch; each
-//! invocation performs strict-end lower bounds over segment records and scanned
-//! row cells, then copies one candidate from the retained validated row axis.
-//! A static capacity-wide gate subsequently proves structural route identity
-//! and the poison tail, independently derives the public dispatch rectangle
-//! from `T`, and publishes it for confirmation and child materialization. The
-//! two dispatch records carry the same logical total but are distinct physical
-//! publication boundaries.
+//! The planning finalizer publishes a private `T`-sized family dispatch.
+//! Present emission inverts exact global destinations with strict-end lower
+//! bounds; active Pair rotations scan row widths and follow their LF mapping;
+//! active Restricted rotations validate row-local source ranges and enumerate
+//! the successor Ring interval. A static capacity-wide gate then proves the
+//! combined structural route identity and poison tail, independently derives
+//! the public dispatch rectangle from `T`, and publishes it for confirmation
+//! and child materialization. The two dispatch records carry the same logical
+//! total but are distinct physical publication boundaries.
 //!
 //! Confirmation resolves every relevant Present descriptor from the candidate
 //! code, owner, proposer, and immutable per-variable CSR. Its private backing
@@ -56,8 +56,8 @@ use crate::resident_round::{
     RESIDENT_U32_SENTINEL,
 };
 use crate::resident_support::{
-    ArmSpec, ResidentAxis, ResidentProposalInputs, ResidentSupportError, WgpuResidentFrontier,
-    WgpuResidentRound,
+    inverse_restricted_rotation, ArmSpec, CodeSource, ResidentAxis, ResidentProposalInputs,
+    ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound, COLUMN_SOURCE, CONSTANT_SOURCE,
 };
 
 type WgpuRuntime = cubecl::wgpu::WgpuRuntime;
@@ -66,12 +66,15 @@ const THREADS: u32 = 64;
 const BLOCK_ITEMS: u32 = 64;
 const CHOICE_WORDS: usize = 3;
 const ARM_DESCRIPTOR_WORDS: usize = 4;
+const RESTRICTED_SOURCE_WORDS_PER_ARM: usize = 4;
 const SEGMENT_SPEC_WORDS: usize = 2;
 const SEGMENT_RECORD_WORDS: usize = 4;
 const CANDIDATE_RECORD_FIELDS: usize = 3;
+const RESTRICTED_SOURCE_WORDS: usize = 8;
 
 const FAMILY_PRESENT: u32 = 0;
 const FAMILY_PAIR_DISTINCT: u32 = 1;
+const FAMILY_RESTRICTED: u32 = 2;
 
 const CONTROL_STATUS: usize = 0;
 const CONTROL_REQUIRED: usize = 1;
@@ -164,6 +167,9 @@ pub(crate) struct WgpuResidentProposals {
     context: GpuContext<WgpuRuntime>,
     round_owner: Arc<()>,
     frontier_lineage: Arc<()>,
+    /// Exact source allocations retained beneath every queued arena command.
+    _frontier_values: Arc<DeviceU32Buffer<WgpuRuntime>>,
+    _proposal_witness: Arc<DeviceU32Buffer<WgpuRuntime>>,
     /// Unique lineage for this exact published arena allocation.
     arena_lineage: Arc<()>,
     rows: usize,
@@ -173,10 +179,19 @@ pub(crate) struct WgpuResidentProposals {
     capacity: usize,
     /// Private pre-validation planning state retained beneath publication.
     _planning_control: DeviceU32Buffer<WgpuRuntime>,
+    /// Classifier widths, route identity, and scan prefixes consumed by every
+    /// queued family generator and the shared structural gate.
+    _workspace: DeviceU32Buffer<WgpuRuntime>,
+    /// Exact immutable packed admission, including the arm-indexed Restricted
+    /// source table consumed by queued row-local generation.
+    _plan: DeviceU32Buffer<WgpuRuntime>,
     /// Private indirect rectangle consumed only by family generators.
     _generation_dispatch: DeviceDispatch<WgpuRuntime>,
     /// Pair-only scan/LF allocations retained until every queued use finishes.
     _pair_generation: Option<Box<PairGenerationBacking>>,
+    /// Restricted source/range/scan allocations retained until every queued
+    /// use finishes.
+    _restricted_generation: Option<Box<RestrictedGenerationBacking>>,
     control: DeviceU32Buffer<WgpuRuntime>,
     meta: DeviceBatchMeta<WgpuRuntime>,
     dispatch: DeviceDispatch<WgpuRuntime>,
@@ -208,7 +223,7 @@ struct ProvisionalBacking {
     _child_body: DeviceU32Buffer<WgpuRuntime>,
 }
 
-/// Reusable device state for the six sequential PairDistinct rotations.
+/// Reusable device state for active PairDistinct rotations in physical order.
 ///
 /// These allocations are deliberately retained by the returned arena. CubeCL
 /// may pool a dropped handle while its commands are still queued; retaining
@@ -224,6 +239,21 @@ struct PairGenerationBacking {
     _positions: DeviceU32Buffer<WgpuRuntime>,
     _values: DeviceU32Buffer<WgpuRuntime>,
     _ranks: DeviceU32Buffer<WgpuRuntime>,
+}
+
+/// Reusable destination scratch plus every exact source-group allocation used
+/// by Restricted generation.
+struct RestrictedGenerationBacking {
+    _control: DeviceU32Buffer<WgpuRuntime>,
+    _meta: DeviceBatchMeta<WgpuRuntime>,
+    _dispatch: DeviceDispatch<WgpuRuntime>,
+    _workspace: DeviceU32Buffer<WgpuRuntime>,
+    _source_positions: DeviceU32Buffer<WgpuRuntime>,
+    _source_values: DeviceU32Buffer<WgpuRuntime>,
+    _source_selected: DeviceU32Buffer<WgpuRuntime>,
+    _source_ranks: DeviceU32Buffer<WgpuRuntime>,
+    _positions: DeviceU32Buffer<WgpuRuntime>,
+    _values: DeviceU32Buffer<WgpuRuntime>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -245,7 +275,12 @@ struct ProposalAdmission {
     /// Whether this capability was lowered through the test-only generic
     /// boundary, independent of whether semantic death erased family tags.
     pair_capable: bool,
+    /// Whether the test-only provisional capability admits Restricted arms.
+    restricted_capable: bool,
     arm_descriptors: Vec<u32>,
+    /// Four words per global arm: first kind/payload, last kind/payload.
+    /// Non-Restricted arms retain canonical sentinel poison.
+    restricted_sources: Vec<u32>,
     /// CSR offsets for stable relevant-arm slices, one entry per variable plus
     /// the terminal arm count.
     variable_offsets: Vec<u32>,
@@ -266,6 +301,14 @@ impl ProposalAdmission {
 
     fn admits_pair(&self) -> bool {
         self.pair_capable
+    }
+
+    fn admits_restricted(&self) -> bool {
+        self.restricted_capable
+    }
+
+    fn is_generic(&self) -> bool {
+        self.pair_capable || self.restricted_capable
     }
 }
 
@@ -297,7 +340,43 @@ struct ProposalPreflight<'admission> {
 #[derive(Clone, Copy)]
 enum ProposerPolicy {
     PresentOnly,
-    PresentAndPair,
+    PairGeneric,
+    /// Strict natural two-peer lowering. This variant cannot exist in a
+    /// production build; published entrypoints therefore have no route to it.
+    #[cfg(test)]
+    RestrictedNatural,
+    /// Structural all-six physical harness. Each arm admits only its canonical
+    /// lowering or exact source-swapped inverse and remains test-only.
+    #[cfg(test)]
+    RestrictedPhysical,
+}
+
+impl ProposerPolicy {
+    const fn allows_pair(self) -> bool {
+        !matches!(self, Self::PresentOnly)
+    }
+
+    const fn allows_restricted(self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::RestrictedNatural | Self::RestrictedPhysical)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    const fn allows_physical_restricted(self) -> bool {
+        #[cfg(test)]
+        {
+            matches!(self, Self::RestrictedPhysical)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
 }
 
 /// Physical regions in the one scratch allocation shared by scan kernels.
@@ -336,6 +415,22 @@ struct PairWorkspaceLayout {
     words: usize,
 }
 
+/// Selected-row source geometry and scan state reused by Restricted rotations.
+#[derive(Clone, Copy)]
+struct RestrictedWorkspaceLayout {
+    source_results: usize,
+    counts: usize,
+    starts: usize,
+    lane_errors: usize,
+    local_offsets: usize,
+    block_sums: usize,
+    block_errors: usize,
+    block_offsets: usize,
+    validation_errors: usize,
+    max_block_count: usize,
+    words: usize,
+}
+
 /// Physical regions in the one confirmation/publication workspace.
 #[derive(Clone, Copy)]
 struct ConfirmationWorkspaceLayout {
@@ -353,6 +448,7 @@ struct ConfirmationWorkspaceLayout {
 #[derive(Clone, Copy)]
 struct PlanLayout {
     arm_descriptors: usize,
+    restricted_sources: usize,
     variable_offsets: usize,
     variable_arms: usize,
     segment_specs: usize,
@@ -445,12 +541,13 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         )
     }
 
-    /// Test-only provisional capability admitting Present and PairDistinct.
+    /// Test-only provisional capability admitting Present, PairDistinct, and
+    /// naturally lowered Restricted arms.
     ///
     /// This boundary publishes structurally validated candidates and generic
     /// children, then returns before Present confirmation. Production
-    /// entrypoints lower `PresentOnly`, and no Pair-tagged arena can obtain the
-    /// existing wired publication path.
+    /// entrypoints lower `PresentOnly`, and no generic-family arena can obtain
+    /// the existing wired publication path.
     #[cfg(test)]
     fn enqueue_generic_proposals_for_test(
         &self,
@@ -459,7 +556,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
         self.enqueue_present_proposals_with_inputs(
             inputs,
@@ -482,7 +579,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         capacity: usize,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
         self.enqueue_present_proposals_with_inputs(
             inputs,
@@ -507,7 +604,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         max_groups_y: u32,
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let inputs = self.proposal_inputs(frontier, choices)?;
-        let admission = lower_proposal_admission(self, ProposerPolicy::PresentAndPair)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedNatural)?;
         let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
         self.enqueue_present_proposals_with_inputs(
             inputs,
@@ -517,6 +614,32 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             },
             None,
             Some((max_groups_x, max_groups_y)),
+            false,
+            PresentPublication::Provisional,
+        )
+    }
+
+    /// Deliberately narrow all-six physical harness. The round must first be
+    /// reconfigured through its matching-axis Restricted test capability;
+    /// production builds contain neither that mutator nor this admission.
+    #[cfg(test)]
+    fn enqueue_physical_restricted_proposals_for_test(
+        &self,
+        frontier: &WgpuResidentFrontier<'_, U>,
+        choices: &ResidentRowChoices<WgpuRuntime>,
+        capacity: usize,
+    ) -> Result<WgpuResidentProposals, ResidentProposalError> {
+        let inputs = self.proposal_inputs(frontier, choices)?;
+        let admission = lower_proposal_admission(self, ProposerPolicy::RestrictedPhysical)?;
+        let geometry = proposal_geometry(inputs.rows, inputs.parent_stride, capacity, &admission)?;
+        self.enqueue_present_proposals_with_inputs(
+            inputs,
+            ProposalPreflight {
+                admission: &admission,
+                geometry,
+            },
+            None,
+            None,
             false,
             PresentPublication::Provisional,
         )
@@ -668,11 +791,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     ) -> Result<WgpuResidentProposals, ResidentProposalError> {
         let context = self.archive().context();
         let admission = preflight.admission;
-        if publication == PresentPublication::Confirmed && admission.admits_pair() {
-            // Pair sibling confirmation is a separate future capability. Do
-            // not let a test-only generic admission cross today's wired
-            // Present publication boundary, even if every device byte would
-            // otherwise be well formed.
+        if publication == PresentPublication::Confirmed && admission.is_generic() {
+            // Pair/Restricted sibling confirmation is a separate future
+            // capability. Do not let a test-only generic admission cross
+            // today's wired Present publication boundary, even if every
+            // device byte would otherwise be well formed.
             return Err(ResidentProposalError::MalformedPlan);
         }
         let ProposalGeometry {
@@ -727,7 +850,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                     dispatch.cube_count(),
                     dispatch.cube_dim(),
                     inputs.choices,
-                    inputs.proposal_witness,
+                    inputs.proposal_witness.input_arg(),
                     plan.input_arg(),
                     workspace.output_arg(),
                     inputs.rows as u32,
@@ -924,18 +1047,20 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         }
 
-        // Generation is an infallible destination-parallel copy. Exhaustively:
-        // the capability seam proves choice/frontier shapes and lineage;
-        // classification proves canonical dead triples or live
-        // variable/arm/axis/count/segment cells and retains each validated arm
-        // and tagged physical witness by row; the flat scan proves every cell
-        // prefix and total below the sentinel; the finalizer proves segment boundaries,
-        // insertion/schema, capacity, and provisional control geometry;
-        // archive construction proves each present list's exact length,
-        // ascending order and in-domain codes; and the checked host products
-        // prove candidate, owner, proposer and child-body bounds. Thus every
-        // defensive guard in the candidate and child kernels is implied by an
-        // earlier proof. Jerky metadata remains zero until both stages finish.
+        // Present emission is an infallible destination-parallel copy. The
+        // capability seam proves choice/frontier shape and lineage;
+        // classification retains exact variable/arm/axis/count/segment cells;
+        // the shared scan proves every prefix and total; the finalizer proves
+        // segment, schema, capacity, and dispatch geometry; and archive
+        // construction proves each present list's exact ordered code domain.
+        // Active Pair and Restricted generators perform their additional
+        // physical proofs below and may raise the sticky status. The shared
+        // destination gate authenticates their combined routes before any
+        // public dispatch or child body becomes visible.
+        let has_present = self
+            .proposal_arm_specs()
+            .iter()
+            .any(|spec| matches!(spec, ArmSpec::Present { .. }));
         let entity_present_codes = self.archive().present_entity_codes().input_arg();
         let attribute_present_codes = self.archive().present_attribute_codes().input_arg();
         let value_present_codes = self.archive().present_value_codes().input_arg();
@@ -971,7 +1096,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             );
         };
         #[cfg(test)]
-        let candidate_profile = if _profile_stages {
+        let candidate_profile = if !has_present {
+            None
+        } else if _profile_stages {
             let ((), profile) = context
                 .client()
                 .profile(launch_candidates, "resident Present candidate emission")
@@ -982,13 +1109,46 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             None
         };
         #[cfg(not(test))]
-        launch_candidates();
+        if has_present {
+            launch_candidates();
+        }
 
-        let pair_generation = if admission.admits_pair() {
+        let pair_generation = if admission.admits_pair()
+            && self
+                .proposal_arm_specs()
+                .iter()
+                .any(|spec| matches!(spec, ArmSpec::PairDistinct { .. }))
+        {
             Some(Box::new(self.enqueue_pair_distinct_candidates(
                 &workspace,
                 workspace_layout,
                 &planning_control,
+                &mut candidate_records,
+                &mut confirmation_workspace,
+                confirmation_layout.keep,
+                inputs.rows,
+                admission.segment_count,
+                capacity,
+                dispatch_limits,
+            )?))
+        } else {
+            None
+        };
+
+        let restricted_generation = if admission.admits_restricted()
+            && self
+                .proposal_arm_specs()
+                .iter()
+                .any(|spec| matches!(spec, ArmSpec::Restricted { .. }))
+        {
+            Some(Box::new(self.enqueue_restricted_candidates(
+                &plan,
+                plan_layout,
+                &inputs.frontier,
+                &inputs.proposal_witness,
+                &workspace,
+                workspace_layout,
+                &mut planning_control,
                 &mut candidate_records,
                 &mut confirmation_workspace,
                 confirmation_layout.keep,
@@ -1174,17 +1334,17 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         #[cfg(not(test))]
         launch_late_cleanup();
 
-        if pair_generation.is_some() {
-            // Generic Pair admission stops at provisional publication. Child
-            // construction is family-neutral after the structural gate, but
-            // the Present confirmer and every confirmed/wired capability are
-            // intentionally unreachable from this branch.
+        if admission.is_generic() {
+            // Generic non-Present admission stops at provisional publication.
+            // Child construction is family-neutral after the structural gate,
+            // but the Present confirmer and every confirmed/wired capability
+            // are intentionally unreachable from this branch.
             unsafe {
                 materialize_proposal_children::launch_unchecked::<WgpuRuntime>(
                     context.client(),
                     dynamic_dispatch.cube_count(),
                     dynamic_dispatch.cube_dim(),
-                    inputs.frontier,
+                    inputs.frontier.input_arg(),
                     plan.input_arg(),
                     segment_records.input_arg(),
                     control.input_arg(),
@@ -1215,6 +1375,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 context: context.clone(),
                 round_owner: inputs.round_owner,
                 frontier_lineage: inputs.frontier_lineage,
+                _frontier_values: inputs.frontier,
+                _proposal_witness: inputs.proposal_witness,
                 arena_lineage: Arc::new(()),
                 rows: inputs.rows,
                 parent_stride: inputs.parent_stride,
@@ -1222,8 +1384,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 segment_count: admission.segment_count,
                 capacity,
                 _planning_control: planning_control,
+                _workspace: workspace,
+                _plan: plan,
                 _generation_dispatch: generation_dispatch,
                 _pair_generation: pair_generation,
+                _restricted_generation: restricted_generation,
                 control,
                 meta,
                 dispatch: dynamic_dispatch,
@@ -1275,12 +1440,12 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         // The child materializer consumes the same published indirect record;
         // neither indirect consumer binds that exclusive buffer as storage.
         let arm_count = self.metadata().arms().len() as u32;
-        let launch_child_body = || unsafe {
+        let mut launch_child_body = || unsafe {
             materialize_proposal_children::launch_unchecked::<WgpuRuntime>(
                 context.client(),
                 dynamic_dispatch.cube_count(),
                 dynamic_dispatch.cube_dim(),
-                inputs.frontier,
+                inputs.frontier.input_arg(),
                 plan.input_arg(),
                 segment_records.input_arg(),
                 control.input_arg(),
@@ -1481,6 +1646,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 context: context.clone(),
                 round_owner: inputs.round_owner,
                 frontier_lineage: inputs.frontier_lineage,
+                _frontier_values: inputs.frontier,
+                _proposal_witness: inputs.proposal_witness,
                 arena_lineage: Arc::new(()),
                 rows: inputs.rows,
                 parent_stride: inputs.parent_stride,
@@ -1488,8 +1655,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
                 segment_count: admission.segment_count,
                 capacity,
                 _planning_control: planning_control,
+                _workspace: workspace,
+                _plan: plan,
                 _generation_dispatch: generation_dispatch,
                 _pair_generation: pair_generation,
+                _restricted_generation: restricted_generation,
                 control: final_control,
                 meta: final_meta,
                 dispatch: final_dispatch,
@@ -1538,6 +1708,8 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             context: context.clone(),
             round_owner: inputs.round_owner,
             frontier_lineage: inputs.frontier_lineage,
+            _frontier_values: inputs.frontier,
+            _proposal_witness: inputs.proposal_witness,
             arena_lineage: Arc::new(()),
             rows: inputs.rows,
             parent_stride: inputs.parent_stride,
@@ -1545,8 +1717,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             segment_count: admission.segment_count,
             capacity,
             _planning_control: planning_control,
+            _workspace: workspace,
+            _plan: plan,
             _generation_dispatch: generation_dispatch,
             _pair_generation: pair_generation,
+            _restricted_generation: restricted_generation,
             control,
             meta,
             dispatch: dynamic_dispatch,
@@ -1604,6 +1779,9 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     ) -> Result<PairGenerationBacking, ResidentProposalError> {
         let context = self.archive().context();
         let pair_layout = pair_workspace_layout(rows)?;
+        #[cfg(test)]
+        let mut pair_workspace = context.upload_u32(&vec![0; pair_layout.words])?;
+        #[cfg(not(test))]
         let mut pair_workspace = context.empty_u32(pair_layout.words)?;
         let mut pair_control =
             context.upload_u32(&[STATUS_DEVICE_INVARIANT, RESIDENT_U32_SENTINEL, 0, 1])?;
@@ -1619,6 +1797,11 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             dispatch_limits.unwrap_or((pair_dispatch.max_groups_x(), pair_dispatch.max_groups_y()));
 
         for rotation in SuccinctRotation::ALL {
+            if !self.proposal_arm_specs().iter().any(|spec| {
+                matches!(spec, ArmSpec::PairDistinct { rotation: candidate, .. } if *candidate == rotation)
+            }) {
+                continue;
+            }
             if rows != 0 {
                 let row_dispatch =
                     context.static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))?;
@@ -1830,6 +2013,329 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             _ranks: ranks,
         })
     }
+
+    /// Enqueues every selected two-peer row through at most one pass per Ring
+    /// rotation. Exact-one-chosen-arm-per-row makes this a structural
+    /// specialization of descriptor-major work: source recomputation is
+    /// `O(6R)`, independent of how many same-rotation arms exist.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_restricted_candidates(
+        &self,
+        plan: &DeviceU32Buffer<WgpuRuntime>,
+        plan_layout: PlanLayout,
+        frontier: &DeviceU32Buffer<WgpuRuntime>,
+        proposal_witness: &DeviceU32Buffer<WgpuRuntime>,
+        workspace: &DeviceU32Buffer<WgpuRuntime>,
+        workspace_layout: WorkspaceLayout,
+        planning_control: &mut DeviceU32Buffer<WgpuRuntime>,
+        candidate_records: &mut DeviceU32Buffer<WgpuRuntime>,
+        route_scratch: &mut DeviceU32Buffer<WgpuRuntime>,
+        route_scratch_base: usize,
+        rows: usize,
+        segment_count: usize,
+        capacity: usize,
+        dispatch_limits: Option<(u32, u32)>,
+    ) -> Result<RestrictedGenerationBacking, ResidentProposalError> {
+        let context = self.archive().context();
+        let restricted_layout = restricted_workspace_layout(rows)?;
+        let mut restricted_workspace = context.empty_u32(restricted_layout.words)?;
+        let mut restricted_control = context.upload_u32(&[STATUS_OK, 0, 0, 1])?;
+        let mut restricted_meta = context.batch_meta(0, capacity)?;
+        let mut restricted_dispatch =
+            context.batch_dispatch(0, capacity, CubeDim::new_1d(THREADS))?;
+        let endpoints = checked_device_product(rows, 2, "Restricted source endpoints")?;
+        let mut source_positions = context.empty_u32(endpoints)?;
+        let mut source_values = context.empty_u32(endpoints)?;
+        let mut source_selected = context.empty_u32(endpoints)?;
+        let mut source_ranks = context.empty_u32(endpoints)?;
+        let mut positions = context.empty_u32(capacity)?;
+        let mut values = context.empty_u32(capacity)?;
+        let domain = self.archive().archive().domain.len() as u32;
+        let ring_len = self.archive().ring_col(SuccinctRotation::Eav).len() as u32;
+        let arm_count = self.metadata().arms().len();
+        let (restricted_max_x, restricted_max_y) = dispatch_limits.unwrap_or((
+            restricted_dispatch.max_groups_x(),
+            restricted_dispatch.max_groups_y(),
+        ));
+        let row_dispatch = if rows == 0 {
+            None
+        } else {
+            Some(context.static_batch_dispatch(rows, rows, CubeDim::new_1d(THREADS))?)
+        };
+        let block_dispatch = if restricted_layout.max_block_count == 0 {
+            None
+        } else {
+            Some(context.static_batch_dispatch(
+                restricted_layout.max_block_count,
+                restricted_layout.max_block_count,
+                CubeDim::new_1d(1),
+            )?)
+        };
+
+        for rotation in SuccinctRotation::ALL {
+            if !self.proposal_arm_specs().iter().any(
+                |spec| matches!(spec, ArmSpec::Restricted { rotation: candidate, .. } if *candidate == rotation),
+            ) {
+                continue;
+            }
+            let successor = successor_rotation(rotation);
+            let successor_len = self.archive().ring_col(successor).len() as u32;
+            if successor_len != ring_len {
+                return Err(ResidentProposalError::MalformedPlan);
+            }
+
+            if let Some(dispatch) = &row_dispatch {
+                unsafe {
+                    prepare_restricted_sources::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        plan.input_arg(),
+                        frontier.input_arg(),
+                        workspace.input_arg(),
+                        source_positions.output_arg(),
+                        source_values.output_arg(),
+                        rows as u32,
+                        self.metadata().bound_variables().len() as u32,
+                        arm_count as u32,
+                        rotation.index() as u32,
+                        domain,
+                        plan_layout.restricted_sources as u32,
+                        workspace_layout.row_arms as u32,
+                        workspace_layout.row_families as u32,
+                        workspace_layout.row_physicals as u32,
+                        RESIDENT_U32_SENTINEL,
+                    );
+                }
+
+                let first_prefix = match rotation {
+                    SuccinctRotation::Eav | SuccinctRotation::Eva => self.archive().entity_prefix(),
+                    SuccinctRotation::Aev | SuccinctRotation::Ave => {
+                        self.archive().attribute_prefix()
+                    }
+                    SuccinctRotation::Vea | SuccinctRotation::Vae => self.archive().value_prefix(),
+                };
+                first_prefix.select1_batch_into(&source_positions, &mut source_selected)?;
+                unsafe {
+                    normalize_restricted_first_range::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        source_selected.input_arg(),
+                        source_positions.output_arg(),
+                        rows as u32,
+                        ring_len,
+                        RESIDENT_U32_SENTINEL,
+                    );
+                }
+                self.archive().ring_col(rotation).rank_batch_into(
+                    &source_positions,
+                    &source_values,
+                    &mut source_ranks,
+                )?;
+                let last_prefix = match successor {
+                    SuccinctRotation::Eav | SuccinctRotation::Eva => self.archive().entity_prefix(),
+                    SuccinctRotation::Aev | SuccinctRotation::Ave => {
+                        self.archive().attribute_prefix()
+                    }
+                    SuccinctRotation::Vea | SuccinctRotation::Vae => self.archive().value_prefix(),
+                };
+                last_prefix.select1_batch_into(&source_values, &mut source_selected)?;
+                unsafe {
+                    pack_restricted_source_results::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        source_positions.input_arg(),
+                        source_values.input_arg(),
+                        source_selected.input_arg(),
+                        source_ranks.input_arg(),
+                        restricted_workspace.output_arg(),
+                        rows as u32,
+                        restricted_layout.source_results as u32,
+                    );
+                    finish_restricted_sources::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        proposal_witness.input_arg(),
+                        workspace.input_arg(),
+                        restricted_workspace.output_arg(),
+                        rows as u32,
+                        arm_count as u32,
+                        rotation.index() as u32,
+                        ring_len,
+                        successor_len,
+                        domain,
+                        workspace_layout.row_arms as u32,
+                        workspace_layout.row_families as u32,
+                        workspace_layout.row_physicals as u32,
+                        workspace_layout.row_counts as u32,
+                        restricted_layout.source_results as u32,
+                        restricted_layout.counts as u32,
+                        restricted_layout.starts as u32,
+                        restricted_layout.lane_errors as u32,
+                        RESIDENT_U32_SENTINEL,
+                        STATUS_DEVICE_INVARIANT,
+                    );
+                }
+            }
+
+            if let Some(dispatch) = &block_dispatch {
+                unsafe {
+                    reduce_validation_errors::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        restricted_workspace.output_arg(),
+                        rows as u32,
+                        restricted_layout.max_block_count as u32,
+                        restricted_layout.lane_errors as u32,
+                        restricted_layout.validation_errors as u32,
+                        BLOCK_ITEMS,
+                    );
+                    scan_present_blocks::launch_unchecked::<WgpuRuntime>(
+                        context.client(),
+                        dispatch.cube_count(),
+                        dispatch.cube_dim(),
+                        restricted_workspace.output_arg(),
+                        rows as u32,
+                        restricted_layout.max_block_count as u32,
+                        restricted_layout.counts as u32,
+                        restricted_layout.local_offsets as u32,
+                        restricted_layout.block_sums as u32,
+                        restricted_layout.block_errors as u32,
+                        BLOCK_ITEMS,
+                        RESIDENT_U32_SENTINEL,
+                    );
+                }
+            }
+
+            unsafe {
+                finalize_restricted_group_scan::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    restricted_workspace.output_arg(),
+                    planning_control.output_arg(),
+                    restricted_control.output_arg(),
+                    rows as u32,
+                    restricted_layout.max_block_count as u32,
+                    capacity as u32,
+                    restricted_max_x,
+                    restricted_max_y,
+                    THREADS,
+                    restricted_layout.validation_errors as u32,
+                    restricted_layout.block_sums as u32,
+                    restricted_layout.block_errors as u32,
+                    restricted_layout.block_offsets as u32,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                    STATUS_CAPACITY,
+                    STATUS_DEVICE_INVARIANT,
+                    STATUS_GEOMETRY,
+                );
+                publish_proposal_dispatch::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    restricted_control.input_arg(),
+                    restricted_dispatch.output_arg(),
+                    STATUS_OK,
+                );
+                publish_proposal_meta::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    CubeCount::new_single(),
+                    CubeDim::new_single(),
+                    restricted_control.input_arg(),
+                    restricted_meta.output_arg(),
+                    capacity as u32,
+                    STATUS_OK,
+                );
+                generate_restricted_positions::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    restricted_dispatch.cube_count(),
+                    restricted_dispatch.cube_dim(),
+                    workspace.input_arg(),
+                    restricted_workspace.input_arg(),
+                    restricted_control.input_arg(),
+                    positions.output_arg(),
+                    route_scratch.output_arg(),
+                    candidate_records.output_arg(),
+                    rows as u32,
+                    arm_count as u32,
+                    segment_count as u32,
+                    capacity as u32,
+                    successor_len,
+                    route_scratch_base as u32,
+                    rotation.index() as u32,
+                    workspace_layout.counts as u32,
+                    workspace_layout.local_offsets as u32,
+                    workspace_layout.block_offsets as u32,
+                    workspace_layout.row_arms as u32,
+                    workspace_layout.row_families as u32,
+                    workspace_layout.row_physicals as u32,
+                    workspace_layout.row_segments as u32,
+                    workspace_layout.row_counts as u32,
+                    restricted_layout.counts as u32,
+                    restricted_layout.starts as u32,
+                    restricted_layout.local_offsets as u32,
+                    restricted_layout.block_offsets as u32,
+                    BLOCK_ITEMS,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+            self.archive()
+                .ring_col(successor)
+                .access_batch_into_dynamic(
+                    &positions,
+                    &mut values,
+                    &restricted_meta,
+                    &restricted_dispatch,
+                )?;
+            unsafe {
+                scatter_pair_candidates::launch_unchecked::<WgpuRuntime>(
+                    context.client(),
+                    restricted_dispatch.cube_count(),
+                    restricted_dispatch.cube_dim(),
+                    values.input_arg(),
+                    route_scratch.input_arg(),
+                    restricted_control.input_arg(),
+                    candidate_records.output_arg(),
+                    capacity as u32,
+                    route_scratch_base as u32,
+                    domain,
+                    RESIDENT_U32_SENTINEL,
+                    STATUS_OK,
+                );
+            }
+        }
+
+        Ok(RestrictedGenerationBacking {
+            _control: restricted_control,
+            _meta: restricted_meta,
+            _dispatch: restricted_dispatch,
+            _workspace: restricted_workspace,
+            _source_positions: source_positions,
+            _source_values: source_values,
+            _source_selected: source_selected,
+            _source_ranks: source_ranks,
+            _positions: positions,
+            _values: values,
+        })
+    }
+}
+
+const fn successor_rotation(rotation: SuccinctRotation) -> SuccinctRotation {
+    match rotation {
+        SuccinctRotation::Eav => SuccinctRotation::Vea,
+        SuccinctRotation::Vea => SuccinctRotation::Ave,
+        SuccinctRotation::Ave => SuccinctRotation::Eav,
+        SuccinctRotation::Vae => SuccinctRotation::Eva,
+        SuccinctRotation::Eva => SuccinctRotation::Aev,
+        SuccinctRotation::Aev => SuccinctRotation::Vae,
+    }
 }
 
 fn lower_proposal_admission<U: Universe>(
@@ -1837,11 +2343,21 @@ fn lower_proposal_admission<U: Universe>(
     policy: ProposerPolicy,
 ) -> Result<ProposalAdmission, ResidentProposalError> {
     let metadata = round.metadata();
-    let (_, pair_counts) = checked_proposal_physical_limits(round)?;
+    let (ring_len, pair_counts) = checked_proposal_physical_limits(round)?;
     let arm_count = metadata.arms().len();
     let descriptor_words =
         checked_device_product(arm_count, ARM_DESCRIPTOR_WORDS, "proposal arm descriptors")?;
     let mut arm_descriptors = vec![RESIDENT_U32_SENTINEL; descriptor_words];
+    let restricted_source_words = if policy.allows_restricted() {
+        checked_device_product(
+            arm_count,
+            RESTRICTED_SOURCE_WORDS_PER_ARM,
+            "Restricted proposal sources",
+        )?
+    } else {
+        0
+    };
+    let mut restricted_sources = vec![RESIDENT_U32_SENTINEL; restricted_source_words];
 
     if !round.proposal_global_dead() {
         let specs = round.proposal_arm_specs();
@@ -1849,9 +2365,23 @@ fn lower_proposal_admission<U: Universe>(
             return Err(ResidentProposalError::MalformedPlan);
         }
         for (arm, &spec) in specs.iter().enumerate() {
-            let descriptor = lower_proposal_arm_descriptor(round, arm, spec, policy, pair_counts)?;
+            let descriptor =
+                lower_proposal_arm_descriptor(round, arm, spec, policy, ring_len, pair_counts)?;
             let base = arm * ARM_DESCRIPTOR_WORDS;
             arm_descriptors[base..base + ARM_DESCRIPTOR_WORDS].copy_from_slice(&descriptor);
+            if let ArmSpec::Restricted { first, last, .. } = spec {
+                let source_base = arm * RESTRICTED_SOURCE_WORDS_PER_ARM;
+                let (first_kind, first_payload) = match first {
+                    CodeSource::Constant(code) => (CONSTANT_SOURCE, code),
+                    CodeSource::Column(column) => (COLUMN_SOURCE, u32::from(column)),
+                };
+                let (last_kind, last_payload) = match last {
+                    CodeSource::Constant(code) => (CONSTANT_SOURCE, code),
+                    CodeSource::Column(column) => (COLUMN_SOURCE, u32::from(column)),
+                };
+                restricted_sources[source_base..source_base + RESTRICTED_SOURCE_WORDS_PER_ARM]
+                    .copy_from_slice(&[first_kind, first_payload, last_kind, last_payload]);
+            }
         }
     }
 
@@ -1887,8 +2417,10 @@ fn lower_proposal_admission<U: Universe>(
     checked_device_product(segment_count, SEGMENT_SPEC_WORDS, "proposal segment specs")?;
 
     Ok(ProposalAdmission {
-        pair_capable: matches!(policy, ProposerPolicy::PresentAndPair),
+        pair_capable: policy.allows_pair(),
+        restricted_capable: policy.allows_restricted(),
         arm_descriptors,
+        restricted_sources,
         variable_offsets,
         variable_arms,
         segment_specs,
@@ -1902,6 +2434,7 @@ fn lower_proposal_arm_descriptor<U: Universe>(
     arm: usize,
     spec: ArmSpec,
     policy: ProposerPolicy,
+    ring_len: u32,
     pair_counts: [u32; 6],
 ) -> Result<[u32; ARM_DESCRIPTOR_WORDS], ResidentProposalError> {
     let identity = round
@@ -1932,7 +2465,7 @@ fn lower_proposal_arm_descriptor<U: Universe>(
             arm: spec_arm,
             rotation,
             ..
-        } if matches!(policy, ProposerPolicy::PresentAndPair) => {
+        } if policy.allows_pair() => {
             if spec_arm as usize != arm
                 || round.proposal_arm_axis(arm) != Some(rotation_target_axis(rotation))
                 || round.proposal_arm_pair_rotation(arm) != Some(rotation)
@@ -1944,6 +2477,33 @@ fn lower_proposal_arm_descriptor<U: Universe>(
                 rotation.index() as u32,
                 pair_counts[rotation.index()],
             )
+        }
+        ArmSpec::Restricted {
+            arm: spec_arm,
+            rotation,
+            first,
+            last,
+        } if policy.allows_restricted() => {
+            let canonical_sources = round.proposal_arm_restricted_sources(arm);
+            let strict_sources = canonical_sources == Some((rotation, first, last));
+            let inverse_sources = policy.allows_physical_restricted()
+                && canonical_sources.is_some_and(
+                    |(canonical_rotation, canonical_first, canonical_last)| {
+                        (rotation, first, last)
+                            == (
+                                inverse_restricted_rotation(canonical_rotation),
+                                canonical_last,
+                                canonical_first,
+                            )
+                    },
+                );
+            if spec_arm as usize != arm
+                || round.proposal_arm_axis(arm) != Some(rotation_target_axis(rotation))
+                || (!strict_sources && !inverse_sources)
+            {
+                return Err(ResidentProposalError::MalformedPlan);
+            }
+            (FAMILY_RESTRICTED, rotation.index() as u32, ring_len)
         }
         ArmSpec::PairDistinct { .. } | ArmSpec::Restricted { .. } => {
             return Err(ResidentProposalError::UnsupportedProposer { arm });
@@ -2159,6 +2719,42 @@ fn pair_workspace_layout(rows: usize) -> Result<PairWorkspaceLayout, ResidentPro
     })
 }
 
+fn restricted_workspace_layout(
+    max_lanes: usize,
+) -> Result<RestrictedWorkspaceLayout, ResidentProposalError> {
+    let max_block_count = max_lanes.div_ceil(BLOCK_ITEMS as usize);
+    ensure_below_sentinel(max_block_count, "Restricted row scan blocks")?;
+    let mut words = 0usize;
+    let source_words = checked_device_product(
+        max_lanes,
+        RESTRICTED_SOURCE_WORDS,
+        "Restricted source results",
+    )?;
+    let source_results = reserve_words(&mut words, source_words, "Restricted source results")?;
+    let counts = reserve_words(&mut words, max_lanes, "Restricted group scan")?;
+    let starts = reserve_words(&mut words, max_lanes, "Restricted group scan")?;
+    let lane_errors = reserve_words(&mut words, max_lanes, "Restricted group scan")?;
+    let local_offsets = reserve_words(&mut words, max_lanes, "Restricted group scan")?;
+    let block_sums = reserve_words(&mut words, max_block_count, "Restricted group scan")?;
+    let block_errors = reserve_words(&mut words, max_block_count, "Restricted group scan")?;
+    let block_offsets = reserve_words(&mut words, max_block_count, "Restricted group scan")?;
+    let validation_errors =
+        reserve_words(&mut words, max_block_count, "Restricted group validation")?;
+    Ok(RestrictedWorkspaceLayout {
+        source_results,
+        counts,
+        starts,
+        lane_errors,
+        local_offsets,
+        block_sums,
+        block_errors,
+        block_offsets,
+        validation_errors,
+        max_block_count,
+        words,
+    })
+}
+
 fn packed_plan(
     admission: &ProposalAdmission,
     descriptors: &[u32],
@@ -2167,6 +2763,12 @@ fn packed_plan(
     let mut words = 0usize;
     let arm_descriptors = reserve_words(&mut words, descriptors.len(), "proposal plan")?;
     plan.extend_from_slice(descriptors);
+    let restricted_sources = reserve_words(
+        &mut words,
+        admission.restricted_sources.len(),
+        "Restricted proposal sources",
+    )?;
+    plan.extend_from_slice(&admission.restricted_sources);
     let variable_offsets = reserve_words(
         &mut words,
         admission.variable_offsets.len(),
@@ -2188,6 +2790,7 @@ fn packed_plan(
         plan,
         PlanLayout {
             arm_descriptors,
+            restricted_sources,
             variable_offsets,
             variable_arms,
             segment_specs,
@@ -2379,6 +2982,13 @@ fn classify_proposal_choices(
                                 && enum_hi <= pair_count
                                 && enum_lo <= base_lo
                                 && enum_hi <= base_hi;
+                        } else if family == FAMILY_RESTRICTED {
+                            valid = physical < SuccinctRotation::ALL.len() as u32
+                                && enum_limit == ring_len
+                                && base_hi <= ring_len
+                                && enum_hi <= ring_len
+                                && enum_lo <= base_lo
+                                && enum_hi <= base_hi;
                         }
                     }
                 }
@@ -2469,6 +3079,13 @@ fn classify_proposal_choices(
                                 && enum_limit == pair_count
                                 && base_hi <= ring_len
                                 && enum_hi <= pair_count
+                                && enum_lo <= base_lo
+                                && enum_hi <= base_hi;
+                        } else if family == FAMILY_RESTRICTED {
+                            exact_witness = physical < SuccinctRotation::ALL.len() as u32
+                                && enum_limit == ring_len
+                                && base_hi <= ring_len
+                                && enum_hi <= ring_len
                                 && enum_lo <= base_lo
                                 && enum_hi <= base_hi;
                         }
@@ -3344,6 +3961,553 @@ fn scatter_pair_candidates(
         let destination = route_scratch[route_scratch_base as usize + lane];
         if candidate != dead && candidate < domain && destination < capacity {
             candidate_records[destination as usize] = candidate;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_restricted_sources(
+    plan: &Array<u32>,
+    frontier: &Array<u32>,
+    workspace: &Array<u32>,
+    positions: &mut Array<u32>,
+    values: &mut Array<u32>,
+    rows: u32,
+    stride: u32,
+    arm_count: u32,
+    rotation: u32,
+    domain: u32,
+    restricted_sources_base: u32,
+    row_arms_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    dead: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let pair = row * 2usize;
+        if pair + 1usize < positions.len() && pair + 1usize < values.len() {
+            // No source may reach Jerky unless the selected semantic row and
+            // both arm-indexed sources jointly validate.
+            positions[pair] = dead;
+            positions[pair + 1usize] = dead;
+            values[pair] = dead;
+            values[pair + 1usize] = dead;
+
+            let arm_word = row_arms_base as usize + row;
+            let family_word = row_families_base as usize + row;
+            let physical_word = row_physicals_base as usize + row;
+            if arm_word < workspace.len()
+                && family_word < workspace.len()
+                && physical_word < workspace.len()
+            {
+                let arm = workspace[arm_word];
+                if arm < arm_count
+                    && workspace[family_word] == FAMILY_RESTRICTED
+                    && workspace[physical_word] == rotation
+                {
+                    let source = restricted_sources_base as usize
+                        + arm as usize * RESTRICTED_SOURCE_WORDS_PER_ARM;
+                    if source + 3usize < plan.len() {
+                        let first_kind = plan[source];
+                        let first_payload = plan[source + 1usize];
+                        let last_kind = plan[source + 2usize];
+                        let last_payload = plan[source + 3usize];
+                        let mut first = dead;
+                        let mut last = dead;
+                        if first_kind == CONSTANT_SOURCE {
+                            first = first_payload;
+                        } else if first_kind == COLUMN_SOURCE && first_payload < stride {
+                            let offset = row * stride as usize + first_payload as usize;
+                            if offset < frontier.len() {
+                                first = frontier[offset];
+                            }
+                        }
+                        if last_kind == CONSTANT_SOURCE {
+                            last = last_payload;
+                        } else if last_kind == COLUMN_SOURCE && last_payload < stride {
+                            let offset = row * stride as usize + last_payload as usize;
+                            if offset < frontier.len() {
+                                last = frontier[offset];
+                            }
+                        }
+                        if first < domain && first < dead - 1u32 && last < domain && last != dead {
+                            positions[pair] = first;
+                            positions[pair + 1usize] = first + 1u32;
+                            values[pair] = last;
+                            values[pair + 1usize] = last;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+fn normalize_restricted_first_range(
+    selected: &Array<u32>,
+    positions: &mut Array<u32>,
+    lanes: u32,
+    ring_len: u32,
+    dead: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if lane < lanes as usize {
+        let pair = lane * 2usize;
+        if pair + 1usize < selected.len() && pair + 1usize < positions.len() {
+            let first = positions[pair];
+            let next = positions[pair + 1usize];
+            let first_selected = selected[pair];
+            let next_selected = selected[pair + 1usize];
+            positions[pair] = dead;
+            positions[pair + 1usize] = dead;
+            if first != dead
+                && next != dead
+                && first_selected != dead
+                && next_selected != dead
+                && first_selected >= first
+                && next_selected >= next
+            {
+                let lo = first_selected - first;
+                let hi = next_selected - next;
+                if lo <= hi && hi <= ring_len {
+                    positions[pair] = lo;
+                    positions[pair + 1usize] = hi;
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn pack_restricted_source_results(
+    positions: &Array<u32>,
+    values: &Array<u32>,
+    selected: &Array<u32>,
+    ranks: &Array<u32>,
+    restricted_workspace: &mut Array<u32>,
+    lanes: u32,
+    source_results_base: u32,
+) {
+    let lane = ABSOLUTE_POS;
+    if lane < lanes as usize {
+        let pair = lane * 2usize;
+        let destination = source_results_base as usize + lane * RESTRICTED_SOURCE_WORDS;
+        if pair + 1usize < positions.len()
+            && pair + 1usize < values.len()
+            && pair + 1usize < selected.len()
+            && pair + 1usize < ranks.len()
+            && destination + 7usize < restricted_workspace.len()
+        {
+            restricted_workspace[destination] = positions[pair];
+            restricted_workspace[destination + 1usize] = positions[pair + 1usize];
+            restricted_workspace[destination + 2usize] = values[pair];
+            restricted_workspace[destination + 3usize] = values[pair + 1usize];
+            restricted_workspace[destination + 4usize] = selected[pair];
+            restricted_workspace[destination + 5usize] = selected[pair + 1usize];
+            restricted_workspace[destination + 6usize] = ranks[pair];
+            restricted_workspace[destination + 7usize] = ranks[pair + 1usize];
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+// Nested checked arithmetic keeps every sentinel subtraction dominated by a
+// non-sentinel/range proof in generated code.
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
+fn finish_restricted_sources(
+    proposal_witness: &Array<u32>,
+    workspace: &Array<u32>,
+    restricted_workspace: &mut Array<u32>,
+    rows: u32,
+    arm_count: u32,
+    rotation: u32,
+    ring_len: u32,
+    successor_len: u32,
+    domain: u32,
+    row_arms_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_counts_base: u32,
+    source_results_base: u32,
+    restricted_counts_base: u32,
+    restricted_starts_base: u32,
+    restricted_errors_base: u32,
+    dead: u32,
+    invariant_status: u32,
+) {
+    let row = ABSOLUTE_POS;
+    if row < rows as usize {
+        let count_word = restricted_counts_base as usize + row;
+        let start_word = restricted_starts_base as usize + row;
+        let error_word = restricted_errors_base as usize + row;
+        if count_word < restricted_workspace.len()
+            && start_word < restricted_workspace.len()
+            && error_word < restricted_workspace.len()
+        {
+            restricted_workspace[count_word] = 0u32;
+            restricted_workspace[start_word] = dead;
+            restricted_workspace[error_word] = 0u32;
+
+            let arm_word = row_arms_base as usize + row;
+            let family_word = row_families_base as usize + row;
+            let physical_word = row_physicals_base as usize + row;
+            let retained_count_word = row_counts_base as usize + row;
+            if arm_word < workspace.len()
+                && family_word < workspace.len()
+                && physical_word < workspace.len()
+                && retained_count_word < workspace.len()
+                && workspace[family_word] == FAMILY_RESTRICTED
+                && workspace[physical_word] == rotation
+            {
+                let mut valid = false;
+                let arm = workspace[arm_word];
+                let source = source_results_base as usize + row * RESTRICTED_SOURCE_WORDS;
+                if arm < arm_count && source + 7usize < restricted_workspace.len() {
+                    let witness = (arm as usize * rows as usize + row) * PROPOSAL_WITNESS_WORDS;
+                    if witness + 3usize < proposal_witness.len() {
+                        let lo = restricted_workspace[source];
+                        let hi = restricted_workspace[source + 1usize];
+                        let last = restricted_workspace[source + 2usize];
+                        let repeated_last = restricted_workspace[source + 3usize];
+                        let last_selected = restricted_workspace[source + 4usize];
+                        let repeated_selected = restricted_workspace[source + 5usize];
+                        let r0 = restricted_workspace[source + 6usize];
+                        let r1 = restricted_workspace[source + 7usize];
+                        let witness_lo = proposal_witness[witness];
+                        let witness_hi = proposal_witness[witness + 1usize];
+                        let witness_r0 = proposal_witness[witness + 2usize];
+                        let witness_r1 = proposal_witness[witness + 3usize];
+                        let retained_count = workspace[retained_count_word];
+                        if lo != dead
+                            && hi != dead
+                            && lo <= hi
+                            && hi <= ring_len
+                            && last != dead
+                            && last < domain
+                            && repeated_last == last
+                            && last_selected != dead
+                            && repeated_selected == last_selected
+                            && last_selected >= last
+                            && r0 != dead
+                            && r1 != dead
+                            && r0 <= r1
+                            && r1 <= ring_len
+                            && lo == witness_lo
+                            && hi == witness_hi
+                            && r0 == witness_r0
+                            && r1 == witness_r1
+                            && r0 <= lo
+                            && r1 <= hi
+                            && retained_count != dead
+                        {
+                            let width = r1 - r0;
+                            let span = hi - lo;
+                            if width <= span {
+                                let base = last_selected - last;
+                                if width == retained_count
+                                    && base <= successor_len
+                                    && r1 <= successor_len - base
+                                {
+                                    restricted_workspace[count_word] = width;
+                                    restricted_workspace[start_word] = base + r0;
+                                    valid = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !valid {
+                    restricted_workspace[error_word] = invariant_status;
+                }
+            }
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn finalize_restricted_group_scan(
+    restricted_workspace: &mut Array<u32>,
+    planning_control: &mut Array<u32>,
+    group_control: &mut Array<u32>,
+    lanes: u32,
+    block_count: u32,
+    capacity: u32,
+    max_groups_x: u32,
+    max_groups_y: u32,
+    threads: u32,
+    validation_errors_base: u32,
+    block_sums_base: u32,
+    block_errors_base: u32,
+    block_offsets_base: u32,
+    dead: u32,
+    ok: u32,
+    capacity_status: u32,
+    invariant_status: u32,
+    geometry_status: u32,
+) {
+    if ABSOLUTE_POS == 0 {
+        let upstream_status = planning_control[CONTROL_STATUS];
+        let planned_total = planning_control[CONTROL_REQUIRED];
+        let mut status = upstream_status;
+        if status > geometry_status {
+            status = invariant_status;
+        }
+
+        let mut total = 0u32;
+        let mut block = 0usize;
+        while block < block_count as usize {
+            restricted_workspace[block_offsets_base as usize + block] = total;
+            let source_error = restricted_workspace[validation_errors_base as usize + block];
+            if source_error > status {
+                status = source_error;
+            }
+            let scan_error = restricted_workspace[block_errors_base as usize + block];
+            if scan_error > status {
+                status = scan_error;
+            }
+            let next = restricted_workspace[block_sums_base as usize + block];
+            if next == dead || next >= dead - total {
+                if geometry_status > status {
+                    status = geometry_status;
+                }
+            } else {
+                total += next;
+            }
+            block += 1usize;
+        }
+
+        let mut expected_blocks = 0u32;
+        if lanes != 0u32 {
+            expected_blocks = 1u32 + (lanes - 1u32) / BLOCK_ITEMS;
+        }
+        if block_count != expected_blocks && invariant_status > status {
+            status = invariant_status;
+        }
+        if (upstream_status == ok || upstream_status == capacity_status)
+            && status < invariant_status
+            && (planned_total == dead || total > planned_total)
+        {
+            status = invariant_status;
+        }
+
+        let mut x = 0u32;
+        let mut y = 1u32;
+        if status == ok && total != 0u32 {
+            if total > capacity || threads == 0u32 || max_groups_x == 0u32 || max_groups_y == 0u32 {
+                status = geometry_status;
+            } else {
+                let groups = 1u32 + (total - 1u32) / threads;
+                y = 1u32 + (groups - 1u32) / max_groups_x;
+                if y == 0u32 || y > max_groups_y {
+                    status = geometry_status;
+                } else {
+                    x = 1u32 + (groups - 1u32) / y;
+                    if x == 0u32 || x > max_groups_x {
+                        status = geometry_status;
+                    }
+                }
+            }
+        }
+
+        // Restricted faults are sticky and outrank a prior capacity miss.
+        // Later groups may only preserve or raise this status.
+        planning_control[CONTROL_STATUS] = status;
+        if status >= invariant_status {
+            planning_control[CONTROL_REQUIRED] = dead;
+        }
+        group_control[CONTROL_STATUS] = status;
+        group_control[CONTROL_REQUIRED] = 0u32;
+        group_control[CONTROL_DISPATCH_X] = 0u32;
+        group_control[CONTROL_DISPATCH_Y] = 1u32;
+        if status == ok {
+            group_control[CONTROL_REQUIRED] = total;
+            group_control[CONTROL_DISPATCH_X] = x;
+            group_control[CONTROL_DISPATCH_Y] = y;
+        }
+    }
+}
+
+#[cube(launch_unchecked)]
+// Keep overflow guards nested so sentinel rejection structurally precedes
+// every `dead - base` expression in the generated device program.
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
+fn generate_restricted_positions(
+    workspace: &Array<u32>,
+    restricted_workspace: &Array<u32>,
+    group_control: &Array<u32>,
+    positions: &mut Array<u32>,
+    route_scratch: &mut Array<u32>,
+    candidate_records: &mut Array<u32>,
+    rows: u32,
+    arm_count: u32,
+    segment_count: u32,
+    capacity: u32,
+    successor_len: u32,
+    route_scratch_base: u32,
+    rotation: u32,
+    counts_base: u32,
+    local_offsets_base: u32,
+    block_offsets_base: u32,
+    row_arms_base: u32,
+    row_families_base: u32,
+    row_physicals_base: u32,
+    row_segments_base: u32,
+    row_counts_base: u32,
+    restricted_counts_base: u32,
+    restricted_starts_base: u32,
+    restricted_local_offsets_base: u32,
+    restricted_block_offsets_base: u32,
+    #[comptime] block_items: u32,
+    dead: u32,
+    ok: u32,
+) {
+    let group_destination = ABSOLUTE_POS;
+    if group_control[CONTROL_STATUS] == ok
+        && group_destination < group_control[CONTROL_REQUIRED] as usize
+        && group_destination < capacity as usize
+        && rows != 0u32
+    {
+        positions[group_destination] = dead;
+        route_scratch[route_scratch_base as usize + group_destination] = dead;
+        let d = group_destination as u32;
+
+        let mut lane_lo = 0u32;
+        let mut lane_hi = rows;
+        while lane_lo < lane_hi {
+            let lane_mid = lane_lo + (lane_hi - lane_lo) / 2u32;
+            let block = lane_mid as usize / block_items as usize;
+            let mut lane_end = dead;
+            if restricted_counts_base as usize + (lane_mid as usize) < restricted_workspace.len()
+                && restricted_local_offsets_base as usize + (lane_mid as usize)
+                    < restricted_workspace.len()
+                && restricted_block_offsets_base as usize + block < restricted_workspace.len()
+            {
+                let block_base =
+                    restricted_workspace[restricted_block_offsets_base as usize + block];
+                let local = restricted_workspace
+                    [restricted_local_offsets_base as usize + lane_mid as usize];
+                let count =
+                    restricted_workspace[restricted_counts_base as usize + lane_mid as usize];
+                if block_base != dead && local != dead && count != dead {
+                    if local < dead - block_base {
+                        let start = block_base + local;
+                        if count < dead - start {
+                            lane_end = start + count;
+                        }
+                    }
+                }
+            }
+            if lane_end <= d {
+                lane_lo = lane_mid + 1u32;
+            } else {
+                lane_hi = lane_mid;
+            }
+        }
+
+        if lane_lo < rows {
+            let lane = lane_lo;
+            let row = lane;
+            let restricted_block = lane as usize / block_items as usize;
+            if restricted_counts_base as usize + (lane as usize) < restricted_workspace.len()
+                && restricted_starts_base as usize + (lane as usize) < restricted_workspace.len()
+                && restricted_local_offsets_base as usize + (lane as usize)
+                    < restricted_workspace.len()
+                && restricted_block_offsets_base as usize + restricted_block
+                    < restricted_workspace.len()
+            {
+                let restricted_block_base =
+                    restricted_workspace[restricted_block_offsets_base as usize + restricted_block];
+                let restricted_local =
+                    restricted_workspace[restricted_local_offsets_base as usize + lane as usize];
+                let restricted_width =
+                    restricted_workspace[restricted_counts_base as usize + lane as usize];
+                let source_start =
+                    restricted_workspace[restricted_starts_base as usize + lane as usize];
+                if restricted_block_base != dead
+                    && restricted_local != dead
+                    && restricted_width != dead
+                    && source_start != dead
+                {
+                    if restricted_local < dead - restricted_block_base {
+                        let group_start = restricted_block_base + restricted_local;
+                        if restricted_width < dead - group_start {
+                            let group_end = group_start + restricted_width;
+                            if d >= group_start && d < group_end {
+                                let ordinal = d - group_start;
+                                let arm_word = row_arms_base as usize + row as usize;
+                                let family_word = row_families_base as usize + row as usize;
+                                let physical_word = row_physicals_base as usize + row as usize;
+                                let segment_word = row_segments_base as usize + row as usize;
+                                let count_word = row_counts_base as usize + row as usize;
+                                if arm_word < workspace.len()
+                                    && family_word < workspace.len()
+                                    && physical_word < workspace.len()
+                                    && segment_word < workspace.len()
+                                    && count_word < workspace.len()
+                                {
+                                    let arm = workspace[arm_word];
+                                    let family = workspace[family_word];
+                                    let physical = workspace[physical_word];
+                                    let segment = workspace[segment_word];
+                                    let retained_count = workspace[count_word];
+                                    if arm < arm_count
+                                        && family == FAMILY_RESTRICTED
+                                        && physical == rotation
+                                        && segment < segment_count
+                                        && retained_count == restricted_width
+                                        && ordinal < restricted_width
+                                    {
+                                        let cell = segment as usize * rows as usize + row as usize;
+                                        let block = cell / block_items as usize;
+                                        if counts_base as usize + cell < workspace.len()
+                                            && local_offsets_base as usize + cell < workspace.len()
+                                            && block_offsets_base as usize + block < workspace.len()
+                                        {
+                                            let canonical_count =
+                                                workspace[counts_base as usize + cell];
+                                            let canonical_block =
+                                                workspace[block_offsets_base as usize + block];
+                                            let canonical_local =
+                                                workspace[local_offsets_base as usize + cell];
+                                            if canonical_count == restricted_width
+                                                && canonical_block != dead
+                                                && canonical_local != dead
+                                                && canonical_local < dead - canonical_block
+                                            {
+                                                let cell_start = canonical_block + canonical_local;
+                                                if ordinal < dead - cell_start {
+                                                    let destination = cell_start + ordinal;
+                                                    if destination < capacity
+                                                        && ordinal < dead - source_start
+                                                    {
+                                                        let source = source_start + ordinal;
+                                                        if source < successor_len {
+                                                            positions[group_destination] = source;
+                                                            route_scratch[route_scratch_base
+                                                                as usize
+                                                                + group_destination] = destination;
+                                                            candidate_records[capacity as usize
+                                                                + destination as usize] = row;
+                                                            candidate_records[capacity as usize
+                                                                * 2usize
+                                                                + destination as usize] = arm;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -4416,7 +5580,8 @@ fn materialize_proposal_children(
                 let family = plan[descriptor + 1usize];
                 let physical = plan[descriptor + 2usize];
                 let admitted_family = (family == FAMILY_PRESENT && physical < 3u32)
-                    || (family == FAMILY_PAIR_DISTINCT && physical < 6u32);
+                    || (family == FAMILY_PAIR_DISTINCT && physical < 6u32)
+                    || (family == FAMILY_RESTRICTED && physical < 6u32);
                 let variable = plan[descriptor];
                 if admitted_family
                     && variable_to_segment_base as usize + (variable as usize) < plan.len()

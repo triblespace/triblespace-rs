@@ -39,8 +39,8 @@ const THREADS: u32 = 64;
 const PAIR_DESCRIPTOR_WORDS: usize = 3;
 const RESTRICTED_DESCRIPTOR_WORDS: usize = 5;
 const SUPPORT_DESCRIPTOR_WORDS: usize = 6;
-const CONSTANT_SOURCE: u32 = 0;
-const COLUMN_SOURCE: u32 = 1;
+pub(crate) const CONSTANT_SOURCE: u32 = 0;
+pub(crate) const COLUMN_SOURCE: u32 = 1;
 
 /// Canonical archive axis selected by a resident proposal arm.
 ///
@@ -157,6 +157,23 @@ pub enum CodeSource {
     Constant(u32),
     /// Zero-based column in the canonical affine frontier schema.
     Column(u8),
+}
+
+/// Reverses a canonical Restricted arm around its fixed target axis.
+///
+/// A Restricted triple `(rotation, first, last)` has exactly one equivalent
+/// physical orientation: `(inverse(rotation), last, first)`. Keeping this
+/// relation explicit prevents test-only physical coverage from relabelling an
+/// arm with unrelated same-shaped sources.
+pub(crate) const fn inverse_restricted_rotation(rotation: SuccinctRotation) -> SuccinctRotation {
+    match rotation {
+        SuccinctRotation::Eav => SuccinctRotation::Vae,
+        SuccinctRotation::Vae => SuccinctRotation::Eav,
+        SuccinctRotation::Vea => SuccinctRotation::Aev,
+        SuccinctRotation::Aev => SuccinctRotation::Vea,
+        SuccinctRotation::Ave => SuccinctRotation::Eva,
+        SuccinctRotation::Eva => SuccinctRotation::Ave,
+    }
 }
 
 /// Complete physical witness instruction for one stable planner arm.
@@ -420,6 +437,35 @@ impl ResidentRoundPlan {
         }
     }
 
+    /// Independently re-lowers one arm's canonical two-peer rotation and
+    /// oriented sources from the retained pattern and bound schema.
+    pub(crate) fn arm_restricted_sources(
+        &self,
+        arm: usize,
+    ) -> Option<(SuccinctRotation, CodeSource, CodeSource)> {
+        let identity = *self.metadata.arms().get(arm)?;
+        let pattern = *self.patterns.get(identity.source_pattern_index())?;
+        let mut columns = vec![None; self.metadata.variable_count()];
+        for (column, &variable) in self.metadata.bound_variables().iter().enumerate() {
+            columns[variable.index()] = Some(u8::try_from(column).ok()?);
+        }
+        match lower_arm(
+            arm as u32,
+            pattern,
+            identity.target_variable(),
+            &columns,
+            [0; 3],
+        ) {
+            ArmSpec::Restricted {
+                rotation,
+                first,
+                last,
+                ..
+            } => Some((rotation, first, last)),
+            ArmSpec::Present { .. } | ArmSpec::PairDistinct { .. } => None,
+        }
+    }
+
     /// Nonempty physical groups in `Present`, pair-rotation, restricted-rotation order.
     #[cfg(test)]
     pub fn arm_groups(&self) -> &[ArmGroup] {
@@ -448,7 +494,7 @@ pub struct WgpuResidentFrontier<'a, U: Universe> {
     owner: Arc<()>,
     /// Unique allocation lineage propagated into inputs and choices.
     lineage: Arc<()>,
-    values: DeviceU32Buffer<WgpuRuntime>,
+    values: Arc<DeviceU32Buffer<WgpuRuntime>>,
     variables: Box<[ProgramVariable]>,
     rows: usize,
     stride: usize,
@@ -477,11 +523,10 @@ impl<U: Universe> WgpuResidentFrontier<'_, U> {
 /// exact archive/context ownership, the compiled round, canonical schema and
 /// geometry, planner ownership, and the unique frontier allocation lineage.
 pub(crate) struct ResidentProposalInputs {
-    pub(crate) frontier: ArrayArg<WgpuRuntime>,
+    pub(crate) frontier: Arc<DeviceU32Buffer<WgpuRuntime>>,
     pub(crate) choices: ArrayArg<WgpuRuntime>,
     /// Exact immutable witness retained by and obtained only from `choices`.
-    #[allow(dead_code)] // Consumed by the next Pair proposal slice.
-    pub(crate) proposal_witness: ArrayArg<WgpuRuntime>,
+    pub(crate) proposal_witness: Arc<DeviceU32Buffer<WgpuRuntime>>,
     pub(crate) rows: usize,
     pub(crate) parent_stride: usize,
     pub(crate) round_owner: Arc<()>,
@@ -602,7 +647,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
             archive: self.archive,
             owner: self.frontier_owner.clone(),
             lineage: Arc::new(()),
-            values: self.archive.context().upload_u32(&values)?,
+            values: Arc::new(self.archive.context().upload_u32(&values)?),
             variables: frontier.variables().to_vec().into_boxed_slice(),
             rows: frontier.len(),
             stride,
@@ -710,7 +755,7 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
         }
         let (choice_words, proposal_witness) = self.planner.proposal_input_args(choices)?;
         Ok(ResidentProposalInputs {
-            frontier: frontier.values.input_arg(),
+            frontier: frontier.values.clone(),
             choices: choice_words,
             proposal_witness,
             rows: frontier.rows,
@@ -733,6 +778,83 @@ impl<'a, U: Universe> WgpuResidentRound<'a, U> {
     /// Independently re-derived one-peer rotation for host admission.
     pub(crate) fn proposal_arm_pair_rotation(&self, arm: usize) -> Option<SuccinctRotation> {
         self.plan.arm_pair_rotation(arm)
+    }
+
+    /// Independently re-derived two-peer rotation and oriented sources for
+    /// strict proposal admission.
+    pub(crate) fn proposal_arm_restricted_sources(
+        &self,
+        arm: usize,
+    ) -> Option<(SuccinctRotation, CodeSource, CodeSource)> {
+        self.plan.arm_restricted_sources(arm)
+    }
+
+    /// Test-only physical all-six harness. It may replace each canonical
+    /// Restricted orientation only with its exact source-swapped inverse.
+    ///
+    /// Reconfiguration is transactional and rotates both planner and frontier
+    /// owners. Frontiers, inputs, and choices minted before a successful call
+    /// are therefore stale; callers must reconfigure before creating any of
+    /// those capabilities.
+    #[cfg(test)]
+    pub(crate) fn reconfigure_restricted_proposal_arms_for_test(
+        &mut self,
+        specs: Vec<ArmSpec>,
+    ) -> Result<(), ResidentSupportError> {
+        if self.plan.is_global_dead() || specs.len() != self.plan.metadata().arms().len() {
+            return Err(ResidentSupportError::MalformedResidentPlan);
+        }
+        for (arm, &spec) in specs.iter().enumerate() {
+            let ArmSpec::Restricted {
+                arm: spec_arm,
+                rotation,
+                first,
+                last,
+            } = spec
+            else {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            };
+            let Some((canonical_rotation, canonical_first, canonical_last)) =
+                self.plan.arm_restricted_sources(arm)
+            else {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            };
+            let canonical =
+                (rotation, first, last) == (canonical_rotation, canonical_first, canonical_last);
+            let inverse = (rotation, first, last)
+                == (
+                    inverse_restricted_rotation(canonical_rotation),
+                    canonical_last,
+                    canonical_first,
+                );
+            if spec_arm as usize != arm || (!canonical && !inverse) {
+                return Err(ResidentSupportError::MalformedResidentPlan);
+            }
+        }
+
+        let mut candidate_plan = self.plan.clone();
+        candidate_plan.arm_specs = specs.into_boxed_slice();
+        candidate_plan.arm_groups = group_arms(&candidate_plan.arm_specs);
+        let candidate_planner = ResidentRowPlanner::from_metadata(
+            candidate_plan.metadata().clone(),
+            self.archive.context().clone(),
+        )?;
+        let candidate_initial_witnesses = self
+            .archive
+            .context()
+            .upload_u32(&initial_witnesses(&candidate_plan)?)?;
+        let candidate_pair_groups = build_pair_groups(self.archive, &candidate_plan)?;
+        let candidate_restricted_groups = build_restricted_groups(self.archive, &candidate_plan)?;
+        let candidate_fully_bound_group = build_fully_bound_group(self.archive, &candidate_plan)?;
+
+        self.plan = candidate_plan;
+        self.planner = candidate_planner;
+        self.frontier_owner = Arc::new(());
+        self.initial_witnesses = candidate_initial_witnesses;
+        self.pair_groups = candidate_pair_groups;
+        self.restricted_groups = candidate_restricted_groups;
+        self.fully_bound_group = candidate_fully_bound_group;
+        Ok(())
     }
 
     /// Whether a missing constant killed the complete positive conjunction.

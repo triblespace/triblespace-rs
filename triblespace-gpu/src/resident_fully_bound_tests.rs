@@ -519,7 +519,8 @@ fn fully_bound_pipeline_preserves_present_absent_and_poison_states() {
                 present[0], present[1], present[2], absent[0], absent[1], absent[2], present[0],
                 present[1], domain,
             ])
-            .unwrap(),
+            .unwrap()
+            .into(),
         variables: vec![v(0), v(1), v(2)].into_boxed_slice(),
         rows: 3,
         stride: 3,

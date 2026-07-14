@@ -708,12 +708,9 @@ impl<R: Runtime> ResidentRowPlanner<R> {
     pub(crate) fn proposal_input_args(
         &self,
         choices: &ResidentRowChoices<R>,
-    ) -> Result<(ArrayArg<R>, ArrayArg<R>), ResidentRoundError> {
+    ) -> Result<(ArrayArg<R>, Arc<DeviceU32Buffer<R>>), ResidentRoundError> {
         self.validate_choices(choices)?;
-        Ok((
-            choices.words.input_arg(),
-            choices.proposal_witness.input_arg(),
-        ))
+        Ok((choices.words.input_arg(), choices.proposal_witness.clone()))
     }
 
     fn validate_choices(&self, choices: &ResidentRowChoices<R>) -> Result<(), ResidentRoundError> {

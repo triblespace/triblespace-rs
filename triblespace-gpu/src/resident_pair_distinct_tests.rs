@@ -510,7 +510,8 @@ fn opaque_frontiers_reject_wrong_schema_archive_and_shape() {
         values: first
             .context()
             .upload_u32(&[code(&first_program, ids.attributes[0])])
-            .unwrap(),
+            .unwrap()
+            .into(),
         variables: vec![v(1)].into_boxed_slice(),
         rows: 1,
         stride: 1,
@@ -524,7 +525,7 @@ fn opaque_frontiers_reject_wrong_schema_archive_and_shape() {
         archive: &first,
         owner: first_round.frontier_owner.clone(),
         lineage: Arc::new(()),
-        values: first.context().upload_u32(&[]).unwrap(),
+        values: first.context().upload_u32(&[]).unwrap().into(),
         variables: vec![v(0)].into_boxed_slice(),
         rows: 1,
         stride: 1,
@@ -554,7 +555,8 @@ fn malformed_device_codes_poison_estimates_but_valid_zero_stays_viable() {
         values: resident
             .context()
             .upload_u32(&[highest, domain, u32::MAX - 1, u32::MAX])
-            .unwrap(),
+            .unwrap()
+            .into(),
         variables: vec![v(0)].into_boxed_slice(),
         rows: 4,
         stride: 1,
@@ -578,7 +580,7 @@ fn malformed_device_codes_poison_estimates_but_valid_zero_stays_viable() {
         archive: &resident,
         owner: round.frontier_owner.clone(),
         lineage: Arc::new(()),
-        values: resident.context().upload_u32(&[highest]).unwrap(),
+        values: resident.context().upload_u32(&[highest]).unwrap().into(),
         variables: vec![v(0)].into_boxed_slice(),
         rows: 1,
         stride: 1,
